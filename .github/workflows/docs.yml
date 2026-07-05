@@ -2,10 +2,16 @@
 # The runner checks out to a parenthesis-free path (/home/runner/work/<repo>/<repo>), so
 # `pnpm run docs:api` (TypeDoc) works here even though it can't on a path containing "(3)".
 #
+# Publishing model: the site is deployed to GitHub Pages ONLY on merge to main. develop (and
+# any other branch that matches below) still runs the build job for validation, so a docs
+# build break is caught early, but the deploy job is gated to main (see its `if`) and the
+# github-pages environment only permits deployments from main.
+#
 # One-time setup in the repo: Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
 name: Docs
 
 on:
+  # Build on pushes to main and develop (docs-affecting paths only); only main deploys.
   push:
     branches: [main, develop]
     paths:
@@ -49,8 +55,11 @@ jobs:
         with:
           path: docs/.vitepress/dist
 
+  # Publish to GitHub Pages on merge to main only. On develop the build above runs for
+  # validation, but this job is skipped, so no branch other than main ever deploys.
   deploy:
     needs: build
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment:
       name: github-pages

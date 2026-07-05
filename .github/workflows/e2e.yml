@@ -3,10 +3,11 @@
 # save-card → off-session recharge → subscribe → renewal → cancel.
 # Needs the same sandbox secrets as integration.yml plus the PUBLIC keys:
 #   VITE_STRIPE_PUBLISHABLE_KEY, VITE_PAYSAFE_PUBLIC_KEY (base64 user:key).
+# Like integration.yml, runs on manual dispatch + a weekly cron, never on PRs
+# (secrets + real browser payments don't belong in the PR loop).
 name: E2E (browser)
 
 on:
-  pull_request:
   workflow_dispatch:
   schedule:
     - cron: "7 6 * * 3" # weekly, after the integration cron
@@ -15,17 +16,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: e2e-${{ github.ref }}
-  # Superseded PR pushes cancel their stale run (sandbox-only money, no harm);
-  # dispatch/cron runs are never interrupted.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: e2e
+  cancel-in-progress: false # never interrupt an in-flight sandbox run
 
 jobs:
   e2e:
     runs-on: ubuntu-latest
-    # Fork PRs have no repo secrets — the sandbox suites can't run there.
-    # Same-repo PRs, dispatch, and cron all carry them.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

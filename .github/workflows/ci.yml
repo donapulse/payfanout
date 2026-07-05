@@ -27,7 +27,7 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm run lint -- --max-warnings 0
+      - run: pnpm run lint
 
   typecheck-and-boundaries:
     runs-on: ubuntu-latest

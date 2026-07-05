@@ -1,0 +1,12 @@
+# Force contributors through a template so reports arrive triage-ready.
+blank_issues_enabled: false
+contact_links:
+  - name: 📚 Documentation
+    url: https://github.com/donapulse/payfanout#readme
+    about: Setup guides, adapter authoring, and API reference. Check here first.
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/donapulse/payfanout/security/advisories/new
+    about: Found a way to leak secrets or mishandle money? Report it privately, never in a public issue.
+  - name: 💬 Questions and discussions
+    url: https://github.com/donapulse/payfanout/discussions
+    about: Usage questions, integration help, and early-stage ideas that are not yet a bug or a concrete proposal.

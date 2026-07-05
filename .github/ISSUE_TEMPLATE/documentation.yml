@@ -1,0 +1,41 @@
+name: 📚 Documentation issue
+description: Report something wrong, missing, or unclear in the docs.
+title: "[Docs]: "
+labels: ["documentation", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve the docs. Small fixes are welcome as a pull request directly.
+  - type: input
+    id: location
+    attributes:
+      label: Where is it?
+      description: URL, file path, or page title.
+      placeholder: "e.g. docs/guide/providers.md, README Server quick start"
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Type of problem
+      options:
+        - "Incorrect / outdated information"
+        - "Missing information"
+        - "Confusing or unclear"
+        - "Broken link or example"
+        - "Typo / formatting"
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: What needs fixing?
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested improvement
+    validations:
+      required: false

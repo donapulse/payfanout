@@ -1,0 +1,19 @@
+# CODEOWNERS assigns automatic reviewers to matching paths. It is currently
+# inert: uncomment the lines below and replace the placeholder with real GitHub
+# usernames or teams (for example @donapulse/maintainers), then GitHub will
+# request those owners on every matching pull request.
+#
+# Docs: https://docs.github.com/articles/about-code-owners
+# Order matters: the last matching pattern wins.
+
+# Default owners for everything in the repo:
+# *                        @donapulse/maintainers
+
+# Core contract: changes here ripple across every adapter.
+# /packages/core/          @donapulse/maintainers
+
+# The conformance suite guards the adapter contract.
+# /packages/conformance/   @donapulse/maintainers
+
+# CI, release, and security configuration.
+# /.github/                @donapulse/maintainers

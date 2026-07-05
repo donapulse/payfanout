@@ -1,0 +1,67 @@
+name: 🔌 New adapter / PSP support
+description: Propose support for a payment provider PayFanout does not ship yet.
+title: "[Adapter]: support <provider name>"
+labels: ["adapter", "enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        PayFanout is provider-agnostic: any payment gateway can be supported by writing a new adapter package, with zero changes to core and zero changes to consuming apps. This form scopes that work. See [docs/adapter-authoring.md](https://github.com/donapulse/payfanout/blob/main/docs/adapter-authoring.md).
+  - type: input
+    id: provider
+    attributes:
+      label: Provider name
+      placeholder: "e.g. Adyen, Braintree, Mollie, Razorpay"
+    validations:
+      required: true
+  - type: input
+    id: api-docs
+    attributes:
+      label: Link to the provider's API documentation
+    validations:
+      required: true
+  - type: dropdown
+    id: flows
+    attributes:
+      label: Which payment flows do you need? Select all that apply.
+      multiple: true
+      options:
+        - "Embedded card fields (hosted iframe / tokenization, no redirect)"
+        - "Redirect / voucher methods (bank redirects, vouchers, wallets)"
+        - "Saved cards / recurring (vaulted token)"
+        - "Refunds (full and partial)"
+        - "Webhooks / async status updates"
+    validations:
+      required: true
+  - type: textarea
+    id: client-sdk
+    attributes:
+      label: Client SDK for card capture
+      description: Does the provider offer hosted iframe fields or a client tokenization SDK? Link it. PayFanout never renders a raw card input, so this is required for embedded card support.
+    validations:
+      required: true
+  - type: dropdown
+    id: edge
+    attributes:
+      label: Server-side runtime
+      description: Can the server integration run without Node built-ins (WebCrypto and fetch only), for edge deployment?
+      options:
+        - "Edge-compatible (WebCrypto, fetch, no Node built-ins)"
+        - "Requires Node.js built-ins"
+        - "Not sure"
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+      description: Regions, currencies, volume, or anything else that motivates this.
+    validations:
+      required: false
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I am willing to author this adapter, guided by docs/adapter-authoring.md and the conformance suite.
+          required: false

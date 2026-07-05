@@ -1,0 +1,106 @@
+name: 🐞 Bug report
+description: Report a defect in a PayFanout package.
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. The sections below help us reproduce it quickly.
+
+        **Never paste live secrets, API keys, full card numbers, or raw webhook payloads containing personal data.** Redact them first. If the bug itself looks like a security vulnerability (secret leakage, signature bypass, money mishandled), stop and report it privately through our [security policy](https://github.com/donapulse/payfanout/security/policy) instead.
+  - type: checkboxes
+    attributes:
+      label: Pre-flight checklist
+      options:
+        - label: I have searched existing issues and this is not a duplicate.
+          required: true
+        - label: I have removed all secret keys, tokens, and cardholder data from this report.
+          required: true
+        - label: This is a reproducible bug, not a usage question (questions go to Discussions).
+          required: true
+  - type: dropdown
+    id: package
+    attributes:
+      label: Affected package
+      description: Which package does the bug live in? Pick the closest match.
+      options:
+        - "@payfanout/core"
+        - "@payfanout/server"
+        - "@payfanout/react"
+        - "@payfanout/adapter-stripe-server"
+        - "@payfanout/adapter-stripe"
+        - "@payfanout/adapter-paysafe-server"
+        - "@payfanout/adapter-paysafe"
+        - "@payfanout/conformance"
+        - "Routing / failover (PaymentRouter)"
+        - "Not sure / other"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      description: Version of the affected package, from your lockfile or package.json.
+      placeholder: "e.g. 0.3.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Adapter environment
+      description: Which environment was configured on the adapter?
+      options:
+        - sandbox
+        - live
+        - not applicable
+    validations:
+      required: true
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Runtime
+      description: Where was the failing code running? Select all that apply.
+      multiple: true
+      options:
+        - "Node.js (server)"
+        - "Edge runtime (Cloudflare Workers, Next.js edge, etc.)"
+        - "Browser (client)"
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Node / browser / framework versions
+      placeholder: "e.g. Node 20.11, Next.js 15.1, Chrome 138"
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and its impact.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Steps or a minimal code snippet. A link to a repo, or a failing conformance case, is ideal.
+      render: TypeScript
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or errors
+      description: Paste stack traces or error output. Rendered as code, so no backticks needed. Redact secrets.
+      render: shell
+    validations:
+      required: false

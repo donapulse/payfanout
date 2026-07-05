@@ -1,0 +1,19 @@
+# gitleaks configuration.
+#
+# Keep the full upstream ruleset, but don't flag the deliberately fake
+# credentials that live in unit-test fixtures. gitleaks-action v3 ships a newer
+# gitleaks whose `generic-api-key` rule matches these mock values, e.g.
+#   apiKey: "cHVibGljOmtleQ=="   (base64 of the literal string "public:key")
+#   token / clientToken: "SPtok_handle_1"   (mock single-use tokens)
+# in packages/adapter-paysafe/test/*. These are not secrets.
+#
+# Real sandbox credentials never enter the repo — they are stored as GitHub
+# Actions secrets (STRIPE_*, PAYSAFE_*, NPM_TOKEN) and read from process.env.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Unit-test fixtures use fake, non-secret credentials"
+paths = [
+  '''packages/[^/]+/test/''',
+]

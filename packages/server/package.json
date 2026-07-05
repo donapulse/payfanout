@@ -1,6 +1,7 @@
 {
   "name": "@payfanout/server",
   "version": "0.1.0",
+  "license": "MIT",
   "description": "PayFanout server-side orchestration: PaymentService over a registry of ServerPaymentAdapters, framework-agnostic webhook handlers. Stateless — no persistence.",
   "type": "module",
   "exports": {

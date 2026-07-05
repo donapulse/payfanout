@@ -451,3 +451,13 @@ isolates them in one place each (`adapter.ts`, `webhook.ts`) with structural typ
 injected transport so they can be re-verified against current docs and adjusted without
 touching core, server, or app code. Re-check against the Paysafe developer portal before
 going live.
+
+## License
+
+[MIT](LICENSE) © 2026 PayFanout contributors.
+
+PayFanout is free and open source. Use it in commercial or private projects, fork it,
+modify it, redistribute it, and send pull requests. The only condition is that the
+copyright notice and the license text stay with copies of the code. Every published
+`@payfanout/*` package ships the same MIT license, and contributions are accepted under
+it (see [CONTRIBUTING](.github/CONTRIBUTING.md)).

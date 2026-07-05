@@ -320,12 +320,11 @@ export function decodeSessionPayload(clientSecret: string): PaysafeSessionPayloa
 
 function base64UrlDecode(value: string): string {
   const base64 = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
-  if (typeof atob === "function") {
-    // Handles UTF-8 payloads correctly in browsers.
-    const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
-    return new TextDecoder().decode(bytes);
-  }
-  return Buffer.from(base64, "base64").toString("utf8");
+  // atob is a global across every supported runtime (browsers, Node >=18.17,
+  // edge), so this client-safe adapter decodes without Node's Buffer; TextDecoder
+  // handles UTF-8 payloads correctly.
+  const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
 }
 
 const PAYSAFE_JS_CODE_MAP: Record<string, UnifiedErrorCode> = {

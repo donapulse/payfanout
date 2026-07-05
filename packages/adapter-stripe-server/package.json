@@ -14,7 +14,7 @@
   "sideEffects": false,
   "dependencies": {
     "@payfanout/core": "workspace:*",
-    "stripe": "^16.0.0"
+    "stripe": "^22.3.0"
   },
   "devDependencies": {
     "@payfanout/conformance": "workspace:*"

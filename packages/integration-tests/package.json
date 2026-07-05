@@ -9,6 +9,6 @@
     "@payfanout/adapter-stripe-server": "workspace:*",
     "@payfanout/core": "workspace:*",
     "@payfanout/server": "workspace:*",
-    "stripe": "^16.0.0"
+    "stripe": "^22.3.0"
   }
 }

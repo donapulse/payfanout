@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import type { JSX } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 import type { PaymentInfo } from "@payfanout/core";
 import {

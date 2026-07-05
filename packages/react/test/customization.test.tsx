@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { JSX } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 import { PayFanoutProvider, PaymentFields, usePay, type PayResult } from "../src/index.js";
 import { FakeClientAdapter } from "./fake-client-adapter.js";

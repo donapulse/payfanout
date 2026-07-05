@@ -53,7 +53,7 @@ jobs:
           VITE_PAYSAFE_CURRENCY: ${{ vars.PAYSAFE_CURRENCY || 'CAD' }}
       - name: Upload traces on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: playwright-traces
           path: packages/e2e/test-results/

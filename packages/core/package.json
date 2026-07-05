@@ -1,0 +1,30 @@
+{
+  "name": "@payfanout/core",
+  "version": "0.1.0",
+  "description": "PayFanout unified payment domain model, adapter contracts, and normalization helpers. Zero PSP dependencies, zero persistence.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "sideEffects": false,
+  "devDependencies": {
+    "fast-check": "^3.19.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "publishConfig": {
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  }
+}

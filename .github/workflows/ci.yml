@@ -1,0 +1,83 @@
+# Fast quality gate on every push and PR: lint, types, boundaries, tests
+# with coverage thresholds, and a publishable build. Real-sandbox suites live
+# in integration.yml / e2e.yml (they need secrets and are dispatch/cron-run).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run lint -- --max-warnings 0
+
+  typecheck-and-boundaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run typecheck
+      - name: Client/server package boundary check
+        run: pnpm run check:boundaries
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Unit + conformance tests with coverage thresholds
+        run: pnpm run test:coverage
+      - name: Upload coverage report
+        if: always() && matrix.node == 22
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage/
+          retention-days: 14
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build every publishable package (tsc emit -> dist)
+        run: pnpm run build
+      - name: Smoke-load the built core package
+        run: node -e "import('./packages/core/dist/index.js').then((m) => { if (m.toMinorUnits(10.99, 'USD') !== 1099) throw new Error('dist smoke failed'); console.log('dist OK'); })"

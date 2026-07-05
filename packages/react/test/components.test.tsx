@@ -1,0 +1,254 @@
+// @vitest-environment jsdom
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { getUiLabel, type PaymentInfo } from "@payfanout/core";
+import { PayButton, PayFanoutProvider, PaymentFields, usePayFanout, type PayResult } from "../src/index.js";
+import { deferred, FakeClientAdapter } from "./fake-client-adapter.js";
+
+afterEach(cleanup);
+
+function StatusProbe(): JSX.Element {
+  const { status, activePsp, availablePsps } = usePayFanout();
+  return (
+    <div>
+      <span data-testid="status">{status}</span>
+      <span data-testid="active">{activePsp}</span>
+      <span data-testid="available">{availablePsps.join(",")}</span>
+    </div>
+  );
+}
+
+const paymentInfo: PaymentInfo = {
+  id: "order-1",
+  pspName: "fakepsp",
+  pspPaymentId: "pay_1",
+  status: "succeeded",
+  amount: 1000,
+  amountRefunded: 0,
+  currency: "USD",
+  paymentMethodType: "card",
+  createdAt: "2026-07-04T00:00:00.000Z",
+  raw: {},
+};
+
+describe("PayFanoutProvider / usePayFanout", () => {
+  it("registers adapters, tracks the active PSP, and lists capabilities", async () => {
+    const a = new FakeClientAdapter("stripe");
+    const b = new FakeClientAdapter("paysafe");
+    render(
+      <PayFanoutProvider adapters={[a, b]} initialPsp="paysafe">
+        <StatusProbe />
+      </PayFanoutProvider>,
+    );
+    expect(screen.getByTestId("active").textContent).toBe("paysafe");
+    expect(screen.getByTestId("available").textContent).toBe("stripe,paysafe");
+    // Provider never loads SDKs eagerly — only PaymentFields does.
+    expect(a.loadSdkCalls + b.loadSdkCalls).toBe(0);
+  });
+
+  it("throws on duplicate adapters and on hooks used outside the provider", () => {
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const dup = [new FakeClientAdapter("x"), new FakeClientAdapter("x")];
+    expect(() =>
+      render(
+        <PayFanoutProvider adapters={dup}>
+          <div />
+        </PayFanoutProvider>,
+      ),
+    ).toThrowError(/duplicate client adapter/);
+    expect(() => render(<StatusProbe />)).toThrowError(/inside <PayFanoutProvider>/);
+    spy.mockRestore();
+  });
+});
+
+describe("PaymentFields", () => {
+  it("lazily loads the SDK, mounts the adapter into its container, and reports ready", async () => {
+    const adapter = new FakeClientAdapter();
+    const onReady = vi.fn();
+    render(
+      <PayFanoutProvider adapters={[adapter]}>
+        <PaymentFields clientSecret="cs_1" appearance={{ theme: "flat" }} onReady={onReady} />
+        <StatusProbe />
+      </PayFanoutProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("status").textContent).toBe("ready"));
+    expect(adapter.loadSdkCalls).toBe(1);
+    expect(adapter.mountCalls).toHaveLength(1);
+    expect(adapter.mountCalls[0]!.clientSecret).toBe("cs_1");
+    expect(adapter.mountCalls[0]!.appearance).toEqual({ theme: "flat" });
+    expect(onReady).toHaveBeenCalledTimes(1);
+    expect(document.querySelector('[data-payfanout-fields="fakepsp"]')).not.toBeNull();
+  });
+
+  it("unmounts the adapter on component teardown", async () => {
+    const adapter = new FakeClientAdapter();
+    const view = render(
+      <PayFanoutProvider adapters={[adapter]}>
+        <PaymentFields clientSecret="cs_1" />
+      </PayFanoutProvider>,
+    );
+    await waitFor(() => expect(adapter.mountCalls).toHaveLength(1));
+    view.unmount();
+    expect(adapter.unmountCalls).toBe(1);
+  });
+
+  it("survives the unmount-while-still-mounting race without leaking a handle", async () => {
+    const adapter = new FakeClientAdapter();
+    adapter.mountGate = deferred<void>();
+    const view = render(
+      <PayFanoutProvider adapters={[adapter]}>
+        <PaymentFields clientSecret="cs_1" />
+      </PayFanoutProvider>,
+    );
+    await waitFor(() => expect(adapter.mountCalls).toHaveLength(1));
+    view.unmount(); // React tears down while the adapter is still awaiting its SDK
+    adapter.mountGate.resolve();
+    await waitFor(() => expect(adapter.unmountCalls).toBe(1)); // late handle cleaned up, not leaked
+  });
+
+  it("surfaces mount failures through onError and the unified status", async () => {
+    const adapter = new FakeClientAdapter();
+    adapter.mountError = new Error("SDK exploded");
+    const onError = vi.fn();
+    render(
+      <PayFanoutProvider adapters={[adapter]}>
+        <PaymentFields clientSecret="cs_1" onError={onError} />
+        <StatusProbe />
+      </PayFanoutProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("status").textContent).toBe("error"));
+    expect(onError).toHaveBeenCalledTimes(1);
+    const err = onError.mock.calls[0]![0] as { code: string; raw: unknown };
+    expect(err.code).toBe("unknown");
+    expect(err.raw).toBe(adapter.mountError);
+  });
+
+  it("errors cleanly when the requested psp has no registered adapter", async () => {
+    const adapter = new FakeClientAdapter();
+    const onError = vi.fn();
+    render(
+      <PayFanoutProvider adapters={[adapter]}>
+        <PaymentFields psp="ghost" clientSecret="cs_1" onError={onError} />
+      </PayFanoutProvider>,
+    );
+    await waitFor(() => expect(onError).toHaveBeenCalled());
+    expect((onError.mock.calls[0]![0] as { code: string }).code).toBe("invalid_request");
+    expect(adapter.mountCalls).toHaveLength(0);
+  });
+});
+
+describe("PayButton", () => {
+  async function renderCheckout(
+    adapter: FakeClientAdapter,
+    props: { onResult: (r: PayResult) => void; onServerCompletion?: (token: string) => Promise<PaymentInfo> },
+  ): Promise<void> {
+    render(
+      <PayFanoutProvider adapters={[adapter]}>
+        <PaymentFields clientSecret="cs_1" />
+        <PayButton {...props}>Pay now</PayButton>
+      </PayFanoutProvider>,
+    );
+    await waitFor(() => expect(adapter.mountCalls).toHaveLength(1));
+  }
+
+  it("confirms the mounted fields and reports the confirm-on-client result", async () => {
+    const adapter = new FakeClientAdapter();
+    const results: PayResult[] = [];
+    await renderCheckout(adapter, { onResult: (r) => void results.push(r) });
+    fireEvent.click(screen.getByRole("button", { name: "Pay now" }));
+    await waitFor(() => expect(results).toHaveLength(1));
+    expect(results[0]).toEqual({ status: "succeeded" });
+    expect(adapter.confirmCalls).toBe(1);
+  });
+
+  it("routes tokenize-first confirms through onServerCompletion (§4a, same button)", async () => {
+    const adapter = new FakeClientAdapter();
+    adapter.confirmImpl = async () => ({ status: "requires_confirmation", clientToken: "SPtok_9" });
+    const tokens: string[] = [];
+    const results: PayResult[] = [];
+    await renderCheckout(adapter, {
+      onResult: (r) => void results.push(r),
+      onServerCompletion: async (token) => {
+        tokens.push(token);
+        return paymentInfo;
+      },
+    });
+    fireEvent.click(screen.getByRole("button"));
+    await waitFor(() => expect(results).toHaveLength(1));
+    expect(tokens).toEqual(["SPtok_9"]);
+    expect(results[0]!.status).toBe("succeeded");
+    expect(results[0]!.info).toBe(paymentInfo);
+  });
+
+  it("disables itself while a confirmation is in flight (no double submit)", async () => {
+    const adapter = new FakeClientAdapter();
+    const gate = deferred<void>();
+    adapter.confirmImpl = async () => {
+      await gate.promise;
+      return { status: "succeeded" };
+    };
+    const results: PayResult[] = [];
+    await renderCheckout(adapter, { onResult: (r) => void results.push(r) });
+    const button = screen.getByRole("button") as HTMLButtonElement;
+    fireEvent.click(button);
+    await waitFor(() => expect(button.disabled).toBe(true));
+    fireEvent.click(button); // ignored while submitting
+    gate.resolve();
+    await waitFor(() => expect(button.disabled).toBe(false));
+    expect(adapter.confirmCalls).toBe(1);
+    expect(results).toHaveLength(1);
+  });
+
+  it("fails loudly when clicked with no mounted fields", async () => {
+    const adapter = new FakeClientAdapter();
+    const results: PayResult[] = [];
+    render(
+      <PayFanoutProvider adapters={[adapter]}>
+        <PayButton onResult={(r) => void results.push(r)} />
+      </PayFanoutProvider>,
+    );
+    fireEvent.click(screen.getByRole("button"));
+    await waitFor(() => expect(results).toHaveLength(1));
+    expect(results[0]!.status).toBe("failed");
+    expect(results[0]!.error?.code).toBe("invalid_request");
+    expect(results[0]!.error?.message).toMatch(/PaymentFields/);
+  });
+});
+
+describe("PayButton localization", () => {
+  it("defaults to the built-in English label with no locale", () => {
+    render(
+      <PayFanoutProvider adapters={[new FakeClientAdapter()]}>
+        <PayButton onResult={() => {}} />
+      </PayFanoutProvider>,
+    );
+    expect(screen.getByRole("button").textContent).toBe("Pay");
+  });
+
+  it("uses the provider locale's built-in label (fr)", () => {
+    render(
+      <PayFanoutProvider adapters={[new FakeClientAdapter()]} locale="fr">
+        <PayButton onResult={() => {}} />
+      </PayFanoutProvider>,
+    );
+    const label = screen.getByRole("button").textContent;
+    expect(label).toBe(getUiLabel("pay", "fr"));
+    expect(label).not.toBe("Pay"); // proves a real French translation ships
+  });
+
+  it("falls back to English for an unknown locale, and lets children override", () => {
+    render(
+      <PayFanoutProvider adapters={[new FakeClientAdapter()]} locale="zz">
+        <PayButton onResult={() => {}} />
+      </PayFanoutProvider>,
+    );
+    expect(screen.getByRole("button").textContent).toBe("Pay");
+    cleanup();
+    render(
+      <PayFanoutProvider adapters={[new FakeClientAdapter()]} locale="de">
+        <PayButton onResult={() => {}}>Jetzt kaufen</PayButton>
+      </PayFanoutProvider>,
+    );
+    expect(screen.getByRole("button").textContent).toBe("Jetzt kaufen");
+  });
+});

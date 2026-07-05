@@ -1,0 +1,488 @@
+import {
+  assertMinorUnitAmount,
+  normalizeCurrency,
+  PayFanoutError,
+  type MinorUnitAmount,
+  type PaymentInfo,
+} from "@payfanout/core";
+import type { PaymentService } from "./payment-service.js";
+
+/**
+ * Recurring payments on top of the vault primitives. The design honors the
+ * library's one hard rule — PayFanout persists nothing — by INJECTING the
+ * storage: the host hands over a SubscriptionStore (its database) and a cron
+ * trigger (`chargeDueSubscriptions`), and this manager supplies everything
+ * else: period math, off-session charging with deterministic idempotency,
+ * retry/dunning policy, and status transitions.
+ *
+ *   host cron ──> manager.chargeDueSubscriptions() ──> service.chargeSavedPaymentMethod()
+ *                        │                                        │
+ *                  host's SubscriptionStore                 PSP vault token
+ *
+ * PSP-native billing products (Stripe Billing) are NOT wrapped —
+ * Paysafe has no equivalent, and an abstraction over one PSP is not an
+ * abstraction. This engine gives BOTH PSPs identical subscription behavior.
+ */
+export type SubscriptionStatus = "active" | "past_due" | "canceled";
+
+export type SubscriptionInterval = "day" | "week" | "month" | "year";
+
+export interface SubscriptionPlan {
+  /** Integer minor units, like every amount in PayFanout. */
+  amount: MinorUnitAmount;
+  currency: string;
+  interval: SubscriptionInterval;
+  /** e.g. every 3 months -> interval "month", intervalCount 3. Default 1. */
+  intervalCount?: number;
+}
+
+export interface SubscriptionRecord {
+  id: string;
+  pspName: string;
+  pspCustomerId: string;
+  savedPaymentMethodToken: string;
+  plan: Required<SubscriptionPlan>;
+  status: SubscriptionStatus;
+  /** ISO 8601 — the paid-through window. The next charge is due at currentPeriodEnd. */
+  currentPeriodStart: string;
+  currentPeriodEnd: string;
+  cancelAtPeriodEnd: boolean;
+  /** Consecutive failed renewal attempts for the CURRENT period (dunning). */
+  failedAttempts: number;
+  /** ISO 8601 — when past_due, the earliest instant the next retry may run. */
+  nextRetryAt?: string;
+  /** pspPaymentId of the latest successful charge. */
+  lastPaymentId?: string;
+  lastError?: { code: string; message: string };
+  /**
+   * AVS data forwarded on every charge — some PSPs (Paysafe) demand a zip on
+   * stored-token charges when the vaulted handle carries no billing data
+   * (browser-tokenized cards). Persisted with the record so renewals have it.
+   */
+  billingDetails?: { name?: string; email?: string; address?: { line1?: string; city?: string; postalCode?: string; country?: string } };
+  metadata?: Record<string, string>;
+  createdAt: string;
+  canceledAt?: string;
+}
+
+/**
+ * The persistence seam — implemented by the HOST over its own database.
+ * `save` upserts by record.id. Implementations must persist every field
+ * verbatim; the manager treats the store as the single source of truth.
+ */
+export interface SubscriptionStore {
+  save(record: SubscriptionRecord): Promise<void>;
+  get(id: string): Promise<SubscriptionRecord | undefined>;
+  list(filter?: { pspCustomerId?: string; status?: SubscriptionStatus }): Promise<SubscriptionRecord[]>;
+}
+
+/** Dev/test/demo store. NOT for production — it forgets everything on restart. */
+export class InMemorySubscriptionStore implements SubscriptionStore {
+  private readonly records = new Map<string, SubscriptionRecord>();
+
+  async save(record: SubscriptionRecord): Promise<void> {
+    this.records.set(record.id, structuredClone(record));
+  }
+
+  async get(id: string): Promise<SubscriptionRecord | undefined> {
+    const record = this.records.get(id);
+    return record ? structuredClone(record) : undefined;
+  }
+
+  async list(filter?: { pspCustomerId?: string; status?: SubscriptionStatus }): Promise<SubscriptionRecord[]> {
+    return [...this.records.values()]
+      .filter((r) => !filter?.pspCustomerId || r.pspCustomerId === filter.pspCustomerId)
+      .filter((r) => !filter?.status || r.status === filter.status)
+      .map((r) => structuredClone(r));
+  }
+}
+
+export interface SubscriptionEvent {
+  type:
+    | "subscription.created"
+    | "subscription.charged"
+    | "subscription.charge_failed"
+    | "subscription.past_due"
+    | "subscription.canceled";
+  subscription: SubscriptionRecord;
+  payment?: PaymentInfo;
+  error?: PayFanoutError;
+}
+
+export interface CreateSubscriptionInput {
+  pspName: string;
+  pspCustomerId: string;
+  /** SavedPaymentMethod.token / PaymentInfo.savedPaymentMethodToken. */
+  savedPaymentMethodToken: string;
+  plan: SubscriptionPlan;
+  /** Host-app id; defaults to a generated UUID. */
+  id?: string;
+  /**
+   * Future instant = trial / delayed start: nothing is charged now, the first
+   * charge happens when chargeDueSubscriptions crosses it. Omitted = charge
+   * the first period immediately (customer-present "initial" charge).
+   */
+  startAt?: string | Date;
+  /**
+   * AVS data carried on the record and forwarded on EVERY charge (first and
+   * renewals) — some PSPs (Paysafe) demand a zip on stored-token charges of
+   * browser-tokenized cards.
+   */
+  billingDetails?: { name?: string; email?: string; address?: { line1?: string; city?: string; postalCode?: string; country?: string } };
+  metadata?: Record<string, string>;
+  /** Idempotency for the FIRST charge (renewals derive their own keys). */
+  idempotencyKey: string;
+}
+
+export interface ChargeDueResult {
+  charged: SubscriptionRecord[];
+  /** Renewals that failed this run (now past_due, retry scheduled). */
+  failed: SubscriptionRecord[];
+  /** Ended this run: dunning exhausted or cancelAtPeriodEnd reached. */
+  canceled: SubscriptionRecord[];
+}
+
+export interface SubscriptionManagerOptions {
+  service: PaymentService;
+  store: SubscriptionStore;
+  /**
+   * Dunning policy: hours to wait before each renewal retry. The Nth failure
+   * schedules a retry after retryDelaysHours[N-1]; failing with the schedule
+   * exhausted cancels the subscription. Default [24, 72] (3 attempts total).
+   */
+  retryDelaysHours?: number[];
+  /**
+   * How many overdue periods one chargeDueSubscriptions run may collect per
+   * subscription. Default 1 — a long-dead cron must not surprise-charge a
+   * customer several periods in one instant.
+   */
+  catchUpLimit?: number;
+  /** Observability: fired on every lifecycle transition. Errors are swallowed. */
+  onEvent?: (event: SubscriptionEvent) => void | Promise<void>;
+  /** Injected clock (ms since epoch) for tests. */
+  now?: () => number;
+  /** Injected id generator; defaults to crypto.randomUUID. */
+  generateId?: () => string;
+}
+
+export class SubscriptionManager {
+  private readonly service: PaymentService;
+  private readonly store: SubscriptionStore;
+  private readonly retryDelaysHours: number[];
+  private readonly catchUpLimit: number;
+  private readonly onEvent?: SubscriptionManagerOptions["onEvent"];
+  private readonly now: () => number;
+  private readonly generateId: () => string;
+
+  constructor(options: SubscriptionManagerOptions) {
+    this.service = options.service;
+    this.store = options.store;
+    this.retryDelaysHours = options.retryDelaysHours ?? [24, 72];
+    this.catchUpLimit = options.catchUpLimit ?? 1;
+    this.onEvent = options.onEvent;
+    this.now = options.now ?? Date.now;
+    this.generateId = options.generateId ?? (() => globalThis.crypto.randomUUID());
+    if (this.catchUpLimit < 1) {
+      throw PayFanoutError.invalidRequest("SubscriptionManager catchUpLimit must be >= 1");
+    }
+    if (this.retryDelaysHours.some((h) => !(h > 0))) {
+      throw PayFanoutError.invalidRequest("SubscriptionManager retryDelaysHours must all be > 0");
+    }
+  }
+
+  /**
+   * Starts a subscription. Immediate start charges the first period NOW
+   * (customer-present, credential-on-file "initial") — a failed first charge
+   * throws and persists nothing, so hosts never hold a subscription that
+   * never collected. A future startAt begins a trial window instead.
+   */
+  async createSubscription(
+    input: CreateSubscriptionInput,
+  ): Promise<{ subscription: SubscriptionRecord; payment?: PaymentInfo }> {
+    const plan = normalizePlan(input.plan);
+    const nowIso = new Date(this.now()).toISOString();
+    const id = input.id ?? this.generateId();
+    if (await this.store.get(id)) {
+      throw PayFanoutError.invalidRequest(`Subscription "${id}" already exists`);
+    }
+
+    const startMs = input.startAt === undefined ? this.now() : toEpochMs(input.startAt, "startAt");
+    const trial = startMs > this.now();
+
+    let payment: PaymentInfo | undefined;
+    let periodStart: string;
+    let periodEnd: string;
+    if (trial) {
+      // Paid-through window is empty until startAt; the first charge is a
+      // normal renewal once the cron crosses it.
+      periodStart = nowIso;
+      periodEnd = new Date(startMs).toISOString();
+    } else {
+      payment = await this.service.chargeSavedPaymentMethod(input.pspName, {
+        pspCustomerId: input.pspCustomerId,
+        savedPaymentMethodToken: input.savedPaymentMethodToken,
+        amount: plan.amount,
+        currency: plan.currency,
+        id,
+        occurrence: "initial",
+        ...(input.billingDetails ? { billingDetails: input.billingDetails } : {}),
+        metadata: { ...input.metadata, payfanout_subscription_id: id },
+        idempotencyKey: input.idempotencyKey,
+      });
+      periodStart = nowIso;
+      periodEnd = addInterval(nowIso, plan.interval, plan.intervalCount);
+    }
+
+    const subscription: SubscriptionRecord = {
+      id,
+      pspName: input.pspName,
+      pspCustomerId: input.pspCustomerId,
+      savedPaymentMethodToken: input.savedPaymentMethodToken,
+      plan,
+      status: "active",
+      currentPeriodStart: periodStart,
+      currentPeriodEnd: periodEnd,
+      cancelAtPeriodEnd: false,
+      failedAttempts: 0,
+      ...(payment ? { lastPaymentId: payment.pspPaymentId } : {}),
+      ...(input.billingDetails ? { billingDetails: input.billingDetails } : {}),
+      ...(input.metadata ? { metadata: input.metadata } : {}),
+      createdAt: nowIso,
+    };
+    await this.store.save(subscription);
+    await this.emit({ type: "subscription.created", subscription });
+    if (payment) await this.emit({ type: "subscription.charged", subscription, payment });
+    return { subscription, ...(payment ? { payment } : {}) };
+  }
+
+  async retrieveSubscription(id: string): Promise<SubscriptionRecord> {
+    const record = await this.store.get(id);
+    if (!record) throw PayFanoutError.invalidRequest(`Unknown subscription "${id}"`);
+    return record;
+  }
+
+  async listSubscriptions(filter?: {
+    pspCustomerId?: string;
+    status?: SubscriptionStatus;
+  }): Promise<SubscriptionRecord[]> {
+    return this.store.list(filter);
+  }
+
+  /**
+   * Plan/instrument changes apply from the NEXT period (no proration — the
+   * already-paid window stands). Changing the token also clears dunning:
+   * a fresh card deserves a fresh chance at the next renewal.
+   */
+  async updateSubscription(
+    id: string,
+    updates: {
+      plan?: SubscriptionPlan;
+      savedPaymentMethodToken?: string;
+      metadata?: Record<string, string>;
+    },
+  ): Promise<SubscriptionRecord> {
+    const record = await this.retrieveSubscription(id);
+    if (record.status === "canceled") {
+      throw PayFanoutError.invalidRequest(`Subscription "${id}" is canceled and cannot be updated`);
+    }
+    const updated: SubscriptionRecord = {
+      ...record,
+      ...(updates.plan ? { plan: normalizePlan(updates.plan) } : {}),
+      ...(updates.savedPaymentMethodToken
+        ? { savedPaymentMethodToken: updates.savedPaymentMethodToken, failedAttempts: 0 }
+        : {}),
+      ...(updates.metadata ? { metadata: updates.metadata } : {}),
+    };
+    if (updates.savedPaymentMethodToken) delete updated.nextRetryAt;
+    await this.store.save(updated);
+    return updated;
+  }
+
+  /**
+   * Immediate cancel stops everything now (the rest of the paid window is
+   * forfeit — no refund is initiated; use refundPayment separately if owed).
+   * atPeriodEnd lets the paid window run out, then ends without charging.
+   */
+  async cancelSubscription(id: string, options: { atPeriodEnd?: boolean } = {}): Promise<SubscriptionRecord> {
+    const record = await this.retrieveSubscription(id);
+    if (record.status === "canceled") return record;
+    if (options.atPeriodEnd) {
+      const updated: SubscriptionRecord = { ...record, cancelAtPeriodEnd: true };
+      await this.store.save(updated);
+      return updated;
+    }
+    const canceled: SubscriptionRecord = {
+      ...record,
+      status: "canceled",
+      canceledAt: new Date(this.now()).toISOString(),
+    };
+    delete canceled.nextRetryAt;
+    await this.store.save(canceled);
+    await this.emit({ type: "subscription.canceled", subscription: canceled });
+    return canceled;
+  }
+
+  /**
+   * THE cron entry point — run it every few minutes/hours from the host's
+   * scheduler. Idempotent and crash-safe: renewal idempotency keys are
+   * derived from (subscription id, period, attempt), so a crashed run that
+   * re-charges after the store missed an update dedupes at the PSP.
+   */
+  async chargeDueSubscriptions(at?: string | Date): Promise<ChargeDueResult> {
+    const nowMs = at === undefined ? this.now() : toEpochMs(at, "at");
+    const result: ChargeDueResult = { charged: [], failed: [], canceled: [] };
+
+    const candidates = [
+      ...(await this.store.list({ status: "active" })),
+      ...(await this.store.list({ status: "past_due" })),
+    ];
+    for (const candidate of candidates) {
+      let record = candidate;
+      for (let cycle = 0; cycle < this.catchUpLimit; cycle++) {
+        if (record.status === "canceled") break;
+        if (Date.parse(record.currentPeriodEnd) > nowMs) break; // paid through — not due
+        if (record.status === "past_due" && record.nextRetryAt && Date.parse(record.nextRetryAt) > nowMs) {
+          break; // dunning backoff still cooling down
+        }
+        if (record.cancelAtPeriodEnd) {
+          record = {
+            ...record,
+            status: "canceled",
+            canceledAt: new Date(nowMs).toISOString(),
+          };
+          delete record.nextRetryAt;
+          await this.store.save(record);
+          await this.emit({ type: "subscription.canceled", subscription: record });
+          result.canceled.push(record);
+          break;
+        }
+        record = await this.renew(record, nowMs, result);
+        if (record.status !== "active") break; // failed renewal ends this subscription's run
+      }
+    }
+    return result;
+  }
+
+  /** One renewal attempt for the period ending at record.currentPeriodEnd. */
+  private async renew(
+    record: SubscriptionRecord,
+    nowMs: number,
+    result: ChargeDueResult,
+  ): Promise<SubscriptionRecord> {
+    // Deterministic per (id, period, attempt): a replayed run can never
+    // double-charge, and a RETRY is a genuinely new PSP request (replaying the
+    // failed attempt's key would just replay its cached failure).
+    const idempotencyKey = `payfanout-sub-${record.id}-${record.currentPeriodEnd}-a${record.failedAttempts}`;
+    try {
+      const payment = await this.service.chargeSavedPaymentMethod(record.pspName, {
+        pspCustomerId: record.pspCustomerId,
+        savedPaymentMethodToken: record.savedPaymentMethodToken,
+        amount: record.plan.amount,
+        currency: record.plan.currency,
+        id: record.id,
+        occurrence: "recurring",
+        ...(record.billingDetails ? { billingDetails: record.billingDetails } : {}),
+        metadata: { ...record.metadata, payfanout_subscription_id: record.id },
+        idempotencyKey,
+      });
+      // Advance from the PERIOD END, not from "now": billing anchors must not
+      // drift later with every cron delay.
+      const updated: SubscriptionRecord = {
+        ...record,
+        status: "active",
+        currentPeriodStart: record.currentPeriodEnd,
+        currentPeriodEnd: addInterval(record.currentPeriodEnd, record.plan.interval, record.plan.intervalCount),
+        failedAttempts: 0,
+        lastPaymentId: payment.pspPaymentId,
+      };
+      delete updated.nextRetryAt;
+      delete updated.lastError;
+      await this.store.save(updated);
+      await this.emit({ type: "subscription.charged", subscription: updated, payment });
+      result.charged.push(updated);
+      return updated;
+    } catch (err) {
+      const error = PayFanoutError.wrap(err, { pspName: record.pspName });
+      const attempts = record.failedAttempts + 1;
+      const retryDelayHours = this.retryDelaysHours[attempts - 1];
+      const exhausted = retryDelayHours === undefined;
+      const updated: SubscriptionRecord = {
+        ...record,
+        failedAttempts: attempts,
+        lastError: { code: error.code, message: error.message },
+        ...(exhausted
+          ? { status: "canceled" as const, canceledAt: new Date(nowMs).toISOString() }
+          : {
+              status: "past_due" as const,
+              nextRetryAt: new Date(nowMs + retryDelayHours * 3_600_000).toISOString(),
+            }),
+      };
+      if (exhausted) delete updated.nextRetryAt;
+      await this.store.save(updated);
+      await this.emit({ type: "subscription.charge_failed", subscription: updated, error });
+      if (exhausted) {
+        await this.emit({ type: "subscription.canceled", subscription: updated, error });
+        result.canceled.push(updated);
+      } else {
+        await this.emit({ type: "subscription.past_due", subscription: updated, error });
+        result.failed.push(updated);
+      }
+      return updated;
+    }
+  }
+
+  private async emit(event: SubscriptionEvent): Promise<void> {
+    try {
+      await this.onEvent?.(event);
+    } catch {
+      // Observability must never break billing.
+    }
+  }
+}
+
+function normalizePlan(plan: SubscriptionPlan): Required<SubscriptionPlan> {
+  assertMinorUnitAmount(plan.amount, "plan.amount");
+  if (plan.amount === 0) throw PayFanoutError.invalidRequest("plan.amount must be positive");
+  const intervalCount = plan.intervalCount ?? 1;
+  if (!Number.isInteger(intervalCount) || intervalCount < 1) {
+    throw PayFanoutError.invalidRequest(`plan.intervalCount must be a positive integer, got ${String(plan.intervalCount)}`);
+  }
+  if (!["day", "week", "month", "year"].includes(plan.interval)) {
+    throw PayFanoutError.invalidRequest(`plan.interval must be day|week|month|year, got "${String(plan.interval)}"`);
+  }
+  return { amount: plan.amount, currency: normalizeCurrency(plan.currency), interval: plan.interval, intervalCount };
+}
+
+/**
+ * Calendar-safe period math (UTC). Month/year arithmetic clamps the day to
+ * the target month's length: Jan 31 + 1 month = Feb 28 (29 in leap years) —
+ * monthly subscriptions anchored on the 31st must not skip February.
+ */
+export function addInterval(fromIso: string, interval: SubscriptionInterval, count: number): string {
+  const from = new Date(fromIso);
+  if (Number.isNaN(from.getTime())) {
+    throw PayFanoutError.invalidRequest(`Invalid period start "${fromIso}"`);
+  }
+  if (interval === "day" || interval === "week") {
+    const days = interval === "week" ? count * 7 : count;
+    return new Date(from.getTime() + days * 86_400_000).toISOString();
+  }
+  const monthsToAdd = interval === "year" ? count * 12 : count;
+  const totalMonths = from.getUTCFullYear() * 12 + from.getUTCMonth() + monthsToAdd;
+  const year = Math.floor(totalMonths / 12);
+  const month = totalMonths % 12;
+  const lastDayOfTarget = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+  const day = Math.min(from.getUTCDate(), lastDayOfTarget);
+  const result = new Date(
+    Date.UTC(year, month, day, from.getUTCHours(), from.getUTCMinutes(), from.getUTCSeconds(), from.getUTCMilliseconds()),
+  );
+  return result.toISOString();
+}
+
+function toEpochMs(value: string | Date, field: string): number {
+  const ms = value instanceof Date ? value.getTime() : Date.parse(value);
+  if (Number.isNaN(ms)) {
+    throw PayFanoutError.invalidRequest(`${field} must be a Date or an ISO 8601 string, got "${String(value)}"`);
+  }
+  return ms;
+}

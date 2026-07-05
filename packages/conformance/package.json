@@ -1,0 +1,33 @@
+{
+  "name": "@payfanout/conformance",
+  "version": "0.1.0",
+  "description": "Shared conformance test suite every PayFanout adapter (present or future) must pass.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "sideEffects": false,
+  "dependencies": {
+    "@payfanout/core": "workspace:*"
+  },
+  "peerDependencies": {
+    "vitest": ">=1.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "publishConfig": {
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  }
+}

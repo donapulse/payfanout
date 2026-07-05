@@ -1,0 +1,50 @@
+# Real PSP sandbox suites (Stripe + Paysafe): every assumption the in-memory
+# fakes encode, validated against reality — incl. vault/recurring flows and a
+# live SubscriptionManager renewal cycle. Needs repo secrets:
+#   STRIPE_SECRET_KEY (sk_test_… only — the suite refuses live keys),
+#   PAYSAFE_USERNAME, PAYSAFE_PASSWORD, and PAYSAFE_CURRENCY (this sandbox: CAD).
+# Runs on manual dispatch + a weekly cron (sandbox drift detection), never on PRs
+# (secrets + real API load don't belong in the PR loop).
+name: Integration (real sandboxes)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "43 5 * * 3" # weekly Wednesday 05:43 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration
+  cancel-in-progress: false # never interrupt in-flight real payments
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Verify secrets are configured
+        env:
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          PAYSAFE_USERNAME: ${{ secrets.PAYSAFE_USERNAME }}
+        run: |
+          if [ -z "$STRIPE_SECRET_KEY" ] && [ -z "$PAYSAFE_USERNAME" ]; then
+            echo "::error::No sandbox secrets configured — set STRIPE_SECRET_KEY / PAYSAFE_* in repo secrets"
+            exit 1
+          fi
+      - run: pnpm run test:integration
+        env:
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET }}
+          PAYSAFE_USERNAME: ${{ secrets.PAYSAFE_USERNAME }}
+          PAYSAFE_PASSWORD: ${{ secrets.PAYSAFE_PASSWORD }}
+          PAYSAFE_ACCOUNT_ID: ${{ secrets.PAYSAFE_ACCOUNT_ID }}
+          PAYSAFE_WEBHOOK_HMAC_KEY: ${{ secrets.PAYSAFE_WEBHOOK_HMAC_KEY }}
+          PAYSAFE_CURRENCY: ${{ vars.PAYSAFE_CURRENCY || 'CAD' }}

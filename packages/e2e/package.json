@@ -1,0 +1,14 @@
+{
+  "name": "@payfanout/e2e",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Playwright browser E2E against the demo app with real PSP sandbox keys. Skipped without credentials.",
+  "scripts": {
+    "e2e": "playwright test",
+    "e2e:install": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.47.0"
+  }
+}

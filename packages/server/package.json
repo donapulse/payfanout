@@ -1,0 +1,30 @@
+{
+  "name": "@payfanout/server",
+  "version": "0.1.0",
+  "description": "PayFanout server-side orchestration: PaymentService over a registry of ServerPaymentAdapters, framework-agnostic webhook handlers. Stateless — no persistence.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "sideEffects": false,
+  "dependencies": {
+    "@payfanout/core": "workspace:*"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "publishConfig": {
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  }
+}

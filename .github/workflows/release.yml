@@ -1,0 +1,44 @@
+# Changesets release automation: on every push to main, opens/refreshes a
+# "Version Packages" PR from pending changesets; merging that PR publishes to
+# npm. Requires the NPM_TOKEN secret (and packages to be made public in
+# .changeset/config.json "access" when the org is ready).
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency: release-${{ github.ref }}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # Same gate as CI: typecheck + boundaries + tests, then build dist.
+      - run: pnpm run check
+      - run: pnpm run build
+
+      - name: Create release PR or publish
+        uses: changesets/action@v1
+        with:
+          publish: pnpm exec changeset publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,0 +1,21 @@
+# Automated dependency updates. Grouped weekly PRs keep noise low; the CI
+# gate (lint/types/tests/build) plus dependency-review vet every bump.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      dev-dependencies:
+        dependency-type: development
+      production-dependencies:
+        dependency-type: production
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday

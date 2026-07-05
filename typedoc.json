@@ -1,0 +1,21 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "name": "PayFanout API reference",
+  "entryPoints": [
+    "packages/core/src/index.ts",
+    "packages/server/src/index.ts",
+    "packages/react/src/index.ts",
+    "packages/adapter-stripe-server/src/index.ts",
+    "packages/adapter-stripe/src/index.ts",
+    "packages/adapter-paysafe-server/src/index.ts",
+    "packages/adapter-paysafe/src/index.ts",
+    "packages/conformance/src/index.ts"
+  ],
+  "tsconfig": "tsconfig.json",
+  "out": "docs/public/api",
+  "readme": "README.md",
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "githubPages": false,
+  "treatWarningsAsErrors": false
+}

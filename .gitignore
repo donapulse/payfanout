@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Test artifacts
+coverage/
+test-results/
+playwright-report/
+
+# Logs
+*.log
+
+# Secrets — sandbox or not, keys never enter the repo
+.env
+.env.*
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+# Generated TypeDoc API reference (served by VitePress under /api/)
+docs/public/api/
+# VitePress build output + cache
+docs/.vitepress/dist/
+docs/.vitepress/cache/

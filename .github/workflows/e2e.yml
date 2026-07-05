@@ -1,0 +1,64 @@
+# Browser E2E through the demo app: real Stripe.js Payment Element and real
+# Paysafe.js hosted fields (customized placeholders/layout), inline 3DS,
+# save-card → off-session recharge → subscribe → renewal → cancel.
+# Needs the same sandbox secrets as integration.yml plus the PUBLIC keys:
+#   VITE_STRIPE_PUBLISHABLE_KEY, VITE_PAYSAFE_PUBLIC_KEY (base64 user:key).
+name: E2E (browser)
+
+on:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "7 6 * * 3" # weekly, after the integration cron
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  # Superseded PR pushes cancel their stale run (sandbox-only money, no harm);
+  # dispatch/cron runs are never interrupted.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    # Fork PRs have no repo secrets — the sandbox suites can't run there.
+    # Same-repo PRs, dispatch, and cron all carry them.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Verify sandbox secrets are configured
+        env:
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          PAYSAFE_USERNAME: ${{ secrets.PAYSAFE_USERNAME }}
+        run: |
+          if [ -z "$STRIPE_SECRET_KEY" ] || [ -z "$PAYSAFE_USERNAME" ]; then
+            echo "::error::E2E needs sandbox secrets — set STRIPE_SECRET_KEY, VITE_STRIPE_PUBLISHABLE_KEY, PAYSAFE_USERNAME, PAYSAFE_PASSWORD, VITE_PAYSAFE_PUBLIC_KEY in repo secrets"
+            exit 1
+          fi
+      - name: Install Playwright Chromium
+        run: pnpm --filter @payfanout/e2e exec playwright install --with-deps chromium
+      - name: Run browser E2E
+        run: pnpm run e2e
+        env:
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          VITE_STRIPE_PUBLISHABLE_KEY: ${{ secrets.VITE_STRIPE_PUBLISHABLE_KEY }}
+          PAYSAFE_USERNAME: ${{ secrets.PAYSAFE_USERNAME }}
+          PAYSAFE_PASSWORD: ${{ secrets.PAYSAFE_PASSWORD }}
+          PAYSAFE_CURRENCY: ${{ vars.PAYSAFE_CURRENCY || 'CAD' }}
+          VITE_PAYSAFE_PUBLIC_KEY: ${{ secrets.VITE_PAYSAFE_PUBLIC_KEY }}
+          VITE_PAYSAFE_CURRENCY: ${{ vars.PAYSAFE_CURRENCY || 'CAD' }}
+      - name: Upload traces on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: packages/e2e/test-results/
+          retention-days: 7

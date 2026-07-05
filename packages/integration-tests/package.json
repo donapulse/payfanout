@@ -1,0 +1,14 @@
+{
+  "name": "@payfanout/integration-tests",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Env-gated integration tests against real PSP sandboxes. Skipped (green) unless credentials are present — see test/README.md.",
+  "dependencies": {
+    "@payfanout/adapter-paysafe-server": "workspace:*",
+    "@payfanout/adapter-stripe-server": "workspace:*",
+    "@payfanout/core": "workspace:*",
+    "@payfanout/server": "workspace:*",
+    "stripe": "^16.0.0"
+  }
+}

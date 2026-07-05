@@ -1,0 +1,41 @@
+{
+  "name": "payfanout",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "packageManager": "pnpm@10.24.0",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:integration": "vitest run packages/integration-tests",
+    "e2e": "pnpm --filter @payfanout/e2e e2e",
+    "typecheck": "tsc -p tsconfig.json",
+    "check:boundaries": "node scripts/check-boundaries.mjs",
+    "check": "pnpm run typecheck && pnpm run lint && pnpm run check:boundaries && pnpm run test",
+    "changeset": "changeset",
+    "build": "pnpm -r run build",
+    "release": "pnpm run check && pnpm run build && changeset publish",
+    "docs:api": "typedoc",
+    "docs:dev": "vitepress dev docs",
+    "docs:build": "pnpm run docs:api && vitepress build docs",
+    "docs:preview": "vitepress preview docs",
+    "lint": "eslint ."
+  },
+  "devDependencies": {
+    "@changesets/cli": "^2.27.0",
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.5.0",
+    "@vitest/coverage-v8": "^2.1.9",
+    "eslint": "^10.6.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "typedoc": "^0.28.19",
+    "typescript": "^5.5.0",
+    "typescript-eslint": "^8.62.1",
+    "vitepress": "^1.6.4",
+    "vitest": "^2.1.0"
+  }
+}

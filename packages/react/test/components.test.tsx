@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import type { JSX } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getUiLabel, type PaymentInfo } from "@payfanout/core";
 import { PayButton, PayFanoutProvider, PaymentFields, usePayFanout, type PayResult } from "../src/index.js";

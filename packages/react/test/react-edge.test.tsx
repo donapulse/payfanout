@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import type { ReactNode } from "react";
+import type { JSX, ReactNode } from "react";
 import { isPayFanoutError } from "@payfanout/core";
 import { PayButton, PayFanoutProvider, PaymentFields, usePayFanout, type PayResult } from "../src/index.js";
 import { FakeClientAdapter } from "./fake-client-adapter.js";

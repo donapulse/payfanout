@@ -6,7 +6,7 @@
  * active locale is handed to both <PayFanoutProvider> and <PaymentFields> so
  * the PSP's own hosted-field texts follow the language too.
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, type JSX } from "react";
 import { StripeClientAdapter } from "@payfanout/adapter-stripe";
 import { PaysafeClientAdapter } from "@payfanout/adapter-paysafe";
 import { PayFanoutProvider, PaymentFields, usePay, usePayFanout, type PayResult } from "@payfanout/react";

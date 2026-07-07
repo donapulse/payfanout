@@ -16,6 +16,9 @@ transitions, payload shapes.
 | `PAYSAFE_CURRENCY` | optional | Defaults to `USD`; sandbox accounts are often provisioned for one currency (the current test account: **CAD only**) |
 | `PAYSAFE_WEBHOOK_HMAC_KEY` | optional | Only needed for future webhook-delivery tests |
 | `PAYSAFE_BASE_URL` | optional | Defaults to `https://api.test.paysafe.com`; live URL is refused |
+| `PAYZEN_SHOP_ID` / `PAYZEN_PASSWORD` | PayZen suite | Back Office "User" + REST password — **must** be a `testpassword_…` value (production keys are refused; PayZen selects TEST mode by the key, not the URL) |
+| `PAYZEN_HMAC_KEY` | optional | Only needed for future webhook-delivery tests |
+| `PAYZEN_BASE_URL` | optional | Defaults to `https://api.payzen.eu/api-payment` (sister Lyra platforms use other hosts) |
 
 ## Run
 

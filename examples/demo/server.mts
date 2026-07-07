@@ -7,6 +7,7 @@
  */
 import { randomUUID } from "node:crypto";
 import express from "express";
+import { rateLimit } from "express-rate-limit";
 import {
   InMemorySubscriptionStore,
   PaymentRouter,
@@ -17,6 +18,7 @@ import {
 } from "@payfanout/server";
 import { StripeServerAdapter } from "@payfanout/adapter-stripe-server";
 import { PaysafeServerAdapter } from "@payfanout/adapter-paysafe-server";
+import { PayZenServerAdapter } from "@payfanout/adapter-payzen-server";
 
 const stripe = new StripeServerAdapter({
   secretKey: process.env.STRIPE_SECRET_KEY ?? "sk_test_replace_me",
@@ -36,8 +38,15 @@ const paysafe = new PaysafeServerAdapter({
   webhookHmacKey: process.env.PAYSAFE_WEBHOOK_HMAC_KEY ?? "dev-only-webhook-key",
 });
 
+const payzen = new PayZenServerAdapter({
+  shopId: process.env.PAYZEN_SHOP_ID ?? "replace_me",
+  password: process.env.PAYZEN_PASSWORD ?? "testpassword_replace_me",
+  environment: "sandbox",
+  hmacKey: process.env.PAYZEN_HMAC_KEY ?? "dev-only-hmac-key",
+});
+
 const payments = new PaymentService({
-  adapters: [stripe, paysafe],
+  adapters: [stripe, paysafe, payzen],
   // Observability seam: one metadata-only record per adapter call. In
   // production this feeds metrics/tracing; the demo just shows it exists.
   telemetry: (t) =>
@@ -50,6 +59,7 @@ const router = new PaymentRouter({
   service: payments,
   rules: [
     { when: { currency: ["CAD"] }, use: ["paysafe", "stripe"] },
+    { when: { currency: ["EUR"] }, use: ["payzen", "stripe"] },
     { when: { currency: ["USD", "JPY"] }, use: ["stripe", "paysafe"] },
   ],
   onAttempt: (a) =>
@@ -101,6 +111,13 @@ function rememberToken(psp: string, token: string | undefined): void {
 
 const app = express();
 
+// Generous per-IP ceiling on the webhook ingress: abuse protection without
+// throttling legitimate PSP retry bursts.
+app.use(
+  "/webhooks",
+  rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true, legacyHeaders: false }),
+);
+
 // ---------------------------------------------------------------------------
 // Webhooks FIRST, with express.raw: signature verification needs the exact raw
 // bytes — express.json() would destroy them. This ordering matters.
@@ -109,11 +126,14 @@ const onEvent = async (event: import("@payfanout/core").UnifiedWebhookEvent): Pr
   if (processedEventIds.has(event.id)) return; // host-owned dedupe
   processedEventIds.add(event.id);
   // Ack-fast contract: enqueue here (BullMQ, SQS, ...) — never process inline.
-  console.log(`[webhook] ${event.pspName} ${event.type} payment=${event.pspPaymentId ?? "-"}`);
+  // pspPaymentId is payload-derived — encode it so log lines cannot be forged.
+  console.log(`[webhook] ${event.pspName} ${event.type} payment=${encodeURIComponent(event.pspPaymentId ?? "-")}`);
 };
 
 const stripeHook = createAdapterWebhookHandler(stripe, { onEvent, log: console.log });
 const paysafeHook = createAdapterWebhookHandler(paysafe, { onEvent, log: console.log });
+const payzenHook = createAdapterWebhookHandler(payzen, { onEvent, log: console.log });
+// PayZen stays out of the unified route: its IPNs are form-urlencoded, not JSON.
 const unifiedHook = createUnifiedWebhookHandler([stripe, paysafe], { onEvent, log: console.log });
 
 for (const [path, handler] of [
@@ -129,6 +149,22 @@ for (const [path, handler] of [
     res.status(result.status).json(result.ok ? { received: true } : { error: result.reason });
   });
 }
+
+// PayZen IPNs POST application/x-www-form-urlencoded: parse the form, pass the
+// kr-answer STRING as rawBody (the signature covers exactly those bytes) and
+// the kr-hash fields as headers — the guide's "recipe A".
+app.post("/webhooks/payzen", express.urlencoded({ extended: false }), async (req, res) => {
+  const body = req.body as Record<string, string | undefined>;
+  const result = await payzenHook({
+    rawBody: body["kr-answer"] ?? "",
+    headers: {
+      "kr-hash": body["kr-hash"] ?? "",
+      "kr-hash-algorithm": body["kr-hash-algorithm"] ?? "",
+      "kr-hash-key": body["kr-hash-key"] ?? "",
+    },
+  });
+  res.status(result.status).json(result.ok ? { received: true } : { error: result.reason });
+});
 
 app.use(express.json());
 

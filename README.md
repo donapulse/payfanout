@@ -39,6 +39,8 @@ Two more non-negotiables baked into the design:
 | `@payfanout/adapter-stripe` | client | Stripe.js + Payment Element. |
 | `@payfanout/adapter-paysafe-server` | server | Paysafe Payments REST API: payments, settlements, refunds, webhooks. **Edge-runtime compatible** (WebCrypto, no Node builtins), runs on Cloudflare Workers / Next.js edge routes. |
 | `@payfanout/adapter-paysafe` | client | Paysafe.js hosted iframe fields (tokenize-first). |
+| `@payfanout/adapter-payzen-server` | server | PayZen (Lyra) REST API V4: payments, validation capture, refunds, IPN verification. **Edge-runtime compatible** (WebCrypto, no Node builtins). |
+| `@payfanout/adapter-payzen` | client | PayZen krypton-client embedded card fields (confirm-on-client, 3DS inline). |
 | `@payfanout/conformance` | tests | The contract suite every adapter, present or future, must pass. |
 
 Client packages have **zero** dependency on anything holding secrets; this is enforced

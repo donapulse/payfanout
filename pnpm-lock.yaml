@@ -53,6 +53,12 @@ importers:
       '@payfanout/adapter-paysafe-server':
         specifier: workspace:*
         version: link:../../packages/adapter-paysafe-server
+      '@payfanout/adapter-payzen':
+        specifier: workspace:*
+        version: link:../../packages/adapter-payzen
+      '@payfanout/adapter-payzen-server':
+        specifier: workspace:*
+        version: link:../../packages/adapter-payzen-server
       '@payfanout/adapter-stripe':
         specifier: workspace:*
         version: link:../../packages/adapter-stripe
@@ -71,6 +77,9 @@ importers:
       express:
         specifier: ^5.2.1
         version: 5.2.1
+      express-rate-limit:
+        specifier: ^8.5.2
+        version: 8.5.2(express@5.2.1)
       react:
         specifier: ^19.2.7
         version: 19.2.7
@@ -108,6 +117,26 @@ importers:
         version: link:../conformance
 
   packages/adapter-paysafe-server:
+    dependencies:
+      '@payfanout/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@payfanout/conformance':
+        specifier: workspace:*
+        version: link:../conformance
+
+  packages/adapter-payzen:
+    dependencies:
+      '@payfanout/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@payfanout/conformance':
+        specifier: workspace:*
+        version: link:../conformance
+
+  packages/adapter-payzen-server:
     dependencies:
       '@payfanout/core':
         specifier: workspace:*
@@ -166,6 +195,9 @@ importers:
       '@payfanout/adapter-paysafe-server':
         specifier: workspace:*
         version: link:../adapter-paysafe-server
+      '@payfanout/adapter-payzen-server':
+        specifier: workspace:*
+        version: link:../adapter-payzen-server
       '@payfanout/adapter-stripe-server':
         specifier: workspace:*
         version: link:../adapter-stripe-server
@@ -1847,6 +1879,12 @@ packages:
     resolution: {integrity: sha512-KfYbmpRm0VbLjEvVa9yGwCi9GI34xvi7A/HXYWQO65CSD2u3MczUJSuwXKFIxlGsgBQizV9q5J9NHj4VG0n+pA==}
     engines: {node: '>=12.0.0'}
 
+  express-rate-limit@8.5.2:
+    resolution: {integrity: sha512-5Kb34ipNX694DH48vN9irak1Qx30nb0PLYHXfJgw4YEjiC3ZEmZJhwOp+VfiCYwFzvFTdB9QkArYS5kXa2cx2A==}
+    engines: {node: '>= 16'}
+    peerDependencies:
+      express: '>= 4.11'
+
   express@5.2.1:
     resolution: {integrity: sha512-hIS4idWWai69NezIdRt2xFVofaF4j+6INOpJlVOLDO8zXGpUVEVzIYk12UUi2JzjEzWL3IOAxcTubgz9Po0yXw==}
     engines: {node: '>= 18'}
@@ -2036,6 +2074,10 @@ packages:
 
   inherits@2.0.4:
     resolution: {integrity: sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ==}
+
+  ip-address@10.2.0:
+    resolution: {integrity: sha512-/+S6j4E9AHvW9SWMSEY9Xfy66O5PWvVEJ08O0y5JGyEKQpojb0K0GKpz/v5HJ/G0vi3D2sjGK78119oXZeE0qA==}
+    engines: {node: '>= 12'}
 
   ipaddr.js@1.9.1:
     resolution: {integrity: sha512-0KI/607xoxSToH7GjN1FfSbLoU0+btTicjsQSWQlh/hZykN8KpmMf7uYwPW3R+akZ6R/w18ZlXSHBYXiYUPO3g==}
@@ -4718,6 +4760,11 @@ snapshots:
 
   expect-type@1.4.0: {}
 
+  express-rate-limit@8.5.2(express@5.2.1):
+    dependencies:
+      express: 5.2.1
+      ip-address: 10.2.0
+
   express@5.2.1:
     dependencies:
       accepts: 2.0.0
@@ -4949,6 +4996,8 @@ snapshots:
   imurmurhash@0.1.4: {}
 
   inherits@2.0.4: {}
+
+  ip-address@10.2.0: {}
 
   ipaddr.js@1.9.1: {}
 

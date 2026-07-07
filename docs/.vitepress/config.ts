@@ -66,6 +66,7 @@ export default defineConfig({
             { text: 'Overview', link: '/guide/providers' },
             { text: 'Set up Stripe', link: '/guide/stripe' },
             { text: 'Set up Paysafe', link: '/guide/paysafe' },
+            { text: 'Set up PayZen', link: '/guide/payzen' },
           ],
         },
         {

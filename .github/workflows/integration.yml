@@ -48,3 +48,6 @@ jobs:
           PAYSAFE_ACCOUNT_ID: ${{ secrets.PAYSAFE_ACCOUNT_ID }}
           PAYSAFE_WEBHOOK_HMAC_KEY: ${{ secrets.PAYSAFE_WEBHOOK_HMAC_KEY }}
           PAYSAFE_CURRENCY: ${{ vars.PAYSAFE_CURRENCY || 'CAD' }}
+          PAYZEN_SHOP_ID: ${{ secrets.PAYZEN_SHOP_ID }}
+          PAYZEN_PASSWORD: ${{ secrets.PAYZEN_PASSWORD }}
+          PAYZEN_HMAC_KEY: ${{ secrets.PAYZEN_HMAC_KEY }}

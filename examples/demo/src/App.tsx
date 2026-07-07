@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useMemo, useState, type JSX } from "react";
 import { StripeClientAdapter } from "@payfanout/adapter-stripe";
 import { PaysafeClientAdapter } from "@payfanout/adapter-paysafe";
+import { PayZenClientAdapter } from "@payfanout/adapter-payzen";
 import { PayFanoutProvider, PaymentFields, usePay, usePayFanout, type PayResult } from "@payfanout/react";
 import { localizeError, PayFanoutError, type PaymentInfo } from "@payfanout/core";
 import { I18nProvider, LOCALES, useI18n } from "./i18n.js";
@@ -20,6 +21,10 @@ const adapters = [
   }),
   new PaysafeClientAdapter({
     apiKey: import.meta.env.VITE_PAYSAFE_PUBLIC_KEY ?? "replace_me_base64",
+    environment: "sandbox",
+  }),
+  new PayZenClientAdapter({
+    publicKey: import.meta.env.VITE_PAYZEN_PUBLIC_KEY ?? "replace_me",
     environment: "sandbox",
   }),
 ];
@@ -45,6 +50,8 @@ const SLOT_BOX: React.CSSProperties = {
 const CURRENCY_BY_PSP: Record<string, string> = {
   stripe: "USD",
   paysafe: import.meta.env.VITE_PAYSAFE_CURRENCY ?? "USD",
+  payzen: "EUR", // PayZen demo shops are EUR-contracted
+
   // "auto" lets the SERVER pick the PSP via PaymentRouter rules (by currency) —
   // using the Paysafe account's currency demonstrates routing AWAY from the default.
   auto: import.meta.env.VITE_PAYSAFE_CURRENCY ?? "USD",

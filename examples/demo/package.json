@@ -9,6 +9,8 @@
     "build": "vite build"
   },
   "dependencies": {
+    "@payfanout/adapter-gocardless": "workspace:*",
+    "@payfanout/adapter-gocardless-server": "workspace:*",
     "@payfanout/adapter-paysafe": "workspace:*",
     "@payfanout/adapter-paysafe-server": "workspace:*",
     "@payfanout/adapter-stripe": "workspace:*",

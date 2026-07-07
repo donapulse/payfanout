@@ -12,6 +12,7 @@ Pick the PSP you're wiring up:
 | --- | --- | --- | --- | --- |
 | **Stripe** | [Set up Stripe](/guide/stripe) | `@payfanout/adapter-stripe-server` | `@payfanout/adapter-stripe` | Confirm-on-client |
 | **Paysafe** | [Set up Paysafe](/guide/paysafe) | `@payfanout/adapter-paysafe-server` | `@payfanout/adapter-paysafe` | Tokenize-first (needs a server-completion route) |
+| **GoCardless** | [Set up GoCardless](/guide/gocardless) | `@payfanout/adapter-gocardless-server` | `@payfanout/adapter-gocardless` | Confirm-on-client (redirect to hosted bank authorisation) |
 
 New to the packages themselves? [Installation](/guide/installation) covers prerequisites,
 which packages to add, and the env-var mechanics first. This page and the two below are

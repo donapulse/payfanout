@@ -47,6 +47,12 @@ importers:
 
   examples/demo:
     dependencies:
+      '@payfanout/adapter-gocardless':
+        specifier: workspace:*
+        version: link:../../packages/adapter-gocardless
+      '@payfanout/adapter-gocardless-server':
+        specifier: workspace:*
+        version: link:../../packages/adapter-gocardless-server
       '@payfanout/adapter-paysafe':
         specifier: workspace:*
         version: link:../../packages/adapter-paysafe
@@ -96,6 +102,26 @@ importers:
       vite:
         specifier: ^8.1.3
         version: 8.1.3(@types/node@26.1.0)(esbuild@0.28.1)(tsx@4.23.0)(yaml@2.9.0)
+
+  packages/adapter-gocardless:
+    dependencies:
+      '@payfanout/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@payfanout/conformance':
+        specifier: workspace:*
+        version: link:../conformance
+
+  packages/adapter-gocardless-server:
+    dependencies:
+      '@payfanout/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@payfanout/conformance':
+        specifier: workspace:*
+        version: link:../conformance
 
   packages/adapter-paysafe:
     dependencies:
@@ -163,6 +189,9 @@ importers:
 
   packages/integration-tests:
     dependencies:
+      '@payfanout/adapter-gocardless-server':
+        specifier: workspace:*
+        version: link:../adapter-gocardless-server
       '@payfanout/adapter-paysafe-server':
         specifier: workspace:*
         version: link:../adapter-paysafe-server

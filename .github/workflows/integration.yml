@@ -1,8 +1,11 @@
-# Real PSP sandbox suites (Stripe + Paysafe): every assumption the in-memory
-# fakes encode, validated against reality — incl. vault/recurring flows and a
-# live SubscriptionManager renewal cycle. Needs repo secrets:
+# Real PSP sandbox suites (Stripe + Paysafe + GoCardless + PayPal): every
+# assumption the in-memory fakes encode, validated against reality — incl.
+# vault/recurring flows and a live SubscriptionManager renewal cycle. Needs
+# repo secrets:
 #   STRIPE_SECRET_KEY (sk_test_… only — the suite refuses live keys),
-#   PAYSAFE_USERNAME, PAYSAFE_PASSWORD, and PAYSAFE_CURRENCY (this sandbox: CAD).
+#   PAYSAFE_USERNAME, PAYSAFE_PASSWORD, PAYSAFE_CURRENCY (this sandbox: CAD),
+#   GOCARDLESS_ACCESS_TOKEN (sandbox read-write token),
+#   PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET (+ optional PAYPAL_WEBHOOK_ID).
 # Runs on manual dispatch + a weekly cron (sandbox drift detection), never on PRs
 # (secrets + real API load don't belong in the PR loop).
 name: Integration (real sandboxes)
@@ -23,7 +26,7 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
         with:
@@ -48,3 +51,8 @@ jobs:
           PAYSAFE_ACCOUNT_ID: ${{ secrets.PAYSAFE_ACCOUNT_ID }}
           PAYSAFE_WEBHOOK_HMAC_KEY: ${{ secrets.PAYSAFE_WEBHOOK_HMAC_KEY }}
           PAYSAFE_CURRENCY: ${{ vars.PAYSAFE_CURRENCY || 'CAD' }}
+          GOCARDLESS_ACCESS_TOKEN: ${{ secrets.GOCARDLESS_ACCESS_TOKEN }}
+          GOCARDLESS_WEBHOOK_SECRET: ${{ secrets.GOCARDLESS_WEBHOOK_SECRET }}
+          PAYPAL_CLIENT_ID: ${{ secrets.PAYPAL_CLIENT_ID }}
+          PAYPAL_CLIENT_SECRET: ${{ secrets.PAYPAL_CLIENT_SECRET }}
+          PAYPAL_WEBHOOK_ID: ${{ secrets.PAYPAL_WEBHOOK_ID }}

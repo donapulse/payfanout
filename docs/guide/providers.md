@@ -12,14 +12,16 @@ Pick the PSP you're wiring up:
 | --- | --- | --- | --- | --- |
 | **Stripe** | [Set up Stripe](/guide/stripe) | `@payfanout/adapter-stripe-server` | `@payfanout/adapter-stripe` | Confirm-on-client |
 | **Paysafe** | [Set up Paysafe](/guide/paysafe) | `@payfanout/adapter-paysafe-server` | `@payfanout/adapter-paysafe` | Tokenize-first (needs a server-completion route) |
+| **GoCardless** | [Set up GoCardless](/guide/gocardless) | `@payfanout/adapter-gocardless-server` | `@payfanout/adapter-gocardless` | Confirm-on-client (redirect to hosted bank authorisation) |
+| **PayPal** | [Set up PayPal](/guide/paypal) | `@payfanout/adapter-paypal-server` | `@payfanout/adapter-paypal` | Tokenize-first (needs a server-completion route) |
 
 New to the packages themselves? [Installation](/guide/installation) covers prerequisites,
-which packages to add, and the env-var mechanics first. This page and the two below are
+which packages to add, and the env-var mechanics first. This page and the guides below are
 about **wiring a specific PSP end to end**.
 
 ## The four steps, for every PSP
 
-Both guides follow the identical arc, only the credential names and a few quirks differ:
+The guides follow the identical arc, only the credential names and a few quirks differ:
 
 1. **Get credentials.** Every PSP has a sandbox and a live set. PayFanout **never infers**
    which you're using from a key prefix, you pass `environment: "sandbox" | "live"`

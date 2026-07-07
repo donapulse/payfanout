@@ -7,6 +7,7 @@
  */
 import { randomUUID } from "node:crypto";
 import express from "express";
+import { rateLimit } from "express-rate-limit";
 import {
   InMemorySubscriptionStore,
   PaymentRouter,
@@ -17,6 +18,8 @@ import {
 } from "@payfanout/server";
 import { StripeServerAdapter } from "@payfanout/adapter-stripe-server";
 import { PaysafeServerAdapter } from "@payfanout/adapter-paysafe-server";
+import { GoCardlessServerAdapter, parseGoCardlessWebhookEvents } from "@payfanout/adapter-gocardless-server";
+import { PayPalServerAdapter } from "@payfanout/adapter-paypal-server";
 
 const stripe = new StripeServerAdapter({
   secretKey: process.env.STRIPE_SECRET_KEY ?? "sk_test_replace_me",
@@ -36,8 +39,22 @@ const paysafe = new PaysafeServerAdapter({
   webhookHmacKey: process.env.PAYSAFE_WEBHOOK_HMAC_KEY ?? "dev-only-webhook-key",
 });
 
+const gocardless = new GoCardlessServerAdapter({
+  accessToken: process.env.GOCARDLESS_ACCESS_TOKEN ?? "replace_me",
+  environment: "sandbox",
+  webhookSecret: process.env.GOCARDLESS_WEBHOOK_SECRET ?? "dev-only-webhook-secret",
+});
+
+const paypal = new PayPalServerAdapter({
+  clientId: process.env.PAYPAL_CLIENT_ID ?? "replace_me",
+  clientSecret: process.env.PAYPAL_CLIENT_SECRET ?? "replace_me",
+  environment: "sandbox",
+  // From the dashboard's webhook registration — verification answers false without it.
+  webhookId: process.env.PAYPAL_WEBHOOK_ID,
+});
+
 const payments = new PaymentService({
-  adapters: [stripe, paysafe],
+  adapters: [stripe, paysafe, gocardless, paypal],
   // Observability seam: one metadata-only record per adapter call. In
   // production this feeds metrics/tracing; the demo just shows it exists.
   telemetry: (t) =>
@@ -101,6 +118,13 @@ function rememberToken(psp: string, token: string | undefined): void {
 
 const app = express();
 
+// Generous per-IP ceiling on the webhook ingress: abuse protection without
+// throttling legitimate PSP retry bursts (GoCardless batches up to 250 events).
+app.use(
+  "/webhooks",
+  rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true, legacyHeaders: false }),
+);
+
 // ---------------------------------------------------------------------------
 // Webhooks FIRST, with express.raw: signature verification needs the exact raw
 // bytes — express.json() would destroy them. This ordering matters.
@@ -109,16 +133,20 @@ const onEvent = async (event: import("@payfanout/core").UnifiedWebhookEvent): Pr
   if (processedEventIds.has(event.id)) return; // host-owned dedupe
   processedEventIds.add(event.id);
   // Ack-fast contract: enqueue here (BullMQ, SQS, ...) — never process inline.
-  console.log(`[webhook] ${event.pspName} ${event.type} payment=${event.pspPaymentId ?? "-"}`);
+  // pspPaymentId is payload-derived — encode it so log lines cannot be forged.
+  console.log(`[webhook] ${event.pspName} ${event.type} payment=${encodeURIComponent(event.pspPaymentId ?? "-")}`);
 };
 
 const stripeHook = createAdapterWebhookHandler(stripe, { onEvent, log: console.log });
 const paysafeHook = createAdapterWebhookHandler(paysafe, { onEvent, log: console.log });
-const unifiedHook = createUnifiedWebhookHandler([stripe, paysafe], { onEvent, log: console.log });
+const paypalHook = createAdapterWebhookHandler(paypal, { onEvent, log: console.log });
+// gocardless here handles single-event deliveries only — batched deliveries 400; /webhooks/gocardless below is the real ingress.
+const unifiedHook = createUnifiedWebhookHandler([stripe, paysafe, gocardless, paypal], { onEvent, log: console.log });
 
 for (const [path, handler] of [
   ["/webhooks/stripe", stripeHook],
   ["/webhooks/paysafe", paysafeHook],
+  ["/webhooks/paypal", paypalHook],
   ["/webhooks/unified", unifiedHook], // single shared entry point variant
 ] as const) {
   app.post(path, express.raw({ type: "application/json" }), async (req, res) => {
@@ -129,6 +157,24 @@ for (const [path, handler] of [
     res.status(result.status).json(result.ok ? { received: true } : { error: result.reason });
   });
 }
+
+// GoCardless BATCHES up to 250 events per delivery, so its ingress differs:
+// verify the signature once over the raw bytes, then fan out per event —
+// parseWebhookEvent (and thus createAdapterWebhookHandler) refuses multi-event
+// deliveries rather than dropping events.
+app.post("/webhooks/gocardless", express.raw({ type: "application/json" }), async (req, res) => {
+  const rawBody = req.body.toString("utf8");
+  if (!(await gocardless.verifyWebhookSignature(rawBody, req.headers as Record<string, string>))) {
+    res.status(498).json({ error: "invalid signature" }); // GoCardless's "Invalid Token" convention
+    return;
+  }
+  try {
+    for (const event of parseGoCardlessWebhookEvents(rawBody)) await onEvent(event);
+    res.status(200).json({ received: true });
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message });
+  }
+});
 
 app.use(express.json());
 
@@ -156,6 +202,8 @@ app.post("/api/session", async (req, res) => {
       // AVS data quality — Paysafe requires a zip on card payments (error 3004).
       billingDetails: billing ? { address: billing } : undefined,
       captureMethod,
+      // Redirect methods (GoCardless hosted bank authorisation) land back here.
+      returnUrl: `${process.env.PUBLIC_URL ?? "http://localhost:4242"}/return`,
       // "auto" doesn't know its PSP yet — the unified endpoint serves any of them.
       webhookUrl: `${process.env.PUBLIC_URL ?? "http://localhost:4242"}/webhooks/${psp === "auto" ? "unified" : psp}`,
       idempotencyKey: orderId,

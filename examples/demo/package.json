@@ -9,6 +9,10 @@
     "build": "vite build"
   },
   "dependencies": {
+    "@payfanout/adapter-gocardless": "workspace:*",
+    "@payfanout/adapter-gocardless-server": "workspace:*",
+    "@payfanout/adapter-paypal": "workspace:*",
+    "@payfanout/adapter-paypal-server": "workspace:*",
     "@payfanout/adapter-paysafe": "workspace:*",
     "@payfanout/adapter-paysafe-server": "workspace:*",
     "@payfanout/adapter-stripe": "workspace:*",
@@ -17,6 +21,7 @@
     "@payfanout/react": "workspace:*",
     "@payfanout/server": "workspace:*",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.5.2",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },

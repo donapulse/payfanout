@@ -53,6 +53,12 @@ importers:
       '@payfanout/adapter-gocardless-server':
         specifier: workspace:*
         version: link:../../packages/adapter-gocardless-server
+      '@payfanout/adapter-paypal':
+        specifier: workspace:*
+        version: link:../../packages/adapter-paypal
+      '@payfanout/adapter-paypal-server':
+        specifier: workspace:*
+        version: link:../../packages/adapter-paypal-server
       '@payfanout/adapter-paysafe':
         specifier: workspace:*
         version: link:../../packages/adapter-paysafe
@@ -117,6 +123,26 @@ importers:
         version: link:../conformance
 
   packages/adapter-gocardless-server:
+    dependencies:
+      '@payfanout/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@payfanout/conformance':
+        specifier: workspace:*
+        version: link:../conformance
+
+  packages/adapter-paypal:
+    dependencies:
+      '@payfanout/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@payfanout/conformance':
+        specifier: workspace:*
+        version: link:../conformance
+
+  packages/adapter-paypal-server:
     dependencies:
       '@payfanout/core':
         specifier: workspace:*
@@ -195,6 +221,9 @@ importers:
       '@payfanout/adapter-gocardless-server':
         specifier: workspace:*
         version: link:../adapter-gocardless-server
+      '@payfanout/adapter-paypal-server':
+        specifier: workspace:*
+        version: link:../adapter-paypal-server
       '@payfanout/adapter-paysafe-server':
         specifier: workspace:*
         version: link:../adapter-paysafe-server

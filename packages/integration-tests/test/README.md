@@ -19,6 +19,10 @@ transitions, payload shapes.
 | `GOCARDLESS_ACCESS_TOKEN` | GoCardless suite | Sandbox **read-write** dashboard token |
 | `GOCARDLESS_WEBHOOK_SECRET` | optional | Only needed for future webhook-delivery tests |
 | `GOCARDLESS_BASE_URL` | optional | Defaults to `https://api-sandbox.gocardless.com`; live URL is refused |
+| `PAYPAL_CLIENT_ID` / `PAYPAL_CLIENT_SECRET` | PayPal suite | Sandbox REST app credentials |
+| `PAYPAL_WEBHOOK_ID` | optional | Only needed for future webhook-delivery tests |
+| `PAYPAL_ENVIRONMENT` | optional | Anything but `live`; setting `live` makes the suite refuse to run |
+| `PAYPAL_NEGATIVE_TESTING` | optional | Set to `1` to run the `INSTRUMENT_DECLINED` mock-response case (requires Negative Testing enabled on the business sandbox account) |
 
 ## Run
 

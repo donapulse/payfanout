@@ -41,6 +41,8 @@ Two more non-negotiables baked into the design:
 | `@payfanout/adapter-paysafe` | client | Paysafe.js hosted iframe fields (tokenize-first). |
 | `@payfanout/adapter-gocardless-server` | server | GoCardless Billing Requests REST API: billing requests + hosted bank authorisation, refunds, events, batched webhooks. **Edge-runtime compatible** (WebCrypto, no Node builtins). |
 | `@payfanout/adapter-gocardless` | client | GoCardless bank payments via the hosted authorisation redirect flow (no card fields). |
+| `@payfanout/adapter-paypal-server` | server | PayPal Orders v2 REST: capture/authorize, refunds, webhook postback verification, event polling. **Edge-runtime compatible** (fetch + WebCrypto, no Node builtins). |
+| `@payfanout/adapter-paypal` | client | PayPal Buttons: popup approval, no card fields (tokenize-first). |
 | `@payfanout/conformance` | tests | The contract suite every adapter, present or future, must pass. |
 
 Client packages have **zero** dependency on anything holding secrets; this is enforced

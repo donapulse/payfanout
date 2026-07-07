@@ -19,6 +19,7 @@ import {
 import { StripeServerAdapter } from "@payfanout/adapter-stripe-server";
 import { PaysafeServerAdapter } from "@payfanout/adapter-paysafe-server";
 import { GoCardlessServerAdapter, parseGoCardlessWebhookEvents } from "@payfanout/adapter-gocardless-server";
+import { PayPalServerAdapter } from "@payfanout/adapter-paypal-server";
 
 const stripe = new StripeServerAdapter({
   secretKey: process.env.STRIPE_SECRET_KEY ?? "sk_test_replace_me",
@@ -44,8 +45,16 @@ const gocardless = new GoCardlessServerAdapter({
   webhookSecret: process.env.GOCARDLESS_WEBHOOK_SECRET ?? "dev-only-webhook-secret",
 });
 
+const paypal = new PayPalServerAdapter({
+  clientId: process.env.PAYPAL_CLIENT_ID ?? "replace_me",
+  clientSecret: process.env.PAYPAL_CLIENT_SECRET ?? "replace_me",
+  environment: "sandbox",
+  // From the dashboard's webhook registration — verification answers false without it.
+  webhookId: process.env.PAYPAL_WEBHOOK_ID,
+});
+
 const payments = new PaymentService({
-  adapters: [stripe, paysafe, gocardless],
+  adapters: [stripe, paysafe, gocardless, paypal],
   // Observability seam: one metadata-only record per adapter call. In
   // production this feeds metrics/tracing; the demo just shows it exists.
   telemetry: (t) =>
@@ -130,12 +139,14 @@ const onEvent = async (event: import("@payfanout/core").UnifiedWebhookEvent): Pr
 
 const stripeHook = createAdapterWebhookHandler(stripe, { onEvent, log: console.log });
 const paysafeHook = createAdapterWebhookHandler(paysafe, { onEvent, log: console.log });
+const paypalHook = createAdapterWebhookHandler(paypal, { onEvent, log: console.log });
 // gocardless here handles single-event deliveries only — batched deliveries 400; /webhooks/gocardless below is the real ingress.
-const unifiedHook = createUnifiedWebhookHandler([stripe, paysafe, gocardless], { onEvent, log: console.log });
+const unifiedHook = createUnifiedWebhookHandler([stripe, paysafe, gocardless, paypal], { onEvent, log: console.log });
 
 for (const [path, handler] of [
   ["/webhooks/stripe", stripeHook],
   ["/webhooks/paysafe", paysafeHook],
+  ["/webhooks/paypal", paypalHook],
   ["/webhooks/unified", unifiedHook], // single shared entry point variant
 ] as const) {
   app.post(path, express.raw({ type: "application/json" }), async (req, res) => {

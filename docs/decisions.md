@@ -194,6 +194,35 @@ than enumerated options (future SDK options need no library release):
 - `listRefunds` scopes with the server-side `?payment=` filter on GET /refunds
   (sandbox-verified: 200 + empty list for a refund-less payment).
 
+## PayPal adapter (2026-07-07)
+
+- **`paypal` added as a first-class unified payment method type** in
+  `PAYMENT_METHOD_TYPES`. Additive vocabulary growth only — no contract semantics
+  changed, so this deliberately did not go through the "adapter contract change"
+  process (core + conformance + all adapters); conformance validates against the
+  const array and no exhaustive switches over the type exist outside adapters.
+- **Post-capture canonical id = the CAPTURE id.** PayPal order GETs stop answering a
+  few days after completion, while the capture is the durable money object refunds
+  and webhooks key on. `completePayment` therefore returns
+  `PaymentInfo.pspPaymentId` = capture id (order id pre-capture / for AUTHORIZE
+  intent), `retrievePayment` accepts either and falls back order → capture, and
+  `refundPayment` resolves order ids to their capture. Hosts are documented to
+  store the capture id.
+- **Webhook verification via PayPal's postback API**
+  (`POST /v1/notifications/verify-webhook-signature`), not local X.509 crypto:
+  stateless, edge-clean, and PayPal does the certificate work. The raw body is
+  spliced into the postback by string concatenation (parse + re-stringify breaks
+  PayPal's verification); a missing `webhookId`, missing transmission headers, or
+  transport trouble all answer `false` (fail closed, no network call where
+  detectable locally). Local crypto (CRC32 + SHA256withRSA over the cert from
+  `paypal-cert-url`) stays a documented optimization path, rejected for v1 because
+  WebCrypto cannot import X.509 certs without hand-rolled ASN.1.
+- **Sandbox-verified 2026-07-07:** orders created with `payment_source.paypal`
+  (always, for the experience_context) answer `PAYER_ACTION_REQUIRED` immediately —
+  not `CREATED` — so a fresh session reports `requires_action`; PATCH still works in
+  that state, and capture/authorize still 422 `ORDER_NOT_APPROVED`. The in-memory
+  fake mirrors this (bare orders without a payment_source keep `CREATED`).
+
 ## Open items requiring humans or infrastructure
 
 - Webhook delivery verification (both PSPs) needs a public URL/tunnel + real webhook

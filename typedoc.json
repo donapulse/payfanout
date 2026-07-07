@@ -11,6 +11,8 @@
     "packages/adapter-paysafe/src/index.ts",
     "packages/adapter-gocardless-server/src/index.ts",
     "packages/adapter-gocardless/src/index.ts",
+    "packages/adapter-paypal-server/src/index.ts",
+    "packages/adapter-paypal/src/index.ts",
     "packages/conformance/src/index.ts"
   ],
   "tsconfig": "tsconfig.json",

@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useMemo, useState, type JSX } from "react";
 import { StripeClientAdapter } from "@payfanout/adapter-stripe";
 import { PaysafeClientAdapter } from "@payfanout/adapter-paysafe";
+import { PayPalClientAdapter } from "@payfanout/adapter-paypal";
 import { PayFanoutProvider, PaymentFields, usePay, usePayFanout, type PayResult } from "@payfanout/react";
 import { localizeError, PayFanoutError, type PaymentInfo } from "@payfanout/core";
 import { I18nProvider, LOCALES, useI18n } from "./i18n.js";
@@ -22,6 +23,10 @@ const adapters = [
     apiKey: import.meta.env.VITE_PAYSAFE_PUBLIC_KEY ?? "replace_me_base64",
     environment: "sandbox",
   }),
+  new PayPalClientAdapter({
+    clientId: import.meta.env.VITE_PAYPAL_CLIENT_ID ?? "replace_me",
+    environment: "sandbox",
+  }),
 ];
 
 // The order total, shown verbatim in every language (a real app would format
@@ -32,6 +37,7 @@ const AMOUNT_LABEL = "$10.99";
 const APPEARANCE_BY_PSP: Record<string, Record<string, unknown>> = {
   stripe: { theme: "flat", variables: { colorPrimary: "#635bff", borderRadius: "8px" } },
   paysafe: { input: { "font-family": "system-ui, sans-serif", "font-size": "16px", color: "#32325d" } },
+  paypal: { layout: "vertical", label: "paypal", shape: "rect" },
 };
 
 const SLOT_BOX: React.CSSProperties = {
@@ -45,6 +51,8 @@ const SLOT_BOX: React.CSSProperties = {
 const CURRENCY_BY_PSP: Record<string, string> = {
   stripe: "USD",
   paysafe: import.meta.env.VITE_PAYSAFE_CURRENCY ?? "USD",
+  // The PayPal JS SDK fixes its currency at load time — the adapter defaults to USD.
+  paypal: "USD",
   // "auto" lets the SERVER pick the PSP via PaymentRouter rules (by currency) —
   // using the Paysafe account's currency demonstrates routing AWAY from the default.
   auto: import.meta.env.VITE_PAYSAFE_CURRENCY ?? "USD",

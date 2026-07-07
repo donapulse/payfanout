@@ -17,6 +17,7 @@ import {
 } from "@payfanout/server";
 import { StripeServerAdapter } from "@payfanout/adapter-stripe-server";
 import { PaysafeServerAdapter } from "@payfanout/adapter-paysafe-server";
+import { PayPalServerAdapter } from "@payfanout/adapter-paypal-server";
 
 const stripe = new StripeServerAdapter({
   secretKey: process.env.STRIPE_SECRET_KEY ?? "sk_test_replace_me",
@@ -36,8 +37,16 @@ const paysafe = new PaysafeServerAdapter({
   webhookHmacKey: process.env.PAYSAFE_WEBHOOK_HMAC_KEY ?? "dev-only-webhook-key",
 });
 
+const paypal = new PayPalServerAdapter({
+  clientId: process.env.PAYPAL_CLIENT_ID ?? "replace_me",
+  clientSecret: process.env.PAYPAL_CLIENT_SECRET ?? "replace_me",
+  environment: "sandbox",
+  // From the dashboard's webhook registration — verification answers false without it.
+  webhookId: process.env.PAYPAL_WEBHOOK_ID,
+});
+
 const payments = new PaymentService({
-  adapters: [stripe, paysafe],
+  adapters: [stripe, paysafe, paypal],
   // Observability seam: one metadata-only record per adapter call. In
   // production this feeds metrics/tracing; the demo just shows it exists.
   telemetry: (t) =>
@@ -114,11 +123,13 @@ const onEvent = async (event: import("@payfanout/core").UnifiedWebhookEvent): Pr
 
 const stripeHook = createAdapterWebhookHandler(stripe, { onEvent, log: console.log });
 const paysafeHook = createAdapterWebhookHandler(paysafe, { onEvent, log: console.log });
-const unifiedHook = createUnifiedWebhookHandler([stripe, paysafe], { onEvent, log: console.log });
+const paypalHook = createAdapterWebhookHandler(paypal, { onEvent, log: console.log });
+const unifiedHook = createUnifiedWebhookHandler([stripe, paysafe, paypal], { onEvent, log: console.log });
 
 for (const [path, handler] of [
   ["/webhooks/stripe", stripeHook],
   ["/webhooks/paysafe", paysafeHook],
+  ["/webhooks/paypal", paypalHook],
   ["/webhooks/unified", unifiedHook], // single shared entry point variant
 ] as const) {
   app.post(path, express.raw({ type: "application/json" }), async (req, res) => {

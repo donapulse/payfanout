@@ -223,6 +223,18 @@ than enumerated options (future SDK options need no library release):
   that state, and capture/authorize still 422 `ORDER_NOT_APPROVED`. The in-memory
   fake mirrors this (bare orders without a payment_source keep `CREATED`).
 
+## Versioning policy (2026-07-07, explicit user decision)
+
+- **Independent package versioning.** The repo-wide `linked: [["@payfanout/*"]]`
+  group (a tooling default from the 2026-07-04 build, until now unconfirmed) is
+  removed: lock-step minors on untouched packages misrepresent what changed.
+  Only packages with a changeset take that bump; packages that merely depend on
+  a bumped package receive the `updateInternalDependencies: "patch"` bump that
+  published artifacts need for coherent internal dependency ranges.
+- The private workspaces `@payfanout/integration-tests` and `@payfanout/e2e`
+  join `payfanout-demo` in changesets `ignore` — never published, no version
+  churn.
+
 ## Open items requiring humans or infrastructure
 
 - Webhook delivery verification (both PSPs) needs a public URL/tunnel + real webhook

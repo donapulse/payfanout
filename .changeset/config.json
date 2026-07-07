@@ -3,9 +3,9 @@
   "changelog": "@changesets/cli/changelog",
   "commit": false,
   "fixed": [],
-  "linked": [["@payfanout/*"]],
+  "linked": [],
   "access": "public",
   "baseBranch": "main",
   "updateInternalDependencies": "patch",
-  "ignore": ["payfanout-demo"]
+  "ignore": ["payfanout-demo", "@payfanout/integration-tests", "@payfanout/e2e"]
 }

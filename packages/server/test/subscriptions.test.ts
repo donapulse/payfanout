@@ -14,18 +14,21 @@ const T0 = Date.parse("2026-01-31T10:00:00.000Z");
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
 
+type ChargeOutcome = "ok" | "declined" | "psp_down" | "processing" | "resolved_failed";
+
 /** Scripted charging harness: control every charge outcome, capture every input. */
 function harness(options: Partial<SubscriptionManagerOptions> = {}): {
   manager: SubscriptionManager;
+  adapter: FakeAdapter;
   store: InMemorySubscriptionStore;
   charges: ChargeSavedPaymentMethodInput[];
   clock: { now: number };
   events: SubscriptionEvent[];
-  scriptNext: (outcome: "ok" | "declined" | "psp_down") => void;
+  scriptNext: (outcome: ChargeOutcome) => void;
 } {
   const adapter = new FakeAdapter({ capabilities: { supportsSavedPaymentMethods: true } });
   const charges: ChargeSavedPaymentMethodInput[] = [];
-  const script: Array<"ok" | "declined" | "psp_down"> = [];
+  const script: ChargeOutcome[] = [];
   adapter.chargeSavedPaymentMethod = async (input): Promise<PaymentInfo> => {
     charges.push(input);
     const outcome = script.shift() ?? "ok";
@@ -40,6 +43,8 @@ function harness(options: Partial<SubscriptionManagerOptions> = {}): {
       pspPaymentId: `pay_${charges.length}`,
       amount: input.amount,
       currency: input.currency,
+      ...(outcome === "processing" ? { status: "processing" as const } : {}),
+      ...(outcome === "resolved_failed" ? { status: "failed" as const } : {}),
     });
   };
   const service = new PaymentService({ adapters: [adapter] });
@@ -56,7 +61,7 @@ function harness(options: Partial<SubscriptionManagerOptions> = {}): {
     generateId: () => `sub_gen_${events.length}`,
     ...options,
   });
-  return { manager, store, charges, clock, events, scriptNext: (o) => script.push(o) };
+  return { manager, adapter, store, charges, clock, events, scriptNext: (o) => script.push(o) };
 }
 
 const PLAN = { amount: 2500, currency: "usd", interval: "month" as const };
@@ -382,5 +387,277 @@ describe("robustness", () => {
     const { manager } = harness();
     const { subscription } = await create(manager, { id: undefined });
     expect(subscription.id).toMatch(/^sub_gen_/);
+  });
+});
+
+describe("money-safety: bookkeeping failures never enter dunning", () => {
+  it("a store.save failure after a successful charge propagates — the next run replays the SAME attempt key", async () => {
+    const { manager, store, charges, clock } = harness();
+    await create(manager);
+    // Due at exactly currentPeriodEnd — the boundary instant counts as due.
+    clock.now = Date.parse("2026-02-28T10:00:00.000Z");
+
+    const originalSave = store.save.bind(store);
+    let failNextSave = true;
+    store.save = async (record) => {
+      if (failNextSave) {
+        failNextSave = false;
+        throw new Error("db down");
+      }
+      return originalSave(record);
+    };
+
+    const run = await manager.chargeDueSubscriptions();
+    expect(run.charged).toHaveLength(0);
+    expect(run.failed).toHaveLength(0);
+    expect(run.errors).toHaveLength(1);
+    expect(run.errors[0]!.subscriptionId).toBe("sub_1");
+
+    // The record is untouched: no dunning, no period advance, same attempt key.
+    const record = await manager.retrieveSubscription("sub_1");
+    expect(record).toMatchObject({ status: "active", failedAttempts: 0, currentPeriodEnd: "2026-02-28T10:00:00.000Z" });
+
+    const rerun = await manager.chargeDueSubscriptions();
+    expect(rerun.charged).toHaveLength(1);
+    expect(charges.map((c) => c.idempotencyKey)).toEqual([
+      "first-charge-key",
+      "payfanout-sub-sub_1-2026-02-28T10:00:00.000Z-a0",
+      "payfanout-sub-sub_1-2026-02-28T10:00:00.000Z-a0", // PSP-side replay, never a fresh charge
+    ]);
+  });
+
+  it("one candidate's storage failure does not abandon the rest of the run", async () => {
+    const { manager, store, clock } = harness();
+    await create(manager);
+    await create(manager, { id: "sub_2", pspCustomerId: "cust_2" });
+    clock.now = Date.parse("2026-03-15T00:00:00.000Z");
+
+    const originalSave = store.save.bind(store);
+    let trip = true;
+    store.save = async (record) => {
+      if (record.id === "sub_1" && trip) {
+        trip = false;
+        throw new Error("db down");
+      }
+      return originalSave(record);
+    };
+
+    const run = await manager.chargeDueSubscriptions();
+    expect(run.errors.map((e) => e.subscriptionId)).toEqual(["sub_1"]);
+    expect(run.charged.map((r) => r.id)).toEqual(["sub_2"]);
+  });
+});
+
+describe("async rails: renewals resolving as processing", () => {
+  it("freezes the record until resolved; resolve(succeeded) advances the period; replays are no-ops", async () => {
+    const { manager, charges, clock, events, scriptNext } = harness();
+    await create(manager);
+    events.length = 0;
+    clock.now = Date.parse("2026-02-28T10:00:01.000Z");
+
+    scriptNext("processing");
+    const run = await manager.chargeDueSubscriptions();
+    expect(run.pending).toHaveLength(1);
+    expect(run.charged).toHaveLength(0);
+    expect(events.map((e) => e.type)).toEqual(["subscription.charge_pending"]);
+
+    const record = await manager.retrieveSubscription("sub_1");
+    expect(record.status).toBe("active");
+    expect(record.currentPeriodEnd).toBe("2026-02-28T10:00:00.000Z"); // NOT advanced — money unconfirmed
+    expect(record.pendingRenewal).toMatchObject({
+      pspPaymentId: "pay_2",
+      periodEnd: "2026-02-28T10:00:00.000Z",
+      attempt: 0,
+    });
+
+    // Frozen: further runs never charge on top of the unresolved renewal.
+    await manager.chargeDueSubscriptions();
+    expect(charges).toHaveLength(2); // create + the one pending renewal
+
+    const resolved = await manager.resolvePendingRenewal("sub_1", { status: "succeeded", pspPaymentId: "pay_2" });
+    expect(resolved).toMatchObject({
+      status: "active",
+      currentPeriodStart: "2026-02-28T10:00:00.000Z",
+      currentPeriodEnd: "2026-03-28T10:00:00.000Z",
+      failedAttempts: 0,
+      lastPaymentId: "pay_2",
+    });
+    expect(resolved.pendingRenewal).toBeUndefined();
+    expect(events.map((e) => e.type)).toEqual(["subscription.charge_pending", "subscription.charged"]);
+
+    const replay = await manager.resolvePendingRenewal("sub_1", { status: "succeeded", pspPaymentId: "pay_2" });
+    expect(replay.currentPeriodEnd).toBe("2026-03-28T10:00:00.000Z");
+    expect(events).toHaveLength(2); // replay emitted nothing
+  });
+
+  it("resolve(failed) enters dunning with the pending attempt's count and a fresh retry key", async () => {
+    const { manager, charges, clock, scriptNext } = harness();
+    await create(manager);
+    clock.now = Date.parse("2026-02-28T10:00:01.000Z");
+
+    scriptNext("processing");
+    await manager.chargeDueSubscriptions();
+
+    clock.now += 5 * HOUR;
+    const failed = await manager.resolvePendingRenewal("sub_1", {
+      status: "failed",
+      pspPaymentId: "pay_2",
+      error: { code: "insufficient_funds", message: "No funds." },
+    });
+    expect(failed).toMatchObject({
+      status: "past_due",
+      failedAttempts: 1,
+      lastError: { code: "insufficient_funds", message: "No funds." },
+      nextRetryAt: new Date(clock.now + 24 * HOUR).toISOString(),
+    });
+    expect(failed.pendingRenewal).toBeUndefined();
+
+    clock.now += 25 * HOUR;
+    const retryRun = await manager.chargeDueSubscriptions();
+    expect(retryRun.charged).toHaveLength(1);
+    expect(charges.at(-1)!.idempotencyKey).toBe("payfanout-sub-sub_1-2026-02-28T10:00:00.000Z-a1");
+  });
+
+  it("guards resolution: no pending renewal, mismatched payment id", async () => {
+    const { manager, clock, scriptNext } = harness();
+    await create(manager);
+    await expect(manager.resolvePendingRenewal("sub_1", { status: "succeeded" })).rejects.toThrowError(
+      /no pending renewal/,
+    );
+
+    clock.now = Date.parse("2026-02-28T10:00:01.000Z");
+    scriptNext("processing");
+    await manager.chargeDueSubscriptions();
+    await expect(
+      manager.resolvePendingRenewal("sub_1", { status: "succeeded", pspPaymentId: "pay_999" }),
+    ).rejects.toThrowError(/awaits payment/);
+  });
+
+  it("a renewal that RESOLVES with status failed (not thrown) still enters dunning", async () => {
+    const { manager, clock, scriptNext } = harness();
+    await create(manager);
+    clock.now = Date.parse("2026-02-28T10:00:01.000Z");
+
+    scriptNext("resolved_failed");
+    const run = await manager.chargeDueSubscriptions();
+    expect(run.failed).toHaveLength(1);
+    const record = await manager.retrieveSubscription("sub_1");
+    expect(record).toMatchObject({
+      status: "past_due",
+      failedAttempts: 1,
+      lastError: { code: "processing_error" },
+    });
+  });
+
+  it("a first charge that does not succeed synchronously throws and persists nothing", async () => {
+    const { manager, store, scriptNext } = harness();
+    scriptNext("processing");
+    await expect(create(manager)).rejects.toMatchObject({ code: "processing_error" });
+    expect(await store.get("sub_1")).toBeUndefined();
+
+    scriptNext("resolved_failed");
+    await expect(create(manager)).rejects.toMatchObject({ code: "processing_error" });
+    expect(await store.get("sub_1")).toBeUndefined();
+  });
+});
+
+describe("cancel racing an in-flight renewal", () => {
+  it("a cancel landing during a SUCCESSFUL charge stands — paid window advances, status stays canceled", async () => {
+    const { manager, adapter, clock } = harness();
+    await create(manager);
+    clock.now = Date.parse("2026-02-28T10:00:01.000Z");
+
+    adapter.chargeSavedPaymentMethod = async (input) => {
+      await manager.cancelSubscription("sub_1");
+      return makePaymentInfo({ pspName: "fake", pspPaymentId: "pay_race", amount: input.amount, currency: input.currency });
+    };
+
+    const run = await manager.chargeDueSubscriptions();
+    expect(run.charged).toHaveLength(1); // the money moved — reported honestly
+
+    const record = await manager.retrieveSubscription("sub_1");
+    expect(record.status).toBe("canceled"); // never resurrected
+    expect(record.canceledAt).toBeDefined();
+    expect(record.currentPeriodEnd).toBe("2026-03-28T10:00:00.000Z"); // paid through what was collected
+    expect(record.lastPaymentId).toBe("pay_race");
+
+    clock.now = Date.parse("2026-06-01T00:00:00.000Z");
+    expect((await manager.chargeDueSubscriptions()).charged).toHaveLength(0);
+  });
+
+  it("a cancel landing during a FAILING charge is not overwritten by dunning", async () => {
+    const { manager, adapter, clock } = harness();
+    await create(manager);
+    clock.now = Date.parse("2026-02-28T10:00:01.000Z");
+
+    adapter.chargeSavedPaymentMethod = async () => {
+      await manager.cancelSubscription("sub_1");
+      throw new PayFanoutError({ code: "card_declined", message: "Declined.", retryable: false });
+    };
+
+    const run = await manager.chargeDueSubscriptions();
+    expect(run.failed).toHaveLength(0);
+    expect(run.canceled).toHaveLength(0); // the cancel was the host's, not the run's
+
+    const record = await manager.retrieveSubscription("sub_1");
+    expect(record.status).toBe("canceled");
+    expect(record.failedAttempts).toBe(0); // no past_due ghost
+    expect(record.nextRetryAt).toBeUndefined();
+  });
+});
+
+describe("dunning and catch-up boundaries", () => {
+  it("a retry fires at exactly nextRetryAt", async () => {
+    const { manager, charges, clock, scriptNext } = harness();
+    await create(manager);
+    clock.now = Date.parse("2026-02-28T10:00:01.000Z");
+    scriptNext("declined");
+    await manager.chargeDueSubscriptions();
+    const record = await manager.retrieveSubscription("sub_1");
+
+    clock.now = Date.parse(record.nextRetryAt!);
+    const run = await manager.chargeDueSubscriptions();
+    expect(run.charged).toHaveLength(1);
+    expect(charges).toHaveLength(3); // create + failed attempt + boundary retry
+  });
+
+  it("a failure mid-catch-up stops the sequence and records partial progress", async () => {
+    const { manager, clock, scriptNext } = harness({ catchUpLimit: 12 });
+    await create(manager);
+    clock.now = Date.parse("2026-05-15T00:00:00.000Z"); // 3 periods overdue
+
+    scriptNext("ok");
+    scriptNext("declined");
+    const run = await manager.chargeDueSubscriptions();
+    expect(run.charged).toHaveLength(1);
+    expect(run.failed).toHaveLength(1);
+
+    const record = await manager.retrieveSubscription("sub_1");
+    expect(record).toMatchObject({
+      status: "past_due",
+      failedAttempts: 1,
+      currentPeriodStart: "2026-02-28T10:00:00.000Z", // first overdue period collected
+      currentPeriodEnd: "2026-03-28T10:00:00.000Z", // second one still owed
+    });
+  });
+
+  it("a past_due record entering a multi-cycle run recovers, then keeps catching up", async () => {
+    const { manager, charges, clock, scriptNext } = harness({ catchUpLimit: 12 });
+    await create(manager);
+    clock.now = Date.parse("2026-02-28T10:00:01.000Z");
+    scriptNext("declined");
+    await manager.chargeDueSubscriptions(); // -> past_due, retry in 24h
+
+    clock.now = Date.parse("2026-04-10T00:00:00.000Z"); // backoff long past; 2 periods owed
+    const run = await manager.chargeDueSubscriptions();
+    expect(run.charged).toHaveLength(2);
+    expect(charges.slice(1).map((c) => c.idempotencyKey)).toEqual([
+      "payfanout-sub-sub_1-2026-02-28T10:00:00.000Z-a0", // the failed attempt
+      "payfanout-sub-sub_1-2026-02-28T10:00:00.000Z-a1", // dunning recovery
+      "payfanout-sub-sub_1-2026-03-28T10:00:00.000Z-a0", // catch-up continues on the next period
+    ]);
+    const record = await manager.retrieveSubscription("sub_1");
+    expect(record.status).toBe("active");
+    expect(record.currentPeriodEnd).toBe("2026-04-28T10:00:00.000Z");
   });
 });

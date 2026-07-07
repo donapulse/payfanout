@@ -7,6 +7,7 @@
  */
 import { randomUUID } from "node:crypto";
 import express from "express";
+import { rateLimit } from "express-rate-limit";
 import {
   InMemorySubscriptionStore,
   PaymentRouter,
@@ -108,6 +109,13 @@ function rememberToken(psp: string, token: string | undefined): void {
 
 const app = express();
 
+// Generous per-IP ceiling on the webhook ingress: abuse protection without
+// throttling legitimate PSP retry bursts (GoCardless batches up to 250 events).
+app.use(
+  "/webhooks",
+  rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true, legacyHeaders: false }),
+);
+
 // ---------------------------------------------------------------------------
 // Webhooks FIRST, with express.raw: signature verification needs the exact raw
 // bytes — express.json() would destroy them. This ordering matters.
@@ -116,7 +124,8 @@ const onEvent = async (event: import("@payfanout/core").UnifiedWebhookEvent): Pr
   if (processedEventIds.has(event.id)) return; // host-owned dedupe
   processedEventIds.add(event.id);
   // Ack-fast contract: enqueue here (BullMQ, SQS, ...) — never process inline.
-  console.log(`[webhook] ${event.pspName} ${event.type} payment=${event.pspPaymentId ?? "-"}`);
+  // pspPaymentId is payload-derived — encode it so log lines cannot be forged.
+  console.log(`[webhook] ${event.pspName} ${event.type} payment=${encodeURIComponent(event.pspPaymentId ?? "-")}`);
 };
 
 const stripeHook = createAdapterWebhookHandler(stripe, { onEvent, log: console.log });

@@ -18,7 +18,8 @@ import { GoCardlessServerAdapter } from "@payfanout/adapter-gocardless-server";
 
 const ACCESS_TOKEN = process.env.GOCARDLESS_ACCESS_TOKEN;
 const BASE_URL = process.env.GOCARDLESS_BASE_URL ?? "https://api-sandbox.gocardless.com";
-if (BASE_URL.includes("api.gocardless.com") && !BASE_URL.includes("api-sandbox.gocardless.com")) {
+// Hostname equality, never substring matching — a lookalike host must not fool the guard.
+if (new URL(BASE_URL).hostname === "api.gocardless.com") {
   throw new Error("Integration tests refuse to run against the live GoCardless API");
 }
 

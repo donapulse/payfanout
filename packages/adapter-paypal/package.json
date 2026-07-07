@@ -1,0 +1,34 @@
+{
+  "name": "@payfanout/adapter-paypal",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Client-side PayPal adapter for PayFanout (PayPal Buttons, popup approval, tokenize-first). No secrets, no server code.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "sideEffects": false,
+  "dependencies": {
+    "@payfanout/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@payfanout/conformance": "workspace:*"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "publishConfig": {
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  }
+}

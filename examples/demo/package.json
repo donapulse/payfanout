@@ -9,6 +9,8 @@
     "build": "vite build"
   },
   "dependencies": {
+    "@payfanout/adapter-paypal": "workspace:*",
+    "@payfanout/adapter-paypal-server": "workspace:*",
     "@payfanout/adapter-paysafe": "workspace:*",
     "@payfanout/adapter-paysafe-server": "workspace:*",
     "@payfanout/adapter-stripe": "workspace:*",

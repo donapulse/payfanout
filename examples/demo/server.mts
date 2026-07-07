@@ -18,6 +18,7 @@ import {
 } from "@payfanout/server";
 import { StripeServerAdapter } from "@payfanout/adapter-stripe-server";
 import { PaysafeServerAdapter } from "@payfanout/adapter-paysafe-server";
+import { PayZenServerAdapter } from "@payfanout/adapter-payzen-server";
 import { GoCardlessServerAdapter, parseGoCardlessWebhookEvents } from "@payfanout/adapter-gocardless-server";
 import { PayPalServerAdapter } from "@payfanout/adapter-paypal-server";
 
@@ -39,6 +40,13 @@ const paysafe = new PaysafeServerAdapter({
   webhookHmacKey: process.env.PAYSAFE_WEBHOOK_HMAC_KEY ?? "dev-only-webhook-key",
 });
 
+const payzen = new PayZenServerAdapter({
+  shopId: process.env.PAYZEN_SHOP_ID ?? "replace_me",
+  password: process.env.PAYZEN_PASSWORD ?? "testpassword_replace_me",
+  environment: "sandbox",
+  hmacKey: process.env.PAYZEN_HMAC_KEY ?? "dev-only-hmac-key",
+});
+
 const gocardless = new GoCardlessServerAdapter({
   accessToken: process.env.GOCARDLESS_ACCESS_TOKEN ?? "replace_me",
   environment: "sandbox",
@@ -54,7 +62,7 @@ const paypal = new PayPalServerAdapter({
 });
 
 const payments = new PaymentService({
-  adapters: [stripe, paysafe, gocardless, paypal],
+  adapters: [stripe, paysafe, gocardless, paypal, payzen],
   // Observability seam: one metadata-only record per adapter call. In
   // production this feeds metrics/tracing; the demo just shows it exists.
   telemetry: (t) =>
@@ -67,6 +75,7 @@ const router = new PaymentRouter({
   service: payments,
   rules: [
     { when: { currency: ["CAD"] }, use: ["paysafe", "stripe"] },
+    { when: { currency: ["EUR"] }, use: ["payzen", "stripe"] },
     { when: { currency: ["USD", "JPY"] }, use: ["stripe", "paysafe"] },
   ],
   onAttempt: (a) =>
@@ -139,7 +148,9 @@ const onEvent = async (event: import("@payfanout/core").UnifiedWebhookEvent): Pr
 
 const stripeHook = createAdapterWebhookHandler(stripe, { onEvent, log: console.log });
 const paysafeHook = createAdapterWebhookHandler(paysafe, { onEvent, log: console.log });
+const payzenHook = createAdapterWebhookHandler(payzen, { onEvent, log: console.log });
 const paypalHook = createAdapterWebhookHandler(paypal, { onEvent, log: console.log });
+// PayZen stays out of the unified route (form-urlencoded IPNs, not JSON);
 // gocardless here handles single-event deliveries only — batched deliveries 400; /webhooks/gocardless below is the real ingress.
 const unifiedHook = createUnifiedWebhookHandler([stripe, paysafe, gocardless, paypal], { onEvent, log: console.log });
 
@@ -157,6 +168,22 @@ for (const [path, handler] of [
     res.status(result.status).json(result.ok ? { received: true } : { error: result.reason });
   });
 }
+
+// PayZen IPNs POST application/x-www-form-urlencoded: parse the form, pass the
+// kr-answer STRING as rawBody (the signature covers exactly those bytes) and
+// the kr-hash fields as headers — the guide's "recipe A".
+app.post("/webhooks/payzen", express.urlencoded({ extended: false }), async (req, res) => {
+  const body = req.body as Record<string, string | undefined>;
+  const result = await payzenHook({
+    rawBody: body["kr-answer"] ?? "",
+    headers: {
+      "kr-hash": body["kr-hash"] ?? "",
+      "kr-hash-algorithm": body["kr-hash-algorithm"] ?? "",
+      "kr-hash-key": body["kr-hash-key"] ?? "",
+    },
+  });
+  res.status(result.status).json(result.ok ? { received: true } : { error: result.reason });
+});
 
 // GoCardless BATCHES up to 250 events per delivery, so its ingress differs:
 // verify the signature once over the raw bytes, then fan out per event —

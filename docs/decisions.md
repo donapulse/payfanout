@@ -162,6 +162,38 @@ than enumerated options (future SDK options need no library release):
 - Proven live in the demo/E2E: Stripe accordion + method order, Paysafe French
   placeholders + host-owned two-column grid, fully custom gradient button.
 
+## PayZen adapter (2026-07-07)
+
+Confirm-on-client pair (`adapter-payzen` / `adapter-payzen-server`, REST API V4 +
+krypton-client embedded form, server edge-runtime compatible). Platform gaps and the
+choices they forced:
+
+- **PayZen has no idempotency mechanism** (live-verified: identical
+  `Charge/CreatePayment` bodies mint distinct formTokens). Session creation synthesizes
+  traceability: `orderId` derives deterministically from the caller's `idempotencyKey`
+  (`pf-` prefix, sanitized, ≤ 64 chars, hash-fragment disambiguation) and the key/id are
+  stamped into `metadata` — replays converge on one order, reconcilable via `Order/Get`.
+- **Refunds have NO honest idempotency**: `Transaction/Refund` carries no
+  metadata/reference field a replayed key could be matched against, so replays stack a
+  second credit. Consequently refund/cancel/validate are never transport-retried, and
+  their transport failures (network/timeout/5xx/429) surface `retryable: false` with
+  guidance to re-read the payment (`amountRefunded`) before retrying — the outcome of a
+  lost response is unknown. ERROR envelopes keep their mapped flags (the gateway
+  provably rejected the call).
+- **IPN event id is synthesized** as `uuid:detailedStatus` — PayZen has no event id,
+  `kr-hash` regenerates per delivery, and a redelivery can carry a *changed*
+  `detailedStatus` that must not dedupe away.
+- **Manual capture = `Transaction/Validate`** (`Transaction/Capture` is a Brazil-only
+  batch WS — a regional trap, never used). `AUTHORISED` maps to `succeeded`
+  (auto-capture is scheduled); `AUTHORISED_TO_VALIDATE` maps to `requires_capture`.
+- **CNY and KHR are excluded by the adapter**: PayZen prices them with 1 and 0
+  fractional digits while ISO 4217 (core's minor-unit contract) uses 2 — pass-through
+  would shift decimal points. **BHD is unsupported by PayZen** (absent from its currency
+  table); KWD/TND prove the 3-decimal path.
+- **The kr-answer string is the signed webhook unit**: `verifyWebhookSignature` hashes
+  the raw `kr-answer` (rawBody), the `kr-hash*` fields ride headers, and handing over
+  the whole urlencoded IPN body is tolerated (the adapter extracts the fields itself).
+
 ## GoCardless adapter (2026-07-07)
 
 - One-off bank payments ("Pay by Bank" / Instant Bank Pay) via **Billing Requests**:

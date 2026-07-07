@@ -56,3 +56,6 @@ jobs:
           PAYPAL_CLIENT_ID: ${{ secrets.PAYPAL_CLIENT_ID }}
           PAYPAL_CLIENT_SECRET: ${{ secrets.PAYPAL_CLIENT_SECRET }}
           PAYPAL_WEBHOOK_ID: ${{ secrets.PAYPAL_WEBHOOK_ID }}
+          PAYZEN_SHOP_ID: ${{ secrets.PAYZEN_SHOP_ID }}
+          PAYZEN_PASSWORD: ${{ secrets.PAYZEN_PASSWORD }}
+          PAYZEN_HMAC_KEY: ${{ secrets.PAYZEN_HMAC_KEY }}

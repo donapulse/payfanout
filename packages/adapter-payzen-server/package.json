@@ -1,0 +1,34 @@
+{
+  "name": "@payfanout/adapter-payzen-server",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Server-side PayZen (Lyra) adapter for PayFanout (REST API V4: payments, validation capture, refunds, IPN verification). Holds secrets — never bundle client-side.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "sideEffects": false,
+  "dependencies": {
+    "@payfanout/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@payfanout/conformance": "workspace:*"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "publishConfig": {
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  }
+}

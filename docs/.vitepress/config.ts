@@ -68,6 +68,7 @@ export default defineConfig({
             { text: 'Set up Paysafe', link: '/guide/paysafe' },
             { text: 'Set up GoCardless', link: '/guide/gocardless' },
             { text: 'Set up PayPal', link: '/guide/paypal' },
+            { text: 'Set up PayZen', link: '/guide/payzen' },
           ],
         },
         {

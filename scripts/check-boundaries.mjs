@@ -15,6 +15,7 @@ const CLIENT_SAFE = new Set([
   "@payfanout/adapter-paysafe",
   "@payfanout/adapter-gocardless",
   "@payfanout/adapter-paypal",
+  "@payfanout/adapter-payzen",
 ]);
 const CLIENT_ALLOWED_EXTERNAL = new Set(["react"]);
 

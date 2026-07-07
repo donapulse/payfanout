@@ -65,6 +65,12 @@ importers:
       '@payfanout/adapter-paysafe-server':
         specifier: workspace:*
         version: link:../../packages/adapter-paysafe-server
+      '@payfanout/adapter-payzen':
+        specifier: workspace:*
+        version: link:../../packages/adapter-payzen
+      '@payfanout/adapter-payzen-server':
+        specifier: workspace:*
+        version: link:../../packages/adapter-payzen-server
       '@payfanout/adapter-stripe':
         specifier: workspace:*
         version: link:../../packages/adapter-stripe
@@ -172,6 +178,26 @@ importers:
         specifier: workspace:*
         version: link:../conformance
 
+  packages/adapter-payzen:
+    dependencies:
+      '@payfanout/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@payfanout/conformance':
+        specifier: workspace:*
+        version: link:../conformance
+
+  packages/adapter-payzen-server:
+    dependencies:
+      '@payfanout/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@payfanout/conformance':
+        specifier: workspace:*
+        version: link:../conformance
+
   packages/adapter-stripe:
     dependencies:
       '@payfanout/core':
@@ -227,6 +253,9 @@ importers:
       '@payfanout/adapter-paysafe-server':
         specifier: workspace:*
         version: link:../adapter-paysafe-server
+      '@payfanout/adapter-payzen-server':
+        specifier: workspace:*
+        version: link:../adapter-payzen-server
       '@payfanout/adapter-stripe-server':
         specifier: workspace:*
         version: link:../adapter-stripe-server

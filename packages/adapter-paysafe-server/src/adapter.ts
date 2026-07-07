@@ -62,7 +62,8 @@ export interface PaysafeServerAdapterConfig {
   sessionTtlSeconds?: number;
   /**
    * Abort a hung Paysafe connection after this many milliseconds (default
-   * 30000). Every mutating call carries an idempotent merchantRefNum, so a
+   * 30000). The timer covers the whole exchange including the response body
+   * read. Every mutating call carries an idempotent merchantRefNum, so a
    * timed-out request is safe to retry. Timeouts surface as retryable
    * psp_unavailable errors.
    */
@@ -723,10 +724,13 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   private async requestOnce<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
     const doFetch = this.config.fetch ?? fetch;
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
-    // A hung PSP connection must not hang the host's request handler.
+    // A hung PSP connection must not hang the host's request handler. The
+    // timer stays armed until the BODY is read — a response can stall after
+    // its headers arrive, and response.text() would otherwise wait forever.
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let response: Response;
+    let text: string;
     try {
       response = await doFetch(`${this.baseUrl}${path}`, {
         method,
@@ -737,6 +741,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
         signal: controller.signal,
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
       });
+      text = await readBodyWithSignal(response, controller.signal);
     } catch (err) {
       const timedOut = controller.signal.aborted;
       throw new PayFanoutError({
@@ -751,7 +756,6 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     } finally {
       clearTimeout(timer);
     }
-    const text = await response.text();
     const json = text ? safeJson(text) : undefined;
     if (!response.ok) throw mapPaysafeError(response.status, json ?? text);
     return json as T;
@@ -767,6 +771,24 @@ function isTransportRetryable(error: PayFanoutError): boolean {
   if (error.code === "rate_limited") return true;
   if (error.code !== "psp_unavailable") return false;
   return true;
+}
+
+/**
+ * Reads the response body under the request's abort signal. Native fetch
+ * bodies reject on abort by themselves; the explicit race also bounds
+ * injected transports whose Responses are not tied to the signal.
+ */
+function readBodyWithSignal(response: Response, signal: AbortSignal): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error("Paysafe response body read aborted"));
+      return;
+    }
+    signal.addEventListener("abort", () => reject(new Error("Paysafe response body read aborted")), {
+      once: true,
+    });
+    response.text().then(resolve, reject);
+  });
 }
 
 /** Paysafe card.type codes → lowercase brand names hosts can render. */

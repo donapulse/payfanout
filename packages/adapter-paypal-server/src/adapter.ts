@@ -61,7 +61,8 @@ export interface PayPalServerAdapterConfig {
   cancelUrl?: string;
   /**
    * Abort a hung PayPal connection after this many milliseconds (default
-   * 30000). Mutating calls carry a deterministic PayPal-Request-Id, so a
+   * 30000). The timer covers the whole exchange including the response body
+   * read. Mutating calls carry a deterministic PayPal-Request-Id, so a
    * timed-out request is safe to retry. Timeouts surface as retryable
    * psp_unavailable errors.
    */
@@ -749,13 +750,13 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
   }
 
   private async requestOnce<T>(method: PayPalHttpMethod, path: string, options: PayPalRequestOptions): Promise<T> {
-    let response = await this.send(method, path, options, await this.accessToken());
-    if (response.status === 401) {
+    let exchange = await this.send(method, path, options, await this.accessToken());
+    if (exchange.response.status === 401) {
       // The cached token went stale or was revoked — re-mint once and replay.
       this.tokenCache = undefined;
-      response = await this.send(method, path, options, await this.accessToken());
+      exchange = await this.send(method, path, options, await this.accessToken());
     }
-    const text = await response.text();
+    const { response, text } = exchange;
     const json = text ? safeJson(text) : undefined;
     if (!response.ok) throw mapPayPalError(response.status, json ?? text);
     return json as T; // 204 No Content (PATCH, void) resolves as undefined
@@ -766,15 +767,17 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     path: string,
     options: PayPalRequestOptions,
     token: string,
-  ): Promise<Response> {
+  ): Promise<{ response: Response; text: string }> {
     const doFetch = this.config.fetch ?? fetch;
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
-    // A hung PSP connection must not hang the host's request handler.
+    // A hung PSP connection must not hang the host's request handler. The
+    // timer stays armed until the BODY is read — a response can stall after
+    // its headers arrive, and response.text() would otherwise wait forever.
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const body = options.rawBody ?? (options.json !== undefined ? JSON.stringify(options.json) : undefined);
     try {
-      return await doFetch(`${this.baseUrl}${path}`, {
+      const response = await doFetch(`${this.baseUrl}${path}`, {
         method,
         headers: {
           authorization: `Bearer ${token}`,
@@ -786,6 +789,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
         signal: controller.signal,
         ...(body !== undefined ? { body } : {}),
       });
+      return { response, text: await readBodyWithSignal(response, controller.signal) };
     } catch (err) {
       const timedOut = controller.signal.aborted;
       throw new PayFanoutError({
@@ -822,6 +826,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let response: Response;
+    let text: string;
     try {
       response = await doFetch(`${this.baseUrl}/v1/oauth2/token`, {
         method: "POST",
@@ -832,6 +837,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
         body: "grant_type=client_credentials",
         signal: controller.signal,
       });
+      text = await readBodyWithSignal(response, controller.signal);
     } catch (err) {
       const timedOut = controller.signal.aborted;
       throw new PayFanoutError({
@@ -844,7 +850,6 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     } finally {
       clearTimeout(timer);
     }
-    const text = await response.text();
     const json = text ? safeJson(text) : undefined;
     if (!response.ok) throw mapPayPalError(response.status, json ?? text);
     const body = json as { access_token?: string; expires_in?: number } | undefined;
@@ -869,6 +874,24 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
 /** Transport-level trouble only: network failure/timeout, HTTP 5xx, or 429. */
 function isTransportRetryable(error: PayFanoutError): boolean {
   return error.code === "rate_limited" || error.code === "psp_unavailable";
+}
+
+/**
+ * Reads the response body under the request's abort signal. Native fetch
+ * bodies reject on abort by themselves; the explicit race also bounds
+ * injected transports whose Responses are not tied to the signal.
+ */
+function readBodyWithSignal(response: Response, signal: AbortSignal): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error("PayPal response body read aborted"));
+      return;
+    }
+    signal.addEventListener("abort", () => reject(new Error("PayPal response body read aborted")), {
+      once: true,
+    });
+    response.text().then(resolve, reject);
+  });
 }
 
 function completedOrderStatus(

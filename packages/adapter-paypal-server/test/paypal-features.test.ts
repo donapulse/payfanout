@@ -540,6 +540,51 @@ describe("PayPal transport", () => {
       }
     }
   });
+
+  it("bounds the response BODY read with the timeout — headers alone do not disarm it", async () => {
+    // Headers arrive immediately but the body stream never closes: without
+    // the timer surviving until text(), this call would hang forever.
+    const { adapter } = adapterWithResponses(
+      [() => new Response(new ReadableStream({ start() {} }))],
+      { requestTimeoutMs: 5, maxNetworkRetries: 0 },
+    );
+    await expect(adapter.retrieveRefund("1JU1")).rejects.toMatchObject({
+      code: "psp_unavailable",
+      retryable: true,
+      message: expect.stringMatching(/did not respond within 5ms/),
+    });
+  });
+
+  it("still times out when a response lands only after the abort already fired", async () => {
+    // An injected transport may ignore the signal and resolve late — the
+    // body read must refuse to start on an already-aborted request.
+    const { adapter } = adapterWithResponses(
+      [() => new Promise<Response>((resolve) => setTimeout(() => resolve(new Response("{}")), 40))],
+      { requestTimeoutMs: 5, maxNetworkRetries: 0 },
+    );
+    await expect(adapter.retrieveRefund("1JU1")).rejects.toMatchObject({
+      code: "psp_unavailable",
+      retryable: true,
+      message: expect.stringMatching(/did not respond within 5ms/),
+    });
+  });
+
+  it("bounds the OAuth token mint's body read with the timeout too", async () => {
+    // Every API call mints first, so a stalled token body would hang everything.
+    const adapter = new PayPalServerAdapter({
+      clientId: "id",
+      clientSecret: "secret",
+      environment: "sandbox",
+      fetch: async () => new Response(new ReadableStream({ start() {} })),
+      requestTimeoutMs: 5,
+      maxNetworkRetries: 0,
+    });
+    await expect(adapter.retrieveRefund("1JU1")).rejects.toMatchObject({
+      code: "psp_unavailable",
+      retryable: true,
+      message: expect.stringMatching(/did not respond within 5ms/),
+    });
+  });
 });
 
 describe("PayPal config validation", () => {

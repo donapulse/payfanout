@@ -345,7 +345,7 @@ export class PaymentService {
       this.emit({ pspName, operation, durationMs: this.now() - startedAt, ok: true });
       return result;
     } catch (err) {
-      const wrapped = PayFanoutError.wrap(err, { pspName });
+      const wrapped = ensurePspName(PayFanoutError.wrap(err, { pspName }), pspName);
       this.emit({
         pspName,
         operation,
@@ -375,6 +375,25 @@ function requireIdempotencyKey(key: string, operation: string): void {
 
 function guardError(pspName: string, message: string): PayFanoutError {
   return new PayFanoutError({ code: "invalid_request", message, retryable: false, pspName });
+}
+
+/**
+ * PayFanoutError.wrap passes existing PayFanoutErrors through without
+ * backfilling pspName, so an adapter error thrown without one would leave the
+ * service unattributed. Fields are readonly — rebuild the error, keeping the
+ * original stack so the adapter's throw site stays in logs.
+ */
+function ensurePspName(error: PayFanoutError, pspName: string): PayFanoutError {
+  if (error.pspName !== undefined) return error;
+  const attributed = new PayFanoutError({
+    code: error.code,
+    message: error.message,
+    retryable: error.retryable,
+    raw: error.raw,
+    pspName,
+  });
+  attributed.stack = error.stack;
+  return attributed;
 }
 
 /** Fails fast at registration if capability flags contradict the implemented surface. */

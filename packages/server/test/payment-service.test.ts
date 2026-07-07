@@ -172,6 +172,41 @@ describe("PaymentService error normalization", () => {
     }
   });
 
+  it("backfills pspName when an adapter throws a PayFanoutError without one", async () => {
+    const adapter = new FakeAdapter({ pspName: "flaky" });
+    const anonymous = new PayFanoutError({
+      code: "card_declined",
+      message: "Declined",
+      retryable: false,
+      raw: { decline_code: "do_not_honor" },
+    });
+    adapter.retrievePayment = async () => {
+      throw anonymous;
+    };
+    const service = new PaymentService({ adapters: [adapter] });
+    try {
+      await service.retrievePayment("flaky", "p1");
+      expect.unreachable();
+    } catch (err) {
+      expect(isPayFanoutError(err)).toBe(true);
+      if (isPayFanoutError(err)) {
+        expect(err.pspName).toBe("flaky");
+        expect(err.code).toBe("card_declined");
+        expect(err.message).toBe("Declined");
+        expect(err.retryable).toBe(false);
+        expect(err.raw).toBe(anonymous.raw);
+        expect(err.stack).toBe(anonymous.stack);
+        expect(err.toJSON()).toEqual({
+          name: "PayFanoutError",
+          code: "card_declined",
+          message: "Declined",
+          retryable: false,
+          pspName: "flaky",
+        });
+      }
+    }
+  });
+
   it("lets adapter-produced PayFanoutErrors pass through untouched", async () => {
     const adapter = new FakeAdapter({ pspName: "flaky" });
     const declined = new PayFanoutError({

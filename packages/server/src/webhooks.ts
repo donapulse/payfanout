@@ -29,7 +29,11 @@ export interface WebhookHandlerOptions {
    * A thrown error yields a 500 so the PSP retries delivery.
    */
   onEvent: (event: UnifiedWebhookEvent) => void | Promise<void>;
-  /** Observability hook (which adapter matched, verification failures, ...). */
+  /**
+   * Observability hook (which adapter matched, verification failures, ...).
+   * Exceptions it throws are swallowed — logging never changes the handler's
+   * result.
+   */
   log?: (message: string) => void;
 }
 
@@ -47,7 +51,7 @@ export function createAdapterWebhookHandler(
     try {
       verified = await adapter.verifyWebhookSignature(req.rawBody, headers);
     } catch (err) {
-      options.log?.(`[payfanout] ${adapter.pspName} signature verification threw: ${describe(err)}`);
+      safeLog(options.log, `[payfanout] ${adapter.pspName} signature verification threw: ${describe(err)}`);
       verified = false;
     }
     if (!verified) {
@@ -80,10 +84,10 @@ export function createUnifiedWebhookHandler(
       try {
         verified = await adapter.verifyWebhookSignature(req.rawBody, headers);
       } catch (err) {
-        options.log?.(`[payfanout] ${adapter.pspName} signature verification threw: ${describe(err)}`);
+        safeLog(options.log, `[payfanout] ${adapter.pspName} signature verification threw: ${describe(err)}`);
       }
       if (verified) {
-        options.log?.(`[payfanout] unified webhook matched adapter "${adapter.pspName}"`);
+        safeLog(options.log, `[payfanout] unified webhook matched adapter "${adapter.pspName}"`);
         return parseAndDispatch(adapter, req.rawBody, headers, options);
       }
     }
@@ -133,4 +137,12 @@ function lowercaseHeaders(headers: Record<string, string>): Record<string, strin
 
 function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function safeLog(log: WebhookHandlerOptions["log"], message: string): void {
+  try {
+    log?.(message);
+  } catch {
+    // Logging must never break webhook handling.
+  }
 }

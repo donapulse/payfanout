@@ -162,6 +162,38 @@ than enumerated options (future SDK options need no library release):
 - Proven live in the demo/E2E: Stripe accordion + method order, Paysafe French
   placeholders + host-owned two-column grid, fully custom gradient button.
 
+## GoCardless adapter (2026-07-07)
+
+- One-off bank payments ("Pay by Bank" / Instant Bank Pay) via **Billing Requests**:
+  the billing request id is `pspSessionId` and the hosted flow's `authorisation_url`
+  is `clientSecret`. Confirm-on-client shaped (`requiresServerCompletion: false`),
+  every method `flow: "redirect"` — bank authorisation is only permitted on
+  GoCardless-hosted UIs, so an embedded flow cannot honestly be claimed.
+- One-off payment requests are **GBP/EUR only**; the other GoCardless currencies need
+  mandate-based flows the adapter does not create in v1.
+- `payment_request.description` is **mandatory** (422 "can't be blank",
+  sandbox-verified 2026-07-07). `statementDescriptor` rides it — the
+  authorisation-screen text, not the bank statement line (`reference` is restricted
+  to PayTo/direct-settlement accounts) — falling back to `metadata.description`,
+  then a derived `Payment <id>` default.
+- **Flow creates are not idempotent at GoCardless** (sandbox-verified 2026-07-07: two
+  POST /billing_request_flows with the same Idempotency-Key returned two different
+  flow ids). Idempotency therefore lives at the billing-request level: a replayed
+  session returns the same billing request with a fresh authorisation URL (every flow
+  authorises that one billing request — no duplicate-payment risk), and the
+  conformance idempotency proof moved to refunds (same key twice → the original
+  refund, exactly one create).
+- Webhook deliveries are **batched** (up to 250 events, one HMAC over the raw body):
+  `parseWebhookEvent` throws on batched deliveries instead of dropping events;
+  `parseGoCardlessWebhookEvents` (verify once, fan out per event) is the documented
+  ingress. `billing_requests`/`fulfilled` maps to `payment.processing`, payment id
+  from `links.payment_request_payment`.
+- `supportsSavedPaymentMethods: false` in v1: mandates are genuinely reusable
+  charging handles, but async bank rails cannot meet the vault contract's
+  instantly-succeeded off-session charge; mandates-as-vault is future work.
+- `listRefunds` scopes with the server-side `?payment=` filter on GET /refunds
+  (sandbox-verified: 200 + empty list for a refund-less payment).
+
 ## PayPal adapter (2026-07-07)
 
 - **`paypal` added as a first-class unified payment method type** in

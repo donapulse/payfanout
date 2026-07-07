@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useMemo, useState, type JSX } from "react";
 import { StripeClientAdapter } from "@payfanout/adapter-stripe";
 import { PaysafeClientAdapter } from "@payfanout/adapter-paysafe";
+import { GoCardlessClientAdapter } from "@payfanout/adapter-gocardless";
 import { PayPalClientAdapter } from "@payfanout/adapter-paypal";
 import { PayFanoutProvider, PaymentFields, usePay, usePayFanout, type PayResult } from "@payfanout/react";
 import { localizeError, PayFanoutError, type PaymentInfo } from "@payfanout/core";
@@ -23,6 +24,8 @@ const adapters = [
     apiKey: import.meta.env.VITE_PAYSAFE_PUBLIC_KEY ?? "replace_me_base64",
     environment: "sandbox",
   }),
+  // No client key at all: the session's clientSecret carries the hosted flow URL.
+  new GoCardlessClientAdapter({ environment: "sandbox" }),
   new PayPalClientAdapter({
     clientId: import.meta.env.VITE_PAYPAL_CLIENT_ID ?? "replace_me",
     environment: "sandbox",
@@ -37,6 +40,7 @@ const AMOUNT_LABEL = "$10.99";
 const APPEARANCE_BY_PSP: Record<string, Record<string, unknown>> = {
   stripe: { theme: "flat", variables: { colorPrimary: "#635bff", borderRadius: "8px" } },
   paysafe: { input: { "font-family": "system-ui, sans-serif", "font-size": "16px", color: "#32325d" } },
+  gocardless: { panel: { padding: "12px", background: "#f8f9fb", borderRadius: "8px", color: "#32325d" } },
   paypal: { layout: "vertical", label: "paypal", shape: "rect" },
 };
 
@@ -51,6 +55,7 @@ const SLOT_BOX: React.CSSProperties = {
 const CURRENCY_BY_PSP: Record<string, string> = {
   stripe: "USD",
   paysafe: import.meta.env.VITE_PAYSAFE_CURRENCY ?? "USD",
+  gocardless: "GBP", // one-off GoCardless bank payments are GBP/EUR only
   // The PayPal JS SDK fixes its currency at load time — the adapter defaults to USD.
   paypal: "USD",
   // "auto" lets the SERVER pick the PSP via PaymentRouter rules (by currency) —
@@ -61,6 +66,7 @@ const BILLING_BY_CURRENCY: Record<string, { country: string; postalCode: string 
   USD: { country: "US", postalCode: "10001" },
   CAD: { country: "CA", postalCode: "M5V 3L9" },
   EUR: { country: "DE", postalCode: "10115" },
+  GBP: { country: "GB", postalCode: "SW1A 1AA" },
 };
 
 export function App(): JSX.Element {

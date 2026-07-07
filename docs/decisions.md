@@ -194,6 +194,79 @@ choices they forced:
   the raw `kr-answer` (rawBody), the `kr-hash*` fields ride headers, and handing over
   the whole urlencoded IPN body is tolerated (the adapter extracts the fields itself).
 
+## GoCardless adapter (2026-07-07)
+
+- One-off bank payments ("Pay by Bank" / Instant Bank Pay) via **Billing Requests**:
+  the billing request id is `pspSessionId` and the hosted flow's `authorisation_url`
+  is `clientSecret`. Confirm-on-client shaped (`requiresServerCompletion: false`),
+  every method `flow: "redirect"` — bank authorisation is only permitted on
+  GoCardless-hosted UIs, so an embedded flow cannot honestly be claimed.
+- One-off payment requests are **GBP/EUR only**; the other GoCardless currencies need
+  mandate-based flows the adapter does not create in v1.
+- `payment_request.description` is **mandatory** (422 "can't be blank",
+  sandbox-verified 2026-07-07). `statementDescriptor` rides it — the
+  authorisation-screen text, not the bank statement line (`reference` is restricted
+  to PayTo/direct-settlement accounts) — falling back to `metadata.description`,
+  then a derived `Payment <id>` default.
+- **Flow creates are not idempotent at GoCardless** (sandbox-verified 2026-07-07: two
+  POST /billing_request_flows with the same Idempotency-Key returned two different
+  flow ids). Idempotency therefore lives at the billing-request level: a replayed
+  session returns the same billing request with a fresh authorisation URL (every flow
+  authorises that one billing request — no duplicate-payment risk), and the
+  conformance idempotency proof moved to refunds (same key twice → the original
+  refund, exactly one create).
+- Webhook deliveries are **batched** (up to 250 events, one HMAC over the raw body):
+  `parseWebhookEvent` throws on batched deliveries instead of dropping events;
+  `parseGoCardlessWebhookEvents` (verify once, fan out per event) is the documented
+  ingress. `billing_requests`/`fulfilled` maps to `payment.processing`, payment id
+  from `links.payment_request_payment`.
+- `supportsSavedPaymentMethods: false` in v1: mandates are genuinely reusable
+  charging handles, but async bank rails cannot meet the vault contract's
+  instantly-succeeded off-session charge; mandates-as-vault is future work.
+- `listRefunds` scopes with the server-side `?payment=` filter on GET /refunds
+  (sandbox-verified: 200 + empty list for a refund-less payment).
+
+## PayPal adapter (2026-07-07)
+
+- **`paypal` added as a first-class unified payment method type** in
+  `PAYMENT_METHOD_TYPES`. Additive vocabulary growth only — no contract semantics
+  changed, so this deliberately did not go through the "adapter contract change"
+  process (core + conformance + all adapters); conformance validates against the
+  const array and no exhaustive switches over the type exist outside adapters.
+- **Post-capture canonical id = the CAPTURE id.** PayPal order GETs stop answering a
+  few days after completion, while the capture is the durable money object refunds
+  and webhooks key on. `completePayment` therefore returns
+  `PaymentInfo.pspPaymentId` = capture id (order id pre-capture / for AUTHORIZE
+  intent), `retrievePayment` accepts either and falls back order → capture, and
+  `refundPayment` resolves order ids to their capture. Hosts are documented to
+  store the capture id.
+- **Webhook verification via PayPal's postback API**
+  (`POST /v1/notifications/verify-webhook-signature`), not local X.509 crypto:
+  stateless, edge-clean, and PayPal does the certificate work. The raw body is
+  spliced into the postback by string concatenation (parse + re-stringify breaks
+  PayPal's verification); a missing `webhookId`, missing transmission headers, or
+  transport trouble all answer `false` (fail closed, no network call where
+  detectable locally). Local crypto (CRC32 + SHA256withRSA over the cert from
+  `paypal-cert-url`) stays a documented optimization path, rejected for v1 because
+  WebCrypto cannot import X.509 certs without hand-rolled ASN.1.
+- **Sandbox-verified 2026-07-07:** orders created with `payment_source.paypal`
+  (always, for the experience_context) answer `PAYER_ACTION_REQUIRED` immediately —
+  not `CREATED` — so a fresh session reports `requires_action`; PATCH still works in
+  that state, and capture/authorize still 422 `ORDER_NOT_APPROVED`. The in-memory
+  fake mirrors this (bare orders without a payment_source keep `CREATED`).
+
+## Versioning policy (2026-07-07, explicit user decision)
+
+- **Independent package versioning.** The repo-wide `linked: [["@payfanout/*"]]`
+  group (a tooling default from the 2026-07-04 build, until now unconfirmed) is
+  removed: lock-step minors on untouched packages misrepresent what changed.
+  Only packages with a changeset take that bump; packages that merely depend on
+  a bumped package receive the `updateInternalDependencies: "patch"` bump that
+  published artifacts need for coherent internal dependency ranges.
+- The private workspaces `@payfanout/integration-tests` and `@payfanout/e2e`
+  join `payfanout-demo` in changesets `ignore` — never published, no version
+  churn.
+
 ## Open items requiring humans or infrastructure
 
 - Webhook delivery verification (both PSPs) needs a public URL/tunnel + real webhook

@@ -37,6 +37,7 @@ export const PAYMENT_METHOD_TYPES = [
   "card",
   "apple_pay",
   "google_pay",
+  "paypal",
   "ideal",
   "sepa_debit",
   "ach",

@@ -38,6 +38,96 @@ function makeAdapter(): GoCardlessServerAdapter {
 
 const key = (): string => `payfanout-int-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
+/** Raw seeding helper: customers/bank accounts/mandates are not adapter surface (vaulting is v1-deferred). */
+async function gcPost<T>(path: string, resource: string, body: unknown): Promise<T> {
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${ACCESS_TOKEN}`,
+      "gocardless-version": "2015-07-06",
+      "content-type": "application/json",
+      "idempotency-key": key(),
+    },
+    body: JSON.stringify({ [resource]: body }),
+  });
+  const json = (await res.json()) as Record<string, T>;
+  if (!res.ok) throw new Error(`${path} -> ${res.status}: ${JSON.stringify(json)}`);
+  return json[resource]!;
+}
+
+describeIf("GoCardless sandbox real transaction lifecycle", () => {
+  // Billing-request payments only materialize after the customer authorises in
+  // the GoCardless-hosted UI (no headless path exists), so this block seeds a
+  // mandate the classic way — customer -> bank account (sandbox test details)
+  // -> mandate -> payment — then drives the payment to `confirmed` with the
+  // sandbox scenario simulator. Everything lands visibly in the dashboard, and
+  // the adapter's read/refund surface is asserted against the real objects.
+  it("charges a seeded mandate, confirms it via the scenario simulator, and reads it back", async () => {
+    const adapter = makeAdapter();
+    const customer = await gcPost<{ id: string }>("/customers", "customers", {
+      email: "integration@payfanout.test",
+      given_name: "Integration",
+      family_name: "Test",
+      address_line1: "1 Test Street",
+      city: "London",
+      postal_code: "SW1A 1AA",
+      country_code: "GB",
+    });
+    const bankAccount = await gcPost<{ id: string }>("/customer_bank_accounts", "customer_bank_accounts", {
+      account_number: "55779911",
+      branch_code: "200000",
+      account_holder_name: "INTEGRATION TEST",
+      country_code: "GB",
+      links: { customer: customer.id },
+    });
+    const mandate = await gcPost<{ id: string }>("/mandates", "mandates", {
+      scheme: "bacs",
+      links: { customer_bank_account: bankAccount.id },
+    });
+    const payment = await gcPost<{ id: string }>("/payments", "payments", {
+      amount: 1234,
+      currency: "GBP",
+      description: "PayFanout integration lifecycle",
+      metadata: { payfanout_id: "int-gc-real-1" },
+      links: { mandate: mandate.id },
+    });
+
+    // A freshly charged mandate is money underway, never instant success.
+    const pending = await adapter.retrievePayment(payment.id);
+    expect(pending.status).toBe("processing");
+    expect(pending.amount).toBe(1234);
+    expect(pending.id).toBe("int-gc-real-1"); // metadata round-trip
+    expect(pending.mandateReference).toBeTruthy();
+
+    // payment_confirmed requires an activated mandate — activate it first.
+    await gcPost("/scenario_simulators/mandate_activated/actions/run", "data", {
+      links: { resource: mandate.id },
+    });
+    await gcPost("/scenario_simulators/payment_confirmed/actions/run", "data", {
+      links: { resource: payment.id },
+    });
+
+    const confirmed = await adapter.retrievePayment(payment.id);
+    expect(confirmed.status).toBe("succeeded");
+    expect(confirmed.paymentMethodType).toBe("bacs_debit");
+
+    // Refunds are account-gated: enabled -> a real refund lands; disabled ->
+    // the actionable invalid_request. The adapter's contract holds either way.
+    try {
+      const refund = await adapter.refundPayment({
+        pspPaymentId: payment.id,
+        amount: 200,
+        idempotencyKey: key(),
+      });
+      expect(["pending", "succeeded"]).toContain(refund.status);
+      expect((await adapter.retrievePayment(payment.id)).amountRefunded).toBe(200);
+    } catch (err) {
+      expect(err).toMatchObject({ code: "invalid_request" });
+      expect(String((err as Error).message)).toMatch(/refund/i);
+    }
+  });
+});
+
 describeIf("GoCardless sandbox integration", () => {
   it("creates a billing request + hosted flow and retrieves it via the session id", async () => {
     const adapter = makeAdapter();

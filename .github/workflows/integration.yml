@@ -37,10 +37,25 @@ jobs:
         env:
           STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
           PAYSAFE_USERNAME: ${{ secrets.PAYSAFE_USERNAME }}
+          GOCARDLESS_ACCESS_TOKEN: ${{ secrets.GOCARDLESS_ACCESS_TOKEN }}
+          PAYPAL_CLIENT_ID: ${{ secrets.PAYPAL_CLIENT_ID }}
+          PAYZEN_SHOP_ID: ${{ secrets.PAYZEN_SHOP_ID }}
         run: |
-          if [ -z "$STRIPE_SECRET_KEY" ] && [ -z "$PAYSAFE_USERNAME" ]; then
-            echo "::error::No sandbox secrets configured — set STRIPE_SECRET_KEY / PAYSAFE_* in repo secrets"
+          # The suites skip silently when a provider's env is absent, so a
+          # deleted/expired secret would otherwise turn drift detection into a
+          # green no-op. Fail for every provisioned provider; PayZen has no
+          # sandbox credentials yet and only warns until it does.
+          missing=""
+          [ -z "$STRIPE_SECRET_KEY" ] && missing="$missing STRIPE_SECRET_KEY"
+          [ -z "$PAYSAFE_USERNAME" ] && missing="$missing PAYSAFE_USERNAME"
+          [ -z "$GOCARDLESS_ACCESS_TOKEN" ] && missing="$missing GOCARDLESS_ACCESS_TOKEN"
+          [ -z "$PAYPAL_CLIENT_ID" ] && missing="$missing PAYPAL_CLIENT_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing sandbox secrets:$missing — these providers would silently skip"
             exit 1
+          fi
+          if [ -z "$PAYZEN_SHOP_ID" ]; then
+            echo "::warning::PAYZEN_SHOP_ID not configured — the PayZen integration suite will skip"
           fi
       - run: pnpm run test:integration
         env:

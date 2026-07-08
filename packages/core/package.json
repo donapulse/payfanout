@@ -1,6 +1,6 @@
 {
   "name": "@payfanout/core",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "license": "MIT",
   "description": "PayFanout unified payment domain model, adapter contracts, and normalization helpers. Zero PSP dependencies, zero persistence.",
   "type": "module",

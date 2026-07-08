@@ -1,5 +1,12 @@
 # @payfanout/conformance
 
+## 1.0.1
+
+### Patch Changes
+
+- Updated dependencies [cbb52de]
+  - @payfanout/core@1.0.1
+
 ## 1.0.0
 
 ### Major Changes

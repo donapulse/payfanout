@@ -5,7 +5,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, develop]
   pull_request:
   workflow_dispatch:
 
@@ -43,6 +43,26 @@ jobs:
       - name: Client/server package boundary check
         run: pnpm run check:boundaries
 
+  # Every PR that changes a published package must carry a changeset (opt out
+  # of a release note deliberately with an empty changeset: `pnpm changeset --empty`).
+  # Promotion/hotfix PRs target main and are exempt — their changesets are
+  # consumed by the release flow itself.
+  changesets:
+    if: github.event_name == 'pull_request' && github.base_ref == 'develop'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Changed published packages carry a changeset
+        run: pnpm exec changeset status --since=origin/develop
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -79,5 +99,5 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Build every publishable package (tsc emit -> dist)
         run: pnpm run build
-      - name: Smoke-load the built core package
-        run: node -e "import('./packages/core/dist/index.js').then((m) => { if (m.toMinorUnits(10.99, 'USD') !== 1099) throw new Error('dist smoke failed'); console.log('dist OK'); })"
+      - name: Smoke-load every published package's dist
+        run: node scripts/smoke-dist.mjs

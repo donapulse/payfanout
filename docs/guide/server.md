@@ -89,7 +89,10 @@ A **circuit breaker** (on by default, configurable via `circuitBreaker`) remembe
 outages: after 5 consecutive transient failures a PSP is skipped without paying its
 latency, half-opens after 30s for a probe, and closes on any response that proves it alive.
 If *every* candidate is open, they are attempted anyway, the breaker never turns an outage
-into a self-inflicted hard-down.
+into a self-inflicted hard-down. For dashboards, `getBreakerState()` snapshots the breaker
+per PSP (`consecutiveFailures`, `open`, `openUntil`) and `onBreakerStateChange` fires on
+open/close transitions, exception-isolated like `onAttempt`; note a custom `shouldFailover`
+also redefines what the breaker counts as transient.
 
 ## Retries, the machinery behind `retryable`
 

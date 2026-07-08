@@ -54,6 +54,11 @@ until it sees success.
 - **Dedupe is yours:** `event.id` is a stable key; keep the seen-set in your store.
 - **Ordering is not guaranteed** by any PSP, treat events as unordered facts and reconcile
   with `retrievePayment` when sequence matters.
+- **Batched deliveries (GoCardless):** the unified handlers process one event per
+  delivery — a batched GoCardless webhook (up to 250 events under one signature) makes
+  `parseWebhookEvent` throw instead of dropping events. Route GoCardless deliveries to
+  `parseGoCardlessWebhookEvents` (verify once, fan out per event) as shown in the
+  [GoCardless guide](/guide/gocardless).
 - **Money facts ride the event** where the PSP payload carries them: `event.amount` /
   `event.currency` (integer minor units) and `event.refundId` on refund-shaped events —
   most handlers never need a `retrievePayment` round-trip just to learn how much a

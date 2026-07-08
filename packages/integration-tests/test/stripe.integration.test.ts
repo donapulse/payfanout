@@ -25,7 +25,8 @@ function makeAdapter(): StripeServerAdapter {
   return new StripeServerAdapter({
     secretKey: SECRET_KEY!,
     apiVersion: API_VERSION,
-    webhookSigningSecret: process.env.STRIPE_WEBHOOK_SECRET ?? "whsec_not_used_in_these_tests",
+    // Unset CI secrets render as EMPTY strings, not undefined — || treats them as absent.
+    webhookSigningSecret: process.env.STRIPE_WEBHOOK_SECRET || "whsec_not_used_in_these_tests",
     environment: "sandbox",
   });
 }

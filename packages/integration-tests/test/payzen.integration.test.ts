@@ -16,7 +16,8 @@ import { PayZenServerAdapter } from "@payfanout/adapter-payzen-server";
 
 const SHOP_ID = process.env.PAYZEN_SHOP_ID;
 const PASSWORD = process.env.PAYZEN_PASSWORD;
-const BASE_URL = process.env.PAYZEN_BASE_URL ?? "https://api.payzen.eu/api-payment";
+// Unset CI secrets render as EMPTY strings, not undefined — || treats them as absent.
+const BASE_URL = process.env.PAYZEN_BASE_URL || "https://api.payzen.eu/api-payment";
 // PayZen selects TEST vs LIVE by the key, not the URL — only test-family
 // passwords may ever reach this suite.
 if (PASSWORD && !PASSWORD.startsWith("testpassword_")) {
@@ -33,7 +34,7 @@ function makeAdapter(): PayZenServerAdapter {
     password: PASSWORD!,
     environment: "sandbox",
     apiBaseUrl: BASE_URL,
-    hmacKey: process.env.PAYZEN_HMAC_KEY ?? "not-used-in-these-tests",
+    hmacKey: process.env.PAYZEN_HMAC_KEY || "not-used-in-these-tests",
   });
 }
 

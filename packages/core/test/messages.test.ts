@@ -67,6 +67,32 @@ describe("error message catalogs (i18n seam)", () => {
     expect(() => registerErrorMessages("  ", {})).toThrowError(/non-empty locale/);
   });
 
+  it("localizeError resolves per code through the region -> primary -> own-message chain", () => {
+    // A region catalog holding a single code must not hide the primary
+    // subtag's translations of every other code.
+    registerErrorMessages("qp", { rate_limited: "QP: too many requests." });
+    registerErrorMessages("qp-BR", { card_declined: "QP-BR: declined." });
+    const declined = new PayFanoutError({ code: "card_declined", message: "Card declined.", retryable: false });
+    const limited = new PayFanoutError({ code: "rate_limited", message: "Rate limited upstream.", retryable: true });
+    const unknown = new PayFanoutError({ code: "unknown", message: "Something specific happened.", retryable: false });
+
+    expect(localizeError(declined, "qp-BR")).toBe("QP-BR: declined.");
+    // Missing in qp-BR: falls back per code to qp — and agrees with getUserMessage.
+    expect(localizeError(limited, "qp-BR")).toBe("QP: too many requests.");
+    expect(localizeError(limited, "qp-BR")).toBe(getUserMessage("rate_limited", "qp-BR"));
+    // Missing in both: the error's own user-safe message.
+    expect(localizeError(unknown, "qp-BR")).toBe("Something specific happened.");
+  });
+
+  it("treats an empty-string translation as missing", () => {
+    // Deliberate: a blank catalog entry must never blank user-facing text,
+    // so lookups skip falsy values and keep falling back.
+    registerErrorMessages("qe", { card_declined: "" });
+    expect(getUserMessage("card_declined", "qe")).toBe(getUserMessage("card_declined"));
+    const declined = new PayFanoutError({ code: "card_declined", message: "Own message.", retryable: false });
+    expect(localizeError(declined, "qe")).toBe("Own message.");
+  });
+
   it("localizeError prefers the catalog but keeps the error's own message otherwise", () => {
     const declined = new PayFanoutError({
       code: "insufficient_funds",

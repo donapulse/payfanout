@@ -27,6 +27,13 @@ describe("currency exponents", () => {
   it("rejects malformed codes", () => {
     expect(() => getCurrencyExponent("US")).toThrowError(/Invalid ISO 4217/);
   });
+
+  it("trims surrounding whitespace before validating", () => {
+    expect(getCurrencyExponent(" USD ")).toBe(2);
+    expect(getCurrencyExponent("\tjpy\n")).toBe(0);
+    expect(toMinorUnits("10.99", " usd")).toBe(1099);
+    expect(() => getCurrencyExponent("US D")).toThrowError(/Invalid ISO 4217/);
+  });
 });
 
 describe("toMinorUnits", () => {
@@ -82,7 +89,10 @@ describe("toMinorUnits overflow and exotic notation", () => {
   });
 
   it("handles small scientific-notation numbers via exact expansion", () => {
-    expect(toMinorUnits(1e-2, "USD")).toBe(1); // String(0.01) is "0.01", but 1e-7 style inputs hit toFixed
+    expect(toMinorUnits(1e-2, "USD")).toBe(1); // String(0.01) is "0.01" — no expansion needed
+    // String(1.5e-7) is "1.5e-7": the toFixed expansion path must surface the
+    // sub-cent digits so precision validation still rejects them.
+    expect(() => toMinorUnits(1.5e-7, "USD")).toThrowError(/more precision/);
   });
 });
 

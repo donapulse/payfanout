@@ -50,6 +50,22 @@ describe("withRetry", () => {
     expect(sleeps).toHaveLength(2);
   });
 
+  it("makes exactly one attempt and never sleeps with retries: 0", async () => {
+    const { sleeps, sleep } = fakeSleep();
+    let calls = 0;
+    await expect(
+      withRetry(
+        async () => {
+          calls += 1;
+          throw transient();
+        },
+        { retries: 0, sleep },
+      ),
+    ).rejects.toMatchObject({ code: "psp_unavailable" });
+    expect(calls).toBe(1);
+    expect(sleeps).toEqual([]);
+  });
+
   it("rethrows non-retryable errors immediately — declines are never replayed", async () => {
     let calls = 0;
     await expect(

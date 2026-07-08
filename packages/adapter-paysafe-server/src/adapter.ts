@@ -1,7 +1,15 @@
 import {
   assertMinorUnitAmount,
+  classifyHttpFallback,
+  getUserMessage,
+  lowercaseKeys,
   normalizeCurrency,
+  normalizeSecrets,
   PayFanoutError,
+  requestWithTimeout,
+  safeJson,
+  utf8ToBase64,
+  withTransportRetries,
   type AdapterCapabilities,
   type ChargeSavedPaymentMethodInput,
   type CompletePaymentInput,
@@ -25,7 +33,6 @@ import {
   type UpdatePaymentSessionInput,
   type VerifyPaymentMethodInput,
 } from "@payfanout/core";
-import { utf8ToBase64 } from "./crypto-utils.js";
 import {
   decodeSessionContext,
   encodeSessionContext,
@@ -177,7 +184,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     for (const key of ["username", "password", "sessionSigningKey"] as const) {
       if (!config[key]) throw PayFanoutError.invalidRequest(`PaysafeServerAdapter config.${key} is required`);
     }
-    if (webhookKeysOf(config).length === 0) {
+    if (normalizeSecrets(config.webhookHmacKey).length === 0) {
       throw PayFanoutError.invalidRequest(
         "PaysafeServerAdapter config.webhookHmacKey is required (one key, or several during rotation)",
       );
@@ -649,7 +656,11 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   }
 
   async verifyWebhookSignature(rawBody: string, headers: Record<string, string>): Promise<boolean> {
-    return verifyPaysafeWebhookSignature(rawBody, lowercaseKeys(headers), webhookKeysOf(this.config));
+    return verifyPaysafeWebhookSignature(
+      rawBody,
+      lowercaseKeys(headers),
+      normalizeSecrets(this.config.webhookHmacKey),
+    );
   }
 
   async parseWebhookEvent(rawBody: string): Promise<UnifiedWebhookEvent> {
@@ -721,93 +732,48 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   /**
    * Transport with timeout + transient-only retries. Safe to retry mutating
    * calls: every one carries an idempotent merchantRefNum, so a replay can
-   * never double-charge. Business errors (4xx other than 429) never retry.
+   * never double-charge. Business errors (4xx other than 429) never retry —
+   * core's isTransportRetryable deliberately ignores `error.retryable` (3406,
+   * unbatched settlement, is retryable *hours* later, not milliseconds).
    */
-  private async request<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
-    const attempts = 1 + (this.config.maxNetworkRetries ?? 2);
-    const sleep = this.config.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-    let lastError: PayFanoutError | undefined;
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      try {
-        return await this.requestOnce<T>(method, path, body);
-      } catch (err) {
-        if (!(err instanceof PayFanoutError) || !isTransportRetryable(err) || attempt === attempts) throw err;
-        lastError = err;
-        await sleep(Math.min(2000, 250 * 2 ** (attempt - 1)));
-      }
-    }
-    /* c8 ignore next -- the loop always returns or throws */
-    throw lastError ?? PayFanoutError.invalidRequest("unreachable");
+  private request<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
+    return withTransportRetries(() => this.requestOnce<T>(method, path, body), {
+      attempts: 1 + (this.config.maxNetworkRetries ?? 2),
+      sleep: this.config.sleep,
+    });
   }
 
   private async requestOnce<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
-    const doFetch = this.config.fetch ?? fetch;
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
-    // A hung PSP connection must not hang the host's request handler. The
-    // timer stays armed until the BODY is read — a response can stall after
-    // its headers arrive, and response.text() would otherwise wait forever.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let response: Response;
-    let text: string;
-    try {
-      response = await doFetch(`${this.baseUrl}${path}`, {
+    const { response, text } = await requestWithTimeout(
+      {
+        fetch: this.config.fetch ?? fetch,
+        timeoutMs,
+        onFailure: (timedOut, cause) =>
+          new PayFanoutError({
+            code: "psp_unavailable",
+            message: timedOut
+              ? `Paysafe did not respond within ${timeoutMs}ms.`
+              : "Could not reach Paysafe.",
+            retryable: true,
+            raw: cause,
+            pspName: this.pspName,
+          }),
+      },
+      `${this.baseUrl}${path}`,
+      {
         method,
         headers: {
           authorization: `Basic ${utf8ToBase64(`${this.config.username}:${this.config.password}`)}`,
           "content-type": "application/json",
         },
-        signal: controller.signal,
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-      });
-      text = await readBodyWithSignal(response, controller.signal);
-    } catch (err) {
-      const timedOut = controller.signal.aborted;
-      throw new PayFanoutError({
-        code: "psp_unavailable",
-        message: timedOut
-          ? `Paysafe did not respond within ${timeoutMs}ms.`
-          : "Could not reach Paysafe.",
-        retryable: true,
-        raw: err,
-        pspName: this.pspName,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
+      },
+    );
     const json = text ? safeJson(text) : undefined;
     if (!response.ok) throw mapPaysafeError(response.status, json ?? text);
     return json as T;
   }
-}
-
-/**
- * Transport-level trouble only: network failure/timeout (psp_unavailable),
- * HTTP 5xx, or 429. NOT `error.retryable` — 3406
- * (unbatched settlement) is retryable *hours* later, not milliseconds.
- */
-function isTransportRetryable(error: PayFanoutError): boolean {
-  if (error.code === "rate_limited") return true;
-  if (error.code !== "psp_unavailable") return false;
-  return true;
-}
-
-/**
- * Reads the response body under the request's abort signal. Native fetch
- * bodies reject on abort by themselves; the explicit race also bounds
- * injected transports whose Responses are not tied to the signal.
- */
-function readBodyWithSignal(response: Response, signal: AbortSignal): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    if (signal.aborted) {
-      reject(new Error("Paysafe response body read aborted"));
-      return;
-    }
-    signal.addEventListener("abort", () => reject(new Error("Paysafe response body read aborted")), {
-      once: true,
-    });
-    response.text().then(resolve, reject);
-  });
 }
 
 /** Paysafe card.type codes → lowercase brand names hosts can render. */
@@ -863,11 +829,6 @@ function isDuplicateCustomerError(err: unknown): boolean {
   if (!(err instanceof PayFanoutError)) return false;
   const code = (err.raw as { error?: { code?: string } } | undefined)?.error?.code;
   return code === "7505";
-}
-
-function webhookKeysOf(config: PaysafeServerAdapterConfig): string[] {
-  const raw = config.webhookHmacKey;
-  return (Array.isArray(raw) ? raw : [raw]).filter((k): k is string => typeof k === "string" && k.length > 0);
 }
 
 function mapRefundStatus(status: string | undefined): RefundResult["status"] {
@@ -930,45 +891,16 @@ export function mapPaysafeError(httpStatus: number, body: unknown): PayFanoutErr
     retryable = code === "processing_error";
   } else if (httpStatus === 402) {
     code = "card_declined";
-  } else if (httpStatus === 429) {
-    code = "rate_limited";
-    retryable = true;
-  } else if (httpStatus >= 500) {
-    code = "psp_unavailable";
-    retryable = true;
   } else {
-    code = "invalid_request";
+    ({ code, retryable } = classifyHttpFallback(httpStatus));
   }
   return new PayFanoutError({
     code,
-    message: userMessageFor(code),
+    message: getUserMessage(code),
     retryable,
     raw: body,
     pspName: PAYSAFE_PSP_NAME,
   });
-}
-
-function userMessageFor(code: UnifiedErrorCode): string {
-  switch (code) {
-    case "insufficient_funds":
-      return "Your card has insufficient funds.";
-    case "expired_card":
-      return "Your card has expired.";
-    case "invalid_card_data":
-      return "The card details are invalid.";
-    case "card_declined":
-      return "Your card was declined.";
-    case "fraud_suspected":
-      return "Your card was declined.";
-    case "rate_limited":
-      return "Too many requests — please retry shortly.";
-    case "processing_error":
-      return "The operation cannot be processed yet — please try again later.";
-    case "psp_unavailable":
-      return "The payment provider is temporarily unavailable.";
-    default:
-      return "The payment request was invalid.";
-  }
 }
 
 function toPaysafeBillingDetails(
@@ -983,18 +915,4 @@ function toPaysafeBillingDetails(
     ...(address.country ? { country: address.country } : {}),
   };
   return Object.keys(mapped).length > 0 ? { billingDetails: mapped } : undefined;
-}
-
-function safeJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-}
-
-function lowercaseKeys(headers: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(headers ?? {})) out[key.toLowerCase()] = value;
-  return out;
 }

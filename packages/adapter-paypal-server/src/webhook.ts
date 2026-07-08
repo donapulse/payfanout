@@ -1,11 +1,13 @@
 import {
+  lowercaseKeys,
   normalizeCurrency,
+  normalizeTime,
   PayFanoutError,
+  sha256Hex,
   type MinorUnitAmount,
   type UnifiedWebhookEvent,
   type UnifiedWebhookEventType,
 } from "@payfanout/core";
-import { sha256Hex } from "./crypto-utils.js";
 import { PAYPAL_PSP_NAME } from "./error-map.js";
 import { fromPayPalValue } from "./money.js";
 
@@ -215,16 +217,4 @@ export function captureIdFromLinks(links: PayPalLink[] | undefined): string | un
     if (match) return match[1];
   }
   return undefined;
-}
-
-function normalizeTime(value: string | undefined): string {
-  const parsed = value ? Date.parse(value) : Number.NaN;
-  // Deterministic fallback: a missing timestamp is the PSP's omission, not ours.
-  return Number.isNaN(parsed) ? "1970-01-01T00:00:00.000Z" : new Date(parsed).toISOString();
-}
-
-function lowercaseKeys(headers: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(headers ?? {})) out[key.toLowerCase()] = value;
-  return out;
 }

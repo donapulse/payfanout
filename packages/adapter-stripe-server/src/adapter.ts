@@ -1,7 +1,9 @@
 import {
   assertMinorUnitAmount,
   getCurrencyExponent,
+  lowercaseKeys,
   normalizeCurrency,
+  normalizeSecrets,
   PayFanoutError,
   type AdapterCapabilities,
   type ChargeSavedPaymentMethodInput,
@@ -75,7 +77,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
         throw PayFanoutError.invalidRequest(`StripeServerAdapter config.${key} is required`);
       }
     }
-    if (webhookSecretsOf(config).length === 0) {
+    if (normalizeSecrets(config.webhookSigningSecret).length === 0) {
       throw PayFanoutError.invalidRequest(
         "StripeServerAdapter config.webhookSigningSecret is required (one secret, or several during rotation)",
       );
@@ -466,7 +468,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     return verifyStripeWebhookSignature(
       rawBody,
       lowercaseKeys(headers),
-      webhookSecretsOf(this.config),
+      normalizeSecrets(this.config.webhookSigningSecret),
       this.config.webhookToleranceSeconds ?? 300,
       (this.config.now ?? Date.now)(),
     );
@@ -619,11 +621,6 @@ function withPayfanoutId(
   return { ...metadata, payfanout_id: id };
 }
 
-function webhookSecretsOf(config: StripeServerAdapterConfig): string[] {
-  const raw = config.webhookSigningSecret;
-  return (Array.isArray(raw) ? raw : [raw]).filter((s): s is string => typeof s === "string" && s.length > 0);
-}
-
 /**
  * statementDescriptor -> statement_descriptor_suffix: on card charges Stripe
  * composes <account prefix>* <suffix>; the standalone statement_descriptor
@@ -770,12 +767,6 @@ function extractMandate(charge: StripeChargeLike | undefined): string | undefine
 function isNotAttachedError(err: unknown): boolean {
   const e = err as { type?: string; message?: string } | undefined;
   return e?.type === "StripeInvalidRequestError" && /not attached/i.test(e?.message ?? "");
-}
-
-function lowercaseKeys(headers: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(headers ?? {})) out[key.toLowerCase()] = value;
-  return out;
 }
 
 async function loadStripeSdk(config: StripeServerAdapterConfig): Promise<StripeClientLike> {

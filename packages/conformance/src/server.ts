@@ -14,6 +14,7 @@ import {
   type ServerPaymentAdapter,
   type UnifiedErrorCode,
   type UnifiedWebhookEventType,
+  validateAdapterCapabilities,
 } from "@payfanout/core";
 
 /**
@@ -114,31 +115,10 @@ export function runServerAdapterConformanceTests(
     it("reports coherent capabilities", () => {
       const adapter = makeAdapter();
       const caps = adapter.getCapabilities();
-      expect(caps.pspName).toBe(adapter.pspName);
+      // The full flag/surface rule table lives in core — the same one
+      // @payfanout/server enforces at registration, so the two cannot drift.
+      expect(validateAdapterCapabilities(adapter)).toEqual([]);
       expect(adapter.pspName.length).toBeGreaterThan(0);
-      // Vaulting is PSP-side only; claiming it demands the full surface.
-      if (caps.supportsSavedPaymentMethods) {
-        expect(typeof adapter.createCustomer).toBe("function");
-        expect(typeof adapter.listSavedPaymentMethods).toBe("function");
-        expect(typeof adapter.deleteSavedPaymentMethod).toBe("function");
-        expect(typeof adapter.chargeSavedPaymentMethod).toBe("function");
-        if (caps.requiresServerCompletion) expect(typeof adapter.savePaymentMethod).toBe("function");
-      }
-      if (caps.supportsPartialRefunds) expect(caps.supportsRefunds).toBe(true);
-      if (caps.requiresServerCompletion) expect(typeof adapter.completePayment).toBe("function");
-      if (caps.supportsManualCapture) expect(typeof adapter.capturePayment).toBe("function");
-      if (caps.supportsMultiCapture) expect(caps.supportsManualCapture).toBe(true);
-      if (caps.supportsPaymentMethodVerification) {
-        expect(typeof adapter.verifyPaymentMethod).toBe("function");
-      }
-      // Pending refunds must be pollable — refund support implies retrieveRefund.
-      if (caps.supportsRefunds) expect(typeof adapter.retrieveRefund).toBe("function");
-      if (caps.supportsSessionUpdate) expect(typeof adapter.updatePaymentSession).toBe("function");
-      if (caps.supportsEventPolling) expect(typeof adapter.fetchEvents).toBe("function");
-      if (caps.supportsListing) {
-        expect(typeof adapter.listPayments).toBe("function");
-        expect(typeof adapter.listRefunds).toBe("function");
-      }
       expect(caps.paymentMethods.length).toBeGreaterThan(0);
       for (const method of caps.paymentMethods) {
         expect(PAYMENT_METHOD_TYPES).toContain(method.type);

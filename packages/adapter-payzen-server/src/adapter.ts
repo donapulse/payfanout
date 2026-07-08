@@ -1,7 +1,15 @@
 import {
   assertMinorUnitAmount,
+  classifyHttpFallback,
+  getUserMessage,
   normalizeCurrency,
+  normalizeSecrets,
   PayFanoutError,
+  requestWithTimeout,
+  safeJson,
+  sha256Hex,
+  utf8ToBase64,
+  withTransportRetries,
   type AdapterCapabilities,
   type CreatePaymentSessionInput,
   type MinorUnitAmount,
@@ -17,7 +25,6 @@ import {
   type UnifiedPaymentStatus,
   type UnifiedWebhookEvent,
 } from "@payfanout/core";
-import { sha256Hex, utf8ToBase64 } from "./crypto-utils.js";
 import { parsePayZenWebhookEvent, verifyPayZenWebhookSignature } from "./webhook.js";
 
 export const PAYZEN_PSP_NAME = "payzen";
@@ -164,7 +171,7 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
 
   constructor(config: PayZenServerAdapterConfig) {
     if (!config.shopId) throw PayFanoutError.invalidRequest("PayZenServerAdapter config.shopId is required");
-    const passwords = keyList(config.password);
+    const passwords = normalizeSecrets(config.password);
     if (passwords.length === 0) {
       throw PayFanoutError.invalidRequest(
         "PayZenServerAdapter config.password is required (one key, or several during rotation)",
@@ -429,8 +436,8 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
 
   async verifyWebhookSignature(rawBody: string, headers: Record<string, string>): Promise<boolean> {
     return verifyPayZenWebhookSignature(rawBody, headers, {
-      passwords: keyList(this.config.password),
-      hmacKeys: keyList(this.config.hmacKey),
+      passwords: normalizeSecrets(this.config.password),
+      hmacKeys: normalizeSecrets(this.config.hmacKey),
     });
   }
 
@@ -520,82 +527,64 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
     body: Record<string, unknown>,
     opts: { retryTransport?: boolean } = {},
   ): Promise<T> {
-    const attempts = (opts.retryTransport ?? true) ? 1 + (this.config.maxNetworkRetries ?? 2) : 1;
-    const sleep = this.config.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-    let envelope: PayZenEnvelopeLike | undefined;
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      try {
-        envelope = await this.requestOnce(operation, body);
-        break;
-      } catch (err) {
-        // Only requestOnce's transport-level failures carry retryable: true.
-        if (!(err instanceof PayFanoutError) || !err.retryable) throw err;
-        if (opts.retryTransport === false) {
-          throw new PayFanoutError({
-            code: err.code,
-            message:
-              `${err.message} The outcome of ${operation} is unknown — it may have been applied. ` +
-              "Do not retry blindly: re-read the payment (amountRefunded) first.",
-            retryable: false,
-            raw: err.raw,
-            pspName: this.pspName,
-          });
-        }
-        if (attempt === attempts) throw err;
-        await sleep(Math.min(2000, 250 * 2 ** (attempt - 1)));
-      }
+    const retryTransport = opts.retryTransport ?? true;
+    let envelope: PayZenEnvelopeLike;
+    try {
+      envelope = await withTransportRetries(() => this.requestOnce(operation, body), {
+        attempts: retryTransport ? 1 + (this.config.maxNetworkRetries ?? 2) : 1,
+        sleep: this.config.sleep,
+      });
+    } catch (err) {
+      // Only requestOnce's transport-level failures carry retryable: true.
+      if (retryTransport || !(err instanceof PayFanoutError) || !err.retryable) throw err;
+      throw new PayFanoutError({
+        code: err.code,
+        message:
+          `${err.message} The outcome of ${operation} is unknown — it may have been applied. ` +
+          "Do not retry blindly: re-read the payment (amountRefunded) first.",
+        retryable: false,
+        raw: err.raw,
+        pspName: this.pspName,
+      });
     }
-    if (envelope?.status !== "SUCCESS") {
-      throw mapPayZenError(envelope?.answer as PayZenErrorAnswerLike | undefined, envelope);
+    if (envelope.status !== "SUCCESS") {
+      throw mapPayZenError(envelope.answer as PayZenErrorAnswerLike | undefined, envelope);
     }
     return envelope.answer as T;
   }
 
   private async requestOnce(operation: string, body: Record<string, unknown>): Promise<PayZenEnvelopeLike> {
-    const doFetch = this.config.fetch ?? fetch;
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
-    // A hung PSP connection must not hang the host's request handler. The
-    // timer stays armed until the BODY is read — a response can stall after
-    // its headers arrive, and response.text() would otherwise wait forever.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let response: Response;
-    let text: string;
-    try {
-      response = await doFetch(`${this.baseUrl}/V4/${operation}`, {
+    const { response, text } = await requestWithTimeout(
+      {
+        fetch: this.config.fetch ?? fetch,
+        timeoutMs,
+        onFailure: (timedOut, cause) =>
+          new PayFanoutError({
+            code: "psp_unavailable",
+            message: timedOut ? `PayZen did not respond within ${timeoutMs}ms.` : "Could not reach PayZen.",
+            retryable: true,
+            raw: cause,
+            pspName: this.pspName,
+          }),
+      },
+      `${this.baseUrl}/V4/${operation}`,
+      {
         method: "POST",
         headers: {
-          authorization: `Basic ${utf8ToBase64(`${this.config.shopId}:${keyList(this.config.password)[0]}`)}`,
+          authorization: `Basic ${utf8ToBase64(`${this.config.shopId}:${normalizeSecrets(this.config.password)[0]}`)}`,
           "content-type": "application/json",
         },
-        signal: controller.signal,
         body: JSON.stringify(body),
-      });
-      text = await readBodyWithSignal(response, controller.signal);
-    } catch (err) {
-      const timedOut = controller.signal.aborted;
-      throw new PayFanoutError({
-        code: "psp_unavailable",
-        message: timedOut ? `PayZen did not respond within ${timeoutMs}ms.` : "Could not reach PayZen.",
-        retryable: true,
-        raw: err,
-        pspName: this.pspName,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
+      },
+    );
     // Non-200s only ever come from infrastructure in front of the gateway
     // (the API itself answers 200 + an ERROR envelope) — map by HTTP status.
     if (!response.ok) {
-      const retryable = response.status === 429 || response.status >= 500;
+      const { code, retryable } = classifyHttpFallback(response.status);
       throw new PayFanoutError({
-        code: response.status === 429 ? "rate_limited" : response.status >= 500 ? "psp_unavailable" : "invalid_request",
-        message:
-          response.status === 429
-            ? "Too many requests — please retry shortly."
-            : response.status >= 500
-              ? "The payment provider is temporarily unavailable."
-              : "The payment request was invalid.",
+        code,
+        message: getUserMessage(code),
         retryable,
         raw: safeJson(text) ?? text,
         pspName: this.pspName,
@@ -628,10 +617,6 @@ export async function derivePayZenOrderId(idempotencyKey: string): Promise<strin
   const direct = `pf-${sanitized}`;
   if (sanitized === idempotencyKey && direct.length <= 64) return direct;
   return `pf-${sanitized.slice(0, 52)}-${(await sha256Hex(idempotencyKey)).slice(0, 8)}`;
-}
-
-function keyList(raw: string | string[] | undefined): string[] {
-  return (Array.isArray(raw) ? raw : [raw]).filter((k): k is string => typeof k === "string" && k.length > 0);
 }
 
 const SUCCEEDED_STATUSES = new Set(["AUTHORISED", "CAPTURED", "ACCEPTED", "PRE_AUTHORISED"]);
@@ -810,37 +795,11 @@ export function mapPayZenError(answer: PayZenErrorAnswerLike | undefined, raw: u
     message:
       errorCode === "INT_905"
         ? "PayZen rejected the API credentials — check shopId, password, and that they match the configured environment."
-        : userMessageFor(code),
+        : getUserMessage(code),
     retryable,
     raw,
     pspName: PAYZEN_PSP_NAME,
   });
-}
-
-function userMessageFor(code: UnifiedErrorCode): string {
-  switch (code) {
-    case "insufficient_funds":
-      return "Your card has insufficient funds.";
-    case "expired_card":
-      return "Your card has expired.";
-    case "invalid_card_data":
-      return "The card details are invalid.";
-    case "card_declined":
-    case "fraud_suspected":
-      return "Your card was declined.";
-    case "authentication_required":
-      return "Additional authentication is required.";
-    case "session_expired":
-      return "Your payment session has expired — please start again.";
-    case "rate_limited":
-      return "Too many requests — please retry shortly.";
-    case "processing_error":
-      return "The operation cannot be processed yet — please try again later.";
-    case "psp_unavailable":
-      return "The payment provider is temporarily unavailable.";
-    default:
-      return "The payment request was invalid.";
-  }
 }
 
 function toPayZenCustomer(input: CreatePaymentSessionInput): Record<string, unknown> | undefined {
@@ -888,30 +847,4 @@ function toPayZenShippingDetails(
     ...(shipping.address?.country ? { country: shipping.address.country } : {}),
   };
   return Object.keys(mapped).length > 0 ? mapped : undefined;
-}
-
-function safeJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Reads the response body under the request's abort signal. Native fetch
- * bodies reject on abort by themselves; the explicit race also bounds
- * injected transports whose Responses are not tied to the signal.
- */
-function readBodyWithSignal(response: Response, signal: AbortSignal): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    if (signal.aborted) {
-      reject(new Error("PayZen response body read aborted"));
-      return;
-    }
-    signal.addEventListener("abort", () => reject(new Error("PayZen response body read aborted")), {
-      once: true,
-    });
-    response.text().then(resolve, reject);
-  });
 }

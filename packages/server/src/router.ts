@@ -82,6 +82,9 @@ export interface PaymentRouterOptions {
    * rate_limited, processing_error). Business rejections (invalid_request,
    * card_declined, …) abort the cascade — retrying them elsewhere would
    * produce surprise duplicate sessions for a request that is simply wrong.
+   * The circuit breaker counts exactly the failures this predicate cascades
+   * on, so a custom predicate also redefines what the breaker treats as
+   * transient (anything else closes the circuit as proof of life).
    */
   shouldFailover?: (error: PayFanoutError) => boolean;
   /**
@@ -90,6 +93,13 @@ export interface PaymentRouterOptions {
    * wins over observability, so never rely on this hook for control flow.
    */
   onAttempt?: (attempt: { pspName: string; ok: boolean; skipped?: boolean; error?: PayFanoutError }) => void;
+  /**
+   * Observability: fired when a PSP's circuit opens (starts being skipped) or
+   * closes (a response proved it alive). A failed half-open probe restarts the
+   * cooldown without re-firing "opened" — the circuit never closed in between.
+   * Exception-isolated like onAttempt.
+   */
+  onBreakerStateChange?: (event: { pspName: string; state: "opened" | "closed" }) => void;
   /** On by default; pass `false` to disable outage memory entirely. */
   circuitBreaker?: CircuitBreakerOptions | false;
 }
@@ -111,6 +121,7 @@ export class PaymentRouter {
   private readonly defaultChain: string[];
   private readonly shouldFailover: (error: PayFanoutError) => boolean;
   private readonly onAttempt?: PaymentRouterOptions["onAttempt"];
+  private readonly onBreakerStateChange?: PaymentRouterOptions["onBreakerStateChange"];
   private readonly breaker: Required<CircuitBreakerOptions> | undefined;
   private readonly breakerState = new Map<string, BreakerState>();
 
@@ -120,6 +131,7 @@ export class PaymentRouter {
     this.defaultChain = options.defaultChain ?? options.service.listPsps();
     this.shouldFailover = options.shouldFailover ?? defaultShouldFailover;
     this.onAttempt = options.onAttempt;
+    this.onBreakerStateChange = options.onBreakerStateChange;
     this.breaker =
       options.circuitBreaker === false
         ? undefined
@@ -215,6 +227,27 @@ export class PaymentRouter {
     });
   }
 
+  /**
+   * Read-only breaker snapshot for dashboards/health endpoints, keyed by
+   * pspName. Only PSPs with recorded consecutive failures appear. `open` means
+   * "currently skipped"; `openUntil` (present once the circuit has opened) is
+   * when the current cooldown ends — in the past, the circuit is half-open and
+   * the next request probes the PSP.
+   */
+  getBreakerState(): Record<string, { consecutiveFailures: number; open: boolean; openUntil?: string }> {
+    const snapshot: Record<string, { consecutiveFailures: number; open: boolean; openUntil?: string }> = {};
+    for (const [pspName, state] of this.breakerState) {
+      snapshot[pspName] = {
+        consecutiveFailures: state.consecutiveFailures,
+        open: this.isCircuitOpen(pspName),
+        ...(this.breaker && state.openedAt !== undefined
+          ? { openUntil: new Date(state.openedAt + this.breaker.cooldownMs).toISOString() }
+          : {}),
+      };
+    }
+    return snapshot;
+  }
+
   /** Open = threshold reached and still inside the cooldown window (after it: half-open, probe allowed). */
   private isCircuitOpen(pspName: string): boolean {
     if (!this.breaker) return false;
@@ -232,8 +265,12 @@ export class PaymentRouter {
    */
   private recordOutcome(pspName: string, error: PayFanoutError | undefined): void {
     if (!this.breaker) return;
+    // "Open" for transition purposes = openedAt set: half-open still counts,
+    // so a recovered probe fires "closed" and a failed one repeats nothing.
+    const wasOpen = this.breakerState.get(pspName)?.openedAt !== undefined;
     if (error === undefined || !this.shouldFailover(error)) {
       this.breakerState.delete(pspName);
+      if (wasOpen) this.emitBreakerChange(pspName, "closed");
       return;
     }
     const state = this.breakerState.get(pspName) ?? { consecutiveFailures: 0 };
@@ -242,6 +279,15 @@ export class PaymentRouter {
       state.openedAt = this.breaker.now();
     }
     this.breakerState.set(pspName, state);
+    if (!wasOpen && state.openedAt !== undefined) this.emitBreakerChange(pspName, "opened");
+  }
+
+  private emitBreakerChange(pspName: string, state: "opened" | "closed"): void {
+    try {
+      this.onBreakerStateChange?.({ pspName, state });
+    } catch {
+      // Observability must never break routing.
+    }
   }
 
   /**

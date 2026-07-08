@@ -25,6 +25,7 @@ import {
   type ServerPaymentAdapter,
   type UnifiedErrorCode,
   type UpdatePaymentSessionInput,
+  validateAdapterCapabilities,
   type VerifyPaymentMethodInput,
 } from "@payfanout/core";
 
@@ -396,83 +397,13 @@ function ensurePspName(error: PayFanoutError, pspName: string): PayFanoutError {
   return attributed;
 }
 
-/** Fails fast at registration if capability flags contradict the implemented surface. */
+/**
+ * Fails fast at registration if capability flags contradict the implemented
+ * surface. The rule table lives in core (`validateAdapterCapabilities`) — the
+ * same one the conformance suite asserts — so the two can never drift; the
+ * service rejects on the first violation.
+ */
 function assertCapabilityCoherence(adapter: ServerPaymentAdapter): void {
-  const caps = adapter.getCapabilities();
-  if (caps.pspName !== adapter.pspName) {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" reports capabilities for "${caps.pspName}"`,
-    );
-  }
-  if (caps.requiresServerCompletion && typeof adapter.completePayment !== "function") {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" requires server completion but does not implement completePayment`,
-    );
-  }
-  if (caps.supportsManualCapture && typeof adapter.capturePayment !== "function") {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" claims manual capture but does not implement capturePayment`,
-    );
-  }
-  if (caps.supportsPaymentMethodVerification && typeof adapter.verifyPaymentMethod !== "function") {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" claims verification but does not implement verifyPaymentMethod`,
-    );
-  }
-  if (caps.supportsPartialRefunds && !caps.supportsRefunds) {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" claims partial refunds without refund support`,
-    );
-  }
-  if (caps.supportsRefunds && typeof adapter.retrieveRefund !== "function") {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" supports refunds but does not implement retrieveRefund — ` +
-        "pending refunds would be unpollable",
-    );
-  }
-  if (caps.supportsMultiCapture && !caps.supportsManualCapture) {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" claims multi-capture without manual capture support`,
-    );
-  }
-  if (caps.supportsSessionUpdate && typeof adapter.updatePaymentSession !== "function") {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" claims session update but does not implement updatePaymentSession`,
-    );
-  }
-  if (caps.supportsEventPolling && typeof adapter.fetchEvents !== "function") {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" claims event polling but does not implement fetchEvents`,
-    );
-  }
-  if (
-    caps.supportsListing &&
-    (typeof adapter.listPayments !== "function" || typeof adapter.listRefunds !== "function")
-  ) {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" claims listing but does not implement listPayments/listRefunds`,
-    );
-  }
-  // The saved-payment-methods flag demands the full method surface. Cards
-  // still live at the PSP only — the coherence rule is about implemented
-  // methods, not about storing card data (never).
-  if (caps.supportsSavedPaymentMethods) {
-    for (const method of [
-      "createCustomer",
-      "listSavedPaymentMethods",
-      "deleteSavedPaymentMethod",
-      "chargeSavedPaymentMethod",
-    ] as const) {
-      if (typeof adapter[method] !== "function") {
-        throw PayFanoutError.invalidRequest(
-          `Adapter "${adapter.pspName}" claims saved payment methods but does not implement ${method}`,
-        );
-      }
-    }
-    if (caps.requiresServerCompletion && typeof adapter.savePaymentMethod !== "function") {
-      throw PayFanoutError.invalidRequest(
-        `Adapter "${adapter.pspName}" is tokenize-first with saved payment methods but does not implement savePaymentMethod`,
-      );
-    }
-  }
+  const issues = validateAdapterCapabilities(adapter);
+  if (issues.length > 0) throw PayFanoutError.invalidRequest(issues[0]!);
 }

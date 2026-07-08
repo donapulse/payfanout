@@ -8,7 +8,7 @@ export {
   type PayPalRefundLike,
   type PayPalServerAdapterConfig,
 } from "./adapter.js";
-export { derivePayPalRequestId } from "./crypto-utils.js";
+export { derivePayPalRequestId } from "./request-id.js";
 export { mapPayPalError, PAYPAL_PSP_NAME } from "./error-map.js";
 export { fromPayPalValue, PAYPAL_SUPPORTED_CURRENCIES, toPayPalValue } from "./money.js";
 export {

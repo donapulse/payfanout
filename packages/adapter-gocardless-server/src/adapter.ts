@@ -1,7 +1,13 @@
 import {
   assertMinorUnitAmount,
+  classifyHttpFallback,
+  getUserMessage,
   normalizeCurrency,
+  normalizeSecrets,
   PayFanoutError,
+  requestWithTimeout,
+  safeJson,
+  withTransportRetries,
   type AdapterCapabilities,
   type CreatePaymentSessionInput,
   type FetchEventsInput,
@@ -187,7 +193,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
         'GoCardlessServerAdapter config.environment must be "sandbox" or "live"',
       );
     }
-    if (webhookSecretsOf(config).length === 0) {
+    if (normalizeSecrets(config.webhookSecret).length === 0) {
       throw PayFanoutError.invalidRequest(
         "GoCardlessServerAdapter config.webhookSecret is required (one secret, or several during rotation)",
       );
@@ -641,35 +647,32 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * resolves it), and a replayed flow create only re-issues an authorisation
    * URL for the same billing request.
    */
-  private async request<T>(method: "GET" | "POST", path: string, options: RequestOptions = {}): Promise<T> {
-    const attempts = 1 + (this.config.maxNetworkRetries ?? 2);
-    const sleep = this.config.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-    let lastError: PayFanoutError | undefined;
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      try {
-        return await this.requestOnce<T>(method, path, options);
-      } catch (err) {
-        if (!(err instanceof PayFanoutError) || !isTransportRetryable(err) || attempt === attempts) throw err;
-        lastError = err;
-        await sleep(Math.min(2000, 250 * 2 ** (attempt - 1)));
-      }
-    }
-    /* c8 ignore next -- the loop always returns or throws */
-    throw lastError ?? PayFanoutError.invalidRequest("unreachable");
+  private request<T>(method: "GET" | "POST", path: string, options: RequestOptions = {}): Promise<T> {
+    return withTransportRetries(() => this.requestOnce<T>(method, path, options), {
+      attempts: 1 + (this.config.maxNetworkRetries ?? 2),
+      sleep: this.config.sleep,
+    });
   }
 
   private async requestOnce<T>(method: "GET" | "POST", path: string, options: RequestOptions): Promise<T> {
-    const doFetch = this.config.fetch ?? fetch;
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
-    // A hung PSP connection must not hang the host's request handler. The
-    // timer stays armed until the BODY is read — a response can stall after
-    // its headers arrive, and response.text() would otherwise wait forever.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let response: Response;
-    let text: string;
-    try {
-      response = await doFetch(`${this.baseUrl}${path}`, {
+    const { response, text } = await requestWithTimeout(
+      {
+        fetch: this.config.fetch ?? fetch,
+        timeoutMs,
+        onFailure: (timedOut, cause) =>
+          new PayFanoutError({
+            code: "psp_unavailable",
+            message: timedOut
+              ? `GoCardless did not respond within ${timeoutMs}ms.`
+              : "Could not reach GoCardless.",
+            retryable: true,
+            raw: cause,
+            pspName: this.pspName,
+          }),
+      },
+      `${this.baseUrl}${path}`,
+      {
         method,
         headers: {
           authorization: `Bearer ${this.config.accessToken}`,
@@ -677,34 +680,14 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
           ...(options.body !== undefined ? { "content-type": "application/json" } : {}),
           ...(options.idempotencyKey ? { "idempotency-key": options.idempotencyKey } : {}),
         },
-        signal: controller.signal,
         ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
-      });
-      text = await readBodyWithSignal(response, controller.signal);
-    } catch (err) {
-      const timedOut = controller.signal.aborted;
-      throw new PayFanoutError({
-        code: "psp_unavailable",
-        message: timedOut
-          ? `GoCardless did not respond within ${timeoutMs}ms.`
-          : "Could not reach GoCardless.",
-        retryable: true,
-        raw: err,
-        pspName: this.pspName,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
+      },
+    );
     const json = text ? safeJson(text) : undefined;
     if (!response.ok) throw mapGoCardlessError(response.status, json ?? text, path);
     const payload = json as Record<string, unknown> | undefined;
     return (options.envelope && payload ? payload[options.envelope] : payload) as T;
   }
-}
-
-/** Transport-level trouble only: network failure/timeout, HTTP 5xx, or 429. */
-function isTransportRetryable(error: PayFanoutError): boolean {
-  return error.code === "rate_limited" || error.code === "psp_unavailable";
 }
 
 function mapBillingRequestStatus(status: string | undefined): UnifiedPaymentStatus {
@@ -789,18 +772,18 @@ function mapSchemeToMethodType(scheme: string | undefined): UnifiedPaymentMethod
  */
 export function mapGoCardlessError(httpStatus: number, body: unknown, path?: string): PayFanoutError {
   const errorBody = (body as { error?: { type?: string; message?: string } } | undefined)?.error;
+  const fallback = classifyHttpFallback(httpStatus);
   let code: UnifiedErrorCode;
   let retryable = false;
   let message: string;
-  if (httpStatus === 429) {
-    code = "rate_limited";
-    retryable = true;
-    message = "Too many requests — please retry shortly.";
-  } else if (httpStatus >= 500 || errorBody?.type === "gocardless") {
+  if (fallback.code === "rate_limited") {
+    ({ code, retryable } = fallback);
+    message = getUserMessage(code);
+  } else if (fallback.code === "psp_unavailable" || errorBody?.type === "gocardless") {
     // type "gocardless" = internal error; the docs say these may be retried.
     code = "psp_unavailable";
     retryable = true;
-    message = "The payment provider is temporarily unavailable.";
+    message = getUserMessage(code);
   } else if (httpStatus === 401) {
     code = "invalid_request";
     message = "GoCardless rejected the access token — check the credential and its environment.";
@@ -812,8 +795,8 @@ export function mapGoCardlessError(httpStatus: number, body: unknown, path?: str
   } else {
     // 400/404/409/422 (validation_failed, invalid_api_usage, invalid_state):
     // caller-side facts — never retryable, the router must not cascade on them.
-    code = "invalid_request";
-    message = "The payment request was invalid.";
+    ({ code, retryable } = fallback);
+    message = getUserMessage(code);
   }
   return new PayFanoutError({ code, message, retryable, raw: body, pspName: GOCARDLESS_PSP_NAME });
 }
@@ -876,31 +859,6 @@ function toPrefilledCustomer(
   return Object.keys(prefilled).length > 0 ? { prefilled_customer: prefilled } : undefined;
 }
 
-function webhookSecretsOf(config: GoCardlessServerAdapterConfig): string[] {
-  const raw = config.webhookSecret;
-  return (Array.isArray(raw) ? raw : [raw]).filter(
-    (secret): secret is string => typeof secret === "string" && secret.length > 0,
-  );
-}
-
-/**
- * Reads the response body under the request's abort signal. Native fetch
- * bodies reject on abort by themselves; the explicit race also bounds
- * injected transports whose Responses are not tied to the signal.
- */
-function readBodyWithSignal(response: Response, signal: AbortSignal): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    if (signal.aborted) {
-      reject(new Error("GoCardless response body read aborted"));
-      return;
-    }
-    signal.addEventListener("abort", () => reject(new Error("GoCardless response body read aborted")), {
-      once: true,
-    });
-    response.text().then(resolve, reject);
-  });
-}
-
 function withQuery(path: string, query: URLSearchParams): string {
   const qs = query.toString();
   return qs ? `${path}?${qs}` : path;
@@ -908,12 +866,4 @@ function withQuery(path: string, query: URLSearchParams): string {
 
 function toIso(value: string | Date): string {
   return typeof value === "string" ? value : value.toISOString();
-}
-
-function safeJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return undefined;
-  }
 }

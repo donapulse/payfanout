@@ -27,6 +27,33 @@ export { SCRUBBED, scrubForLogging } from "./scrub.js";
 export type { RetryPolicy } from "./retry.js";
 export { defaultShouldRetry, withRetry } from "./retry.js";
 
+export {
+  base64UrlToUtf8,
+  bytesToBase64,
+  bytesToBase64Url,
+  constantTimeEqual,
+  hmacSha256,
+  hmacSha256Hex,
+  sha256Hex,
+  utf8ToBase64,
+  utf8ToBase64Url,
+} from "./webcrypto.js";
+
+export type { TransportRequestOptions, TransportRetryOptions } from "./transport.js";
+export {
+  classifyHttpFallback,
+  isTransportRetryable,
+  requestWithTimeout,
+  safeJson,
+  withTransportRetries,
+} from "./transport.js";
+
+export { lowercaseKeys, normalizeSecrets, normalizeTime } from "./webhook-util.js";
+
+export { assertBrowser, injectScript } from "./sdk-loader.js";
+
+export { validateAdapterCapabilities } from "./capability-validation.js";
+
 export type {
   AdapterCapabilities,
   CustomerRef,

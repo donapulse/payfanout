@@ -17,14 +17,14 @@
 import { describe, expect, it } from "vitest";
 import { getRefundState, isPayFanoutError, isUnifiedPaymentStatus } from "@payfanout/core";
 import { PaysafeServerAdapter } from "@payfanout/adapter-paysafe-server";
+import { isLiveHost } from "./live-host-guard.js";
 
 const USERNAME = process.env.PAYSAFE_USERNAME;
 const PASSWORD = process.env.PAYSAFE_PASSWORD;
 const ACCOUNT_ID = process.env.PAYSAFE_ACCOUNT_ID;
 // Unset CI secrets render as EMPTY strings, not undefined — || treats them as absent.
 const BASE_URL = process.env.PAYSAFE_BASE_URL || "https://api.test.paysafe.com";
-// Hostname equality, never substring matching — a lookalike host must not fool the guard.
-if (new URL(BASE_URL).hostname === "api.paysafe.com") {
+if (isLiveHost(BASE_URL, "api.paysafe.com")) {
   throw new Error("Integration tests refuse to run against the live Paysafe API");
 }
 

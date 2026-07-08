@@ -1,8 +1,9 @@
 # Future designs — the big bets, decided but deliberately not built
 
-> Naming note: nothing here refers to a released version — the packages are unpublished
-> (0.1.0). "Current scope" below means what the library enforces today; "future" means
-> a later deliberate expansion of that scope.
+> Naming note: nothing here refers to a package's semver — packages version independently
+> and "v1" elsewhere in the docs means feature scope, not a release number. "Current scope"
+> below means what the library enforces today; "future" means a later deliberate expansion
+> of that scope.
 
 The pre-2026-07-04 roadmap's strategic items each got a decision in the 2026-07-04
 sessions. Three have now SHIPPED (smart routing, then — by explicit user decision later

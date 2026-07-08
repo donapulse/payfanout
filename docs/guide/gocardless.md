@@ -49,11 +49,6 @@ pnpm add @payfanout/react @payfanout/adapter-gocardless react react-dom
 There is no GoCardless browser SDK to load for the redirect flow — nothing extra to
 `pnpm add`, nothing injected at runtime.
 
-::: warning Not on npm yet
-The packages are `0.1.0` and unpublished, consume from source per
-[Installation](/guide/installation#using-it-now-from-source) until a release is cut.
-:::
-
 ## 3. Environment variables
 
 ```bash

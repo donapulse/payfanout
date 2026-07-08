@@ -45,12 +45,6 @@ The `stripe` Node SDK is bundled with the server adapter, nothing else to add. S
 is **not** an npm dependency; the client adapter injects it lazily from Stripe's CDN on
 first mount.
 
-::: warning Not on npm yet
-The packages are `0.1.0` and unpublished, so `pnpm add @payfanout/…` will not resolve today,
-consume from source per [Installation](/guide/installation#using-it-now-from-source). The
-commands above are what install looks like once a release is cut.
-:::
-
 ## 3. Environment variables
 
 ```bash

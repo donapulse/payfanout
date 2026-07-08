@@ -59,11 +59,6 @@ pnpm add @payfanout/react @payfanout/adapter-paysafe react react-dom
 Paysafe.js is **not** an npm dependency; the client adapter injects it lazily from Paysafe's
 CDN on first mount.
 
-::: warning Not on npm yet
-The packages are `0.1.0` and unpublished, consume from source per
-[Installation](/guide/installation#using-it-now-from-source) until a release is cut.
-:::
-
 ## 3. Environment variables
 
 ```bash

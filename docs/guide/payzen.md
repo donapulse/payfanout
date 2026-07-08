@@ -54,11 +54,6 @@ pnpm add @payfanout/react @payfanout/adapter-payzen react react-dom
 krypton-client is **not** an npm dependency; the client adapter injects the script and
 its stylesheet lazily on first mount.
 
-::: warning Not on npm yet
-The packages are `0.1.0` and unpublished, consume from source per
-[Installation](/guide/installation#using-it-now-from-source) until a release is cut.
-:::
-
 ## 3. Environment variables
 
 ```bash

@@ -139,12 +139,17 @@ app.use(
 // Webhooks FIRST, with express.raw: signature verification needs the exact raw
 // bytes — express.json() would destroy them. This ordering matters.
 // ---------------------------------------------------------------------------
+const stripCrlf = (value: string): string => value.replace(/[\r\n]/g, "");
+
 const onEvent = async (event: import("@payfanout/core").UnifiedWebhookEvent): Promise<void> => {
   if (processedEventIds.has(event.id)) return; // host-owned dedupe
   processedEventIds.add(event.id);
   // Ack-fast contract: enqueue here (BullMQ, SQS, ...) — never process inline.
-  // pspPaymentId is payload-derived — encode it so log lines cannot be forged.
-  console.log(`[webhook] ${event.pspName} ${event.type} payment=${encodeURIComponent(event.pspPaymentId ?? "-")}`);
+  // This event was parsed from the raw webhook payload — strip CR/LF from
+  // every field before logging so none of them can forge a fake log line.
+  console.log(
+    `[webhook] ${stripCrlf(event.pspName)} ${stripCrlf(event.type)} payment=${stripCrlf(event.pspPaymentId ?? "-")}`,
+  );
 };
 
 const stripeHook = createAdapterWebhookHandler(stripe, { onEvent, log: console.log });

@@ -100,6 +100,70 @@ const { pay, paying } = usePay({ onServerCompletion });
 Adapters keep only the keys they must own to function (Stripe: `clientSecret`; Paysafe:
 environment/currency/account/mount selectors), everything else is yours.
 
+## Returning customers
+
+Vaulting is PSP-side only ([Saved cards & subscriptions](/guide/recurring)); the browser
+half is two pieces, and the division of labor is strict: **your backend** talks to
+`PaymentService` and owns the `user → pspCustomerId` mapping, the React layer only renders
+consent and list state — PayFanout persists nothing.
+
+**Consent first.** `<PaymentFields saveConsent>` renders an accessible "save my card"
+checkbox after the hosted fields — unchecked by default, and never auto-saved:
+
+```tsx
+const [saveCard, setSaveCard] = useState(false);
+
+<PaymentFields
+  clientSecret={session.clientSecret}
+  saveConsent={{ onChange: setSaveCard }} // label / defaultChecked optional
+/>
+```
+
+The checkbox only *reports* consent. Your app forwards it when it asks your server for the
+session, and the server sets the flag — when, and only when, the customer checked it:
+
+```ts
+// your /api/session route:
+payments.createPaymentSession("stripe", {
+  ...order,
+  customer: pspCustomerId,                          // from YOUR user -> customer mapping
+  ...(saveCard ? { savePaymentMethod: true } : {}), // unchecked => the flag is never sent
+  idempotencyKey,
+});
+```
+
+After confirmation, `PaymentInfo.savedPaymentMethodToken` is the vaulted token your
+database stores. (Tokenize-first PSPs vault via
+`savePaymentMethod(psp, { pspCustomerId, clientToken })` — same consent rule.)
+Style the checkbox via `[data-payfanout-save-consent]`; pass `label` for your own text or
+translation.
+
+**Listing what came back.** `useSavedPaymentMethods` is the loading/error/refresh state
+machine over *your* endpoints — the hook never calls a PSP and works outside
+`<PayFanoutProvider>`:
+
+```tsx
+const { methods, status, error, refresh, remove } = useSavedPaymentMethods({
+  fetch: () => getJson("/api/payment-methods"),           // -> SavedPaymentMethod[]
+  remove: (token) => del(`/api/payment-methods/${token}`),
+});
+// status: "idle" | "loading" | "ready" | "error"
+
+{methods.map((m) => (
+  <li key={m.token}>
+    {m.details?.brand} •••• {m.details?.last4}
+    <button onClick={() => void remove(m.token)}>Remove</button>
+  </li>
+))}
+```
+
+Server-side, those two routes call `payments.listSavedPaymentMethods(psp, pspCustomerId)`
+and `payments.deleteSavedPaymentMethod(psp, pspCustomerId, token)`. `remove(token)` awaits
+your endpoint and then **re-fetches** — the list your backend serves is the truth; the hook
+never edits it locally. It fetches on mount (`auto: false` opts out), survives StrictMode,
+and neither call ever throws: failures land in `error` with `status: "error"`. Charging a
+stored token happens entirely server-side — no fields mounted, nothing to render.
+
 ## Redirect payment methods: the return trip
 
 Cards stay embedded, but genuinely redirect methods (iDEAL, bank redirects) leave the page.
@@ -115,6 +179,29 @@ const { phase, result } = useRedirectReturn({ onResult: showOutcome });
 Implemented for Stripe today (`payment_intent_client_secret` params → real intent status,
 not the `redirect_status` hint). Paysafe redirect methods stay capability-off until an
 account with them enabled lets us verify the return params.
+
+## Async rails: polling to a terminal state
+
+Bank-debit rails (SEPA, ACH) and vouchers resolve `"processing"` and settle later —
+sometimes days later. [Webhooks](/guide/webhooks) stay the server-side truth; for the
+waiting UI, `usePaymentStatus` polls *your* status endpoint (which calls
+`payments.retrievePayment`) until the payment reaches a terminal state:
+
+```tsx
+const { status, polling, error, refresh } = usePaymentStatus({
+  fetch: () => getJson(`/api/payments/${id}/status`), // -> { status }
+  intervalMs: 3000,     // first gap (default 3000)
+  maxIntervalMs: 15000, // gaps double up to this cap (default 15000)
+});
+// stops by itself on "succeeded" | "failed" | "canceled", on unmount,
+// or when enabled flips false
+```
+
+It fetches immediately, then backs off exponentially (3s, 6s, 12s, 15s, 15s, …) so a
+payment that settles in days does not hammer your API. A failed poll records `error` and
+keeps polling (transient by default); the next success clears it. `refresh()` polls now and
+resets the cadence — wire it to a "check again" button. Like `useSavedPaymentMethods`, it
+needs no `<PayFanoutProvider>`.
 
 ## Next
 

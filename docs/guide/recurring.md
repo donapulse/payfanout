@@ -11,7 +11,9 @@ charge the stored token off-session, no card fields, no customer present:
 ```ts
 const customer = await payments.createCustomer("stripe", { id: user.id, email, idempotencyKey });
 
-// checkout with consent (the "save my card" checkbox is YOUR UI):
+// checkout with consent (<PaymentFields saveConsent> renders the checkbox — see the
+// React guide; its onChange state travels to YOUR server, which sets the session flag
+// only when the customer actually checked it):
 //   Stripe: createPaymentSession({ ..., customer: customer.pspCustomerId, savePaymentMethod: true })
 //           -> after confirmation, PaymentInfo.savedPaymentMethodToken is the stored token
 //   Paysafe (tokenize-first): savePaymentMethod(psp, { pspCustomerId, clientToken }) converts the
@@ -26,7 +28,9 @@ const info = await payments.chargeSavedPaymentMethod("stripe", {
 });
 ```
 
-`listSavedPaymentMethods` / `deleteSavedPaymentMethod` complete the lifecycle.
+`listSavedPaymentMethods` / `deleteSavedPaymentMethod` complete the lifecycle; on the
+client, `useSavedPaymentMethods` wraps the endpoints you build on them for the saved-cards
+UI (see [React usage](/guide/react#returning-customers)).
 
 ## Subscriptions
 
@@ -47,11 +51,36 @@ await subs.createSubscription({ pspName, pspCustomerId, savedPaymentMethodToken,
 await subs.chargeDueSubscriptions();   // renews, retries (24h/72h dunning), cancels when exhausted
 
 // retrieveSubscription / listSubscriptions / updateSubscription / cancelSubscription({ atPeriodEnd })
+// pauseSubscription / resumeSubscription({ idempotencyKey })
 ```
+
+Monthly/yearly records remember their creation day as `anchorDay`: a subscription created
+Jan 31 bills Feb 28, Mar 31, Apr 30 — the February clamp never erodes the anchor. Records
+created before `anchorDay` existed keep the old clamp-forward behavior.
 
 Off-session charges that hit a bank's authentication demand surface as
 `authentication_required`, bring the customer back on-session; the dunning schedule handles
 the retries.
+
+### Trials & delayed starts
+
+A future `startAt` creates the record as `"trialing"`: nothing is charged until the cron
+crosses `startAt`, and the first successful charge flips it to `"active"`. Because that
+first charge is deferred, the trial path validates eagerly — the psp must be registered
+and support saved payment methods, or `createSubscription` throws before anything
+persists.
+
+### Pause & resume
+
+`pauseSubscription(id)` (from active, trialing, or past_due) halts everything: the cron
+skips paused records and dunning stops (`nextRetryAt` is cleared; `failedAttempts` and any
+`pendingRenewal` survive — an unresolved renewal still resolves via
+`resolvePendingRenewal`, but a paused record is never re-charged).
+`resumeSubscription(id, { idempotencyKey })` reactivates: still paid through → just
+`"active"` again, no charge; lapsed → one immediate charge re-anchors the billing cycle at
+the resume instant. A failed resume charge leaves the record paused with `lastError` (no
+dunning) and throws; retry with the same key so the PSP replays instead of re-charging.
+Events: `subscription.paused` / `subscription.resumed`.
 
 ### Renewals on async rails
 
@@ -71,15 +100,28 @@ await subs.resolvePendingRenewal(subscriptionId, {
 Resolving is replay-safe (a re-delivered webhook is a no-op) and a pending renewal that you
 never resolve stays frozen — the safe default is to not charge twice, never to assume.
 
+### Scaling the cron: `listDue`
+
+By default `chargeDueSubscriptions` scans every active/trialing/past_due record. Implement
+the optional `SubscriptionStore.listDue({ dueBefore, limit })` to push the due-ness
+predicate into your database index instead: return records with
+`currentPeriodEnd <= dueBefore` (active/trialing) or `nextRetryAt <= dueBefore`
+(past_due), never canceled or paused ones, in a stable order, at most `limit`. The manager
+pages until a short batch and still re-checks due-ness per record — the store filter is an
+optimization, not a trust boundary.
+
 ### Concurrency & delivery semantics
 
 Concurrent `chargeDueSubscriptions` runs are safe for **money** — renewal idempotency keys
 are deterministic per (subscription, period, attempt), so overlapping runs converge on one
 PSP charge. They are at-least-once for **events**: dedupe `onEvent` deliveries on
-`(subscription.id, type, currentPeriodEnd)` if exactly-once matters, or hold a lock around
-the cron call. A storage failure after a successful charge never enters dunning: the run
-reports it under `ChargeDueResult.errors` and the next run replays the same attempt key,
-which the PSP answers from cache instead of charging again.
+`(subscription.id, type, currentPeriodEnd)` — never on `occurredAt`, which is stamped from
+the manager clock per delivery — if exactly-once matters, or hold a lock around the cron
+call. `updateSubscription` and the `cancelSubscription({ atPeriodEnd: true })` flag-set
+emit `subscription.updated`; renewals never do. A storage failure after a successful
+charge never enters dunning: the run reports it under `ChargeDueResult.errors` and the
+next run replays the same attempt key, which the PSP answers from cache instead of
+charging again.
 
 ::: info Why not wrap Stripe Billing?
 PSP-native billing (Stripe Billing) is deliberately not wrapped: Paysafe has no equivalent,

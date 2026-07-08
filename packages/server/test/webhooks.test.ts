@@ -42,6 +42,21 @@ describe("createAdapterWebhookHandler", () => {
     if (!result.ok) expect(result.reason).toMatch(/express\.raw/);
   });
 
+  it("a throwing log hook does not reject the handler — verification failure still yields 401", async () => {
+    const adapter = new FakeAdapter({ pspName: "broken" });
+    adapter.verifyWebhookSignature = async () => {
+      throw new Error("kaboom");
+    };
+    const handler = createAdapterWebhookHandler(adapter, {
+      onEvent: () => {},
+      log: () => {
+        throw new Error("logger down");
+      },
+    });
+    const result = await handler({ rawBody, headers: {} });
+    expect(result).toMatchObject({ ok: false, status: 401 });
+  });
+
   it("returns 500 when the host enqueue fails, so the PSP retries", async () => {
     const adapter = new FakeAdapter({ webhookSecret: "s3cr3t" });
     const handler = createAdapterWebhookHandler(adapter, {
@@ -84,5 +99,23 @@ describe("createUnifiedWebhookHandler", () => {
 
     const hit = await handler({ rawBody, headers: { "x-fake-signature": "h-key" } });
     expect(hit).toMatchObject({ ok: true, pspName: "healthy" });
+  });
+
+  it("a throwing log hook never breaks dispatch — the matched adapter still acks 200", async () => {
+    const broken = new FakeAdapter({ pspName: "broken" });
+    broken.verifyWebhookSignature = async () => {
+      throw new Error("kaboom");
+    };
+    const healthy = new FakeAdapter({ pspName: "healthy", webhookSecret: "h-key" });
+    const seen: UnifiedWebhookEvent[] = [];
+    const handler = createUnifiedWebhookHandler([broken, healthy], {
+      onEvent: (e) => void seen.push(e),
+      log: () => {
+        throw new Error("logger down");
+      },
+    });
+    const result = await handler({ rawBody, headers: { "x-fake-signature": "h-key" } });
+    expect(result).toMatchObject({ ok: true, status: 200, pspName: "healthy" });
+    expect(seen).toHaveLength(1);
   });
 });

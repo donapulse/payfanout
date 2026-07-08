@@ -83,7 +83,11 @@ export interface PaymentRouterOptions {
    * produce surprise duplicate sessions for a request that is simply wrong.
    */
   shouldFailover?: (error: PayFanoutError) => boolean;
-  /** Observability: called once per failed/skipped candidate and once for the winner (error absent). */
+  /**
+   * Observability: called once per failed/skipped candidate and once for the
+   * winner (error absent). Exceptions it throws are swallowed — routing always
+   * wins over observability, so never rely on this hook for control flow.
+   */
   onAttempt?: (attempt: { pspName: string; ok: boolean; skipped?: boolean; error?: PayFanoutError }) => void;
   /** On by default; pass `false` to disable outage memory entirely. */
   circuitBreaker?: CircuitBreakerOptions | false;
@@ -171,7 +175,7 @@ export class PaymentRouter {
       const ineligible = this.eligibilityError(pspName, input);
       if (ineligible) {
         attempts.push({ pspName, error: ineligible, skipped: true });
-        this.onAttempt?.({ pspName, ok: false, skipped: true, error: ineligible });
+        this.emitAttempt({ pspName, ok: false, skipped: true, error: ineligible });
         continue;
       }
       if (honorBreaker && this.isCircuitOpen(pspName)) {
@@ -182,22 +186,22 @@ export class PaymentRouter {
           pspName,
         });
         attempts.push({ pspName, error, skipped: true });
-        this.onAttempt?.({ pspName, ok: false, skipped: true, error });
+        this.emitAttempt({ pspName, ok: false, skipped: true, error });
         continue;
       }
       try {
         const session = await this.service.createPaymentSession(pspName, input);
         this.recordOutcome(pspName, undefined);
-        this.onAttempt?.({ pspName, ok: true });
+        this.emitAttempt({ pspName, ok: true });
         return { session, pspName, attempts };
       } catch (err) {
         const error = PayFanoutError.wrap(err, { pspName });
         this.recordOutcome(pspName, error);
         attempts.push({ pspName, error, skipped: false });
-        this.onAttempt?.({ pspName, ok: false, skipped: false, error });
+        this.emitAttempt({ pspName, ok: false, skipped: false, error });
         const isLast = pspName === chain[chain.length - 1];
         if (!isLast && this.shouldFailover(error)) continue;
-        throw error;
+        throw withAttemptTrail(error, attempts);
       }
     }
 
@@ -261,6 +265,37 @@ export class PaymentRouter {
     }
     return undefined;
   }
+
+  private emitAttempt(attempt: Parameters<NonNullable<PaymentRouterOptions["onAttempt"]>>[0]): void {
+    try {
+      this.onAttempt?.(attempt);
+    } catch {
+      // Observability must never break routing.
+    }
+  }
+}
+
+/**
+ * The error a host catches after a cascade must keep the audit trail of the
+ * candidates tried before the final one. The trail nests into `raw` in the
+ * same per-candidate shape the all-skipped diagnostic uses, with the failing
+ * candidate's own raw preserved under `pspError`. A failure with no earlier
+ * attempts rethrows untouched so the adapter's raw shape survives.
+ */
+function withAttemptTrail(error: PayFanoutError, attempts: RoutedAttempt[]): PayFanoutError {
+  if (attempts.length <= 1) return error;
+  const trailed = new PayFanoutError({
+    code: error.code,
+    message: error.message,
+    retryable: error.retryable,
+    pspName: error.pspName,
+    raw: {
+      pspError: error.raw,
+      attempts: attempts.map((a) => ({ pspName: a.pspName, code: a.error.code, message: a.error.message })),
+    },
+  });
+  trailed.stack = error.stack;
+  return trailed;
 }
 
 function ineligible(pspName: string, message: string): PayFanoutError {

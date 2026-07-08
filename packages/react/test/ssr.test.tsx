@@ -22,4 +22,17 @@ describe("server-side rendering", () => {
     expect(adapter.loadSdkCalls).toBe(0);
     expect(adapter.mountCalls).toHaveLength(0);
   });
+
+  it("renderToString includes the saveConsent checkbox markup", () => {
+    const adapter = new FakeClientAdapter();
+    const html = renderToString(
+      <PayFanoutProvider adapters={[adapter]}>
+        <PaymentFields clientSecret="cs_1" saveConsent={{ onChange: () => {} }} />
+      </PayFanoutProvider>,
+    );
+    expect(html).toContain("data-payfanout-save-consent");
+    expect(html).toContain('type="checkbox"');
+    expect(html).toContain("Save my card for future payments");
+    expect(adapter.loadSdkCalls).toBe(0);
+  });
 });

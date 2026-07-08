@@ -11,7 +11,9 @@ charge the stored token off-session, no card fields, no customer present:
 ```ts
 const customer = await payments.createCustomer("stripe", { id: user.id, email, idempotencyKey });
 
-// checkout with consent (the "save my card" checkbox is YOUR UI):
+// checkout with consent (<PaymentFields saveConsent> renders the checkbox — see the
+// React guide; its onChange state travels to YOUR server, which sets the session flag
+// only when the customer actually checked it):
 //   Stripe: createPaymentSession({ ..., customer: customer.pspCustomerId, savePaymentMethod: true })
 //           -> after confirmation, PaymentInfo.savedPaymentMethodToken is the stored token
 //   Paysafe (tokenize-first): savePaymentMethod(psp, { pspCustomerId, clientToken }) converts the
@@ -26,7 +28,9 @@ const info = await payments.chargeSavedPaymentMethod("stripe", {
 });
 ```
 
-`listSavedPaymentMethods` / `deleteSavedPaymentMethod` complete the lifecycle.
+`listSavedPaymentMethods` / `deleteSavedPaymentMethod` complete the lifecycle; on the
+client, `useSavedPaymentMethods` wraps the endpoints you build on them for the saved-cards
+UI (see [React usage](/guide/react#returning-customers)).
 
 ## Subscriptions
 

@@ -4,6 +4,15 @@ import { PayFanoutError, type FieldsChangeState, type UnifiedError } from "@payf
 import { usePayFanoutContext } from "./provider.js";
 import { useLatestRef } from "./use-latest-ref.js";
 
+export interface SaveConsentOptions {
+  /** Rendered inside the label; defaults to "Save my card for future payments". */
+  label?: ReactNode;
+  /** Initial state — unchecked unless explicitly set. */
+  defaultChecked?: boolean;
+  /** Fires with the new checked state on every toggle. */
+  onChange?: (checked: boolean) => void;
+}
+
 export interface PaymentFieldsProps {
   /** Defaults to the provider's active PSP. */
   psp?: string;
@@ -35,6 +44,15 @@ export interface PaymentFieldsProps {
    * Single-element PSPs (Stripe) ignore slots; layout goes via fieldOptions.
    */
   children?: ReactNode;
+  /**
+   * Renders an accessible "save my card" consent checkbox after the hosted
+   * fields — unchecked by default, never auto-saved. The checkbox only
+   * REPORTS consent via onChange: the host forwards it to its own server,
+   * which sets `savePaymentMethod: true` on createPaymentSession when (and
+   * only when) the customer checked it. Style it via
+   * [data-payfanout-save-consent].
+   */
+  saveConsent?: SaveConsentOptions;
 }
 
 /**
@@ -55,6 +73,7 @@ export function PaymentFields({
   className,
   style,
   children,
+  saveConsent,
 }: PaymentFieldsProps): ReactNode {
   const { adapters, activePsp, setStatus, setLastError, mountedRef, fieldsOwnerRef } = usePayFanoutContext();
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -177,6 +196,19 @@ export function PaymentFields({
   return (
     <div ref={containerRef} className={className} style={style} data-payfanout-fields={targetPsp ?? ""}>
       {children}
+      {saveConsent ? (
+        // A wrapping <label> gives the native checkbox its accessible name —
+        // no ids needed, so multiple checkouts never collide.
+        <label data-payfanout-save-consent="">
+          <input
+            type="checkbox"
+            data-payfanout-save-consent-input=""
+            defaultChecked={saveConsent.defaultChecked ?? false}
+            onChange={(event) => saveConsent.onChange?.(event.currentTarget.checked)}
+          />
+          {saveConsent.label ?? "Save my card for future payments"}
+        </label>
+      ) : null}
     </div>
   );
 }

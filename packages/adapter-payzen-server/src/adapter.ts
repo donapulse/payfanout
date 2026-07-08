@@ -52,7 +52,8 @@ export interface PayZenServerAdapterConfig {
   apiBaseUrl?: string;
   /**
    * Abort a hung PayZen connection after this many milliseconds (default
-   * 30000). Timeouts surface as psp_unavailable — retryable except on
+   * 30000). The timer covers the whole exchange including the response body
+   * read. Timeouts surface as psp_unavailable — retryable except on
    * refund/cancel/validate, whose outcome is unknown.
    */
   requestTimeoutMs?: number;
@@ -531,10 +532,13 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
   private async requestOnce(operation: string, body: Record<string, unknown>): Promise<PayZenEnvelopeLike> {
     const doFetch = this.config.fetch ?? fetch;
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
-    // A hung PSP connection must not hang the host's request handler.
+    // A hung PSP connection must not hang the host's request handler. The
+    // timer stays armed until the BODY is read — a response can stall after
+    // its headers arrive, and response.text() would otherwise wait forever.
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let response: Response;
+    let text: string;
     try {
       response = await doFetch(`${this.baseUrl}/V4/${operation}`, {
         method: "POST",
@@ -545,6 +549,7 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
         signal: controller.signal,
         body: JSON.stringify(body),
       });
+      text = await readBodyWithSignal(response, controller.signal);
     } catch (err) {
       const timedOut = controller.signal.aborted;
       throw new PayFanoutError({
@@ -557,7 +562,6 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
     } finally {
       clearTimeout(timer);
     }
-    const text = await response.text();
     // Non-200s only ever come from infrastructure in front of the gateway
     // (the API itself answers 200 + an ERROR envelope) — map by HTTP status.
     if (!response.ok) {
@@ -866,4 +870,22 @@ function safeJson(text: string): unknown {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Reads the response body under the request's abort signal. Native fetch
+ * bodies reject on abort by themselves; the explicit race also bounds
+ * injected transports whose Responses are not tied to the signal.
+ */
+function readBodyWithSignal(response: Response, signal: AbortSignal): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error("PayZen response body read aborted"));
+      return;
+    }
+    signal.addEventListener("abort", () => reject(new Error("PayZen response body read aborted")), {
+      once: true,
+    });
+    response.text().then(resolve, reject);
+  });
 }

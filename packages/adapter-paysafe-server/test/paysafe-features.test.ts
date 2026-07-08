@@ -476,6 +476,34 @@ describe("Paysafe transport retries", () => {
     await expect(adapter.retrieveRefund("ref_1")).rejects.toMatchObject({ code: "psp_unavailable" });
     expect(calls()).toBe(1);
   });
+
+  it("bounds the response BODY read with the timeout — headers alone do not disarm it", async () => {
+    // Headers arrive immediately but the body stream never closes: without
+    // the timer surviving until text(), this call would hang forever.
+    const { adapter } = makeRetryingAdapter(
+      [() => Promise.resolve(new Response(new ReadableStream({ start() {} })))],
+      { requestTimeoutMs: 5, maxNetworkRetries: 0 },
+    );
+    await expect(adapter.retrieveRefund("ref_1")).rejects.toMatchObject({
+      code: "psp_unavailable",
+      retryable: true,
+      message: expect.stringMatching(/did not respond within 5ms/),
+    });
+  });
+
+  it("still times out when a response lands only after the abort already fired", async () => {
+    // An injected transport may ignore the signal and resolve late — the
+    // body read must refuse to start on an already-aborted request.
+    const { adapter } = makeRetryingAdapter(
+      [() => new Promise<Response>((resolve) => setTimeout(() => resolve(new Response("{}")), 40))],
+      { requestTimeoutMs: 5, maxNetworkRetries: 0 },
+    );
+    await expect(adapter.retrieveRefund("ref_1")).rejects.toMatchObject({
+      code: "psp_unavailable",
+      retryable: true,
+      message: expect.stringMatching(/did not respond within 5ms/),
+    });
+  });
 });
 
 describe("edge-runtime compatibility", () => {

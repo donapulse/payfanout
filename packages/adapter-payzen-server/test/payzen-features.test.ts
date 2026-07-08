@@ -207,6 +207,36 @@ describe("transport behavior", () => {
     });
   });
 
+  it("bounds the response BODY read with the timeout — headers alone do not disarm it", async () => {
+    // Headers arrive immediately but the body stream never closes: without
+    // the timer surviving until text(), this call would hang forever.
+    const adapter = makeAdapter({
+      maxNetworkRetries: 0,
+      requestTimeoutMs: 5,
+      fetch: async () => new Response(new ReadableStream({ start() {} })),
+    });
+    await expect(adapter.retrievePayment("a".repeat(32))).rejects.toMatchObject({
+      code: "psp_unavailable",
+      retryable: true,
+      message: expect.stringMatching(/did not respond within 5ms/) as string,
+    });
+  });
+
+  it("still times out when a response lands only after the abort already fired", async () => {
+    // An injected transport may ignore the signal and resolve late — the
+    // body read must refuse to start on an already-aborted request.
+    const adapter = makeAdapter({
+      maxNetworkRetries: 0,
+      requestTimeoutMs: 5,
+      fetch: () => new Promise<Response>((resolve) => setTimeout(() => resolve(new Response("{}")), 40)),
+    });
+    await expect(adapter.retrievePayment("a".repeat(32))).rejects.toMatchObject({
+      code: "psp_unavailable",
+      retryable: true,
+      message: expect.stringMatching(/did not respond within 5ms/) as string,
+    });
+  });
+
   it("survives non-JSON bodies from proxies (200 garbage and 502 HTML)", async () => {
     const garbage200 = makeAdapter({ maxNetworkRetries: 0, fetch: async () => new Response("<html>hi</html>", { status: 200 }) });
     await expect(garbage200.retrievePayment("a".repeat(32))).rejects.toMatchObject({

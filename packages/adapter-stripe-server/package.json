@@ -1,6 +1,6 @@
 {
   "name": "@payfanout/adapter-stripe-server",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "license": "MIT",
   "description": "Server-side Stripe adapter for PayFanout (PaymentIntents, Refunds, webhook signature verification). Holds secrets — never bundle client-side.",
   "type": "module",

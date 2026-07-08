@@ -1,6 +1,6 @@
 {
   "name": "@payfanout/conformance",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "license": "MIT",
   "description": "Shared conformance test suite every PayFanout adapter (present or future) must pass.",
   "type": "module",

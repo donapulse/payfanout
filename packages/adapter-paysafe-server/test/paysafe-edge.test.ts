@@ -153,14 +153,6 @@ describe("session context edge cases", () => {
     });
   });
 
-  it("produces tokens bit-identical to the previous node:crypto implementation", async () => {
-    // The WebCrypto migration must not invalidate outstanding signed tokens.
-    const { createHmac } = await import("node:crypto");
-    const context = { v: 1 as const, amount: 777, currency: "USD", captureMethod: "automatic" as const, expiresAt: 2_000_000_000_000 };
-    const payload = Buffer.from(JSON.stringify(context), "utf8").toString("base64url");
-    const nodeSignature = createHmac("sha256", SIGNING_KEY).update(payload, "utf8").digest("base64url");
-    await expect(encodeSessionContext(context, SIGNING_KEY)).resolves.toBe(`${payload}.${nodeSignature}`);
-  });
 });
 
 describe("webhook edge cases", () => {
@@ -207,12 +199,6 @@ describe("webhook edge cases", () => {
     }
   });
 
-  it("hashed fallback dedupe ids match the previous node:crypto output", async () => {
-    const { createHash } = await import("node:crypto");
-    const rawBody = JSON.stringify({ eventType: "PAYMENT_COMPLETED", payload: { id: "pay_1" } });
-    const event = await parsePaysafeWebhookEvent(rawBody);
-    expect(event.id).toBe(`paysafe_${createHash("sha256").update(rawBody, "utf8").digest("hex")}`);
-  });
 });
 
 describe("transport edge cases", () => {

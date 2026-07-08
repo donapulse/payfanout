@@ -2,6 +2,10 @@ import {
   assertMinorUnitAmount,
   normalizeCurrency,
   PayFanoutError,
+  requestWithTimeout,
+  safeJson,
+  utf8ToBase64,
+  withTransportRetries,
   type AdapterCapabilities,
   type CompletePaymentInput,
   type CreatePaymentSessionInput,
@@ -20,8 +24,8 @@ import {
   type UnifiedWebhookEvent,
   type UpdatePaymentSessionInput,
 } from "@payfanout/core";
-import { derivePayPalRequestId, utf8ToBase64 } from "./crypto-utils.js";
 import { mapPayPalError, PAYPAL_PSP_NAME } from "./error-map.js";
+import { derivePayPalRequestId } from "./request-id.js";
 import { fromPayPalValue, PAYPAL_SUPPORTED_CURRENCIES, toPayPalValue } from "./money.js";
 import {
   buildWebhookVerificationBody,
@@ -754,21 +758,11 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * safe: they reuse the same PayPal-Request-Id, so a replay can never
    * double-charge. Business errors (4xx other than 429) never retry.
    */
-  private async request<T>(method: PayPalHttpMethod, path: string, options: PayPalRequestOptions = {}): Promise<T> {
-    const attempts = 1 + (this.config.maxNetworkRetries ?? 2);
-    const sleep = this.config.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-    let lastError: PayFanoutError | undefined;
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      try {
-        return await this.requestOnce<T>(method, path, options);
-      } catch (err) {
-        if (!(err instanceof PayFanoutError) || !isTransportRetryable(err) || attempt === attempts) throw err;
-        lastError = err;
-        await sleep(Math.min(2000, 250 * 2 ** (attempt - 1)));
-      }
-    }
-    /* c8 ignore next -- the loop always returns or throws */
-    throw lastError ?? PayFanoutError.invalidRequest("unreachable");
+  private request<T>(method: PayPalHttpMethod, path: string, options: PayPalRequestOptions = {}): Promise<T> {
+    return withTransportRetries(() => this.requestOnce<T>(method, path, options), {
+      attempts: 1 + (this.config.maxNetworkRetries ?? 2),
+      sleep: this.config.sleep,
+    });
   }
 
   private async requestOnce<T>(method: PayPalHttpMethod, path: string, options: PayPalRequestOptions): Promise<T> {
@@ -784,22 +778,18 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     return json as T; // 204 No Content (PATCH, void) resolves as undefined
   }
 
-  private async send(
+  private send(
     method: PayPalHttpMethod,
     path: string,
     options: PayPalRequestOptions,
     token: string,
   ): Promise<{ response: Response; text: string }> {
-    const doFetch = this.config.fetch ?? fetch;
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
-    // A hung PSP connection must not hang the host's request handler. The
-    // timer stays armed until the BODY is read — a response can stall after
-    // its headers arrive, and response.text() would otherwise wait forever.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
     const body = options.rawBody ?? (options.json !== undefined ? JSON.stringify(options.json) : undefined);
-    try {
-      const response = await doFetch(`${this.baseUrl}${path}`, {
+    return requestWithTimeout(
+      { fetch: this.config.fetch ?? fetch, timeoutMs, onFailure: this.transportFailure(timeoutMs) },
+      `${this.baseUrl}${path}`,
+      {
         method,
         headers: {
           authorization: `Bearer ${token}`,
@@ -808,22 +798,20 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
           // Minimal responses omit purchase_units — the mappers need the money objects.
           ...(method === "POST" ? { prefer: "return=representation" } : {}),
         },
-        signal: controller.signal,
         ...(body !== undefined ? { body } : {}),
-      });
-      return { response, text: await readBodyWithSignal(response, controller.signal) };
-    } catch (err) {
-      const timedOut = controller.signal.aborted;
-      throw new PayFanoutError({
+      },
+    );
+  }
+
+  private transportFailure(timeoutMs: number): (timedOut: boolean, cause: unknown) => PayFanoutError {
+    return (timedOut, cause) =>
+      new PayFanoutError({
         code: "psp_unavailable",
         message: timedOut ? `PayPal did not respond within ${timeoutMs}ms.` : "Could not reach PayPal.",
         retryable: true,
-        raw: err,
+        raw: cause,
         pspName: this.pspName,
       });
-    } finally {
-      clearTimeout(timer);
-    }
   }
 
   /**
@@ -843,35 +831,19 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
 
   private async mintAccessToken(): Promise<string> {
     const now = this.now();
-    const doFetch = this.config.fetch ?? fetch;
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let response: Response;
-    let text: string;
-    try {
-      response = await doFetch(`${this.baseUrl}/v1/oauth2/token`, {
+    const { response, text } = await requestWithTimeout(
+      { fetch: this.config.fetch ?? fetch, timeoutMs, onFailure: this.transportFailure(timeoutMs) },
+      `${this.baseUrl}/v1/oauth2/token`,
+      {
         method: "POST",
         headers: {
           authorization: `Basic ${utf8ToBase64(`${this.config.clientId}:${this.config.clientSecret}`)}`,
           "content-type": "application/x-www-form-urlencoded",
         },
         body: "grant_type=client_credentials",
-        signal: controller.signal,
-      });
-      text = await readBodyWithSignal(response, controller.signal);
-    } catch (err) {
-      const timedOut = controller.signal.aborted;
-      throw new PayFanoutError({
-        code: "psp_unavailable",
-        message: timedOut ? `PayPal did not respond within ${timeoutMs}ms.` : "Could not reach PayPal.",
-        retryable: true,
-        raw: err,
-        pspName: this.pspName,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
+      },
+    );
     const json = text ? safeJson(text) : undefined;
     if (!response.ok) throw mapPayPalError(response.status, json ?? text);
     const body = json as { access_token?: string; expires_in?: number } | undefined;
@@ -891,29 +863,6 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
   private now(): number {
     return (this.config.now ?? Date.now)();
   }
-}
-
-/** Transport-level trouble only: network failure/timeout, HTTP 5xx, or 429. */
-function isTransportRetryable(error: PayFanoutError): boolean {
-  return error.code === "rate_limited" || error.code === "psp_unavailable";
-}
-
-/**
- * Reads the response body under the request's abort signal. Native fetch
- * bodies reject on abort by themselves; the explicit race also bounds
- * injected transports whose Responses are not tied to the signal.
- */
-function readBodyWithSignal(response: Response, signal: AbortSignal): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    if (signal.aborted) {
-      reject(new Error("PayPal response body read aborted"));
-      return;
-    }
-    signal.addEventListener("abort", () => reject(new Error("PayPal response body read aborted")), {
-      once: true,
-    });
-    response.text().then(resolve, reject);
-  });
 }
 
 function completedOrderStatus(
@@ -1075,13 +1024,4 @@ function toIsoTime(value: string | Date): string {
     throw PayFanoutError.invalidRequest(`Invalid "since" timestamp: ${String(value)}`, { since: value });
   }
   return parsed.toISOString();
-}
-
-function safeJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    // Proxies/load balancers answer HTML — the raw text still rides the error.
-    return undefined;
-  }
 }

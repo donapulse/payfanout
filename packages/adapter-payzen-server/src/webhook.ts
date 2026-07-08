@@ -1,5 +1,13 @@
-import { PayFanoutError, type UnifiedWebhookEvent, type UnifiedWebhookEventType } from "@payfanout/core";
-import { constantTimeEqual, hmacSha256Hex, sha256Hex } from "./crypto-utils.js";
+import {
+  constantTimeEqual,
+  hmacSha256Hex,
+  lowercaseKeys,
+  normalizeTime,
+  PayFanoutError,
+  sha256Hex,
+  type UnifiedWebhookEvent,
+  type UnifiedWebhookEventType,
+} from "@payfanout/core";
 
 /**
  * PayZen notifications (IPN) and browser returns both deliver the same five
@@ -197,16 +205,4 @@ function mapEventType(tx: PayZenKrAnswerTransactionLike | undefined): UnifiedWeb
   // AUTHORISED_TO_VALIDATE etc.: awaiting a MERCHANT action, not a customer
   // one — payment.requires_action would misdirect hosts, so stay honest.
   return "unknown";
-}
-
-function normalizeTime(value: string | undefined): string {
-  const parsed = value ? Date.parse(value) : Number.NaN;
-  // Deterministic fallback: a missing timestamp is the PSP's omission, not ours.
-  return Number.isNaN(parsed) ? "1970-01-01T00:00:00.000Z" : new Date(parsed).toISOString();
-}
-
-function lowercaseKeys(headers: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(headers ?? {})) out[key.toLowerCase()] = value;
-  return out;
 }

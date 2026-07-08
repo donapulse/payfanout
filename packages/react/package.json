@@ -1,6 +1,6 @@
 {
   "name": "@payfanout/react",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "license": "MIT",
   "description": "React bindings for PayFanout: PayFanoutProvider, usePayFanout, PaymentFields, PayButton. No secrets, no server logic.",
   "type": "module",

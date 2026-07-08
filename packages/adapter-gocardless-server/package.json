@@ -1,6 +1,6 @@
 {
   "name": "@payfanout/adapter-gocardless-server",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "license": "MIT",
   "description": "Server-side GoCardless adapter for PayFanout (Billing Requests REST API: hosted bank authorisation flows, payments, refunds, events, webhooks). Holds secrets — never bundle client-side.",
   "type": "module",

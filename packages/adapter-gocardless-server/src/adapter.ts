@@ -201,6 +201,14 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
     if (config.requestTimeoutMs !== undefined && !(config.requestTimeoutMs > 0)) {
       throw PayFanoutError.invalidRequest("GoCardlessServerAdapter config.requestTimeoutMs must be > 0");
     }
+    if (
+      config.maxNetworkRetries !== undefined &&
+      (!Number.isInteger(config.maxNetworkRetries) || config.maxNetworkRetries < 0)
+    ) {
+      throw PayFanoutError.invalidRequest(
+        "GoCardlessServerAdapter config.maxNetworkRetries must be an integer >= 0",
+      );
+    }
     this.config = config;
     this.baseUrl =
       config.baseUrl ??
@@ -468,7 +476,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
   /** Missed-webhook recovery: GET /events, normalized by the same mapper webhooks use. */
   async fetchEvents(input: FetchEventsInput = {}): Promise<FetchEventsResult> {
     const query = new URLSearchParams();
-    if (input.limit !== undefined) query.set("limit", String(input.limit));
+    if (input.limit !== undefined) query.set("limit", String(clampPageSize(input.limit)));
     if (input.cursor) query.set("after", input.cursor);
     if (input.since) query.set("created_at[gte]", toIso(input.since));
     const page = await this.request<{ events?: GoCardlessEventLike[]; meta?: GoCardlessListMeta }>(
@@ -482,7 +490,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
 
   async listPayments(input: ListPaymentsInput = {}): Promise<ListPaymentsResult> {
     const query = new URLSearchParams();
-    if (input.limit !== undefined) query.set("limit", String(input.limit));
+    if (input.limit !== undefined) query.set("limit", String(clampPageSize(input.limit)));
     if (input.cursor) query.set("after", input.cursor);
     if (input.createdAfter) query.set("created_at[gte]", toIso(input.createdAfter));
     if (input.createdBefore) query.set("created_at[lte]", toIso(input.createdBefore));
@@ -499,7 +507,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
 
   async listRefunds(input: ListRefundsInput = {}): Promise<ListRefundsResult> {
     const query = new URLSearchParams();
-    if (input.limit !== undefined) query.set("limit", String(input.limit));
+    if (input.limit !== undefined) query.set("limit", String(clampPageSize(input.limit)));
     if (input.cursor) query.set("after", input.cursor);
     if (input.createdAfter) query.set("created_at[gte]", toIso(input.createdAfter));
     if (input.createdBefore) query.set("created_at[lte]", toIso(input.createdBefore));
@@ -857,6 +865,14 @@ function toPrefilledCustomer(
     ...(address?.country ? { country_code: address.country } : {}),
   };
   return Object.keys(prefilled).length > 0 ? { prefilled_customer: prefilled } : undefined;
+}
+
+/**
+ * GoCardless cursor pagination documents `limit` as 1-500 (default 50) —
+ * clamped locally so fractional/zero/oversized values never reach the API.
+ */
+function clampPageSize(limit: number): number {
+  return Math.min(500, Math.max(1, Math.trunc(limit)));
 }
 
 function withQuery(path: string, query: URLSearchParams): string {

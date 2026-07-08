@@ -388,6 +388,31 @@ describe("PayPal fetchEvents", () => {
     });
     await expect(adapter.fetchEvents({ since: "not-a-date" })).rejects.toMatchObject({ code: "invalid_request" });
   });
+
+  it("normalizes page_size to a whole number >= 1 (PayPal documents no maximum)", async () => {
+    const seen: string[] = [];
+    const fetchSpy: typeof fetch = async (input) => {
+      const url = String(input);
+      seen.push(url);
+      if (url.endsWith("/v1/oauth2/token")) {
+        return new Response(JSON.stringify({ access_token: "t", expires_in: 3600 }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ events: [] }), { status: 200 });
+    };
+    const adapter = new PayPalServerAdapter({
+      clientId: "id",
+      clientSecret: "secret",
+      environment: "sandbox",
+      fetch: fetchSpy,
+    });
+    await adapter.fetchEvents({ limit: 0.4 });
+    await adapter.fetchEvents({ limit: 2.9 });
+    await adapter.fetchEvents({ limit: 500 });
+    const pageSizes = seen
+      .filter((url) => url.includes("/v1/notifications/webhooks-events"))
+      .map((url) => new URL(url).searchParams.get("page_size"));
+    expect(pageSizes).toEqual(["1", "2", "500"]);
+  });
 });
 
 describe("PayPal webhook verification (postback)", () => {
@@ -612,6 +637,7 @@ describe("PayPal config validation", () => {
   it("rejects nonsensical tuning values eagerly", () => {
     expect(() => new PayPalServerAdapter({ ...base, requestTimeoutMs: 0 })).toThrowError(/requestTimeoutMs/);
     expect(() => new PayPalServerAdapter({ ...base, maxNetworkRetries: -1 })).toThrowError(/maxNetworkRetries/);
+    expect(() => new PayPalServerAdapter({ ...base, maxNetworkRetries: 1.5 })).toThrowError(/maxNetworkRetries/);
     expect(() => new PayPalServerAdapter({ ...base, userAction: "BUY" as never })).toThrowError(/userAction/);
   });
 

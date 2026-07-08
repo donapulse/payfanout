@@ -123,7 +123,10 @@ function mapEventType(resourceType: string, action: string): UnifiedWebhookEvent
       case "chargeback_cancelled":
         return "payment.chargeback_won";
       // paid_out / chargeback_settled / surcharge_fee_debited are payout
-      // accounting, not payer-state changes.
+      // accounting, not payer-state changes. chargeback_settled in particular
+      // records already-reclaimed funds being debited from a payout, NOT a
+      // dispute outcome — the loss is final at charged_back itself, so no
+      // action here maps to payment.chargeback_lost (see the guide).
       default:
         return "unknown";
     }

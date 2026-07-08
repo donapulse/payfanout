@@ -47,6 +47,8 @@ describe("GoCardless config validation", () => {
     expect(() => makePair({ webhookSecret: [] })).toThrowError(/webhookSecret/);
     expect(() => makePair({ webhookSecret: ["", ""] })).toThrowError(/webhookSecret/);
     expect(() => makePair({ requestTimeoutMs: 0 })).toThrowError(/requestTimeoutMs/);
+    expect(() => makePair({ maxNetworkRetries: -1 })).toThrowError(/maxNetworkRetries/);
+    expect(() => makePair({ maxNetworkRetries: 1.5 })).toThrowError(/maxNetworkRetries/);
   });
 
   it("selects the host from the explicit environment, never from the credential", async () => {
@@ -524,6 +526,22 @@ describe("GoCardless event polling + listing", () => {
     expect(one.refunds).toHaveLength(1);
     expect(one.refunds[0]!.amount).toBe(100);
     expect(one.refunds[0]!.pspPaymentId).toBe(targetPayment);
+  });
+
+  it("clamps page sizes to GoCardless's documented 1-500 limit bounds", async () => {
+    const seen: string[] = [];
+    const fetchSpy: typeof fetch = async (input) => {
+      seen.push(String(input));
+      return new Response(
+        JSON.stringify({ payments: [], refunds: [], events: [], meta: { cursors: {} } }),
+        { status: 200 },
+      );
+    };
+    const { adapter } = makePair({ fetch: fetchSpy });
+    await adapter.listPayments({ limit: 1234 });
+    await adapter.listRefunds({ limit: 0 });
+    await adapter.fetchEvents({ limit: 2.9 });
+    expect(seen.map((url) => new URL(url).searchParams.get("limit"))).toEqual(["500", "1", "2"]);
   });
 });
 

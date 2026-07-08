@@ -39,6 +39,8 @@ export class FakeStripe implements StripeClientLike {
   uniquePaymentIntentCreations = 0;
   uniqueRefundCreations = 0;
   readonly detachedPaymentMethods: string[] = [];
+  /** Params of every customers.listPaymentMethods call — for pagination assertions. */
+  readonly listPaymentMethodsCalls: Array<Record<string, unknown> | undefined> = [];
   /** Params of the last paymentIntents.create/update call — for mapping assertions. */
   lastPaymentIntentParams: Record<string, unknown> | undefined;
   private nextError: object | undefined;
@@ -274,14 +276,20 @@ export class FakeStripe implements StripeClientLike {
       this.uniqueCustomerCreations++;
       return customer;
     },
-    listPaymentMethods: async (id: string): Promise<StripeListLike<StripePaymentMethodLike>> => {
+    listPaymentMethods: async (
+      id: string,
+      params?: Record<string, unknown>,
+    ): Promise<StripeListLike<StripePaymentMethodLike>> => {
       this.throwPending();
+      this.listPaymentMethodsCalls.push(params);
       if (!this.storedCustomers.has(id)) this.notFound("customer", id);
       const attached = [...this.storedPaymentMethods.values()].filter((pm) => {
         const owner = typeof pm.customer === "string" ? pm.customer : pm.customer?.id;
         return owner === id;
       });
-      return { data: attached, has_more: false };
+      // Real pagination semantics so >100-method customers exercise the
+      // adapter's has_more/starting_after loop.
+      return paginate(attached, params, (pm) => pm.id, (pm) => pm.created ?? 0);
     },
   };
 

@@ -54,6 +54,8 @@ export {
 export type { RefundState } from "./refunds.js";
 export { getRefundState } from "./refunds.js";
 
+export { screenSessionInput } from "./screening.js";
+
 export type {
   ChargeSavedPaymentMethodInput,
   ClientPaymentAdapter,

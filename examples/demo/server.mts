@@ -143,8 +143,10 @@ const onEvent = async (event: import("@payfanout/core").UnifiedWebhookEvent): Pr
   if (processedEventIds.has(event.id)) return; // host-owned dedupe
   processedEventIds.add(event.id);
   // Ack-fast contract: enqueue here (BullMQ, SQS, ...) — never process inline.
-  // pspPaymentId is payload-derived — encode it so log lines cannot be forged.
-  console.log(`[webhook] ${event.pspName} ${event.type} payment=${encodeURIComponent(event.pspPaymentId ?? "-")}`);
+  // Every field here is payload-derived — encode all of them so log lines cannot be forged.
+  console.log(
+    `[webhook] ${encodeURIComponent(event.pspName)} ${encodeURIComponent(event.type)} payment=${encodeURIComponent(event.pspPaymentId ?? "-")}`,
+  );
 };
 
 const stripeHook = createAdapterWebhookHandler(stripe, { onEvent, log: console.log });

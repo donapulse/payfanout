@@ -72,10 +72,14 @@ const router = new PaymentRouter({
 const { session, pspName, attempts } = await router.createPaymentSession(input);
 ```
 
-Candidates that can't serve the input (no manual capture, unsupported method types…) are
-skipped without a PSP call; business rejections (`invalid_request`, `card_declined`) abort
-the cascade, only transient trouble (`psp_unavailable`, `rate_limited`,
-`processing_error`, or `retryable` errors) fails over. `attempts` is your audit trail.
+Candidates that can't serve the input (no manual capture, no vaulting for a
+`savePaymentMethod` session, unsupported method types…) are skipped without a PSP call —
+the router and `PaymentService` share one predicate, `screenSessionInput` from
+`@payfanout/core`, so a skipped candidate is exactly one the service would have rejected.
+Business rejections (`invalid_request`, `card_declined`) abort the cascade, only transient
+trouble (`psp_unavailable`, `rate_limited`, `processing_error`, or `retryable` errors)
+fails over. `attempts` is your audit trail. Note a vault session is inherently pinned to
+the PSP that holds the customer/token, route such traffic with single-PSP rules.
 
 A **circuit breaker** (on by default, configurable via `circuitBreaker`) remembers
 outages: after 5 consecutive transient failures a PSP is skipped without paying its

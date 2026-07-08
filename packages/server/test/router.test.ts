@@ -401,3 +401,36 @@ describe("defaultShouldFailover", () => {
     ).toBe(false);
   });
 });
+
+describe("PaymentRouter capability screening (shared predicate with PaymentService)", () => {
+  it("a vault session skips candidates without saved-payment-method support instead of aborting", async () => {
+    const a = new FakeAdapter({ pspName: "psp-a" }); // no vault support
+    const b = new FakeAdapter({ pspName: "psp-b", capabilities: { supportsSavedPaymentMethods: true } });
+    const service = new PaymentService({ adapters: [a, b] });
+    const router = new PaymentRouter({ service });
+
+    const { pspName, attempts } = await router.createPaymentSession(
+      input({ savePaymentMethod: true, customer: "cus_1" }),
+    );
+    expect(pspName).toBe("psp-b");
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]).toMatchObject({ pspName: "psp-a", skipped: true });
+    expect(attempts[0]!.error.message).toMatch(/saved payment methods/);
+    expect(a.calls.filter((c) => c.method === "createPaymentSession")).toHaveLength(0); // never burned a PSP call
+  });
+
+  it("a zero-amount save-card session is eligible on a vault-capable candidate", async () => {
+    const b = new FakeAdapter({
+      pspName: "psp-b",
+      capabilities: { supportsSavedPaymentMethods: true, supportsPaymentMethodVerification: false },
+    });
+    const service = new PaymentService({ adapters: [b] });
+    const router = new PaymentRouter({ service });
+
+    const { pspName, attempts } = await router.createPaymentSession(
+      input({ amount: 0, savePaymentMethod: true, customer: "cus_1" }),
+    );
+    expect(pspName).toBe("psp-b");
+    expect(attempts).toHaveLength(0); // not skipped — the service accepts exactly this input
+  });
+});

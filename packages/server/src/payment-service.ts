@@ -19,6 +19,7 @@ import {
   type RefundInfo,
   type RefundRequest,
   type RefundResult,
+  screenSessionInput,
   type SavedPaymentMethod,
   type SavePaymentMethodInput,
   type ServerPaymentAdapter,
@@ -115,26 +116,15 @@ export class PaymentService {
     const adapter = this.adapterFor(pspName);
     assertMinorUnitAmount(input.amount, "amount");
     requireIdempotencyKey(input.idempotencyKey, "createPaymentSession");
-    const caps = adapter.getCapabilities();
-    if (input.captureMethod === "manual" && !caps.supportsManualCapture) {
-      throw guardError(pspName, `"${pspName}" does not support manual capture`);
-    }
-    if (input.amount === 0 && !caps.supportsPaymentMethodVerification && !input.savePaymentMethod) {
+    // Capability rules live in core's screenSessionInput — the router consumes
+    // the same predicate for candidate skipping, so the two can never drift.
+    const issue = screenSessionInput(adapter.getCapabilities(), input);
+    if (issue) throw guardError(pspName, issue);
+    if (input.savePaymentMethod && !input.customer) {
       throw guardError(
         pspName,
-        `"${pspName}" does not support zero-amount payment method verification`,
+        "savePaymentMethod requires `customer` — create one with createCustomer first",
       );
-    }
-    if (input.savePaymentMethod) {
-      if (!caps.supportsSavedPaymentMethods) {
-        throw guardError(pspName, `"${pspName}" does not support saved payment methods`);
-      }
-      if (!input.customer) {
-        throw guardError(
-          pspName,
-          "savePaymentMethod requires `customer` — create one with createCustomer first",
-        );
-      }
     }
     return this.run(pspName, "createPaymentSession", () => adapter.createPaymentSession(input));
   }

@@ -1,6 +1,7 @@
 import {
   normalizeCurrency,
   PayFanoutError,
+  screenSessionInput,
   type CreatePaymentSessionInput,
   type PaymentSession,
   type UnifiedPaymentMethodType,
@@ -243,27 +244,17 @@ export class PaymentRouter {
     this.breakerState.set(pspName, state);
   }
 
-  /** Static capability screening — mirrors PaymentService's guards without spending a PSP call. */
+  /**
+   * Static capability screening — core's screenSessionInput, the same
+   * predicate PaymentService enforces, so a skipped candidate is exactly one
+   * the service would have rejected without spending a PSP call. Vault
+   * sessions therefore skip candidates without supportsSavedPaymentMethods —
+   * but note a vault session is inherently pinned to the PSP holding the
+   * customer/token, so route such traffic with single-PSP rules.
+   */
   private eligibilityError(pspName: string, input: CreatePaymentSessionInput): PayFanoutError | undefined {
-    const caps = this.service.getCapabilities(pspName);
-    if (input.captureMethod === "manual" && !caps.supportsManualCapture) {
-      return ineligible(pspName, `"${pspName}" does not support manual capture`);
-    }
-    if (input.amount === 0 && !caps.supportsPaymentMethodVerification) {
-      return ineligible(pspName, `"${pspName}" does not support zero-amount payment method verification`);
-    }
-    if (input.paymentMethodTypes && input.paymentMethodTypes.length > 0) {
-      const supported = new Set(
-        caps.paymentMethods.filter((m) => m.supported).map((m) => m.type as string),
-      );
-      if (!input.paymentMethodTypes.some((t) => supported.has(t))) {
-        return ineligible(
-          pspName,
-          `"${pspName}" supports none of the requested payment method types: ${input.paymentMethodTypes.join(", ")}`,
-        );
-      }
-    }
-    return undefined;
+    const issue = screenSessionInput(this.service.getCapabilities(pspName), input);
+    return issue ? ineligible(pspName, issue) : undefined;
   }
 
   private emitAttempt(attempt: Parameters<NonNullable<PaymentRouterOptions["onAttempt"]>>[0]): void {

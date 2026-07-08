@@ -223,3 +223,19 @@ describe("PaymentService error normalization", () => {
     await expect(service.retrievePayment("flaky", "p1")).rejects.toBe(declined);
   });
 });
+
+describe("PaymentService session screening (shared predicate with PaymentRouter)", () => {
+  it("rejects sessions restricted to method types the adapter does not support, before any PSP call", async () => {
+    const adapter = new FakeAdapter({});
+    const service = new PaymentService({ adapters: [adapter] });
+    await expect(
+      service.createPaymentSession("fake", {
+        amount: 1000,
+        currency: "USD",
+        idempotencyKey: "k",
+        paymentMethodTypes: ["ideal"],
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request", pspName: "fake" });
+    expect(adapter.calls.filter((c) => c.method === "createPaymentSession")).toHaveLength(0);
+  });
+});

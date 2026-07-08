@@ -18,6 +18,7 @@ import {
   type ListRefundsResult,
   type MinorUnitAmount,
   type PaymentInfo,
+  type PaymentMethodCapability,
   type PaymentMethodDetails,
   type PaymentSession,
   type RefundInfo,
@@ -66,6 +67,21 @@ const STRIPE_CHARGE_TYPE_TO_UNIFIED: Record<string, UnifiedPaymentMethodType> = 
   bacs_debit: "bacs_debit",
 };
 
+/**
+ * Defaults mirror the client adapter. iDEAL/SEPA/ACH/Bacs are per-account
+ * dashboard enablements — config.paymentMethods overrides for accounts that
+ * differ.
+ */
+const DEFAULT_METHODS: PaymentMethodCapability[] = [
+  { type: "card", flow: "embedded", supported: true },
+  { type: "apple_pay", flow: "popup", supported: true },
+  { type: "google_pay", flow: "popup", supported: true },
+  { type: "ideal", flow: "redirect", supported: true },
+  { type: "sepa_debit", flow: "embedded", supported: true },
+  { type: "ach", flow: "embedded", supported: true },
+  { type: "bacs_debit", flow: "embedded", supported: true },
+];
+
 export class StripeServerAdapter implements ServerPaymentAdapter {
   readonly pspName = STRIPE_PSP_NAME;
   private readonly config: StripeServerAdapterConfig;
@@ -87,6 +103,18 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
         'StripeServerAdapter config.environment must be explicitly "sandbox" or "live" — it is never inferred from key prefixes',
       );
     }
+    if (config.webhookToleranceSeconds !== undefined && !(config.webhookToleranceSeconds > 0)) {
+      throw PayFanoutError.invalidRequest("StripeServerAdapter config.webhookToleranceSeconds must be > 0");
+    }
+    if (
+      config.requestTimeoutMs !== undefined &&
+      (!Number.isInteger(config.requestTimeoutMs) || config.requestTimeoutMs <= 0)
+    ) {
+      // The SDK's timeout option takes whole milliseconds and rejects fractions.
+      throw PayFanoutError.invalidRequest(
+        "StripeServerAdapter config.requestTimeoutMs must be a positive integer (milliseconds)",
+      );
+    }
     this.config = config;
   }
 
@@ -105,15 +133,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       supportsEventPolling: true, // GET /v1/events
       supportsListing: true,
       requiresServerCompletion: false, // Stripe confirms on the client (§4a)
-      paymentMethods: [
-        { type: "card", flow: "embedded", supported: true },
-        { type: "apple_pay", flow: "popup", supported: true },
-        { type: "google_pay", flow: "popup", supported: true },
-        { type: "ideal", flow: "redirect", supported: true },
-        { type: "sepa_debit", flow: "embedded", supported: true },
-        { type: "ach", flow: "embedded", supported: true },
-        { type: "bacs_debit", flow: "embedded", supported: true },
-      ],
+      paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };
   }
 
@@ -405,8 +425,19 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
 
   async listSavedPaymentMethods(pspCustomerId: string): Promise<SavedPaymentMethod[]> {
     return this.run(async (client) => {
-      const page = await client.customers.listPaymentMethods(pspCustomerId, { limit: 100 });
-      return page.data.map((pm) => toSavedPaymentMethod(this.pspName, pspCustomerId, pm));
+      // Stripe pages at 100 max; a customer can hold more — follow has_more so
+      // no vaulted instrument is silently truncated away.
+      const methods: SavedPaymentMethod[] = [];
+      let startingAfter: string | undefined;
+      do {
+        const page = await client.customers.listPaymentMethods(pspCustomerId, {
+          limit: 100,
+          ...(startingAfter ? { starting_after: startingAfter } : {}),
+        });
+        for (const pm of page.data) methods.push(toSavedPaymentMethod(this.pspName, pspCustomerId, pm));
+        startingAfter = page.has_more ? page.data[page.data.length - 1]?.id : undefined;
+      } while (startingAfter);
+      return methods;
     });
   }
 
@@ -777,5 +808,7 @@ async function loadStripeSdk(config: StripeServerAdapterConfig): Promise<StripeC
     apiVersion: config.apiVersion,
     // Idempotency keys make network retries safe; the SDK backs off on its own.
     maxNetworkRetries: config.maxNetworkRetries ?? 2,
+    // Bounds each request (headers and body); unset, the SDK's own 80s default applies.
+    ...(config.requestTimeoutMs !== undefined ? { timeout: config.requestTimeoutMs } : {}),
   }) as StripeClientLike;
 }

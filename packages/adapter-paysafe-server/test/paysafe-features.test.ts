@@ -85,9 +85,11 @@ describe("Paysafe session TTL", () => {
     expect(info.status).toBe("succeeded");
   });
 
-  it("rejects nonsensical TTL/timeout configs eagerly", () => {
+  it("rejects nonsensical TTL/timeout/retry configs eagerly", () => {
     expect(() => makePair({ sessionTtlSeconds: 0 })).toThrowError(/sessionTtlSeconds/);
     expect(() => makePair({ requestTimeoutMs: -5 })).toThrowError(/requestTimeoutMs/);
+    expect(() => makePair({ maxNetworkRetries: -1 })).toThrowError(/maxNetworkRetries/);
+    expect(() => makePair({ maxNetworkRetries: 1.5 })).toThrowError(/maxNetworkRetries/);
   });
 });
 
@@ -715,6 +717,16 @@ describe("Paysafe webhook rotation + refund_failed mapping", () => {
     await expect(adapter.verifyWebhookSignature(rawBody, signWith(rawBody, "old-key"))).resolves.toBe(true);
     await expect(adapter.verifyWebhookSignature(rawBody, signWith(rawBody, "new-key"))).resolves.toBe(true);
     await expect(adapter.verifyWebhookSignature(rawBody, signWith(rawBody, "other"))).resolves.toBe(false);
+  });
+
+  it("verifies with mixed-case header names (proxies rewrite casing)", async () => {
+    const { adapter } = makePair();
+    const rawBody = JSON.stringify({ id: "evt", eventType: "PAYMENT_COMPLETED" });
+    const value = signWith(rawBody, WEBHOOK_KEY)["signature"]!;
+    await expect(adapter.verifyWebhookSignature(rawBody, { Signature: value })).resolves.toBe(true);
+    await expect(
+      adapter.verifyWebhookSignature(rawBody, { "X-Paysafe-Signature": value }),
+    ).resolves.toBe(true);
   });
 
   it("rejects configs with no usable HMAC key", () => {

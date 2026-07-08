@@ -188,8 +188,11 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     if (config.requestTimeoutMs !== undefined && !(config.requestTimeoutMs > 0)) {
       throw PayFanoutError.invalidRequest("PayPalServerAdapter config.requestTimeoutMs must be > 0");
     }
-    if (config.maxNetworkRetries !== undefined && !(config.maxNetworkRetries >= 0)) {
-      throw PayFanoutError.invalidRequest("PayPalServerAdapter config.maxNetworkRetries must be >= 0");
+    if (
+      config.maxNetworkRetries !== undefined &&
+      (!Number.isInteger(config.maxNetworkRetries) || config.maxNetworkRetries < 0)
+    ) {
+      throw PayFanoutError.invalidRequest("PayPalServerAdapter config.maxNetworkRetries must be an integer >= 0");
     }
     this.config = config;
     this.baseUrl =
@@ -550,6 +553,9 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       path = input.cursor;
     } else {
       const params = new URLSearchParams();
+      // The webhooks-events list documents no page_size maximum (its OpenAPI
+      // spec pins only the default of 10), so only integer >= 1 is enforced —
+      // fractional/zero input never reaches the API.
       if (input.limit !== undefined) params.set("page_size", String(Math.max(1, Math.trunc(input.limit))));
       if (input.since !== undefined) params.set("start_time", toIsoTime(input.since));
       const query = params.toString();

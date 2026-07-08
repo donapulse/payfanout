@@ -1,8 +1,30 @@
 import { createHmac } from "node:crypto";
-import { describe, expect, it } from "vitest";
-import { isPayFanoutError } from "@payfanout/core";
+import { describe, expect, it, vi } from "vitest";
+import { isPayFanoutError, type PaymentMethodCapability } from "@payfanout/core";
 import { StripeServerAdapter, type StripeServerAdapterConfig } from "../src/index.js";
 import { FakeStripe, stripeError } from "./fake-stripe.js";
+
+// Captures the options the adapter hands the lazily-imported SDK constructor.
+const sdkConstructions = vi.hoisted(() => [] as Array<{ key: string; options: Record<string, unknown> }>);
+vi.mock("stripe", () => ({
+  default: class {
+    constructor(key: string, options: Record<string, unknown>) {
+      sdkConstructions.push({ key, options });
+      return {
+        paymentIntents: {
+          retrieve: async () => ({
+            id: "pi_sdk",
+            object: "payment_intent",
+            status: "succeeded",
+            amount: 100,
+            currency: "usd",
+            created: 1,
+          }),
+        },
+      };
+    }
+  },
+}));
 
 const NOW_MS = Date.parse("2026-07-04T12:00:00Z");
 const SIGNING_SECRET = "whsec_test_secret";
@@ -326,9 +348,77 @@ describe("Stripe webhook refund mapping + secret rotation", () => {
     await expect(rotated.verifyWebhookSignature(rawBody, sign(rawBody, OLD))).resolves.toBe(false);
   });
 
+  it("verifies with mixed-case header names (proxies rewrite casing)", async () => {
+    const { adapter } = makePair();
+    const rawBody = JSON.stringify({ id: "evt_mc", type: "payment_intent.succeeded", created: 1 });
+    const value = sign(rawBody, SIGNING_SECRET)["stripe-signature"]!;
+    await expect(adapter.verifyWebhookSignature(rawBody, { "Stripe-Signature": value })).resolves.toBe(true);
+  });
+
   it("rejects configs with no usable webhook secret", () => {
     expect(() => makePair({ webhookSigningSecret: [] })).toThrowError(/webhookSigningSecret/);
     expect(() => makePair({ webhookSigningSecret: ["", ""] })).toThrowError(/webhookSigningSecret/);
+  });
+
+  it("rejects nonsensical tolerance/timeout settings eagerly", () => {
+    expect(() => makePair({ webhookToleranceSeconds: 0 })).toThrowError(/webhookToleranceSeconds/);
+    expect(() => makePair({ webhookToleranceSeconds: -300 })).toThrowError(/webhookToleranceSeconds/);
+    expect(() => makePair({ requestTimeoutMs: 0 })).toThrowError(/requestTimeoutMs/);
+    expect(() => makePair({ requestTimeoutMs: 500.5 })).toThrowError(/requestTimeoutMs/);
+  });
+});
+
+describe("Stripe capability declaration", () => {
+  it("declares the default method list until told otherwise", () => {
+    const { adapter } = makePair();
+    expect(adapter.getCapabilities().paymentMethods).toEqual([
+      { type: "card", flow: "embedded", supported: true },
+      { type: "apple_pay", flow: "popup", supported: true },
+      { type: "google_pay", flow: "popup", supported: true },
+      { type: "ideal", flow: "redirect", supported: true },
+      { type: "sepa_debit", flow: "embedded", supported: true },
+      { type: "ach", flow: "embedded", supported: true },
+      { type: "bacs_debit", flow: "embedded", supported: true },
+    ]);
+  });
+
+  it("honors a per-account capability override (dashboard enablement varies)", () => {
+    const override: PaymentMethodCapability[] = [
+      { type: "card", flow: "embedded", supported: true },
+      { type: "ideal", flow: "redirect", supported: false },
+    ];
+    const { adapter } = makePair({ paymentMethods: override });
+    expect(adapter.getCapabilities().paymentMethods).toEqual(override);
+  });
+});
+
+describe("Stripe SDK client construction (lazy load)", () => {
+  it("pins apiVersion and threads maxNetworkRetries/requestTimeoutMs into the client", async () => {
+    const defaults = new StripeServerAdapter({
+      secretKey: "sk_test_a",
+      apiVersion: "2024-06-20",
+      webhookSigningSecret: SIGNING_SECRET,
+      environment: "sandbox",
+    });
+    await defaults.retrievePayment("pi_sdk");
+    const tuned = new StripeServerAdapter({
+      secretKey: "sk_test_b",
+      apiVersion: "2024-06-20",
+      webhookSigningSecret: SIGNING_SECRET,
+      environment: "sandbox",
+      maxNetworkRetries: 5,
+      requestTimeoutMs: 10_000,
+    });
+    await tuned.retrievePayment("pi_sdk");
+    // No timeout key on the defaults: the SDK's own 80s default stays in charge.
+    expect(sdkConstructions[0]).toEqual({
+      key: "sk_test_a",
+      options: { apiVersion: "2024-06-20", maxNetworkRetries: 2 },
+    });
+    expect(sdkConstructions[1]).toEqual({
+      key: "sk_test_b",
+      options: { apiVersion: "2024-06-20", maxNetworkRetries: 5, timeout: 10_000 },
+    });
   });
 });
 
@@ -456,6 +546,20 @@ describe("Stripe vaulting (Customers + saved PaymentMethods)", () => {
     fake.simulateClientConfirm(session.pspSessionId);
     const info = await adapter.retrievePayment(session.pspSessionId);
     expect(info.savedPaymentMethodToken).toBeUndefined();
+  });
+
+  it("pages past Stripe's 100-item limit — customers with >100 methods list completely", async () => {
+    const { adapter, fake } = makePair();
+    const customer = await adapter.createCustomer({ idempotencyKey: "k-cust" });
+    const seeded = Array.from({ length: 150 }, () => fake.seedPaymentMethod(customer.pspCustomerId).id);
+
+    const methods = await adapter.listSavedPaymentMethods(customer.pspCustomerId);
+    expect(methods).toHaveLength(150);
+    expect(new Set(methods.map((m) => m.token))).toEqual(new Set(seeded));
+    // Two round-trips: a full page of 100, then the cursor-anchored remainder.
+    expect(fake.listPaymentMethodsCalls).toHaveLength(2);
+    expect(fake.listPaymentMethodsCalls[0]).toEqual({ limit: 100 });
+    expect(fake.listPaymentMethodsCalls[1]).toEqual({ limit: 100, starting_after: seeded[99] });
   });
 
   it("savePaymentMethod without customer is rejected locally", async () => {

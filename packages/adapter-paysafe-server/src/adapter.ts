@@ -203,6 +203,12 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     if (config.requestTimeoutMs !== undefined && !(config.requestTimeoutMs > 0)) {
       throw PayFanoutError.invalidRequest("PaysafeServerAdapter config.requestTimeoutMs must be > 0");
     }
+    if (
+      config.maxNetworkRetries !== undefined &&
+      (!Number.isInteger(config.maxNetworkRetries) || config.maxNetworkRetries < 0)
+    ) {
+      throw PayFanoutError.invalidRequest("PaysafeServerAdapter config.maxNetworkRetries must be an integer >= 0");
+    }
     this.config = config;
     this.baseUrl =
       config.baseUrl ??
@@ -874,6 +880,9 @@ const PAYSAFE_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "3022": "insufficient_funds",
   "3006": "expired_card",
   "3017": "invalid_card_data",
+  // 3004: the zip/billing data Paysafe requires is missing from the request —
+  // a data-quality error (fixed by supplying billingDetails), not a decline.
+  "3004": "invalid_request",
   "3009": "card_declined",
   // 3406: settlement not batched yet — a timing state, retry later.
   "3406": "processing_error",

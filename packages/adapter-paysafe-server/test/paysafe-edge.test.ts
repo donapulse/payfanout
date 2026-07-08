@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isPayFanoutError, type UnifiedErrorCode, type UnifiedPaymentStatus } from "@payfanout/core";
+import { getUserMessage, isPayFanoutError, type UnifiedErrorCode, type UnifiedPaymentStatus } from "@payfanout/core";
 import {
   decodeSessionContext,
   encodeSessionContext,
@@ -60,6 +60,7 @@ describe("mapPaysafeError", () => {
     [402, "3022", "insufficient_funds", false],
     [402, "3006", "expired_card", false],
     [402, "3017", "invalid_card_data", false],
+    [402, "3004", "invalid_request", false], // zip/billing data required — data quality, not a decline
     [402, "3009", "card_declined", false],
     [402, "8000", "fraud_suspected", false],
     [402, "9999", "card_declined", false], // unknown code on a 402 is still a decline
@@ -80,6 +81,12 @@ describe("mapPaysafeError", () => {
       expect(mapped.pspName).toBe("paysafe");
     });
   }
+
+  it("gives 3004 the catalog invalid_request message, never the decline text", () => {
+    const mapped = mapPaysafeError(402, { error: { code: "3004", message: "Zip is required" } });
+    expect(mapped.message).toBe(getUserMessage("invalid_request"));
+    expect(mapped.message).not.toBe(getUserMessage("card_declined"));
+  });
 });
 
 describe("session context edge cases", () => {

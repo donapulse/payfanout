@@ -49,6 +49,10 @@ Paysafe: re-issues the signed context, **always continue with the returned sessi
 Later calls in the lifecycle: `retrievePayment` · `capturePayment` · `cancelPayment` ·
 `refundPayment` · `retrieveRefund` (poll `"pending"` refunds) · `verifyPaymentMethod` ·
 `fetchEvents` · `listPayments` · `listRefunds` (capability-gated passthroughs).
+Capture, cancel, and verify take a **required `idempotencyKey`** like every other
+mutating call — under multi-capture, each partial capture is its own charge with its own
+key. `PaymentInfo` reports `amountCaptured`/`amountCapturable` and echoes your `metadata`
+where the PSP supports it.
 
 `PaymentInfo` carries receipt-grade facts once the PSP reports them:
 `paymentMethodDetails` (`{ brand: "visa", last4: "4242", wallet? }`) and `mandateReference`
@@ -72,16 +76,23 @@ const router = new PaymentRouter({
 const { session, pspName, attempts } = await router.createPaymentSession(input);
 ```
 
-Candidates that can't serve the input (no manual capture, unsupported method types…) are
-skipped without a PSP call; business rejections (`invalid_request`, `card_declined`) abort
-the cascade, only transient trouble (`psp_unavailable`, `rate_limited`,
-`processing_error`, or `retryable` errors) fails over. `attempts` is your audit trail.
+Candidates that can't serve the input (no manual capture, no vaulting for a
+`savePaymentMethod` session, unsupported method types…) are skipped without a PSP call —
+the router and `PaymentService` share one predicate, `screenSessionInput` from
+`@payfanout/core`, so a skipped candidate is exactly one the service would have rejected.
+Business rejections (`invalid_request`, `card_declined`) abort the cascade, only transient
+trouble (`psp_unavailable`, `rate_limited`, `processing_error`, or `retryable` errors)
+fails over. `attempts` is your audit trail. Note a vault session is inherently pinned to
+the PSP that holds the customer/token, route such traffic with single-PSP rules.
 
 A **circuit breaker** (on by default, configurable via `circuitBreaker`) remembers
 outages: after 5 consecutive transient failures a PSP is skipped without paying its
 latency, half-opens after 30s for a probe, and closes on any response that proves it alive.
 If *every* candidate is open, they are attempted anyway, the breaker never turns an outage
-into a self-inflicted hard-down.
+into a self-inflicted hard-down. For dashboards, `getBreakerState()` snapshots the breaker
+per PSP (`consecutiveFailures`, `open`, `openUntil`) and `onBreakerStateChange` fires on
+open/close transitions, exception-isolated like `onAttempt`; note a custom `shouldFailover`
+also redefines what the breaker counts as transient.
 
 ## Retries, the machinery behind `retryable`
 
@@ -98,7 +109,10 @@ replay. Three layers act on that:
 
 Every failure from every adapter is a `PayFanoutError` (a real `Error` subclass): unified
 `code` (`card_declined`, `insufficient_funds`, `rate_limited`, …), user-safe `message`, a
-`retryable` flag, and the untouched PSP error on `raw`, never dropped.
+`retryable` flag, and the untouched PSP error on `raw`, never dropped. Capability guards
+reject with `unsupported_operation`; an expired stateless session token is
+`session_expired` (create a fresh session to recover); `authentication_required` is never
+retryable — bring the customer back on-session.
 
 Amounts are **integer minor units, always**, and minor units are currency-dependent, JPY
 has 0 decimals (`¥500` → `500`), BHD has 3 (`BD 1.234` → `1234`). Use

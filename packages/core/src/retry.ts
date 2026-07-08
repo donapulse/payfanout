@@ -17,10 +17,16 @@ export interface RetryPolicy {
   retries?: number;
   /** First backoff delay in ms (default 200). Doubles per attempt. */
   minDelayMs?: number;
-  /** Backoff ceiling in ms (default 5000). */
+  /** Backoff ceiling in ms (default 5000) — a hard cap, jitter included. */
   maxDelayMs?: number;
   /** Adds 0–25% random jitter to each delay (default true) to avoid thundering herds. */
   jitter?: boolean;
+  /**
+   * Cancels waiting: an aborted signal stops before the next attempt and
+   * rejects with the signal's reason (the in-flight attempt itself is the
+   * caller's to abort — thread the same signal into it).
+   */
+  signal?: AbortSignal;
   /** Which errors to retry. Default: isPayFanoutError(err) && err.retryable. */
   shouldRetry?: (error: unknown, attempt: number) => boolean;
   /** Observability: called before each backoff sleep. */
@@ -45,15 +51,22 @@ export async function withRetry<T>(fn: () => Promise<T>, policy: RetryPolicy = {
 
   let attempt = 0;
   while (true) {
+    if (policy.signal?.aborted) throw abortReason(policy.signal);
     try {
       return await fn();
     } catch (error) {
       attempt += 1;
       if (attempt > retries || !shouldRetry(error, attempt)) throw error;
+      if (policy.signal?.aborted) throw abortReason(policy.signal);
       const base = Math.min(maxDelayMs, minDelayMs * 2 ** (attempt - 1));
-      const delayMs = policy.jitter === false ? base : Math.round(base * (1 + random() * 0.25));
+      const jittered = policy.jitter === false ? base : Math.round(base * (1 + random() * 0.25));
+      const delayMs = Math.min(maxDelayMs, jittered); // maxDelayMs is a hard ceiling, jitter included
       policy.onRetry?.(error, attempt, delayMs);
       await sleep(delayMs);
     }
   }
+}
+
+function abortReason(signal: AbortSignal): unknown {
+  return signal.reason ?? new Error("Retry aborted");
 }

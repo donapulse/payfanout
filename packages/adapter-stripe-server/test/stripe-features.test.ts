@@ -1,8 +1,30 @@
 import { createHmac } from "node:crypto";
-import { describe, expect, it } from "vitest";
-import { isPayFanoutError } from "@payfanout/core";
+import { describe, expect, it, vi } from "vitest";
+import { isPayFanoutError, type PaymentMethodCapability } from "@payfanout/core";
 import { StripeServerAdapter, type StripeServerAdapterConfig } from "../src/index.js";
 import { FakeStripe, stripeError } from "./fake-stripe.js";
+
+// Captures the options the adapter hands the lazily-imported SDK constructor.
+const sdkConstructions = vi.hoisted(() => [] as Array<{ key: string; options: Record<string, unknown> }>);
+vi.mock("stripe", () => ({
+  default: class {
+    constructor(key: string, options: Record<string, unknown>) {
+      sdkConstructions.push({ key, options });
+      return {
+        paymentIntents: {
+          retrieve: async () => ({
+            id: "pi_sdk",
+            object: "payment_intent",
+            status: "succeeded",
+            amount: 100,
+            currency: "usd",
+            created: 1,
+          }),
+        },
+      };
+    }
+  },
+}));
 
 const NOW_MS = Date.parse("2026-07-04T12:00:00Z");
 const SIGNING_SECRET = "whsec_test_secret";
@@ -276,14 +298,19 @@ describe("Stripe webhook refund mapping + secret rotation", () => {
           id: `evt_${status}`,
           type: "charge.refund.updated",
           created: 1_780_000_400,
-          data: { object: { object: "refund", id: "re_9", status, payment_intent: "pi_9" } },
+          data: { object: { object: "refund", id: "re_9", status, amount: 700, currency: "eur", payment_intent: "pi_9" } },
         }),
       );
     expect((await parse("failed")).type).toBe("payment.refund_failed");
     expect((await parse("canceled")).type).toBe("payment.refund_failed");
     expect((await parse("succeeded")).type).toBe("payment.refunded");
     expect((await parse("pending")).type).toBe("unknown");
-    expect((await parse("failed")).pspPaymentId).toBe("pi_9");
+    const failed = await parse("failed");
+    expect(failed.pspPaymentId).toBe("pi_9");
+    // Refund-object events carry their own money facts — no retrieve round-trip needed.
+    expect(failed.amount).toBe(700);
+    expect(failed.currency).toBe("EUR");
+    expect(failed.refundId).toBe("re_9");
   });
 
   it("refund.failed / refund.updated events map the same way; charge.refunded stays payment.refunded", async () => {
@@ -321,9 +348,77 @@ describe("Stripe webhook refund mapping + secret rotation", () => {
     await expect(rotated.verifyWebhookSignature(rawBody, sign(rawBody, OLD))).resolves.toBe(false);
   });
 
+  it("verifies with mixed-case header names (proxies rewrite casing)", async () => {
+    const { adapter } = makePair();
+    const rawBody = JSON.stringify({ id: "evt_mc", type: "payment_intent.succeeded", created: 1 });
+    const value = sign(rawBody, SIGNING_SECRET)["stripe-signature"]!;
+    await expect(adapter.verifyWebhookSignature(rawBody, { "Stripe-Signature": value })).resolves.toBe(true);
+  });
+
   it("rejects configs with no usable webhook secret", () => {
     expect(() => makePair({ webhookSigningSecret: [] })).toThrowError(/webhookSigningSecret/);
     expect(() => makePair({ webhookSigningSecret: ["", ""] })).toThrowError(/webhookSigningSecret/);
+  });
+
+  it("rejects nonsensical tolerance/timeout settings eagerly", () => {
+    expect(() => makePair({ webhookToleranceSeconds: 0 })).toThrowError(/webhookToleranceSeconds/);
+    expect(() => makePair({ webhookToleranceSeconds: -300 })).toThrowError(/webhookToleranceSeconds/);
+    expect(() => makePair({ requestTimeoutMs: 0 })).toThrowError(/requestTimeoutMs/);
+    expect(() => makePair({ requestTimeoutMs: 500.5 })).toThrowError(/requestTimeoutMs/);
+  });
+});
+
+describe("Stripe capability declaration", () => {
+  it("declares the default method list until told otherwise", () => {
+    const { adapter } = makePair();
+    expect(adapter.getCapabilities().paymentMethods).toEqual([
+      { type: "card", flow: "embedded", supported: true },
+      { type: "apple_pay", flow: "popup", supported: true },
+      { type: "google_pay", flow: "popup", supported: true },
+      { type: "ideal", flow: "redirect", supported: true },
+      { type: "sepa_debit", flow: "embedded", supported: true },
+      { type: "ach", flow: "embedded", supported: true },
+      { type: "bacs_debit", flow: "embedded", supported: true },
+    ]);
+  });
+
+  it("honors a per-account capability override (dashboard enablement varies)", () => {
+    const override: PaymentMethodCapability[] = [
+      { type: "card", flow: "embedded", supported: true },
+      { type: "ideal", flow: "redirect", supported: false },
+    ];
+    const { adapter } = makePair({ paymentMethods: override });
+    expect(adapter.getCapabilities().paymentMethods).toEqual(override);
+  });
+});
+
+describe("Stripe SDK client construction (lazy load)", () => {
+  it("pins apiVersion and threads maxNetworkRetries/requestTimeoutMs into the client", async () => {
+    const defaults = new StripeServerAdapter({
+      secretKey: "sk_test_a",
+      apiVersion: "2024-06-20",
+      webhookSigningSecret: SIGNING_SECRET,
+      environment: "sandbox",
+    });
+    await defaults.retrievePayment("pi_sdk");
+    const tuned = new StripeServerAdapter({
+      secretKey: "sk_test_b",
+      apiVersion: "2024-06-20",
+      webhookSigningSecret: SIGNING_SECRET,
+      environment: "sandbox",
+      maxNetworkRetries: 5,
+      requestTimeoutMs: 10_000,
+    });
+    await tuned.retrievePayment("pi_sdk");
+    // No timeout key on the defaults: the SDK's own 80s default stays in charge.
+    expect(sdkConstructions[0]).toEqual({
+      key: "sk_test_a",
+      options: { apiVersion: "2024-06-20", maxNetworkRetries: 2 },
+    });
+    expect(sdkConstructions[1]).toEqual({
+      key: "sk_test_b",
+      options: { apiVersion: "2024-06-20", maxNetworkRetries: 5, timeout: 10_000 },
+    });
   });
 });
 
@@ -332,10 +427,16 @@ describe("Stripe payment method details + mandates", () => {
     const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession({ amount: 1000, currency: "USD", idempotencyKey: "k" });
     fake.simulateClientConfirm(session.pspSessionId, {
-      card: { brand: "Visa", last4: "4242", wallet: { type: "apple_pay" } },
+      card: { brand: "Visa", last4: "4242", wallet: { type: "apple_pay" }, exp_month: 11, exp_year: 2031 },
     });
     const info = await adapter.retrievePayment(session.pspSessionId);
-    expect(info.paymentMethodDetails).toEqual({ brand: "visa", last4: "4242", wallet: "apple_pay" });
+    expect(info.paymentMethodDetails).toEqual({
+      brand: "visa",
+      last4: "4242",
+      wallet: "apple_pay",
+      expMonth: 11,
+      expYear: 2031,
+    });
     expect(info.mandateReference).toBeUndefined(); // cards have no mandate
   });
 
@@ -376,9 +477,17 @@ describe("Stripe async-rails + dispute event mapping", () => {
 
   it("payment_intent.processing maps to payment.processing", async () => {
     const { adapter } = makePair();
-    const event = await parse(adapter, "payment_intent.processing", { object: "payment_intent", id: "pi_9" });
+    const event = await parse(adapter, "payment_intent.processing", {
+      object: "payment_intent",
+      id: "pi_9",
+      amount: 3200,
+      currency: "usd",
+    });
     expect(event.type).toBe("payment.processing");
     expect(event.pspPaymentId).toBe("pi_9");
+    expect(event.amount).toBe(3200);
+    expect(event.currency).toBe("USD");
+    expect(event.refundId).toBeUndefined();
   });
 
   it("charge.dispute.closed maps by outcome: won / warning_closed / lost", async () => {
@@ -439,6 +548,20 @@ describe("Stripe vaulting (Customers + saved PaymentMethods)", () => {
     expect(info.savedPaymentMethodToken).toBeUndefined();
   });
 
+  it("pages past Stripe's 100-item limit — customers with >100 methods list completely", async () => {
+    const { adapter, fake } = makePair();
+    const customer = await adapter.createCustomer({ idempotencyKey: "k-cust" });
+    const seeded = Array.from({ length: 150 }, () => fake.seedPaymentMethod(customer.pspCustomerId).id);
+
+    const methods = await adapter.listSavedPaymentMethods(customer.pspCustomerId);
+    expect(methods).toHaveLength(150);
+    expect(new Set(methods.map((m) => m.token))).toEqual(new Set(seeded));
+    // Two round-trips: a full page of 100, then the cursor-anchored remainder.
+    expect(fake.listPaymentMethodsCalls).toHaveLength(2);
+    expect(fake.listPaymentMethodsCalls[0]).toEqual({ limit: 100 });
+    expect(fake.listPaymentMethodsCalls[1]).toEqual({ limit: 100, starting_after: seeded[99] });
+  });
+
   it("savePaymentMethod without customer is rejected locally", async () => {
     const { adapter } = makePair();
     await expect(
@@ -457,7 +580,10 @@ describe("Stripe vaulting (Customers + saved PaymentMethods)", () => {
       idempotencyKey: "k-save",
     });
     const pm = fake.simulateSetupConfirm(saveSession.pspSessionId);
-    const saved = await adapter.verifyPaymentMethod({ pspSessionId: saveSession.pspSessionId });
+    const saved = await adapter.verifyPaymentMethod({
+      pspSessionId: saveSession.pspSessionId,
+      idempotencyKey: "k-verify-save",
+    });
     expect(saved.status).toBe("succeeded");
     expect(saved.savedPaymentMethodToken).toBe(pm.id);
     expect(fake.detachedPaymentMethods).not.toContain(pm.id); // stays vaulted
@@ -465,7 +591,10 @@ describe("Stripe vaulting (Customers + saved PaymentMethods)", () => {
     // Plain verification (no customer) keeps the detach guarantee.
     const verifySession = await adapter.createPaymentSession({ amount: 0, currency: "USD", idempotencyKey: "k-ver" });
     const verifyPm = fake.simulateSetupConfirm(verifySession.pspSessionId);
-    const verified = await adapter.verifyPaymentMethod({ pspSessionId: verifySession.pspSessionId });
+    const verified = await adapter.verifyPaymentMethod({
+      pspSessionId: verifySession.pspSessionId,
+      idempotencyKey: "k-verify-only",
+    });
     expect(verified.savedPaymentMethodToken).toBeUndefined();
     expect(fake.detachedPaymentMethods).toContain(verifyPm.id);
   });
@@ -494,7 +623,7 @@ describe("Stripe vaulting (Customers + saved PaymentMethods)", () => {
       idempotencyKey: "k-c2",
     });
     expect(recurring.status).toBe("succeeded");
-    expect(recurring.paymentMethodDetails).toEqual({ brand: "visa", last4: "4242" });
+    expect(recurring.paymentMethodDetails).toEqual({ brand: "visa", last4: "4242", expMonth: 12, expYear: 2030 });
     expect(fake.lastPaymentIntentParams).toMatchObject({ off_session: true });
   });
 
@@ -510,7 +639,7 @@ describe("Stripe vaulting (Customers + saved PaymentMethods)", () => {
         currency: "USD",
         idempotencyKey: "k-c",
       }),
-    ).rejects.toMatchObject({ code: "authentication_required", retryable: true });
+    ).rejects.toMatchObject({ code: "authentication_required", retryable: false });
   });
 
   it("deleteSavedPaymentMethod enforces ownership, then kills the token", async () => {

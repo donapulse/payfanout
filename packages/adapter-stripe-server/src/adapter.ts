@@ -1,7 +1,9 @@
 import {
   assertMinorUnitAmount,
   getCurrencyExponent,
+  lowercaseKeys,
   normalizeCurrency,
+  normalizeSecrets,
   PayFanoutError,
   type AdapterCapabilities,
   type ChargeSavedPaymentMethodInput,
@@ -16,6 +18,7 @@ import {
   type ListRefundsResult,
   type MinorUnitAmount,
   type PaymentInfo,
+  type PaymentMethodCapability,
   type PaymentMethodDetails,
   type PaymentSession,
   type RefundInfo,
@@ -64,6 +67,21 @@ const STRIPE_CHARGE_TYPE_TO_UNIFIED: Record<string, UnifiedPaymentMethodType> = 
   bacs_debit: "bacs_debit",
 };
 
+/**
+ * Defaults mirror the client adapter. iDEAL/SEPA/ACH/Bacs are per-account
+ * dashboard enablements — config.paymentMethods overrides for accounts that
+ * differ.
+ */
+const DEFAULT_METHODS: PaymentMethodCapability[] = [
+  { type: "card", flow: "embedded", supported: true },
+  { type: "apple_pay", flow: "popup", supported: true },
+  { type: "google_pay", flow: "popup", supported: true },
+  { type: "ideal", flow: "redirect", supported: true },
+  { type: "sepa_debit", flow: "embedded", supported: true },
+  { type: "ach", flow: "embedded", supported: true },
+  { type: "bacs_debit", flow: "embedded", supported: true },
+];
+
 export class StripeServerAdapter implements ServerPaymentAdapter {
   readonly pspName = STRIPE_PSP_NAME;
   private readonly config: StripeServerAdapterConfig;
@@ -75,7 +93,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
         throw PayFanoutError.invalidRequest(`StripeServerAdapter config.${key} is required`);
       }
     }
-    if (webhookSecretsOf(config).length === 0) {
+    if (normalizeSecrets(config.webhookSigningSecret).length === 0) {
       throw PayFanoutError.invalidRequest(
         "StripeServerAdapter config.webhookSigningSecret is required (one secret, or several during rotation)",
       );
@@ -83,6 +101,18 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     if (config.environment !== "sandbox" && config.environment !== "live") {
       throw PayFanoutError.invalidRequest(
         'StripeServerAdapter config.environment must be explicitly "sandbox" or "live" — it is never inferred from key prefixes',
+      );
+    }
+    if (config.webhookToleranceSeconds !== undefined && !(config.webhookToleranceSeconds > 0)) {
+      throw PayFanoutError.invalidRequest("StripeServerAdapter config.webhookToleranceSeconds must be > 0");
+    }
+    if (
+      config.requestTimeoutMs !== undefined &&
+      (!Number.isInteger(config.requestTimeoutMs) || config.requestTimeoutMs <= 0)
+    ) {
+      // The SDK's timeout option takes whole milliseconds and rejects fractions.
+      throw PayFanoutError.invalidRequest(
+        "StripeServerAdapter config.requestTimeoutMs must be a positive integer (milliseconds)",
       );
     }
     this.config = config;
@@ -103,15 +133,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       supportsEventPolling: true, // GET /v1/events
       supportsListing: true,
       requiresServerCompletion: false, // Stripe confirms on the client (§4a)
-      paymentMethods: [
-        { type: "card", flow: "embedded", supported: true },
-        { type: "apple_pay", flow: "popup", supported: true },
-        { type: "google_pay", flow: "popup", supported: true },
-        { type: "ideal", flow: "redirect", supported: true },
-        { type: "sepa_debit", flow: "embedded", supported: true },
-        { type: "ach", flow: "embedded", supported: true },
-        { type: "bacs_debit", flow: "embedded", supported: true },
-      ],
+      paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };
   }
 
@@ -200,44 +222,36 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
 
   async capturePayment(
     pspPaymentId: string,
-    amount?: MinorUnitAmount,
-    idempotencyKey?: string,
+    amount: MinorUnitAmount | undefined,
+    idempotencyKey: string,
   ): Promise<PaymentInfo> {
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
     return this.run(async (client) => {
       const pi = await client.paymentIntents.capture(
         pspPaymentId,
         amount !== undefined ? { amount_to_capture: amount } : {},
-        idempotencyKey ? { idempotencyKey } : undefined,
+        { idempotencyKey },
       );
       return this.toPaymentInfo(pi);
     });
   }
 
-  async cancelPayment(pspPaymentId: string, idempotencyKey?: string): Promise<PaymentInfo> {
+  async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
     return this.run(async (client) => {
-      const pi = await client.paymentIntents.cancel(
-        pspPaymentId,
-        {},
-        idempotencyKey ? { idempotencyKey } : undefined,
-      );
+      const pi = await client.paymentIntents.cancel(pspPaymentId, {}, { idempotencyKey });
       return this.toPaymentInfo(pi);
     });
   }
 
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
     if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
-    const stripeReasons = new Set(["duplicate", "fraudulent", "requested_by_customer"]);
     return this.run(async (client) => {
       const refund = await client.refunds.create(
         {
           payment_intent: req.pspPaymentId,
           ...(req.amount !== undefined ? { amount: req.amount } : {}),
-          ...(req.reason && stripeReasons.has(req.reason)
-            ? { reason: req.reason }
-            : req.reason
-              ? { metadata: { payfanout_reason: req.reason } }
-              : {}),
+          // RefundReason is exactly Stripe's own vocabulary — passed through as-is.
+          ...(req.reason ? { reason: req.reason } : {}),
         },
         { idempotencyKey: req.idempotencyKey },
       );
@@ -411,8 +425,19 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
 
   async listSavedPaymentMethods(pspCustomerId: string): Promise<SavedPaymentMethod[]> {
     return this.run(async (client) => {
-      const page = await client.customers.listPaymentMethods(pspCustomerId, { limit: 100 });
-      return page.data.map((pm) => toSavedPaymentMethod(this.pspName, pspCustomerId, pm));
+      // Stripe pages at 100 max; a customer can hold more — follow has_more so
+      // no vaulted instrument is silently truncated away.
+      const methods: SavedPaymentMethod[] = [];
+      let startingAfter: string | undefined;
+      do {
+        const page = await client.customers.listPaymentMethods(pspCustomerId, {
+          limit: 100,
+          ...(startingAfter ? { starting_after: startingAfter } : {}),
+        });
+        for (const pm of page.data) methods.push(toSavedPaymentMethod(this.pspName, pspCustomerId, pm));
+        startingAfter = page.has_more ? page.data[page.data.length - 1]?.id : undefined;
+      } while (startingAfter);
+      return methods;
     });
   }
 
@@ -474,7 +499,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     return verifyStripeWebhookSignature(
       rawBody,
       lowercaseKeys(headers),
-      webhookSecretsOf(this.config),
+      normalizeSecrets(this.config.webhookSigningSecret),
       this.config.webhookToleranceSeconds ?? 300,
       (this.config.now ?? Date.now)(),
     );
@@ -570,11 +595,14 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       // derived against collected funds, so that wins once it exists.
       amount: pi.amount_received && pi.amount_received > 0 ? pi.amount_received : pi.amount,
       amountRefunded: charge?.amount_refunded ?? 0,
+      ...(pi.amount_received !== undefined ? { amountCaptured: pi.amount_received } : {}),
+      ...(pi.amount_capturable !== undefined ? { amountCapturable: pi.amount_capturable } : {}),
       currency: pi.currency.toUpperCase(),
       paymentMethodType:
         (chargeType ? STRIPE_CHARGE_TYPE_TO_UNIFIED[chargeType] : undefined) ??
         (pi.payment_method_types?.[0] ? STRIPE_CHARGE_TYPE_TO_UNIFIED[pi.payment_method_types[0]] : undefined) ??
         "other",
+      ...(pi.metadata && Object.keys(pi.metadata).length > 0 ? { metadata: pi.metadata } : {}),
       ...(methodDetails ? { paymentMethodDetails: methodDetails } : {}),
       ...(mandateReference ? { mandateReference } : {}),
       ...(savedPaymentMethodToken ? { savedPaymentMethodToken } : {}),
@@ -622,11 +650,6 @@ function withPayfanoutId(
 ): Record<string, string> | undefined {
   if (!id) return metadata;
   return { ...metadata, payfanout_id: id };
-}
-
-function webhookSecretsOf(config: StripeServerAdapterConfig): string[] {
-  const raw = config.webhookSigningSecret;
-  return (Array.isArray(raw) ? raw : [raw]).filter((s): s is string => typeof s === "string" && s.length > 0);
 }
 
 /**
@@ -688,19 +711,18 @@ function toSavedPaymentMethod(
   pspCustomerId: string,
   pm: StripePaymentMethodLike,
 ): SavedPaymentMethod {
+  const details: PaymentMethodDetails = {
+    ...(pm.card?.brand ? { brand: pm.card.brand.toLowerCase() } : {}),
+    ...(pm.card?.last4 ? { last4: pm.card.last4 } : {}),
+    ...(pm.card?.exp_month ? { expMonth: pm.card.exp_month } : {}),
+    ...(pm.card?.exp_year ? { expYear: pm.card.exp_year } : {}),
+  };
   return {
     token: pm.id,
     pspName,
     pspCustomerId,
     paymentMethodType: pm.type && STRIPE_CHARGE_TYPE_TO_UNIFIED[pm.type] ? STRIPE_CHARGE_TYPE_TO_UNIFIED[pm.type]! : "card",
-    ...(pm.card?.brand || pm.card?.last4
-      ? {
-          details: {
-            ...(pm.card.brand ? { brand: pm.card.brand.toLowerCase() } : {}),
-            ...(pm.card.last4 ? { last4: pm.card.last4 } : {}),
-          },
-        }
-      : {}),
+    ...(Object.keys(details).length > 0 ? { details } : {}),
     ...(pm.created ? { createdAt: new Date(pm.created * 1000).toISOString() } : {}),
     raw: pm,
   };
@@ -753,6 +775,8 @@ function toPaymentMethodDetails(charge: StripeChargeLike | undefined): PaymentMe
     ...(card.brand ? { brand: card.brand.toLowerCase() } : {}),
     ...(card.last4 ? { last4: card.last4 } : {}),
     ...(card.wallet?.type ? { wallet: card.wallet.type } : {}),
+    ...(card.exp_month ? { expMonth: card.exp_month } : {}),
+    ...(card.exp_year ? { expYear: card.exp_year } : {}),
   };
   return Object.keys(details).length > 0 ? details : undefined;
 }
@@ -776,12 +800,6 @@ function isNotAttachedError(err: unknown): boolean {
   return e?.type === "StripeInvalidRequestError" && /not attached/i.test(e?.message ?? "");
 }
 
-function lowercaseKeys(headers: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(headers ?? {})) out[key.toLowerCase()] = value;
-  return out;
-}
-
 async function loadStripeSdk(config: StripeServerAdapterConfig): Promise<StripeClientLike> {
   const mod = (await import("stripe")) as unknown as { default: new (key: string, opts: object) => unknown };
   const StripeCtor = mod.default;
@@ -790,5 +808,7 @@ async function loadStripeSdk(config: StripeServerAdapterConfig): Promise<StripeC
     apiVersion: config.apiVersion,
     // Idempotency keys make network retries safe; the SDK backs off on its own.
     maxNetworkRetries: config.maxNetworkRetries ?? 2,
+    // Bounds each request (headers and body); unset, the SDK's own 80s default applies.
+    ...(config.requestTimeoutMs !== undefined ? { timeout: config.requestTimeoutMs } : {}),
   }) as StripeClientLike;
 }

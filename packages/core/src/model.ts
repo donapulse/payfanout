@@ -62,6 +62,13 @@ export interface PaymentMethodCapability {
 
 export interface AdapterCapabilities {
   pspName: string;
+  /**
+   * Hard PSP currency constraints (ISO 4217, uppercase). ABSENT means
+   * unrestricted. When present, the router pre-screens candidates by it —
+   * without it, a PSP-local currency rejection (invalid_request) aborts the
+   * failover cascade before an eligible PSP is tried.
+   */
+  supportedCurrencies?: string[];
   supportsRefunds: boolean;
   supportsPartialRefunds: boolean;
   /** Authorize now, capture later. */
@@ -124,6 +131,10 @@ export interface PaymentMethodDetails {
   last4?: string;
   /** Wallet that wrapped the card ("apple_pay", "google_pay", "link", …). */
   wallet?: string;
+  /** Card expiry month (1-12), when the PSP reports it — display/renewal warnings only. */
+  expMonth?: number;
+  /** Card expiry year (4 digits), when the PSP reports it. */
+  expYear?: number;
 }
 
 export interface PaymentInfo {
@@ -134,8 +145,21 @@ export interface PaymentInfo {
   amount: MinorUnitAmount;
   /** Source of truth for refund state — see getRefundState(). */
   amountRefunded: MinorUnitAmount;
+  /**
+   * Total captured so far, when the PSP reports it — the running sum under
+   * partial/multi-capture. Absent on PSPs that don't report it.
+   */
+  amountCaptured?: MinorUnitAmount;
+  /** Authorized-but-uncaptured remainder, when the PSP reports it. */
+  amountCapturable?: MinorUnitAmount;
   currency: string;
   paymentMethodType: UnifiedPaymentMethodType;
+  /**
+   * The host metadata stored on the PSP object, echoed back where the PSP
+   * supports it (adapters that carry metadata only in signed session tokens
+   * cannot echo it on retrieve).
+   */
+  metadata?: Record<string, string>;
   /** Present once the PSP reports instrument facts (post-confirmation). */
   paymentMethodDetails?: PaymentMethodDetails;
   /**
@@ -164,13 +188,24 @@ export interface RefundRequest {
   pspPaymentId: string;
   /** Omit for a full refund. */
   amount?: MinorUnitAmount;
-  reason?: string;
+  /**
+   * Best-effort per PSP: mapped to the provider's own vocabulary where one
+   * exists (Stripe accepts exactly these), passed through or withheld where
+   * none does.
+   */
+  reason?: RefundReason;
   idempotencyKey: string;
 }
 
+export type RefundReason = "duplicate" | "fraudulent" | "requested_by_customer";
+
+export const REFUND_STATUSES = ["succeeded", "pending", "failed"] as const;
+
+export type RefundStatus = (typeof REFUND_STATUSES)[number];
+
 export interface RefundResult {
   refundId: string;
-  status: "succeeded" | "pending" | "failed";
+  status: RefundStatus;
   amount: MinorUnitAmount;
   raw: unknown;
 }
@@ -241,6 +276,14 @@ export const WEBHOOK_EVENT_TYPES = [
 
 export type UnifiedWebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
 
+export function isUnifiedWebhookEventType(value: unknown): value is UnifiedWebhookEventType {
+  return typeof value === "string" && (WEBHOOK_EVENT_TYPES as readonly string[]).includes(value);
+}
+
+export function isUnifiedPaymentMethodType(value: unknown): value is UnifiedPaymentMethodType {
+  return typeof value === "string" && (PAYMENT_METHOD_TYPES as readonly string[]).includes(value);
+}
+
 export interface UnifiedWebhookEvent {
   /**
    * Stable dedupe key. The consuming application owns the "have I already
@@ -250,6 +293,16 @@ export interface UnifiedWebhookEvent {
   pspName: string;
   type: UnifiedWebhookEventType;
   pspPaymentId?: string;
+  /**
+   * Money facts, normalized where the PSP payload carries them — a stateless
+   * host should not need a retrievePayment round-trip to know how much a
+   * payment.refunded event refunded. Integer minor units.
+   */
+  amount?: MinorUnitAmount;
+  /** ISO 4217, when the payload reports it alongside `amount`. */
+  currency?: string;
+  /** The PSP refund id, on refund-shaped events. */
+  refundId?: string;
   /** ISO 8601. Webhook delivery is unordered on every PSP — treat events as unordered facts. */
   occurredAt: string;
   raw: unknown;

@@ -1,7 +1,13 @@
 import {
   assertMinorUnitAmount,
+  classifyHttpFallback,
+  getUserMessage,
   normalizeCurrency,
+  normalizeSecrets,
   PayFanoutError,
+  requestWithTimeout,
+  safeJson,
+  withTransportRetries,
   type AdapterCapabilities,
   type CreatePaymentSessionInput,
   type FetchEventsInput,
@@ -72,8 +78,8 @@ export interface GoCardlessServerAdapterConfig {
   /**
    * Automatic retries for transport-level trouble only (network failure,
    * timeout, HTTP 5xx, 429) with exponential backoff. Default 2. Safe for
-   * mutating calls: billing-request and refund creates carry an
-   * Idempotency-Key, and a replayed flow create only re-issues an
+   * mutating calls: billing-request/refund creates and cancel actions carry
+   * an Idempotency-Key, and a replayed flow create only re-issues an
    * authorisation URL for the same billing request. Business errors
    * (validation, invalid_state, permissions) are NEVER retried here.
    */
@@ -93,6 +99,7 @@ export interface GoCardlessBillingRequestLike {
     currency?: string;
     description?: string;
     scheme?: string;
+    metadata?: Record<string, string>;
   };
   mandate_request?: { currency?: string; scheme?: string };
   links?: {
@@ -186,13 +193,21 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
         'GoCardlessServerAdapter config.environment must be "sandbox" or "live"',
       );
     }
-    if (webhookSecretsOf(config).length === 0) {
+    if (normalizeSecrets(config.webhookSecret).length === 0) {
       throw PayFanoutError.invalidRequest(
         "GoCardlessServerAdapter config.webhookSecret is required (one secret, or several during rotation)",
       );
     }
     if (config.requestTimeoutMs !== undefined && !(config.requestTimeoutMs > 0)) {
       throw PayFanoutError.invalidRequest("GoCardlessServerAdapter config.requestTimeoutMs must be > 0");
+    }
+    if (
+      config.maxNetworkRetries !== undefined &&
+      (!Number.isInteger(config.maxNetworkRetries) || config.maxNetworkRetries < 0)
+    ) {
+      throw PayFanoutError.invalidRequest(
+        "GoCardlessServerAdapter config.maxNetworkRetries must be an integer >= 0",
+      );
     }
     this.config = config;
     this.baseUrl =
@@ -203,6 +218,9 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
   getCapabilities(): AdapterCapabilities {
     return {
       pspName: this.pspName,
+      // One-off billing request payments are GBP/EUR only (other GoCardless
+      // currencies need a mandate first) — declared so the router pre-screens.
+      supportedCurrencies: [...SUPPORTED_ONE_OFF_CURRENCIES],
       supportsRefunds: true,
       supportsPartialRefunds: true,
       supportsManualCapture: false, // bank debits/credits have no authorize-then-capture split
@@ -252,6 +270,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       );
     }
 
+    const metadata = toStampedMetadata(input);
     const billingRequest = await this.createWithIdempotencyReplay<GoCardlessBillingRequestLike>(
       "billing_requests",
       {
@@ -268,11 +287,15 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
               input.statementDescriptor ??
               input.metadata?.description ??
               (input.id ? `Payment ${input.id}` : "Payment"),
+            // payment_request.metadata is stored on the payment the billing
+            // request creates — how payfanout_id and host metadata reach
+            // retrievePayment once the payment exists.
+            ...(metadata ? { metadata } : {}),
           },
           ...(this.config.fallbackEnabled !== undefined
             ? { fallback_enabled: this.config.fallbackEnabled }
             : {}),
-          ...(toBillingRequestMetadata(input) ?? {}),
+          ...(metadata ? { metadata } : {}),
         },
       },
       input.idempotencyKey,
@@ -362,6 +385,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       amountRefunded: 0,
       currency: (billingRequest.payment_request?.currency ?? "").toUpperCase() || "GBP",
       paymentMethodType: mapSchemeToMethodType(billingRequest.payment_request?.scheme),
+      ...(billingRequest.metadata ? { metadata: billingRequest.metadata } : {}),
       createdAt: billingRequest.created_at ?? EPOCH,
       raw: billingRequest,
     };
@@ -371,22 +395,22 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * Cancels whichever stage the id names: a billing request pre-fulfilment
    * (expires its flows), or a payment — GoCardless only cancels
    * pending_submission payments, anything later rejects with invalid_state
-   * (cancellation_failed) -> invalid_request, never retried.
-   * GoCardless actions are not create endpoints, so no Idempotency-Key applies.
+   * (cancellation_failed) -> invalid_request, never retried. The caller's key
+   * rides the Idempotency-Key header (GoCardless accepts it on POST actions).
    */
-  async cancelPayment(pspPaymentId: string, _idempotencyKey?: string): Promise<PaymentInfo> {
+  async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
     if (pspPaymentId.startsWith("BRQ")) {
       const billingRequest = await this.request<GoCardlessBillingRequestLike>(
         "POST",
         `/billing_requests/${encodeURIComponent(pspPaymentId)}/actions/cancel`,
-        { body: {}, envelope: "billing_requests" },
+        { body: {}, idempotencyKey, envelope: "billing_requests" },
       );
       return this.billingRequestToPaymentInfo(billingRequest);
     }
     const payment = await this.request<GoCardlessPaymentLike>(
       "POST",
       `/payments/${encodeURIComponent(pspPaymentId)}/actions/cancel`,
-      { body: {}, envelope: "payments" },
+      { body: {}, idempotencyKey, envelope: "payments" },
     );
     return this.toPaymentInfo(payment, { mandateReference: await this.mandateReference(payment) });
   }
@@ -452,7 +476,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
   /** Missed-webhook recovery: GET /events, normalized by the same mapper webhooks use. */
   async fetchEvents(input: FetchEventsInput = {}): Promise<FetchEventsResult> {
     const query = new URLSearchParams();
-    if (input.limit !== undefined) query.set("limit", String(input.limit));
+    if (input.limit !== undefined) query.set("limit", String(clampPageSize(input.limit)));
     if (input.cursor) query.set("after", input.cursor);
     if (input.since) query.set("created_at[gte]", toIso(input.since));
     const page = await this.request<{ events?: GoCardlessEventLike[]; meta?: GoCardlessListMeta }>(
@@ -466,7 +490,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
 
   async listPayments(input: ListPaymentsInput = {}): Promise<ListPaymentsResult> {
     const query = new URLSearchParams();
-    if (input.limit !== undefined) query.set("limit", String(input.limit));
+    if (input.limit !== undefined) query.set("limit", String(clampPageSize(input.limit)));
     if (input.cursor) query.set("after", input.cursor);
     if (input.createdAfter) query.set("created_at[gte]", toIso(input.createdAfter));
     if (input.createdBefore) query.set("created_at[lte]", toIso(input.createdBefore));
@@ -483,7 +507,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
 
   async listRefunds(input: ListRefundsInput = {}): Promise<ListRefundsResult> {
     const query = new URLSearchParams();
-    if (input.limit !== undefined) query.set("limit", String(input.limit));
+    if (input.limit !== undefined) query.set("limit", String(clampPageSize(input.limit)));
     if (input.cursor) query.set("after", input.cursor);
     if (input.createdAfter) query.set("created_at[gte]", toIso(input.createdAfter));
     if (input.createdBefore) query.set("created_at[lte]", toIso(input.createdBefore));
@@ -553,6 +577,9 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       paymentMethodType: mapSchemeToMethodType(
         payment.scheme ?? extras.billingRequest?.payment_request?.scheme,
       ),
+      // Echoed verbatim as stored at the PSP (payfanout_id slot included). No
+      // amountCaptured/amountCapturable: bank debits have no capture split.
+      ...(payment.metadata ? { metadata: payment.metadata } : {}),
       ...(extras.mandateReference ? { mandateReference: extras.mandateReference } : {}),
       createdAt: payment.created_at ?? EPOCH,
       raw: extras.billingRequest ? { billing_request: extras.billingRequest, payment } : payment,
@@ -623,40 +650,37 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
 
   /**
    * Transport with timeout + transient-only retries. Safe to retry mutating
-   * calls: billing-request and refund creates carry an Idempotency-Key (a
-   * consumed key 409s and the create helper resolves it), and a replayed
-   * flow create only re-issues an authorisation URL for the same billing
-   * request.
+   * calls: billing-request/refund creates and cancel actions carry an
+   * Idempotency-Key (a consumed create key 409s and the create helper
+   * resolves it), and a replayed flow create only re-issues an authorisation
+   * URL for the same billing request.
    */
-  private async request<T>(method: "GET" | "POST", path: string, options: RequestOptions = {}): Promise<T> {
-    const attempts = 1 + (this.config.maxNetworkRetries ?? 2);
-    const sleep = this.config.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-    let lastError: PayFanoutError | undefined;
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      try {
-        return await this.requestOnce<T>(method, path, options);
-      } catch (err) {
-        if (!(err instanceof PayFanoutError) || !isTransportRetryable(err) || attempt === attempts) throw err;
-        lastError = err;
-        await sleep(Math.min(2000, 250 * 2 ** (attempt - 1)));
-      }
-    }
-    /* c8 ignore next -- the loop always returns or throws */
-    throw lastError ?? PayFanoutError.invalidRequest("unreachable");
+  private request<T>(method: "GET" | "POST", path: string, options: RequestOptions = {}): Promise<T> {
+    return withTransportRetries(() => this.requestOnce<T>(method, path, options), {
+      attempts: 1 + (this.config.maxNetworkRetries ?? 2),
+      sleep: this.config.sleep,
+    });
   }
 
   private async requestOnce<T>(method: "GET" | "POST", path: string, options: RequestOptions): Promise<T> {
-    const doFetch = this.config.fetch ?? fetch;
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
-    // A hung PSP connection must not hang the host's request handler. The
-    // timer stays armed until the BODY is read — a response can stall after
-    // its headers arrive, and response.text() would otherwise wait forever.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let response: Response;
-    let text: string;
-    try {
-      response = await doFetch(`${this.baseUrl}${path}`, {
+    const { response, text } = await requestWithTimeout(
+      {
+        fetch: this.config.fetch ?? fetch,
+        timeoutMs,
+        onFailure: (timedOut, cause) =>
+          new PayFanoutError({
+            code: "psp_unavailable",
+            message: timedOut
+              ? `GoCardless did not respond within ${timeoutMs}ms.`
+              : "Could not reach GoCardless.",
+            retryable: true,
+            raw: cause,
+            pspName: this.pspName,
+          }),
+      },
+      `${this.baseUrl}${path}`,
+      {
         method,
         headers: {
           authorization: `Bearer ${this.config.accessToken}`,
@@ -664,34 +688,14 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
           ...(options.body !== undefined ? { "content-type": "application/json" } : {}),
           ...(options.idempotencyKey ? { "idempotency-key": options.idempotencyKey } : {}),
         },
-        signal: controller.signal,
         ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
-      });
-      text = await readBodyWithSignal(response, controller.signal);
-    } catch (err) {
-      const timedOut = controller.signal.aborted;
-      throw new PayFanoutError({
-        code: "psp_unavailable",
-        message: timedOut
-          ? `GoCardless did not respond within ${timeoutMs}ms.`
-          : "Could not reach GoCardless.",
-        retryable: true,
-        raw: err,
-        pspName: this.pspName,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
+      },
+    );
     const json = text ? safeJson(text) : undefined;
     if (!response.ok) throw mapGoCardlessError(response.status, json ?? text, path);
     const payload = json as Record<string, unknown> | undefined;
     return (options.envelope && payload ? payload[options.envelope] : payload) as T;
   }
-}
-
-/** Transport-level trouble only: network failure/timeout, HTTP 5xx, or 429. */
-function isTransportRetryable(error: PayFanoutError): boolean {
-  return error.code === "rate_limited" || error.code === "psp_unavailable";
 }
 
 function mapBillingRequestStatus(status: string | undefined): UnifiedPaymentStatus {
@@ -776,18 +780,18 @@ function mapSchemeToMethodType(scheme: string | undefined): UnifiedPaymentMethod
  */
 export function mapGoCardlessError(httpStatus: number, body: unknown, path?: string): PayFanoutError {
   const errorBody = (body as { error?: { type?: string; message?: string } } | undefined)?.error;
+  const fallback = classifyHttpFallback(httpStatus);
   let code: UnifiedErrorCode;
   let retryable = false;
   let message: string;
-  if (httpStatus === 429) {
-    code = "rate_limited";
-    retryable = true;
-    message = "Too many requests — please retry shortly.";
-  } else if (httpStatus >= 500 || errorBody?.type === "gocardless") {
+  if (fallback.code === "rate_limited") {
+    ({ code, retryable } = fallback);
+    message = getUserMessage(code);
+  } else if (fallback.code === "psp_unavailable" || errorBody?.type === "gocardless") {
     // type "gocardless" = internal error; the docs say these may be retried.
     code = "psp_unavailable";
     retryable = true;
-    message = "The payment provider is temporarily unavailable.";
+    message = getUserMessage(code);
   } else if (httpStatus === 401) {
     code = "invalid_request";
     message = "GoCardless rejected the access token — check the credential and its environment.";
@@ -799,8 +803,8 @@ export function mapGoCardlessError(httpStatus: number, body: unknown, path?: str
   } else {
     // 400/404/409/422 (validation_failed, invalid_api_usage, invalid_state):
     // caller-side facts — never retryable, the router must not cascade on them.
-    code = "invalid_request";
-    message = "The payment request was invalid.";
+    ({ code, retryable } = fallback);
+    message = getUserMessage(code);
   }
   return new PayFanoutError({ code, message, retryable, raw: body, pspName: GOCARDLESS_PSP_NAME });
 }
@@ -825,17 +829,17 @@ function idempotentConflictResourceId(err: unknown): string | undefined {
  * GoCardless metadata allows at most 3 keys (50-char names, 500-char values).
  * payfanout_id claims a slot first so the host id round-trips; host keys fill
  * the remaining slots and overflow is withheld rather than failing the payment.
+ * Stamped on the billing request AND its payment_request, so the facts survive
+ * onto the payment GoCardless creates at fulfilment.
  */
-function toBillingRequestMetadata(
-  input: CreatePaymentSessionInput,
-): { metadata: Record<string, string> } | undefined {
+function toStampedMetadata(input: CreatePaymentSessionInput): Record<string, string> | undefined {
   const metadata: Record<string, string> = {};
   if (input.id) metadata["payfanout_id"] = input.id;
   for (const [key, value] of Object.entries(input.metadata ?? {})) {
     if (Object.keys(metadata).length >= 3) break;
     if (!(key in metadata)) metadata[key] = value;
   }
-  return Object.keys(metadata).length > 0 ? { metadata } : undefined;
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
 
 /**
@@ -863,29 +867,12 @@ function toPrefilledCustomer(
   return Object.keys(prefilled).length > 0 ? { prefilled_customer: prefilled } : undefined;
 }
 
-function webhookSecretsOf(config: GoCardlessServerAdapterConfig): string[] {
-  const raw = config.webhookSecret;
-  return (Array.isArray(raw) ? raw : [raw]).filter(
-    (secret): secret is string => typeof secret === "string" && secret.length > 0,
-  );
-}
-
 /**
- * Reads the response body under the request's abort signal. Native fetch
- * bodies reject on abort by themselves; the explicit race also bounds
- * injected transports whose Responses are not tied to the signal.
+ * GoCardless cursor pagination documents `limit` as 1-500 (default 50) —
+ * clamped locally so fractional/zero/oversized values never reach the API.
  */
-function readBodyWithSignal(response: Response, signal: AbortSignal): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    if (signal.aborted) {
-      reject(new Error("GoCardless response body read aborted"));
-      return;
-    }
-    signal.addEventListener("abort", () => reject(new Error("GoCardless response body read aborted")), {
-      once: true,
-    });
-    response.text().then(resolve, reject);
-  });
+function clampPageSize(limit: number): number {
+  return Math.min(500, Math.max(1, Math.trunc(limit)));
 }
 
 function withQuery(path: string, query: URLSearchParams): string {
@@ -895,12 +882,4 @@ function withQuery(path: string, query: URLSearchParams): string {
 
 function toIso(value: string | Date): string {
   return typeof value === "string" ? value : value.toISOString();
-}
-
-function safeJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return undefined;
-  }
 }

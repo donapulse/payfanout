@@ -25,7 +25,7 @@ export function getCurrencyExponent(currency: string): number {
 }
 
 export function normalizeCurrency(currency: string): string {
-  const code = currency?.toUpperCase?.();
+  const code = currency?.trim?.().toUpperCase?.();
   if (typeof code !== "string" || !/^[A-Z]{3}$/.test(code)) {
     throw PayFanoutError.invalidRequest(`Invalid ISO 4217 currency code: ${String(currency)}`);
   }
@@ -93,4 +93,39 @@ function formatNumberExact(value: number): string {
   if (!str.includes("e") && !str.includes("E")) return str;
   // Fall back to fixed notation for exotic inputs; 20 digits is the max toFixed supports.
   return value.toFixed(20).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+/**
+ * Splits an integer minor-unit amount across weights with no lost or invented
+ * cents: results sum exactly to `amount`, remainders distribute by the
+ * largest-remainder method (ties to the earliest position). The safe way to
+ * compute fee shares and tax splits — never float math on money.
+ *
+ *   allocate(1000, [1, 1, 1]) -> [334, 333, 333]
+ */
+export function allocate(amount: MinorUnitAmount, weights: number[]): MinorUnitAmount[] {
+  assertMinorUnitAmount(amount, "amount");
+  if (weights.length === 0) {
+    throw PayFanoutError.invalidRequest("allocate needs at least one weight");
+  }
+  if (weights.some((w) => !Number.isFinite(w) || w < 0)) {
+    throw PayFanoutError.invalidRequest("allocate weights must be finite and >= 0");
+  }
+  const total = weights.reduce((sum, w) => sum + w, 0);
+  if (total === 0) {
+    throw PayFanoutError.invalidRequest("allocate weights must not all be zero");
+  }
+  const shares = weights.map((w) => (amount * w) / total);
+  const floors = shares.map(Math.floor);
+  let remainder = amount - floors.reduce((sum, f) => sum + f, 0);
+  // Hand the leftover units to the largest fractional parts, earliest first on ties.
+  const order = shares
+    .map((share, index) => ({ index, fraction: share - Math.floor(share) }))
+    .sort((a, b) => b.fraction - a.fraction || a.index - b.index);
+  for (const { index } of order) {
+    if (remainder === 0) break;
+    floors[index]! += 1;
+    remainder -= 1;
+  }
+  return floors;
 }

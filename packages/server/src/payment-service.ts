@@ -19,11 +19,13 @@ import {
   type RefundInfo,
   type RefundRequest,
   type RefundResult,
+  screenSessionInput,
   type SavedPaymentMethod,
   type SavePaymentMethodInput,
   type ServerPaymentAdapter,
   type UnifiedErrorCode,
   type UpdatePaymentSessionInput,
+  validateAdapterCapabilities,
   type VerifyPaymentMethodInput,
 } from "@payfanout/core";
 
@@ -115,26 +117,16 @@ export class PaymentService {
     const adapter = this.adapterFor(pspName);
     assertMinorUnitAmount(input.amount, "amount");
     requireIdempotencyKey(input.idempotencyKey, "createPaymentSession");
-    const caps = adapter.getCapabilities();
-    if (input.captureMethod === "manual" && !caps.supportsManualCapture) {
-      throw guardError(pspName, `"${pspName}" does not support manual capture`);
-    }
-    if (input.amount === 0 && !caps.supportsPaymentMethodVerification && !input.savePaymentMethod) {
+    // Capability rules live in core's screenSessionInput — the router consumes
+    // the same predicate for candidate skipping, so the two can never drift.
+    const issue = screenSessionInput(adapter.getCapabilities(), input);
+    if (issue) throw guardError(pspName, issue);
+    if (input.savePaymentMethod && !input.customer) {
       throw guardError(
         pspName,
-        `"${pspName}" does not support zero-amount payment method verification`,
+        "savePaymentMethod requires `customer` — create one with createCustomer first",
+        "invalid_request",
       );
-    }
-    if (input.savePaymentMethod) {
-      if (!caps.supportsSavedPaymentMethods) {
-        throw guardError(pspName, `"${pspName}" does not support saved payment methods`);
-      }
-      if (!input.customer) {
-        throw guardError(
-          pspName,
-          "savePaymentMethod requires `customer` — create one with createCustomer first",
-        );
-      }
     }
     return this.run(pspName, "createPaymentSession", () => adapter.createPaymentSession(input));
   }
@@ -187,7 +179,7 @@ export class PaymentService {
     const adapter = this.vaultAdapter(pspName, "chargeSavedPaymentMethod");
     assertMinorUnitAmount(input.amount, "amount");
     if (input.amount === 0) {
-      throw guardError(pspName, "chargeSavedPaymentMethod requires a positive amount");
+      throw guardError(pspName, "chargeSavedPaymentMethod requires a positive amount", "invalid_request");
     }
     requireIdempotencyKey(input.idempotencyKey, "chargeSavedPaymentMethod");
     return this.run(pspName, "chargeSavedPaymentMethod", () => adapter.chargeSavedPaymentMethod!(input));
@@ -237,24 +229,27 @@ export class PaymentService {
     return this.run(pspName, "retrievePayment", () => adapter.retrievePayment(pspPaymentId));
   }
 
+  /** Capture is a charge — the idempotency key is required, per-capture under multi-capture. */
   async capturePayment(
     pspName: string,
     pspPaymentId: string,
-    amount?: MinorUnitAmount,
-    idempotencyKey?: string,
+    amount: MinorUnitAmount | undefined,
+    idempotencyKey: string,
   ): Promise<PaymentInfo> {
     const adapter = this.adapterFor(pspName);
     if (!adapter.getCapabilities().supportsManualCapture || !adapter.capturePayment) {
       throw guardError(pspName, `"${pspName}" does not support manual capture`);
     }
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
+    requireIdempotencyKey(idempotencyKey, "capturePayment");
     return this.run(pspName, "capturePayment", () =>
       adapter.capturePayment!(pspPaymentId, amount, idempotencyKey),
     );
   }
 
-  async cancelPayment(pspName: string, pspPaymentId: string, idempotencyKey?: string): Promise<PaymentInfo> {
+  async cancelPayment(pspName: string, pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
     const adapter = this.adapterFor(pspName);
+    requireIdempotencyKey(idempotencyKey, "cancelPayment");
     return this.run(pspName, "cancelPayment", () => adapter.cancelPayment(pspPaymentId, idempotencyKey));
   }
 
@@ -291,6 +286,7 @@ export class PaymentService {
     if (!adapter.getCapabilities().supportsPaymentMethodVerification || !adapter.verifyPaymentMethod) {
       throw guardError(pspName, `"${pspName}" does not support payment method verification`);
     }
+    requireIdempotencyKey(input.idempotencyKey, "verifyPaymentMethod");
     return this.run(pspName, "verifyPaymentMethod", () => adapter.verifyPaymentMethod!(input));
   }
 
@@ -345,7 +341,7 @@ export class PaymentService {
       this.emit({ pspName, operation, durationMs: this.now() - startedAt, ok: true });
       return result;
     } catch (err) {
-      const wrapped = PayFanoutError.wrap(err, { pspName });
+      const wrapped = ensurePspName(PayFanoutError.wrap(err, { pspName }), pspName);
       this.emit({
         pspName,
         operation,
@@ -373,87 +369,41 @@ function requireIdempotencyKey(key: string, operation: string): void {
   }
 }
 
-function guardError(pspName: string, message: string): PayFanoutError {
-  return new PayFanoutError({ code: "invalid_request", message, retryable: false, pspName });
+/** Capability guards reject with unsupported_operation; input-shape problems pass invalid_request. */
+function guardError(
+  pspName: string,
+  message: string,
+  code: UnifiedErrorCode = "unsupported_operation",
+): PayFanoutError {
+  return new PayFanoutError({ code, message, retryable: false, pspName });
 }
 
-/** Fails fast at registration if capability flags contradict the implemented surface. */
+/**
+ * PayFanoutError.wrap passes existing PayFanoutErrors through without
+ * backfilling pspName, so an adapter error thrown without one would leave the
+ * service unattributed. Fields are readonly — rebuild the error, keeping the
+ * original stack so the adapter's throw site stays in logs.
+ */
+function ensurePspName(error: PayFanoutError, pspName: string): PayFanoutError {
+  if (error.pspName !== undefined) return error;
+  const attributed = new PayFanoutError({
+    code: error.code,
+    message: error.message,
+    retryable: error.retryable,
+    raw: error.raw,
+    pspName,
+  });
+  attributed.stack = error.stack;
+  return attributed;
+}
+
+/**
+ * Fails fast at registration if capability flags contradict the implemented
+ * surface. The rule table lives in core (`validateAdapterCapabilities`) — the
+ * same one the conformance suite asserts — so the two can never drift; the
+ * service rejects on the first violation.
+ */
 function assertCapabilityCoherence(adapter: ServerPaymentAdapter): void {
-  const caps = adapter.getCapabilities();
-  if (caps.pspName !== adapter.pspName) {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" reports capabilities for "${caps.pspName}"`,
-    );
-  }
-  if (caps.requiresServerCompletion && typeof adapter.completePayment !== "function") {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" requires server completion but does not implement completePayment`,
-    );
-  }
-  if (caps.supportsManualCapture && typeof adapter.capturePayment !== "function") {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" claims manual capture but does not implement capturePayment`,
-    );
-  }
-  if (caps.supportsPaymentMethodVerification && typeof adapter.verifyPaymentMethod !== "function") {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" claims verification but does not implement verifyPaymentMethod`,
-    );
-  }
-  if (caps.supportsPartialRefunds && !caps.supportsRefunds) {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" claims partial refunds without refund support`,
-    );
-  }
-  if (caps.supportsRefunds && typeof adapter.retrieveRefund !== "function") {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" supports refunds but does not implement retrieveRefund — ` +
-        "pending refunds would be unpollable",
-    );
-  }
-  if (caps.supportsMultiCapture && !caps.supportsManualCapture) {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" claims multi-capture without manual capture support`,
-    );
-  }
-  if (caps.supportsSessionUpdate && typeof adapter.updatePaymentSession !== "function") {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" claims session update but does not implement updatePaymentSession`,
-    );
-  }
-  if (caps.supportsEventPolling && typeof adapter.fetchEvents !== "function") {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" claims event polling but does not implement fetchEvents`,
-    );
-  }
-  if (
-    caps.supportsListing &&
-    (typeof adapter.listPayments !== "function" || typeof adapter.listRefunds !== "function")
-  ) {
-    throw PayFanoutError.invalidRequest(
-      `Adapter "${adapter.pspName}" claims listing but does not implement listPayments/listRefunds`,
-    );
-  }
-  // The saved-payment-methods flag demands the full method surface. Cards
-  // still live at the PSP only — the coherence rule is about implemented
-  // methods, not about storing card data (never).
-  if (caps.supportsSavedPaymentMethods) {
-    for (const method of [
-      "createCustomer",
-      "listSavedPaymentMethods",
-      "deleteSavedPaymentMethod",
-      "chargeSavedPaymentMethod",
-    ] as const) {
-      if (typeof adapter[method] !== "function") {
-        throw PayFanoutError.invalidRequest(
-          `Adapter "${adapter.pspName}" claims saved payment methods but does not implement ${method}`,
-        );
-      }
-    }
-    if (caps.requiresServerCompletion && typeof adapter.savePaymentMethod !== "function") {
-      throw PayFanoutError.invalidRequest(
-        `Adapter "${adapter.pspName}" is tokenize-first with saved payment methods but does not implement savePaymentMethod`,
-      );
-    }
-  }
+  const issues = validateAdapterCapabilities(adapter);
+  if (issues.length > 0) throw PayFanoutError.invalidRequest(issues[0]!);
 }

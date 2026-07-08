@@ -1,5 +1,14 @@
-import { PayFanoutError, type UnifiedWebhookEvent, type UnifiedWebhookEventType } from "@payfanout/core";
-import { bytesToBase64, constantTimeEqual, hmacSha256, sha256Hex } from "./crypto-utils.js";
+import {
+  bytesToBase64,
+  constantTimeEqual,
+  hmacSha256,
+  normalizeSecrets,
+  normalizeTime,
+  PayFanoutError,
+  sha256Hex,
+  type UnifiedWebhookEvent,
+  type UnifiedWebhookEventType,
+} from "@payfanout/core";
 
 /**
  * Paysafe webhook signature: base64(HMAC_SHA256(hmacKey, rawJsonBody)) carried
@@ -21,8 +30,7 @@ export async function verifyPaysafeWebhookSignature(
     (value): value is string => typeof value === "string" && value.length > 0,
   );
   if (!provided) return false;
-  const keys = Array.isArray(hmacKeys) ? hmacKeys : [hmacKeys];
-  for (const key of keys) {
+  for (const key of normalizeSecrets(hmacKeys)) {
     const expected = bytesToBase64(await hmacSha256(key, rawBody));
     if (constantTimeEqual(provided.trim(), expected)) return true;
   }
@@ -60,7 +68,15 @@ interface PaysafeWebhookBody {
   resourceId?: string;
   txnTime?: string;
   eventDate?: string;
-  payload?: { id?: string; status?: string; txnTime?: string; merchantRefNum?: string };
+  payload?: {
+    id?: string;
+    status?: string;
+    txnTime?: string;
+    merchantRefNum?: string;
+    /** Integer minor units, as everywhere in the Paysafe API. */
+    amount?: number;
+    currencyCode?: string;
+  };
 }
 
 export async function parsePaysafeWebhookEvent(rawBody: string): Promise<UnifiedWebhookEvent> {
@@ -88,6 +104,10 @@ export async function parsePaysafeWebhookEvent(rawBody: string): Promise<Unified
 
   const rawType = (body.eventType ?? body.event ?? "").toUpperCase().replace(/[.\s-]/g, "_");
   const type = mapEventType(rawType);
+  const amount = body.payload?.amount;
+  const currency = body.payload?.currencyCode;
+  // On refund events the payload IS the refund object, so its id is the refund id.
+  const isRefundEvent = type === "payment.refunded" || type === "payment.refund_failed";
 
   return {
     // Stable dedupe key even if Paysafe omits an event id: hash of the exact raw bytes.
@@ -95,6 +115,9 @@ export async function parsePaysafeWebhookEvent(rawBody: string): Promise<Unified
     pspName: "paysafe",
     type,
     pspPaymentId: body.payload?.id ?? body.resourceId,
+    ...(typeof amount === "number" && Number.isSafeInteger(amount) ? { amount } : {}),
+    ...(typeof currency === "string" && currency !== "" ? { currency: currency.toUpperCase() } : {}),
+    ...(isRefundEvent && body.payload?.id ? { refundId: body.payload.id } : {}),
     occurredAt: normalizeTime(body.txnTime ?? body.eventDate ?? body.payload?.txnTime),
     raw: body,
   };
@@ -111,10 +134,4 @@ function mapEventType(rawType: string): UnifiedWebhookEventType {
     return "payment.chargeback";
   }
   return "unknown";
-}
-
-function normalizeTime(value: string | undefined): string {
-  const parsed = value ? Date.parse(value) : Number.NaN;
-  // Deterministic fallback: a missing timestamp is the PSP's omission, not ours.
-  return Number.isNaN(parsed) ? "1970-01-01T00:00:00.000Z" : new Date(parsed).toISOString();
 }

@@ -1,0 +1,34 @@
+{
+  "name": "@payfanout/adapter-payzen",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Client-side PayZen (Lyra) adapter for PayFanout (krypton-client embedded card fields, confirm-on-client, inline 3DS). No secrets, no server code.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "sideEffects": false,
+  "dependencies": {
+    "@payfanout/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@payfanout/conformance": "workspace:*"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "publishConfig": {
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  }
+}

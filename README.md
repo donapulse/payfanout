@@ -43,6 +43,8 @@ Two more non-negotiables baked into the design:
 | `@payfanout/adapter-gocardless` | client | GoCardless bank payments via the hosted authorisation redirect flow (no card fields). |
 | `@payfanout/adapter-paypal-server` | server | PayPal Orders v2 REST: capture/authorize, refunds, webhook postback verification, event polling. **Edge-runtime compatible** (fetch + WebCrypto, no Node builtins). |
 | `@payfanout/adapter-paypal` | client | PayPal Buttons: popup approval, no card fields (tokenize-first). |
+| `@payfanout/adapter-payzen-server` | server | PayZen (Lyra) REST API V4: payments, validation capture, refunds, IPN verification. **Edge-runtime compatible** (WebCrypto, no Node builtins). |
+| `@payfanout/adapter-payzen` | client | PayZen krypton-client embedded card fields (confirm-on-client, 3DS inline). |
 | `@payfanout/conformance` | tests | The contract suite every adapter, present or future, must pass. |
 
 Client packages have **zero** dependency on anything holding secrets; this is enforced

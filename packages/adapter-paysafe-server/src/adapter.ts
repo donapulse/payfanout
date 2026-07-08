@@ -1,7 +1,15 @@
 import {
   assertMinorUnitAmount,
+  classifyHttpFallback,
+  getUserMessage,
+  lowercaseKeys,
   normalizeCurrency,
+  normalizeSecrets,
   PayFanoutError,
+  requestWithTimeout,
+  safeJson,
+  utf8ToBase64,
+  withTransportRetries,
   type AdapterCapabilities,
   type ChargeSavedPaymentMethodInput,
   type CompletePaymentInput,
@@ -11,6 +19,7 @@ import {
   type MinorUnitAmount,
   type PaymentInfo,
   type PaymentMethodCapability,
+  type PaymentMethodDetails,
   type PaymentSession,
   type RefundInfo,
   type RefundRequest,
@@ -24,7 +33,6 @@ import {
   type UpdatePaymentSessionInput,
   type VerifyPaymentMethodInput,
 } from "@payfanout/core";
-import { utf8ToBase64 } from "./crypto-utils.js";
 import {
   decodeSessionContext,
   encodeSessionContext,
@@ -62,7 +70,8 @@ export interface PaysafeServerAdapterConfig {
   sessionTtlSeconds?: number;
   /**
    * Abort a hung Paysafe connection after this many milliseconds (default
-   * 30000). Every mutating call carries an idempotent merchantRefNum, so a
+   * 30000). The timer covers the whole exchange including the response body
+   * read. Every mutating call carries an idempotent merchantRefNum, so a
    * timed-out request is safe to retry. Timeouts surface as retryable
    * psp_unavailable errors.
    */
@@ -88,6 +97,14 @@ export interface PaysafeServerAdapterConfig {
   sleep?: (ms: number) => Promise<void>;
 }
 
+/** Masked instrument facts as the real API echoes them back (cardType/lastDigits/cardExpiry). */
+export interface PaysafeCardLike {
+  cardType?: string;
+  cardBrand?: string;
+  lastDigits?: string;
+  cardExpiry?: { month?: number; year?: number };
+}
+
 /** Structural shape of Paysafe Payments API responses. */
 export interface PaysafeSettlementLike {
   id: string;
@@ -111,8 +128,7 @@ export interface PaysafePaymentLike {
   settleWithAuth?: boolean;
   txnTime?: string;
   paymentType?: string;
-  /** Masked instrument facts as the real API echoes them back (cardType/lastDigits). */
-  card?: { cardType?: string; cardBrand?: string; lastDigits?: string };
+  card?: PaysafeCardLike;
   /** NOT populated by the real GET /payments — settlements are queried separately. */
   settlements?: PaysafeSettlementLike[];
   error?: { code?: string; message?: string };
@@ -126,7 +142,7 @@ export interface PaysafeStoredHandleLike {
   status?: string;
   usage?: string;
   paymentType?: string;
-  card?: { cardType?: string; cardBrand?: string; lastDigits?: string };
+  card?: PaysafeCardLike;
 }
 
 function toStoredMethod(
@@ -134,22 +150,13 @@ function toStoredMethod(
   pspCustomerId: string,
   handle: PaysafeStoredHandleLike,
 ): SavedPaymentMethod {
-  const brand =
-    handle.card?.cardBrand?.toLowerCase() ??
-    (handle.card?.cardType ? PAYSAFE_CARD_TYPE_TO_BRAND[handle.card.cardType.toUpperCase()] : undefined);
+  const details = toPaymentMethodDetails(handle.card);
   return {
     token: handle.paymentHandleToken,
     pspName,
     pspCustomerId,
     paymentMethodType: handle.paymentType === "CARD" || !handle.paymentType ? "card" : "other",
-    ...(brand || handle.card?.lastDigits
-      ? {
-          details: {
-            ...(brand ? { brand } : {}),
-            ...(handle.card?.lastDigits ? { last4: handle.card.lastDigits } : {}),
-          },
-        }
-      : {}),
+    ...(details ? { details } : {}),
     raw: handle,
   };
 }
@@ -177,7 +184,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     for (const key of ["username", "password", "sessionSigningKey"] as const) {
       if (!config[key]) throw PayFanoutError.invalidRequest(`PaysafeServerAdapter config.${key} is required`);
     }
-    if (webhookKeysOf(config).length === 0) {
+    if (normalizeSecrets(config.webhookHmacKey).length === 0) {
       throw PayFanoutError.invalidRequest(
         "PaysafeServerAdapter config.webhookHmacKey is required (one key, or several during rotation)",
       );
@@ -195,6 +202,12 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     }
     if (config.requestTimeoutMs !== undefined && !(config.requestTimeoutMs > 0)) {
       throw PayFanoutError.invalidRequest("PaysafeServerAdapter config.requestTimeoutMs must be > 0");
+    }
+    if (
+      config.maxNetworkRetries !== undefined &&
+      (!Number.isInteger(config.maxNetworkRetries) || config.maxNetworkRetries < 0)
+    ) {
+      throw PayFanoutError.invalidRequest("PaysafeServerAdapter config.maxNetworkRetries must be an integer >= 0");
     }
     this.config = config;
     this.baseUrl =
@@ -354,10 +367,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   }
 
   async retrievePayment(pspPaymentId: string): Promise<PaymentInfo> {
-    const payment = await this.request<PaysafePaymentLike>(
-      "GET",
-      `/paymenthub/v1/payments/${encodeURIComponent(pspPaymentId)}`,
-    );
+    const payment = await this.fetchPayment(pspPaymentId);
     // The real API never embeds settlements in the payment — query them so
     // amountRefunded/capturedAt reflect reality.
     const settlements = payment.settlements?.length
@@ -368,51 +378,57 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
 
   async capturePayment(
     pspPaymentId: string,
-    amount?: MinorUnitAmount,
-    idempotencyKey?: string,
+    amount: MinorUnitAmount | undefined,
+    idempotencyKey: string,
   ): Promise<PaymentInfo> {
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
     // Paysafe requires an explicit amount on settlements (error 5068 without one)
     // — resolve "capture everything" ourselves.
-    const captureAmount = amount ?? (await this.remainingAuthorizedAmount(pspPaymentId));
+    const captureAmount = amount ?? remainingToSettle(await this.fetchPayment(pspPaymentId));
     await this.request("POST", `/paymenthub/v1/payments/${encodeURIComponent(pspPaymentId)}/settlements`, {
-      // Deterministic fallback keeps repeat captures idempotent on the PSP side.
-      merchantRefNum: idempotencyKey ?? `payfanout-capture-${pspPaymentId}`,
+      merchantRefNum: idempotencyKey, // Paysafe dedupes settlements on merchantRefNum — one charge per key
       amount: captureAmount,
     });
     return this.retrievePayment(pspPaymentId);
   }
 
   /**
-   * Voids the remaining authorization. This also
-   * works AFTER partial settlements (multi-capture flows) — settled funds stay
-   * settled and the payment keeps reporting them (status "succeeded"); only a
-   * payment with no settlements at all comes back "canceled". With custom
-   * capture idempotency keys the settled amount is not rediscoverable
-   * statelessly (documented limitation) — prefer the default capture keys.
+   * Voids the remaining authorization. This also works AFTER partial
+   * settlements (multi-capture flows) — settled funds stay settled and the
+   * returned PaymentInfo reports them (status "succeeded"), derived from the
+   * pre-void remainder; only a payment with no settlements at all comes back
+   * "canceled". Caller-keyed settlements are not rediscoverable statelessly,
+   * so LATER retrievePayment calls lose that split once the void has consumed
+   * availableToSettle (documented limitation).
    */
-  async cancelPayment(pspPaymentId: string, idempotencyKey?: string): Promise<PaymentInfo> {
+  async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
+    const payment = await this.fetchPayment(pspPaymentId);
     // Voidauths also require an explicit amount (full remaining authorization).
-    const voidAmount = await this.remainingAuthorizedAmount(pspPaymentId);
+    const remaining = remainingToSettle(payment);
     await this.request("POST", `/paymenthub/v1/payments/${encodeURIComponent(pspPaymentId)}/voidauths`, {
-      merchantRefNum: idempotencyKey ?? `payfanout-void-${pspPaymentId}`,
-      amount: voidAmount,
+      merchantRefNum: idempotencyKey,
+      amount: remaining,
     });
-    return this.retrievePayment(pspPaymentId);
+    const fresh = await this.fetchPayment(pspPaymentId);
+    const settlements = fresh.settlements?.length ? fresh.settlements : await this.findSettlements(fresh);
+    // Post-void the amount/availableToSettle derivation would count the voided
+    // funds as settled — the pre-void remainder is the last stateless witness.
+    const settledBeforeVoid = Math.max(0, (payment.amount ?? 0) - remaining);
+    return this.toPaymentInfo({ ...fresh, settlements }, undefined, settledBeforeVoid);
   }
 
-  private async remainingAuthorizedAmount(pspPaymentId: string): Promise<number> {
-    const payment = await this.request<PaysafePaymentLike>(
+  private fetchPayment(pspPaymentId: string): Promise<PaysafePaymentLike> {
+    return this.request<PaysafePaymentLike>(
       "GET",
       `/paymenthub/v1/payments/${encodeURIComponent(pspPaymentId)}`,
     );
-    return payment.availableToSettle ?? payment.amount ?? 0;
   }
 
   /**
    * Settlements are query-only in the real API and keyed by merchantRefNum.
-   * Auto-capture settlements share the payment's refNum; manual captures use
-   * the capture's key (PayFanout's deterministic fallback when none was given).
+   * Auto-capture settlements share the payment's refNum; caller-keyed capture
+   * settlements cannot be rediscovered statelessly. The second candidate keeps
+   * payments captured by earlier releases' derived default keys readable.
    */
   private async findSettlements(payment: PaysafePaymentLike): Promise<PaysafeSettlementLike[]> {
     const candidates = [payment.merchantRefNum, `payfanout-capture-${payment.id}`];
@@ -434,10 +450,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   /** Paysafe refunds settle against a settlement, not the payment — resolved here so callers keep one API. */
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
     if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
-    const payment = await this.request<PaysafePaymentLike>(
-      "GET",
-      `/paymenthub/v1/payments/${encodeURIComponent(req.pspPaymentId)}`,
-    );
+    const payment = await this.fetchPayment(req.pspPaymentId);
     const settlements = payment.settlements?.length ? payment.settlements : await this.findSettlements(payment);
     const settlement = settlements.find(
       (s) => s.status !== "CANCELLED" && s.status !== "FAILED" && (s.availableToRefund ?? s.amount ?? 0) > 0,
@@ -456,6 +469,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       {
         merchantRefNum: req.idempotencyKey,
         ...(req.amount !== undefined ? { amount: req.amount } : {}),
+        // Paysafe has no refund-reason enum — the normalized reason rides the free-text description.
         ...(req.reason ? { description: req.reason } : {}),
       },
     );
@@ -497,10 +511,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       );
     }
     const context = await this.decodeContext(input.pspSessionId);
-    // The refNum must be unique per verification ATTEMPT (Paysafe 409s on reuse)
-    // yet stable for a same-token retry — so hash session + handle token together.
+    // Verification refNums must be unique per ATTEMPT (Paysafe 409s on reuse) —
+    // the caller's required idempotencyKey carries exactly that duty.
     const verification = await this.request<PaysafePaymentLike>("POST", "/paymenthub/v1/verifications", {
-      merchantRefNum: `payfanout-verify-${hashToken(`${input.pspSessionId}:${input.clientToken}`)}`,
+      merchantRefNum: input.idempotencyKey,
       paymentHandleToken: input.clientToken,
       ...(context.merchantAccountId ? { accountId: context.merchantAccountId } : {}),
       currencyCode: context.currency,
@@ -648,24 +662,35 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   }
 
   async verifyWebhookSignature(rawBody: string, headers: Record<string, string>): Promise<boolean> {
-    return verifyPaysafeWebhookSignature(rawBody, lowercaseKeys(headers), webhookKeysOf(this.config));
+    return verifyPaysafeWebhookSignature(
+      rawBody,
+      lowercaseKeys(headers),
+      normalizeSecrets(this.config.webhookHmacKey),
+    );
   }
 
   async parseWebhookEvent(rawBody: string): Promise<UnifiedWebhookEvent> {
     return parsePaysafeWebhookEvent(rawBody);
   }
 
-  private toPaymentInfo(payment: PaysafePaymentLike, payfanoutId?: string): PaymentInfo {
+  private toPaymentInfo(
+    payment: PaysafePaymentLike,
+    payfanoutId?: string,
+    knownSettled?: number,
+  ): PaymentInfo {
     const methodDetails = toPaymentMethodDetails(payment.card);
     const settlements = (payment.settlements ?? []).filter(
       (s) => s.status !== "CANCELLED" && s.status !== "FAILED",
     );
+    const completed = (payment.status ?? "").toUpperCase() === "COMPLETED";
     let settled = settlements.reduce((sum, s) => sum + (s.amount ?? 0), 0);
-    if (
+    if (settled === 0 && knownSettled !== undefined) {
+      settled = knownSettled;
+    } else if (
       settled === 0 &&
       payment.settleWithAuth === false &&
       typeof payment.availableToSettle === "number" &&
-      (payment.status ?? "").toUpperCase() === "COMPLETED"
+      completed
     ) {
       // The payment itself is the only witness when settlements weren't queried:
       // whatever left availableToSettle has been captured.
@@ -676,6 +701,14 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       (sum, s) => sum + (s.refundedAmount ?? Math.max(0, (s.amount ?? 0) - (s.availableToRefund ?? s.amount ?? 0))),
       0,
     );
+    // amountCaptured is only claimed with a witness: settlements/derivation for
+    // manual capture, or the settle-with-auth completion itself (full amount).
+    let amountCaptured: number | undefined;
+    if (settled > 0) amountCaptured = settled;
+    else if (completed && payment.settleWithAuth) amountCaptured = payment.amount ?? 0;
+    else if (completed && (typeof payment.availableToSettle === "number" || knownSettled !== undefined)) {
+      amountCaptured = 0;
+    }
     return {
       id: payfanoutId ?? payment.merchantRefNum ?? payment.id,
       pspName: this.pspName,
@@ -685,6 +718,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       // amount — the authorized amount is only meaningful pre-settlement.
       amount: settled > 0 ? settled : (payment.amount ?? 0),
       amountRefunded: refunded,
+      ...(amountCaptured !== undefined ? { amountCaptured } : {}),
+      ...(typeof payment.availableToSettle === "number"
+        ? { amountCapturable: payment.availableToSettle }
+        : {}),
       currency: (payment.currencyCode ?? "").toUpperCase() || "USD",
       paymentMethodType: payment.paymentType === "CARD" || !payment.paymentType ? "card" : "other",
       ...(methodDetails ? { paymentMethodDetails: methodDetails } : {}),
@@ -701,72 +738,48 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   /**
    * Transport with timeout + transient-only retries. Safe to retry mutating
    * calls: every one carries an idempotent merchantRefNum, so a replay can
-   * never double-charge. Business errors (4xx other than 429) never retry.
+   * never double-charge. Business errors (4xx other than 429) never retry —
+   * core's isTransportRetryable deliberately ignores `error.retryable` (3406,
+   * unbatched settlement, is retryable *hours* later, not milliseconds).
    */
-  private async request<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
-    const attempts = 1 + (this.config.maxNetworkRetries ?? 2);
-    const sleep = this.config.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-    let lastError: PayFanoutError | undefined;
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      try {
-        return await this.requestOnce<T>(method, path, body);
-      } catch (err) {
-        if (!(err instanceof PayFanoutError) || !isTransportRetryable(err) || attempt === attempts) throw err;
-        lastError = err;
-        await sleep(Math.min(2000, 250 * 2 ** (attempt - 1)));
-      }
-    }
-    /* c8 ignore next -- the loop always returns or throws */
-    throw lastError ?? PayFanoutError.invalidRequest("unreachable");
+  private request<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
+    return withTransportRetries(() => this.requestOnce<T>(method, path, body), {
+      attempts: 1 + (this.config.maxNetworkRetries ?? 2),
+      sleep: this.config.sleep,
+    });
   }
 
   private async requestOnce<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
-    const doFetch = this.config.fetch ?? fetch;
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
-    // A hung PSP connection must not hang the host's request handler.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let response: Response;
-    try {
-      response = await doFetch(`${this.baseUrl}${path}`, {
+    const { response, text } = await requestWithTimeout(
+      {
+        fetch: this.config.fetch ?? fetch,
+        timeoutMs,
+        onFailure: (timedOut, cause) =>
+          new PayFanoutError({
+            code: "psp_unavailable",
+            message: timedOut
+              ? `Paysafe did not respond within ${timeoutMs}ms.`
+              : "Could not reach Paysafe.",
+            retryable: true,
+            raw: cause,
+            pspName: this.pspName,
+          }),
+      },
+      `${this.baseUrl}${path}`,
+      {
         method,
         headers: {
           authorization: `Basic ${utf8ToBase64(`${this.config.username}:${this.config.password}`)}`,
           "content-type": "application/json",
         },
-        signal: controller.signal,
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-      });
-    } catch (err) {
-      const timedOut = controller.signal.aborted;
-      throw new PayFanoutError({
-        code: "psp_unavailable",
-        message: timedOut
-          ? `Paysafe did not respond within ${timeoutMs}ms.`
-          : "Could not reach Paysafe.",
-        retryable: true,
-        raw: err,
-        pspName: this.pspName,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
-    const text = await response.text();
+      },
+    );
     const json = text ? safeJson(text) : undefined;
     if (!response.ok) throw mapPaysafeError(response.status, json ?? text);
     return json as T;
   }
-}
-
-/**
- * Transport-level trouble only: network failure/timeout (psp_unavailable),
- * HTTP 5xx, or 429. NOT `error.retryable` — 3406
- * (unbatched settlement) is retryable *hours* later, not milliseconds.
- */
-function isTransportRetryable(error: PayFanoutError): boolean {
-  if (error.code === "rate_limited") return true;
-  if (error.code !== "psp_unavailable") return false;
-  return true;
 }
 
 /** Paysafe card.type codes → lowercase brand names hosts can render. */
@@ -783,18 +796,23 @@ const PAYSAFE_CARD_TYPE_TO_BRAND: Record<string, string> = {
   UP: "unionpay",
 };
 
-function toPaymentMethodDetails(
-  card: PaysafePaymentLike["card"],
-): { brand?: string; last4?: string } | undefined {
+function toPaymentMethodDetails(card: PaysafeCardLike | undefined): PaymentMethodDetails | undefined {
   if (!card) return undefined;
   const brand =
     card.cardBrand?.toLowerCase() ??
     (card.cardType ? PAYSAFE_CARD_TYPE_TO_BRAND[card.cardType.toUpperCase()] : undefined);
-  const details = {
+  const details: PaymentMethodDetails = {
     ...(brand ? { brand } : {}),
     ...(card.lastDigits ? { last4: card.lastDigits } : {}),
+    ...(typeof card.cardExpiry?.month === "number" ? { expMonth: card.cardExpiry.month } : {}),
+    ...(typeof card.cardExpiry?.year === "number" ? { expYear: card.cardExpiry.year } : {}),
   };
   return Object.keys(details).length > 0 ? details : undefined;
+}
+
+/** Authorized-but-unsettled remainder — the explicit amount full captures and voids need. */
+function remainingToSettle(payment: PaysafePaymentLike): number {
+  return payment.availableToSettle ?? payment.amount ?? 0;
 }
 
 /**
@@ -817,11 +835,6 @@ function isDuplicateCustomerError(err: unknown): boolean {
   if (!(err instanceof PayFanoutError)) return false;
   const code = (err.raw as { error?: { code?: string } } | undefined)?.error?.code;
   return code === "7505";
-}
-
-function webhookKeysOf(config: PaysafeServerAdapterConfig): string[] {
-  const raw = config.webhookHmacKey;
-  return (Array.isArray(raw) ? raw : [raw]).filter((k): k is string => typeof k === "string" && k.length > 0);
 }
 
 function mapRefundStatus(status: string | undefined): RefundResult["status"] {
@@ -867,6 +880,9 @@ const PAYSAFE_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "3022": "insufficient_funds",
   "3006": "expired_card",
   "3017": "invalid_card_data",
+  // 3004: the zip/billing data Paysafe requires is missing from the request —
+  // a data-quality error (fixed by supplying billingDetails), not a decline.
+  "3004": "invalid_request",
   "3009": "card_declined",
   // 3406: settlement not batched yet — a timing state, retry later.
   "3406": "processing_error",
@@ -884,45 +900,16 @@ export function mapPaysafeError(httpStatus: number, body: unknown): PayFanoutErr
     retryable = code === "processing_error";
   } else if (httpStatus === 402) {
     code = "card_declined";
-  } else if (httpStatus === 429) {
-    code = "rate_limited";
-    retryable = true;
-  } else if (httpStatus >= 500) {
-    code = "psp_unavailable";
-    retryable = true;
   } else {
-    code = "invalid_request";
+    ({ code, retryable } = classifyHttpFallback(httpStatus));
   }
   return new PayFanoutError({
     code,
-    message: userMessageFor(code),
+    message: getUserMessage(code),
     retryable,
     raw: body,
     pspName: PAYSAFE_PSP_NAME,
   });
-}
-
-function userMessageFor(code: UnifiedErrorCode): string {
-  switch (code) {
-    case "insufficient_funds":
-      return "Your card has insufficient funds.";
-    case "expired_card":
-      return "Your card has expired.";
-    case "invalid_card_data":
-      return "The card details are invalid.";
-    case "card_declined":
-      return "Your card was declined.";
-    case "fraud_suspected":
-      return "Your card was declined.";
-    case "rate_limited":
-      return "Too many requests — please retry shortly.";
-    case "processing_error":
-      return "The operation cannot be processed yet — please try again later.";
-    case "psp_unavailable":
-      return "The payment provider is temporarily unavailable.";
-    default:
-      return "The payment request was invalid.";
-  }
 }
 
 function toPaysafeBillingDetails(
@@ -937,25 +924,4 @@ function toPaysafeBillingDetails(
     ...(address.country ? { country: address.country } : {}),
   };
   return Object.keys(mapped).length > 0 ? { billingDetails: mapped } : undefined;
-}
-
-function safeJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-}
-
-function hashToken(token: string): string {
-  // Deterministic short id so verification retries reuse the same merchantRefNum.
-  let hash = 0;
-  for (let i = 0; i < token.length; i++) hash = (hash * 31 + token.charCodeAt(i)) >>> 0;
-  return hash.toString(16);
-}
-
-function lowercaseKeys(headers: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(headers ?? {})) out[key.toLowerCase()] = value;
-  return out;
 }

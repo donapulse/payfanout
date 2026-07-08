@@ -44,6 +44,7 @@ export function PayButton({
       className={className}
       style={style}
       disabled={disabled || paying}
+      aria-busy={paying}
       onClick={() => void pay().then(onResult)}
       data-payfanout-paybutton=""
     >

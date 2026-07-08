@@ -39,6 +39,8 @@ export class FakeStripe implements StripeClientLike {
   uniquePaymentIntentCreations = 0;
   uniqueRefundCreations = 0;
   readonly detachedPaymentMethods: string[] = [];
+  /** Params of every customers.listPaymentMethods call — for pagination assertions. */
+  readonly listPaymentMethodsCalls: Array<Record<string, unknown> | undefined> = [];
   /** Params of the last paymentIntents.create/update call — for mapping assertions. */
   lastPaymentIntentParams: Record<string, unknown> | undefined;
   private nextError: object | undefined;
@@ -76,6 +78,7 @@ export class FakeStripe implements StripeClientLike {
         status: "requires_payment_method",
         amount: params["amount"] as number,
         amount_received: 0,
+        amount_capturable: 0,
         currency: params["currency"] as string,
         created: 1_780_000_000,
         client_secret: `pi_${this.seq}_secret_test`,
@@ -133,7 +136,15 @@ export class FakeStripe implements StripeClientLike {
           captured: true,
           created: 1_780_000_150,
           payment_method: pm.id,
-          payment_method_details: { type: "card", card: { brand: pm.card?.brand ?? "visa", last4: pm.card?.last4 ?? "4242" } },
+          payment_method_details: {
+            type: "card",
+            card: {
+              brand: pm.card?.brand ?? "visa",
+              last4: pm.card?.last4 ?? "4242",
+              ...(pm.card?.exp_month ? { exp_month: pm.card.exp_month } : {}),
+              ...(pm.card?.exp_year ? { exp_year: pm.card.exp_year } : {}),
+            },
+          },
         };
       }
       return pi;
@@ -177,10 +188,19 @@ export class FakeStripe implements StripeClientLike {
         });
       }
       const captureAmount = (params?.["amount_to_capture"] as number | undefined) ?? pi.amount;
+      if (captureAmount > (pi.amount_capturable ?? pi.amount)) {
+        throw stripeError({
+          type: "StripeInvalidRequestError",
+          statusCode: 400,
+          message: `Amount to capture (${captureAmount}) is greater than the amount authorized (${pi.amount_capturable ?? pi.amount})`,
+        });
+      }
       pi.status = "succeeded";
       // Real Stripe semantics: `amount` stays at the authorized value; the
-      // collected funds land in amount_received.
+      // collected funds land in amount_received and nothing stays capturable
+      // (single capture releases the remainder of the authorization).
       pi.amount_received = captureAmount;
+      pi.amount_capturable = 0;
       if (typeof pi.latest_charge === "object" && pi.latest_charge) pi.latest_charge.captured = true;
       return pi;
     },
@@ -188,7 +208,15 @@ export class FakeStripe implements StripeClientLike {
       this.throwPending();
       const pi = this.intents.get(id);
       if (!pi) this.notFound("payment_intent", id);
+      if (pi.status === "succeeded" || pi.status === "canceled") {
+        throw stripeError({
+          type: "StripeInvalidRequestError",
+          statusCode: 400,
+          message: `You cannot cancel this PaymentIntent because it has a status of ${pi.status}.`,
+        });
+      }
       pi.status = "canceled";
+      pi.amount_capturable = 0;
       return pi;
     },
   };
@@ -248,14 +276,20 @@ export class FakeStripe implements StripeClientLike {
       this.uniqueCustomerCreations++;
       return customer;
     },
-    listPaymentMethods: async (id: string): Promise<StripeListLike<StripePaymentMethodLike>> => {
+    listPaymentMethods: async (
+      id: string,
+      params?: Record<string, unknown>,
+    ): Promise<StripeListLike<StripePaymentMethodLike>> => {
       this.throwPending();
+      this.listPaymentMethodsCalls.push(params);
       if (!this.storedCustomers.has(id)) this.notFound("customer", id);
       const attached = [...this.storedPaymentMethods.values()].filter((pm) => {
         const owner = typeof pm.customer === "string" ? pm.customer : pm.customer?.id;
         return owner === id;
       });
-      return { data: attached, has_more: false };
+      // Real pagination semantics so >100-method customers exercise the
+      // adapter's has_more/starting_after loop.
+      return paginate(attached, params, (pm) => pm.id, (pm) => pm.created ?? 0);
     },
   };
 
@@ -264,14 +298,26 @@ export class FakeStripe implements StripeClientLike {
   /** Test helper: a vaulted PaymentMethod attached to a customer. */
   seedPaymentMethod(
     customerId: string | null,
-    opts: { id?: string; brand?: string; last4?: string; behavior?: "ok" | "auth_required" | "declined" } = {},
+    opts: {
+      id?: string;
+      brand?: string;
+      last4?: string;
+      expMonth?: number;
+      expYear?: number;
+      behavior?: "ok" | "auth_required" | "declined";
+    } = {},
   ): StripePaymentMethodLike {
     const pm: StripePaymentMethodLike = {
       id: opts.id ?? `pm_${++this.seq}`,
       type: "card",
       customer: customerId,
       created: 1_780_000_120,
-      card: { brand: opts.brand ?? "visa", last4: opts.last4 ?? "4242" },
+      card: {
+        brand: opts.brand ?? "visa",
+        last4: opts.last4 ?? "4242",
+        exp_month: opts.expMonth ?? 12,
+        exp_year: opts.expYear ?? 2030,
+      },
     };
     if (opts.behavior && opts.behavior !== "ok") {
       (pm as unknown as Record<string, unknown>)["__behavior"] = opts.behavior;
@@ -297,7 +343,16 @@ export class FakeStripe implements StripeClientLike {
         });
       }
       const collected = pi.amount_received && pi.amount_received > 0 ? pi.amount_received : pi.amount;
-      const amount = (params["amount"] as number | undefined) ?? collected - (charge.amount_refunded ?? 0);
+      const unrefunded = collected - (charge.amount_refunded ?? 0);
+      const amount = (params["amount"] as number | undefined) ?? unrefunded;
+      // Real Stripe rejects refunding more than what remains on the charge.
+      if (amount > unrefunded) {
+        throw stripeError({
+          type: "StripeInvalidRequestError",
+          statusCode: 400,
+          message: `Refund amount (${amount}) is greater than unrefunded amount on charge (${unrefunded})`,
+        });
+      }
       charge.amount_refunded = (charge.amount_refunded ?? 0) + amount;
       charge.refunded = charge.amount_refunded >= collected;
       const refund: StripeRefundLike = {
@@ -361,7 +416,7 @@ export class FakeStripe implements StripeClientLike {
     piId: string,
     opts: {
       paymentMethodType?: string;
-      card?: { brand?: string; last4?: string; wallet?: { type?: string } };
+      card?: { brand?: string; last4?: string; wallet?: { type?: string }; exp_month?: number; exp_year?: number };
       /** Debit rails (sepa_debit, us_bank_account, …) report a mandate id. */
       mandate?: string;
     } = {},
@@ -372,6 +427,7 @@ export class FakeStripe implements StripeClientLike {
     const type = opts.paymentMethodType ?? "card";
     pi.status = manual ? "requires_capture" : "succeeded";
     pi.amount_received = manual ? 0 : pi.amount;
+    pi.amount_capturable = manual ? pi.amount : 0;
     // Save-during-checkout: customer + setup_future_usage vaults the instrument,
     // exactly like real Stripe attaches the PaymentMethod on confirmation.
     const customer = (pi as unknown as Record<string, unknown>)["customer"] as string | undefined;

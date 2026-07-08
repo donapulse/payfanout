@@ -16,6 +16,8 @@ export const en: LocaleBundle = {
     rate_limited: "Too many requests — please retry shortly.",
     psp_unavailable: "The payment provider is temporarily unavailable.",
     invalid_request: "The payment request was invalid.",
+    session_expired: "Your payment session has expired — please start again.",
+    unsupported_operation: "This payment operation is not available for the selected provider.",
     unknown: "Payment failed. Please try again or use a different payment method.",
   },
   ui: {

@@ -2,6 +2,16 @@
 import { useEffect, useRef, type CSSProperties, type ReactNode } from "react";
 import { PayFanoutError, type FieldsChangeState, type UnifiedError } from "@payfanout/core";
 import { usePayFanoutContext } from "./provider.js";
+import { useLatestRef } from "./use-latest-ref.js";
+
+export interface SaveConsentOptions {
+  /** Rendered inside the label; defaults to "Save my card for future payments". */
+  label?: ReactNode;
+  /** Initial state — unchecked unless explicitly set. */
+  defaultChecked?: boolean;
+  /** Fires with the new checked state on every toggle. */
+  onChange?: (checked: boolean) => void;
+}
 
 export interface PaymentFieldsProps {
   /** Defaults to the provider's active PSP. */
@@ -34,6 +44,15 @@ export interface PaymentFieldsProps {
    * Single-element PSPs (Stripe) ignore slots; layout goes via fieldOptions.
    */
   children?: ReactNode;
+  /**
+   * Renders an accessible "save my card" consent checkbox after the hosted
+   * fields — unchecked by default, never auto-saved. The checkbox only
+   * REPORTS consent via onChange: the host forwards it to its own server,
+   * which sets `savePaymentMethod: true` on createPaymentSession when (and
+   * only when) the customer checked it. Style it via
+   * [data-payfanout-save-consent].
+   */
+  saveConsent?: SaveConsentOptions;
 }
 
 /**
@@ -54,54 +73,87 @@ export function PaymentFields({
   className,
   style,
   children,
+  saveConsent,
 }: PaymentFieldsProps): ReactNode {
-  const { adapters, activePsp, setStatus, setLastError, mountedRef } = usePayFanoutContext();
+  const { adapters, activePsp, setStatus, setLastError, mountedRef, fieldsOwnerRef } = usePayFanoutContext();
   const containerRef = useRef<HTMLDivElement | null>(null);
-  // Latest-callbacks ref, updated in an effect (never during render): the
-  // mount effect below runs after this one, and SDK events fire later still.
-  const callbacksRef = useRef({ onReady, onError, onChange });
-  useEffect(() => {
-    callbacksRef.current = { onReady, onError, onChange };
-  });
+  // This instance's identity — the token it claims the provider's single
+  // mount slot with.
+  const instanceRef = useRef<object>({});
+  // Latest mount inputs and callbacks: SDK events fire long after the mount
+  // effect ran, and appearance/fieldOptions/locale must not be effect
+  // dependencies (PSP SDKs handle live option updates poorly; remount by
+  // changing clientSecret/psp instead).
+  const latestRef = useLatestRef({ appearance, fieldOptions, locale, onReady, onError, onChange });
 
   const targetPsp = psp ?? activePsp;
+  // Resolved during render so the mount effect keys on the adapter INSTANCE:
+  // a host re-rendering with an inline adapters array rebuilds the registry
+  // Map, and remounting on Map identity would wipe typed card data.
+  const adapter = targetPsp === undefined ? undefined : adapters.get(targetPsp);
 
   useEffect(() => {
     const container = containerRef.current;
-    if (!targetPsp || !container) return;
-    const adapter = adapters.get(targetPsp);
-    if (!adapter) {
-      const err = PayFanoutError.invalidRequest(`No client adapter registered for psp "${targetPsp}"`);
+    const instance = instanceRef.current;
+    if (!container) return;
+
+    const fail = (err: PayFanoutError): void => {
       setLastError(err);
       setStatus("error");
-      callbacksRef.current.onError?.(err);
+      latestRef.current.onError?.(err);
+    };
+    if (targetPsp === undefined) {
+      fail(
+        PayFanoutError.invalidRequest(
+          "No PSP to mount — pass <PaymentFields psp> or register at least one adapter with <PayFanoutProvider>",
+        ),
+      );
       return;
     }
+    if (!adapter) {
+      fail(PayFanoutError.invalidRequest(`No client adapter registered for psp "${targetPsp}"`));
+      return;
+    }
+    if (fieldsOwnerRef.current !== null && fieldsOwnerRef.current !== instance) {
+      fail(
+        PayFanoutError.invalidRequest(
+          "Only one <PaymentFields> may be mounted at a time — unmount the other instance first",
+        ),
+      );
+      return;
+    }
+    fieldsOwnerRef.current = instance;
 
     let cancelled = false;
     let cleanupHandle: (() => void) | undefined;
+    // Snapshot now: the mount must use this render's inputs even if the host
+    // re-renders while the SDK is still loading.
+    const { appearance, fieldOptions, locale } = latestRef.current;
     setStatus("loading-sdk");
     setLastError(undefined);
 
     void (async () => {
       try {
         await adapter.loadSdk();
+        // A StrictMode/remount cleanup may have run while the SDK loaded —
+        // the container now belongs to a newer invocation; never mount into it.
+        if (cancelled) return;
         const handle = await adapter.mount(container, {
           clientSecret,
           appearance,
           fieldOptions,
           locale,
           onReady: () => {
-            if (!cancelled) callbacksRef.current.onReady?.();
+            if (!cancelled) latestRef.current.onReady?.();
           },
           onError: (err) => {
             if (cancelled) return;
             setLastError(err);
             setStatus("error");
-            callbacksRef.current.onError?.(err);
+            latestRef.current.onError?.(err);
           },
           onChange: (state) => {
-            if (!cancelled) callbacksRef.current.onChange?.(state);
+            if (!cancelled) latestRef.current.onChange?.(state);
           },
         });
         cleanupHandle = () => {
@@ -121,7 +173,7 @@ export function PaymentFields({
         const wrapped = PayFanoutError.wrap(err, { pspName: targetPsp });
         setLastError(wrapped);
         setStatus("error");
-        callbacksRef.current.onError?.(wrapped);
+        latestRef.current.onError?.(wrapped);
       }
     })();
 
@@ -132,17 +184,31 @@ export function PaymentFields({
       } catch {
         // Unmount failures must never break React teardown.
       }
-      setStatus("idle");
+      // Only the slot owner releases it — a rejected second instance
+      // unmounting must not reset the live instance's status or slot.
+      if (fieldsOwnerRef.current === instance) {
+        fieldsOwnerRef.current = null;
+        setStatus("idle");
+      }
     };
-    // appearance/fieldOptions/locale are not dependencies: PSP
-    // SDKs handle live option updates poorly; remount by changing
-    // clientSecret/psp instead.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [targetPsp, clientSecret, adapters]);
+  }, [adapter, targetPsp, clientSecret, setStatus, setLastError, mountedRef, fieldsOwnerRef, latestRef]);
 
   return (
     <div ref={containerRef} className={className} style={style} data-payfanout-fields={targetPsp ?? ""}>
       {children}
+      {saveConsent ? (
+        // A wrapping <label> gives the native checkbox its accessible name —
+        // no ids needed, so multiple checkouts never collide.
+        <label data-payfanout-save-consent="">
+          <input
+            type="checkbox"
+            data-payfanout-save-consent-input=""
+            defaultChecked={saveConsent.defaultChecked ?? false}
+            onChange={(event) => saveConsent.onChange?.(event.currentTarget.checked)}
+          />
+          {saveConsent.label ?? "Save my card for future payments"}
+        </label>
+      ) : null}
     </div>
   );
 }

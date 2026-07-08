@@ -1,5 +1,5 @@
 import type { UnifiedError, UnifiedErrorCode } from "./errors.js";
-import { lookupLocalized, normalizeLocale } from "./locale-util.js";
+import { createCatalogStore, normalizeLocale } from "./locale-util.js";
 import { BUILT_IN_LOCALES } from "./locales/index.js";
 
 /**
@@ -12,15 +12,15 @@ import { BUILT_IN_LOCALES } from "./locales/index.js";
  *
  * PayFanout ships built-in en/fr/de/es catalogs (see `BUILT_IN_LOCALES`). A
  * host catalog only needs the codes it wants to override — anything missing
- * falls back to the locale's primary subtag, then to English, so partial
- * translations stay safe.
+ * falls back per code to the locale's primary subtag, then to English, so
+ * partial translations stay safe.
  */
 export type ErrorMessageCatalog = Partial<Record<UnifiedErrorCode, string>>;
 
-const EN: Record<UnifiedErrorCode, string> = BUILT_IN_LOCALES.en.errors;
-
-const catalogs = new Map<string, ErrorMessageCatalog>(
-  Object.entries(BUILT_IN_LOCALES).map(([locale, bundle]) => [locale, bundle.errors]),
+const store = createCatalogStore<UnifiedErrorCode>(
+  Object.entries(BUILT_IN_LOCALES).map(([locale, bundle]) => [locale, bundle.errors] as const),
+  BUILT_IN_LOCALES.en.errors,
+  "registerErrorMessages",
 );
 
 /**
@@ -29,25 +29,23 @@ const catalogs = new Map<string, ErrorMessageCatalog>(
  * Use this to override a built-in locale or add a new one.
  */
 export function registerErrorMessages(locale: string, catalog: ErrorMessageCatalog): void {
-  const key = normalizeLocale(locale);
-  if (!key) throw new Error("registerErrorMessages requires a non-empty locale");
-  catalogs.set(key, { ...catalogs.get(key), ...catalog });
+  store.register(locale, catalog);
 }
 
 /** The user-safe message for a code in the given locale (en fallback, always defined). */
 export function getUserMessage(code: UnifiedErrorCode, locale?: string): string {
-  return lookupLocalized(catalogs, code, locale, EN);
+  return store.get(code, locale);
 }
 
 /**
  * Localizes any UnifiedError/PayFanoutError for display: the locale's message
- * for its code when one is registered, otherwise the error's own (English,
- * user-safe) message. For English (or no locale) the error's own message wins —
- * it can be more specific than the generic catalog entry.
+ * for its code when one is registered (resolved per code — exact locale, then
+ * primary subtag, same chain as `getUserMessage`), otherwise the error's own
+ * (English, user-safe) message. For English (or no locale) the error's own
+ * message wins — it can be more specific than the generic catalog entry.
  */
 export function localizeError(error: Pick<UnifiedError, "code" | "message">, locale?: string): string {
   const key = normalizeLocale(locale);
   if (!key || key === "en" || key.startsWith("en-")) return error.message;
-  const catalog = catalogs.get(key) ?? catalogs.get(key.split("-")[0] ?? "");
-  return catalog?.[error.code] ?? error.message;
+  return store.resolve(error.code, locale) ?? error.message;
 }

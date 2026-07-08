@@ -1,6 +1,7 @@
 import {
   normalizeCurrency,
   PayFanoutError,
+  screenSessionInput,
   type CreatePaymentSessionInput,
   type PaymentSession,
   type UnifiedPaymentMethodType,
@@ -81,10 +82,24 @@ export interface PaymentRouterOptions {
    * rate_limited, processing_error). Business rejections (invalid_request,
    * card_declined, …) abort the cascade — retrying them elsewhere would
    * produce surprise duplicate sessions for a request that is simply wrong.
+   * The circuit breaker counts exactly the failures this predicate cascades
+   * on, so a custom predicate also redefines what the breaker treats as
+   * transient (anything else closes the circuit as proof of life).
    */
   shouldFailover?: (error: PayFanoutError) => boolean;
-  /** Observability: called once per failed/skipped candidate and once for the winner (error absent). */
+  /**
+   * Observability: called once per failed/skipped candidate and once for the
+   * winner (error absent). Exceptions it throws are swallowed — routing always
+   * wins over observability, so never rely on this hook for control flow.
+   */
   onAttempt?: (attempt: { pspName: string; ok: boolean; skipped?: boolean; error?: PayFanoutError }) => void;
+  /**
+   * Observability: fired when a PSP's circuit opens (starts being skipped) or
+   * closes (a response proved it alive). A failed half-open probe restarts the
+   * cooldown without re-firing "opened" — the circuit never closed in between.
+   * Exception-isolated like onAttempt.
+   */
+  onBreakerStateChange?: (event: { pspName: string; state: "opened" | "closed" }) => void;
   /** On by default; pass `false` to disable outage memory entirely. */
   circuitBreaker?: CircuitBreakerOptions | false;
 }
@@ -106,6 +121,7 @@ export class PaymentRouter {
   private readonly defaultChain: string[];
   private readonly shouldFailover: (error: PayFanoutError) => boolean;
   private readonly onAttempt?: PaymentRouterOptions["onAttempt"];
+  private readonly onBreakerStateChange?: PaymentRouterOptions["onBreakerStateChange"];
   private readonly breaker: Required<CircuitBreakerOptions> | undefined;
   private readonly breakerState = new Map<string, BreakerState>();
 
@@ -115,6 +131,7 @@ export class PaymentRouter {
     this.defaultChain = options.defaultChain ?? options.service.listPsps();
     this.shouldFailover = options.shouldFailover ?? defaultShouldFailover;
     this.onAttempt = options.onAttempt;
+    this.onBreakerStateChange = options.onBreakerStateChange;
     this.breaker =
       options.circuitBreaker === false
         ? undefined
@@ -171,7 +188,7 @@ export class PaymentRouter {
       const ineligible = this.eligibilityError(pspName, input);
       if (ineligible) {
         attempts.push({ pspName, error: ineligible, skipped: true });
-        this.onAttempt?.({ pspName, ok: false, skipped: true, error: ineligible });
+        this.emitAttempt({ pspName, ok: false, skipped: true, error: ineligible });
         continue;
       }
       if (honorBreaker && this.isCircuitOpen(pspName)) {
@@ -182,22 +199,22 @@ export class PaymentRouter {
           pspName,
         });
         attempts.push({ pspName, error, skipped: true });
-        this.onAttempt?.({ pspName, ok: false, skipped: true, error });
+        this.emitAttempt({ pspName, ok: false, skipped: true, error });
         continue;
       }
       try {
         const session = await this.service.createPaymentSession(pspName, input);
         this.recordOutcome(pspName, undefined);
-        this.onAttempt?.({ pspName, ok: true });
+        this.emitAttempt({ pspName, ok: true });
         return { session, pspName, attempts };
       } catch (err) {
         const error = PayFanoutError.wrap(err, { pspName });
         this.recordOutcome(pspName, error);
         attempts.push({ pspName, error, skipped: false });
-        this.onAttempt?.({ pspName, ok: false, skipped: false, error });
+        this.emitAttempt({ pspName, ok: false, skipped: false, error });
         const isLast = pspName === chain[chain.length - 1];
         if (!isLast && this.shouldFailover(error)) continue;
-        throw error;
+        throw withAttemptTrail(error, attempts);
       }
     }
 
@@ -208,6 +225,27 @@ export class PaymentRouter {
       retryable: attempts.some((a) => a.error.retryable),
       raw: attempts.map((a) => ({ pspName: a.pspName, code: a.error.code, message: a.error.message })),
     });
+  }
+
+  /**
+   * Read-only breaker snapshot for dashboards/health endpoints, keyed by
+   * pspName. Only PSPs with recorded consecutive failures appear. `open` means
+   * "currently skipped"; `openUntil` (present once the circuit has opened) is
+   * when the current cooldown ends — in the past, the circuit is half-open and
+   * the next request probes the PSP.
+   */
+  getBreakerState(): Record<string, { consecutiveFailures: number; open: boolean; openUntil?: string }> {
+    const snapshot: Record<string, { consecutiveFailures: number; open: boolean; openUntil?: string }> = {};
+    for (const [pspName, state] of this.breakerState) {
+      snapshot[pspName] = {
+        consecutiveFailures: state.consecutiveFailures,
+        open: this.isCircuitOpen(pspName),
+        ...(this.breaker && state.openedAt !== undefined
+          ? { openUntil: new Date(state.openedAt + this.breaker.cooldownMs).toISOString() }
+          : {}),
+      };
+    }
+    return snapshot;
   }
 
   /** Open = threshold reached and still inside the cooldown window (after it: half-open, probe allowed). */
@@ -227,8 +265,12 @@ export class PaymentRouter {
    */
   private recordOutcome(pspName: string, error: PayFanoutError | undefined): void {
     if (!this.breaker) return;
+    // "Open" for transition purposes = openedAt set: half-open still counts,
+    // so a recovered probe fires "closed" and a failed one repeats nothing.
+    const wasOpen = this.breakerState.get(pspName)?.openedAt !== undefined;
     if (error === undefined || !this.shouldFailover(error)) {
       this.breakerState.delete(pspName);
+      if (wasOpen) this.emitBreakerChange(pspName, "closed");
       return;
     }
     const state = this.breakerState.get(pspName) ?? { consecutiveFailures: 0 };
@@ -237,34 +279,64 @@ export class PaymentRouter {
       state.openedAt = this.breaker.now();
     }
     this.breakerState.set(pspName, state);
+    if (!wasOpen && state.openedAt !== undefined) this.emitBreakerChange(pspName, "opened");
   }
 
-  /** Static capability screening — mirrors PaymentService's guards without spending a PSP call. */
+  private emitBreakerChange(pspName: string, state: "opened" | "closed"): void {
+    try {
+      this.onBreakerStateChange?.({ pspName, state });
+    } catch {
+      // Observability must never break routing.
+    }
+  }
+
+  /**
+   * Static capability screening — core's screenSessionInput, the same
+   * predicate PaymentService enforces, so a skipped candidate is exactly one
+   * the service would have rejected without spending a PSP call. Vault
+   * sessions therefore skip candidates without supportsSavedPaymentMethods —
+   * but note a vault session is inherently pinned to the PSP holding the
+   * customer/token, so route such traffic with single-PSP rules.
+   */
   private eligibilityError(pspName: string, input: CreatePaymentSessionInput): PayFanoutError | undefined {
-    const caps = this.service.getCapabilities(pspName);
-    if (input.captureMethod === "manual" && !caps.supportsManualCapture) {
-      return ineligible(pspName, `"${pspName}" does not support manual capture`);
+    const issue = screenSessionInput(this.service.getCapabilities(pspName), input);
+    return issue ? ineligible(pspName, issue) : undefined;
+  }
+
+  private emitAttempt(attempt: Parameters<NonNullable<PaymentRouterOptions["onAttempt"]>>[0]): void {
+    try {
+      this.onAttempt?.(attempt);
+    } catch {
+      // Observability must never break routing.
     }
-    if (input.amount === 0 && !caps.supportsPaymentMethodVerification) {
-      return ineligible(pspName, `"${pspName}" does not support zero-amount payment method verification`);
-    }
-    if (input.paymentMethodTypes && input.paymentMethodTypes.length > 0) {
-      const supported = new Set(
-        caps.paymentMethods.filter((m) => m.supported).map((m) => m.type as string),
-      );
-      if (!input.paymentMethodTypes.some((t) => supported.has(t))) {
-        return ineligible(
-          pspName,
-          `"${pspName}" supports none of the requested payment method types: ${input.paymentMethodTypes.join(", ")}`,
-        );
-      }
-    }
-    return undefined;
   }
 }
 
+/**
+ * The error a host catches after a cascade must keep the audit trail of the
+ * candidates tried before the final one. The trail nests into `raw` in the
+ * same per-candidate shape the all-skipped diagnostic uses, with the failing
+ * candidate's own raw preserved under `pspError`. A failure with no earlier
+ * attempts rethrows untouched so the adapter's raw shape survives.
+ */
+function withAttemptTrail(error: PayFanoutError, attempts: RoutedAttempt[]): PayFanoutError {
+  if (attempts.length <= 1) return error;
+  const trailed = new PayFanoutError({
+    code: error.code,
+    message: error.message,
+    retryable: error.retryable,
+    pspName: error.pspName,
+    raw: {
+      pspError: error.raw,
+      attempts: attempts.map((a) => ({ pspName: a.pspName, code: a.error.code, message: a.error.message })),
+    },
+  });
+  trailed.stack = error.stack;
+  return trailed;
+}
+
 function ineligible(pspName: string, message: string): PayFanoutError {
-  return new PayFanoutError({ code: "invalid_request", message, retryable: false, pspName });
+  return new PayFanoutError({ code: "unsupported_operation", message, retryable: false, pspName });
 }
 
 function matches(when: RoutingConditions | undefined, input: CreatePaymentSessionInput): boolean {

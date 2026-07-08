@@ -1,4 +1,4 @@
-import { lookupLocalized, normalizeLocale } from "./locale-util.js";
+import { createCatalogStore } from "./locale-util.js";
 import { BUILT_IN_LOCALES } from "./locales/index.js";
 
 /**
@@ -14,10 +14,10 @@ export const UI_LABEL_KEYS: readonly UiLabelKey[] = ["pay"] as const;
 
 export type UiLabelCatalog = Partial<Record<UiLabelKey, string>>;
 
-const EN: Record<UiLabelKey, string> = BUILT_IN_LOCALES.en.ui;
-
-const catalogs = new Map<string, UiLabelCatalog>(
-  Object.entries(BUILT_IN_LOCALES).map(([locale, bundle]) => [locale, bundle.ui]),
+const store = createCatalogStore<UiLabelKey>(
+  Object.entries(BUILT_IN_LOCALES).map(([locale, bundle]) => [locale, bundle.ui] as const),
+  BUILT_IN_LOCALES.en.ui,
+  "registerUiLabels",
 );
 
 /**
@@ -26,12 +26,10 @@ const catalogs = new Map<string, UiLabelCatalog>(
  * subtag ("de-AT" falls back to "de").
  */
 export function registerUiLabels(locale: string, catalog: UiLabelCatalog): void {
-  const key = normalizeLocale(locale);
-  if (!key) throw new Error("registerUiLabels requires a non-empty locale");
-  catalogs.set(key, { ...catalogs.get(key), ...catalog });
+  store.register(locale, catalog);
 }
 
 /** The library UI label for `key` in the given locale (en fallback, always defined). */
 export function getUiLabel(key: UiLabelKey, locale?: string): string {
-  return lookupLocalized(catalogs, key, locale, EN);
+  return store.get(key, locale);
 }

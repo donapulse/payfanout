@@ -17,7 +17,8 @@ import { isUnifiedPaymentStatus } from "@payfanout/core";
 import { GoCardlessServerAdapter } from "@payfanout/adapter-gocardless-server";
 
 const ACCESS_TOKEN = process.env.GOCARDLESS_ACCESS_TOKEN;
-const BASE_URL = process.env.GOCARDLESS_BASE_URL ?? "https://api-sandbox.gocardless.com";
+// Unset CI secrets render as EMPTY strings, not undefined — || treats them as absent.
+const BASE_URL = process.env.GOCARDLESS_BASE_URL || "https://api-sandbox.gocardless.com";
 // Hostname equality, never substring matching — a lookalike host must not fool the guard.
 if (new URL(BASE_URL).hostname === "api.gocardless.com") {
   throw new Error("Integration tests refuse to run against the live GoCardless API");
@@ -32,7 +33,7 @@ function makeAdapter(): GoCardlessServerAdapter {
     accessToken: ACCESS_TOKEN!,
     environment: "sandbox",
     baseUrl: BASE_URL,
-    webhookSecret: process.env.GOCARDLESS_WEBHOOK_SECRET ?? "not-used-in-these-tests",
+    webhookSecret: process.env.GOCARDLESS_WEBHOOK_SECRET || "not-used-in-these-tests",
   });
 }
 
@@ -183,7 +184,7 @@ describeIf("GoCardless sandbox integration", () => {
       returnUrl: RETURN_URL,
       idempotencyKey: key(),
     });
-    const canceled = await adapter.cancelPayment(session.pspSessionId);
+    const canceled = await adapter.cancelPayment(session.pspSessionId, key());
     expect(canceled.status).toBe("canceled");
     const info = await adapter.retrievePayment(session.pspSessionId);
     expect(info.status).toBe("canceled");

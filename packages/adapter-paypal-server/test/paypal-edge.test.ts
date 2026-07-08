@@ -7,6 +7,7 @@ import {
   parsePayPalWebhookEvent,
   PayPalServerAdapter,
   toPayPalValue,
+  type PayPalCaptureLike,
   type PayPalOrderLike,
 } from "../src/index.js";
 
@@ -190,12 +191,72 @@ describe("PayPal order state mapping", () => {
       payment_source: { paypal: { email_address: "b@example.com" } },
     }).retrievePayment("5O1");
     expect(info.amount).toBe(1200); // 7.00 + 5.00; the declined 99.00 never counts
+    expect(info.amountCaptured).toBe(1200);
+    expect(info.amountCapturable).toBeUndefined(); // no authorization on a CAPTURE-intent order
     expect(info.amountRefunded).toBe(300);
     expect(info.id).toBe("order-42");
     expect(info.pspPaymentId).toBe("c1");
     expect(info.capturedAt).toBe("2026-07-07T10:00:00Z");
     expect(info.createdAt).toBe("2026-07-07T09:00:00Z");
     expect(info.paymentMethodDetails).toEqual({ wallet: "paypal" });
+  });
+
+  it("a PENDING capture counts toward amount but not amountCaptured (nothing settled)", async () => {
+    const info = await adapterWithOrder({
+      status: "COMPLETED",
+      purchase_units: [
+        {
+          reference_id: "default",
+          amount: { currency_code: "USD", value: "20.00" },
+          payments: { captures: [{ id: "c1", status: "PENDING", amount: { currency_code: "USD", value: "20.00" } }] },
+        },
+      ],
+    }).retrievePayment("5O1");
+    expect(info.amount).toBe(2000);
+    expect(info.amountCaptured).toBe(0);
+  });
+
+  it("derives amountCapturable from the authorization state", async () => {
+    const withAuth = (status: string, captures: PayPalCaptureLike[] = []) =>
+      adapterWithOrder({
+        status: "COMPLETED",
+        purchase_units: [
+          {
+            reference_id: "default",
+            amount: { currency_code: "USD", value: "50.00" },
+            payments: {
+              authorizations: [{ id: "a1", status, amount: { currency_code: "USD", value: "50.00" } }],
+              ...(captures.length > 0 ? { captures } : {}),
+            },
+          },
+        ],
+      }).retrievePayment("5O1");
+
+    const open = await withAuth("CREATED");
+    expect(open.amountCapturable).toBe(5000);
+    expect(open.amountCaptured).toBe(0);
+
+    const partial = await withAuth("PARTIALLY_CAPTURED", [
+      { id: "c1", status: "COMPLETED", amount: { currency_code: "USD", value: "20.00" } },
+    ]);
+    expect(partial.amountCapturable).toBe(3000);
+    expect(partial.amountCaptured).toBe(2000);
+
+    const voided = await withAuth("VOIDED");
+    expect(voided.amountCapturable).toBe(0);
+
+    // No amount on the authorization: the remainder is not derivable — omitted.
+    const amountless = await adapterWithOrder({
+      status: "COMPLETED",
+      purchase_units: [
+        {
+          reference_id: "default",
+          amount: { currency_code: "USD", value: "50.00" },
+          payments: { authorizations: [{ id: "a1", status: "CREATED" }] },
+        },
+      ],
+    }).retrievePayment("5O1");
+    expect(amountless.amountCapturable).toBeUndefined();
   });
 
   it("derives amountRefunded from a fully REFUNDED capture when refunds[] is absent", async () => {
@@ -244,6 +305,7 @@ describe("PayPal bare-capture mapping (order aged out of GET)", () => {
       status: "succeeded",
       amount: 5000,
       amountRefunded: 0,
+      amountCaptured: 5000,
       currency: "USD",
       paymentMethodType: "paypal",
       capturedAt: "2026-05-16T05:18:59Z",
@@ -266,9 +328,60 @@ describe("PayPal bare-capture mapping (order aged out of GET)", () => {
     expect(partial.status).toBe("succeeded");
   });
 
+  it("resolves the parent order for cumulative refunds while it is still retrievable", async () => {
+    const adapter = adapterWithRoutes({
+      "/v2/payments/captures/2GG1": {
+        status: 200,
+        body: {
+          id: "2GG1",
+          status: "PARTIALLY_REFUNDED",
+          amount: { currency_code: "USD", value: "30.00" },
+          supplementary_data: { related_ids: { order_id: "5O1" } },
+        },
+      },
+      "/v2/checkout/orders/5O1": {
+        status: 200,
+        body: {
+          id: "5O1",
+          status: "COMPLETED",
+          purchase_units: [
+            {
+              reference_id: "default",
+              custom_id: "order-9",
+              amount: { currency_code: "USD", value: "30.00" },
+              payments: {
+                captures: [
+                  { id: "2GG1", status: "PARTIALLY_REFUNDED", amount: { currency_code: "USD", value: "30.00" } },
+                ],
+                refunds: [{ id: "r1", status: "COMPLETED", amount: { currency_code: "USD", value: "10.00" } }],
+              },
+            },
+          ],
+        },
+      },
+    });
+    const info = await adapter.retrievePayment("2GG1");
+    expect(info.amountRefunded).toBe(1000); // the order's embedded refunds, not the bare capture's 0
+    expect(info.pspPaymentId).toBe("2GG1");
+    expect(info.id).toBe("order-9");
+  });
+
+  it("falls back to bare capture facts when the parent order aged out of GET", async () => {
+    const info = await adapterWithCapture({
+      status: "COMPLETED",
+      amount: { currency_code: "USD", value: "50.00" },
+      links: [{ href: "https://api.paypal.com/v2/checkout/orders/5OGONE", rel: "up", method: "GET" }],
+    }).retrievePayment("2GG1");
+    expect(info.pspPaymentId).toBe("2GG1");
+    expect(info.amount).toBe(5000);
+    expect(info.amountCaptured).toBe(5000);
+  });
+
   it("maps PENDING to processing and DECLINED to failed", async () => {
     const pending = adapterWithCapture({ status: "PENDING", amount: { currency_code: "USD", value: "1.00" } });
-    expect((await pending.retrievePayment("2GG1")).status).toBe("processing");
+    const pendingInfo = await pending.retrievePayment("2GG1");
+    expect(pendingInfo.status).toBe("processing");
+    expect(pendingInfo.amountCaptured).toBe(0); // nothing settled yet
     const declined = adapterWithCapture({ status: "DECLINED", amount: { currency_code: "USD", value: "1.00" } });
     const info = await declined.retrievePayment("2GG1");
     expect(info.status).toBe("failed");
@@ -342,6 +455,7 @@ describe("PayPal webhook event mapping", () => {
 
     const refundNoLinks = await parse({ id: "e3", event_type: "PAYMENT.REFUND.FAILED", resource: { id: "1JUREFUND" } });
     expect(refundNoLinks.pspPaymentId).toBe("1JUREFUND"); // honest fallback
+    expect(refundNoLinks.refundId).toBe("1JUREFUND"); // still the refund id either way
 
     const authEvent = await parse({
       id: "e4",
@@ -349,6 +463,51 @@ describe("PayPal webhook event mapping", () => {
       resource: { id: "0AW1", supplementary_data: { related_ids: { order_id: "5O9" } } },
     });
     expect(authEvent.pspPaymentId).toBe("5O9"); // pre-capture canonical id = order id
+  });
+
+  it("normalizes money facts and the refund id where the payload carries them", async () => {
+    const captureEvent = await parse({
+      id: "e-money",
+      event_type: "PAYMENT.CAPTURE.COMPLETED",
+      resource: { id: "2GGCAP", amount: { currency_code: "USD", value: "50.00" } },
+    });
+    expect(captureEvent.amount).toBe(5000);
+    expect(captureEvent.currency).toBe("USD");
+    expect(captureEvent.refundId).toBeUndefined(); // not refund-shaped
+
+    const refundEvent = await parse({
+      id: "e-refund",
+      event_type: "PAYMENT.CAPTURE.REFUNDED",
+      resource: {
+        id: "1JUREFUND",
+        amount: { currency_code: "EUR", value: "12.34" },
+        links: [{ href: "https://api.paypal.com/v2/payments/captures/2GGCAP", rel: "up", method: "GET" }],
+      },
+    });
+    expect(refundEvent.refundId).toBe("1JUREFUND");
+    expect(refundEvent.pspPaymentId).toBe("2GGCAP"); // the parent capture, not the refund
+    expect(refundEvent.amount).toBe(1234);
+    expect(refundEvent.currency).toBe("EUR");
+
+    const wholeUnit = await parse({
+      id: "e-jpy",
+      event_type: "PAYMENT.CAPTURE.COMPLETED",
+      resource: { id: "2GGJPY", amount: { currency_code: "JPY", value: "500" } },
+    });
+    expect(wholeUnit.amount).toBe(500);
+
+    // Malformed or unsupported money never fails parsing — facts are withheld.
+    const badMoney = await parse({
+      id: "e-bad",
+      event_type: "PAYMENT.CAPTURE.COMPLETED",
+      resource: { id: "2GGBAD", amount: { currency_code: "XYZ", value: "1.00" } },
+    });
+    expect(badMoney.amount).toBeUndefined();
+    expect(badMoney.currency).toBeUndefined();
+
+    const noMoney = await parse({ id: "e-none", event_type: "PAYMENT.CAPTURE.COMPLETED", resource: { id: "2GGNONE" } });
+    expect(noMoney.amount).toBeUndefined();
+    expect(noMoney.refundId).toBeUndefined();
   });
 
   it("hashes a stable dedupe id when PayPal omits one and falls back on timestamps", async () => {

@@ -1,5 +1,13 @@
-import { PayFanoutError, type UnifiedWebhookEvent, type UnifiedWebhookEventType } from "@payfanout/core";
-import { constantTimeEqual, hmacSha256Hex } from "./crypto-utils.js";
+import {
+  constantTimeEqual,
+  hmacSha256Hex,
+  lowercaseKeys,
+  normalizeSecrets,
+  normalizeTime,
+  PayFanoutError,
+  type UnifiedWebhookEvent,
+  type UnifiedWebhookEventType,
+} from "@payfanout/core";
 
 /**
  * GoCardless webhook delivery: one HTTP POST carries `{"events": [...]}` with
@@ -22,10 +30,7 @@ export async function verifyGoCardlessWebhookSignature(
 ): Promise<boolean> {
   const provided = lowercaseKeys(headers)[SIGNATURE_HEADER];
   if (typeof provided !== "string" || provided.length === 0 || rawBody.length === 0) return false;
-  const keys = (Array.isArray(secrets) ? secrets : [secrets]).filter(
-    (key): key is string => typeof key === "string" && key.length > 0,
-  );
-  for (const key of keys) {
+  for (const key of normalizeSecrets(secrets)) {
     const expected = await hmacSha256Hex(key, rawBody);
     if (constantTimeEqual(provided.trim().toLowerCase(), expected)) return true;
   }
@@ -77,6 +82,7 @@ export function parseGoCardlessWebhookEvents(rawBody: string): UnifiedWebhookEve
 /** Shared normalizer: webhook deliveries and GET /events map identically. */
 export function normalizeGoCardlessEvent(event: GoCardlessEventLike): UnifiedWebhookEvent {
   const links = event.links ?? {};
+  const refundId = links["refund"];
   return {
     // GoCardless event ids (EV...) are globally unique — THE dedupe key. The
     // fallback hash keeps ids stable across parses if one is ever missing.
@@ -84,6 +90,9 @@ export function normalizeGoCardlessEvent(event: GoCardlessEventLike): UnifiedWeb
     pspName: "gocardless",
     type: mapEventType(event.resource_type ?? "", event.action ?? ""),
     pspPaymentId: links["payment"] ?? links["payment_request_payment"],
+    // No amount/currency: GoCardless events carry links + details only, never
+    // money fields — money truth stays on retrievePayment/retrieveRefund.
+    ...(refundId ? { refundId } : {}),
     occurredAt: normalizeTime(event.created_at),
     raw: event,
   };
@@ -114,7 +123,10 @@ function mapEventType(resourceType: string, action: string): UnifiedWebhookEvent
       case "chargeback_cancelled":
         return "payment.chargeback_won";
       // paid_out / chargeback_settled / surcharge_fee_debited are payout
-      // accounting, not payer-state changes.
+      // accounting, not payer-state changes. chargeback_settled in particular
+      // records already-reclaimed funds being debited from a payout, NOT a
+      // dispute outcome — the loss is final at charged_back itself, so no
+      // action here maps to payment.chargeback_lost (see the guide).
       default:
         return "unknown";
     }
@@ -146,12 +158,6 @@ function mapEventType(resourceType: string, action: string): UnifiedWebhookEvent
   return "unknown";
 }
 
-function normalizeTime(value: string | undefined): string {
-  const parsed = value ? Date.parse(value) : Number.NaN;
-  // Deterministic fallback: a missing timestamp is the PSP's omission, not ours.
-  return Number.isNaN(parsed) ? "1970-01-01T00:00:00.000Z" : new Date(parsed).toISOString();
-}
-
 /** FNV-1a in pure JS: deterministic, dependency-free id fallback (not security-sensitive). */
 function fnv1aHex(value: string): string {
   let hash = 0x811c9dc5;
@@ -160,10 +166,4 @@ function fnv1aHex(value: string): string {
     hash = Math.imul(hash, 0x01000193) >>> 0;
   }
   return hash.toString(16).padStart(8, "0");
-}
-
-function lowercaseKeys(headers: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(headers ?? {})) out[key.toLowerCase()] = value;
-  return out;
 }

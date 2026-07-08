@@ -3,18 +3,25 @@ import { isPayFanoutError, PayFanoutError } from "@payfanout/core";
 import { PaymentService, type PaymentOperationTelemetry } from "../src/index.js";
 import { FakeAdapter } from "./fake-adapter.js";
 
-async function expectInvalidRequest(promise: Promise<unknown>, match: RegExp): Promise<void> {
+async function expectGuard(
+  promise: Promise<unknown>,
+  pattern: RegExp,
+  code: "invalid_request" | "unsupported_operation",
+): Promise<void> {
   try {
     await promise;
     expect.unreachable("expected rejection");
   } catch (err) {
     expect(isPayFanoutError(err)).toBe(true);
     if (isPayFanoutError(err)) {
-      expect(err.code).toBe("invalid_request");
-      expect(err.message).toMatch(match);
+      expect(err.code).toBe(code);
+      expect(err.message).toMatch(pattern);
     }
   }
 }
+
+const expectInvalidRequest = (p: Promise<unknown>, r: RegExp) => expectGuard(p, r, "invalid_request");
+const expectUnsupported = (p: Promise<unknown>, r: RegExp) => expectGuard(p, r, "unsupported_operation");
 
 describe("PaymentService — refund lifecycle / session update / recovery passthroughs", () => {
   it("routes retrieveRefund and updatePaymentSession to the adapter", async () => {
@@ -36,7 +43,7 @@ describe("PaymentService — refund lifecycle / session update / recovery passth
   it("guards updatePaymentSession: capability, amount integrity, idempotency key", async () => {
     const noUpdate = new FakeAdapter({ pspName: "no-upd", capabilities: { supportsSessionUpdate: false } });
     const service = new PaymentService({ adapters: [noUpdate, new FakeAdapter()] });
-    await expectInvalidRequest(
+    await expectUnsupported(
       service.updatePaymentSession("no-upd", { pspSessionId: "s", amount: 1, idempotencyKey: "k" }),
       /does not support updating/,
     );
@@ -56,7 +63,7 @@ describe("PaymentService — refund lifecycle / session update / recovery passth
       capabilities: { supportsRefunds: false, supportsPartialRefunds: false },
     });
     const service = new PaymentService({ adapters: [noRefunds] });
-    await expectInvalidRequest(service.retrieveRefund("no-ref", "re_1"), /refund retrieval/);
+    await expectUnsupported(service.retrieveRefund("no-ref", "re_1"), /refund retrieval/);
   });
 
   it("routes fetchEvents / listPayments / listRefunds and guards their capabilities", async () => {
@@ -71,9 +78,9 @@ describe("PaymentService — refund lifecycle / session update / recovery passth
     expect((await service.listPayments("fake")).payments).toHaveLength(1);
     expect((await service.listRefunds("fake")).refunds).toEqual([]);
 
-    await expectInvalidRequest(service.fetchEvents("bare"), /event polling/);
-    await expectInvalidRequest(service.listPayments("bare"), /listing payments/);
-    await expectInvalidRequest(service.listRefunds("bare"), /listing refunds/);
+    await expectUnsupported(service.fetchEvents("bare"), /event polling/);
+    await expectUnsupported(service.listPayments("bare"), /listing payments/);
+    await expectUnsupported(service.listRefunds("bare"), /listing refunds/);
   });
 
   it("rejects registration when new capability claims lack implementations", () => {
@@ -153,7 +160,7 @@ describe("PaymentService vault surface", () => {
           idempotencyKey: "k",
         }),
     ]) {
-      await expectInvalidRequest(call(), /does not support saved payment methods/);
+      await expectUnsupported(call(), /does not support saved payment methods/);
     }
   });
 
@@ -165,7 +172,7 @@ describe("PaymentService vault surface", () => {
     // Confirm-on-client adapters have no savePaymentMethod (coherence allows that).
     checkoutVaulting.savePaymentMethod = undefined;
     const service = new PaymentService({ adapters: [checkoutVaulting] });
-    await expectInvalidRequest(
+    await expectUnsupported(
       service.savePaymentMethod("checkout-vaulting", { pspCustomerId: "c", clientToken: "t", idempotencyKey: "k" }),
       /vaults during checkout/,
     );
@@ -179,7 +186,7 @@ describe("PaymentService vault surface", () => {
     const plain = new FakeAdapter({ pspName: "plain" });
     const service = new PaymentService({ adapters: [vaulting, plain] });
 
-    await expectInvalidRequest(
+    await expectUnsupported(
       service.createPaymentSession("plain", {
         amount: 100,
         currency: "USD",

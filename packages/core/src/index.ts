@@ -1,5 +1,6 @@
 export type { MinorUnitAmount } from "./currency.js";
 export {
+  allocate,
   assertMinorUnitAmount,
   formatMinorUnits,
   fromMinorUnits,
@@ -26,6 +27,33 @@ export { SCRUBBED, scrubForLogging } from "./scrub.js";
 export type { RetryPolicy } from "./retry.js";
 export { defaultShouldRetry, withRetry } from "./retry.js";
 
+export {
+  base64UrlToUtf8,
+  bytesToBase64,
+  bytesToBase64Url,
+  constantTimeEqual,
+  hmacSha256,
+  hmacSha256Hex,
+  sha256Hex,
+  utf8ToBase64,
+  utf8ToBase64Url,
+} from "./webcrypto.js";
+
+export type { TransportRequestOptions, TransportRetryOptions } from "./transport.js";
+export {
+  classifyHttpFallback,
+  isTransportRetryable,
+  requestWithTimeout,
+  safeJson,
+  withTransportRetries,
+} from "./transport.js";
+
+export { lowercaseKeys, normalizeSecrets, normalizeTime } from "./webhook-util.js";
+
+export { assertBrowser, injectScript } from "./sdk-loader.js";
+
+export { validateAdapterCapabilities } from "./capability-validation.js";
+
 export type {
   AdapterCapabilities,
   CustomerRef,
@@ -35,8 +63,10 @@ export type {
   PaymentMethodFlow,
   PaymentSession,
   RefundInfo,
+  RefundReason,
   RefundRequest,
   RefundResult,
+  RefundStatus,
   SavedPaymentMethod,
   UnifiedPaymentMethodType,
   UnifiedPaymentStatus,
@@ -44,15 +74,20 @@ export type {
   UnifiedWebhookEventType,
 } from "./model.js";
 export {
+  isUnifiedPaymentMethodType,
   isUnifiedPaymentStatus,
+  isUnifiedWebhookEventType,
   PAYMENT_METHOD_FLOWS,
   PAYMENT_METHOD_TYPES,
   PAYMENT_STATUSES,
+  REFUND_STATUSES,
   WEBHOOK_EVENT_TYPES,
 } from "./model.js";
 
 export type { RefundState } from "./refunds.js";
 export { getRefundState } from "./refunds.js";
+
+export { screenSessionInput } from "./screening.js";
 
 export type {
   ChargeSavedPaymentMethodInput,
@@ -78,4 +113,4 @@ export type {
   UpdatePaymentSessionInput,
   VerifyPaymentMethodInput,
 } from "./adapters.js";
-export { brandMountedFieldsHandle } from "./adapters.js";
+export { brandMountedFieldsHandle, DATA_PAYFANOUT_FIELD } from "./adapters.js";

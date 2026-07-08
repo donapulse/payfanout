@@ -25,7 +25,8 @@ function makeAdapter(): StripeServerAdapter {
   return new StripeServerAdapter({
     secretKey: SECRET_KEY!,
     apiVersion: API_VERSION,
-    webhookSigningSecret: process.env.STRIPE_WEBHOOK_SECRET ?? "whsec_not_used_in_these_tests",
+    // Unset CI secrets render as EMPTY strings, not undefined — || treats them as absent.
+    webhookSigningSecret: process.env.STRIPE_WEBHOOK_SECRET || "whsec_not_used_in_these_tests",
     environment: "sandbox",
   });
 }
@@ -155,7 +156,7 @@ describeIf("Stripe sandbox integration", () => {
     await rawStripe().setupIntents.confirm(session.pspSessionId, { payment_method: "pm_card_visa" });
 
     // Must not throw — validates the detach-on-unattached handling against reality.
-    const info = await adapter.verifyPaymentMethod({ pspSessionId: session.pspSessionId });
+    const info = await adapter.verifyPaymentMethod({ pspSessionId: session.pspSessionId, idempotencyKey: key() });
     expect(info.status).toBe("succeeded");
     expect(info.amount).toBe(0);
 

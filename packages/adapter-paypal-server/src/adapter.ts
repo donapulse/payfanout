@@ -2,6 +2,10 @@ import {
   assertMinorUnitAmount,
   normalizeCurrency,
   PayFanoutError,
+  requestWithTimeout,
+  safeJson,
+  utf8ToBase64,
+  withTransportRetries,
   type AdapterCapabilities,
   type CompletePaymentInput,
   type CreatePaymentSessionInput,
@@ -20,9 +24,9 @@ import {
   type UnifiedWebhookEvent,
   type UpdatePaymentSessionInput,
 } from "@payfanout/core";
-import { derivePayPalRequestId, utf8ToBase64 } from "./crypto-utils.js";
 import { mapPayPalError, PAYPAL_PSP_NAME } from "./error-map.js";
-import { fromPayPalValue, toPayPalValue } from "./money.js";
+import { derivePayPalRequestId } from "./request-id.js";
+import { fromPayPalValue, PAYPAL_SUPPORTED_CURRENCIES, toPayPalValue } from "./money.js";
 import {
   buildWebhookVerificationBody,
   captureIdFromLinks,
@@ -61,7 +65,8 @@ export interface PayPalServerAdapterConfig {
   cancelUrl?: string;
   /**
    * Abort a hung PayPal connection after this many milliseconds (default
-   * 30000). Mutating calls carry a deterministic PayPal-Request-Id, so a
+   * 30000). The timer covers the whole exchange including the response body
+   * read. Mutating calls carry a deterministic PayPal-Request-Id, so a
    * timed-out request is safe to retry. Timeouts surface as retryable
    * psp_unavailable errors.
    */
@@ -183,8 +188,11 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     if (config.requestTimeoutMs !== undefined && !(config.requestTimeoutMs > 0)) {
       throw PayFanoutError.invalidRequest("PayPalServerAdapter config.requestTimeoutMs must be > 0");
     }
-    if (config.maxNetworkRetries !== undefined && !(config.maxNetworkRetries >= 0)) {
-      throw PayFanoutError.invalidRequest("PayPalServerAdapter config.maxNetworkRetries must be >= 0");
+    if (
+      config.maxNetworkRetries !== undefined &&
+      (!Number.isInteger(config.maxNetworkRetries) || config.maxNetworkRetries < 0)
+    ) {
+      throw PayFanoutError.invalidRequest("PayPalServerAdapter config.maxNetworkRetries must be an integer >= 0");
     }
     this.config = config;
     this.baseUrl =
@@ -195,6 +203,8 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
   getCapabilities(): AdapterCapabilities {
     return {
       pspName: this.pspName,
+      // Router pre-screen; money.ts revalidates locally as defense-in-depth.
+      supportedCurrencies: [...PAYPAL_SUPPORTED_CURRENCIES],
       supportsRefunds: true,
       supportsPartialRefunds: true,
       supportsManualCapture: true, // intent AUTHORIZE + authorization capture
@@ -318,15 +328,35 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
         "GET",
         `/v2/payments/captures/${encodeURIComponent(pspPaymentId)}`,
       );
+      // The bare capture reports no cumulative refunds — while the parent
+      // order is still GETtable its embedded payments collection is the money
+      // truth; once it ages out the capture's own facts are all that is left.
+      const orderId = parentOrderId(capture);
+      if (orderId) {
+        try {
+          const order = await this.request<PayPalOrderLike>(
+            "GET",
+            `/v2/checkout/orders/${encodeURIComponent(orderId)}`,
+          );
+          return this.orderToPaymentInfo(order);
+        } catch (orderErr) {
+          if (!isNotFound(orderErr)) throw orderErr;
+        }
+      }
       return this.captureToPaymentInfo(capture);
     }
   }
 
-  /** Manual capture of an AUTHORIZE-intent payment; pspPaymentId is the order id. */
+  /**
+   * Manual capture of an AUTHORIZE-intent payment; pspPaymentId is the order
+   * id. Each partial capture is its own charge under its own required key —
+   * a reused key replays the earlier capture via PayPal-Request-Id and moves
+   * no new money.
+   */
   async capturePayment(
     pspPaymentId: string,
-    amount?: MinorUnitAmount,
-    idempotencyKey?: string,
+    amount: MinorUnitAmount | undefined,
+    idempotencyKey: string,
   ): Promise<PaymentInfo> {
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
     const order = await this.request<PayPalOrderLike>(
@@ -341,23 +371,12 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
         order,
       );
     }
-    if (idempotencyKey === undefined && (unit?.payments?.captures ?? []).some((c) => !isFailedCaptureStatus(c.status))) {
-      // The derived fallback key collides when a later capture repeats an
-      // amount: PayPal-Request-Id replay answers the first capture's 200 and
-      // no money moves. Multi-capture demands per-capture keys.
-      throw PayFanoutError.invalidRequest(
-        `Payment "${pspPaymentId}" is already captured in part — captures beyond the first require an explicit idempotencyKey`,
-        order,
-      );
-    }
     const currency = (unit?.amount?.currency_code ?? "USD").toUpperCase();
     await this.request<PayPalCaptureLike>(
       "POST",
       `/v2/payments/authorizations/${encodeURIComponent(authorization.id)}/capture`,
       {
-        requestId: await derivePayPalRequestId(
-          idempotencyKey ?? `payfanout-capture-${authorization.id}-${amount ?? "full"}`,
-        ),
+        requestId: await derivePayPalRequestId(idempotencyKey),
         json: {
           ...(amount !== undefined ? { amount: { currency_code: currency, value: toPayPalValue(amount, currency) } } : {}),
           // Leave the authorization open for further partial captures; PayPal
@@ -374,7 +393,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * orders cannot be cancelled via the API — they expire on their own, so
    * cancelling one is rejected rather than faked.
    */
-  async cancelPayment(pspPaymentId: string, idempotencyKey?: string): Promise<PaymentInfo> {
+  async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
     let order: PayPalOrderLike;
     try {
       order = await this.request<PayPalOrderLike>(
@@ -404,7 +423,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
           `/v2/payments/authorizations/${encodeURIComponent(authorization.id)}/void`,
           {
             json: {},
-            requestId: await derivePayPalRequestId(idempotencyKey ?? `payfanout-void-${authorization.id}`),
+            requestId: await derivePayPalRequestId(idempotencyKey),
           },
         );
       }
@@ -534,6 +553,9 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       path = input.cursor;
     } else {
       const params = new URLSearchParams();
+      // The webhooks-events list documents no page_size maximum (its OpenAPI
+      // spec pins only the default of 10), so only integer >= 1 is enforced —
+      // fractional/zero input never reaches the API.
       if (input.limit !== undefined) params.set("page_size", String(Math.max(1, Math.trunc(input.limit))));
       if (input.since !== undefined) params.set("start_time", toIsoTime(input.since));
       const query = params.toString();
@@ -634,6 +656,14 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     const primaryCapture = activeCaptures[0] ?? captures[0];
     const settledCapture = activeCaptures.find((c) => isSettledCaptureStatus(c.status));
     const details = detailsFrom(order.payment_source);
+    // Settled money only — a PENDING (eCheck) capture holds funds but has not
+    // captured them yet.
+    const amountCaptured = sumPayPalAmounts(
+      activeCaptures.filter((c) => isSettledCaptureStatus(c.status)).map((c) => c.amount),
+      currency,
+    );
+    const authorization = unit?.payments?.authorizations?.[0];
+    const amountCapturable = authorization ? capturableRemainder(authorization, captured, currency) : undefined;
     return {
       id: unit?.custom_id ?? order.id,
       pspName: this.pspName,
@@ -648,6 +678,8 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
             ? fromPayPalValue(unit.amount.value, currency)
             : 0,
       amountRefunded: refunded,
+      amountCaptured,
+      ...(amountCapturable !== undefined ? { amountCapturable } : {}),
       currency,
       paymentMethodType: "paypal",
       ...(details ? { paymentMethodDetails: details } : {}),
@@ -677,6 +709,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       // PARTIALLY_REFUNDED reports 0 — hosts keep refund records
       // (statelessness already demands it; see the PayPal guide).
       amountRefunded: state === "REFUNDED" ? amount : 0,
+      amountCaptured: status === "succeeded" ? amount : 0,
       currency,
       paymentMethodType: "paypal",
       paymentMethodDetails: { wallet: "paypal" },
@@ -731,50 +764,38 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * safe: they reuse the same PayPal-Request-Id, so a replay can never
    * double-charge. Business errors (4xx other than 429) never retry.
    */
-  private async request<T>(method: PayPalHttpMethod, path: string, options: PayPalRequestOptions = {}): Promise<T> {
-    const attempts = 1 + (this.config.maxNetworkRetries ?? 2);
-    const sleep = this.config.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-    let lastError: PayFanoutError | undefined;
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      try {
-        return await this.requestOnce<T>(method, path, options);
-      } catch (err) {
-        if (!(err instanceof PayFanoutError) || !isTransportRetryable(err) || attempt === attempts) throw err;
-        lastError = err;
-        await sleep(Math.min(2000, 250 * 2 ** (attempt - 1)));
-      }
-    }
-    /* c8 ignore next -- the loop always returns or throws */
-    throw lastError ?? PayFanoutError.invalidRequest("unreachable");
+  private request<T>(method: PayPalHttpMethod, path: string, options: PayPalRequestOptions = {}): Promise<T> {
+    return withTransportRetries(() => this.requestOnce<T>(method, path, options), {
+      attempts: 1 + (this.config.maxNetworkRetries ?? 2),
+      sleep: this.config.sleep,
+    });
   }
 
   private async requestOnce<T>(method: PayPalHttpMethod, path: string, options: PayPalRequestOptions): Promise<T> {
-    let response = await this.send(method, path, options, await this.accessToken());
-    if (response.status === 401) {
+    let exchange = await this.send(method, path, options, await this.accessToken());
+    if (exchange.response.status === 401) {
       // The cached token went stale or was revoked — re-mint once and replay.
       this.tokenCache = undefined;
-      response = await this.send(method, path, options, await this.accessToken());
+      exchange = await this.send(method, path, options, await this.accessToken());
     }
-    const text = await response.text();
+    const { response, text } = exchange;
     const json = text ? safeJson(text) : undefined;
     if (!response.ok) throw mapPayPalError(response.status, json ?? text);
     return json as T; // 204 No Content (PATCH, void) resolves as undefined
   }
 
-  private async send(
+  private send(
     method: PayPalHttpMethod,
     path: string,
     options: PayPalRequestOptions,
     token: string,
-  ): Promise<Response> {
-    const doFetch = this.config.fetch ?? fetch;
+  ): Promise<{ response: Response; text: string }> {
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
-    // A hung PSP connection must not hang the host's request handler.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
     const body = options.rawBody ?? (options.json !== undefined ? JSON.stringify(options.json) : undefined);
-    try {
-      return await doFetch(`${this.baseUrl}${path}`, {
+    return requestWithTimeout(
+      { fetch: this.config.fetch ?? fetch, timeoutMs, onFailure: this.transportFailure(timeoutMs) },
+      `${this.baseUrl}${path}`,
+      {
         method,
         headers: {
           authorization: `Bearer ${token}`,
@@ -783,21 +804,20 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
           // Minimal responses omit purchase_units — the mappers need the money objects.
           ...(method === "POST" ? { prefer: "return=representation" } : {}),
         },
-        signal: controller.signal,
         ...(body !== undefined ? { body } : {}),
-      });
-    } catch (err) {
-      const timedOut = controller.signal.aborted;
-      throw new PayFanoutError({
+      },
+    );
+  }
+
+  private transportFailure(timeoutMs: number): (timedOut: boolean, cause: unknown) => PayFanoutError {
+    return (timedOut, cause) =>
+      new PayFanoutError({
         code: "psp_unavailable",
         message: timedOut ? `PayPal did not respond within ${timeoutMs}ms.` : "Could not reach PayPal.",
         retryable: true,
-        raw: err,
+        raw: cause,
         pspName: this.pspName,
       });
-    } finally {
-      clearTimeout(timer);
-    }
   }
 
   /**
@@ -817,34 +837,19 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
 
   private async mintAccessToken(): Promise<string> {
     const now = this.now();
-    const doFetch = this.config.fetch ?? fetch;
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    let response: Response;
-    try {
-      response = await doFetch(`${this.baseUrl}/v1/oauth2/token`, {
+    const { response, text } = await requestWithTimeout(
+      { fetch: this.config.fetch ?? fetch, timeoutMs, onFailure: this.transportFailure(timeoutMs) },
+      `${this.baseUrl}/v1/oauth2/token`,
+      {
         method: "POST",
         headers: {
           authorization: `Basic ${utf8ToBase64(`${this.config.clientId}:${this.config.clientSecret}`)}`,
           "content-type": "application/x-www-form-urlencoded",
         },
         body: "grant_type=client_credentials",
-        signal: controller.signal,
-      });
-    } catch (err) {
-      const timedOut = controller.signal.aborted;
-      throw new PayFanoutError({
-        code: "psp_unavailable",
-        message: timedOut ? `PayPal did not respond within ${timeoutMs}ms.` : "Could not reach PayPal.",
-        retryable: true,
-        raw: err,
-        pspName: this.pspName,
-      });
-    } finally {
-      clearTimeout(timer);
-    }
-    const text = await response.text();
+      },
+    );
     const json = text ? safeJson(text) : undefined;
     if (!response.ok) throw mapPayPalError(response.status, json ?? text);
     const body = json as { access_token?: string; expires_in?: number } | undefined;
@@ -864,11 +869,6 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
   private now(): number {
     return (this.config.now ?? Date.now)();
   }
-}
-
-/** Transport-level trouble only: network failure/timeout, HTTP 5xx, or 429. */
-function isTransportRetryable(error: PayFanoutError): boolean {
-  return error.code === "rate_limited" || error.code === "psp_unavailable";
 }
 
 function completedOrderStatus(
@@ -903,6 +903,26 @@ function isFailedCaptureStatus(status: string | undefined): boolean {
   return state === "DECLINED" || state === "FAILED";
 }
 
+/**
+ * Authorized-but-uncaptured remainder. `held` counts every non-failed capture
+ * (PENDING ones already reserve their slice); VOIDED/DENIED/CAPTURED
+ * authorizations report 0 — nothing is left to take.
+ */
+function capturableRemainder(
+  authorization: PayPalAuthorizationLike,
+  held: MinorUnitAmount,
+  fallbackCurrency: string,
+): MinorUnitAmount | undefined {
+  if (authorization.amount?.value === undefined) return undefined;
+  const authorized = fromPayPalValue(
+    authorization.amount.value,
+    authorization.amount.currency_code ?? fallbackCurrency,
+  );
+  const state = (authorization.status ?? "").toUpperCase();
+  const open = state === "CREATED" || state === "PENDING" || state === "PARTIALLY_CAPTURED";
+  return open ? Math.max(0, authorized - held) : 0;
+}
+
 function sumPayPalAmounts(amounts: Array<PayPalMoney | undefined>, fallbackCurrency: string): number {
   let total = 0;
   for (const amount of amounts) {
@@ -910,6 +930,18 @@ function sumPayPalAmounts(amounts: Array<PayPalMoney | undefined>, fallbackCurre
     total += fromPayPalValue(amount.value, amount.currency_code ?? fallbackCurrency);
   }
   return total;
+}
+
+/** The order a capture settled, from supplementary data or the links[rel=up] href. */
+function parentOrderId(capture: PayPalCaptureLike): string | undefined {
+  const fromSupplementary = capture.supplementary_data?.related_ids?.order_id;
+  if (fromSupplementary) return fromSupplementary;
+  for (const link of capture.links ?? []) {
+    if ((link.rel ?? "").toLowerCase() !== "up") continue;
+    const match = /\/v2\/checkout\/orders\/([^/?#]+)/.exec(link.href ?? "");
+    if (match) return match[1];
+  }
+  return undefined;
 }
 
 function captureTarget(capture: PayPalCaptureLike): {
@@ -998,13 +1030,4 @@ function toIsoTime(value: string | Date): string {
     throw PayFanoutError.invalidRequest(`Invalid "since" timestamp: ${String(value)}`, { since: value });
   }
   return parsed.toISOString();
-}
-
-function safeJson(text: string): unknown {
-  try {
-    return JSON.parse(text);
-  } catch {
-    // Proxies/load balancers answer HTML — the raw text still rides the error.
-    return undefined;
-  }
 }

@@ -104,6 +104,30 @@ describe("PaymentRouter failover cascade", () => {
     expect(seen).toEqual(["psp-a:psp_unavailable", "psp-b:ok"]);
   });
 
+  it("a throwing onAttempt hook never breaks routing — skip, failure, and success stages all fire", async () => {
+    const noManual = new FakeAdapter({
+      pspName: "no-manual",
+      capabilities: { supportsManualCapture: false, supportsMultiCapture: false },
+    });
+    const flaky = new FakeAdapter({ pspName: "flaky" });
+    failWith(flaky, new PayFanoutError({ code: "psp_unavailable", message: "down", retryable: true, pspName: "flaky" }));
+    const winner = new FakeAdapter({ pspName: "winner" });
+    const service = new PaymentService({ adapters: [noManual, flaky, winner] });
+    const stages: string[] = [];
+    const router = new PaymentRouter({
+      service,
+      onAttempt: (attempt) => {
+        stages.push(`${attempt.pspName}:${attempt.ok ? "ok" : attempt.skipped ? "skipped" : "failed"}`);
+        throw new Error("observer down");
+      },
+    });
+
+    const result = await router.createPaymentSession(input({ captureMethod: "manual" }));
+    expect(result.pspName).toBe("winner");
+    expect(result.attempts).toHaveLength(2);
+    expect(stages).toEqual(["no-manual:skipped", "flaky:failed", "winner:ok"]);
+  });
+
   it("does NOT cascade business rejections — the error surfaces immediately", async () => {
     const { service, a, b } = twoPspService();
     failWith(a, new PayFanoutError({ code: "invalid_request", message: "bad request", retryable: false }));
@@ -118,6 +142,48 @@ describe("PaymentRouter failover cascade", () => {
     failWith(b, new PayFanoutError({ code: "psp_unavailable", message: "also down", retryable: true }));
     const router = new PaymentRouter({ service });
     await expect(router.createPaymentSession(input())).rejects.toMatchObject({ code: "psp_unavailable" });
+  });
+
+  it("carries the earlier attempts trail on the final error's raw when every candidate fails", async () => {
+    const { service, a, b } = twoPspService();
+    const pspRaw = { incident: "b-outage" };
+    failWith(a, new PayFanoutError({ code: "rate_limited", message: "slow down", retryable: true, pspName: "psp-a" }));
+    failWith(
+      b,
+      new PayFanoutError({ code: "psp_unavailable", message: "also down", retryable: true, pspName: "psp-b", raw: pspRaw }),
+    );
+    const router = new PaymentRouter({ service });
+    try {
+      await router.createPaymentSession(input());
+      expect.unreachable("expected rejection");
+    } catch (err) {
+      expect(isPayFanoutError(err)).toBe(true);
+      if (isPayFanoutError(err)) {
+        expect(err.code).toBe("psp_unavailable");
+        expect(err.pspName).toBe("psp-b");
+        expect(err.raw).toEqual({
+          pspError: pspRaw,
+          attempts: [
+            { pspName: "psp-a", code: "rate_limited", message: "slow down" },
+            { pspName: "psp-b", code: "psp_unavailable", message: "also down" },
+          ],
+        });
+      }
+    }
+  });
+
+  it("a failure with no earlier attempts rethrows the adapter error untouched", async () => {
+    const { service, a } = twoPspService();
+    const declined = new PayFanoutError({
+      code: "card_declined",
+      message: "no",
+      retryable: false,
+      pspName: "psp-a",
+      raw: { decline_code: "generic_decline" },
+    });
+    failWith(a, declined);
+    const router = new PaymentRouter({ service });
+    await expect(router.createPaymentSession(input())).rejects.toBe(declined);
   });
 
   it("honors a custom shouldFailover", async () => {
@@ -291,6 +357,23 @@ describe("PaymentRouter circuit breaker", () => {
     expect(routed.pspName).toBe("psp-b"); // attempted despite the open circuit — not a self-inflicted outage
   });
 
+  it("a throwing onAttempt hook never breaks a circuit-breaker skip", async () => {
+    const { service, a } = twoPspService();
+    failWith(a, transientError());
+    const router = new PaymentRouter({
+      service,
+      circuitBreaker: { failureThreshold: 1, cooldownMs: 1000, now: () => 100_000 },
+      onAttempt: () => {
+        throw new Error("observer down");
+      },
+    });
+    await router.createPaymentSession(input()); // failure opens psp-a's circuit
+    const routed = await router.createPaymentSession(input());
+    expect(routed.pspName).toBe("psp-b");
+    expect(routed.attempts[0]).toMatchObject({ pspName: "psp-a", skipped: true });
+    expect(routed.attempts[0]!.error.message).toMatch(/circuit breaker/);
+  });
+
   it("circuitBreaker: false disables outage memory entirely", async () => {
     const { service, a } = twoPspService();
     failWith(a, transientError());
@@ -298,6 +381,86 @@ describe("PaymentRouter circuit breaker", () => {
     for (let i = 0; i < 6; i++) await router.createPaymentSession(input());
     const routed = await router.createPaymentSession(input());
     expect(routed.attempts[0]).toMatchObject({ pspName: "psp-a", skipped: false }); // still tried every time
+  });
+
+  it("getBreakerState snapshots failures, the open flag, and openUntil through the breaker lifecycle", async () => {
+    const { router, a, clock } = breakerSetup(); // threshold 2, cooldown 1000ms, clock at 100_000
+    expect(router.getBreakerState()).toEqual({});
+
+    failWith(a, transientError());
+    await router.createPaymentSession(input());
+    expect(router.getBreakerState()).toEqual({ "psp-a": { consecutiveFailures: 1, open: false } });
+
+    await router.createPaymentSession(input()); // threshold reached -> opens
+    expect(router.getBreakerState()).toEqual({
+      "psp-a": { consecutiveFailures: 2, open: true, openUntil: new Date(101_000).toISOString() },
+    });
+
+    clock.now += 1001; // cooldown elapsed: half-open — not skipped, failures remembered
+    expect(router.getBreakerState()["psp-a"]).toMatchObject({
+      consecutiveFailures: 2,
+      open: false,
+      openUntil: new Date(101_000).toISOString(),
+    });
+
+    a.createPaymentSession = FakeAdapter.prototype.createPaymentSession.bind(a);
+    await router.createPaymentSession(input()); // successful probe closes the circuit
+    expect(router.getBreakerState()).toEqual({});
+  });
+
+  it("onBreakerStateChange fires once per open and close transition and is exception-isolated", async () => {
+    const { service, a } = twoPspService();
+    const clock = { now: 100_000 };
+    const transitions: string[] = [];
+    const router = new PaymentRouter({
+      service,
+      circuitBreaker: { failureThreshold: 2, cooldownMs: 1000, now: () => clock.now },
+      onBreakerStateChange: (event) => {
+        transitions.push(`${event.pspName}:${event.state}`);
+        throw new Error("observer down");
+      },
+    });
+    failWith(a, transientError());
+    await router.createPaymentSession(input()); // failure 1 — below threshold
+    expect(transitions).toEqual([]);
+    await router.createPaymentSession(input()); // failure 2 -> opened
+    expect(transitions).toEqual(["psp-a:opened"]);
+
+    clock.now += 1001;
+    await router.createPaymentSession(input()); // failed probe: circuit never closed — no repeat event
+    expect(transitions).toEqual(["psp-a:opened"]);
+
+    clock.now += 1001;
+    a.createPaymentSession = FakeAdapter.prototype.createPaymentSession.bind(a);
+    const probe = await router.createPaymentSession(input()); // successful probe -> closed
+    expect(probe.pspName).toBe("psp-a");
+    expect(transitions).toEqual(["psp-a:opened", "psp-a:closed"]);
+  });
+
+  it("a business rejection on the half-open probe also closes the breaker — the PSP answered", async () => {
+    const { router, a, clock } = breakerSetup();
+    failWith(a, transientError());
+    await router.createPaymentSession(input());
+    await router.createPaymentSession(input()); // open
+    clock.now += 1001;
+
+    failWith(a, new PayFanoutError({ code: "card_declined", message: "no", retryable: false }));
+    await router.createPaymentSession(input()).catch(() => undefined); // probe: business rejection aborts the cascade
+    expect(router.getBreakerState()).toEqual({}); // …but proves the PSP alive
+  });
+
+  it("circuitBreaker: false keeps the snapshot empty and never fires transitions", async () => {
+    const { service, a } = twoPspService();
+    const transitions: string[] = [];
+    failWith(a, transientError());
+    const router = new PaymentRouter({
+      service,
+      circuitBreaker: false,
+      onBreakerStateChange: (event) => transitions.push(`${event.pspName}:${event.state}`),
+    });
+    for (let i = 0; i < 6; i++) await router.createPaymentSession(input());
+    expect(router.getBreakerState()).toEqual({});
+    expect(transitions).toEqual([]);
   });
 });
 
@@ -316,5 +479,38 @@ describe("defaultShouldFailover", () => {
     expect(
       defaultShouldFailover(new PayFanoutError({ code: "invalid_request", message: "x", retryable: false })),
     ).toBe(false);
+  });
+});
+
+describe("PaymentRouter capability screening (shared predicate with PaymentService)", () => {
+  it("a vault session skips candidates without saved-payment-method support instead of aborting", async () => {
+    const a = new FakeAdapter({ pspName: "psp-a" }); // no vault support
+    const b = new FakeAdapter({ pspName: "psp-b", capabilities: { supportsSavedPaymentMethods: true } });
+    const service = new PaymentService({ adapters: [a, b] });
+    const router = new PaymentRouter({ service });
+
+    const { pspName, attempts } = await router.createPaymentSession(
+      input({ savePaymentMethod: true, customer: "cus_1" }),
+    );
+    expect(pspName).toBe("psp-b");
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0]).toMatchObject({ pspName: "psp-a", skipped: true });
+    expect(attempts[0]!.error.message).toMatch(/saved payment methods/);
+    expect(a.calls.filter((c) => c.method === "createPaymentSession")).toHaveLength(0); // never burned a PSP call
+  });
+
+  it("a zero-amount save-card session is eligible on a vault-capable candidate", async () => {
+    const b = new FakeAdapter({
+      pspName: "psp-b",
+      capabilities: { supportsSavedPaymentMethods: true, supportsPaymentMethodVerification: false },
+    });
+    const service = new PaymentService({ adapters: [b] });
+    const router = new PaymentRouter({ service });
+
+    const { pspName, attempts } = await router.createPaymentSession(
+      input({ amount: 0, savePaymentMethod: true, customer: "cus_1" }),
+    );
+    expect(pspName).toBe("psp-b");
+    expect(attempts).toHaveLength(0); // not skipped — the service accepts exactly this input
   });
 });

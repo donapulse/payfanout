@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useMemo, useState, type JSX } from "react";
 import { StripeClientAdapter } from "@payfanout/adapter-stripe";
 import { PaysafeClientAdapter } from "@payfanout/adapter-paysafe";
+import { PayZenClientAdapter } from "@payfanout/adapter-payzen";
 import { GoCardlessClientAdapter } from "@payfanout/adapter-gocardless";
 import { PayPalClientAdapter } from "@payfanout/adapter-paypal";
 import { PayFanoutProvider, PaymentFields, usePay, usePayFanout, type PayResult } from "@payfanout/react";
@@ -22,6 +23,10 @@ const adapters = [
   }),
   new PaysafeClientAdapter({
     apiKey: import.meta.env.VITE_PAYSAFE_PUBLIC_KEY ?? "replace_me_base64",
+    environment: "sandbox",
+  }),
+  new PayZenClientAdapter({
+    publicKey: import.meta.env.VITE_PAYZEN_PUBLIC_KEY ?? "replace_me",
     environment: "sandbox",
   }),
   // No client key at all: the session's clientSecret carries the hosted flow URL.
@@ -55,6 +60,7 @@ const SLOT_BOX: React.CSSProperties = {
 const CURRENCY_BY_PSP: Record<string, string> = {
   stripe: "USD",
   paysafe: import.meta.env.VITE_PAYSAFE_CURRENCY ?? "USD",
+  payzen: "EUR", // PayZen demo shops are EUR-contracted
   gocardless: "GBP", // one-off GoCardless bank payments are GBP/EUR only
   // The PayPal JS SDK fixes its currency at load time — the adapter defaults to USD.
   paypal: "USD",

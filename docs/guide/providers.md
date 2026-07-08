@@ -14,6 +14,7 @@ Pick the PSP you're wiring up:
 | **Paysafe** | [Set up Paysafe](/guide/paysafe) | `@payfanout/adapter-paysafe-server` | `@payfanout/adapter-paysafe` | Tokenize-first (needs a server-completion route) |
 | **GoCardless** | [Set up GoCardless](/guide/gocardless) | `@payfanout/adapter-gocardless-server` | `@payfanout/adapter-gocardless` | Confirm-on-client (redirect to hosted bank authorisation) |
 | **PayPal** | [Set up PayPal](/guide/paypal) | `@payfanout/adapter-paypal-server` | `@payfanout/adapter-paypal` | Tokenize-first (needs a server-completion route) |
+| **PayZen (Lyra)** | [Set up PayZen](/guide/payzen) | `@payfanout/adapter-payzen-server` | `@payfanout/adapter-payzen` | Confirm-on-client |
 
 New to the packages themselves? [Installation](/guide/installation) covers prerequisites,
 which packages to add, and the env-var mechanics first. This page and the guides below are

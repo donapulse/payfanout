@@ -1,5 +1,7 @@
 import {
+  assertBrowser,
   brandMountedFieldsHandle,
+  injectScript,
   PayFanoutError,
   type ClientPaymentAdapter,
   type ConfirmResult,
@@ -101,9 +103,10 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
   }
 
   async loadSdk(): Promise<void> {
-    assertBrowser("loadSdk");
+    assertBrowser("StripeClientAdapter", "loadSdk");
     if (this.stripeGlobal()) return;
-    this.sdkPromise ??= (this.config.loadScript ?? injectScript)(this.config.sdkUrl ?? STRIPE_JS_URL);
+    const url = this.config.sdkUrl ?? STRIPE_JS_URL;
+    this.sdkPromise ??= this.config.loadScript ? this.config.loadScript(url) : injectScript(url, this.pspName);
     await this.sdkPromise;
     if (!this.stripeGlobal()) {
       throw new PayFanoutError({
@@ -117,7 +120,7 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
   }
 
   async mount(container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
-    assertBrowser("mount");
+    assertBrowser("StripeClientAdapter", "mount");
     await this.loadSdk();
     const factory = this.stripeGlobal()!;
     const locale = options.locale ?? this.config.locale;
@@ -192,7 +195,7 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
     const setiSecret = params.get("setup_intent_client_secret");
     if (!piSecret && !setiSecret) return null;
 
-    assertBrowser("handleRedirectReturn");
+    assertBrowser("StripeClientAdapter", "handleRedirectReturn");
     await this.loadSdk();
     const stripe = this.stripeGlobal()!(
       this.config.publishableKey,
@@ -219,14 +222,6 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
     if (this.config.getStripeGlobal) return this.config.getStripeGlobal();
     if (typeof window === "undefined") return undefined;
     return (window as unknown as { Stripe?: StripeJsFactory }).Stripe;
-  }
-}
-
-function assertBrowser(operation: string): void {
-  if (typeof window === "undefined" || typeof document === "undefined") {
-    throw PayFanoutError.invalidRequest(
-      `StripeClientAdapter.${operation} is browser-only — never call it during SSR`,
-    );
   }
 }
 
@@ -280,33 +275,10 @@ function mapStripeJsError(error: StripeJsErrorLike | undefined): UnifiedError {
   return new PayFanoutError({
     code,
     message: error?.message ?? "Payment failed.",
-    retryable: code === "processing_error" || code === "authentication_required",
+    // authentication_required is resolved on-session (a 3DS challenge), never by replay.
+    retryable: code === "processing_error",
     raw: error,
     pspName: "stripe",
   });
 }
 
-function injectScript(url: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const existing = document.querySelector(`script[src="${url}"]`);
-    if (existing) {
-      resolve();
-      return;
-    }
-    const script = document.createElement("script");
-    script.src = url;
-    script.async = true;
-    script.onload = () => resolve();
-    script.onerror = () =>
-      reject(
-        new PayFanoutError({
-          code: "psp_unavailable",
-          message: `Failed to load ${url}`,
-          retryable: true,
-          raw: undefined,
-          pspName: "stripe",
-        }),
-      );
-    document.head.appendChild(script);
-  });
-}

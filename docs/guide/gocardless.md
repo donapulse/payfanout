@@ -206,6 +206,16 @@ Notable mappings: `payments.confirmed` → `payment.succeeded` (money collected;
 payer completed the hosted flow; the event's `links.payment_request_payment` is the new
 payment id).
 
+::: warning A bank-debit chargeback is effectively final
+The direct debit guarantee reclaims the funds at `charged_back` itself, and GoCardless
+has no merchant dispute flow — so **no GoCardless event maps to
+`payment.chargeback_lost`**. Treat `payment.chargeback` as lost unless
+`payment.chargeback_won` (`chargeback_cancelled`: the payer's bank withdrew the claim,
+rare) follows. The later `chargeback_settled` action is payout accounting — the
+already-reclaimed funds being debited from a payout — not a dispute outcome; it maps to
+`unknown` like the other payout events.
+:::
+
 ## 8. Refunds must be enabled first
 
 Refunds are **disabled by default** on GoCardless accounts — a registered admin requests

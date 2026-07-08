@@ -8,6 +8,7 @@
     "@payfanout/adapter-gocardless-server": "workspace:*",
     "@payfanout/adapter-paypal-server": "workspace:*",
     "@payfanout/adapter-paysafe-server": "workspace:*",
+    "@payfanout/adapter-payzen-server": "workspace:*",
     "@payfanout/adapter-stripe-server": "workspace:*",
     "@payfanout/core": "workspace:*",
     "@payfanout/server": "workspace:*",

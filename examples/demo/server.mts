@@ -18,43 +18,52 @@ import {
 } from "@payfanout/server";
 import { StripeServerAdapter } from "@payfanout/adapter-stripe-server";
 import { PaysafeServerAdapter } from "@payfanout/adapter-paysafe-server";
+import { PayZenServerAdapter } from "@payfanout/adapter-payzen-server";
 import { GoCardlessServerAdapter, parseGoCardlessWebhookEvents } from "@payfanout/adapter-gocardless-server";
 import { PayPalServerAdapter } from "@payfanout/adapter-paypal-server";
 
 const stripe = new StripeServerAdapter({
-  secretKey: process.env.STRIPE_SECRET_KEY ?? "sk_test_replace_me",
+  // Unset CI secrets render as EMPTY strings, not undefined — || treats them as absent.
+  secretKey: process.env.STRIPE_SECRET_KEY || "sk_test_replace_me",
   apiVersion: "2024-06-20", // pinned — never rely on the account default
-  webhookSigningSecret: process.env.STRIPE_WEBHOOK_SECRET ?? "whsec_replace_me",
+  webhookSigningSecret: process.env.STRIPE_WEBHOOK_SECRET || "whsec_replace_me",
   environment: "sandbox",
 });
 
 const paysafe = new PaysafeServerAdapter({
-  username: process.env.PAYSAFE_USERNAME ?? "replace_me",
-  password: process.env.PAYSAFE_PASSWORD ?? "replace_me",
+  username: process.env.PAYSAFE_USERNAME || "replace_me",
+  password: process.env.PAYSAFE_PASSWORD || "replace_me",
   environment: "sandbox",
   // Paysafe merchant accounts are per currency/country — resolve, don't hardcode.
   // Returning undefined lets single-account API keys route by key + currency.
   merchantAccountResolver: () => process.env.PAYSAFE_ACCOUNT_ID,
-  sessionSigningKey: process.env.PAYSAFE_SESSION_KEY ?? "dev-only-session-signing-key",
-  webhookHmacKey: process.env.PAYSAFE_WEBHOOK_HMAC_KEY ?? "dev-only-webhook-key",
+  sessionSigningKey: process.env.PAYSAFE_SESSION_KEY || "dev-only-session-signing-key",
+  webhookHmacKey: process.env.PAYSAFE_WEBHOOK_HMAC_KEY || "dev-only-webhook-key",
+});
+
+const payzen = new PayZenServerAdapter({
+  shopId: process.env.PAYZEN_SHOP_ID || "replace_me",
+  password: process.env.PAYZEN_PASSWORD || "testpassword_replace_me",
+  environment: "sandbox",
+  hmacKey: process.env.PAYZEN_HMAC_KEY || "dev-only-hmac-key",
 });
 
 const gocardless = new GoCardlessServerAdapter({
-  accessToken: process.env.GOCARDLESS_ACCESS_TOKEN ?? "replace_me",
+  accessToken: process.env.GOCARDLESS_ACCESS_TOKEN || "replace_me",
   environment: "sandbox",
-  webhookSecret: process.env.GOCARDLESS_WEBHOOK_SECRET ?? "dev-only-webhook-secret",
+  webhookSecret: process.env.GOCARDLESS_WEBHOOK_SECRET || "dev-only-webhook-secret",
 });
 
 const paypal = new PayPalServerAdapter({
-  clientId: process.env.PAYPAL_CLIENT_ID ?? "replace_me",
-  clientSecret: process.env.PAYPAL_CLIENT_SECRET ?? "replace_me",
+  clientId: process.env.PAYPAL_CLIENT_ID || "replace_me",
+  clientSecret: process.env.PAYPAL_CLIENT_SECRET || "replace_me",
   environment: "sandbox",
   // From the dashboard's webhook registration — verification answers false without it.
   webhookId: process.env.PAYPAL_WEBHOOK_ID,
 });
 
 const payments = new PaymentService({
-  adapters: [stripe, paysafe, gocardless, paypal],
+  adapters: [stripe, paysafe, gocardless, paypal, payzen],
   // Observability seam: one metadata-only record per adapter call. In
   // production this feeds metrics/tracing; the demo just shows it exists.
   telemetry: (t) =>
@@ -67,6 +76,7 @@ const router = new PaymentRouter({
   service: payments,
   rules: [
     { when: { currency: ["CAD"] }, use: ["paysafe", "stripe"] },
+    { when: { currency: ["EUR"] }, use: ["payzen", "stripe"] },
     { when: { currency: ["USD", "JPY"] }, use: ["stripe", "paysafe"] },
   ],
   onAttempt: (a) =>
@@ -139,7 +149,9 @@ const onEvent = async (event: import("@payfanout/core").UnifiedWebhookEvent): Pr
 
 const stripeHook = createAdapterWebhookHandler(stripe, { onEvent, log: console.log });
 const paysafeHook = createAdapterWebhookHandler(paysafe, { onEvent, log: console.log });
+const payzenHook = createAdapterWebhookHandler(payzen, { onEvent, log: console.log });
 const paypalHook = createAdapterWebhookHandler(paypal, { onEvent, log: console.log });
+// PayZen stays out of the unified route (form-urlencoded IPNs, not JSON);
 // gocardless here handles single-event deliveries only — batched deliveries 400; /webhooks/gocardless below is the real ingress.
 const unifiedHook = createUnifiedWebhookHandler([stripe, paysafe, gocardless, paypal], { onEvent, log: console.log });
 
@@ -157,6 +169,22 @@ for (const [path, handler] of [
     res.status(result.status).json(result.ok ? { received: true } : { error: result.reason });
   });
 }
+
+// PayZen IPNs POST application/x-www-form-urlencoded: parse the form, pass the
+// kr-answer STRING as rawBody (the signature covers exactly those bytes) and
+// the kr-hash fields as headers — the guide's "recipe A".
+app.post("/webhooks/payzen", express.urlencoded({ extended: false }), async (req, res) => {
+  const body = req.body as Record<string, string | undefined>;
+  const result = await payzenHook({
+    rawBody: body["kr-answer"] ?? "",
+    headers: {
+      "kr-hash": body["kr-hash"] ?? "",
+      "kr-hash-algorithm": body["kr-hash-algorithm"] ?? "",
+      "kr-hash-key": body["kr-hash-key"] ?? "",
+    },
+  });
+  res.status(result.status).json(result.ok ? { received: true } : { error: result.reason });
+});
 
 // GoCardless BATCHES up to 250 events per delivery, so its ingress differs:
 // verify the signature once over the raw bytes, then fan out per event —
@@ -203,9 +231,9 @@ app.post("/api/session", async (req, res) => {
       billingDetails: billing ? { address: billing } : undefined,
       captureMethod,
       // Redirect methods (GoCardless hosted bank authorisation) land back here.
-      returnUrl: `${process.env.PUBLIC_URL ?? "http://localhost:4242"}/return`,
+      returnUrl: `${process.env.PUBLIC_URL || "http://localhost:4242"}/return`,
       // "auto" doesn't know its PSP yet — the unified endpoint serves any of them.
-      webhookUrl: `${process.env.PUBLIC_URL ?? "http://localhost:4242"}/webhooks/${psp === "auto" ? "unified" : psp}`,
+      webhookUrl: `${process.env.PUBLIC_URL || "http://localhost:4242"}/webhooks/${psp === "auto" ? "unified" : psp}`,
       idempotencyKey: orderId,
       ...stripeSave,
     };
@@ -300,9 +328,9 @@ app.post("/api/charge-saved", async (req, res) => {
       pspCustomerId: entry.pspCustomerId,
       savedPaymentMethodToken: token,
       amount,
-      currency: psp === "paysafe" ? (process.env.PAYSAFE_CURRENCY ?? process.env.VITE_PAYSAFE_CURRENCY ?? "USD") : "USD",
+      currency: psp === "paysafe" ? (process.env.PAYSAFE_CURRENCY || process.env.VITE_PAYSAFE_CURRENCY || "USD") : "USD",
       occurrence: "recurring",
-      billingDetails: { address: DEMO_BILLING[psp === "paysafe" ? (process.env.PAYSAFE_CURRENCY ?? "USD") : "USD"] ?? DEMO_BILLING["USD"] },
+      billingDetails: { address: DEMO_BILLING[psp === "paysafe" ? (process.env.PAYSAFE_CURRENCY || "USD") : "USD"] ?? DEMO_BILLING["USD"] },
       idempotencyKey: `charge-saved-${randomUUID()}`,
     });
     res.json(info);
@@ -325,8 +353,8 @@ app.post("/api/subscriptions", async (req, res) => {
       pspName: psp,
       pspCustomerId: entry.pspCustomerId,
       savedPaymentMethodToken: token,
-      plan: { amount, currency: psp === "paysafe" ? (process.env.PAYSAFE_CURRENCY ?? process.env.VITE_PAYSAFE_CURRENCY ?? "USD") : "USD", interval: "month" },
-      billingDetails: { address: DEMO_BILLING[psp === "paysafe" ? (process.env.PAYSAFE_CURRENCY ?? "USD") : "USD"] ?? DEMO_BILLING["USD"] },
+      plan: { amount, currency: psp === "paysafe" ? (process.env.PAYSAFE_CURRENCY || process.env.VITE_PAYSAFE_CURRENCY || "USD") : "USD", interval: "month" },
+      billingDetails: { address: DEMO_BILLING[psp === "paysafe" ? (process.env.PAYSAFE_CURRENCY || "USD") : "USD"] ?? DEMO_BILLING["USD"] },
       idempotencyKey: `subscribe-${randomUUID()}`,
     });
     res.json({ subscription, payment });

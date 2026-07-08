@@ -1,3 +1,5 @@
+import type { PaymentMethodCapability } from "@payfanout/core";
+
 /**
  * Structural subset of the `stripe` Node SDK that the adapter uses. Keeping it
  * structural lets tests inject an in-memory client and keeps the adapter's
@@ -26,6 +28,8 @@ export interface StripeChargeLike {
       brand?: string;
       last4?: string;
       wallet?: { type?: string } | null;
+      exp_month?: number;
+      exp_year?: number;
     } | null;
     [rail: string]: unknown;
   } | null;
@@ -45,6 +49,8 @@ export interface StripePaymentIntentLike {
   amount: number;
   /** What was actually collected — differs from `amount` after partial capture. */
   amount_received?: number;
+  /** Authorized-but-uncaptured remainder on manual-capture intents. */
+  amount_capturable?: number;
   currency: string;
   created: number;
   client_secret?: string | null;
@@ -170,11 +176,24 @@ export interface StripeServerAdapterConfig {
   /** Webhook timestamp tolerance in seconds (replay protection). Default 300. */
   webhookToleranceSeconds?: number;
   /**
+   * Abort a hung Stripe request after this many milliseconds (the SDK's
+   * `timeout` client option). Left unset, the SDK's own default of 80000
+   * (80s) applies. Only applies when the SDK is loaded lazily — an injected
+   * client keeps its own configuration.
+   */
+  requestTimeoutMs?: number;
+  /**
    * Automatic network-level retries inside the Stripe SDK (idempotency keys
    * make them safe). Default 2. Only applies when the SDK is loaded lazily —
    * an injected client keeps its own configuration.
    */
   maxNetworkRetries?: number;
+  /**
+   * iDEAL/SEPA/ACH/Bacs are per-account dashboard enablements, and wallet
+   * availability varies too — override instead of trusting the defaults when
+   * the account differs.
+   */
+  paymentMethods?: PaymentMethodCapability[];
   /** Injected client for tests; defaults to lazily importing the `stripe` SDK. */
   client?: StripeClientLike;
   /** Injected clock (ms since epoch) for webhook tolerance tests. */

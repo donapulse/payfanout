@@ -47,6 +47,8 @@ describe("GoCardless config validation", () => {
     expect(() => makePair({ webhookSecret: [] })).toThrowError(/webhookSecret/);
     expect(() => makePair({ webhookSecret: ["", ""] })).toThrowError(/webhookSecret/);
     expect(() => makePair({ requestTimeoutMs: 0 })).toThrowError(/requestTimeoutMs/);
+    expect(() => makePair({ maxNetworkRetries: -1 })).toThrowError(/maxNetworkRetries/);
+    expect(() => makePair({ maxNetworkRetries: 1.5 })).toThrowError(/maxNetworkRetries/);
   });
 
   it("selects the host from the explicit environment, never from the credential", async () => {
@@ -134,7 +136,7 @@ describe("GoCardless status mapping", () => {
     expect((await adapter.retrievePayment(pending)).status).toBe("requires_action");
 
     const cancelled = await make();
-    await adapter.cancelPayment(cancelled);
+    await adapter.cancelPayment(cancelled, "k-cancel-br");
     expect((await adapter.retrievePayment(cancelled)).status).toBe("canceled");
 
     // Fulfilled with the payment link not landed yet = money is underway.
@@ -379,6 +381,33 @@ describe("GoCardless webhook parsing (batched deliveries)", () => {
     }
   });
 
+  it("carries the refund id on refund events and never invents money facts", () => {
+    const [paid] = parseGoCardlessWebhookEvents(
+      JSON.stringify({
+        events: [
+          {
+            id: "EV_R1",
+            created_at: "2026-07-07T10:00:00.000Z",
+            resource_type: "refunds",
+            action: "paid",
+            links: { refund: "RF77", payment: "PM77" },
+          },
+        ],
+      }),
+    );
+    expect(paid).toMatchObject({ type: "payment.refunded", refundId: "RF77", pspPaymentId: "PM77" });
+    // GoCardless events carry no amount/currency — the normalizer must not guess.
+    expect(paid!.amount).toBeUndefined();
+    expect(paid!.currency).toBeUndefined();
+
+    const [confirmed] = parseGoCardlessWebhookEvents(
+      JSON.stringify({
+        events: [{ id: "EV_P1", resource_type: "payments", action: "confirmed", links: { payment: "PM1" } }],
+      }),
+    );
+    expect(confirmed!.refundId).toBeUndefined();
+  });
+
   it("takes pspPaymentId from links.payment, else links.payment_request_payment", () => {
     const [fulfilled] = parseGoCardlessWebhookEvents(
       JSON.stringify({
@@ -497,6 +526,22 @@ describe("GoCardless event polling + listing", () => {
     expect(one.refunds).toHaveLength(1);
     expect(one.refunds[0]!.amount).toBe(100);
     expect(one.refunds[0]!.pspPaymentId).toBe(targetPayment);
+  });
+
+  it("clamps page sizes to GoCardless's documented 1-500 limit bounds", async () => {
+    const seen: string[] = [];
+    const fetchSpy: typeof fetch = async (input) => {
+      seen.push(String(input));
+      return new Response(
+        JSON.stringify({ payments: [], refunds: [], events: [], meta: { cursors: {} } }),
+        { status: 200 },
+      );
+    };
+    const { adapter } = makePair({ fetch: fetchSpy });
+    await adapter.listPayments({ limit: 1234 });
+    await adapter.listRefunds({ limit: 0 });
+    await adapter.fetchEvents({ limit: 2.9 });
+    expect(seen.map((url) => new URL(url).searchParams.get("limit"))).toEqual(["500", "1", "2"]);
   });
 });
 

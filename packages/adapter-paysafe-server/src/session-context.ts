@@ -1,11 +1,13 @@
-import { PayFanoutError, type CreatePaymentSessionInput, type ShippingDetails } from "@payfanout/core";
 import {
-  constantTimeEqual,
-  bytesToBase64Url,
   base64UrlToUtf8,
+  bytesToBase64Url,
+  constantTimeEqual,
   hmacSha256,
+  PayFanoutError,
   utf8ToBase64Url,
-} from "./crypto-utils.js";
+  type CreatePaymentSessionInput,
+  type ShippingDetails,
+} from "@payfanout/core";
 
 /**
  * Paysafe is tokenize-first (§4a): no PSP object exists until the server's
@@ -20,7 +22,8 @@ import {
  *
  * Every context carries an expiry (`expiresAt`, epoch ms): a signed token must
  * not stay completable forever. Enforced at decode time — completePayment,
- * verifyPaymentMethod, and updatePaymentSession all reject expired tokens.
+ * verifyPaymentMethod, and updatePaymentSession all reject expired tokens with
+ * code "session_expired" (hosts recover by creating a fresh session).
  *
  * Crypto is WebCrypto (async) so this module runs on edge runtimes too.
  */
@@ -99,10 +102,12 @@ export async function decodeSessionContext(
     );
   }
   if ((options.now ?? Date.now()) > context.expiresAt) {
-    throw PayFanoutError.invalidRequest(
-      "This payment session has expired — create a new payment session",
-      { expiresAt: new Date(context.expiresAt).toISOString() },
-    );
+    throw new PayFanoutError({
+      code: "session_expired",
+      message: "This payment session has expired — create a new payment session",
+      retryable: false,
+      raw: { expiresAt: new Date(context.expiresAt).toISOString() },
+    });
   }
   return context;
 }

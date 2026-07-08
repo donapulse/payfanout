@@ -9,18 +9,25 @@ const baseInput = {
   idempotencyKey: "idem-1",
 };
 
-async function expectInvalidRequest(promise: Promise<unknown>, pattern: RegExp): Promise<void> {
+async function expectGuard(
+  promise: Promise<unknown>,
+  pattern: RegExp,
+  code: "invalid_request" | "unsupported_operation",
+): Promise<void> {
   try {
     await promise;
     expect.unreachable("expected rejection");
   } catch (err) {
     expect(isPayFanoutError(err)).toBe(true);
     if (isPayFanoutError(err)) {
-      expect(err.code).toBe("invalid_request");
+      expect(err.code).toBe(code);
       expect(err.message).toMatch(pattern);
     }
   }
 }
+
+const expectInvalidRequest = (p: Promise<unknown>, r: RegExp) => expectGuard(p, r, "invalid_request");
+const expectUnsupported = (p: Promise<unknown>, r: RegExp) => expectGuard(p, r, "unsupported_operation");
 
 describe("PaymentService registry", () => {
   it("routes to the named adapter and lists psps", async () => {
@@ -110,20 +117,20 @@ describe("PaymentService guards", () => {
       },
     });
     const service = new PaymentService({ adapters: [limited] });
-    await expectInvalidRequest(
+    await expectUnsupported(
       service.createPaymentSession("limited", { ...baseInput, captureMethod: "manual" }),
       /manual capture/,
     );
-    await expectInvalidRequest(service.capturePayment("limited", "p1", 500, "k"), /manual capture/);
-    await expectInvalidRequest(
+    await expectUnsupported(service.capturePayment("limited", "p1", 500, "k"), /manual capture/);
+    await expectUnsupported(
       service.createPaymentSession("limited", { ...baseInput, amount: 0 }),
       /verification/,
     );
-    await expectInvalidRequest(
-      service.verifyPaymentMethod("limited", { pspSessionId: "s1" }),
+    await expectUnsupported(
+      service.verifyPaymentMethod("limited", { pspSessionId: "s1", idempotencyKey: "k" }),
       /verification/,
     );
-    await expectInvalidRequest(
+    await expectUnsupported(
       service.refundPayment("limited", { pspPaymentId: "p1", amount: 100, idempotencyKey: "k" }),
       /partial refunds/,
     );
@@ -139,7 +146,7 @@ describe("PaymentService guards", () => {
       capabilities: { requiresServerCompletion: true },
     });
     const service = new PaymentService({ adapters: [stripeish, paysafeish] });
-    await expectInvalidRequest(
+    await expectUnsupported(
       service.completePayment("stripeish", { pspSessionId: "s", clientToken: "t", idempotencyKey: "k" }),
       /completes payments on the client/,
     );
@@ -172,6 +179,41 @@ describe("PaymentService error normalization", () => {
     }
   });
 
+  it("backfills pspName when an adapter throws a PayFanoutError without one", async () => {
+    const adapter = new FakeAdapter({ pspName: "flaky" });
+    const anonymous = new PayFanoutError({
+      code: "card_declined",
+      message: "Declined",
+      retryable: false,
+      raw: { decline_code: "do_not_honor" },
+    });
+    adapter.retrievePayment = async () => {
+      throw anonymous;
+    };
+    const service = new PaymentService({ adapters: [adapter] });
+    try {
+      await service.retrievePayment("flaky", "p1");
+      expect.unreachable();
+    } catch (err) {
+      expect(isPayFanoutError(err)).toBe(true);
+      if (isPayFanoutError(err)) {
+        expect(err.pspName).toBe("flaky");
+        expect(err.code).toBe("card_declined");
+        expect(err.message).toBe("Declined");
+        expect(err.retryable).toBe(false);
+        expect(err.raw).toBe(anonymous.raw);
+        expect(err.stack).toBe(anonymous.stack);
+        expect(err.toJSON()).toEqual({
+          name: "PayFanoutError",
+          code: "card_declined",
+          message: "Declined",
+          retryable: false,
+          pspName: "flaky",
+        });
+      }
+    }
+  });
+
   it("lets adapter-produced PayFanoutErrors pass through untouched", async () => {
     const adapter = new FakeAdapter({ pspName: "flaky" });
     const declined = new PayFanoutError({
@@ -186,5 +228,21 @@ describe("PaymentService error normalization", () => {
     };
     const service = new PaymentService({ adapters: [adapter] });
     await expect(service.retrievePayment("flaky", "p1")).rejects.toBe(declined);
+  });
+});
+
+describe("PaymentService session screening (shared predicate with PaymentRouter)", () => {
+  it("rejects sessions restricted to method types the adapter does not support, before any PSP call", async () => {
+    const adapter = new FakeAdapter({});
+    const service = new PaymentService({ adapters: [adapter] });
+    await expect(
+      service.createPaymentSession("fake", {
+        amount: 1000,
+        currency: "USD",
+        idempotencyKey: "k",
+        paymentMethodTypes: ["ideal"],
+      }),
+    ).rejects.toMatchObject({ code: "unsupported_operation", pspName: "fake" });
+    expect(adapter.calls.filter((c) => c.method === "createPaymentSession")).toHaveLength(0);
   });
 });

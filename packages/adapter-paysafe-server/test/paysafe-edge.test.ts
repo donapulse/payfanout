@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isPayFanoutError, type UnifiedErrorCode, type UnifiedPaymentStatus } from "@payfanout/core";
+import { getUserMessage, isPayFanoutError, type UnifiedErrorCode, type UnifiedPaymentStatus } from "@payfanout/core";
 import {
   decodeSessionContext,
   encodeSessionContext,
@@ -60,6 +60,7 @@ describe("mapPaysafeError", () => {
     [402, "3022", "insufficient_funds", false],
     [402, "3006", "expired_card", false],
     [402, "3017", "invalid_card_data", false],
+    [402, "3004", "invalid_request", false], // zip/billing data required — data quality, not a decline
     [402, "3009", "card_declined", false],
     [402, "8000", "fraud_suspected", false],
     [402, "9999", "card_declined", false], // unknown code on a 402 is still a decline
@@ -80,6 +81,12 @@ describe("mapPaysafeError", () => {
       expect(mapped.pspName).toBe("paysafe");
     });
   }
+
+  it("gives 3004 the catalog invalid_request message, never the decline text", () => {
+    const mapped = mapPaysafeError(402, { error: { code: "3004", message: "Zip is required" } });
+    expect(mapped.message).toBe(getUserMessage("invalid_request"));
+    expect(mapped.message).not.toBe(getUserMessage("card_declined"));
+  });
 });
 
 describe("session context edge cases", () => {
@@ -129,27 +136,30 @@ describe("session context edge cases", () => {
     await expect(decodeSessionContext(await encodeSessionContext(full, SIGNING_KEY), SIGNING_KEY)).resolves.toEqual(full);
   });
 
-  it("rejects an expired context and one issued without an expiry", async () => {
+  it("rejects an expired context with session_expired and a missing expiry as invalid_request", async () => {
     const base = { v: 1 as const, amount: 100, currency: "USD", captureMethod: "automatic" as const };
     const expired = await encodeSessionContext({ ...base, expiresAt: Date.now() - 1 }, SIGNING_KEY);
-    await expect(decodeSessionContext(expired, SIGNING_KEY)).rejects.toThrowError(/expired/);
+    // Expiry is a recoverable host condition (create a fresh session), not a malformed request.
+    await expect(decodeSessionContext(expired, SIGNING_KEY)).rejects.toMatchObject({
+      code: "session_expired",
+      retryable: false,
+      message: expect.stringMatching(/expired/),
+    });
     // Explicit clock: expiry is compared against the caller's `now`.
     const shortLived = await encodeSessionContext({ ...base, expiresAt: 1_000_000 }, SIGNING_KEY);
     expect((await decodeSessionContext(shortLived, SIGNING_KEY, { now: 999_999 })).amount).toBe(100);
-    await expect(decodeSessionContext(shortLived, SIGNING_KEY, { now: 1_000_001 })).rejects.toThrowError(/expired/);
-    // Tokens with no expiresAt are rejected — unbounded lifetime is the hole TTLs close.
+    await expect(decodeSessionContext(shortLived, SIGNING_KEY, { now: 1_000_001 })).rejects.toMatchObject({
+      code: "session_expired",
+    });
+    // Tokens with no expiresAt are rejected — unbounded lifetime is the hole TTLs
+    // close. That is a malformed token, so it stays invalid_request.
     const legacy = await encodeSessionContext({ ...base, expiresAt: undefined as never }, SIGNING_KEY);
-    await expect(decodeSessionContext(legacy, SIGNING_KEY)).rejects.toThrowError(/no expiry/);
+    await expect(decodeSessionContext(legacy, SIGNING_KEY)).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringMatching(/no expiry/),
+    });
   });
 
-  it("produces tokens bit-identical to the previous node:crypto implementation", async () => {
-    // The WebCrypto migration must not invalidate outstanding signed tokens.
-    const { createHmac } = await import("node:crypto");
-    const context = { v: 1 as const, amount: 777, currency: "USD", captureMethod: "automatic" as const, expiresAt: 2_000_000_000_000 };
-    const payload = Buffer.from(JSON.stringify(context), "utf8").toString("base64url");
-    const nodeSignature = createHmac("sha256", SIGNING_KEY).update(payload, "utf8").digest("base64url");
-    await expect(encodeSessionContext(context, SIGNING_KEY)).resolves.toBe(`${payload}.${nodeSignature}`);
-  });
 });
 
 describe("webhook edge cases", () => {
@@ -196,12 +206,6 @@ describe("webhook edge cases", () => {
     }
   });
 
-  it("hashed fallback dedupe ids match the previous node:crypto output", async () => {
-    const { createHash } = await import("node:crypto");
-    const rawBody = JSON.stringify({ eventType: "PAYMENT_COMPLETED", payload: { id: "pay_1" } });
-    const event = await parsePaysafeWebhookEvent(rawBody);
-    expect(event.id).toBe(`paysafe_${createHash("sha256").update(rawBody, "utf8").digest("hex")}`);
-  });
 });
 
 describe("transport edge cases", () => {

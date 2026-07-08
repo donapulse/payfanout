@@ -36,7 +36,7 @@ The test pyramid layers on top of this:
 
 ## Writing a new adapter
 
-The step-by-step guide for adding PSP #3 lives in
+The step-by-step guide for adding the next PSP lives in
 [Writing an adapter](/adapter-authoring). The short version: implement the
 `ServerPaymentAdapter` / `ClientPaymentAdapter` contract from `@payfanout/core`, then wire
 your adapter into `runServerAdapterConformanceTests` / `runClientAdapterConformanceTests`

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { getRefundState, isPayFanoutError } from "@payfanout/core";
+import { getRefundState, isPayFanoutError, type ServerPaymentAdapter } from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
-import { PayPalServerAdapter, type PayPalServerAdapterConfig } from "../src/index.js";
+import { PAYPAL_SUPPORTED_CURRENCIES, PayPalServerAdapter, type PayPalServerAdapterConfig } from "../src/index.js";
 import { FakePayPalApi } from "./fake-paypal-api.js";
 
 const WEBHOOK_ID = "1JE4291016473214C";
@@ -63,12 +63,48 @@ const WEBHOOK_HEADERS: Record<string, string> = {
   "paypal-auth-algo": "SHA256withRSA",
 };
 
+/**
+ * A genuine, signature-verifiable delivery of an event type the adapter has
+ * no mapping for — must parse to "unknown", never throw.
+ */
+const ORDER_APPROVED_EVENT = JSON.stringify({
+  id: "WH-58D329510W468432D-8HN650336L201105X",
+  event_version: "1.0",
+  create_time: "2026-05-16T05:18:15.000Z",
+  resource_type: "checkout-order",
+  resource_version: "2.0",
+  event_type: "CHECKOUT.ORDER.APPROVED",
+  summary: "An order has been approved by buyer",
+  resource: {
+    id: "5O190127TN364715T",
+    intent: "CAPTURE",
+    status: "APPROVED",
+    purchase_units: [{ reference_id: "default", amount: { currency_code: "USD", value: "50.00" } }],
+  },
+  links: [
+    {
+      href: "https://api.paypal.com/v1/notifications/webhooks-events/WH-58D329510W468432D-8HN650336L201105X",
+      rel: "self",
+      method: "GET",
+    },
+  ],
+});
+
+const ORDER_APPROVED_HEADERS: Record<string, string> = {
+  "paypal-transmission-id": "af4d4300-5b47-11f0-b2ab-c1cb46a52d0d",
+  "paypal-transmission-time": "2026-05-16T05:18:16Z",
+  "paypal-transmission-sig": "YW5vdGhlci1mYWtlLXNpZ25hdHVyZS1mb3ItdGVzdHM=",
+  "paypal-cert-url": "https://api.paypal.com/v1/notifications/certs/CERT-360caa42-fca2a594-a5cafa77",
+  "paypal-auth-algo": "SHA256withRSA",
+};
+
 function makePair(config: Partial<PayPalServerAdapterConfig> = {}): {
   adapter: PayPalServerAdapter;
   fake: FakePayPalApi;
 } {
   const fake = new FakePayPalApi({ webhookId: WEBHOOK_ID });
   fake.registerWebhookFixture(CAPTURE_COMPLETED_EVENT, WEBHOOK_HEADERS);
+  fake.registerWebhookFixture(ORDER_APPROVED_EVENT, ORDER_APPROVED_HEADERS);
   const adapter = new PayPalServerAdapter({
     clientId: fake.clientId,
     clientSecret: fake.clientSecret,
@@ -85,6 +121,24 @@ function makePair(config: Partial<PayPalServerAdapterConfig> = {}): {
 // The exact same conformance contract the Stripe and Paysafe adapters pass.
 // ---------------------------------------------------------------------------
 let lastFake: FakePayPalApi;
+
+/** Approve + complete an AUTHORIZE-intent order; the uncaptured ORDER id stays canonical. */
+async function approvedAuthorization(adapter: ServerPaymentAdapter, amount: number): Promise<string> {
+  const session = await adapter.createPaymentSession({
+    amount,
+    currency: "USD",
+    captureMethod: "manual",
+    idempotencyKey: `authorize-${Math.random()}`,
+  });
+  lastFake.approveOrder(session.pspSessionId);
+  await adapter.completePayment!({
+    pspSessionId: session.pspSessionId,
+    clientToken: session.pspSessionId,
+    idempotencyKey: `authorize-c-${Math.random()}`,
+  });
+  return session.pspSessionId;
+}
+
 runServerAdapterConformanceTests(
   "paypal",
   () => {
@@ -112,6 +166,32 @@ runServerAdapterConformanceTests(
       validHeaders: WEBHOOK_HEADERS,
       expectedType: "payment.succeeded",
       expectedEventId: "WH-7YX49823S2290830K-0JE13296W68552352",
+      expectedAmount: 5000, // the fixture capture's "50.00" USD
+      unknownEvent: { rawBody: ORDER_APPROVED_EVENT, headers: ORDER_APPROVED_HEADERS },
+    },
+    money: {
+      completedPayment: async (adapter, { amount, id, metadata }) => {
+        const session = await adapter.createPaymentSession({
+          id,
+          amount,
+          currency: "USD",
+          metadata,
+          idempotencyKey: `money-create-${Math.random()}`,
+        });
+        lastFake.approveOrder(session.pspSessionId);
+        const info = await adapter.completePayment!({
+          pspSessionId: session.pspSessionId,
+          clientToken: session.pspSessionId,
+          idempotencyKey: `money-complete-${Math.random()}`,
+        });
+        return info.pspPaymentId; // the durable CAPTURE id — refunds key on it
+      },
+      authorizedPayment: (adapter, { amount }) => approvedAuthorization(adapter, amount),
+      // The only PayPal state cancelPayment can void is an uncaptured authorization.
+      cancelablePayment: (adapter) => approvedAuthorization(adapter, 1000),
+      // PayPal has no metadata object — the host id rides custom_id (round-trips),
+      // session metadata is never echoed back by retrievePayment.
+      expectations: { metadataEcho: false },
     },
     failingCalls: [
       {
@@ -212,6 +292,15 @@ runServerAdapterConformanceTests(
 // PayPal-specific behavior.
 // ---------------------------------------------------------------------------
 describe("PayPalServerAdapter specifics", () => {
+  it("declares the hard currency whitelist for router pre-screening", () => {
+    const { adapter } = makePair();
+    const declared = adapter.getCapabilities().supportedCurrencies;
+    // Must stay in lockstep with money.ts, which revalidates as defense-in-depth.
+    expect(declared).toEqual([...PAYPAL_SUPPORTED_CURRENCIES]);
+    expect(declared).toContain("USD");
+    expect(declared).not.toContain("BHD"); // PayPal supports no 3-decimal currency
+  });
+
   it("creates an order with intent CAPTURE, custom_id round-trip, and the experience context", async () => {
     const { adapter, fake } = makePair({
       brandName: "Demo Shop",
@@ -334,6 +423,7 @@ describe("PayPalServerAdapter specifics", () => {
     expect(info.id).toBe("order-1"); // custom_id round-trip
     expect(info.amount).toBe(5000);
     expect(info.amountRefunded).toBe(0);
+    expect(info.amountCaptured).toBe(5000);
     expect(info.capturedAt).toBeDefined();
     expect(info.paymentMethodType).toBe("paypal");
     expect(info.paymentMethodDetails).toEqual({ wallet: "paypal" });

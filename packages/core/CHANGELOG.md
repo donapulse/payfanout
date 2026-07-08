@@ -1,5 +1,11 @@
 # @payfanout/core
 
+## 1.0.2
+
+### Patch Changes
+
+- b190438: Remove the stale "not yet published to npm" notice from the package README. The package has been available on the public npm registry since its first release.
+
 ## 1.0.1
 
 ### Patch Changes

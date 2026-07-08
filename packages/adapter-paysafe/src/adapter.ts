@@ -1,5 +1,7 @@
 import {
+  assertBrowser,
   brandMountedFieldsHandle,
+  injectScript,
   PayFanoutError,
   type ClientPaymentAdapter,
   type ConfirmResult,
@@ -92,9 +94,10 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
   }
 
   async loadSdk(): Promise<void> {
-    assertBrowser("loadSdk");
+    assertBrowser("PaysafeClientAdapter", "loadSdk");
     if (this.paysafeGlobal()) return;
-    this.sdkPromise ??= (this.config.loadScript ?? injectScript)(this.config.sdkUrl ?? PAYSAFE_JS_URL);
+    const url = this.config.sdkUrl ?? PAYSAFE_JS_URL;
+    this.sdkPromise ??= this.config.loadScript ? this.config.loadScript(url) : injectScript(url, this.pspName);
     await this.sdkPromise;
     if (!this.paysafeGlobal()) {
       throw new PayFanoutError({
@@ -116,7 +119,7 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
    * per-field or SDK option come from MountOptions.fieldOptions / locale.
    */
   async mount(container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
-    assertBrowser("mount");
+    assertBrowser("PaysafeClientAdapter", "mount");
     await this.loadSdk();
     const session = decodeSessionPayload(options.clientSecret);
     const suffix = `payfanout-psf-${++mountCounter}`;
@@ -280,14 +283,6 @@ function toPaysafeStyle(appearance: Record<string, unknown> | undefined): { styl
   return Object.keys(style).length > 0 ? { style } : undefined;
 }
 
-function assertBrowser(operation: string): void {
-  if (typeof window === "undefined" || typeof document === "undefined") {
-    throw PayFanoutError.invalidRequest(
-      `PaysafeClientAdapter.${operation} is browser-only — never call it during SSR`,
-    );
-  }
-}
-
 function asPaysafeHandle(handle: MountedFieldsHandle): PaysafeHandle {
   const h = handle as unknown as PaysafeHandle;
   if (h?.pspName !== "paysafe" || !h.instance) {
@@ -351,30 +346,5 @@ function mapPaysafeJsError(err: unknown): UnifiedError {
     retryable: code === "processing_error" || code === "psp_unavailable",
     raw: err,
     pspName: "paysafe",
-  });
-}
-
-function injectScript(url: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const existing = document.querySelector(`script[src="${url}"]`);
-    if (existing) {
-      resolve();
-      return;
-    }
-    const script = document.createElement("script");
-    script.src = url;
-    script.async = true;
-    script.onload = () => resolve();
-    script.onerror = () =>
-      reject(
-        new PayFanoutError({
-          code: "psp_unavailable",
-          message: `Failed to load ${url}`,
-          retryable: true,
-          raw: undefined,
-          pspName: "paysafe",
-        }),
-      );
-    document.head.appendChild(script);
   });
 }

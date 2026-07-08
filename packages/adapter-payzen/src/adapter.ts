@@ -1,4 +1,5 @@
 import {
+  assertBrowser,
   brandMountedFieldsHandle,
   PayFanoutError,
   type ClientPaymentAdapter,
@@ -136,7 +137,7 @@ export class PayZenClientAdapter implements ClientPaymentAdapter {
   }
 
   async loadSdk(): Promise<void> {
-    assertBrowser("loadSdk");
+    assertBrowser("PayZenClientAdapter", "loadSdk");
     if (this.kr()) return;
     this.sdkPromise ??= (this.config.loadScript ?? injectKrAssets(this.config.publicKey))(
       this.config.scriptUrl ?? KR_SCRIPT_URL,
@@ -170,7 +171,7 @@ export class PayZenClientAdapter implements ClientPaymentAdapter {
    * with plain CSS (or a cssUrl override) — documented no-op.
    */
   async mount(container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
-    assertBrowser("mount");
+    assertBrowser("PayZenClientAdapter", "mount");
     await this.loadSdk();
     const kr = this.kr()!;
     const wrapper = document.createElement("div");
@@ -438,14 +439,6 @@ function userMessageFor(code: UnifiedErrorCode): string {
 /** kr-language uses Culture format ("en-US") — normalize underscore variants, pass BCP-47 through. */
 function toKrLanguage(locale: string): string {
   return locale.replace(/_/g, "-");
-}
-
-function assertBrowser(operation: string): void {
-  if (typeof window === "undefined" || typeof document === "undefined") {
-    throw PayFanoutError.invalidRequest(
-      `PayZenClientAdapter.${operation} is browser-only — never call it during SSR`,
-    );
-  }
 }
 
 function asPayZenHandle(handle: MountedFieldsHandle): PayZenHandle {

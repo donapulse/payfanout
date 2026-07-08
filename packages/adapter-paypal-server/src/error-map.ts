@@ -1,4 +1,4 @@
-import { PayFanoutError, type UnifiedErrorCode } from "@payfanout/core";
+import { classifyHttpFallback, getUserMessage, PayFanoutError, type UnifiedErrorCode } from "@payfanout/core";
 
 export const PAYPAL_PSP_NAME = "paypal";
 
@@ -58,21 +58,25 @@ export function mapPayPalError(httpStatus: number, body: unknown): PayFanoutErro
   let code: UnifiedErrorCode;
   let retryable = false;
   let message: string | undefined;
+  const fallback = classifyHttpFallback(httpStatus);
   if (mappedIssue) {
     code = mappedIssue;
     if (code === "card_declined") {
       // Recovery is a fresh approval on the SAME order: the buyer picks a
       // different funding source in the PayPal window, then pay runs again.
       message = "The payment was declined — choose a different way to pay in the PayPal window and try again.";
+    } else if (code === "authentication_required") {
+      // PSP-specific recovery detail the generic catalog cannot carry.
+      message = "Additional approval is required — return to PayPal to continue.";
     }
   } else if (httpStatus === 401 && parsed.error) {
     code = "invalid_request";
     message =
       "PayPal rejected the API credentials — check clientId/clientSecret and that they match the configured environment.";
-  } else if (httpStatus === 429 || parsed.name === "RATE_LIMIT_REACHED") {
+  } else if (fallback.code === "rate_limited" || parsed.name === "RATE_LIMIT_REACHED") {
     code = "rate_limited";
     retryable = true;
-  } else if (httpStatus >= 500 || parsed.name === "INTERNAL_SERVICE_ERROR") {
+  } else if (fallback.code === "psp_unavailable" || parsed.name === "INTERNAL_SERVICE_ERROR") {
     code = "psp_unavailable";
     retryable = true;
   } else if (httpStatus === 409) {
@@ -80,32 +84,13 @@ export function mapPayPalError(httpStatus: number, body: unknown): PayFanoutErro
     code = "processing_error";
     retryable = true;
   } else {
-    code = "invalid_request";
+    ({ code, retryable } = fallback);
   }
   return new PayFanoutError({
     code,
-    message: message ?? defaultMessageFor(code),
+    message: message ?? getUserMessage(code),
     retryable,
     raw: body,
     pspName: PAYPAL_PSP_NAME,
   });
-}
-
-function defaultMessageFor(code: UnifiedErrorCode): string {
-  switch (code) {
-    case "card_declined":
-      return "Your payment was declined.";
-    case "authentication_required":
-      return "Additional approval is required — return to PayPal to continue.";
-    case "fraud_suspected":
-      return "The payment was declined.";
-    case "rate_limited":
-      return "Too many requests — please retry shortly.";
-    case "processing_error":
-      return "The operation cannot be processed right now — please try again later.";
-    case "psp_unavailable":
-      return "The payment provider is temporarily unavailable.";
-    default:
-      return "The payment request was invalid.";
-  }
 }

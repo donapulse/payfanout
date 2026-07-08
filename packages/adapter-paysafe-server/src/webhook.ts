@@ -1,5 +1,14 @@
-import { PayFanoutError, type UnifiedWebhookEvent, type UnifiedWebhookEventType } from "@payfanout/core";
-import { bytesToBase64, constantTimeEqual, hmacSha256, sha256Hex } from "./crypto-utils.js";
+import {
+  bytesToBase64,
+  constantTimeEqual,
+  hmacSha256,
+  normalizeSecrets,
+  normalizeTime,
+  PayFanoutError,
+  sha256Hex,
+  type UnifiedWebhookEvent,
+  type UnifiedWebhookEventType,
+} from "@payfanout/core";
 
 /**
  * Paysafe webhook signature: base64(HMAC_SHA256(hmacKey, rawJsonBody)) carried
@@ -21,8 +30,7 @@ export async function verifyPaysafeWebhookSignature(
     (value): value is string => typeof value === "string" && value.length > 0,
   );
   if (!provided) return false;
-  const keys = Array.isArray(hmacKeys) ? hmacKeys : [hmacKeys];
-  for (const key of keys) {
+  for (const key of normalizeSecrets(hmacKeys)) {
     const expected = bytesToBase64(await hmacSha256(key, rawBody));
     if (constantTimeEqual(provided.trim(), expected)) return true;
   }
@@ -126,10 +134,4 @@ function mapEventType(rawType: string): UnifiedWebhookEventType {
     return "payment.chargeback";
   }
   return "unknown";
-}
-
-function normalizeTime(value: string | undefined): string {
-  const parsed = value ? Date.parse(value) : Number.NaN;
-  // Deterministic fallback: a missing timestamp is the PSP's omission, not ours.
-  return Number.isNaN(parsed) ? "1970-01-01T00:00:00.000Z" : new Date(parsed).toISOString();
 }

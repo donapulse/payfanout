@@ -1,4 +1,5 @@
 import {
+  assertBrowser,
   brandMountedFieldsHandle,
   PayFanoutError,
   type ClientPaymentAdapter,
@@ -58,7 +59,7 @@ export class GoCardlessClientAdapter implements ClientPaymentAdapter {
 
   /** No script to inject — resolves once the browser guard passes (SSR parity with SDK adapters). */
   async loadSdk(): Promise<void> {
-    assertBrowser("loadSdk");
+    assertBrowser("GoCardlessClientAdapter", "loadSdk");
   }
 
   /**
@@ -70,7 +71,7 @@ export class GoCardlessClientAdapter implements ClientPaymentAdapter {
    * GoCardless-hosted and not themeable from here.
    */
   async mount(container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
-    assertBrowser("mount");
+    assertBrowser("GoCardlessClientAdapter", "mount");
     if (!options.clientSecret) {
       throw PayFanoutError.invalidRequest(
         "GoCardless mount requires PaymentSession.clientSecret (the hosted authorisation URL)",
@@ -106,7 +107,7 @@ export class GoCardlessClientAdapter implements ClientPaymentAdapter {
    */
   async confirm(handle: MountedFieldsHandle): Promise<ConfirmResult> {
     const h = asGoCardlessHandle(handle);
-    assertBrowser("confirm");
+    assertBrowser("GoCardlessClientAdapter", "confirm");
     if (!/^https:\/\//.test(h.authorisationUrl)) {
       return {
         status: "failed",
@@ -144,14 +145,6 @@ export class GoCardlessClientAdapter implements ClientPaymentAdapter {
 
   listPaymentMethodCapabilities(): PaymentMethodCapability[] {
     return this.config.paymentMethods ?? DEFAULT_METHODS;
-  }
-}
-
-function assertBrowser(operation: string): void {
-  if (typeof window === "undefined" || typeof document === "undefined") {
-    throw PayFanoutError.invalidRequest(
-      `GoCardlessClientAdapter.${operation} is browser-only — never call it during SSR`,
-    );
   }
 }
 

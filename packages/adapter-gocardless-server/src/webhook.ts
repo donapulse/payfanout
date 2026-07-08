@@ -1,5 +1,13 @@
-import { PayFanoutError, type UnifiedWebhookEvent, type UnifiedWebhookEventType } from "@payfanout/core";
-import { constantTimeEqual, hmacSha256Hex } from "./crypto-utils.js";
+import {
+  constantTimeEqual,
+  hmacSha256Hex,
+  lowercaseKeys,
+  normalizeSecrets,
+  normalizeTime,
+  PayFanoutError,
+  type UnifiedWebhookEvent,
+  type UnifiedWebhookEventType,
+} from "@payfanout/core";
 
 /**
  * GoCardless webhook delivery: one HTTP POST carries `{"events": [...]}` with
@@ -22,10 +30,7 @@ export async function verifyGoCardlessWebhookSignature(
 ): Promise<boolean> {
   const provided = lowercaseKeys(headers)[SIGNATURE_HEADER];
   if (typeof provided !== "string" || provided.length === 0 || rawBody.length === 0) return false;
-  const keys = (Array.isArray(secrets) ? secrets : [secrets]).filter(
-    (key): key is string => typeof key === "string" && key.length > 0,
-  );
-  for (const key of keys) {
+  for (const key of normalizeSecrets(secrets)) {
     const expected = await hmacSha256Hex(key, rawBody);
     if (constantTimeEqual(provided.trim().toLowerCase(), expected)) return true;
   }
@@ -150,12 +155,6 @@ function mapEventType(resourceType: string, action: string): UnifiedWebhookEvent
   return "unknown";
 }
 
-function normalizeTime(value: string | undefined): string {
-  const parsed = value ? Date.parse(value) : Number.NaN;
-  // Deterministic fallback: a missing timestamp is the PSP's omission, not ours.
-  return Number.isNaN(parsed) ? "1970-01-01T00:00:00.000Z" : new Date(parsed).toISOString();
-}
-
 /** FNV-1a in pure JS: deterministic, dependency-free id fallback (not security-sensitive). */
 function fnv1aHex(value: string): string {
   let hash = 0x811c9dc5;
@@ -164,10 +163,4 @@ function fnv1aHex(value: string): string {
     hash = Math.imul(hash, 0x01000193) >>> 0;
   }
   return hash.toString(16).padStart(8, "0");
-}
-
-function lowercaseKeys(headers: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(headers ?? {})) out[key.toLowerCase()] = value;
-  return out;
 }

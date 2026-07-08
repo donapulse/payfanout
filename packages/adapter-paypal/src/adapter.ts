@@ -1,5 +1,7 @@
 import {
+  assertBrowser,
   brandMountedFieldsHandle,
+  injectScript,
   normalizeCurrency,
   PayFanoutError,
   type ClientPaymentAdapter,
@@ -109,12 +111,13 @@ export class PayPalClientAdapter implements ClientPaymentAdapter {
   }
 
   async loadSdk(): Promise<void> {
-    assertBrowser("loadSdk");
+    assertBrowser("PayPalClientAdapter", "loadSdk");
     // window.paypal is a page-wide singleton: whichever adapter loaded it
     // fixed currency/intent/commit for this page load, and later instances
     // reuse it as-is — one currency and intent per page load (see the guide).
     if (this.payPalGlobal()) return;
-    this.sdkPromise ??= (this.config.loadScript ?? injectScript)(this.sdkUrl());
+    const url = this.sdkUrl();
+    this.sdkPromise ??= this.config.loadScript ? this.config.loadScript(url) : injectScript(url, this.pspName);
     await this.sdkPromise;
     if (!this.payPalGlobal()) {
       throw new PayFanoutError({
@@ -136,7 +139,7 @@ export class PayPalClientAdapter implements ClientPaymentAdapter {
    * the integration.
    */
   async mount(container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
-    assertBrowser("mount");
+    assertBrowser("PayPalClientAdapter", "mount");
     if (!options.clientSecret) {
       throw PayFanoutError.invalidRequest(
         "PayPal mount requires clientSecret — pass PaymentSession.clientSecret (the PayPal order id)",
@@ -271,14 +274,6 @@ function unmountedError(): PayFanoutError {
   return PayFanoutError.invalidRequest("PayPal buttons were unmounted before the buyer approved the payment");
 }
 
-function assertBrowser(operation: string): void {
-  if (typeof window === "undefined" || typeof document === "undefined") {
-    throw PayFanoutError.invalidRequest(
-      `PayPalClientAdapter.${operation} is browser-only — never call it during SSR`,
-    );
-  }
-}
-
 function asPayPalHandle(handle: MountedFieldsHandle): PayPalHandle {
   const h = handle as unknown as PayPalHandle;
   if (h?.pspName !== "paypal" || !h.state) {
@@ -301,27 +296,3 @@ function mapPayPalJsError(err: unknown): PayFanoutError {
   });
 }
 
-function injectScript(url: string): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const existing = document.querySelector(`script[src="${url}"]`);
-    if (existing) {
-      resolve();
-      return;
-    }
-    const script = document.createElement("script");
-    script.src = url;
-    script.async = true;
-    script.onload = () => resolve();
-    script.onerror = () =>
-      reject(
-        new PayFanoutError({
-          code: "psp_unavailable",
-          message: `Failed to load ${url}`,
-          retryable: true,
-          raw: undefined,
-          pspName: "paypal",
-        }),
-      );
-    document.head.appendChild(script);
-  });
-}

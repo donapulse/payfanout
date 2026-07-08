@@ -20,5 +20,6 @@ One more place documentation lives, on purpose:
 > and *why* now lives in [decisions.md](decisions.md); what was deliberately deferred and
 > its unblock conditions live in [future-designs.md](future-designs.md).
 
-> Versioning note: the packages are at 0.1.0 and unpublished — no "v1"/"v2" exists.
-> Where the README or brief says "v1", read "the current release scope".
+> Versioning note: packages version independently (see `.changeset/config.json`) and don't
+> share one library-wide release number. Where the README or brief says "v1", read "the
+> current feature scope", not any package's semver.

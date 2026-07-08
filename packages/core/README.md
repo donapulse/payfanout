@@ -24,9 +24,6 @@ pnpm add @payfanout/core
 `@payfanout/core` comes in transitively with the server and React packages, but you can add
 it explicitly to use its helpers directly.
 
-> **Not yet published to npm.** The packages are at `0.1.0`. Until a release is cut, consume
-> them from source, see the [Installation guide](https://donapulse.github.io/payfanout/guide/installation).
-
 ## What's inside
 
 - **Domain model** (`PaymentSession`, `PaymentInfo`, `RefundInfo`, `UnifiedPaymentStatus`,

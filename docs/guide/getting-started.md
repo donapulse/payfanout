@@ -68,6 +68,7 @@ never inferred from key prefixes.
 - [API reference](/api/), the generated TypeDoc for every public symbol.
 
 ::: tip Versioning note
-The packages are at `0.1.0` and unpublished, no "v1"/"v2" exists yet. Where docs say
-"v1", read "the current release scope".
+Packages version independently (see `.changeset/config.json`) and don't share one
+library-wide release number. Where docs say "v1", read "the current feature scope", not
+any package's semver.
 :::

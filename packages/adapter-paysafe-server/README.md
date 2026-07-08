@@ -24,9 +24,6 @@ pnpm add @payfanout/server @payfanout/adapter-paysafe-server
 
 `@payfanout/core` comes in transitively.
 
-> **Not yet published to npm.** The packages are at `0.1.0`. Until a release is cut, consume
-> them from source, see the [Installation guide](https://donapulse.github.io/payfanout/guide/installation).
-
 ## Usage
 
 ```ts

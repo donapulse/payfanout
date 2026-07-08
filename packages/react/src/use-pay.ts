@@ -1,8 +1,9 @@
 "use client";
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { PayFanoutError } from "@payfanout/core";
 import { resolveConfirmOutcome, type PayResult, type ServerCompletionCallback } from "./pay-logic.js";
 import { usePayFanoutContext } from "./provider.js";
+import { useLatestRef } from "./use-latest-ref.js";
 
 export interface UsePayOptions {
   /** Same contract as <PayButton>: tokenize-first PSPs finish via the host's server route. */
@@ -13,8 +14,10 @@ export interface UsePayResult {
   /**
    * Confirms the currently mounted <PaymentFields> and resolves both
    * completion shapes (§4a) into one PayResult. Never throws — failures come
-   * back as { status: "failed", error }. Concurrent calls no-op (returns the
-   * same in-flight promise's shape with status "processing").
+   * back as { status: "failed", error }. While a confirmation is in flight,
+   * calling pay() again returns the SAME in-flight promise: the confirm runs
+   * once and every caller resolves to the identical result. Identity is
+   * stable across renders — safe to list as an effect dependency.
    */
   pay: () => Promise<PayResult>;
   /** True while a confirmation is in flight — drive spinners/disabled state. */
@@ -33,29 +36,38 @@ export interface UsePayResult {
 export function usePay(options: UsePayOptions = {}): UsePayResult {
   const { adapters, mountedRef } = usePayFanoutContext();
   const [paying, setPaying] = useState(false);
+  const optionsRef = useLatestRef(options);
+  // Single-flight lives in a ref: state would be a stale closure, letting two
+  // same-tick pay() calls both pass the guard and confirm twice.
+  const inFlightRef = useRef<Promise<PayResult> | null>(null);
 
-  const pay = useCallback(async (): Promise<PayResult> => {
-    if (paying) return { status: "processing" };
+  const pay = useCallback((): Promise<PayResult> => {
+    if (inFlightRef.current) return inFlightRef.current;
     const mounted = mountedRef.current;
     const adapter = mounted ? adapters.get(mounted.psp) : undefined;
     if (!mounted || !adapter) {
-      return {
+      return Promise.resolve({
         status: "failed",
         error: PayFanoutError.invalidRequest(
           "No mounted <PaymentFields> to confirm — render it before calling pay()",
         ),
-      };
+      });
     }
     setPaying(true);
-    try {
-      const confirmResult = await adapter.confirm(mounted.handle);
-      return await resolveConfirmOutcome(confirmResult, options.onServerCompletion);
-    } catch (err) {
-      return { status: "failed", error: PayFanoutError.wrap(err, { pspName: mounted.psp }) };
-    } finally {
-      setPaying(false);
-    }
-  }, [adapters, mountedRef, paying, options.onServerCompletion]);
+    const flight = (async (): Promise<PayResult> => {
+      try {
+        const confirmResult = await adapter.confirm(mounted.handle);
+        return await resolveConfirmOutcome(confirmResult, optionsRef.current.onServerCompletion);
+      } catch (err) {
+        return { status: "failed", error: PayFanoutError.wrap(err, { pspName: mounted.psp }) };
+      } finally {
+        inFlightRef.current = null;
+        setPaying(false);
+      }
+    })();
+    inFlightRef.current = flight;
+    return flight;
+  }, [adapters, mountedRef, optionsRef]);
 
   return { pay, paying };
 }

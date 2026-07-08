@@ -1,12 +1,13 @@
 "use client";
 import {
   createContext,
+  useCallback,
   useContext,
   useMemo,
   useRef,
   useState,
-  type MutableRefObject,
   type ReactNode,
+  type RefObject,
 } from "react";
 import type {
   ClientPaymentAdapter,
@@ -33,7 +34,14 @@ export interface PayFanoutContextValue {
   lastError: UnifiedError | undefined;
   setLastError: (err: UnifiedError | undefined) => void;
   /** The currently mounted fields — what PayButton confirms. */
-  mountedRef: MutableRefObject<MountedEntry | null>;
+  mountedRef: RefObject<MountedEntry | null>;
+  /**
+   * Identity of the <PaymentFields> instance holding the single mount slot.
+   * Claimed synchronously when its mount effect starts (before the async SDK
+   * load), so a second concurrent instance is rejected instead of silently
+   * stealing the slot.
+   */
+  fieldsOwnerRef: RefObject<object | null>;
 }
 
 const PayFanoutContext = createContext<PayFanoutContextValue | null>(null);
@@ -68,32 +76,44 @@ export function PayFanoutProvider({ adapters, initialPsp, locale, children }: Pa
       }
       map.set(adapter.pspName, adapter);
     }
+    // Eager: a typo'd initialPsp must fail at the provider, not as a silent
+    // no-mount later.
+    if (initialPsp !== undefined && !map.has(initialPsp)) {
+      throw new Error(`[payfanout] no client adapter registered for psp "${initialPsp}"`);
+    }
     return map;
-  }, [adapters]);
+  }, [adapters, initialPsp]);
 
-  const [activePsp, setActivePsp] = useState<string | undefined>(
+  const [activePsp, setActivePspState] = useState<string | undefined>(
     initialPsp ?? adapters[0]?.pspName,
   );
   const [status, setStatus] = useState<PayFanoutStatus>("idle");
   const [lastError, setLastError] = useState<UnifiedError | undefined>(undefined);
   const mountedRef = useRef<MountedEntry | null>(null);
+  const fieldsOwnerRef = useRef<object | null>(null);
+
+  const setActivePsp = useCallback(
+    (psp: string) => {
+      if (!registry.has(psp)) throw new Error(`[payfanout] no client adapter registered for psp "${psp}"`);
+      setActivePspState(psp);
+    },
+    [registry],
+  );
 
   const value = useMemo<PayFanoutContextValue>(
     () => ({
       adapters: registry,
       activePsp,
-      setActivePsp: (psp: string) => {
-        if (!registry.has(psp)) throw new Error(`[payfanout] no client adapter registered for psp "${psp}"`);
-        setActivePsp(psp);
-      },
+      setActivePsp,
       locale,
       status,
       setStatus,
       lastError,
       setLastError,
       mountedRef,
+      fieldsOwnerRef,
     }),
-    [registry, activePsp, locale, status, lastError],
+    [registry, activePsp, setActivePsp, locale, status, lastError],
   );
 
   return <PayFanoutContext.Provider value={value}>{children}</PayFanoutContext.Provider>;
@@ -119,13 +139,16 @@ export interface UsePayFanoutResult {
 
 export function usePayFanout(): UsePayFanoutResult {
   const { adapters, activePsp, setActivePsp, locale, status, lastError } = usePayFanoutContext();
-  return {
-    activePsp,
-    setActivePsp,
-    availablePsps: [...adapters.keys()],
-    capabilities: activePsp ? (adapters.get(activePsp)?.listPaymentMethodCapabilities() ?? []) : [],
-    locale,
-    status,
-    lastError,
-  };
+  return useMemo(
+    () => ({
+      activePsp,
+      setActivePsp,
+      availablePsps: [...adapters.keys()],
+      capabilities: activePsp ? (adapters.get(activePsp)?.listPaymentMethodCapabilities() ?? []) : [],
+      locale,
+      status,
+      lastError,
+    }),
+    [adapters, activePsp, setActivePsp, locale, status, lastError],
+  );
 }

@@ -20,9 +20,6 @@ Cloudflare Workers and Next.js edge routes as well as Node ≥ 18.17 (a test gua
 pnpm add @payfanout/server @payfanout/adapter-paypal-server
 ```
 
-> **Not yet published to npm.** The packages are at `0.1.0`. Until a release is cut, consume
-> them from source, see the [Installation guide](https://donapulse.github.io/payfanout/guide/installation).
-
 ## Usage
 
 ```ts

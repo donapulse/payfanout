@@ -7,14 +7,6 @@
   npm/yarn work for consuming the published packages, but the monorepo scripts assume pnpm.
 - **React ≥ 18** if you use `@payfanout/react` (declared as a peer dependency).
 
-::: warning Not published to npm yet
-The packages are at `0.1.0` and **not yet published to the public registry**, so
-`pnpm add @payfanout/core` will not resolve today. Until a release is cut
-(`pnpm run release`, via Changesets), consume the library **from source**, see
-[Using it now, from source](#using-it-now-from-source) below. The commands in the next
-section are what installation will look like **once published**.
-:::
-
 ## Which packages do I need?
 
 Install only the side(s) you run. `@payfanout/core` comes in transitively but can be added
@@ -84,9 +76,10 @@ webhook, and test cards:
 - [Set up Stripe](/guide/stripe) · [Set up Paysafe](/guide/paysafe)
 - [Writing an adapter](/adapter-authoring), install a PSP we don't ship yet.
 
-## Using it now, from source
+## Building from source (contributing)
 
-Until a release is published, use the workspace directly:
+Working on PayFanout itself, or need an unreleased change from `develop`? Use the
+workspace directly:
 
 ```bash
 git clone <this-repo>

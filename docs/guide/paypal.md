@@ -40,11 +40,6 @@ pnpm add @payfanout/react @payfanout/adapter-paypal react react-dom
 The PayPal JS SDK is **not** an npm dependency; the client adapter injects it lazily from
 `www.paypal.com/sdk/js` on first mount (PayPal requires loading it from their host).
 
-::: warning Not on npm yet
-The packages are `0.1.0` and unpublished, consume from source per
-[Installation](/guide/installation#using-it-now-from-source) until a release is cut.
-:::
-
 ## 3. Environment variables
 
 ```bash

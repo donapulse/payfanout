@@ -21,9 +21,6 @@ during SSR.
 pnpm add @payfanout/react @payfanout/adapter-payzen react react-dom
 ```
 
-> **Not yet published to npm.** The packages are at `0.1.0`. Until a release is cut, consume
-> them from source, see the [Installation guide](https://donapulse.github.io/payfanout/guide/installation).
-
 ## Usage
 
 ```tsx

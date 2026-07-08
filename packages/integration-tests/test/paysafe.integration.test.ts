@@ -23,7 +23,8 @@ const PASSWORD = process.env.PAYSAFE_PASSWORD;
 const ACCOUNT_ID = process.env.PAYSAFE_ACCOUNT_ID;
 // Unset CI secrets render as EMPTY strings, not undefined — || treats them as absent.
 const BASE_URL = process.env.PAYSAFE_BASE_URL || "https://api.test.paysafe.com";
-if (BASE_URL.includes("api.paysafe.com") && !BASE_URL.includes("api.test.paysafe.com")) {
+// Hostname equality, never substring matching — a lookalike host must not fool the guard.
+if (new URL(BASE_URL).hostname === "api.paysafe.com") {
   throw new Error("Integration tests refuse to run against the live Paysafe API");
 }
 

@@ -349,7 +349,7 @@ describe("PayZenClientAdapter confirm", () => {
     const async = await mounted(asyncFake);
     const asyncResult = await async.adapter.confirm(async.handle);
     expect(asyncResult.status).toBe("failed");
-    expect(asyncResult.error?.code).toBe("invalid_request"); // expired formToken — new session needed
+    expect(asyncResult.error?.code).toBe("session_expired"); // expired formToken — new session needed
   });
 
   it("refuses overlapping confirmations on the same form", async () => {
@@ -424,7 +424,7 @@ describe("PayZenClientAdapter error mapping", () => {
       [{ errorCode: "CLIENT_502" }, "invalid_request", false], // integration errors
       [{ errorCode: "CLIENT_997" }, "invalid_request", false], // formToken from a sister platform's endpoint
       [{ errorCode: "CLIENT_999" }, "psp_unavailable", true],
-      [{ errorCode: "PSP_108" }, "invalid_request", false],
+      [{ errorCode: "PSP_108" }, "session_expired", false], // formToken expiry recovers via a new session
       [{ errorCode: "ACQ_001", detailedErrorCode: "54" }, "expired_card", false],
       [{ errorCode: "ACQ_001", detailedErrorCode: "59" }, "fraud_suspected", false],
       [{ errorCode: "ACQ_001", detailedErrorCode: "1A" }, "authentication_required", false],

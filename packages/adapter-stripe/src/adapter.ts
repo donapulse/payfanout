@@ -280,7 +280,8 @@ function mapStripeJsError(error: StripeJsErrorLike | undefined): UnifiedError {
   return new PayFanoutError({
     code,
     message: error?.message ?? "Payment failed.",
-    retryable: code === "processing_error" || code === "authentication_required",
+    // authentication_required is resolved on-session (a 3DS challenge), never by replay.
+    retryable: code === "processing_error",
     raw: error,
     pspName: "stripe",
   });

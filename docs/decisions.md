@@ -273,3 +273,47 @@ choices they forced:
   secrets; deferred by user request. Paysafe's signature **header name** is still
   unconfirmed (adapter accepts `signature` / `x-signature` / `x-paysafe-signature`).
 - Team sign-off on every *(default, unconfirmed)* item above.
+
+## Contract hardening (2026-07-08, explicit user-approved review follow-up)
+
+One atomic core+conformance+all-adapters change (major changesets across the board):
+
+- **idempotencyKey is now REQUIRED on `capturePayment`, `cancelPayment`, and
+  `verifyPaymentMethod`** (`VerifyPaymentMethodInput.idempotencyKey`). The library's own
+  invariant said "required on every mutating call" while the contract left it optional on
+  capture — the canonical double-charge operation. Under `supportsMultiCapture` every
+  partial capture carries its own key.
+- **`authentication_required` is retryable: false, everywhere.** Stripe's adapter said
+  true, PayPal's said false; `withRetry` and the router cascade act on the flag, so the
+  same situation behaved differently per PSP. Resolving SCA means bringing the customer
+  back on-session — never replaying the call. The conformance error suite now asserts
+  this, plus retryable: true for `rate_limited`/`psp_unavailable`.
+- **`AdapterCapabilities.supportedCurrencies`** (absent = unrestricted): hard PSP currency
+  constraints (PayPal's whitelist, GoCardless GBP/EUR) are now declared and pre-screened
+  by `screenSessionInput`, so a currency mismatch skips the candidate instead of aborting
+  the failover cascade with the PSP-local `invalid_request`.
+- **New error codes**: `session_expired` (expired stateless session tokens — recover by
+  creating a fresh session; Paysafe's session-context adopts it) and
+  `unsupported_operation` (capability guards, previously indistinguishable from input
+  errors under `invalid_request`). Compiler-enforced entries in every locale catalog.
+- **`PaymentInfo` grew `amountCaptured`/`amountCapturable`** (partial/multi-capture is
+  first-class but the model couldn't show captured totals) **and `metadata`** (echo of the
+  PSP-stored host metadata). PSPs that cannot honestly provide id round-trip or metadata
+  echo declare it via conformance `money.expectations` (Paysafe: both false — the id and
+  metadata ride the signed session token only; PayPal: metadata false, custom_id carries
+  the id). `PaymentMethodDetails` grew `expMonth`/`expYear` (display/renewal warnings).
+- **`UnifiedWebhookEvent` grew `amount`/`currency`/`refundId`** — a stateless host should
+  not need a retrieve round-trip to know how much a `payment.refunded` refunded.
+- **Conformance now proves the money paths** instead of trusting per-adapter discipline:
+  mandatory `money` fixtures drive retrievePayment truth (amount/ids/metadata), full
+  refund, accumulating partial refunds, over-refund rejection, pending-refund polling,
+  capture (`amountCaptured` === captured amount), multi-capture accumulation, and
+  cancel → `"canceled"`; webhooks additionally prove unknown-but-valid types map to
+  `"unknown"` on a SIGNED body, and client adapters that report redirect-flow methods
+  must implement `handleRedirectReturn`.
+- Smaller core additions: `allocate()` (largest-remainder integer splits — the sanctioned
+  way to compute fee/tax shares), `RetryPolicy.signal` (AbortSignal stops between
+  attempts) and `maxDelayMs` is now a hard ceiling jitter included, `REFUND_STATUSES`/
+  `RefundStatus`, `RefundRequest.reason` typed to Stripe's vocabulary (best-effort
+  elsewhere), `isUnifiedWebhookEventType`/`isUnifiedPaymentMethodType` guards, and the
+  `DATA_PAYFANOUT_FIELD` slot-attribute constant.

@@ -72,8 +72,8 @@ export interface GoCardlessServerAdapterConfig {
   /**
    * Automatic retries for transport-level trouble only (network failure,
    * timeout, HTTP 5xx, 429) with exponential backoff. Default 2. Safe for
-   * mutating calls: billing-request and refund creates carry an
-   * Idempotency-Key, and a replayed flow create only re-issues an
+   * mutating calls: billing-request/refund creates and cancel actions carry
+   * an Idempotency-Key, and a replayed flow create only re-issues an
    * authorisation URL for the same billing request. Business errors
    * (validation, invalid_state, permissions) are NEVER retried here.
    */
@@ -93,6 +93,7 @@ export interface GoCardlessBillingRequestLike {
     currency?: string;
     description?: string;
     scheme?: string;
+    metadata?: Record<string, string>;
   };
   mandate_request?: { currency?: string; scheme?: string };
   links?: {
@@ -203,6 +204,9 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
   getCapabilities(): AdapterCapabilities {
     return {
       pspName: this.pspName,
+      // One-off billing request payments are GBP/EUR only (other GoCardless
+      // currencies need a mandate first) — declared so the router pre-screens.
+      supportedCurrencies: [...SUPPORTED_ONE_OFF_CURRENCIES],
       supportsRefunds: true,
       supportsPartialRefunds: true,
       supportsManualCapture: false, // bank debits/credits have no authorize-then-capture split
@@ -252,6 +256,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       );
     }
 
+    const metadata = toStampedMetadata(input);
     const billingRequest = await this.createWithIdempotencyReplay<GoCardlessBillingRequestLike>(
       "billing_requests",
       {
@@ -268,11 +273,15 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
               input.statementDescriptor ??
               input.metadata?.description ??
               (input.id ? `Payment ${input.id}` : "Payment"),
+            // payment_request.metadata is stored on the payment the billing
+            // request creates — how payfanout_id and host metadata reach
+            // retrievePayment once the payment exists.
+            ...(metadata ? { metadata } : {}),
           },
           ...(this.config.fallbackEnabled !== undefined
             ? { fallback_enabled: this.config.fallbackEnabled }
             : {}),
-          ...(toBillingRequestMetadata(input) ?? {}),
+          ...(metadata ? { metadata } : {}),
         },
       },
       input.idempotencyKey,
@@ -362,6 +371,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       amountRefunded: 0,
       currency: (billingRequest.payment_request?.currency ?? "").toUpperCase() || "GBP",
       paymentMethodType: mapSchemeToMethodType(billingRequest.payment_request?.scheme),
+      ...(billingRequest.metadata ? { metadata: billingRequest.metadata } : {}),
       createdAt: billingRequest.created_at ?? EPOCH,
       raw: billingRequest,
     };
@@ -371,22 +381,22 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * Cancels whichever stage the id names: a billing request pre-fulfilment
    * (expires its flows), or a payment — GoCardless only cancels
    * pending_submission payments, anything later rejects with invalid_state
-   * (cancellation_failed) -> invalid_request, never retried.
-   * GoCardless actions are not create endpoints, so no Idempotency-Key applies.
+   * (cancellation_failed) -> invalid_request, never retried. The caller's key
+   * rides the Idempotency-Key header (GoCardless accepts it on POST actions).
    */
-  async cancelPayment(pspPaymentId: string, _idempotencyKey?: string): Promise<PaymentInfo> {
+  async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
     if (pspPaymentId.startsWith("BRQ")) {
       const billingRequest = await this.request<GoCardlessBillingRequestLike>(
         "POST",
         `/billing_requests/${encodeURIComponent(pspPaymentId)}/actions/cancel`,
-        { body: {}, envelope: "billing_requests" },
+        { body: {}, idempotencyKey, envelope: "billing_requests" },
       );
       return this.billingRequestToPaymentInfo(billingRequest);
     }
     const payment = await this.request<GoCardlessPaymentLike>(
       "POST",
       `/payments/${encodeURIComponent(pspPaymentId)}/actions/cancel`,
-      { body: {}, envelope: "payments" },
+      { body: {}, idempotencyKey, envelope: "payments" },
     );
     return this.toPaymentInfo(payment, { mandateReference: await this.mandateReference(payment) });
   }
@@ -553,6 +563,9 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       paymentMethodType: mapSchemeToMethodType(
         payment.scheme ?? extras.billingRequest?.payment_request?.scheme,
       ),
+      // Echoed verbatim as stored at the PSP (payfanout_id slot included). No
+      // amountCaptured/amountCapturable: bank debits have no capture split.
+      ...(payment.metadata ? { metadata: payment.metadata } : {}),
       ...(extras.mandateReference ? { mandateReference: extras.mandateReference } : {}),
       createdAt: payment.created_at ?? EPOCH,
       raw: extras.billingRequest ? { billing_request: extras.billingRequest, payment } : payment,
@@ -623,10 +636,10 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
 
   /**
    * Transport with timeout + transient-only retries. Safe to retry mutating
-   * calls: billing-request and refund creates carry an Idempotency-Key (a
-   * consumed key 409s and the create helper resolves it), and a replayed
-   * flow create only re-issues an authorisation URL for the same billing
-   * request.
+   * calls: billing-request/refund creates and cancel actions carry an
+   * Idempotency-Key (a consumed create key 409s and the create helper
+   * resolves it), and a replayed flow create only re-issues an authorisation
+   * URL for the same billing request.
    */
   private async request<T>(method: "GET" | "POST", path: string, options: RequestOptions = {}): Promise<T> {
     const attempts = 1 + (this.config.maxNetworkRetries ?? 2);
@@ -825,17 +838,17 @@ function idempotentConflictResourceId(err: unknown): string | undefined {
  * GoCardless metadata allows at most 3 keys (50-char names, 500-char values).
  * payfanout_id claims a slot first so the host id round-trips; host keys fill
  * the remaining slots and overflow is withheld rather than failing the payment.
+ * Stamped on the billing request AND its payment_request, so the facts survive
+ * onto the payment GoCardless creates at fulfilment.
  */
-function toBillingRequestMetadata(
-  input: CreatePaymentSessionInput,
-): { metadata: Record<string, string> } | undefined {
+function toStampedMetadata(input: CreatePaymentSessionInput): Record<string, string> | undefined {
   const metadata: Record<string, string> = {};
   if (input.id) metadata["payfanout_id"] = input.id;
   for (const [key, value] of Object.entries(input.metadata ?? {})) {
     if (Object.keys(metadata).length >= 3) break;
     if (!(key in metadata)) metadata[key] = value;
   }
-  return Object.keys(metadata).length > 0 ? { metadata } : undefined;
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
 
 /**

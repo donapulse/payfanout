@@ -256,7 +256,7 @@ describeIf("Paysafe sandbox integration", () => {
       // still exercises the verifications endpoint.
       return createTestPaymentHandle(100, CURRENCY);
     });
-    const info = await adapter.verifyPaymentMethod({ pspSessionId: session.pspSessionId, clientToken: token });
+    const info = await adapter.verifyPaymentMethod({ pspSessionId: session.pspSessionId, clientToken: token, idempotencyKey: key() });
     expect(["succeeded", "failed", "processing"]).toContain(info.status);
     expect(info.amount).toBe(0);
   });
@@ -390,7 +390,7 @@ describeIf("Paysafe sandbox integration", () => {
       idempotencyKey: key(),
     });
     // Default capture key keeps the settlement statelessly rediscoverable.
-    const captured = await adapter.capturePayment(authorized.pspPaymentId, 1000);
+    const captured = await adapter.capturePayment(authorized.pspPaymentId, 1000, key());
     expect(["succeeded", "processing"]).toContain(captured.status);
 
     const released = await adapter.cancelPayment(authorized.pspPaymentId, key());

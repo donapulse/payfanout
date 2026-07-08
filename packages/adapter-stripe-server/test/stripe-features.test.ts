@@ -276,14 +276,19 @@ describe("Stripe webhook refund mapping + secret rotation", () => {
           id: `evt_${status}`,
           type: "charge.refund.updated",
           created: 1_780_000_400,
-          data: { object: { object: "refund", id: "re_9", status, payment_intent: "pi_9" } },
+          data: { object: { object: "refund", id: "re_9", status, amount: 700, currency: "eur", payment_intent: "pi_9" } },
         }),
       );
     expect((await parse("failed")).type).toBe("payment.refund_failed");
     expect((await parse("canceled")).type).toBe("payment.refund_failed");
     expect((await parse("succeeded")).type).toBe("payment.refunded");
     expect((await parse("pending")).type).toBe("unknown");
-    expect((await parse("failed")).pspPaymentId).toBe("pi_9");
+    const failed = await parse("failed");
+    expect(failed.pspPaymentId).toBe("pi_9");
+    // Refund-object events carry their own money facts — no retrieve round-trip needed.
+    expect(failed.amount).toBe(700);
+    expect(failed.currency).toBe("EUR");
+    expect(failed.refundId).toBe("re_9");
   });
 
   it("refund.failed / refund.updated events map the same way; charge.refunded stays payment.refunded", async () => {
@@ -332,10 +337,16 @@ describe("Stripe payment method details + mandates", () => {
     const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession({ amount: 1000, currency: "USD", idempotencyKey: "k" });
     fake.simulateClientConfirm(session.pspSessionId, {
-      card: { brand: "Visa", last4: "4242", wallet: { type: "apple_pay" } },
+      card: { brand: "Visa", last4: "4242", wallet: { type: "apple_pay" }, exp_month: 11, exp_year: 2031 },
     });
     const info = await adapter.retrievePayment(session.pspSessionId);
-    expect(info.paymentMethodDetails).toEqual({ brand: "visa", last4: "4242", wallet: "apple_pay" });
+    expect(info.paymentMethodDetails).toEqual({
+      brand: "visa",
+      last4: "4242",
+      wallet: "apple_pay",
+      expMonth: 11,
+      expYear: 2031,
+    });
     expect(info.mandateReference).toBeUndefined(); // cards have no mandate
   });
 
@@ -376,9 +387,17 @@ describe("Stripe async-rails + dispute event mapping", () => {
 
   it("payment_intent.processing maps to payment.processing", async () => {
     const { adapter } = makePair();
-    const event = await parse(adapter, "payment_intent.processing", { object: "payment_intent", id: "pi_9" });
+    const event = await parse(adapter, "payment_intent.processing", {
+      object: "payment_intent",
+      id: "pi_9",
+      amount: 3200,
+      currency: "usd",
+    });
     expect(event.type).toBe("payment.processing");
     expect(event.pspPaymentId).toBe("pi_9");
+    expect(event.amount).toBe(3200);
+    expect(event.currency).toBe("USD");
+    expect(event.refundId).toBeUndefined();
   });
 
   it("charge.dispute.closed maps by outcome: won / warning_closed / lost", async () => {
@@ -457,7 +476,10 @@ describe("Stripe vaulting (Customers + saved PaymentMethods)", () => {
       idempotencyKey: "k-save",
     });
     const pm = fake.simulateSetupConfirm(saveSession.pspSessionId);
-    const saved = await adapter.verifyPaymentMethod({ pspSessionId: saveSession.pspSessionId });
+    const saved = await adapter.verifyPaymentMethod({
+      pspSessionId: saveSession.pspSessionId,
+      idempotencyKey: "k-verify-save",
+    });
     expect(saved.status).toBe("succeeded");
     expect(saved.savedPaymentMethodToken).toBe(pm.id);
     expect(fake.detachedPaymentMethods).not.toContain(pm.id); // stays vaulted
@@ -465,7 +487,10 @@ describe("Stripe vaulting (Customers + saved PaymentMethods)", () => {
     // Plain verification (no customer) keeps the detach guarantee.
     const verifySession = await adapter.createPaymentSession({ amount: 0, currency: "USD", idempotencyKey: "k-ver" });
     const verifyPm = fake.simulateSetupConfirm(verifySession.pspSessionId);
-    const verified = await adapter.verifyPaymentMethod({ pspSessionId: verifySession.pspSessionId });
+    const verified = await adapter.verifyPaymentMethod({
+      pspSessionId: verifySession.pspSessionId,
+      idempotencyKey: "k-verify-only",
+    });
     expect(verified.savedPaymentMethodToken).toBeUndefined();
     expect(fake.detachedPaymentMethods).toContain(verifyPm.id);
   });
@@ -494,7 +519,7 @@ describe("Stripe vaulting (Customers + saved PaymentMethods)", () => {
       idempotencyKey: "k-c2",
     });
     expect(recurring.status).toBe("succeeded");
-    expect(recurring.paymentMethodDetails).toEqual({ brand: "visa", last4: "4242" });
+    expect(recurring.paymentMethodDetails).toEqual({ brand: "visa", last4: "4242", expMonth: 12, expYear: 2030 });
     expect(fake.lastPaymentIntentParams).toMatchObject({ off_session: true });
   });
 
@@ -510,7 +535,7 @@ describe("Stripe vaulting (Customers + saved PaymentMethods)", () => {
         currency: "USD",
         idempotencyKey: "k-c",
       }),
-    ).rejects.toMatchObject({ code: "authentication_required", retryable: true });
+    ).rejects.toMatchObject({ code: "authentication_required", retryable: false });
   });
 
   it("deleteSavedPaymentMethod enforces ownership, then kills the token", async () => {

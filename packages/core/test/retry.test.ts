@@ -88,8 +88,8 @@ describe("withRetry", () => {
       },
       { retries: 4, minDelayMs: 1000, maxDelayMs: 1500, sleep, random: () => 1 },
     );
-    // base delays: 1000, 1500(cap), 1500, 1500 — jitter ×1.25 with random()=1
-    expect(sleeps).toEqual([1250, 1875, 1875, 1875]);
+    // base delays: 1000, 1500(cap), 1500, 1500 — jitter ×1.25, hard-clamped to maxDelayMs
+    expect(sleeps).toEqual([1250, 1500, 1500, 1500]);
   });
 
   it("honors a custom shouldRetry and reports attempts via onRetry", async () => {
@@ -121,5 +121,42 @@ describe("withRetry", () => {
 
   it("passes through an immediate success untouched", async () => {
     await expect(withRetry(async () => 42)).resolves.toBe(42);
+  });
+});
+
+describe("withRetry — cancellation", () => {
+  it("a pre-aborted signal rejects before the first attempt", async () => {
+    const controller = new AbortController();
+    const reason = new Error("caller gave up");
+    controller.abort(reason);
+    let calls = 0;
+    await expect(
+      withRetry(
+        async () => {
+          calls += 1;
+          return "never";
+        },
+        { signal: controller.signal },
+      ),
+    ).rejects.toBe(reason);
+    expect(calls).toBe(0);
+  });
+
+  it("an abort between attempts stops the retry loop without sleeping", async () => {
+    const controller = new AbortController();
+    const sleeps: number[] = [];
+    let calls = 0;
+    await expect(
+      withRetry(
+        async () => {
+          calls += 1;
+          controller.abort();
+          throw new PayFanoutError({ code: "psp_unavailable", message: "down", retryable: true });
+        },
+        { signal: controller.signal, retries: 3, sleep: async (ms) => void sleeps.push(ms) },
+      ),
+    ).rejects.toBeDefined();
+    expect(calls).toBe(1);
+    expect(sleeps).toEqual([]);
   });
 });

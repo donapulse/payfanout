@@ -222,6 +222,8 @@ export interface VerifyPaymentMethodInput {
   pspSessionId: string;
   /** Required by tokenize-first PSPs (Paysafe); ignored by confirm-on-client PSPs. */
   clientToken?: string;
+  /** Verification creates PSP-side objects — mutating, so the key is required. */
+  idempotencyKey: string;
 }
 
 export interface ServerPaymentAdapter {
@@ -238,14 +240,19 @@ export interface ServerPaymentAdapter {
 
   retrievePayment(pspPaymentId: string): Promise<PaymentInfo>;
 
-  /** Only present if getCapabilities().supportsManualCapture. */
+  /**
+   * Only present if getCapabilities().supportsManualCapture. Capture is the
+   * canonical double-charge operation — the idempotency key is REQUIRED, and
+   * under supportsMultiCapture each partial capture is its own charge with its
+   * own key.
+   */
   capturePayment?(
     pspPaymentId: string,
-    amount?: MinorUnitAmount,
-    idempotencyKey?: string,
+    amount: MinorUnitAmount | undefined,
+    idempotencyKey: string,
   ): Promise<PaymentInfo>;
 
-  cancelPayment(pspPaymentId: string, idempotencyKey?: string): Promise<PaymentInfo>;
+  cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo>;
 
   refundPayment(req: RefundRequest): Promise<RefundResult>;
 
@@ -327,6 +334,14 @@ export interface MountedFieldsHandle {
 export function brandMountedFieldsHandle<T extends object>(handle: T): T & MountedFieldsHandle {
   return handle as T & MountedFieldsHandle;
 }
+
+/**
+ * The slot-attribute protocol for split-field PSPs: elements carrying
+ * `data-payfanout-field="cardNumber|expiryDate|cvv"` inside the mount
+ * container become the field mount points. One constant, three consumers
+ * (core docs, adapters, react) — never retype the string.
+ */
+export const DATA_PAYFANOUT_FIELD = "data-payfanout-field";
 
 /** Live validity state of the mounted fields — drives "disable Pay until complete" UX. */
 export interface FieldsChangeState {

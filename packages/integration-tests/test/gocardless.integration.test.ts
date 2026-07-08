@@ -183,7 +183,7 @@ describeIf("GoCardless sandbox integration", () => {
       returnUrl: RETURN_URL,
       idempotencyKey: key(),
     });
-    const canceled = await adapter.cancelPayment(session.pspSessionId);
+    const canceled = await adapter.cancelPayment(session.pspSessionId, key());
     expect(canceled.status).toBe("canceled");
     const info = await adapter.retrievePayment(session.pspSessionId);
     expect(info.status).toBe("canceled");

@@ -136,6 +136,8 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
     // Pre-capture the ORDER id stays canonical: capture/cancel resolve from it.
     expect(info.pspPaymentId).toBe(session.pspSessionId);
     expect(info.capturedAt).toBeUndefined();
+    expect(info.amountCaptured).toBe(0);
+    expect(info.amountCapturable).toBe(2000); // the full authorization is still open
     return { adapter, fake, orderId: session.pspSessionId };
   }
 
@@ -144,6 +146,8 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
     const captured = await adapter.capturePayment(orderId, undefined, "k-cap");
     expect(captured.status).toBe("succeeded");
     expect(captured.amount).toBe(2000);
+    expect(captured.amountCaptured).toBe(2000);
+    expect(captured.amountCapturable).toBe(0); // fully captured — nothing left to take
     expect(captured.pspPaymentId).toMatch(/^2GG/);
     expect(fake.lastRequestBody).toBeDefined();
   });
@@ -153,9 +157,13 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
     const first = await adapter.capturePayment(orderId, 700, "k-cap-1");
     expect(first.status).toBe("succeeded");
     expect(first.amount).toBe(700);
+    expect(first.amountCaptured).toBe(700);
+    expect(first.amountCapturable).toBe(1300);
 
     const second = await adapter.capturePayment(orderId, 500, "k-cap-2");
     expect(second.amount).toBe(1200); // cumulative captured funds
+    expect(second.amountCaptured).toBe(1200);
+    expect(second.amountCapturable).toBe(800);
 
     // The wire request kept the authorization open for the next capture.
     const lastCaptureBody = fake.lastRequestBody as Record<string, unknown>;
@@ -187,21 +195,19 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
     expect(refund.amount).toBe(300);
   });
 
-  it("captures after the first demand an explicit idempotency key", async () => {
+  it("replaying a capture key answers the original capture — no new money moves", async () => {
     const { adapter, orderId } = await authorizedPayment();
-    // The first keyless capture is safe: the derived key only guards retries.
-    const first = await adapter.capturePayment(orderId, 500);
-    expect(first.amount).toBe(500);
+    const first = await adapter.capturePayment(orderId, 500, "k-cap-replay");
+    expect(first.amountCaptured).toBe(500);
 
-    // A second keyless capture of the same amount would replay the first via
-    // PayPal-Request-Id (200, no new money) — rejected instead.
-    await expect(adapter.capturePayment(orderId, 500)).rejects.toMatchObject({
-      code: "invalid_request",
-      message: expect.stringMatching(/idempotencyKey/),
-    });
+    // Same key, same amount: PayPal-Request-Id replay answers the original
+    // 201 — a retried capture can never double-charge.
+    const replayed = await adapter.capturePayment(orderId, 500, "k-cap-replay");
+    expect(replayed.amountCaptured).toBe(500);
 
-    const second = await adapter.capturePayment(orderId, 500, "k-cap-again");
-    expect(second.amount).toBe(1000); // both captures moved money
+    // A distinct key is a distinct charge — multi-capture demands per-capture keys.
+    const second = await adapter.capturePayment(orderId, 500, "k-cap-fresh");
+    expect(second.amountCaptured).toBe(1000);
   });
 
   it("rejects captures beyond the authorized amount via the PSP error", async () => {
@@ -216,33 +222,36 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
     const { adapter, orderId } = await authorizedPayment();
     const canceled = await adapter.cancelPayment(orderId, "k-void");
     expect(canceled.status).toBe("canceled");
+    expect(canceled.amountCapturable).toBe(0); // a voided authorization holds nothing
     // A second cancel finds the VOIDED authorization and reports state without a second void.
-    const again = await adapter.cancelPayment(orderId);
+    const again = await adapter.cancelPayment(orderId, "k-void-2");
     expect(again.status).toBe("canceled");
   });
 
   it("refuses to cancel once captured — refunds are the only way back", async () => {
     const { adapter, orderId } = await authorizedPayment();
     await adapter.capturePayment(orderId, 700, "k-cap");
-    await expect(adapter.cancelPayment(orderId)).rejects.toThrowError(/already captured/);
+    await expect(adapter.cancelPayment(orderId, "k-void")).rejects.toThrowError(/already captured/);
   });
 
   it("capturePayment on a CAPTURE-intent order names the missing authorization", async () => {
     const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession(sessionInput);
     fake.approveOrder(session.pspSessionId);
-    await expect(adapter.capturePayment(session.pspSessionId, 500)).rejects.toThrowError(/no authorization/);
+    await expect(adapter.capturePayment(session.pspSessionId, 500, "k-cap")).rejects.toThrowError(
+      /no authorization/,
+    );
   });
 
   it("cancelPayment on a CAPTURE-intent order explains that orders expire instead", async () => {
     const { adapter } = makePair();
     const session = await adapter.createPaymentSession(sessionInput);
-    await expect(adapter.cancelPayment(session.pspSessionId)).rejects.toThrowError(/expires/);
+    await expect(adapter.cancelPayment(session.pspSessionId, "k-void")).rejects.toThrowError(/expires/);
   });
 
   it("cancelPayment on an unknown/captured id points to refunds", async () => {
     const { adapter } = makePair();
-    await expect(adapter.cancelPayment("2GGCAPTUREID")).rejects.toThrowError(/refund/);
+    await expect(adapter.cancelPayment("2GGCAPTUREID", "k-void")).rejects.toThrowError(/refund/);
   });
 });
 

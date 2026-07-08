@@ -4,6 +4,11 @@ import { getUserMessage } from "./messages.js";
  * Unified error taxonomy. Every rejection from any adapter method rejects with
  * PayFanoutError — never a raw PSP error. The original PSP error is always
  * preserved untouched on `raw` for logs/support.
+ *
+ * `retryable` semantics adapters must honor (conformance asserts them):
+ * `rate_limited` and `psp_unavailable` are always retryable;
+ * `authentication_required` is NEVER retryable — resolving it means bringing
+ * the customer back on-session, not replaying the call.
  */
 export type UnifiedErrorCode =
   | "card_declined"
@@ -16,6 +21,10 @@ export type UnifiedErrorCode =
   | "rate_limited"
   | "psp_unavailable"
   | "invalid_request"
+  /** A stateless session/token outlived its expiry — recover by creating a fresh session. */
+  | "session_expired"
+  /** The adapter/PSP cannot perform the requested operation (capability guard). */
+  | "unsupported_operation"
   | "unknown";
 
 export interface UnifiedError {

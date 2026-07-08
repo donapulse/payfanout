@@ -55,7 +55,8 @@ function classify(e: StripeErrorLike): { code: UnifiedErrorCode; retryable: bool
       return { code: "invalid_card_data", retryable: false, message: userMessage };
     }
     if (e.code === "authentication_required" || e.decline_code === "authentication_required") {
-      return { code: "authentication_required", retryable: true, message: userMessage };
+      // Resolved by bringing the customer back on-session, never by replaying the call.
+      return { code: "authentication_required", retryable: false, message: userMessage };
     }
     if (e.decline_code && FRAUD_DECLINE_CODES.has(e.decline_code)) {
       return { code: "fraud_suspected", retryable: false, message: "Your card was declined." };

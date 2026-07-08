@@ -1,5 +1,6 @@
 export type { MinorUnitAmount } from "./currency.js";
 export {
+  allocate,
   assertMinorUnitAmount,
   formatMinorUnits,
   fromMinorUnits,
@@ -35,8 +36,10 @@ export type {
   PaymentMethodFlow,
   PaymentSession,
   RefundInfo,
+  RefundReason,
   RefundRequest,
   RefundResult,
+  RefundStatus,
   SavedPaymentMethod,
   UnifiedPaymentMethodType,
   UnifiedPaymentStatus,
@@ -44,10 +47,13 @@ export type {
   UnifiedWebhookEventType,
 } from "./model.js";
 export {
+  isUnifiedPaymentMethodType,
   isUnifiedPaymentStatus,
+  isUnifiedWebhookEventType,
   PAYMENT_METHOD_FLOWS,
   PAYMENT_METHOD_TYPES,
   PAYMENT_STATUSES,
+  REFUND_STATUSES,
   WEBHOOK_EVENT_TYPES,
 } from "./model.js";
 
@@ -80,4 +86,4 @@ export type {
   UpdatePaymentSessionInput,
   VerifyPaymentMethodInput,
 } from "./adapters.js";
-export { brandMountedFieldsHandle } from "./adapters.js";
+export { brandMountedFieldsHandle, DATA_PAYFANOUT_FIELD } from "./adapters.js";

@@ -32,7 +32,15 @@ const webhookFixture = signedWebhook({
   id: "evt_conformance_1",
   type: "payment_intent.succeeded",
   created: 1_780_000_200,
-  data: { object: { object: "payment_intent", id: "pi_42" } },
+  data: { object: { object: "payment_intent", id: "pi_42", amount: 1099, currency: "usd" } },
+});
+
+// Valid Stripe delivery of an event type the adapter has no mapping for.
+const unknownEventFixture = signedWebhook({
+  id: "evt_conformance_unknown",
+  type: "invoice.finalized",
+  created: 1_780_000_210,
+  data: { object: { object: "invoice", id: "in_1" } },
 });
 
 // ---------------------------------------------------------------------------
@@ -67,6 +75,42 @@ runServerAdapterConformanceTests(
       validHeaders: webhookFixture.headers,
       expectedType: "payment.succeeded",
       expectedEventId: "evt_conformance_1",
+      expectedAmount: 1099,
+      unknownEvent: unknownEventFixture,
+    },
+    money: {
+      // Completion happens on the client against real Stripe; the fake's
+      // simulateClientConfirm plays that role.
+      completedPayment: async (adapter, { amount, id, metadata }) => {
+        const session = await adapter.createPaymentSession({
+          id,
+          amount,
+          currency: "USD",
+          metadata,
+          idempotencyKey: `money-completed-${Math.random()}`,
+        });
+        lastFake.simulateClientConfirm(session.pspSessionId);
+        return session.pspSessionId;
+      },
+      authorizedPayment: async (adapter, { amount }) => {
+        const session = await adapter.createPaymentSession({
+          amount,
+          currency: "USD",
+          captureMethod: "manual",
+          idempotencyKey: `money-authorized-${Math.random()}`,
+        });
+        lastFake.simulateClientConfirm(session.pspSessionId);
+        return session.pspSessionId;
+      },
+      // Created but never confirmed — Stripe's canonical pre-completion state.
+      cancelablePayment: async (adapter) => {
+        const session = await adapter.createPaymentSession({
+          amount: 1500,
+          currency: "USD",
+          idempotencyKey: `money-cancelable-${Math.random()}`,
+        });
+        return session.pspSessionId;
+      },
     },
     vault: {
       // Confirm-on-client PSP: vault during checkout, then hand back the token.
@@ -154,6 +198,7 @@ describe("StripeServerAdapter specifics", () => {
     const info = await adapter.retrievePayment(session.pspSessionId);
     expect(info.id).toBe("order-77");
     expect(info.pspPaymentId).toBe(session.pspSessionId);
+    expect(info.metadata).toMatchObject({ payfanout_id: "order-77" });
   });
 
   it("runs the full manual-capture flow: authorize -> requires_capture -> partial capture -> succeeded", async () => {
@@ -167,10 +212,14 @@ describe("StripeServerAdapter specifics", () => {
     fake.simulateClientConfirm(session.pspSessionId);
     const authorized = await adapter.retrievePayment(session.pspSessionId);
     expect(authorized.status).toBe("requires_capture");
+    expect(authorized.amountCaptured).toBe(0);
+    expect(authorized.amountCapturable).toBe(5000);
 
     const captured = await adapter.capturePayment(session.pspSessionId, 3000, "cap-key");
     expect(captured.status).toBe("succeeded");
     expect(captured.amount).toBe(3000);
+    expect(captured.amountCaptured).toBe(3000);
+    expect(captured.amountCapturable).toBe(0); // single capture — the remainder is released
   });
 
   it("cancels an authorized-but-uncaptured payment", async () => {
@@ -229,7 +278,7 @@ describe("StripeServerAdapter specifics", () => {
     it("detaches the attached PaymentMethod after a successful verification", async () => {
       const { adapter, fake } = makePair();
       const setiId = fake.seedSetupIntent("succeeded", "pm_attached_1");
-      const info = await adapter.verifyPaymentMethod({ pspSessionId: setiId });
+      const info = await adapter.verifyPaymentMethod({ pspSessionId: setiId, idempotencyKey: "verify-1" });
       expect(info.status).toBe("succeeded");
       expect(info.amount).toBe(0);
       expect(fake.detachedPaymentMethods).toEqual(["pm_attached_1"]);
@@ -238,7 +287,7 @@ describe("StripeServerAdapter specifics", () => {
     it("detaches even when the verification itself failed", async () => {
       const { adapter, fake } = makePair();
       const setiId = fake.seedSetupIntent("canceled", "pm_attached_2");
-      const info = await adapter.verifyPaymentMethod({ pspSessionId: setiId });
+      const info = await adapter.verifyPaymentMethod({ pspSessionId: setiId, idempotencyKey: "verify-2" });
       expect(info.status).toBe("failed");
       expect(fake.detachedPaymentMethods).toEqual(["pm_attached_2"]);
     });
@@ -253,7 +302,7 @@ describe("StripeServerAdapter specifics", () => {
         return seti;
       };
       try {
-        await adapter.verifyPaymentMethod({ pspSessionId: setiId });
+        await adapter.verifyPaymentMethod({ pspSessionId: setiId, idempotencyKey: "verify-3" });
         expect.unreachable();
       } catch (err) {
         expect(isPayFanoutError(err)).toBe(true);
@@ -279,14 +328,16 @@ describe("StripeServerAdapter specifics", () => {
         );
         return seti;
       };
-      const info = await adapter.verifyPaymentMethod({ pspSessionId: setiId });
+      const info = await adapter.verifyPaymentMethod({ pspSessionId: setiId, idempotencyKey: "verify-4" });
       expect(info.status).toBe("succeeded"); // no PayFanoutError — nothing was stored
     });
 
     it("reports the capability off and rejects when the strategy is disabled", async () => {
       const { adapter } = makePair({ verifyPaymentMethodStrategy: "disabled" });
       expect(adapter.getCapabilities().supportsPaymentMethodVerification).toBe(false);
-      await expect(adapter.verifyPaymentMethod({ pspSessionId: "seti_x" })).rejects.toThrowError(/disabled/);
+      await expect(
+        adapter.verifyPaymentMethod({ pspSessionId: "seti_x", idempotencyKey: "verify-5" }),
+      ).rejects.toThrowError(/disabled/);
     });
   });
 
@@ -304,11 +355,23 @@ describe("StripeServerAdapter specifics", () => {
           id: "evt_r",
           type: "charge.refunded",
           created: 1_780_000_300,
-          data: { object: { object: "charge", id: "ch_9", payment_intent: "pi_9" } },
+          data: {
+            object: {
+              object: "charge",
+              id: "ch_9",
+              payment_intent: "pi_9",
+              amount_refunded: 450,
+              currency: "usd",
+              refunds: { data: [{ id: "re_9" }] },
+            },
+          },
         }),
       );
       expect(refundEvt.type).toBe("payment.refunded");
       expect(refundEvt.pspPaymentId).toBe("pi_9");
+      expect(refundEvt.amount).toBe(450);
+      expect(refundEvt.currency).toBe("USD");
+      expect(refundEvt.refundId).toBe("re_9");
 
       const disputeEvt = await adapter.parseWebhookEvent(
         JSON.stringify({

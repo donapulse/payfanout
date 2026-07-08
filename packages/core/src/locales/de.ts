@@ -16,6 +16,8 @@ export const de: LocaleBundle = {
     rate_limited: "Zu viele Anfragen — bitte versuchen Sie es in Kürze erneut.",
     psp_unavailable: "Der Zahlungsanbieter ist vorübergehend nicht verfügbar.",
     invalid_request: "Die Zahlungsanfrage war ungültig.",
+    session_expired: "Ihre Zahlungssitzung ist abgelaufen — bitte beginnen Sie erneut.",
+    unsupported_operation: "Dieser Zahlungsvorgang ist für den ausgewählten Anbieter nicht verfügbar.",
     unknown: "Die Zahlung ist fehlgeschlagen. Bitte versuchen Sie es erneut oder verwenden Sie eine andere Zahlungsmethode.",
   },
   ui: {

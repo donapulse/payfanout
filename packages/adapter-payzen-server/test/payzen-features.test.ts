@@ -139,7 +139,7 @@ describe("mapPayZenError (envelope taxonomy)", () => {
     ["PSP_999", null, "psp_unavailable", true],
     ["PSP_514", null, "psp_unavailable", true],
     ["PSP_010", null, "invalid_request", false],
-    ["PSP_108", null, "invalid_request", false], // expired formToken
+    ["PSP_108", null, "session_expired", false], // expired formToken — a fresh session recovers, a replay never does
     ["PSP_610", null, "invalid_request", false],
     ["PSP_075", null, "invalid_request", false],
     ["PSP_083", null, "invalid_request", false],
@@ -390,7 +390,7 @@ describe("transport behavior", () => {
         ),
     });
     await expect(adapter.retrievePayment("pf-some-order")).rejects.toMatchObject({ code: "invalid_request" });
-    await expect(adapter.cancelPayment("pf-some-order")).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(adapter.cancelPayment("pf-some-order", "void-x")).rejects.toMatchObject({ code: "invalid_request" });
   });
 });
 
@@ -574,6 +574,34 @@ describe("PayZen webhook event parsing", () => {
     expect(event.type).toBe("payment.refunded");
     expect(event.pspPaymentId).toBe("f".repeat(32));
     expect(event.id).toBe(`${"e".repeat(32)}:CAPTURED`); // the credit's own identity
+    expect(event.refundId).toBe("e".repeat(32)); // pollable via retrieveRefund
+  });
+
+  it("carries the payload's money facts so hosts need no retrievePayment round-trip", async () => {
+    const refunded = await parse(
+      krAnswerFor({
+        uuid: "e".repeat(32),
+        operationType: "CREDIT",
+        detailedStatus: "CAPTURED",
+        amount: 750,
+        currency: "EUR",
+        transactionDetails: { parentTransactionUuid: "f".repeat(32) },
+      }),
+    );
+    expect(refunded.amount).toBe(750); // the credit's amount IS the refunded amount
+    expect(refunded.currency).toBe("EUR");
+
+    const paid = await parse(
+      krAnswerFor({ uuid: "1".repeat(32), operationType: "DEBIT", detailedStatus: "AUTHORISED", amount: 990, currency: "eur" }),
+    );
+    expect(paid.amount).toBe(990);
+    expect(paid.currency).toBe("EUR"); // normalized to ISO 4217 uppercase
+    expect(paid.refundId).toBeUndefined(); // refund-shaped events only
+
+    // Facts the payload does not carry stay absent — never fabricated.
+    const bare = await parse(krAnswerFor({ uuid: "2".repeat(32), operationType: "DEBIT", detailedStatus: "AUTHORISED" }));
+    expect(bare.amount).toBeUndefined();
+    expect(bare.currency).toBeUndefined();
   });
 
   it("uses the NEWEST transaction when the snapshot carries several attempts", async () => {

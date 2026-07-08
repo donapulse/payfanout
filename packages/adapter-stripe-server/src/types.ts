@@ -26,6 +26,8 @@ export interface StripeChargeLike {
       brand?: string;
       last4?: string;
       wallet?: { type?: string } | null;
+      exp_month?: number;
+      exp_year?: number;
     } | null;
     [rail: string]: unknown;
   } | null;
@@ -45,6 +47,8 @@ export interface StripePaymentIntentLike {
   amount: number;
   /** What was actually collected — differs from `amount` after partial capture. */
   amount_received?: number;
+  /** Authorized-but-uncaptured remainder on manual-capture intents. */
+  amount_capturable?: number;
   currency: string;
   created: number;
   client_secret?: string | null;

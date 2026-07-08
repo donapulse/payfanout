@@ -62,7 +62,7 @@ describe("StripeClientAdapter edge cases", () => {
     expect(confirmCalls[0]!["confirmParams"]).toEqual({ return_url: "https://host.example/return" });
   });
 
-  it("maps validation errors and unrecognized failures distinctly", async () => {
+  it("maps validation, authentication and unrecognized failures distinctly", async () => {
     stubBrowser();
     const element = { mount: () => {}, unmount: () => {}, destroy: () => {}, on: () => {} };
     const makeAdapter = (error: object): StripeClientAdapter =>
@@ -83,6 +83,13 @@ describe("StripeClientAdapter edge cases", () => {
     const vHandle = await validation.mount({} as HTMLElement, { clientSecret: "pi_1_secret" });
     const vResult = await validation.confirm(vHandle);
     expect(vResult.error?.code).toBe("invalid_card_data");
+
+    // authentication_required is resolved on-session (3DS challenge), never by replay.
+    const auth = makeAdapter({ type: "card_error", code: "authentication_required", message: "3DS needed." });
+    const aHandle = await auth.mount({} as HTMLElement, { clientSecret: "pi_1_secret" });
+    const aResult = await auth.confirm(aHandle);
+    expect(aResult.error?.code).toBe("authentication_required");
+    expect(aResult.error?.retryable).toBe(false);
 
     const exotic = makeAdapter({ type: "api_error", message: "Something odd." });
     const eHandle = await exotic.mount({} as HTMLElement, { clientSecret: "pi_1_secret" });

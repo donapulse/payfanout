@@ -87,7 +87,7 @@ export class FakePaysafeApi {
         status: "PAYABLE",
         usage: "MULTI_USE",
         paymentType: "CARD",
-        card: { cardType: "VI", lastDigits: "1111" },
+        card: { cardType: "VI", lastDigits: "1111", cardExpiry: { month: 12, year: 2030 } },
       };
       customer.handles.push(handle);
       this.multiUseTokens.add(handle.paymentHandleToken);
@@ -189,7 +189,7 @@ export class FakePaysafeApi {
       txnTime: "2026-07-04T10:00:00Z",
       paymentType: "CARD",
       // Real API echoes masked instrument facts on the payment object (cardType, not type).
-      card: { cardType: "VI", lastDigits: "1111" },
+      card: { cardType: "VI", lastDigits: "1111", cardExpiry: { month: 12, year: 2030 } },
       settlements: [],
     };
     if (settleWithAuth) {

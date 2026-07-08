@@ -290,7 +290,7 @@ function withAttemptTrail(error: PayFanoutError, attempts: RoutedAttempt[]): Pay
 }
 
 function ineligible(pspName: string, message: string): PayFanoutError {
-  return new PayFanoutError({ code: "invalid_request", message, retryable: false, pspName });
+  return new PayFanoutError({ code: "unsupported_operation", message, retryable: false, pspName });
 }
 
 function matches(when: RoutingConditions | undefined, input: CreatePaymentSessionInput): boolean {

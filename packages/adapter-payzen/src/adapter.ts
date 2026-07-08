@@ -384,7 +384,7 @@ const KR_CLIENT_CODE_MAP: Record<string, UnifiedErrorCode> = {
   CLIENT_997: "invalid_request", // endpoint/platform mismatch — the formToken came from a sister platform
   CLIENT_998: "invalid_request", // demo formToken used against a real shop
   CLIENT_999: "psp_unavailable",
-  PSP_108: "invalid_request", // formToken expired (~15 min) — create a fresh session
+  PSP_108: "session_expired", // formToken outlived its ~15 min — create a fresh session
 };
 
 function mapKrError(err: unknown): UnifiedError {
@@ -424,6 +424,8 @@ function userMessageFor(code: UnifiedErrorCode): string {
       return "Your card was declined.";
     case "authentication_required":
       return "Additional authentication is required.";
+    case "session_expired":
+      return "Your payment session has expired — please start again.";
     case "invalid_request":
       return "The payment form could not be set up.";
     case "psp_unavailable":

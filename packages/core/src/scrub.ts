@@ -46,6 +46,11 @@ export interface ScrubOptions {
  * Deep-copies `value` with PII redacted: sensitive keys replaced by
  * "[scrubbed]", card-number-shaped strings masked to their last 4 digits,
  * circular references and over-deep nesting cut off safely.
+ *
+ * Caveat: PAN masking applies to strings only. A card number carried as a JS
+ * NUMBER under a key that isn't in the sensitive list passes through
+ * unmasked — numbers are returned verbatim, so key-based redaction is the
+ * only guard for numeric fields.
  */
 export function scrubForLogging<T>(value: T, options: ScrubOptions = {}): unknown {
   const extra = new Set((options.extraKeys ?? []).map(normalizeKey));

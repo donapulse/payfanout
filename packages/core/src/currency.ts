@@ -25,7 +25,7 @@ export function getCurrencyExponent(currency: string): number {
 }
 
 export function normalizeCurrency(currency: string): string {
-  const code = currency?.toUpperCase?.();
+  const code = currency?.trim?.().toUpperCase?.();
   if (typeof code !== "string" || !/^[A-Z]{3}$/.test(code)) {
     throw PayFanoutError.invalidRequest(`Invalid ISO 4217 currency code: ${String(currency)}`);
   }

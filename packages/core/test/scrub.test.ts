@@ -83,6 +83,13 @@ describe("scrubForLogging", () => {
     expect(original.internalNote).toBe("keep-off-logs");
   });
 
+  it("passes card-number-shaped NUMBERS through verbatim under non-sensitive keys", () => {
+    // Pins the documented caveat: PAN masking is string-only. A Luhn-valid
+    // 16-digit value carried as a JS number is returned as-is.
+    const scrubbed = scrubForLogging({ reference: 4111111111111111 }) as Record<string, unknown>;
+    expect(scrubbed["reference"]).toBe(4111111111111111);
+  });
+
   it("passes through primitives and redacts functions/symbols", () => {
     expect(scrubForLogging(null)).toBeNull();
     expect(scrubForLogging(42)).toBe(42);

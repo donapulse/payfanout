@@ -1,3 +1,5 @@
+import { getUserMessage } from "./messages.js";
+
 /**
  * Unified error taxonomy. Every rejection from any adapter method rejects with
  * PayFanoutError — never a raw PSP error. The original PSP error is always
@@ -52,16 +54,18 @@ export class PayFanoutError extends Error implements UnifiedError {
   /**
    * Normalizes any thrown value into a PayFanoutError. Existing PayFanoutErrors
    * pass through unchanged (so `raw` and `code` set close to the PSP win);
-   * anything else becomes `code: "unknown"` with the original value on `raw`.
+   * anything else becomes `code: "unknown"` (unless the fallback says
+   * otherwise) with the original value on `raw`. The wrapped error's own
+   * message is never copied into `message` — it is user-facing and arbitrary
+   * error text can leak internals — so absent `fallback.message` the built-in
+   * user-safe catalog message for the code is used instead.
    */
   static wrap(err: unknown, fallback?: Partial<PayFanoutErrorInit>): PayFanoutError {
-    if (err instanceof PayFanoutError) return err;
-    const message =
-      fallback?.message ??
-      (err instanceof Error ? err.message : "Payment operation failed");
+    if (isPayFanoutError(err)) return err;
+    const code = fallback?.code ?? "unknown";
     return new PayFanoutError({
-      code: fallback?.code ?? "unknown",
-      message,
+      code,
+      message: fallback?.message ?? getUserMessage(code),
       retryable: fallback?.retryable ?? false,
       raw: err,
       pspName: fallback?.pspName,
@@ -83,6 +87,19 @@ export class PayFanoutError extends Error implements UnifiedError {
   }
 }
 
+/**
+ * True for PayFanoutError instances and structural matches. The structural
+ * fallback matters because a host's node_modules can hold duplicated copies of
+ * core — `instanceof` fails across copies, so the unified shape is the contract.
+ */
 export function isPayFanoutError(err: unknown): err is PayFanoutError {
-  return err instanceof PayFanoutError;
+  if (err instanceof PayFanoutError) return true;
+  if (typeof err !== "object" || err === null) return false;
+  const candidate = err as Record<string, unknown>;
+  return (
+    candidate["name"] === "PayFanoutError" &&
+    typeof candidate["code"] === "string" &&
+    typeof candidate["retryable"] === "boolean" &&
+    typeof candidate["message"] === "string"
+  );
 }

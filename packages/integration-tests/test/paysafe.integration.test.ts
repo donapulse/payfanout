@@ -21,7 +21,8 @@ import { PaysafeServerAdapter } from "@payfanout/adapter-paysafe-server";
 const USERNAME = process.env.PAYSAFE_USERNAME;
 const PASSWORD = process.env.PAYSAFE_PASSWORD;
 const ACCOUNT_ID = process.env.PAYSAFE_ACCOUNT_ID;
-const BASE_URL = process.env.PAYSAFE_BASE_URL ?? "https://api.test.paysafe.com";
+// Unset CI secrets render as EMPTY strings, not undefined — || treats them as absent.
+const BASE_URL = process.env.PAYSAFE_BASE_URL || "https://api.test.paysafe.com";
 if (BASE_URL.includes("api.paysafe.com") && !BASE_URL.includes("api.test.paysafe.com")) {
   throw new Error("Integration tests refuse to run against the live Paysafe API");
 }
@@ -31,7 +32,7 @@ const describeIf = USERNAME && PASSWORD ? describe : describe.skip;
 
 // Sandbox accounts are provisioned for one currency (often CAD) — parameterized
 // so the suite matches whatever the account supports.
-const CURRENCY = process.env.PAYSAFE_CURRENCY ?? "USD";
+const CURRENCY = process.env.PAYSAFE_CURRENCY || "USD";
 const BILLING: Record<string, { country: string; zip: string }> = {
   CAD: { country: "CA", zip: "M5V 3L9" },
   USD: { country: "US", zip: "10001" },
@@ -48,7 +49,7 @@ function makeAdapter(): PaysafeServerAdapter {
     baseUrl: BASE_URL,
     merchantAccountResolver: () => ACCOUNT_ID,
     sessionSigningKey: "integration-session-signing-key",
-    webhookHmacKey: process.env.PAYSAFE_WEBHOOK_HMAC_KEY ?? "not-used-in-these-tests",
+    webhookHmacKey: process.env.PAYSAFE_WEBHOOK_HMAC_KEY || "not-used-in-these-tests",
   });
 }
 

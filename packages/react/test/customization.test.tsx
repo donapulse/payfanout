@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import type { JSX } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 import { PayFanoutProvider, PaymentFields, usePay, type PayResult } from "../src/index.js";
-import { FakeClientAdapter } from "./fake-client-adapter.js";
+import { deferred, FakeClientAdapter } from "./fake-client-adapter.js";
 
 afterEach(cleanup);
 
@@ -111,6 +111,45 @@ describe("usePay — bring-your-own-button", () => {
     await waitFor(() => expect(bare).toHaveLength(1));
     expect(bare[0]!.status).toBe("failed");
     expect(bare[0]!.error?.message).toMatch(/No mounted <PaymentFields>/);
+  });
+
+  it("same-tick pay() calls share one confirm, one promise, one result", async () => {
+    const adapter = new FakeClientAdapter("fakepsp");
+    const gate = deferred<void>();
+    adapter.confirmImpl = async () => {
+      await gate.promise;
+      return { status: "succeeded" };
+    };
+    const pays: Array<() => Promise<PayResult>> = [];
+    function Capture(): JSX.Element {
+      pays.push(usePay().pay);
+      return <PaymentFields clientSecret="secret_1" />;
+    }
+    render(
+      <PayFanoutProvider adapters={[adapter]}>
+        <Capture />
+      </PayFanoutProvider>,
+    );
+    await waitFor(() => expect(adapter.mountCalls).toHaveLength(1));
+
+    let p1!: Promise<PayResult>;
+    let p2!: Promise<PayResult>;
+    act(() => {
+      p1 = pays.at(-1)!();
+      p2 = pays.at(-1)!(); // double-click before any re-render lands
+    });
+    expect(p2).toBe(p1);
+
+    let r1!: PayResult;
+    let r2!: PayResult;
+    await act(async () => {
+      gate.resolve();
+      [r1, r2] = await Promise.all([p1, p2]);
+    });
+    expect(adapter.confirmCalls).toBe(1);
+    expect(r1).toBe(r2);
+    expect(r1.status).toBe("succeeded");
+    expect(new Set(pays).size).toBe(1); // pay identity is stable across renders
   });
 });
 

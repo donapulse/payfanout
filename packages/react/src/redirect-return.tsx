@@ -3,6 +3,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { PayFanoutError, type RedirectReturnLocation } from "@payfanout/core";
 import { resolveConfirmOutcome, type PayResult, type ServerCompletionCallback } from "./pay-logic.js";
 import { usePayFanoutContext } from "./provider.js";
+import { useLatestRef } from "./use-latest-ref.js";
 
 export type RedirectReturnPhase =
   /** Still probing the URL / resolving the outcome. */
@@ -42,20 +43,14 @@ export interface UseRedirectReturnOptions {
 export function useRedirectReturn(options: UseRedirectReturnOptions = {}): RedirectReturnState {
   const { adapters, setActivePsp } = usePayFanoutContext();
   const [state, setState] = useState<RedirectReturnState>({ phase: "checking" });
-  // The exact options object identity changes per render — pin the latest
-  // callbacks without retriggering the (run-once) effect. Updated in an
-  // effect (declared BEFORE the run-once effect, so it executes first); the
-  // initial useRef(options) value covers the very first run.
-  const optionsRef = useRef(options);
-  useEffect(() => {
-    optionsRef.current = options;
-  });
+  const optionsRef = useLatestRef(options);
   const startedRef = useRef(false);
 
   useEffect(() => {
-    if (startedRef.current) return; // StrictMode double-invoke guard
+    if (startedRef.current) return; // a previous invocation settled (or is settling) this mount
     startedRef.current = true;
     let cancelled = false;
+    let settled = false;
 
     const run = async (): Promise<void> => {
       const current = optionsRef.current;
@@ -74,6 +69,10 @@ export function useRedirectReturn(options: UseRedirectReturnOptions = {}): Redir
             error: PayFanoutError.wrap(err, { pspName }),
           };
         }
+        // Bail before any side effect: handleRedirectReturn is a read-only
+        // probe (safe to re-run), but activation and above all
+        // onServerCompletion must only ever run for the surviving invocation.
+        if (cancelled) return;
         if (confirmResult === null) continue; // not this PSP's return URL
         try {
           setActivePsp(pspName);
@@ -82,18 +81,27 @@ export function useRedirectReturn(options: UseRedirectReturnOptions = {}): Redir
         }
         const result = await resolveConfirmOutcome(confirmResult, current.onServerCompletion);
         if (cancelled) return;
+        settled = true;
         setState({ phase: "complete", result, pspName });
         current.onResult?.(result, pspName);
         return;
       }
-      if (!cancelled) setState({ phase: "none" });
+      if (!cancelled) {
+        settled = true;
+        setState({ phase: "none" });
+      }
     };
 
     void run();
     return () => {
       cancelled = true;
+      // StrictMode unmounts before the async probe can settle; free the
+      // guard so the paired remount runs to a terminal phase (onResult still
+      // fires exactly once — the cancelled invocation discarded its result).
+      // Once settled, the guard stays set: production keeps single-flight.
+      if (!settled) startedRef.current = false;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- run exactly once per mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- single-flight per mount, never re-probed on context churn
   }, []);
 
   return state;

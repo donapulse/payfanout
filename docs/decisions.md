@@ -317,3 +317,22 @@ One atomic core+conformance+all-adapters change (major changesets across the boa
   `RefundStatus`, `RefundRequest.reason` typed to Stripe's vocabulary (best-effort
   elsewhere), `isUnifiedWebhookEventType`/`isUnifiedPaymentMethodType` guards, and the
   `DATA_PAYFANOUT_FIELD` slot-attribute constant.
+
+## Dependency security remediation (2026-07-09)
+
+- **`vite`/`esbuild` forced past 4 disclosed CVEs via `pnpm.overrides`**, not a plain
+  version bump: `vitepress@1.6.4` pins its own `vite: ^5.4.14`, and 5.x never received a
+  patched release for any of them (fixes start at 6.4.2/6.4.3). `vite@<6.4.3` /
+  `esbuild@<0.25.0` overrides force every resolution in the tree upward regardless of
+  what a dependency declares; pnpm dedupes this onto the `vite@8.1.3`/`esbuild@0.28.1`
+  versions `examples/demo` already depends on directly.
+- **Known, accepted cost: `pnpm run docs:dev` serves pages with empty `<title>`/meta
+  tags** under vite 8 — vitepress 1.x's dev-server SSR head-injection isn't compatible
+  with vite 8's Rolldown-based bundler (vitepress itself logs "not compatible with
+  rolldown-vite, use VitePress v2" on startup). Tried capping the override at `<7.0.0`
+  to stay on a more conservative vite major instead; that broke `vitest@4.1.9`'s own
+  peer expectations (it wants the same vite 8 line `examples/demo` uses), which is worse
+  since every CI check depends on vitest. `pnpm run docs:build` — what actually ships to
+  GitHub Pages — is unaffected; verified the built output's titles/meta are correct. No
+  clean fix exists short of a VitePress v2 migration (alpha-only as of this writing);
+  revisit once VitePress ships a stable v2.

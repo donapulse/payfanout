@@ -1,4 +1,4 @@
-# @payfanout/adapter-gocardless-server
+# @payfanout/adapter-payzen-server
 
 ## 1.0.0
 
@@ -10,23 +10,16 @@
 
   The conformance suite now proves the money paths on every adapter — retrieve truth, full/partial/over-refund behavior, pending-refund polling, capture and multi-capture amounts, clean cancellation, unknown-webhook mapping, per-code retryable semantics, and redirect-flow client adapters must implement `handleRedirectReturn`.
 
+### Minor Changes
+
+- 1e7559f: Add the PayZen (Lyra) adapter pair: embedded card fields with inline 3DS via krypton-client on the client, and REST API V4 payments, validation capture, refunds, and IPN signature verification on the server (edge-runtime compatible). Confirm-on-client shape — no server-completion route needed.
+
 ### Patch Changes
 
-- 8b720a8: Per-adapter consistency: the Stripe server config gains a `paymentMethods` override (dashboard enablement varies per account — stop hardcoding iDEAL/SEPA/ACH/BACS as supported) and `requestTimeoutMs` (threaded to the SDK's timeout, default remains the SDK's 80s); `listSavedPaymentMethods` pages past 100 stored methods instead of silently truncating. Paysafe error 3004 (billing zip required) now maps to `invalid_request` instead of masquerading as a card decline. All REST adapters validate `maxNetworkRetries` as an integer ≥ 0 at construction, Stripe validates `webhookToleranceSeconds`, and GoCardless clamps list page sizes to its documented 1–500 bounds.
+- 0e31e62: The request timeout now covers the response body read. A PSP response that stalled after its headers arrived could previously hang the host's request handler indefinitely; it now rejects with the same retryable `psp_unavailable` timeout error as a connection hang.
 - a016891: Adapter plumbing that existed as four-to-five drifting copies now lives once in `@payfanout/core`, and every adapter consumes it: the WebCrypto/base64 helper family (`hmacSha256`, `constantTimeEqual`, …, with the node:crypto bit-equivalence tests moved alongside), the REST transport primitives (`requestWithTimeout` with the timer covering the body read, `withTransportRetries`, `isTransportRetryable`, `safeJson`), the HTTP error tail (`classifyHttpFallback`), capability coherence (`validateAdapterCapabilities`, shared by `PaymentService` and the conformance suite), client SDK loading (`assertBrowser`, `injectScript`), and webhook utilities (`normalizeTime`, `lowercaseKeys`, `normalizeSecrets`). Behavior is unchanged apart from a few user-message strings converging on core's catalog text; all transport timing, retry, and edge-runtime guarantees are preserved and still guard-tested. Core remains zero-dependency and browser-safe.
 - Updated dependencies [d68ccbb]
 - Updated dependencies [d2c4702]
 - Updated dependencies [43569f4]
 - Updated dependencies [a016891]
   - @payfanout/core@1.0.0
-
-## 0.2.0
-
-### Minor Changes
-
-- 7444bb6: Add the GoCardless bank payments adapter pair. The server adapter creates billing requests with GoCardless-hosted bank authorisation flows and covers retrieval by session or payment id, cancellation, full/partial refunds, event polling, listing, and signature-verified webhooks — including batched deliveries via `parseGoCardlessWebhookEvents`. The client adapter drives the redirect flow (no card fields, no client-side key) and resolves the return trip through `handleRedirectReturn`.
-
-### Patch Changes
-
-- Updated dependencies [6e039c2]
-  - @payfanout/core@0.2.0

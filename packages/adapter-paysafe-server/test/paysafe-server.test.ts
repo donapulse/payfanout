@@ -1,9 +1,10 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { getRefundState, isPayFanoutError } from "@payfanout/core";
+import { getRefundState, isPayFanoutError, type ServerPaymentAdapter } from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
 import {
   decodeSessionContext,
+  encodeSessionContext,
   PaysafeServerAdapter,
   type PaysafeServerAdapterConfig,
 } from "../src/index.js";
@@ -40,8 +41,38 @@ const webhookFixture = signedWebhook({
   id: "psf_evt_1",
   eventType: "PAYMENT.COMPLETED",
   txnTime: "2026-07-04T10:00:02Z",
-  payload: { id: "pay_42", status: "COMPLETED", merchantRefNum: "order-1" },
+  payload: { id: "pay_42", status: "COMPLETED", merchantRefNum: "order-1", amount: 1099, currencyCode: "USD" },
 });
+
+const unknownWebhookFixture = signedWebhook({
+  id: "psf_evt_new",
+  eventType: "WALLET.SOMETHING.NEW",
+  txnTime: "2026-07-04T10:00:03Z",
+  payload: { id: "obj_1" },
+});
+
+/** Tokenize-first completion of a fresh session — how every "money moved" fixture starts. */
+async function completedPayment(
+  adapter: ServerPaymentAdapter,
+  input: { amount: number; id?: string; metadata?: Record<string, string>; captureMethod?: "automatic" | "manual" },
+): Promise<string> {
+  const key = `money-${Math.random().toString(36).slice(2)}`;
+  const session = await adapter.createPaymentSession({
+    amount: input.amount,
+    currency: "USD",
+    country: "US",
+    ...(input.id ? { id: input.id } : {}),
+    ...(input.metadata ? { metadata: input.metadata } : {}),
+    ...(input.captureMethod ? { captureMethod: input.captureMethod } : {}),
+    idempotencyKey: `${key}-session`,
+  });
+  const info = await adapter.completePayment!({
+    pspSessionId: session.pspSessionId,
+    clientToken: `tok_${key}`,
+    idempotencyKey: `${key}-complete`,
+  });
+  return info.pspPaymentId;
+}
 
 // ---------------------------------------------------------------------------
 // The exact same conformance contract the Stripe adapter passes.
@@ -78,10 +109,22 @@ runServerAdapterConformanceTests(
       validHeaders: webhookFixture.headers,
       expectedType: "payment.succeeded",
       expectedEventId: "psf_evt_1",
+      expectedAmount: 1099,
+      unknownEvent: { rawBody: unknownWebhookFixture.rawBody, headers: unknownWebhookFixture.headers },
     },
     vault: {
       // Tokenize-first PSP: the client's single-use handle converts server-side.
       clientToken: () => `tok_single_${Math.random().toString(36).slice(2)}`,
+    },
+    money: {
+      completedPayment: (adapter, input) => completedPayment(adapter, input),
+      authorizedPayment: (adapter, input) =>
+        completedPayment(adapter, { amount: input.amount, captureMethod: "manual" }),
+      cancelablePayment: (adapter) => completedPayment(adapter, { amount: 1500, captureMethod: "manual" }),
+      // Documented Paysafe limitations: POST /payments strict-rejects extra
+      // fields, so the host id and metadata live in the signed session token
+      // only — neither survives onto the PSP object for retrievePayment.
+      expectations: { idRoundTrip: false, metadataEcho: false },
     },
     failingCalls: [
       {
@@ -112,6 +155,17 @@ runServerAdapterConformanceTests(
           return a.completePayment!({ pspSessionId: session.pspSessionId, clientToken: "tok_declined", idempotencyKey: "k3" });
         },
         expectedCode: "insufficient_funds",
+      },
+      {
+        name: "completePayment with an expired session context",
+        invoke: async (a) => {
+          const expired = await encodeSessionContext(
+            { v: 1, amount: 100, currency: "USD", captureMethod: "automatic", expiresAt: Date.now() - 1 },
+            SIGNING_KEY,
+          );
+          return a.completePayment!({ pspSessionId: expired, clientToken: "tok_ok", idempotencyKey: "k4" });
+        },
+        expectedCode: "session_expired",
       },
     ],
     idempotency: {
@@ -180,6 +234,7 @@ describe("PaysafeServerAdapter specifics", () => {
       idempotencyKey: "complete-1",
     });
     expect(info.status).toBe("succeeded"); // settleWithAuth: automatic capture
+    expect(info.amountCaptured).toBe(2500); // settled with the auth — fully captured
     expect(fake.lastRequestBody).toMatchObject({
       merchantRefNum: "complete-1",
       amount: 2500,
@@ -210,12 +265,13 @@ describe("PaysafeServerAdapter specifics", () => {
       idempotencyKey: "c1",
     });
     expect(authorized.status).toBe("requires_capture");
+    expect(authorized.amountCaptured).toBe(0);
+    expect(authorized.amountCapturable).toBe(4000);
 
-    // No idempotency key -> PayFanout derives `payfanout-capture-<id>`, which keeps
-    // the settlement statelessly rediscoverable for refunds/capturedAt.
-    const captured = await adapter.capturePayment(authorized.pspPaymentId, 4000);
+    const captured = await adapter.capturePayment(authorized.pspPaymentId, 4000, "cap-1");
     expect(captured.status).toBe("succeeded");
-    expect(captured.capturedAt).toBeDefined();
+    expect(captured.amountCaptured).toBe(4000);
+    expect(captured.amountCapturable).toBe(0);
   });
 
   it("cancels an authorized-but-uncaptured payment via voidauths", async () => {
@@ -231,7 +287,7 @@ describe("PaysafeServerAdapter specifics", () => {
       clientToken: "tok_1",
       idempotencyKey: "c1",
     });
-    const canceled = await adapter.cancelPayment(authorized.pspPaymentId);
+    const canceled = await adapter.cancelPayment(authorized.pspPaymentId, "void-1");
     expect(canceled.status).toBe("canceled");
   });
 
@@ -274,15 +330,18 @@ describe("PaysafeServerAdapter specifics", () => {
   });
 
   it("verifyPaymentMethod requires the clientToken (tokenize-first) and returns a zero-amount result", async () => {
-    const { adapter } = makePair();
+    const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession({ amount: 0, currency: "USD", idempotencyKey: "k" });
-    await expect(adapter.verifyPaymentMethod({ pspSessionId: session.pspSessionId })).rejects.toThrowError(
-      /tokenize-first/,
-    );
+    await expect(
+      adapter.verifyPaymentMethod({ pspSessionId: session.pspSessionId, idempotencyKey: "v1" }),
+    ).rejects.toThrowError(/tokenize-first/);
     const info = await adapter.verifyPaymentMethod({
       pspSessionId: session.pspSessionId,
       clientToken: "tok_verify",
+      idempotencyKey: "v2",
     });
+    // Paysafe 409s on verification refNum reuse — the caller key is the refNum.
+    expect(fake.lastRequestBody).toMatchObject({ merchantRefNum: "v2" });
     expect(info.status).toBe("succeeded");
     expect(info.amount).toBe(0);
     expect(info.amountRefunded).toBe(0);

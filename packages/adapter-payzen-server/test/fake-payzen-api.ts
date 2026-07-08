@@ -16,6 +16,8 @@
 interface FakeCardDetails {
   effectiveBrand: string;
   pan: string;
+  expiryMonth: number;
+  expiryYear: number;
   manualValidation: string;
   expectedCaptureDate: string | null;
   captureResponse: { captureDate: string | null; refundAmount: number } | null;
@@ -203,6 +205,8 @@ export class FakePayZenApi {
         cardDetails: {
           effectiveBrand: opts.card?.brand ?? "VISA",
           pan: opts.card?.pan ?? "497010XXXXXX0055",
+          expiryMonth: 6,
+          expiryYear: 2029,
           manualValidation: session.manualValidation ? "YES" : "NO",
           expectedCaptureDate: refused ? null : "2026-07-08T10:00:00+00:00",
           captureResponse: null,

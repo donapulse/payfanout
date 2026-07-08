@@ -7,6 +7,7 @@ import {
   type MinorUnitAmount,
   type PaymentInfo,
   type PaymentMethodCapability,
+  type PaymentMethodDetails,
   type PaymentSession,
   type RefundInfo,
   type RefundRequest,
@@ -109,6 +110,8 @@ export interface PayZenTransactionLike {
     cardDetails?: {
       effectiveBrand?: string;
       pan?: string;
+      expiryMonth?: number | null;
+      expiryYear?: number | null;
       manualValidation?: string;
       expectedCaptureDate?: string;
       captureResponse?: { captureDate?: string | null; refundAmount?: number | null };
@@ -200,6 +203,10 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
   getCapabilities(): AdapterCapabilities {
     return {
       pspName: this.pspName,
+      // Router pre-screen input: the platform currency table minus the
+      // adapter's CNY/KHR exclusions — exactly what createPaymentSession
+      // enforces locally.
+      supportedCurrencies: [...PAYZEN_CURRENCIES],
       supportsRefunds: true,
       supportsPartialRefunds: true,
       supportsManualCapture: true, // manualValidation:"YES" + Transaction/Validate
@@ -307,14 +314,14 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
    * Transaction/Capture is NOT this operation — it is a Brazil-specific batch
    * WS and must never be used here. Validation releases the full authorized
    * amount; PayZen has no partial validate, so a differing `amount` is
-   * rejected. `idempotencyKey` is accepted for interface parity but PayZen
-   * offers no channel to honor it (validating twice yields a status error,
-   * not a duplicate capture).
+   * rejected. The required `idempotencyKey` cannot be delegated — PayZen has
+   * no idempotency channel — but replays are naturally safe: validating twice
+   * yields a status error, never a duplicate capture.
    */
   async capturePayment(
     pspPaymentId: string,
-    amount?: MinorUnitAmount,
-    _idempotencyKey?: string,
+    amount: MinorUnitAmount | undefined,
+    _idempotencyKey: string,
   ): Promise<PaymentInfo> {
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
     const { transaction } = await this.resolveTransaction(pspPaymentId);
@@ -333,8 +340,12 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
     return this.toPaymentInfo(validated, refundedFromCaptureResponse(validated), validated);
   }
 
-  /** Pre-capture void via Transaction/Cancel; captured transactions come back PSP_075 → invalid_request. */
-  async cancelPayment(pspPaymentId: string, _idempotencyKey?: string): Promise<PaymentInfo> {
+  /**
+   * Pre-capture void via Transaction/Cancel; captured transactions come back
+   * PSP_075 → invalid_request. The required `idempotencyKey` has no PayZen
+   * channel; a replayed cancel is a PSP_105 state error, never a second effect.
+   */
+  async cancelPayment(pspPaymentId: string, _idempotencyKey: string): Promise<PaymentInfo> {
     const { transaction } = await this.resolveTransaction(pspPaymentId);
     const canceled = await this.call<PayZenTransactionLike>(
       "Transaction/Cancel",
@@ -464,6 +475,12 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
   private toPaymentInfo(tx: PayZenTransactionLike, amountRefunded: number, raw: unknown): PaymentInfo {
     const methodDetails = toPaymentMethodDetails(tx.transactionDetails?.cardDetails);
     const capturedAt = tx.transactionDetails?.cardDetails?.captureResponse?.captureDate;
+    const detailedStatus = (tx.detailedStatus ?? "").toUpperCase();
+    // Validation commits the FULL authorized amount to the capture batch, so
+    // AUTHORISED already reports as captured (the merchant has nothing left to
+    // do); AUTHORISED_TO_VALIDATE is the remainder Transaction/Validate can
+    // still release.
+    const captured = detailedStatus === "CAPTURED" || detailedStatus === "AUTHORISED";
     return {
       id: tx.metadata?.["payfanout_id"] ?? tx.orderDetails?.orderId ?? tx.uuid ?? "",
       pspName: this.pspName,
@@ -471,9 +488,14 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       status: mapPayZenDetailedStatus(tx.detailedStatus),
       amount: tx.amount ?? 0,
       amountRefunded,
+      ...(captured ? { amountCaptured: tx.amount ?? 0 } : {}),
+      ...(detailedStatus === "AUTHORISED_TO_VALIDATE" ? { amountCapturable: tx.amount ?? 0 } : {}),
       // Never fabricate a currency: empty is more honest when PayZen omits it.
       currency: (tx.currency ?? "").toUpperCase(),
       paymentMethodType: tx.paymentMethodType === "CARD" || !tx.paymentMethodType ? "card" : "other",
+      // Echoed verbatim as stored at the PSP — the payfanout_* stamps included
+      // (they are genuinely on the transaction and visible in the Back Office).
+      ...(tx.metadata && Object.keys(tx.metadata).length > 0 ? { metadata: tx.metadata } : {}),
       ...(methodDetails ? { paymentMethodDetails: methodDetails } : {}),
       createdAt: tx.creationDate ?? "1970-01-01T00:00:00.000Z",
       ...(capturedAt ? { capturedAt } : {}),
@@ -678,12 +700,14 @@ function refundedFromCaptureResponse(tx: PayZenTransactionLike): number {
 
 function toPaymentMethodDetails(
   card: NonNullable<PayZenTransactionLike["transactionDetails"]>["cardDetails"],
-): { brand?: string; last4?: string } | undefined {
+): PaymentMethodDetails | undefined {
   if (!card) return undefined;
   const last4 = /(\d{4})$/.exec(card.pan ?? "")?.[1];
-  const details = {
+  const details: PaymentMethodDetails = {
     ...(card.effectiveBrand ? { brand: card.effectiveBrand.toLowerCase() } : {}),
     ...(last4 ? { last4 } : {}),
+    ...(typeof card.expiryMonth === "number" ? { expMonth: card.expiryMonth } : {}),
+    ...(typeof card.expiryYear === "number" ? { expYear: card.expiryYear } : {}),
   };
   return Object.keys(details).length > 0 ? details : undefined;
 }
@@ -737,7 +761,7 @@ const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
   PSP_010: "invalid_request", // transaction not found
   PSP_015: "invalid_request", // too many results (Order/Get > 30 transactions)
   PSP_100: "invalid_request", // REST API not enabled on the shop
-  PSP_108: "invalid_request", // formToken expired (> 15 min)
+  PSP_108: "session_expired", // formToken outlived its ~15 min — create a fresh session
   PSP_109: "invalid_request", // production mode not activated
   PSP_610: "invalid_request", // no acceptance agreement (currency/config)
   // State-machine rejections: retrying cannot succeed — never retryable.
@@ -806,6 +830,8 @@ function userMessageFor(code: UnifiedErrorCode): string {
       return "Your card was declined.";
     case "authentication_required":
       return "Additional authentication is required.";
+    case "session_expired":
+      return "Your payment session has expired — please start again.";
     case "rate_limited":
       return "Too many requests — please retry shortly.";
     case "processing_error":

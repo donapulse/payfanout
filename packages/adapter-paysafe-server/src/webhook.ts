@@ -60,7 +60,15 @@ interface PaysafeWebhookBody {
   resourceId?: string;
   txnTime?: string;
   eventDate?: string;
-  payload?: { id?: string; status?: string; txnTime?: string; merchantRefNum?: string };
+  payload?: {
+    id?: string;
+    status?: string;
+    txnTime?: string;
+    merchantRefNum?: string;
+    /** Integer minor units, as everywhere in the Paysafe API. */
+    amount?: number;
+    currencyCode?: string;
+  };
 }
 
 export async function parsePaysafeWebhookEvent(rawBody: string): Promise<UnifiedWebhookEvent> {
@@ -88,6 +96,10 @@ export async function parsePaysafeWebhookEvent(rawBody: string): Promise<Unified
 
   const rawType = (body.eventType ?? body.event ?? "").toUpperCase().replace(/[.\s-]/g, "_");
   const type = mapEventType(rawType);
+  const amount = body.payload?.amount;
+  const currency = body.payload?.currencyCode;
+  // On refund events the payload IS the refund object, so its id is the refund id.
+  const isRefundEvent = type === "payment.refunded" || type === "payment.refund_failed";
 
   return {
     // Stable dedupe key even if Paysafe omits an event id: hash of the exact raw bytes.
@@ -95,6 +107,9 @@ export async function parsePaysafeWebhookEvent(rawBody: string): Promise<Unified
     pspName: "paysafe",
     type,
     pspPaymentId: body.payload?.id ?? body.resourceId,
+    ...(typeof amount === "number" && Number.isSafeInteger(amount) ? { amount } : {}),
+    ...(typeof currency === "string" && currency !== "" ? { currency: currency.toUpperCase() } : {}),
+    ...(isRefundEvent && body.payload?.id ? { refundId: body.payload.id } : {}),
     occurredAt: normalizeTime(body.txnTime ?? body.eventDate ?? body.payload?.txnTime),
     raw: body,
   };

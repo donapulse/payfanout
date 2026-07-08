@@ -71,3 +71,14 @@ describe("screenSessionInput", () => {
     ).toBeUndefined();
   });
 });
+
+describe("screenSessionInput — supportedCurrencies", () => {
+  it("screens hard currency constraints case-insensitively; absent means unrestricted", () => {
+    const constrained = caps({ supportedCurrencies: ["GBP", "EUR"] });
+    expect(screenSessionInput(constrained, input({ currency: "USD" }))).toMatch(/does not support currency USD/);
+    expect(screenSessionInput(constrained, input({ currency: "gbp" }))).toBeUndefined();
+    expect(screenSessionInput(constrained, input({ currency: " EUR " }))).toBeUndefined();
+    expect(screenSessionInput(caps(), input({ currency: "XCD" }))).toBeUndefined();
+    expect(screenSessionInput(caps({ supportedCurrencies: [] }), input({ currency: "XCD" }))).toBeUndefined();
+  });
+});

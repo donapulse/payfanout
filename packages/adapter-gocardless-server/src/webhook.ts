@@ -77,6 +77,7 @@ export function parseGoCardlessWebhookEvents(rawBody: string): UnifiedWebhookEve
 /** Shared normalizer: webhook deliveries and GET /events map identically. */
 export function normalizeGoCardlessEvent(event: GoCardlessEventLike): UnifiedWebhookEvent {
   const links = event.links ?? {};
+  const refundId = links["refund"];
   return {
     // GoCardless event ids (EV...) are globally unique — THE dedupe key. The
     // fallback hash keeps ids stable across parses if one is ever missing.
@@ -84,6 +85,9 @@ export function normalizeGoCardlessEvent(event: GoCardlessEventLike): UnifiedWeb
     pspName: "gocardless",
     type: mapEventType(event.resource_type ?? "", event.action ?? ""),
     pspPaymentId: links["payment"] ?? links["payment_request_payment"],
+    // No amount/currency: GoCardless events carry links + details only, never
+    // money fields — money truth stays on retrievePayment/retrieveRefund.
+    ...(refundId ? { refundId } : {}),
     occurredAt: normalizeTime(event.created_at),
     raw: event,
   };

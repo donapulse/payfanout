@@ -41,6 +41,18 @@ const webhookFixture = signedDelivery([
   },
 ]);
 
+// Valid, correctly signed, but not a payer-state change this adapter maps.
+const unknownEventFixture = signedDelivery([
+  {
+    id: "EV_CONFORMANCE_UNKNOWN",
+    created_at: "2026-07-07T10:00:00.000Z",
+    resource_type: "mandates",
+    action: "cancelled",
+    links: { mandate: "MD123" },
+    details: { origin: "bank", cause: "bank_account_disabled" },
+  },
+]);
+
 // ---------------------------------------------------------------------------
 // The exact same conformance contract the Stripe and Paysafe adapters pass.
 // ---------------------------------------------------------------------------
@@ -67,6 +79,38 @@ runServerAdapterConformanceTests(
       validHeaders: webhookFixture.headers,
       expectedType: "payment.succeeded",
       expectedEventId: "EV_CONFORMANCE_1",
+      // No expectedAmount: GoCardless events carry no money fields at all.
+      unknownEvent: { rawBody: unknownEventFixture.rawBody, headers: unknownEventFixture.headers },
+    },
+    money: {
+      // Same path a payer takes: hosted flow fulfils the billing request into
+      // a payment, then the bank collects (confirmed) — the refundable state.
+      completedPayment: async (adapter, { amount, id, metadata }) => {
+        const session = await adapter.createPaymentSession({
+          id,
+          amount,
+          currency: "GBP",
+          returnUrl: RETURN_URL,
+          metadata,
+          idempotencyKey: `k-completed-${id}`,
+        });
+        const { paymentId } = lastFake.fulfilBillingRequest(session.pspSessionId);
+        lastFake.confirmPayment(paymentId);
+        return paymentId;
+      },
+      // A pending billing request — the payer has not authorised at the bank.
+      cancelablePayment: async (adapter) => {
+        const session = await adapter.createPaymentSession({
+          amount: 1500,
+          currency: "GBP",
+          returnUrl: RETURN_URL,
+          idempotencyKey: "k-cancelable",
+        });
+        return session.pspSessionId;
+      },
+      // No authorizedPayment: bank debits have no authorize-then-capture split.
+      // id round-trip and metadata echo both hold — payfanout_id and host keys
+      // ride payment_request.metadata onto the payment GoCardless creates.
     },
     failingCalls: [
       {
@@ -101,7 +145,7 @@ runServerAdapterConformanceTests(
           });
           const { paymentId } = lastFake.fulfilBillingRequest(session.pspSessionId);
           lastFake.confirmPayment(paymentId); // confirmed payments cannot cancel
-          return a.cancelPayment(paymentId);
+          return a.cancelPayment(paymentId, "k-cancel-422-key");
         },
         expectedCode: "invalid_request",
       },
@@ -225,11 +269,44 @@ describe("GoCardlessServerAdapter specifics", () => {
     });
     const info = await adapter.retrievePayment(session.pspSessionId);
     expect(info.id).toBe("order-42"); // payfanout_id round-trips via metadata
-    const raw = info.raw as { metadata?: Record<string, string>; payment_request?: { description?: string }; fallback_enabled?: boolean };
+    expect(info.metadata).toEqual({ payfanout_id: "order-42" }); // echoed as stored
+    const raw = info.raw as {
+      metadata?: Record<string, string>;
+      payment_request?: { description?: string; metadata?: Record<string, string> };
+      fallback_enabled?: boolean;
+    };
     expect(raw.metadata).toEqual({ payfanout_id: "order-42" });
+    // Stamped on payment_request too — GoCardless stores it on the payment.
+    expect(raw.payment_request?.metadata).toEqual({ payfanout_id: "order-42" });
     expect(raw.payment_request?.description).toBe("ACME 42");
     expect(raw.fallback_enabled).toBe(true);
     expect(fake.uniqueBillingRequestCreations).toBe(1);
+  });
+
+  it("echoes PSP-stored metadata on the payment, capping at GoCardless's 3 keys", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({
+      id: "order-meta",
+      amount: 1000,
+      currency: "GBP",
+      returnUrl: RETURN_URL,
+      metadata: { plan: "pro", seats: "3", promo: "spring" },
+      idempotencyKey: "k",
+    });
+    const { paymentId } = fake.fulfilBillingRequest(session.pspSessionId);
+    fake.confirmPayment(paymentId);
+    const info = await adapter.retrievePayment(paymentId);
+    expect(info.id).toBe("order-meta");
+    // payfanout_id claims a slot; "promo" overflowed the 3-key cap and was withheld.
+    expect(info.metadata).toEqual({ payfanout_id: "order-meta", plan: "pro", seats: "3" });
+    // Bank debits: no capture split, so the capture money facts stay absent.
+    expect(info.amountCaptured).toBeUndefined();
+    expect(info.amountCapturable).toBeUndefined();
+  });
+
+  it("declares the one-off GBP/EUR constraint for router pre-screening", () => {
+    const { adapter } = makePair();
+    expect(adapter.getCapabilities().supportedCurrencies).toEqual(["GBP", "EUR"]);
   });
 
   it("resolves the whole redirect round-trip: requires_action -> processing -> succeeded", async () => {
@@ -283,7 +360,7 @@ describe("GoCardlessServerAdapter specifics", () => {
     expect(withoutMandate.mandateReference).toBeUndefined();
   });
 
-  it("cancels a billing request pre-fulfilment and a pending_submission payment", async () => {
+  it("cancels either stage, threading the Idempotency-Key onto the action POST", async () => {
     const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession({
       amount: 1000,
@@ -291,8 +368,12 @@ describe("GoCardlessServerAdapter specifics", () => {
       returnUrl: RETURN_URL,
       idempotencyKey: "k1",
     });
-    const canceledSession = await adapter.cancelPayment(session.pspSessionId);
+    const canceledSession = await adapter.cancelPayment(session.pspSessionId, "cancel-br-key");
     expect(canceledSession.status).toBe("canceled");
+    expect(fake.idempotencyKeysSeen).toContainEqual({
+      path: `/billing_requests/${session.pspSessionId}/actions/cancel`,
+      key: "cancel-br-key",
+    });
 
     const other = await adapter.createPaymentSession({
       amount: 2000,
@@ -301,9 +382,14 @@ describe("GoCardlessServerAdapter specifics", () => {
       idempotencyKey: "k2",
     });
     const { paymentId } = fake.fulfilBillingRequest(other.pspSessionId);
-    const canceledPayment = await adapter.cancelPayment(paymentId); // pending_submission cancels
+    // pending_submission cancels
+    const canceledPayment = await adapter.cancelPayment(paymentId, "cancel-pm-key");
     expect(canceledPayment.status).toBe("canceled");
     expect(canceledPayment.pspPaymentId).toBe(paymentId);
+    expect(fake.idempotencyKeysSeen).toContainEqual({
+      path: `/payments/${paymentId}/actions/cancel`,
+      key: "cancel-pm-key",
+    });
   });
 
   it("computes total_amount_confirmation across partial-after-partial refunds", async () => {

@@ -44,7 +44,7 @@ describe("StripeServerAdapter edges", () => {
     ).rejects.toThrowError(/does not support payment method type "paysafecard"/);
   });
 
-  it("passes canonical refund reasons through and tunnels custom ones via metadata", async () => {
+  it("passes every canonical refund reason through in Stripe's own vocabulary", async () => {
     const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession({ amount: 1000, currency: "USD", idempotencyKey: "k" });
     fake.simulateClientConfirm(session.pspSessionId);
@@ -56,22 +56,33 @@ describe("StripeServerAdapter edges", () => {
       return realCreate(params, opts);
     };
 
+    // RefundReason is exactly Stripe's refund-reason enum — sent verbatim.
     await adapter.refundPayment({
       pspPaymentId: session.pspSessionId,
       amount: 100,
       reason: "requested_by_customer",
       idempotencyKey: "r1",
     });
-    expect(captured[0]!["reason"]).toBe("requested_by_customer");
-
     await adapter.refundPayment({
       pspPaymentId: session.pspSessionId,
       amount: 100,
-      reason: "customer changed their mind twice",
+      reason: "duplicate",
       idempotencyKey: "r2",
     });
-    expect(captured[1]!["reason"]).toBeUndefined();
-    expect(captured[1]!["metadata"]).toEqual({ payfanout_reason: "customer changed their mind twice" });
+    await adapter.refundPayment({
+      pspPaymentId: session.pspSessionId,
+      amount: 100,
+      reason: "fraudulent",
+      idempotencyKey: "r3",
+    });
+    await adapter.refundPayment({ pspPaymentId: session.pspSessionId, amount: 100, idempotencyKey: "r4" });
+    expect(captured.map((params) => params["reason"])).toEqual([
+      "requested_by_customer",
+      "duplicate",
+      "fraudulent",
+      undefined,
+    ]);
+    expect(captured[3]).not.toHaveProperty("reason");
   });
 
   it("tolerates an unexpanded latest_charge (string) without inventing refund data", async () => {

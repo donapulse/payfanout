@@ -155,7 +155,7 @@ describeIf("Stripe sandbox integration", () => {
     await rawStripe().setupIntents.confirm(session.pspSessionId, { payment_method: "pm_card_visa" });
 
     // Must not throw — validates the detach-on-unattached handling against reality.
-    const info = await adapter.verifyPaymentMethod({ pspSessionId: session.pspSessionId });
+    const info = await adapter.verifyPaymentMethod({ pspSessionId: session.pspSessionId, idempotencyKey: key() });
     expect(info.status).toBe("succeeded");
     expect(info.amount).toBe(0);
 

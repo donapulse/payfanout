@@ -152,6 +152,11 @@ export async function parsePayZenWebhookEvent(
     pspName: "payzen",
     type: mapEventType(tx),
     ...(pspPaymentIdOf(tx) !== undefined ? { pspPaymentId: pspPaymentIdOf(tx) } : {}),
+    // Money facts ride the notified transaction: on a CREDIT the amount is the
+    // refunded amount and the credit's own uuid is the refund id.
+    ...(typeof tx?.amount === "number" ? { amount: tx.amount } : {}),
+    ...(tx?.currency ? { currency: tx.currency.toUpperCase() } : {}),
+    ...(tx?.operationType === "CREDIT" && tx.uuid ? { refundId: tx.uuid } : {}),
     occurredAt: normalizeTime(body.serverDate ?? tx?.creationDate),
     raw: body,
   };

@@ -124,6 +124,7 @@ export class PaymentService {
       throw guardError(
         pspName,
         "savePaymentMethod requires `customer` — create one with createCustomer first",
+        "invalid_request",
       );
     }
     return this.run(pspName, "createPaymentSession", () => adapter.createPaymentSession(input));
@@ -177,7 +178,7 @@ export class PaymentService {
     const adapter = this.vaultAdapter(pspName, "chargeSavedPaymentMethod");
     assertMinorUnitAmount(input.amount, "amount");
     if (input.amount === 0) {
-      throw guardError(pspName, "chargeSavedPaymentMethod requires a positive amount");
+      throw guardError(pspName, "chargeSavedPaymentMethod requires a positive amount", "invalid_request");
     }
     requireIdempotencyKey(input.idempotencyKey, "chargeSavedPaymentMethod");
     return this.run(pspName, "chargeSavedPaymentMethod", () => adapter.chargeSavedPaymentMethod!(input));
@@ -227,24 +228,27 @@ export class PaymentService {
     return this.run(pspName, "retrievePayment", () => adapter.retrievePayment(pspPaymentId));
   }
 
+  /** Capture is a charge — the idempotency key is required, per-capture under multi-capture. */
   async capturePayment(
     pspName: string,
     pspPaymentId: string,
-    amount?: MinorUnitAmount,
-    idempotencyKey?: string,
+    amount: MinorUnitAmount | undefined,
+    idempotencyKey: string,
   ): Promise<PaymentInfo> {
     const adapter = this.adapterFor(pspName);
     if (!adapter.getCapabilities().supportsManualCapture || !adapter.capturePayment) {
       throw guardError(pspName, `"${pspName}" does not support manual capture`);
     }
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
+    requireIdempotencyKey(idempotencyKey, "capturePayment");
     return this.run(pspName, "capturePayment", () =>
       adapter.capturePayment!(pspPaymentId, amount, idempotencyKey),
     );
   }
 
-  async cancelPayment(pspName: string, pspPaymentId: string, idempotencyKey?: string): Promise<PaymentInfo> {
+  async cancelPayment(pspName: string, pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
     const adapter = this.adapterFor(pspName);
+    requireIdempotencyKey(idempotencyKey, "cancelPayment");
     return this.run(pspName, "cancelPayment", () => adapter.cancelPayment(pspPaymentId, idempotencyKey));
   }
 
@@ -281,6 +285,7 @@ export class PaymentService {
     if (!adapter.getCapabilities().supportsPaymentMethodVerification || !adapter.verifyPaymentMethod) {
       throw guardError(pspName, `"${pspName}" does not support payment method verification`);
     }
+    requireIdempotencyKey(input.idempotencyKey, "verifyPaymentMethod");
     return this.run(pspName, "verifyPaymentMethod", () => adapter.verifyPaymentMethod!(input));
   }
 
@@ -363,8 +368,13 @@ function requireIdempotencyKey(key: string, operation: string): void {
   }
 }
 
-function guardError(pspName: string, message: string): PayFanoutError {
-  return new PayFanoutError({ code: "invalid_request", message, retryable: false, pspName });
+/** Capability guards reject with unsupported_operation; input-shape problems pass invalid_request. */
+function guardError(
+  pspName: string,
+  message: string,
+  code: UnifiedErrorCode = "unsupported_operation",
+): PayFanoutError {
+  return new PayFanoutError({ code, message, retryable: false, pspName });
 }
 
 /**

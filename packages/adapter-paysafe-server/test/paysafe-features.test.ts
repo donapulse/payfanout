@@ -40,7 +40,7 @@ describe("Paysafe session TTL", () => {
     expect(context.expiresAt).toBe(t0 + 900_000);
   });
 
-  it("completePayment rejects an expired session with a user-safe invalid_request", async () => {
+  it("completePayment rejects an expired session with session_expired (host: create a fresh session)", async () => {
     let now = Date.parse("2026-07-04T12:00:00Z");
     const { adapter } = makePair({ now: () => now, sessionTtlSeconds: 60 });
     const session = await adapter.createPaymentSession(sessionInput);
@@ -55,7 +55,8 @@ describe("Paysafe session TTL", () => {
     } catch (err) {
       expect(isPayFanoutError(err)).toBe(true);
       if (isPayFanoutError(err)) {
-        expect(err.code).toBe("invalid_request");
+        expect(err.code).toBe("session_expired");
+        expect(err.retryable).toBe(false); // recovered by a new session, not by replay
         expect(err.message).toMatch(/expired/);
       }
     }
@@ -67,8 +68,8 @@ describe("Paysafe session TTL", () => {
     const session = await adapter.createPaymentSession(sessionInput);
     now += 3600_000 + 1; // default TTL is one hour
     await expect(
-      adapter.verifyPaymentMethod({ pspSessionId: session.pspSessionId, clientToken: "tok_ok" }),
-    ).rejects.toThrowError(/expired/);
+      adapter.verifyPaymentMethod({ pspSessionId: session.pspSessionId, clientToken: "tok_ok", idempotencyKey: "k-v" }),
+    ).rejects.toMatchObject({ code: "session_expired" });
   });
 
   it("a session completed within its TTL still works", async () => {
@@ -264,11 +265,30 @@ describe("Paysafe multi-capture (partial settlements)", () => {
     const first = await adapter.capturePayment(authorized.pspPaymentId, 700, "k-cap-1");
     expect(first.status).toBe("succeeded");
     expect(first.amount).toBe(700);
+    expect(first.amountCaptured).toBe(700);
+    expect(first.amountCapturable).toBe(1300);
 
     const second = await adapter.capturePayment(authorized.pspPaymentId, 500, "k-cap-2");
-    expect(second.amount).toBe(1200); // cumulative settled funds
+    expect(second.amountCaptured).toBe(1200); // cumulative settled funds
+    expect(second.amountCapturable).toBe(800);
 
     expect(adapter.getCapabilities().supportsMultiCapture).toBe(true);
+  });
+
+  it("captures the full remaining authorization when no amount is given, replay-safe per key", async () => {
+    const { adapter } = makePair();
+    const session = await adapter.createPaymentSession({ ...sessionInput, captureMethod: "manual" });
+    const authorized = await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: "tok_ok",
+      idempotencyKey: "k-auth",
+    });
+    const captured = await adapter.capturePayment(authorized.pspPaymentId, undefined, "k-cap-all");
+    expect(captured.status).toBe("succeeded");
+    expect(captured.amountCaptured).toBe(2000);
+    // Same key -> same merchantRefNum -> the PSP replays the settlement, no double charge.
+    const replay = await adapter.capturePayment(authorized.pspPaymentId, undefined, "k-cap-all");
+    expect(replay.amountCaptured).toBe(2000);
   });
 
   it("releases the un-captured remainder: partial settle -> cancelPayment voids the rest, settled funds stay", async () => {
@@ -279,18 +299,18 @@ describe("Paysafe multi-capture (partial settlements)", () => {
       clientToken: "tok_ok",
       idempotencyKey: "k-auth",
     });
-    // Default capture key (payfanout-capture-<id>) keeps the settlement rediscoverable.
-    const captured = await adapter.capturePayment(authorized.pspPaymentId, 700);
+    const captured = await adapter.capturePayment(authorized.pspPaymentId, 700, "k-cap");
     expect(captured.amount).toBe(700);
 
     const released = await adapter.cancelPayment(authorized.pspPaymentId, "k-void");
-    // NOT canceled — the settled 700 stands, the 1300 remainder is gone.
+    // NOT canceled — the settled 700 stands, the 1300 remainder is gone. The
+    // returned info derives the split from the pre-void remainder (caller-keyed
+    // settlements are not rediscoverable statelessly on later retrieves).
     expect(released.status).toBe("succeeded");
     expect(released.amount).toBe(700);
-
-    const final = await adapter.retrievePayment(authorized.pspPaymentId);
-    expect(final.amount).toBe(700);
-    expect((final.raw as { availableToSettle?: number }).availableToSettle).toBe(0);
+    expect(released.amountCaptured).toBe(700);
+    expect(released.amountCapturable).toBe(0);
+    expect((released.raw as { availableToSettle?: number }).availableToSettle).toBe(0);
   });
 
   it("a capture beyond the remaining authorization is rejected by the PSP", async () => {
@@ -349,7 +369,7 @@ describe("Paysafe network timeouts", () => {
 });
 
 describe("Paysafe payment method details", () => {
-  it("maps card.type/lastDigits onto brand/last4", async () => {
+  it("maps card.type/lastDigits/cardExpiry onto brand/last4/expMonth/expYear", async () => {
     const { adapter } = makePair();
     const session = await adapter.createPaymentSession(sessionInput);
     const info = await adapter.completePayment({
@@ -357,10 +377,10 @@ describe("Paysafe payment method details", () => {
       clientToken: "tok_ok",
       idempotencyKey: "k-complete",
     });
-    expect(info.paymentMethodDetails).toEqual({ brand: "visa", last4: "1111" });
+    expect(info.paymentMethodDetails).toEqual({ brand: "visa", last4: "1111", expMonth: 12, expYear: 2030 });
   });
 
-  it("prefers an explicit cardBrand and tolerates unknown type codes", async () => {
+  it("prefers an explicit cardBrand and tolerates unknown type codes and absent expiry", async () => {
     const withCard = (card: Record<string, unknown>): PaysafeServerAdapterConfig["fetch"] =>
       async () =>
         new Response(JSON.stringify({ id: "pay_1", amount: 100, currencyCode: "USD", status: "COMPLETED", settleWithAuth: true, card }), { status: 200 });
@@ -369,11 +389,13 @@ describe("Paysafe payment method details", () => {
       username: "u", password: "p", environment: "sandbox",
       merchantAccountResolver: () => undefined,
       sessionSigningKey: SIGNING_KEY, webhookHmacKey: WEBHOOK_KEY,
-      fetch: withCard({ cardBrand: "Mastercard", lastDigits: "5100" }),
+      fetch: withCard({ cardBrand: "Mastercard", lastDigits: "5100", cardExpiry: { month: 3, year: 2031 } }),
     });
     expect((await branded.retrievePayment("pay_1")).paymentMethodDetails).toEqual({
       brand: "mastercard",
       last4: "5100",
+      expMonth: 3,
+      expYear: 2031,
     });
 
     const unknownType = new PaysafeServerAdapter({
@@ -541,7 +563,7 @@ describe("Paysafe Customer Vault", () => {
       idempotencyKey: "k-save",
     });
     expect(saved.token).toMatch(/^MU/);
-    expect(saved.details).toEqual({ brand: "visa", last4: "1111" });
+    expect(saved.details).toEqual({ brand: "visa", last4: "1111", expMonth: 12, expYear: 2030 });
 
     const listed = await adapter.listSavedPaymentMethods(customer.pspCustomerId);
     expect(listed.map((m) => m.token)).toEqual([saved.token]);
@@ -699,18 +721,33 @@ describe("Paysafe webhook rotation + refund_failed mapping", () => {
     expect(() => makePair({ webhookHmacKey: [] })).toThrowError(/webhookHmacKey/);
   });
 
-  it("maps refund failure events to payment.refund_failed", async () => {
+  it("maps refund failure events to payment.refund_failed, carrying the refund's money facts", async () => {
     const { adapter } = makePair();
     for (const eventType of ["REFUND_FAILED", "REFUND.DECLINED", "refund_error"]) {
       const event = await adapter.parseWebhookEvent(
-        JSON.stringify({ id: `evt-${eventType}`, eventType, payload: { id: "ref_1" } }),
+        JSON.stringify({ id: `evt-${eventType}`, eventType, payload: { id: "ref_1", amount: 450, currencyCode: "usd" } }),
       );
       expect(event.type, eventType).toBe("payment.refund_failed");
       expect(event.pspPaymentId).toBe("ref_1");
+      expect(event.refundId).toBe("ref_1");
+      expect(event.amount).toBe(450);
+      expect(event.currency).toBe("USD");
     }
     const completed = await adapter.parseWebhookEvent(
-      JSON.stringify({ id: "evt-ok", eventType: "REFUND_COMPLETED", payload: { id: "ref_1" } }),
+      JSON.stringify({ id: "evt-ok", eventType: "REFUND_COMPLETED", payload: { id: "ref_1", amount: 450 } }),
     );
     expect(completed.type).toBe("payment.refunded");
+    expect(completed.refundId).toBe("ref_1");
+    expect(completed.amount).toBe(450);
+  });
+
+  it("keeps money facts off events whose payloads do not carry them (never fabricated)", async () => {
+    const { adapter } = makePair();
+    const event = await adapter.parseWebhookEvent(
+      JSON.stringify({ id: "evt-bare", eventType: "PAYMENT_COMPLETED", payload: { id: "pay_1", amount: 10.5 } }),
+    );
+    expect(event.amount).toBeUndefined(); // non-integer amounts are dropped, not rounded
+    expect(event.currency).toBeUndefined();
+    expect(event.refundId).toBeUndefined(); // not a refund-shaped event
   });
 });

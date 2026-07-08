@@ -200,44 +200,36 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
 
   async capturePayment(
     pspPaymentId: string,
-    amount?: MinorUnitAmount,
-    idempotencyKey?: string,
+    amount: MinorUnitAmount | undefined,
+    idempotencyKey: string,
   ): Promise<PaymentInfo> {
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
     return this.run(async (client) => {
       const pi = await client.paymentIntents.capture(
         pspPaymentId,
         amount !== undefined ? { amount_to_capture: amount } : {},
-        idempotencyKey ? { idempotencyKey } : undefined,
+        { idempotencyKey },
       );
       return this.toPaymentInfo(pi);
     });
   }
 
-  async cancelPayment(pspPaymentId: string, idempotencyKey?: string): Promise<PaymentInfo> {
+  async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
     return this.run(async (client) => {
-      const pi = await client.paymentIntents.cancel(
-        pspPaymentId,
-        {},
-        idempotencyKey ? { idempotencyKey } : undefined,
-      );
+      const pi = await client.paymentIntents.cancel(pspPaymentId, {}, { idempotencyKey });
       return this.toPaymentInfo(pi);
     });
   }
 
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
     if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
-    const stripeReasons = new Set(["duplicate", "fraudulent", "requested_by_customer"]);
     return this.run(async (client) => {
       const refund = await client.refunds.create(
         {
           payment_intent: req.pspPaymentId,
           ...(req.amount !== undefined ? { amount: req.amount } : {}),
-          ...(req.reason && stripeReasons.has(req.reason)
-            ? { reason: req.reason }
-            : req.reason
-              ? { metadata: { payfanout_reason: req.reason } }
-              : {}),
+          // RefundReason is exactly Stripe's own vocabulary — passed through as-is.
+          ...(req.reason ? { reason: req.reason } : {}),
         },
         { idempotencyKey: req.idempotencyKey },
       );
@@ -570,11 +562,14 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       // derived against collected funds, so that wins once it exists.
       amount: pi.amount_received && pi.amount_received > 0 ? pi.amount_received : pi.amount,
       amountRefunded: charge?.amount_refunded ?? 0,
+      ...(pi.amount_received !== undefined ? { amountCaptured: pi.amount_received } : {}),
+      ...(pi.amount_capturable !== undefined ? { amountCapturable: pi.amount_capturable } : {}),
       currency: pi.currency.toUpperCase(),
       paymentMethodType:
         (chargeType ? STRIPE_CHARGE_TYPE_TO_UNIFIED[chargeType] : undefined) ??
         (pi.payment_method_types?.[0] ? STRIPE_CHARGE_TYPE_TO_UNIFIED[pi.payment_method_types[0]] : undefined) ??
         "other",
+      ...(pi.metadata && Object.keys(pi.metadata).length > 0 ? { metadata: pi.metadata } : {}),
       ...(methodDetails ? { paymentMethodDetails: methodDetails } : {}),
       ...(mandateReference ? { mandateReference } : {}),
       ...(savedPaymentMethodToken ? { savedPaymentMethodToken } : {}),
@@ -688,19 +683,18 @@ function toSavedPaymentMethod(
   pspCustomerId: string,
   pm: StripePaymentMethodLike,
 ): SavedPaymentMethod {
+  const details: PaymentMethodDetails = {
+    ...(pm.card?.brand ? { brand: pm.card.brand.toLowerCase() } : {}),
+    ...(pm.card?.last4 ? { last4: pm.card.last4 } : {}),
+    ...(pm.card?.exp_month ? { expMonth: pm.card.exp_month } : {}),
+    ...(pm.card?.exp_year ? { expYear: pm.card.exp_year } : {}),
+  };
   return {
     token: pm.id,
     pspName,
     pspCustomerId,
     paymentMethodType: pm.type && STRIPE_CHARGE_TYPE_TO_UNIFIED[pm.type] ? STRIPE_CHARGE_TYPE_TO_UNIFIED[pm.type]! : "card",
-    ...(pm.card?.brand || pm.card?.last4
-      ? {
-          details: {
-            ...(pm.card.brand ? { brand: pm.card.brand.toLowerCase() } : {}),
-            ...(pm.card.last4 ? { last4: pm.card.last4 } : {}),
-          },
-        }
-      : {}),
+    ...(Object.keys(details).length > 0 ? { details } : {}),
     ...(pm.created ? { createdAt: new Date(pm.created * 1000).toISOString() } : {}),
     raw: pm,
   };
@@ -753,6 +747,8 @@ function toPaymentMethodDetails(charge: StripeChargeLike | undefined): PaymentMe
     ...(card.brand ? { brand: card.brand.toLowerCase() } : {}),
     ...(card.last4 ? { last4: card.last4 } : {}),
     ...(card.wallet?.type ? { wallet: card.wallet.type } : {}),
+    ...(card.exp_month ? { expMonth: card.exp_month } : {}),
+    ...(card.exp_year ? { expYear: card.exp_year } : {}),
   };
   return Object.keys(details).length > 0 ? details : undefined;
 }

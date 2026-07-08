@@ -134,7 +134,7 @@ describe("GoCardless status mapping", () => {
     expect((await adapter.retrievePayment(pending)).status).toBe("requires_action");
 
     const cancelled = await make();
-    await adapter.cancelPayment(cancelled);
+    await adapter.cancelPayment(cancelled, "k-cancel-br");
     expect((await adapter.retrievePayment(cancelled)).status).toBe("canceled");
 
     // Fulfilled with the payment link not landed yet = money is underway.
@@ -377,6 +377,33 @@ describe("GoCardless webhook parsing (batched deliveries)", () => {
       );
       expect(event!.type, `${resourceType}/${action}`).toBe(expected);
     }
+  });
+
+  it("carries the refund id on refund events and never invents money facts", () => {
+    const [paid] = parseGoCardlessWebhookEvents(
+      JSON.stringify({
+        events: [
+          {
+            id: "EV_R1",
+            created_at: "2026-07-07T10:00:00.000Z",
+            resource_type: "refunds",
+            action: "paid",
+            links: { refund: "RF77", payment: "PM77" },
+          },
+        ],
+      }),
+    );
+    expect(paid).toMatchObject({ type: "payment.refunded", refundId: "RF77", pspPaymentId: "PM77" });
+    // GoCardless events carry no amount/currency — the normalizer must not guess.
+    expect(paid!.amount).toBeUndefined();
+    expect(paid!.currency).toBeUndefined();
+
+    const [confirmed] = parseGoCardlessWebhookEvents(
+      JSON.stringify({
+        events: [{ id: "EV_P1", resource_type: "payments", action: "confirmed", links: { payment: "PM1" } }],
+      }),
+    );
+    expect(confirmed!.refundId).toBeUndefined();
   });
 
   it("takes pspPaymentId from links.payment, else links.payment_request_payment", () => {

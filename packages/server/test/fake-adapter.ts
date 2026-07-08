@@ -22,6 +22,7 @@ import type {
   ServerPaymentAdapter,
   UnifiedWebhookEvent,
   UpdatePaymentSessionInput,
+  VerifyPaymentMethodInput,
 } from "@payfanout/core";
 
 export interface FakeAdapterOptions {
@@ -56,8 +57,8 @@ export class FakeAdapter implements ServerPaymentAdapter {
   private readonly webhookSecret: string;
 
   completePayment?: (input: CompletePaymentInput) => Promise<PaymentInfo>;
-  capturePayment?: (id: string, amount?: MinorUnitAmount, key?: string) => Promise<PaymentInfo>;
-  verifyPaymentMethod?: (input: { pspSessionId: string; clientToken?: string }) => Promise<PaymentInfo>;
+  capturePayment?: (id: string, amount: MinorUnitAmount | undefined, key: string) => Promise<PaymentInfo>;
+  verifyPaymentMethod?: (input: VerifyPaymentMethodInput) => Promise<PaymentInfo>;
   retrieveRefund?: (refundId: string) => Promise<RefundInfo>;
   updatePaymentSession?: (input: UpdatePaymentSessionInput) => Promise<PaymentSession>;
   fetchEvents?: (input?: FetchEventsInput) => Promise<FetchEventsResult>;
@@ -215,7 +216,7 @@ export class FakeAdapter implements ServerPaymentAdapter {
     return makePaymentInfo({ pspName: this.pspName, pspPaymentId });
   }
 
-  async cancelPayment(pspPaymentId: string, idempotencyKey?: string): Promise<PaymentInfo> {
+  async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
     this.calls.push({ method: "cancelPayment", args: [pspPaymentId, idempotencyKey] });
     return makePaymentInfo({ pspName: this.pspName, pspPaymentId, status: "canceled" });
   }

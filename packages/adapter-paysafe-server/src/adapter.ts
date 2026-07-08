@@ -11,6 +11,7 @@ import {
   type MinorUnitAmount,
   type PaymentInfo,
   type PaymentMethodCapability,
+  type PaymentMethodDetails,
   type PaymentSession,
   type RefundInfo,
   type RefundRequest,
@@ -89,6 +90,14 @@ export interface PaysafeServerAdapterConfig {
   sleep?: (ms: number) => Promise<void>;
 }
 
+/** Masked instrument facts as the real API echoes them back (cardType/lastDigits/cardExpiry). */
+export interface PaysafeCardLike {
+  cardType?: string;
+  cardBrand?: string;
+  lastDigits?: string;
+  cardExpiry?: { month?: number; year?: number };
+}
+
 /** Structural shape of Paysafe Payments API responses. */
 export interface PaysafeSettlementLike {
   id: string;
@@ -112,8 +121,7 @@ export interface PaysafePaymentLike {
   settleWithAuth?: boolean;
   txnTime?: string;
   paymentType?: string;
-  /** Masked instrument facts as the real API echoes them back (cardType/lastDigits). */
-  card?: { cardType?: string; cardBrand?: string; lastDigits?: string };
+  card?: PaysafeCardLike;
   /** NOT populated by the real GET /payments — settlements are queried separately. */
   settlements?: PaysafeSettlementLike[];
   error?: { code?: string; message?: string };
@@ -127,7 +135,7 @@ export interface PaysafeStoredHandleLike {
   status?: string;
   usage?: string;
   paymentType?: string;
-  card?: { cardType?: string; cardBrand?: string; lastDigits?: string };
+  card?: PaysafeCardLike;
 }
 
 function toStoredMethod(
@@ -135,22 +143,13 @@ function toStoredMethod(
   pspCustomerId: string,
   handle: PaysafeStoredHandleLike,
 ): SavedPaymentMethod {
-  const brand =
-    handle.card?.cardBrand?.toLowerCase() ??
-    (handle.card?.cardType ? PAYSAFE_CARD_TYPE_TO_BRAND[handle.card.cardType.toUpperCase()] : undefined);
+  const details = toPaymentMethodDetails(handle.card);
   return {
     token: handle.paymentHandleToken,
     pspName,
     pspCustomerId,
     paymentMethodType: handle.paymentType === "CARD" || !handle.paymentType ? "card" : "other",
-    ...(brand || handle.card?.lastDigits
-      ? {
-          details: {
-            ...(brand ? { brand } : {}),
-            ...(handle.card?.lastDigits ? { last4: handle.card.lastDigits } : {}),
-          },
-        }
-      : {}),
+    ...(details ? { details } : {}),
     raw: handle,
   };
 }
@@ -355,10 +354,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   }
 
   async retrievePayment(pspPaymentId: string): Promise<PaymentInfo> {
-    const payment = await this.request<PaysafePaymentLike>(
-      "GET",
-      `/paymenthub/v1/payments/${encodeURIComponent(pspPaymentId)}`,
-    );
+    const payment = await this.fetchPayment(pspPaymentId);
     // The real API never embeds settlements in the payment — query them so
     // amountRefunded/capturedAt reflect reality.
     const settlements = payment.settlements?.length
@@ -369,51 +365,57 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
 
   async capturePayment(
     pspPaymentId: string,
-    amount?: MinorUnitAmount,
-    idempotencyKey?: string,
+    amount: MinorUnitAmount | undefined,
+    idempotencyKey: string,
   ): Promise<PaymentInfo> {
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
     // Paysafe requires an explicit amount on settlements (error 5068 without one)
     // — resolve "capture everything" ourselves.
-    const captureAmount = amount ?? (await this.remainingAuthorizedAmount(pspPaymentId));
+    const captureAmount = amount ?? remainingToSettle(await this.fetchPayment(pspPaymentId));
     await this.request("POST", `/paymenthub/v1/payments/${encodeURIComponent(pspPaymentId)}/settlements`, {
-      // Deterministic fallback keeps repeat captures idempotent on the PSP side.
-      merchantRefNum: idempotencyKey ?? `payfanout-capture-${pspPaymentId}`,
+      merchantRefNum: idempotencyKey, // Paysafe dedupes settlements on merchantRefNum — one charge per key
       amount: captureAmount,
     });
     return this.retrievePayment(pspPaymentId);
   }
 
   /**
-   * Voids the remaining authorization. This also
-   * works AFTER partial settlements (multi-capture flows) — settled funds stay
-   * settled and the payment keeps reporting them (status "succeeded"); only a
-   * payment with no settlements at all comes back "canceled". With custom
-   * capture idempotency keys the settled amount is not rediscoverable
-   * statelessly (documented limitation) — prefer the default capture keys.
+   * Voids the remaining authorization. This also works AFTER partial
+   * settlements (multi-capture flows) — settled funds stay settled and the
+   * returned PaymentInfo reports them (status "succeeded"), derived from the
+   * pre-void remainder; only a payment with no settlements at all comes back
+   * "canceled". Caller-keyed settlements are not rediscoverable statelessly,
+   * so LATER retrievePayment calls lose that split once the void has consumed
+   * availableToSettle (documented limitation).
    */
-  async cancelPayment(pspPaymentId: string, idempotencyKey?: string): Promise<PaymentInfo> {
+  async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
+    const payment = await this.fetchPayment(pspPaymentId);
     // Voidauths also require an explicit amount (full remaining authorization).
-    const voidAmount = await this.remainingAuthorizedAmount(pspPaymentId);
+    const remaining = remainingToSettle(payment);
     await this.request("POST", `/paymenthub/v1/payments/${encodeURIComponent(pspPaymentId)}/voidauths`, {
-      merchantRefNum: idempotencyKey ?? `payfanout-void-${pspPaymentId}`,
-      amount: voidAmount,
+      merchantRefNum: idempotencyKey,
+      amount: remaining,
     });
-    return this.retrievePayment(pspPaymentId);
+    const fresh = await this.fetchPayment(pspPaymentId);
+    const settlements = fresh.settlements?.length ? fresh.settlements : await this.findSettlements(fresh);
+    // Post-void the amount/availableToSettle derivation would count the voided
+    // funds as settled — the pre-void remainder is the last stateless witness.
+    const settledBeforeVoid = Math.max(0, (payment.amount ?? 0) - remaining);
+    return this.toPaymentInfo({ ...fresh, settlements }, undefined, settledBeforeVoid);
   }
 
-  private async remainingAuthorizedAmount(pspPaymentId: string): Promise<number> {
-    const payment = await this.request<PaysafePaymentLike>(
+  private fetchPayment(pspPaymentId: string): Promise<PaysafePaymentLike> {
+    return this.request<PaysafePaymentLike>(
       "GET",
       `/paymenthub/v1/payments/${encodeURIComponent(pspPaymentId)}`,
     );
-    return payment.availableToSettle ?? payment.amount ?? 0;
   }
 
   /**
    * Settlements are query-only in the real API and keyed by merchantRefNum.
-   * Auto-capture settlements share the payment's refNum; manual captures use
-   * the capture's key (PayFanout's deterministic fallback when none was given).
+   * Auto-capture settlements share the payment's refNum; caller-keyed capture
+   * settlements cannot be rediscovered statelessly. The second candidate keeps
+   * payments captured by earlier releases' derived default keys readable.
    */
   private async findSettlements(payment: PaysafePaymentLike): Promise<PaysafeSettlementLike[]> {
     const candidates = [payment.merchantRefNum, `payfanout-capture-${payment.id}`];
@@ -435,10 +437,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   /** Paysafe refunds settle against a settlement, not the payment — resolved here so callers keep one API. */
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
     if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
-    const payment = await this.request<PaysafePaymentLike>(
-      "GET",
-      `/paymenthub/v1/payments/${encodeURIComponent(req.pspPaymentId)}`,
-    );
+    const payment = await this.fetchPayment(req.pspPaymentId);
     const settlements = payment.settlements?.length ? payment.settlements : await this.findSettlements(payment);
     const settlement = settlements.find(
       (s) => s.status !== "CANCELLED" && s.status !== "FAILED" && (s.availableToRefund ?? s.amount ?? 0) > 0,
@@ -457,6 +456,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       {
         merchantRefNum: req.idempotencyKey,
         ...(req.amount !== undefined ? { amount: req.amount } : {}),
+        // Paysafe has no refund-reason enum — the normalized reason rides the free-text description.
         ...(req.reason ? { description: req.reason } : {}),
       },
     );
@@ -498,10 +498,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       );
     }
     const context = await this.decodeContext(input.pspSessionId);
-    // The refNum must be unique per verification ATTEMPT (Paysafe 409s on reuse)
-    // yet stable for a same-token retry — so hash session + handle token together.
+    // Verification refNums must be unique per ATTEMPT (Paysafe 409s on reuse) —
+    // the caller's required idempotencyKey carries exactly that duty.
     const verification = await this.request<PaysafePaymentLike>("POST", "/paymenthub/v1/verifications", {
-      merchantRefNum: `payfanout-verify-${hashToken(`${input.pspSessionId}:${input.clientToken}`)}`,
+      merchantRefNum: input.idempotencyKey,
       paymentHandleToken: input.clientToken,
       ...(context.merchantAccountId ? { accountId: context.merchantAccountId } : {}),
       currencyCode: context.currency,
@@ -656,17 +656,24 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     return parsePaysafeWebhookEvent(rawBody);
   }
 
-  private toPaymentInfo(payment: PaysafePaymentLike, payfanoutId?: string): PaymentInfo {
+  private toPaymentInfo(
+    payment: PaysafePaymentLike,
+    payfanoutId?: string,
+    knownSettled?: number,
+  ): PaymentInfo {
     const methodDetails = toPaymentMethodDetails(payment.card);
     const settlements = (payment.settlements ?? []).filter(
       (s) => s.status !== "CANCELLED" && s.status !== "FAILED",
     );
+    const completed = (payment.status ?? "").toUpperCase() === "COMPLETED";
     let settled = settlements.reduce((sum, s) => sum + (s.amount ?? 0), 0);
-    if (
+    if (settled === 0 && knownSettled !== undefined) {
+      settled = knownSettled;
+    } else if (
       settled === 0 &&
       payment.settleWithAuth === false &&
       typeof payment.availableToSettle === "number" &&
-      (payment.status ?? "").toUpperCase() === "COMPLETED"
+      completed
     ) {
       // The payment itself is the only witness when settlements weren't queried:
       // whatever left availableToSettle has been captured.
@@ -677,6 +684,14 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       (sum, s) => sum + (s.refundedAmount ?? Math.max(0, (s.amount ?? 0) - (s.availableToRefund ?? s.amount ?? 0))),
       0,
     );
+    // amountCaptured is only claimed with a witness: settlements/derivation for
+    // manual capture, or the settle-with-auth completion itself (full amount).
+    let amountCaptured: number | undefined;
+    if (settled > 0) amountCaptured = settled;
+    else if (completed && payment.settleWithAuth) amountCaptured = payment.amount ?? 0;
+    else if (completed && (typeof payment.availableToSettle === "number" || knownSettled !== undefined)) {
+      amountCaptured = 0;
+    }
     return {
       id: payfanoutId ?? payment.merchantRefNum ?? payment.id,
       pspName: this.pspName,
@@ -686,6 +701,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       // amount — the authorized amount is only meaningful pre-settlement.
       amount: settled > 0 ? settled : (payment.amount ?? 0),
       amountRefunded: refunded,
+      ...(amountCaptured !== undefined ? { amountCaptured } : {}),
+      ...(typeof payment.availableToSettle === "number"
+        ? { amountCapturable: payment.availableToSettle }
+        : {}),
       currency: (payment.currencyCode ?? "").toUpperCase() || "USD",
       paymentMethodType: payment.paymentType === "CARD" || !payment.paymentType ? "card" : "other",
       ...(methodDetails ? { paymentMethodDetails: methodDetails } : {}),
@@ -805,18 +824,23 @@ const PAYSAFE_CARD_TYPE_TO_BRAND: Record<string, string> = {
   UP: "unionpay",
 };
 
-function toPaymentMethodDetails(
-  card: PaysafePaymentLike["card"],
-): { brand?: string; last4?: string } | undefined {
+function toPaymentMethodDetails(card: PaysafeCardLike | undefined): PaymentMethodDetails | undefined {
   if (!card) return undefined;
   const brand =
     card.cardBrand?.toLowerCase() ??
     (card.cardType ? PAYSAFE_CARD_TYPE_TO_BRAND[card.cardType.toUpperCase()] : undefined);
-  const details = {
+  const details: PaymentMethodDetails = {
     ...(brand ? { brand } : {}),
     ...(card.lastDigits ? { last4: card.lastDigits } : {}),
+    ...(typeof card.cardExpiry?.month === "number" ? { expMonth: card.cardExpiry.month } : {}),
+    ...(typeof card.cardExpiry?.year === "number" ? { expYear: card.cardExpiry.year } : {}),
   };
   return Object.keys(details).length > 0 ? details : undefined;
+}
+
+/** Authorized-but-unsettled remainder — the explicit amount full captures and voids need. */
+function remainingToSettle(payment: PaysafePaymentLike): number {
+  return payment.availableToSettle ?? payment.amount ?? 0;
 }
 
 /**
@@ -967,13 +991,6 @@ function safeJson(text: string): unknown {
   } catch {
     return undefined;
   }
-}
-
-function hashToken(token: string): string {
-  // Deterministic short id so verification retries reuse the same merchantRefNum.
-  let hash = 0;
-  for (let i = 0; i < token.length; i++) hash = (hash * 31 + token.charCodeAt(i)) >>> 0;
-  return hash.toString(16);
 }
 
 function lowercaseKeys(headers: Record<string, string>): Record<string, string> {

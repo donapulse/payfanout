@@ -129,17 +129,28 @@ describe("session context edge cases", () => {
     await expect(decodeSessionContext(await encodeSessionContext(full, SIGNING_KEY), SIGNING_KEY)).resolves.toEqual(full);
   });
 
-  it("rejects an expired context and one issued without an expiry", async () => {
+  it("rejects an expired context with session_expired and a missing expiry as invalid_request", async () => {
     const base = { v: 1 as const, amount: 100, currency: "USD", captureMethod: "automatic" as const };
     const expired = await encodeSessionContext({ ...base, expiresAt: Date.now() - 1 }, SIGNING_KEY);
-    await expect(decodeSessionContext(expired, SIGNING_KEY)).rejects.toThrowError(/expired/);
+    // Expiry is a recoverable host condition (create a fresh session), not a malformed request.
+    await expect(decodeSessionContext(expired, SIGNING_KEY)).rejects.toMatchObject({
+      code: "session_expired",
+      retryable: false,
+      message: expect.stringMatching(/expired/),
+    });
     // Explicit clock: expiry is compared against the caller's `now`.
     const shortLived = await encodeSessionContext({ ...base, expiresAt: 1_000_000 }, SIGNING_KEY);
     expect((await decodeSessionContext(shortLived, SIGNING_KEY, { now: 999_999 })).amount).toBe(100);
-    await expect(decodeSessionContext(shortLived, SIGNING_KEY, { now: 1_000_001 })).rejects.toThrowError(/expired/);
-    // Tokens with no expiresAt are rejected — unbounded lifetime is the hole TTLs close.
+    await expect(decodeSessionContext(shortLived, SIGNING_KEY, { now: 1_000_001 })).rejects.toMatchObject({
+      code: "session_expired",
+    });
+    // Tokens with no expiresAt are rejected — unbounded lifetime is the hole TTLs
+    // close. That is a malformed token, so it stays invalid_request.
     const legacy = await encodeSessionContext({ ...base, expiresAt: undefined as never }, SIGNING_KEY);
-    await expect(decodeSessionContext(legacy, SIGNING_KEY)).rejects.toThrowError(/no expiry/);
+    await expect(decodeSessionContext(legacy, SIGNING_KEY)).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringMatching(/no expiry/),
+    });
   });
 
   it("produces tokens bit-identical to the previous node:crypto implementation", async () => {

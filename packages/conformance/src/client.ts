@@ -47,6 +47,17 @@ export function runClientAdapterConformanceTests(
       }
     });
 
+    it("implements handleRedirectReturn when it reports redirect-flow methods", () => {
+      const adapter = makeAdapter();
+      const hasRedirect = adapter
+        .listPaymentMethodCapabilities()
+        .some((m) => m.flow === "redirect" && m.supported);
+      if (hasRedirect) {
+        // A redirect flow without a return-trip handler strands the customer.
+        expect(typeof adapter.handleRedirectReturn).toBe("function");
+      }
+    });
+
     it("never resolves mount without a DOM (SSR guard)", async () => {
       const adapter = makeAdapter();
       if (typeof document !== "undefined") return; // suite runs in node by default

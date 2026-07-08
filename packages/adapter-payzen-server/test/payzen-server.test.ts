@@ -47,6 +47,24 @@ const IPN_HEADERS = {
   "kr-hash-key": "password",
 };
 
+/**
+ * A correctly signed IPN whose newest transaction is a VERIFICATION — an
+ * operation type outside the adapter's DEBIT/CREDIT vocabulary, so parsing
+ * must land on type "unknown" instead of throwing.
+ */
+const UNKNOWN_KR_ANSWER =
+  '{"shopId":"69876357","orderCycle":"CLOSED","orderStatus":"PAID","serverDate":"2026-01-15T10:05:00+00:00",' +
+  '"orderDetails":{"orderTotalAmount":0,"orderEffectiveAmount":0,"orderCurrency":"EUR","mode":"TEST",' +
+  '"orderId":"myOrderId-475883","_type":"V4/OrderDetails"},"transactions":[{"uuid":"8faeed4bbba748b78dfe0466cd45c1a4",' +
+  '"amount":0,"currency":"EUR","paymentMethodType":"CARD","status":"ACCEPTED","detailedStatus":"ACCEPTED",' +
+  '"operationType":"VERIFICATION","_type":"V4/PaymentTransaction"}],"_type":"V4/Payment"}';
+/** hex(HMAC-SHA-256(demo password, UNKNOWN_KR_ANSWER)). */
+const UNKNOWN_IPN_HEADERS = {
+  "kr-hash": "949c8ba6a0cdeed50e0d0d3fdfc941403d555c84ccf86f1f4f8ca1ec952311d3",
+  "kr-hash-algorithm": "sha256_hmac",
+  "kr-hash-key": "password",
+};
+
 const key = (): string => `k-${Math.random().toString(36).slice(2)}`;
 
 // ---------------------------------------------------------------------------
@@ -80,6 +98,38 @@ runServerAdapterConformanceTests(
       // Stable dedupe rule: transaction uuid + detailedStatus (PayZen has no
       // event id and kr-hash regenerates per delivery).
       expectedEventId: "1c8356b0e24442b2acc579cf1ae4d814:AUTHORISED",
+      expectedAmount: 990,
+      unknownEvent: { rawBody: UNKNOWN_KR_ANSWER, headers: UNKNOWN_IPN_HEADERS },
+    },
+    // Both expectations hold genuinely: payfanout_id round-trips via the
+    // transaction metadata stamp and PayZen echoes metadata on every read —
+    // no honesty flags needed.
+    money: {
+      completedPayment: async (adapter, { amount, id, metadata }) => {
+        const session = await adapter.createPaymentSession({
+          amount,
+          currency: "EUR",
+          id,
+          metadata,
+          idempotencyKey: key(),
+        });
+        const tx = lastFake.payOrder(session.pspSessionId);
+        lastFake.settle(tx.uuid); // the capture batch ran — refundable from here
+        return tx.uuid;
+      },
+      authorizedPayment: async (adapter, { amount }) => {
+        const session = await adapter.createPaymentSession({
+          amount,
+          currency: "EUR",
+          captureMethod: "manual",
+          idempotencyKey: key(),
+        });
+        return lastFake.payOrder(session.pspSessionId).uuid; // AUTHORISED_TO_VALIDATE
+      },
+      cancelablePayment: async (adapter) => {
+        const session = await adapter.createPaymentSession({ amount: 2000, currency: "EUR", idempotencyKey: key() });
+        return lastFake.payOrder(session.pspSessionId).uuid; // AUTHORISED — cancelable until the batch
+      },
     },
     failingCalls: [
       {
@@ -116,7 +166,7 @@ runServerAdapterConformanceTests(
           const session = await a.createPaymentSession({ amount: 2000, currency: "EUR", idempotencyKey: key() });
           const tx = lastFake.payOrder(session.pspSessionId);
           lastFake.settle(tx.uuid);
-          return a.cancelPayment(tx.uuid);
+          return a.cancelPayment(tx.uuid, "c");
         },
         expectedCode: "invalid_request",
       },
@@ -191,6 +241,18 @@ describe("PayZen deterministic signature vectors", () => {
     await expect(
       adapter.verifyWebhookSignature(KR_ANSWER, { ...IPN_HEADERS, "kr-hash": KR_HASH_HMAC }),
     ).resolves.toBe(false);
+  });
+});
+
+describe("PayZenServerAdapter capabilities", () => {
+  it("declares the platform currency table for router pre-screening, minus the adapter exclusions", () => {
+    const { adapter } = makePair();
+    const currencies = adapter.getCapabilities().supportedCurrencies!;
+    expect(currencies).toContain("EUR");
+    expect(currencies).toContain("JPY");
+    expect(currencies).not.toContain("BHD"); // not on the platform
+    expect(currencies).not.toContain("CNY"); // adapter-excluded: fractional-digit mismatch
+    expect(currencies).not.toContain("KHR");
   });
 });
 
@@ -348,8 +410,23 @@ describe("PayZenServerAdapter reads", () => {
     expect(info.status).toBe("succeeded"); // AUTHORISED: auto-capture scheduled
     expect(info.id).toBe("order-77"); // payfanout_id round-trips via metadata
     expect(info.pspPaymentId).toMatch(/^[0-9a-f]{32}$/);
-    expect(info.paymentMethodDetails).toEqual({ brand: "mastercard", last4: "0067" });
+    expect(info.paymentMethodDetails).toEqual({ brand: "mastercard", last4: "0067", expMonth: 6, expYear: 2029 });
     expect(info.amountRefunded).toBe(0);
+    expect(info.amountCaptured).toBe(1099); // AUTHORISED = committed to the capture batch
+  });
+
+  it("echoes the transaction metadata as stored at the PSP, payfanout stamps included", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({
+      id: "order-88",
+      amount: 1000,
+      currency: "EUR",
+      metadata: { plan: "pro" },
+      idempotencyKey: "k-88",
+    });
+    fake.payOrder(session.pspSessionId);
+    const info = await adapter.retrievePayment(session.pspSessionId);
+    expect(info.metadata).toEqual({ plan: "pro", payfanout_key: "k-88", payfanout_id: "order-88" });
   });
 
   it("retrieves by transaction uuid (Transaction/Get) with the answer preserved on raw", async () => {
@@ -393,10 +470,17 @@ describe("PayZenServerAdapter capture and cancel", () => {
     fake.payOrder(session.pspSessionId); // manualValidation:"YES" -> AUTHORISED_TO_VALIDATE
     const pending = await adapter.retrievePayment(session.pspSessionId);
     expect(pending.status).toBe("requires_capture");
+    expect(pending.amountCapturable).toBe(4000); // awaiting Transaction/Validate
+    expect(pending.amountCaptured).toBeUndefined();
 
-    const captured = await adapter.capturePayment(pending.pspPaymentId, 4000);
+    const captured = await adapter.capturePayment(pending.pspPaymentId, 4000, "cap-1");
     expect(captured.status).toBe("succeeded");
+    expect(captured.amountCaptured).toBe(4000); // validation commits the full authorization
+    expect(captured.amountCapturable).toBeUndefined();
     expect(fake.lastOperation).toBe("Transaction/Validate"); // never Transaction/Capture (Brazil-only WS)
+    // The required idempotencyKey has no Validate field to ride — replay
+    // safety comes from the PSP state machine (second validate = PSP_503).
+    expect(fake.lastRequestBody).toEqual({ uuid: pending.pspPaymentId });
   });
 
   it("rejects a capture amount differing from the authorization (no partial validate)", async () => {
@@ -408,7 +492,7 @@ describe("PayZenServerAdapter capture and cancel", () => {
       idempotencyKey: "k",
     });
     const tx = fake.payOrder(session.pspSessionId);
-    await expect(adapter.capturePayment(tx.uuid, 1500)).rejects.toMatchObject({ code: "invalid_request" });
+    await expect(adapter.capturePayment(tx.uuid, 1500, "cap-2")).rejects.toMatchObject({ code: "invalid_request" });
   });
 
   it("capturing an already-validated transaction surfaces the PSP status error", async () => {
@@ -420,25 +504,29 @@ describe("PayZenServerAdapter capture and cancel", () => {
       idempotencyKey: "k",
     });
     const tx = fake.payOrder(session.pspSessionId);
-    await adapter.capturePayment(tx.uuid);
-    await expect(adapter.capturePayment(tx.uuid)).rejects.toMatchObject({ code: "invalid_request" });
+    await adapter.capturePayment(tx.uuid, undefined, "cap-3");
+    await expect(adapter.capturePayment(tx.uuid, undefined, "cap-4")).rejects.toMatchObject({
+      code: "invalid_request",
+    });
   });
 
   it("cancels a pre-capture authorization by orderId", async () => {
     const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession({ amount: 2000, currency: "EUR", idempotencyKey: "k" });
     fake.payOrder(session.pspSessionId); // AUTHORISED — cancelable until capture
-    const canceled = await adapter.cancelPayment(session.pspSessionId);
+    const canceled = await adapter.cancelPayment(session.pspSessionId, "void-1");
     expect(canceled.status).toBe("canceled");
+    expect(canceled.amountCaptured).toBeUndefined(); // nothing was ever captured
+    expect(canceled.amountCapturable).toBeUndefined();
   });
 
   it("cancelling twice surfaces the already-cancelled rejection", async () => {
     const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession({ amount: 2000, currency: "EUR", idempotencyKey: "k" });
     const tx = fake.payOrder(session.pspSessionId);
-    await adapter.cancelPayment(tx.uuid);
+    await adapter.cancelPayment(tx.uuid, "void-2");
     try {
-      await adapter.cancelPayment(tx.uuid);
+      await adapter.cancelPayment(tx.uuid, "void-3");
       expect.unreachable("expected rejection");
     } catch (err) {
       expect(isPayFanoutError(err)).toBe(true);
@@ -573,9 +661,16 @@ describe("PayZenServerAdapter refunds", () => {
   });
 
   it("passes the reason through as the Back Office comment", async () => {
+    // PayZen has no refund-reason vocabulary — the unified token goes through
+    // verbatim as the audit-trail comment.
     const { adapter, fake } = makePair();
     const uuid = await capturedPayment(adapter, fake);
-    await adapter.refundPayment({ pspPaymentId: uuid, amount: 100, reason: "customer request", idempotencyKey: "r" });
-    expect(fake.lastRequestBody).toMatchObject({ comment: "customer request" });
+    await adapter.refundPayment({
+      pspPaymentId: uuid,
+      amount: 100,
+      reason: "requested_by_customer",
+      idempotencyKey: "r",
+    });
+    expect(fake.lastRequestBody).toMatchObject({ comment: "requested_by_customer" });
   });
 });

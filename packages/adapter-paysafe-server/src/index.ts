@@ -2,6 +2,7 @@ export {
   mapPaysafeError,
   PaysafeServerAdapter,
   PAYSAFE_PSP_NAME,
+  type PaysafeCardLike,
   type PaysafePaymentLike,
   type PaysafeServerAdapterConfig,
   type PaysafeStoredHandleLike,

@@ -1,6 +1,13 @@
-import { PayFanoutError, type UnifiedWebhookEvent, type UnifiedWebhookEventType } from "@payfanout/core";
+import {
+  normalizeCurrency,
+  PayFanoutError,
+  type MinorUnitAmount,
+  type UnifiedWebhookEvent,
+  type UnifiedWebhookEventType,
+} from "@payfanout/core";
 import { sha256Hex } from "./crypto-utils.js";
 import { PAYPAL_PSP_NAME } from "./error-map.js";
+import { fromPayPalValue } from "./money.js";
 
 /**
  * PayPal webhook verification is a postback: the adapter POSTs the delivery
@@ -64,6 +71,8 @@ export interface PayPalEventBody {
     id?: string;
     status?: string;
     create_time?: string;
+    /** Capture and refund resources both carry their money object here. */
+    amount?: { currency_code?: string; value?: string };
     links?: PayPalLink[];
     supplementary_data?: { related_ids?: { order_id?: string } };
     disputed_transactions?: Array<{ seller_transaction_id?: string }>;
@@ -97,6 +106,8 @@ export async function payPalEventBodyToUnified(
   rawForFallbackId?: string,
 ): Promise<UnifiedWebhookEvent> {
   const eventType = (body.event_type ?? "").toUpperCase();
+  const money = resourceMoney(body.resource);
+  const refundId = isRefundShapedEvent(eventType) ? body.resource?.id : undefined;
   return {
     // Real PayPal events always carry an id — that is the dedupe key. The
     // hash fallback differs by ingress (delivered raw bytes vs re-serialized
@@ -105,6 +116,8 @@ export async function payPalEventBodyToUnified(
     pspName: PAYPAL_PSP_NAME,
     type: mapEventType(eventType, body),
     pspPaymentId: extractPspPaymentId(eventType, body.resource),
+    ...(money ?? {}),
+    ...(refundId !== undefined ? { refundId } : {}),
     occurredAt: normalizeTime(body.create_time ?? body.resource?.create_time),
     raw: body,
   };
@@ -149,19 +162,42 @@ function mapEventType(eventType: string, body: PayPalEventBody): UnifiedWebhookE
   return "unknown";
 }
 
+/** Events whose resource is a refund object (resource.id = the REFUND id). */
+function isRefundShapedEvent(eventType: string): boolean {
+  return (
+    eventType === "PAYMENT.CAPTURE.REFUNDED" ||
+    eventType === "PAYMENT.CAPTURE.REVERSED" ||
+    eventType.startsWith("PAYMENT.REFUND.")
+  );
+}
+
+/**
+ * Money facts, when the resource carries a parseable amount. Best-effort by
+ * design: a malformed or unsupported money object never fails event parsing.
+ */
+function resourceMoney(
+  resource: PayPalEventBody["resource"],
+): { amount: MinorUnitAmount; currency: string } | undefined {
+  const value = resource?.amount?.value;
+  const currency = resource?.amount?.currency_code;
+  if (value === undefined || currency === undefined) return undefined;
+  try {
+    const code = normalizeCurrency(currency);
+    return { amount: fromPayPalValue(value, code), currency: code };
+  } catch {
+    // The event still parses — only the optional money facts are withheld.
+    return undefined;
+  }
+}
+
 function extractPspPaymentId(eventType: string, resource: PayPalEventBody["resource"]): string | undefined {
   if (!resource) return undefined;
   if (eventType.startsWith("CUSTOMER.DISPUTE.")) {
     // Dispute payloads carry the CAPTURE id as seller_transaction_id.
     return resource.disputed_transactions?.find((t) => t.seller_transaction_id)?.seller_transaction_id;
   }
-  if (
-    eventType === "PAYMENT.CAPTURE.REFUNDED" ||
-    eventType === "PAYMENT.CAPTURE.REVERSED" ||
-    eventType.startsWith("PAYMENT.REFUND.")
-  ) {
-    // The resource here is refund-shaped: resource.id is the REFUND id — the
-    // parent capture (our canonical pspPaymentId) rides the links[rel=up] href.
+  if (isRefundShapedEvent(eventType)) {
+    // The parent capture (our canonical pspPaymentId) rides the links[rel=up] href.
     return captureIdFromLinks(resource.links) ?? resource.id;
   }
   if (eventType.startsWith("PAYMENT.AUTHORIZATION.")) {

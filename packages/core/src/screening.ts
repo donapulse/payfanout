@@ -18,6 +18,12 @@ export function screenSessionInput(
   input: CreatePaymentSessionInput,
 ): string | undefined {
   const psp = caps.pspName;
+  if (caps.supportedCurrencies && caps.supportedCurrencies.length > 0) {
+    const currency = input.currency?.trim().toUpperCase();
+    if (!caps.supportedCurrencies.some((c) => c.toUpperCase() === currency)) {
+      return `"${psp}" does not support currency ${String(input.currency)}`;
+    }
+  }
   if (input.captureMethod === "manual" && !caps.supportsManualCapture) {
     return `"${psp}" does not support manual capture`;
   }

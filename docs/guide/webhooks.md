@@ -54,6 +54,10 @@ until it sees success.
 - **Dedupe is yours:** `event.id` is a stable key; keep the seen-set in your store.
 - **Ordering is not guaranteed** by any PSP, treat events as unordered facts and reconcile
   with `retrievePayment` when sequence matters.
+- **Money facts ride the event** where the PSP payload carries them: `event.amount` /
+  `event.currency` (integer minor units) and `event.refundId` on refund-shaped events —
+  most handlers never need a `retrievePayment` round-trip just to learn how much a
+  `payment.refunded` refunded.
 
 ## Operational concerns
 

@@ -83,7 +83,13 @@ interface StripeEventBody {
       object?: string;
       id?: string;
       status?: string;
+      amount?: number;
+      /** On charge objects: cumulative total refunded so far. */
+      amount_refunded?: number;
+      currency?: string;
       payment_intent?: string | { id?: string };
+      /** Embedded refund list on charge payloads (older API versions include it). */
+      refunds?: { data?: Array<{ id?: string }> };
     };
   };
 }
@@ -115,9 +121,48 @@ export function stripeEventBodyToUnified(body: StripeEventBody): UnifiedWebhookE
     pspName: "stripe",
     type: mapEventType(body),
     pspPaymentId,
+    ...moneyFacts(body),
     occurredAt: new Date((body.created ?? 0) * 1000).toISOString(),
     raw: body,
   };
+}
+
+/**
+ * Normalized money facts, only where the payload genuinely carries them:
+ * refund objects report their own amount and id; charge.refunded reports the
+ * charge's cumulative amount_refunded; payment_intent events report the
+ * intent amount. A stateless host acts on these without a retrievePayment
+ * round-trip.
+ */
+function moneyFacts(body: StripeEventBody): Pick<UnifiedWebhookEvent, "amount" | "currency" | "refundId"> {
+  const object = body.data?.object;
+  if (!object) return {};
+  const currency =
+    typeof object.currency === "string" && object.currency.length > 0
+      ? { currency: object.currency.toUpperCase() }
+      : {};
+  if (object.object === "refund") {
+    return {
+      ...(typeof object.amount === "number" ? { amount: object.amount } : {}),
+      ...currency,
+      ...(typeof object.id === "string" ? { refundId: object.id } : {}),
+    };
+  }
+  if (body.type === "charge.refunded") {
+    const lastRefundId = object.refunds?.data?.[0]?.id;
+    return {
+      ...(typeof object.amount_refunded === "number" ? { amount: object.amount_refunded } : {}),
+      ...currency,
+      ...(typeof lastRefundId === "string" ? { refundId: lastRefundId } : {}),
+    };
+  }
+  if (object.object === "payment_intent") {
+    return {
+      ...(typeof object.amount === "number" ? { amount: object.amount } : {}),
+      ...currency,
+    };
+  }
+  return {};
 }
 
 function mapEventType(body: StripeEventBody): UnifiedWebhookEventType {

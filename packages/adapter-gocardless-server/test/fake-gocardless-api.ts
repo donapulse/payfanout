@@ -188,7 +188,13 @@ export class FakeGoCardlessApi {
     const replay = this.idempotentReplay("billing_requests", idempotencyKey);
     if (replay) return replay;
     const request = body["billing_requests"] as FakeBillingRequest & {
-      payment_request?: { amount?: number; currency?: string; description?: string; scheme?: string };
+      payment_request?: {
+        amount?: number;
+        currency?: string;
+        description?: string;
+        scheme?: string;
+        metadata?: Record<string, string>;
+      };
     };
     const paymentRequest = request?.payment_request;
     if (paymentRequest && !["GBP", "EUR"].includes(paymentRequest.currency ?? "")) {
@@ -330,6 +336,8 @@ export class FakeGoCardlessApi {
       currency: br.payment_request?.currency ?? "GBP",
       scheme: br.payment_request?.scheme ?? "faster_payments",
       status: "pending_submission",
+      // Real API: payment_request.metadata is stored on the created payment.
+      ...(br.payment_request?.metadata ? { metadata: { ...br.payment_request.metadata } } : {}),
       links: { mandate: mandate.id },
     };
     this.payments.set(payment.id, payment);

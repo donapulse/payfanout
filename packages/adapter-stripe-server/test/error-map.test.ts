@@ -40,10 +40,11 @@ describe("mapStripeError", () => {
       retryable: false,
     },
     {
+      // Resolved by bringing the customer back on-session — never by replay.
       name: "3DS required",
       err: { type: "StripeCardError", code: "authentication_required", message: "…" },
       code: "authentication_required",
-      retryable: true,
+      retryable: false,
     },
     {
       name: "fraud decline",

@@ -17,17 +17,19 @@ pnpm add -D @payfanout/conformance
 
 `vitest` (>= 1.0) is a peer dependency; the suite runs inside your test runner.
 
-> **Not yet published to npm.** The packages are at `0.1.0`. Until a release is cut, consume
-> them from source, see the [Installation guide](https://donapulse.github.io/payfanout/guide/installation).
-
 ## What the suite proves
 
 - **Capability coherence**, an adapter cannot claim a capability it does not honor.
+- **The money paths**: retrieve truth (amounts, ids, metadata), full refunds, accumulating
+  partial refunds, over-refund rejection, pending-refund polling, capture and
+  multi-capture amounts, and clean cancellation — proven against your fake, not trusted.
 - **Integer minor-unit boundaries**, proven for JPY (0 decimals) and BHD (3 decimals).
 - **Raw-body webhook signatures**, including the re-serialization trap: same JSON value,
-  different bytes must be rejected.
+  different bytes must be rejected — plus unknown-but-valid event types mapping to
+  `"unknown"` on a correctly signed body.
 - **Stable webhook dedupe ids**, `event.id` is a durable key across retries and replays.
-- **Error normalization**, with the untouched PSP error preserved on `raw`.
+- **Error normalization**, with the untouched PSP error preserved on `raw` and the
+  documented `retryable` semantics per code.
 - **Idempotency replay**, the same key twice yields the same result and one side effect.
 
 ## Usage
@@ -40,13 +42,13 @@ import {
   runClientAdapterConformanceTests,
 } from "@payfanout/conformance";
 
-runServerAdapterConformanceTests(myServerFixtures); // ServerConformanceFixtures
-runClientAdapterConformanceTests(myClientFixtures); // ClientConformanceFixtures
+runServerAdapterConformanceTests("acme", () => makeAdapterWithFake(), serverFixtures);
+runClientAdapterConformanceTests("acme", () => makeClientAdapter(), clientFixtures);
 ```
 
-Both `@payfanout/adapter-stripe*` and `@payfanout/adapter-paysafe*` are wired into these
-runners. A new adapter is **done when the suite is green**, and core, server, React, and
-every consuming app stay untouched.
+All five shipped adapter pairs (Stripe, Paysafe, GoCardless, PayPal, PayZen) are wired
+into these runners. A new adapter is **done when the suite is green**, and core, server,
+React, and every consuming app stay untouched.
 
 ## Where it fits
 

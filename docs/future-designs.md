@@ -107,6 +107,13 @@ the expected seam).
   the return-trip against guessed parameter names is exactly the doc-drift trap the
   README warns about. Unblock: an enabled account, then verify the return params and
   handle-lookup flow, then flip the capability entries to `supported: true`.
+- **Express wallet buttons (Apple Pay / Google Pay standalone):** Stripe wallets are
+  reachable today inside the Payment Element via `fieldOptions.wallets`; a dedicated
+  express-checkout surface (buttons above the fields) needs a NEW client-adapter
+  contract method + capability flag — a deliberate contract change requiring its own
+  sign-off, not a side effect. The seam is reserved: a `mountWalletButtons?` optional
+  client method mirroring `mount`. Unblock: demand + a second PSP with an express
+  surface to keep the abstraction honest.
 - **Dispute/chargeback management:** today the library surfaces `payment.chargeback` webhooks;
   evidence submission stays in PSP dashboards. Unblock: real merchant demand.
 - **Hosted-checkout fallback:** rejected (embedded-only is a product

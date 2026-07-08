@@ -15,12 +15,12 @@
 import { describe, expect, it } from "vitest";
 import { isUnifiedPaymentStatus } from "@payfanout/core";
 import { GoCardlessServerAdapter } from "@payfanout/adapter-gocardless-server";
+import { isLiveHost } from "./live-host-guard.js";
 
 const ACCESS_TOKEN = process.env.GOCARDLESS_ACCESS_TOKEN;
 // Unset CI secrets render as EMPTY strings, not undefined — || treats them as absent.
 const BASE_URL = process.env.GOCARDLESS_BASE_URL || "https://api-sandbox.gocardless.com";
-// Hostname equality, never substring matching — a lookalike host must not fool the guard.
-if (new URL(BASE_URL).hostname === "api.gocardless.com") {
+if (isLiveHost(BASE_URL, "api.gocardless.com")) {
   throw new Error("Integration tests refuse to run against the live GoCardless API");
 }
 

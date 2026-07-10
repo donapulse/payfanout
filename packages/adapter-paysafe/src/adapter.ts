@@ -162,7 +162,7 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
         // Required by Paysafe.js — omitting it fails setup with error 9055
         // "Invalid currency parameter".
         currencyCode: session.currency,
-        ...(session.merchantAccountId ? { accountId: session.merchantAccountId } : {}),
+        ...(session.merchantAccountId ? { accountId: toPaysafeAccountId(session.merchantAccountId) } : {}),
         fields: {
           cardNumber: fieldConfig("cardNumber", { placeholder: "Card number" }),
           expiryDate: fieldConfig("expiryDate", { placeholder: "MM/YY" }),
@@ -203,7 +203,7 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
         paymentType: "CARD",
         amount: h.session.amount,
         currencyCode: h.session.currency,
-        ...(h.session.merchantAccountId ? { accountId: h.session.merchantAccountId } : {}),
+        ...(h.session.merchantAccountId ? { accountId: toPaysafeAccountId(h.session.merchantAccountId) } : {}),
         ...(h.session.id ? { merchantRefNum: h.session.id } : {}),
         ...(this.config.threeDs ? { threeDs: this.config.threeDs } : {}),
       });
@@ -281,6 +281,20 @@ function toPaysafeStyle(appearance: Record<string, unknown> | undefined): { styl
     if (value !== null && typeof value === "object" && !Array.isArray(value)) style[selector] = value;
   }
   return Object.keys(style).length > 0 ? { style } : undefined;
+}
+
+/**
+ * Paysafe.js validates `accountId` as a NUMBER — the string form produced by a
+ * `merchantAccountResolver` (typed `=> string | undefined`) fails setup/tokenize with error
+ * 9003 ("Invalid accountId parameter") before any card data is evaluated, even
+ * though the Paysafe REST API accepts both. Coerce a digit-only id to its
+ * numeric form; leave anything non-numeric, or too large to represent exactly
+ * (a silently rounded id could route to the wrong merchant account), untouched.
+ */
+function toPaysafeAccountId(id: string): string | number {
+  if (!/^\d+$/.test(id)) return id;
+  const numeric = Number(id);
+  return Number.isSafeInteger(numeric) ? numeric : id;
 }
 
 function asPaysafeHandle(handle: MountedFieldsHandle): PaysafeHandle {

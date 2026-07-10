@@ -63,6 +63,24 @@ slots, any grid, rows, and labels:
 </PaymentFields>
 ```
 
+## Content-Security-Policy
+
+On CSP-enforcing pages, allow every host Paysafe.js touches, or the hosted fields
+fail quietly: the script (`hosted.paysafe.com`), the card-field iframes
+(`hosted.paysafe.com` in live, `hosted.test.paysafe.com` in sandbox), and its
+parent-page XHRs (`api.paysafe.com` / `api.test.paysafe.com`):
+
+```
+script-src  https://hosted.paysafe.com
+frame-src   https://hosted.paysafe.com https://hosted.test.paysafe.com
+connect-src https://hosted.paysafe.com https://hosted.test.paysafe.com
+            https://api.paysafe.com https://api.test.paysafe.com
+```
+
+The `.test` hosts are used only by `environment: "sandbox"`. See
+[Set up Paysafe](https://donapulse.github.io/payfanout/guide/paysafe) for the
+per-directive failure modes.
+
 ## What's inside
 
 - **`PaysafeClientAdapter`**, mounts the hosted fields, tokenizes, and resolves the

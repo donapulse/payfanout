@@ -1,6 +1,6 @@
 {
   "name": "@payfanout/adapter-paypal",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "license": "MIT",
   "description": "Client-side PayPal adapter for PayFanout (PayPal Buttons, popup approval, tokenize-first). No secrets, no server code.",
   "type": "module",

@@ -1,6 +1,6 @@
 {
   "name": "@payfanout/adapter-paysafe-server",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "license": "MIT",
   "description": "Server-side Paysafe adapter for PayFanout (Payments REST API: Payment Handles, Payments, Settlements, Refunds, Webhooks). Holds secrets — never bundle client-side.",
   "type": "module",

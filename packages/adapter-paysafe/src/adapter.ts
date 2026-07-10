@@ -285,7 +285,7 @@ function toPaysafeStyle(appearance: Record<string, unknown> | undefined): { styl
 
 /**
  * Paysafe.js validates `accountId` as a NUMBER — the string form produced by a
- * `merchantAccountResolver` (typed `=> string`) fails setup/tokenize with error
+ * `merchantAccountResolver` (typed `=> string | undefined`) fails setup/tokenize with error
  * 9003 ("Invalid accountId parameter") before any card data is evaluated, even
  * though the Paysafe REST API accepts both. Coerce a digit-only id to its
  * numeric form; leave anything non-numeric, or too large to represent exactly

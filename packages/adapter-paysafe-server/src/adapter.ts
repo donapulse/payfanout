@@ -338,8 +338,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       settleWithAuth: context.captureMethod !== "manual",
       ...(context.merchantAccountId ? { accountId: context.merchantAccountId } : {}),
       // Browser-tokenized handles carry no AVS data — Paysafe rejects card
-      // payments without a zip (error 3004), so billing rides the signed context.
-      ...(toPaysafeBillingDetails(context.billingDetails) ?? {}),
+      // payments without a zip (error 3004). Billing rides the signed context;
+      // completion-time billingDetails (e.g. a zip collected on the payment step)
+      // merges over it here, so AVS-enforcing accounts complete without a new session.
+      ...(toPaysafeBillingDetails(mergeBillingDetails(context.billingDetails, input.billingDetails)) ?? {}),
       // Checkout fields against POST /payments (which
       // strict-rejects unknown fields, error 5023): merchantDescriptor and
       // profile are accepted; shippingDetails is NOT — it is a payment-HANDLE
@@ -910,6 +912,30 @@ export function mapPaysafeError(httpStatus: number, body: unknown): PayFanoutErr
     raw: body,
     pspName: PAYSAFE_PSP_NAME,
   });
+}
+
+/**
+ * Merge completion-time billingDetails over the session context's, field by field:
+ * a completion field with a DEFINED value wins, but an explicit `undefined` leaves
+ * the session's value intact — a host binding a maybe-empty form field to postalCode
+ * would otherwise clobber the session zip and re-trigger the very 3004 this prevents.
+ */
+function mergeBillingDetails(
+  base: PaysafeSessionContextV1["billingDetails"],
+  override: PaysafeSessionContextV1["billingDetails"],
+): PaysafeSessionContextV1["billingDetails"] {
+  if (!base) return override;
+  if (!override) return base;
+  return {
+    ...base,
+    ...pruneUndefined(override),
+    address: { ...base.address, ...pruneUndefined(override.address) },
+  };
+}
+
+function pruneUndefined<T extends object>(obj: T | undefined): Partial<T> {
+  if (!obj) return {};
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as Partial<T>;
 }
 
 function toPaysafeBillingDetails(

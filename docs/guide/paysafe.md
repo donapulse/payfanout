@@ -173,7 +173,9 @@ URL with the `sdkUrl` config field to pin a version or self-host.
 
 Browser-tokenized handles carry no AVS data, so Paysafe rejects card charges without a
 billing postal/ZIP code (error `3004`). Supply `billingDetails.address` on
-`createPaymentSession` (the demo always does).
+`createPaymentSession` (the demo always does) — or, when the postal code is collected on
+the payment step, pass `billingDetails` to `completePayment` (step 7): it merges over the
+session's billing, so AVS-enforcing accounts complete without recreating the session.
 
 ## 7. The server-completion route (Paysafe-only)
 
@@ -188,6 +190,9 @@ app.post("/api/complete", express.json(), async (req, res) => {
     pspSessionId: req.body.pspSessionId,   // the signed session id from createPaymentSession
     clientToken: req.body.clientToken,     // the single-use handle from the browser
     idempotencyKey: req.body.orderId,      // required
+    // Optional AVS billing collected on the payment step; merged over the session's
+    // billing (an AVS-enforcing account needs at least a postal code, else Paysafe 3004).
+    ...(req.body.zip ? { billingDetails: { address: { postalCode: req.body.zip } } } : {}),
   });
   res.json(info);
 });

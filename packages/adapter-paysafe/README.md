@@ -68,7 +68,8 @@ slots, any grid, rows, and labels:
 On CSP-enforcing pages, allow every host Paysafe.js touches, or the hosted fields
 fail quietly: the script (`hosted.paysafe.com`), the card-field iframes
 (`hosted.paysafe.com` in live, `hosted.test.paysafe.com` in sandbox), and its
-parent-page XHRs (`api.paysafe.com` / `api.test.paysafe.com`):
+parent-page XHRs (telemetry to the `hosted` hosts, config and BIN lookups to
+`api.paysafe.com` / `api.test.paysafe.com`):
 
 ```
 script-src  https://hosted.paysafe.com

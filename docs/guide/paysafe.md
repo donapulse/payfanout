@@ -152,10 +152,10 @@ quietly and each missing host looks like a different problem:
 - **`frame-src`** — the card-field iframes. In **sandbox** they are served from
   `https://hosted.test.paysafe.com` (LIVE uses `https://hosted.paysafe.com`), so
   allowing only the LIVE host still breaks mounting under `environment: "sandbox"`.
-- **`connect-src`** — Paysafe.js issues XHRs **from the parent page** (telemetry,
-  payment-method and merchant-configuration lookups, BIN checks) to
-  `https://api.paysafe.com` / `https://api.test.paysafe.com`. Blocking them
-  degrades the mount with only console CSP violations to show for it.
+- **`connect-src`** — Paysafe.js issues XHRs **from the parent page**: client
+  telemetry to the `hosted` hosts, plus payment-method / merchant-configuration /
+  BIN lookups to `https://api.paysafe.com` / `https://api.test.paysafe.com`.
+  Blocking them degrades the mount with only console CSP violations to show for it.
 
 ```
 script-src  https://hosted.paysafe.com

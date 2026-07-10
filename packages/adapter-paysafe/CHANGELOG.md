@@ -1,5 +1,18 @@
 # @payfanout/adapter-paysafe
 
+## 0.2.0
+
+### Minor Changes
+
+- 5999f19: Translate a small cross-PSP appearance token set (`colorPrimary`, `colorText`, `colorDanger`, `colorBackground`, `fontFamily`, `fontSize`) in the hosted-card-field adapters, Stripe and Paysafe, so one `<PaymentFields appearance>` styles either of them. Stripe maps the tokens into its Appearance API `variables`; Paysafe maps the ones its hosted inputs support onto the field `input` selector. PSP-native shapes still pass through for power users, and the Paysafe adapter now warns about appearance entries it cannot apply — e.g. a Stripe `variables` object handed to Paysafe — instead of silently dropping all styling with a cryptic "Invalid css property" from Paysafe.js. Other PSPs (PayPal button, GoCardless panel, PayZen) keep their own native `appearance` shape; the common tokens do not apply to them.
+
+### Patch Changes
+
+- 6ae6ab8: Map Paysafe.js 9003 failures that name a setup/tokenize `options.*` parameter (accountId, currencyCode, merchantRefNum, …) to `invalid_request` instead of `invalid_card_data`. A merchant-configuration error no longer tells the cardholder their card is invalid — so hosts alert on configuration instead of shoppers retyping a valid card — while genuine invalid card fields still surface as `invalid_card_data`.
+- 3d8d31f: Coerce a digit-only Paysafe `merchantAccountId` to the numeric form Paysafe.js requires. A `merchantAccountResolver` returning the account id as a string (the documented type) previously failed every tokenize client-side with error 9003 ("Invalid accountId parameter") before any card data was evaluated. The account id is now passed to `fields.setup`/`tokenize` as a number; ids too large to represent exactly are left as strings so one is never silently rounded to a different account.
+- Updated dependencies [66095d1]
+  - @payfanout/core@1.1.0
+
 ## 0.1.4
 
 ### Patch Changes

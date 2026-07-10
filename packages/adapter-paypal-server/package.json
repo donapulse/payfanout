@@ -1,6 +1,6 @@
 {
   "name": "@payfanout/adapter-paypal-server",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "license": "MIT",
   "description": "Server-side PayPal adapter for PayFanout (Orders v2 REST: create/capture/authorize, refunds, webhook postback verification, event polling). Holds secrets — never bundle client-side.",
   "type": "module",

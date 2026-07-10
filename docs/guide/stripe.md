@@ -116,10 +116,18 @@ const stripe = new StripeClientAdapter({
   the browser. Components work as Next.js App Router client components.
 
 ::: tip Content-Security-Policy
-Stripe.js loads from `https://js.stripe.com/v3`, and card fields render in an iframe from
-Stripe. If you set a CSP, allow `script-src https://js.stripe.com` and
-`frame-src https://js.stripe.com`. Pin or self-host the script via the `sdkUrl` config
-field if you must.
+Stripe.js loads from `https://js.stripe.com/v3` and renders card fields, 3DS, and
+redirect challenges in iframes. A CSP-enforcing page needs:
+
+```
+script-src  https://js.stripe.com
+frame-src   https://js.stripe.com https://hooks.stripe.com
+connect-src https://api.stripe.com
+```
+
+Stripe's fraud signals (Radar) additionally load `https://m.stripe.network` — allow
+it under `frame-src`/`script-src` if you rely on them. Pin or self-host the script
+via the `sdkUrl` config field if you must.
 :::
 
 ## 6. Register the webhook endpoint

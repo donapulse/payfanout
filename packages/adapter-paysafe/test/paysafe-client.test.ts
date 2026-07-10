@@ -117,6 +117,24 @@ describe("PaysafeClientAdapter", () => {
     });
   });
 
+  it("coerces a digit-only merchantAccountId to the number Paysafe.js requires, but never rounds an oversized id", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    // A real per-currency account id is numeric — Paysafe.js rejects the string
+    // form with 9003, so setup() and tokenize() must receive a number.
+    const numericToken = sessionToken({ v: 1, amount: 2500, currency: "CAD", merchantAccountId: "1003178470", id: "o1" });
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: numericToken });
+    expect(fake.setupCalls[0]!.options["accountId"]).toBe(1003178470);
+    await adapter.confirm(handle);
+    expect(fake.tokenizeCalls[0]!["accountId"]).toBe(1003178470);
+
+    // An id too large to represent exactly stays a string — silently rounding it
+    // could route the tokenize to a different merchant account.
+    const huge = "9".repeat(20);
+    await adapter.mount(fakeContainer(), { clientSecret: sessionToken({ v: 1, amount: 2500, currency: "CAD", merchantAccountId: huge }) });
+    expect(fake.setupCalls[1]!.options["accountId"]).toBe(huge);
+  });
+
   it("maps tokenize failures to unified errors with raw preserved", async () => {
     stubBrowser();
     const declined = { error: { code: "9003", message: "Invalid card number" } };

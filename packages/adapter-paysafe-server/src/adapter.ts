@@ -338,8 +338,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       settleWithAuth: context.captureMethod !== "manual",
       ...(context.merchantAccountId ? { accountId: context.merchantAccountId } : {}),
       // Browser-tokenized handles carry no AVS data — Paysafe rejects card
-      // payments without a zip (error 3004), so billing rides the signed context.
-      ...(toPaysafeBillingDetails(context.billingDetails) ?? {}),
+      // payments without a zip (error 3004). Billing rides the signed context;
+      // completion-time billingDetails (e.g. a zip collected on the payment step)
+      // merges over it here, so AVS-enforcing accounts complete without a new session.
+      ...(toPaysafeBillingDetails(mergeBillingDetails(context.billingDetails, input.billingDetails)) ?? {}),
       // Checkout fields against POST /payments (which
       // strict-rejects unknown fields, error 5023): merchantDescriptor and
       // profile are accepted; shippingDetails is NOT — it is a payment-HANDLE
@@ -910,6 +912,20 @@ export function mapPaysafeError(httpStatus: number, body: unknown): PayFanoutErr
     raw: body,
     pspName: PAYSAFE_PSP_NAME,
   });
+}
+
+/**
+ * Merge completion-time billingDetails over the session context's, field by field
+ * (completion wins), so a postal code collected on the payment step augments —
+ * rather than replaces — whatever the session already carried.
+ */
+function mergeBillingDetails(
+  base: PaysafeSessionContextV1["billingDetails"],
+  override: PaysafeSessionContextV1["billingDetails"],
+): PaysafeSessionContextV1["billingDetails"] {
+  if (!base) return override;
+  if (!override) return base;
+  return { ...base, ...override, address: { ...base.address, ...override.address } };
 }
 
 function toPaysafeBillingDetails(

@@ -216,6 +216,15 @@ export interface CompletePaymentInput {
   /** Token produced by the client adapter's confirm() (e.g. Paysafe Payment Handle token). */
   clientToken: string;
   idempotencyKey: string;
+  /**
+   * AVS billing data gathered after the session was created — merged over the
+   * session's own billingDetails at completion. Tokenize-first PSPs (Paysafe)
+   * forward it to the charge; confirm-on-client PSPs (Stripe) never call
+   * completePayment. Lets a host attach a postal code collected on the payment
+   * step, which AVS-enforcing accounts require (Paysafe error 3004), without
+   * recreating the session.
+   */
+  billingDetails?: CreatePaymentSessionInput["billingDetails"];
 }
 
 export interface VerifyPaymentMethodInput {

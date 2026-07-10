@@ -336,3 +336,15 @@ One atomic core+conformance+all-adapters change (major changesets across the boa
   GitHub Pages — is unaffected; verified the built output's titles/meta are correct. No
   clean fix exists short of a VitePress v2 migration (alpha-only as of this writing);
   revisit once VitePress ships a stable v2.
+
+## Completion-time billing (2026-07-10)
+
+- **`CompletePaymentInput.billingDetails`** (optional) lets a host attach AVS billing —
+  typically a postal code collected on the payment step — at completion, not only at
+  `createPaymentSession`. The Paysafe server adapter merges it over the signed session
+  context's billing (completion wins, field by field) before `POST /payments`, so
+  AVS-enforcing accounts clear error 3004 without recreating the session. Additive and
+  backward-compatible: existing callers/adapters are unaffected, confirm-on-client PSPs
+  (Stripe) never call `completePayment`, and the conformance suite is unchanged — so, like
+  the PayPal payment-method-type addition, this deliberately did NOT go through the
+  breaking adapter-contract-change process (core + conformance + all adapters).

@@ -370,3 +370,34 @@ One atomic core+conformance+all-adapters change (major changesets across the boa
   vocabulary is shared by convention (documented in the `appearance` JSDoc), not a core
   export — core stays UI-free. Not a contract change: `appearance` is
   `Record<string, unknown>` and each adapter handles it independently; conformance is unchanged.
+
+## Built-in server-completion transport (2026-07-10)
+
+- **`createCompletionHandler` (@payfanout/server) + `completionEndpoint` (@payfanout/react)**
+  make `requiresServerCompletion` a mounted transport instead of per-host, per-surface
+  plumbing. The flag *described* the tokenize-first flow, but every host re-implemented the
+  same bridge: return a completion reference from each session endpoint, thread it through
+  every checkout surface, hand-write a `completePayment` route, wire `onServerCompletion` per
+  surface, and CSRF-exempt the route. Now the provider derives `onServerCompletion` from
+  `completionEndpoint` (POST `{ sessionRef, clientToken, billingDetails? }` → `PaymentInfo`)
+  and the server mounts one handler.
+- **The session's `clientSecret` is the completion reference.** The browser already holds it
+  (it mounted `<PaymentFields>` with it), so `<PaymentFields>` publishes it on the mounted
+  entry (`MountedEntry.sessionRef`) and `usePay` posts it — no host-minted id travels through
+  session-creation responses or checkout components. `resolveSession(sessionRef)` maps it to
+  `{ service, pspName, pspSessionId, idempotencyKey }`; for tokenize-first PSPs the session
+  token IS the `pspSessionId`.
+- **Web-standard `Request`/`Response`, deliberately diverging from the webhook handler's
+  neutral `{ rawBody, headers }` objects.** Those globals are native in
+  Next.js/Hono/workers/Node 18+, so the handler mounts as one route with no framework
+  dependency; Express bridges via `new Request(...)`. The error taxonomy maps to HTTP status
+  (`completionErrorStatus`: declines + `authentication_required` → 402, `invalid_request` →
+  400, `session_expired` → 410, `unsupported_operation` → 422, `rate_limited` → 429,
+  `psp_unavailable` → 503, `processing_error` → 502, `unknown` → 500) and the client rebuilds
+  the `PayFanoutError` from the `{ error }` body so `code`/`message`/`retryable` survive.
+- **Additive and backward-compatible**: the explicit `onServerCompletion` callback stays the
+  escape hatch (and always wins over the endpoint), `createCompletionHandler`/
+  `createEndpointCompletion` are new exports, `completionEndpoint` is a new optional prop, and
+  no adapter contract or conformance test changed — so, like the completion-time
+  `billingDetails` and the appearance tokens, this did NOT go through the breaking
+  core+conformance+all-adapters process. @payfanout/server and @payfanout/react bump minor.

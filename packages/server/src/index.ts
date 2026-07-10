@@ -36,3 +36,12 @@ export {
   type WebhookHandlerResult,
   type WebhookRequest,
 } from "./webhooks.js";
+export {
+  completionErrorStatus,
+  createCompletionHandler,
+  type CompletionHandler,
+  type CompletionHandlerContext,
+  type CompletionHandlerOptions,
+  type CompletionRequestBody,
+  type ResolvedCompletionSession,
+} from "./completion.js";

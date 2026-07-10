@@ -58,6 +58,64 @@ where the PSP supports it.
 `paymentMethodDetails` (`{ brand: "visa", last4: "4242", wallet? }`) and `mandateReference`
 (SEPA/ACH/BACS mandate id, quote it to the customer).
 
+## Server completion (tokenize-first)
+
+Tokenize-first PSPs (Paysafe, PayPal) finish on the server: the browser tokenizes, then your
+backend calls `completePayment` with that `clientToken`. `createCompletionHandler` turns that
+into one mountable route instead of per-surface plumbing — the client's
+[`completionEndpoint`](/guide/react#built-in-completion-transport) drives it automatically.
+
+```ts
+import { createCompletionHandler } from "@payfanout/server";
+
+const complete = createCompletionHandler({
+  // Map the opaque reference the browser sent (the session's clientSecret) to
+  // the tenant-scoped service + session. For tokenize-first PSPs the session
+  // token IS the pspSessionId, so this is usually a lookup for pspName plus a
+  // stable idempotency key.
+  resolveSession: async (sessionRef) => {
+    const order = await db.orderByClientSecret(sessionRef); // your storage
+    return {
+      service: payments,
+      pspName: order.psp,
+      pspSessionId: order.pspSessionId,
+      idempotencyKey: `complete-${order.id}`, // stable -> a retried POST dedupes
+    };
+  },
+  onCompleted: async (info, ctx) => {
+    await db.linkPayment(ctx.sessionRef, info.pspPaymentId); // persist status/id
+  },
+});
+```
+
+It speaks web-standard `Request`/`Response`, so it mounts as one route wherever those are
+globals (Next.js App Router, Hono, workers); Express bridges its parsed body:
+
+```ts
+// Next.js App Router / Hono / workers:
+export const POST = (req: Request) => complete(req);
+
+// Express:
+app.post("/api/complete", express.json(), async (req, res) => {
+  const response = await complete(
+    new Request("http://host/api/complete", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(req.body),
+    }),
+  );
+  res.status(response.status).type("application/json").send(await response.text());
+});
+```
+
+The wire contract (`{ sessionRef, clientToken, billingDetails? }` → `PaymentInfo`) is owned
+and versioned by the library. Failures map to HTTP status by taxonomy — card declines are
+`402`, an expired session token `410`, and so on (`completionErrorStatus` is the full table) —
+and the client rebuilds the `PayFanoutError` from the body so `code`/`message`/`retryable`
+survive. The route needs **no CSRF cookie**: the session reference is the credential, so
+exempt it from first-party CSRF the way every embedded/iframe checkout must. Confirm-on-client
+PSPs (Stripe) never reach this route — completion happens in the browser.
+
 ## Routing & failover
 
 `PaymentRouter` picks the PSP per payment and cascades transient failures, **session

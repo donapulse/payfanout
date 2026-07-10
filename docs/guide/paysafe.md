@@ -125,14 +125,10 @@ const paysafe = new PaysafeClientAdapter({
   environment: "sandbox",                            // → Paysafe.js "TEST"
 });
 
-<PayFanoutProvider adapters={[paysafe]} initialPsp="paysafe">
+<PayFanoutProvider adapters={[paysafe]} initialPsp="paysafe" completionEndpoint="/api/complete">
   <PaymentFields clientSecret={session.clientSecret} onChange={({ complete }) => setPayEnabled(complete)} />
-  <PayButton
-    onResult={(result) => showOutcome(result)}
-    onServerCompletion={(clientToken) => postToMyApi("/api/complete", { clientToken })} // REQUIRED, see §7
-  >
-    Pay
-  </PayButton>
+  {/* completionEndpoint finishes the tokenize-first flow automatically — no onServerCompletion. See §7. */}
+  <PayButton onResult={(result) => showOutcome(result)}>Pay</PayButton>
 </PayFanoutProvider>
 ```
 
@@ -179,28 +175,28 @@ session's billing, so AVS-enforcing accounts complete without recreating the ses
 
 ## 7. The server-completion route (Paysafe-only)
 
-This is the step Stripe doesn't have. When the client tokenizes, `<PayButton>` hands the
-resulting `clientToken` to your `onServerCompletion` callback, which **POSTs to your own
-API route**. That route calls `completePayment`, the server-side finalization:
+This is the step Stripe doesn't have. When the client tokenizes, the library POSTs the
+resulting `clientToken` (with the session reference and any completion-time `billingDetails`)
+to your `completionEndpoint`, where you mount `createCompletionHandler`:
 
 ```ts
-// POST /api/complete  (your route)
-app.post("/api/complete", express.json(), async (req, res) => {
-  const info = await payments.completePayment("paysafe", {
-    pspSessionId: req.body.pspSessionId,   // the signed session id from createPaymentSession
-    clientToken: req.body.clientToken,     // the single-use handle from the browser
-    idempotencyKey: req.body.orderId,      // required
-    // Optional AVS billing collected on the payment step; merged over the session's
-    // billing (an AVS-enforcing account needs at least a postal code, else Paysafe 3004).
-    ...(req.body.zip ? { billingDetails: { address: { postalCode: req.body.zip } } } : {}),
-  });
-  res.json(info);
+import { createCompletionHandler } from "@payfanout/server";
+
+// POST /api/complete
+const complete = createCompletionHandler({
+  resolveSession: async (sessionRef) => {
+    const order = await db.orderByClientSecret(sessionRef); // your storage
+    return { service: payments, pspName: "paysafe", pspSessionId: order.pspSessionId, idempotencyKey: `complete-${order.id}` };
+  },
 });
 ```
 
-`completePayment` verifies the session signature and expiry, then charges. Calling it on a
-confirm-on-client PSP (Stripe) throws, it exists only for tokenize-first PSPs
-(`requiresServerCompletion: true`). See [React usage](/guide/react#the-two-completion-shapes).
+Under the hood it calls `completePayment`, which verifies the session signature and expiry,
+merges any completion-time `billingDetails` over the session's (§6), then charges. Calling it
+on a confirm-on-client PSP (Stripe) throws — it exists only for tokenize-first PSPs
+(`requiresServerCompletion: true`). Prefer to hand-write the route? Call `completePayment`
+directly; both forms are in [Server usage](/guide/server#server-completion-tokenize-first), and
+the client side is [React usage](/guide/react#built-in-completion-transport).
 
 ## 8. Register the webhook endpoint
 

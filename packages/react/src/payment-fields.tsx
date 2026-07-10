@@ -177,7 +177,7 @@ export function PaymentFields({
           cleanupHandle = undefined;
           return;
         }
-        mountedRef.current = { psp: targetPsp, handle };
+        mountedRef.current = { psp: targetPsp, handle, sessionRef: clientSecret };
         setStatus("ready");
       } catch (err) {
         if (cancelled) return;

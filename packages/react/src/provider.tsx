@@ -21,6 +21,12 @@ export type PayFanoutStatus = "idle" | "loading-sdk" | "ready" | "error";
 export interface MountedEntry {
   psp: string;
   handle: MountedFieldsHandle;
+  /**
+   * The clientSecret the fields were mounted with — the sufficient completion
+   * reference POSTed to `completionEndpoint` (the browser already holds it, so
+   * no host-minted id needs to travel through the checkout surfaces).
+   */
+  sessionRef: string;
 }
 
 export interface PayFanoutContextValue {
@@ -29,6 +35,8 @@ export interface PayFanoutContextValue {
   setActivePsp: (psp: string) => void;
   /** BCP-47 locale for library-rendered text; undefined means English. */
   locale: string | undefined;
+  /** Host route that finalizes tokenize-first payments; undefined disables auto-completion. */
+  completionEndpoint: string | undefined;
   status: PayFanoutStatus;
   setStatus: (status: PayFanoutStatus) => void;
   lastError: UnifiedError | undefined;
@@ -58,6 +66,15 @@ export interface PayFanoutProviderProps {
    * those via `<PaymentFields locale>`).
    */
   locale?: string;
+  /**
+   * Host route that finalizes tokenize-first payments (Paysafe, PayPal). When
+   * set, `usePay`/`<PayButton>` derive `onServerCompletion` automatically —
+   * they POST `{ sessionRef, clientToken, billingDetails? }` here (mount
+   * @payfanout/server's `createCompletionHandler` at this path) and no
+   * per-surface completion wiring is needed. An explicit `onServerCompletion`
+   * still wins, as the escape hatch for a custom transport.
+   */
+  completionEndpoint?: string;
   children: ReactNode;
 }
 
@@ -67,7 +84,7 @@ export interface PayFanoutProviderProps {
  * an app with five registered PSPs still downloads one script.
  * SSR-safe: nothing here touches window/document.
  */
-export function PayFanoutProvider({ adapters, initialPsp, locale, children }: PayFanoutProviderProps): ReactNode {
+export function PayFanoutProvider({ adapters, initialPsp, locale, completionEndpoint, children }: PayFanoutProviderProps): ReactNode {
   const registry = useMemo(() => {
     const map = new Map<string, ClientPaymentAdapter>();
     for (const adapter of adapters) {
@@ -106,6 +123,7 @@ export function PayFanoutProvider({ adapters, initialPsp, locale, children }: Pa
       activePsp,
       setActivePsp,
       locale,
+      completionEndpoint,
       status,
       setStatus,
       lastError,
@@ -113,7 +131,7 @@ export function PayFanoutProvider({ adapters, initialPsp, locale, children }: Pa
       mountedRef,
       fieldsOwnerRef,
     }),
-    [registry, activePsp, setActivePsp, locale, status, lastError],
+    [registry, activePsp, setActivePsp, locale, completionEndpoint, status, lastError],
   );
 
   return <PayFanoutContext.Provider value={value}>{children}</PayFanoutContext.Provider>;

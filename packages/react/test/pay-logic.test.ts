@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { isPayFanoutError, PayFanoutError, type PaymentInfo } from "@payfanout/core";
-import { resolveConfirmOutcome } from "../src/pay-logic.js";
+import { createEndpointCompletion, resolveConfirmOutcome } from "../src/pay-logic.js";
 
 const info: PaymentInfo = {
   id: "order-1",
@@ -64,5 +64,75 @@ describe("resolveConfirmOutcome (§4a branching)", () => {
     expect(result.status).toBe("failed");
     expect(isPayFanoutError(result.error)).toBe(true);
     expect(result.error?.raw).toBe(boom);
+  });
+});
+
+describe("createEndpointCompletion", () => {
+  function fakeFetch(status: number, body: unknown) {
+    return vi.fn(async (_url: string, _init?: RequestInit) =>
+      new Response(body === undefined ? "" : JSON.stringify(body), {
+        status,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+  }
+
+  it("POSTs the wire contract and resolves with the PaymentInfo on 2xx", async () => {
+    const fetchImpl = fakeFetch(200, info);
+    const complete = createEndpointCompletion("/api/complete", "cs_ref", undefined, fetchImpl as unknown as typeof fetch);
+
+    const result = await complete("handle_1");
+
+    expect(result).toEqual(info);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchImpl.mock.calls[0]!;
+    expect(url).toBe("/api/complete");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(init?.body as string)).toEqual({ sessionRef: "cs_ref", clientToken: "handle_1" });
+  });
+
+  it("includes billingDetails in the body only when provided", async () => {
+    const fetchImpl = fakeFetch(200, info);
+    const complete = createEndpointCompletion(
+      "/c",
+      "cs",
+      { address: { postalCode: "10001" } },
+      fetchImpl as unknown as typeof fetch,
+    );
+
+    await complete("t");
+
+    expect(JSON.parse(fetchImpl.mock.calls[0]![1]?.body as string)).toEqual({
+      sessionRef: "cs",
+      clientToken: "t",
+      billingDetails: { address: { postalCode: "10001" } },
+    });
+  });
+
+  it("rebuilds a PayFanoutError from a non-2xx { error } body, preserving code/message/retryable/pspName", async () => {
+    const fetchImpl = fakeFetch(402, {
+      error: { name: "PayFanoutError", code: "card_declined", message: "Your card was declined.", retryable: false, pspName: "paysafe" },
+    });
+    const complete = createEndpointCompletion("/c", "cs", undefined, fetchImpl as unknown as typeof fetch);
+
+    let thrown: unknown;
+    await complete("t").catch((e: unknown) => {
+      thrown = e;
+    });
+    expect(isPayFanoutError(thrown)).toBe(true);
+    expect(thrown).toMatchObject({ code: "card_declined", message: "Your card was declined.", retryable: false, pspName: "paysafe" });
+  });
+
+  it("falls back to a generic unknown error when the non-2xx body is missing or unparseable", async () => {
+    const fetchImpl = fakeFetch(500, undefined); // empty body -> response.json() throws -> generic fallback
+    const complete = createEndpointCompletion("/c", "cs", undefined, fetchImpl as unknown as typeof fetch);
+
+    let thrown: unknown;
+    await complete("t").catch((e: unknown) => {
+      thrown = e;
+    });
+    expect(isPayFanoutError(thrown)).toBe(true);
+    expect((thrown as PayFanoutError).code).toBe("unknown");
+    expect((thrown as PayFanoutError).message).toMatch(/HTTP 500/);
   });
 });

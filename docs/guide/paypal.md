@@ -146,24 +146,27 @@ waits for the popup outcome instead of failing.
 
 ## 7. The server-completion route
 
-Identical to Paysafe's (PayPal is `requiresServerCompletion: true`):
+Identical to Paysafe's (PayPal is `requiresServerCompletion: true`): set
+`completionEndpoint` on the provider and mount `createCompletionHandler` at it —
 
 ```ts
-// POST /api/complete  (your route)
-app.post("/api/complete", express.json(), async (req, res) => {
-  const info = await payments.completePayment("paypal", {
-    pspSessionId: req.body.pspSessionId, // the order id from createPaymentSession
-    clientToken: req.body.clientToken,   // the approved order id from confirm()
-    idempotencyKey: req.body.orderId,    // required
-  });
-  res.json(info);
+import { createCompletionHandler } from "@payfanout/server";
+
+// POST /api/complete
+const complete = createCompletionHandler({
+  resolveSession: async (sessionRef) => {
+    const order = await db.orderByClientSecret(sessionRef); // your storage
+    return { service: payments, pspName: "paypal", pspSessionId: order.pspSessionId, idempotencyKey: `complete-${order.id}` };
+  },
 });
 ```
 
-The adapter rejects a `clientToken` that names a different order than the session
-(tamper guard), and branches on the order's intent: `CAPTURE` orders capture,
-`AUTHORIZE` orders authorize and return `requires_capture` for a later
-`capturePayment` (partial and multiple captures supported).
+Under the hood it calls `completePayment` (which **captures**). The adapter rejects a
+`clientToken` that names a different order than the session (tamper guard), and branches on
+the order's intent: `CAPTURE` orders capture, `AUTHORIZE` orders authorize and return
+`requires_capture` for a later `capturePayment` (partial and multiple captures supported).
+Prefer a hand-written route? Call `completePayment` directly — see
+[Server usage](/guide/server#server-completion-tokenize-first).
 
 ### Declines: `INSTRUMENT_DECLINED` recovery
 

@@ -13,7 +13,7 @@ import { PayZenClientAdapter } from "@payfanout/adapter-payzen";
 import { GoCardlessClientAdapter } from "@payfanout/adapter-gocardless";
 import { PayPalClientAdapter } from "@payfanout/adapter-paypal";
 import { PayFanoutProvider, PaymentFields, usePay, usePayFanout, type PayResult } from "@payfanout/react";
-import { localizeError, PayFanoutError, type PaymentInfo } from "@payfanout/core";
+import { localizeError, PayFanoutError } from "@payfanout/core";
 import { I18nProvider, LOCALES, useI18n } from "./i18n.js";
 
 const adapters = [
@@ -88,7 +88,9 @@ function LocalizedApp(): JSX.Element {
   return (
     // locale flows to the library: the default <PayButton> label and any
     // library-rendered text localize; hosts still override with their own copy.
-    <PayFanoutProvider adapters={adapters} initialPsp="stripe" locale={locale}>
+    // completionEndpoint makes tokenize-first PSPs (Paysafe/PayPal) finish
+    // themselves — no per-surface onServerCompletion wiring anywhere below.
+    <PayFanoutProvider adapters={adapters} initialPsp="stripe" locale={locale} completionEndpoint="/api/complete">
       <Checkout />
     </PayFanoutProvider>
   );
@@ -229,21 +231,6 @@ function Checkout(): JSX.Element {
     [saveCard, session],
   );
 
-  // Tokenize-first PSPs (Paysafe) land here; Stripe never calls it.
-  const orderId = session?.orderId;
-  const onServerCompletion = useCallback(
-    async (clientToken: string): Promise<PaymentInfo> => {
-      const response = await fetch("/api/complete", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ orderId, clientToken }),
-      });
-      if (!response.ok) throw new Error((await response.json()).error);
-      return (await response.json()) as PaymentInfo;
-    },
-    [orderId],
-  );
-
   return (
     <main style={{ maxWidth: 480, margin: "4rem auto", fontFamily: "system-ui" }}>
       <LanguagePicker />
@@ -309,11 +296,7 @@ function Checkout(): JSX.Element {
             <input type="checkbox" checked={saveCard} onChange={(e) => { resetCheckout(); setSaveCard(e.target.checked); }} />{" "}
             {t("demo.saveCard")}
           </label>
-          <DesignSystemPayButton
-            disabled={!fieldsComplete}
-            onResult={handleResult}
-            onServerCompletion={onServerCompletion}
-          />
+          <DesignSystemPayButton disabled={!fieldsComplete} onResult={handleResult} />
         </>
       )}
 
@@ -336,14 +319,15 @@ function Checkout(): JSX.Element {
  * Bring-your-own-button: usePay() gives any design-system button the exact
  * <PayButton> behavior (confirm + §4a branching + normalized failures) —
  * the styling and label below are 100% the host's (localized here via t()).
+ * Server completion is derived from the provider's completionEndpoint, so this
+ * button needs no onServerCompletion wiring even for tokenize-first PSPs.
  */
 function DesignSystemPayButton(props: {
   disabled?: boolean;
   onResult: (result: PayResult) => void;
-  onServerCompletion?: (clientToken: string) => Promise<PaymentInfo>;
 }): JSX.Element {
   const { t } = useI18n();
-  const { pay, paying } = usePay({ onServerCompletion: props.onServerCompletion });
+  const { pay, paying } = usePay();
   return (
     <button
       type="button"

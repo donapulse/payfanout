@@ -306,6 +306,104 @@ describe("PayButton", () => {
   });
 });
 
+describe("PayButton with provider completionEndpoint (derived onServerCompletion)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("derives server completion from completionEndpoint for tokenize-first PSPs", async () => {
+    const adapter = new FakeClientAdapter();
+    adapter.confirmImpl = async () => ({ status: "requires_confirmation", clientToken: "SPtok_42" });
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(paymentInfo), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const results: PayResult[] = [];
+    render(
+      <PayFanoutProvider adapters={[adapter]} completionEndpoint="/api/complete">
+        <PaymentFields clientSecret="cs_ref_1" />
+        <PayButton onResult={(r) => void results.push(r)}>Pay now</PayButton>
+      </PayFanoutProvider>,
+    );
+    await waitFor(() => expect(adapter.mountCalls).toHaveLength(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Pay now" }));
+
+    await waitFor(() => expect(results).toHaveLength(1));
+    expect(results[0]!.status).toBe("succeeded");
+    expect(results[0]!.info).toEqual(paymentInfo);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]![0]).toBe("/api/complete");
+    // The mounted clientSecret is the completion reference — no host-minted id needed.
+    expect(JSON.parse(fetchMock.mock.calls[0]![1]?.body as string)).toEqual({ sessionRef: "cs_ref_1", clientToken: "SPtok_42" });
+  });
+
+  it("lets an explicit onServerCompletion override the endpoint", async () => {
+    const adapter = new FakeClientAdapter();
+    adapter.confirmImpl = async () => ({ status: "requires_confirmation", clientToken: "SPtok_7" });
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(paymentInfo), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const explicit = vi.fn(async () => paymentInfo);
+    const results: PayResult[] = [];
+    render(
+      <PayFanoutProvider adapters={[adapter]} completionEndpoint="/api/complete">
+        <PaymentFields clientSecret="cs_ref_1" />
+        <PayButton onResult={(r) => void results.push(r)} onServerCompletion={explicit}>
+          Pay now
+        </PayButton>
+      </PayFanoutProvider>,
+    );
+    await waitFor(() => expect(adapter.mountCalls).toHaveLength(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Pay now" }));
+
+    await waitFor(() => expect(results).toHaveLength(1));
+    expect(explicit).toHaveBeenCalledWith("SPtok_7");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("forwards PayButton billingDetails to the completion endpoint", async () => {
+    const adapter = new FakeClientAdapter();
+    adapter.confirmImpl = async () => ({ status: "requires_confirmation", clientToken: "SPtok_z" });
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(paymentInfo), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <PayFanoutProvider adapters={[adapter]} completionEndpoint="/c">
+        <PaymentFields clientSecret="cs_x" />
+        <PayButton onResult={() => {}} billingDetails={{ address: { postalCode: "94107" } }}>
+          Pay now
+        </PayButton>
+      </PayFanoutProvider>,
+    );
+    await waitFor(() => expect(adapter.mountCalls).toHaveLength(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Pay now" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(JSON.parse(fetchMock.mock.calls[0]![1]?.body as string)).toEqual({
+      sessionRef: "cs_x",
+      clientToken: "SPtok_z",
+      billingDetails: { address: { postalCode: "94107" } },
+    });
+  });
+
+  it("still fails loudly for a tokenize-first PSP when neither endpoint nor callback is set", async () => {
+    const adapter = new FakeClientAdapter();
+    adapter.confirmImpl = async () => ({ status: "requires_confirmation", clientToken: "SPtok_x" });
+    const results: PayResult[] = [];
+    render(
+      <PayFanoutProvider adapters={[adapter]}>
+        <PaymentFields clientSecret="cs_1" />
+        <PayButton onResult={(r) => void results.push(r)}>Pay now</PayButton>
+      </PayFanoutProvider>,
+    );
+    await waitFor(() => expect(adapter.mountCalls).toHaveLength(1));
+
+    fireEvent.click(screen.getByRole("button", { name: "Pay now" }));
+
+    await waitFor(() => expect(results).toHaveLength(1));
+    expect(results[0]!.status).toBe("failed");
+    expect(results[0]!.error?.code).toBe("invalid_request");
+    expect(results[0]!.error?.message).toMatch(/completionEndpoint/);
+  });
+});
+
 describe("PayButton localization", () => {
   it("defaults to the built-in English label with no locale", () => {
     render(

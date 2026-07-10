@@ -38,16 +38,18 @@ function signedWebhook(body: object): { rawBody: string; headers: Record<string,
   return { rawBody, headers: { signature } };
 }
 
+// Real Paysafe Payments-API deliveries carry the event in `eventName` (see webhook.ts) —
+// the conformance contract exercises that real-world shape.
 const webhookFixture = signedWebhook({
   id: "psf_evt_1",
-  eventType: "PAYMENT.COMPLETED",
+  eventName: "PAYMENT.COMPLETED",
   txnTime: "2026-07-04T10:00:02Z",
   payload: { id: "pay_42", status: "COMPLETED", merchantRefNum: "order-1", amount: 1099, currencyCode: "USD" },
 });
 
 const unknownWebhookFixture = signedWebhook({
   id: "psf_evt_new",
-  eventType: "WALLET.SOMETHING.NEW",
+  eventName: "WALLET.SOMETHING.NEW",
   txnTime: "2026-07-04T10:00:03Z",
   payload: { id: "obj_1" },
 });

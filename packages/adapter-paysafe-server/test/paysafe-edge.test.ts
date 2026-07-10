@@ -206,6 +206,45 @@ describe("webhook edge cases", () => {
     }
   });
 
+  it("reads the event name from eventName, as real Payments-API deliveries send it", async () => {
+    // Verbatim shape of a real sandbox delivery (values sanitized): the event name lives in
+    // `eventName`; top-level `type` is the resource CATEGORY ("PAYMENT"), not the event; and
+    // there is no top-level `id`, so the dedupe id must fall back to the raw-body hash.
+    const rawBody = JSON.stringify({
+      payload: {
+        id: "cfdd12b1-0000-0000-0000-000000000000",
+        source: "PaysafeJSV2",
+        merchantRefNum: "complete-ref-1",
+        amount: 1000,
+        currencyCode: "CAD",
+        status: "COMPLETED",
+        txnTime: "2026-07-10T15:07:39Z",
+      },
+      attemptNumber: "1",
+      type: "PAYMENT",
+      resourceId: "cfdd12b1-0000-0000-0000-000000000000",
+      eventDate: "2026-07-10T15:07:39Z",
+      eventName: "PAYMENT_COMPLETED",
+    });
+    const event = await parsePaysafeWebhookEvent(rawBody);
+    expect(event.type).toBe("payment.succeeded"); // not "unknown"
+    expect(event.pspPaymentId).toBe("cfdd12b1-0000-0000-0000-000000000000");
+    expect(event.amount).toBe(1000);
+    expect(event.currency).toBe("CAD");
+    expect(event.occurredAt).toBe("2026-07-10T15:07:39.000Z");
+    expect(event.id).toMatch(/^paysafe_/); // no top-level id -> stable raw-body hash
+  });
+
+  it("still reads legacy eventType/event fields and never treats the resource-category type as the event", async () => {
+    expect((await parsePaysafeWebhookEvent(JSON.stringify({ eventType: "PAYMENT_COMPLETED" }))).type).toBe(
+      "payment.succeeded",
+    );
+    expect((await parsePaysafeWebhookEvent(JSON.stringify({ event: "PAYMENT_COMPLETED" }))).type).toBe(
+      "payment.succeeded",
+    );
+    // A body whose only event-ish field is the resource category must not be mistaken for an event.
+    expect((await parsePaysafeWebhookEvent(JSON.stringify({ type: "PAYMENT" }))).type).toBe("unknown");
+  });
 });
 
 describe("transport edge cases", () => {

@@ -245,7 +245,6 @@ describe("webhook edge cases", () => {
     // A body whose only event-ish field is the resource category must not be mistaken for an event.
     expect((await parsePaysafeWebhookEvent(JSON.stringify({ type: "PAYMENT" }))).type).toBe("unknown");
   });
-
 });
 
 describe("transport edge cases", () => {

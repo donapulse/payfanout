@@ -23,6 +23,7 @@ import {
   type UnifiedPaymentStatus,
   type UnifiedWebhookEvent,
   type UpdatePaymentSessionInput,
+  type VerifyCredentialsResult,
 } from "@payfanout/core";
 import { mapPayPalError, PAYPAL_PSP_NAME } from "./error-map.js";
 import { derivePayPalRequestId } from "./request-id.js";
@@ -599,6 +600,37 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     return parsePayPalWebhookEvent(rawBody);
   }
 
+  /**
+   * Side-effect-free credential probe behind a host's "Test connection" button.
+   * The client-credentials token mint IS the ideal probe: it reads nothing and
+   * moves no money, yet it exercises the exact clientId/clientSecret the adapter
+   * authenticates with. Always performs a real token fetch (never trusting a
+   * warm cache), and classifies from the RAW HTTP status so a rejected key
+   * (401/403) is never confused with a transient outage — the mint issues a
+   * single request, so an auth rejection is never retried. Secrets are never
+   * echoed back in the message.
+   */
+  async verifyCredentials(): Promise<VerifyCredentialsResult> {
+    let exchange: { response: Response; text: string };
+    try {
+      exchange = await this.requestAccessToken();
+    } catch {
+      // requestWithTimeout maps a dropped connection or timeout — the only
+      // thing this call can throw — to a transport error, so it is always a
+      // reach problem. Auth rejections arrive as HTTP responses, handled below.
+      return { ok: false, category: "network", message: "Could not reach PayPal — try again." };
+    }
+    const { response, text } = exchange;
+    if (response.ok && accessTokenFrom(text)) return { ok: true };
+    if (response.status === 401 || response.status === 403) {
+      return { ok: false, category: "auth", message: "Authentication failed — check the PayPal client id and secret." };
+    }
+    if (response.status === 429 || response.status >= 500) {
+      return { ok: false, category: "network", message: "Could not reach PayPal — try again." };
+    }
+    return { ok: false, category: "internal", message: `PayPal rejected the credential check (HTTP ${response.status}).` };
+  }
+
   // --- mapping ------------------------------------------------------------
 
   private orderStateToStatus(order: PayPalOrderLike): UnifiedPaymentStatus {
@@ -837,19 +869,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
 
   private async mintAccessToken(): Promise<string> {
     const now = this.now();
-    const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
-    const { response, text } = await requestWithTimeout(
-      { fetch: this.config.fetch ?? fetch, timeoutMs, onFailure: this.transportFailure(timeoutMs) },
-      `${this.baseUrl}/v1/oauth2/token`,
-      {
-        method: "POST",
-        headers: {
-          authorization: `Basic ${utf8ToBase64(`${this.config.clientId}:${this.config.clientSecret}`)}`,
-          "content-type": "application/x-www-form-urlencoded",
-        },
-        body: "grant_type=client_credentials",
-      },
-    );
+    const { response, text } = await this.requestAccessToken();
     const json = text ? safeJson(text) : undefined;
     if (!response.ok) throw mapPayPalError(response.status, json ?? text);
     const body = json as { access_token?: string; expires_in?: number } | undefined;
@@ -864,6 +884,28 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     }
     this.tokenCache = { token: body.access_token, expiresAt: now + (body.expires_in ?? 0) * 1000 };
     return body.access_token;
+  }
+
+  /**
+   * The raw client-credentials token exchange — shared by mintAccessToken (which
+   * caches the token) and verifyCredentials (which inspects the raw status). An
+   * HTTP error status returns the response; only transport failure/timeout
+   * throws (a retryable psp_unavailable).
+   */
+  private requestAccessToken(): Promise<{ response: Response; text: string }> {
+    const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
+    return requestWithTimeout(
+      { fetch: this.config.fetch ?? fetch, timeoutMs, onFailure: this.transportFailure(timeoutMs) },
+      `${this.baseUrl}/v1/oauth2/token`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Basic ${utf8ToBase64(`${this.config.clientId}:${this.config.clientSecret}`)}`,
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        body: "grant_type=client_credentials",
+      },
+    );
   }
 
   private now(): number {
@@ -1012,6 +1054,12 @@ function toPayPalShipping(details: ShippingDetails | undefined): Record<string, 
 function isNotFound(err: unknown): boolean {
   if (!(err instanceof PayFanoutError)) return false;
   return (err.raw as { name?: string } | undefined)?.name === "RESOURCE_NOT_FOUND";
+}
+
+/** The access token in an OAuth token response body, if the mint returned one. */
+function accessTokenFrom(text: string): string | undefined {
+  const token = (text ? safeJson(text) : undefined) as { access_token?: unknown } | undefined;
+  return typeof token?.access_token === "string" ? token.access_token : undefined;
 }
 
 function relativeEventsPath(href: string): string | undefined {

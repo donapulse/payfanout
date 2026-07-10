@@ -20,8 +20,12 @@ export class FakePaysafeApi {
   uniqueRefundCreations = 0;
   uniqueCustomerCreations = 0;
   lastRequestBody: Record<string, unknown> | undefined;
+  /** Test levers for the verifyCredentials probe (bad key / transient outage). */
+  authFailure = false;
+  networkFailure = false;
 
   readonly fetch: typeof fetch = async (input, init) => {
+    if (this.networkFailure) throw new TypeError("simulated network failure");
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const method = init?.method ?? "GET";
     const parsed = new URL(url);
@@ -29,7 +33,7 @@ export class FakePaysafeApi {
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined;
     this.lastRequestBody = body;
 
-    if (!(init?.headers as Record<string, string>)?.["authorization"]?.startsWith("Basic ")) {
+    if (this.authFailure || !(init?.headers as Record<string, string>)?.["authorization"]?.startsWith("Basic ")) {
       return json(401, { error: { code: "5279", message: "Invalid credentials" } });
     }
 
@@ -54,7 +58,10 @@ export class FakePaysafeApi {
     if (method === "GET" && path === "/paymenthub/v1/customers" && parsed.searchParams.get("merchantCustomerId")) {
       const wanted = parsed.searchParams.get("merchantCustomerId");
       const found = [...this.customers.values()].find((c) => c.merchantCustomerId === wanted);
-      if (!found) return json(404, { error: { code: "5269", message: "No such customer" } });
+      // The lookup endpoint returns a (possibly empty) match set, not a 404: an
+      // absent profile is 200 + empty list. createCustomer's 7505 recovery only
+      // queries ids it knows exist; verifyCredentials probes a random absent id.
+      if (!found) return json(200, { customers: [], meta: { numberOfRecords: 0 } });
       return json(200, { id: found.id, merchantCustomerId: found.merchantCustomerId, status: "ACTIVE" });
     }
     const custHandlesMatch = /^\/paymenthub\/v1\/customers\/([^/?]+)\/paymenthandles$/.exec(path);

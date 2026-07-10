@@ -316,6 +316,13 @@ export interface ServerPaymentAdapter {
   getCapabilities(): AdapterCapabilities;
 
   /**
+   * Optional side-effect-free credential probe — the engine behind a host
+   * "Test connection" button. Makes ONE read-only PSP call and classifies the
+   * outcome; never mutates PSP state. Absence means the adapter offers no probe.
+   */
+  verifyCredentials?(): Promise<VerifyCredentialsResult>;
+
+  /**
    * Webhook handling — same adapter, separate concerns. Both async: future
    * PSPs may need remote key retrieval; the contract stays uniform.
    * MUST operate on the RAW request body bytes/string — re-serializing a
@@ -329,6 +336,16 @@ export interface ServerPaymentAdapter {
    */
   parseWebhookEvent(rawBody: string, headers: Record<string, string>): Promise<UnifiedWebhookEvent>;
 }
+
+/**
+ * Outcome of ServerPaymentAdapter.verifyCredentials — a side-effect-free probe
+ * that the configured credentials authenticate against the PSP. `category` lets
+ * a host's "Test connection" UI distinguish a wrong key (`auth`) from a
+ * transient outage (`network`) or an unexpected adapter/PSP fault (`internal`).
+ */
+export type VerifyCredentialsResult =
+  | { ok: true }
+  | { ok: false; category: "auth" | "network" | "internal"; message: string };
 
 /**
  * Opaque handle returned by ClientPaymentAdapter.mount. Each adapter brands

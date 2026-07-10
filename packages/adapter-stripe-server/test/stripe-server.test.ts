@@ -2,7 +2,7 @@ import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { getRefundState, isPayFanoutError } from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
-import { StripeServerAdapter, type StripeServerAdapterConfig } from "../src/index.js";
+import { StripeServerAdapter, stripeOnboarding, type StripeServerAdapterConfig } from "../src/index.js";
 import { FakeStripe, stripeError } from "./fake-stripe.js";
 
 const NOW_MS = Date.parse("2026-07-04T12:00:00Z");
@@ -55,6 +55,7 @@ runServerAdapterConformanceTests(
     return adapter;
   },
   {
+    onboarding: stripeOnboarding,
     createSessionInput: () => ({
       amount: 1099,
       currency: "USD",
@@ -403,5 +404,63 @@ describe("StripeServerAdapter specifics", () => {
         expect(err.pspName).toBe("stripe");
       } else expect.unreachable();
     }
+  });
+
+  describe("verifyCredentials (Test connection probe)", () => {
+    it("returns { ok: true } after one successful read-only events.list call", async () => {
+      const { adapter } = makePair();
+      await expect(adapter.verifyCredentials()).resolves.toEqual({ ok: true });
+    });
+
+    it("classifies a 401 StripeAuthenticationError as category 'auth'", async () => {
+      const { adapter, fake } = makePair();
+      fake.failNextWith(
+        stripeError({ type: "StripeAuthenticationError", statusCode: 401, message: "Invalid API Key provided" }),
+      );
+      const result = await adapter.verifyCredentials();
+      expect(result).toEqual({
+        ok: false,
+        category: "auth",
+        message: "Authentication failed — check the Stripe secret key.",
+      });
+    });
+
+    it("classifies a 403 StripePermissionError as category 'auth'", async () => {
+      const { adapter, fake } = makePair();
+      fake.failNextWith(stripeError({ type: "StripePermissionError", statusCode: 403, message: "no access" }));
+      const result = await adapter.verifyCredentials();
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.category).toBe("auth");
+    });
+
+    it("classifies a StripeConnectionError as category 'network'", async () => {
+      const { adapter, fake } = makePair();
+      fake.failNextWith(stripeError({ type: "StripeConnectionError", message: "socket hang up" }));
+      const result = await adapter.verifyCredentials();
+      expect(result).toEqual({
+        ok: false,
+        category: "network",
+        message: "Could not reach Stripe — try again.",
+      });
+    });
+
+    it("classifies a 5xx as category 'network'", async () => {
+      const { adapter, fake } = makePair();
+      fake.failNextWith(stripeError({ type: "StripeAPIError", statusCode: 503, message: "upstream down" }));
+      const result = await adapter.verifyCredentials();
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.category).toBe("network");
+    });
+
+    it("classifies anything else as category 'internal' without leaking details", async () => {
+      const { adapter, fake } = makePair();
+      fake.failNextWith(stripeError({ type: "StripeInvalidRequestError", statusCode: 400, message: "bad param" }));
+      const result = await adapter.verifyCredentials();
+      expect(result).toEqual({
+        ok: false,
+        category: "internal",
+        message: "Could not verify Stripe credentials.",
+      });
+    });
   });
 });

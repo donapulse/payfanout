@@ -7,6 +7,7 @@ export {
   type GoCardlessRefundLike,
   type GoCardlessServerAdapterConfig,
 } from "./adapter.js";
+export { gocardlessOnboarding } from "./onboarding.js";
 export {
   parseGoCardlessWebhookEvents,
   verifyGoCardlessWebhookSignature,

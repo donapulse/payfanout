@@ -53,6 +53,7 @@ export class FakeGoCardlessApi {
   private readonly idempotencyKeys = new Map<string, string>();
   private seq = 0;
   private failure: { status: number; body: unknown; times: number } | undefined;
+  private networkFailure = 0;
 
   refundsEnabled = true;
   mandateLookupFails = false;
@@ -67,7 +68,18 @@ export class FakeGoCardlessApi {
     this.failure = { status, body, times };
   }
 
+  /** Rejects the next `times` requests at the transport layer (fetch throws) — the psp_unavailable path. */
+  failNextWithNetworkError(times = 1): void {
+    this.networkFailure = times;
+  }
+
   readonly fetch: typeof fetch = async (input, init) => {
+    // A transport failure (DNS/connection/timeout): fetch rejects before the
+    // request is processed, exercising the adapter's onFailure mapping.
+    if (this.networkFailure > 0) {
+      this.networkFailure -= 1;
+      throw new TypeError("simulated GoCardless network failure");
+    }
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const method = init?.method ?? "GET";
     const parsed = new URL(url);

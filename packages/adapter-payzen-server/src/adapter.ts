@@ -24,6 +24,7 @@ import {
   type UnifiedErrorCode,
   type UnifiedPaymentStatus,
   type UnifiedWebhookEvent,
+  type VerifyCredentialsResult,
 } from "@payfanout/core";
 import { parsePayZenWebhookEvent, verifyPayZenWebhookSignature } from "./webhook.js";
 
@@ -434,6 +435,38 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
     };
   }
 
+  /**
+   * "Test connection" probe: one side-effect-free Charge/SDKTest call — PayZen's
+   * purpose-built connection test, which just echoes the submitted value back on
+   * valid credentials. The outcome is classified so a host UI can tell a wrong
+   * shopId/password (`auth`) from a transient outage (`network`); it resolves on
+   * every path instead of throwing, and never surfaces the credential.
+   */
+  async verifyCredentials(): Promise<VerifyCredentialsResult> {
+    try {
+      await this.call<{ value?: string }>("Charge/SDKTest", {
+        value: "connection-test",
+        mode: this.config.environment === "live" ? "PRODUCTION" : "TEST",
+      });
+      return { ok: true };
+    } catch (err) {
+      const e = (err ?? {}) as { code?: string; retryable?: boolean; raw?: unknown };
+      const envelopeCode = readEnvelopeErrorCode(e.raw);
+      // INT_905 is PayZen's wrong shopId/password rejection (delivered inside an
+      // HTTP 200 ERROR envelope); an auth proxy in front of the gateway would
+      // answer HTTP 401/403, which classifyHttpFallback collapses to a bare,
+      // non-retryable invalid_request with no PayZen envelope. Both are auth.
+      if (envelopeCode === "INT_905" || (envelopeCode === undefined && e.code === "invalid_request")) {
+        return { ok: false, category: "auth", message: "Authentication failed — check the PayZen shop id and password." };
+      }
+      // rate_limited / psp_unavailable — the only transient (retryable) failures.
+      if (e.retryable === true) {
+        return { ok: false, category: "network", message: "Could not reach PayZen — try again." };
+      }
+      return { ok: false, category: "internal", message: "Could not verify PayZen credentials." };
+    }
+  }
+
   async verifyWebhookSignature(rawBody: string, headers: Record<string, string>): Promise<boolean> {
     return verifyPayZenWebhookSignature(rawBody, headers, {
       passwords: normalizeSecrets(this.config.password),
@@ -800,6 +833,21 @@ export function mapPayZenError(answer: PayZenErrorAnswerLike | undefined, raw: u
     raw,
     pspName: PAYZEN_PSP_NAME,
   });
+}
+
+/**
+ * The PayZen `errorCode` carried on a mapped envelope error's `raw` (an ERROR
+ * envelope), or undefined for a transport-level failure — a network/timeout
+ * (raw is the cause) or an HTTP status from infrastructure in front of the
+ * gateway (raw is the response body). Lets verifyCredentials tell an INT_905
+ * credential rejection apart from a mere outage.
+ */
+function readEnvelopeErrorCode(raw: unknown): string | undefined {
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const answer = (raw as { answer?: unknown }).answer;
+  if (typeof answer !== "object" || answer === null) return undefined;
+  const errorCode = (answer as { errorCode?: unknown }).errorCode;
+  return typeof errorCode === "string" ? errorCode : undefined;
 }
 
 function toPayZenCustomer(input: CreatePaymentSessionInput): Record<string, unknown> | undefined {

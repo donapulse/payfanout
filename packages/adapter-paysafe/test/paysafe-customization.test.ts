@@ -154,4 +154,54 @@ describe("Paysafe field customization", () => {
       accountId: "acct-1",
     });
   });
+
+  it("translates common appearance tokens onto the Paysafe input selector", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    await adapter.mount({ appendChild: () => {} } as never, {
+      clientSecret: TOKEN,
+      appearance: { colorText: "#333", fontFamily: "system-ui", fontSize: "16px", colorPrimary: "#7c3aed" },
+    });
+    const style = fake.setupOptions[0]!["style"] as Record<string, Record<string, string>>;
+    // colorPrimary is a recognized common token with no honest Paysafe surface — not applied, not warned.
+    expect(style["input"]).toEqual({ color: "#333", "font-family": "system-ui", "font-size": "16px" });
+  });
+
+  it("passes native Paysafe selectors through, and a native input wins over the common tokens", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    await adapter.mount({ appendChild: () => {} } as never, {
+      clientSecret: TOKEN,
+      appearance: { colorText: "#333", input: { color: "#999", "border-radius": "6px" }, ":focus": { color: "#000" } },
+    });
+    const style = fake.setupOptions[0]!["style"] as Record<string, Record<string, string>>;
+    expect(style["input"]).toEqual({ color: "#999", "border-radius": "6px" });
+    expect(style[":focus"]).toEqual({ color: "#000" });
+  });
+
+  it("drops Stripe Appearance keys with a warning instead of silently breaking all styling", async () => {
+    stubBrowser();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { adapter, fake } = makeAdapter();
+    await adapter.mount({ appendChild: () => {} } as never, {
+      clientSecret: TOKEN,
+      appearance: { variables: { colorPrimary: "#7c3aed" }, theme: "flat", input: { color: "#333" } },
+    });
+    expect(fake.setupOptions[0]!["style"]).toEqual({ input: { color: "#333" } });
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("variables"));
+    warn.mockRestore();
+  });
+
+  it("hands Paysafe no style at all when every appearance entry is unusable (issue #62 payload)", async () => {
+    stubBrowser();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { adapter, fake } = makeAdapter();
+    await adapter.mount({ appendChild: () => {} } as never, {
+      clientSecret: TOKEN,
+      appearance: { variables: { colorPrimary: "#7c3aed" }, borderRadius: "8px" }, // Stripe object + a stray scalar
+    });
+    expect(fake.setupOptions[0]).not.toHaveProperty("style"); // no bogus { style: {} } — Paysafe.js gets no style option
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("variables"));
+    warn.mockRestore();
+  });
 });

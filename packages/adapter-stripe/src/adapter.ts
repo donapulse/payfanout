@@ -125,9 +125,10 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
     const factory = this.stripeGlobal()!;
     const locale = options.locale ?? this.config.locale;
     const stripe = factory(this.config.publishableKey, locale ? { locale } : undefined);
+    const appearance = toStripeAppearance(options.appearance);
     const elements = stripe.elements({
       clientSecret: options.clientSecret,
-      ...(options.appearance ? { appearance: options.appearance } : {}),
+      ...(appearance ? { appearance } : {}),
     });
     // fieldOptions = the full Payment Element option surface (layout,
     // paymentMethodOrder, fields, defaultValues, terms, wallets, …), passed
@@ -223,6 +224,38 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
     if (typeof window === "undefined") return undefined;
     return (window as unknown as { Stripe?: StripeJsFactory }).Stripe;
   }
+}
+
+/** Cross-PSP appearance tokens → Stripe Appearance API `variables`. */
+const COMMON_APPEARANCE_TO_STRIPE_VARIABLE: Record<string, string> = {
+  colorPrimary: "colorPrimary",
+  colorText: "colorText",
+  colorDanger: "colorDanger",
+  colorBackground: "colorBackground",
+  fontFamily: "fontFamily",
+  fontSize: "fontSizeBase",
+};
+
+/**
+ * Translates PaymentFields `appearance` into the Stripe Appearance API. The small
+ * cross-PSP token set (colorPrimary/colorText/colorDanger/colorBackground/
+ * fontFamily/fontSize) is mapped into `variables` so one `appearance` styles either
+ * PSP; native Stripe keys (`theme`, `variables`, `rules`, `labels`) pass through
+ * untouched, and an explicit native `variables` value wins over a translated token.
+ */
+function toStripeAppearance(appearance: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!appearance) return undefined;
+  const translated: Record<string, unknown> = {};
+  const native: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(appearance)) {
+    const variable = COMMON_APPEARANCE_TO_STRIPE_VARIABLE[key];
+    if (variable !== undefined && typeof value === "string") translated[variable] = value;
+    else native[key] = value;
+  }
+  if (Object.keys(translated).length === 0) return native;
+  const nv = native["variables"];
+  const nativeVariables = (nv !== null && typeof nv === "object" ? nv : {}) as Record<string, unknown>;
+  return { ...native, variables: { ...translated, ...nativeVariables } };
 }
 
 function asStripeHandle(handle: MountedFieldsHandle): StripeHandle {

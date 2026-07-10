@@ -192,6 +192,48 @@ describe("Paysafe checkout fields on POST /payments", () => {
     expect(context.shippingDetails?.address?.city).toBe("NYC");
   });
 
+  it("merges completion-time billingDetails into /payments when the session carried none (AVS zip on the payment step)", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession(sessionInput); // no billingDetails on the session
+    await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: "tok_ok",
+      idempotencyKey: "k-complete",
+      billingDetails: { address: { postalCode: "90210", country: "US" } },
+    });
+    expect(fake.lastRequestBody).toMatchObject({ billingDetails: { zip: "90210", country: "US" } });
+  });
+
+  it("merges completion-time billingDetails over the session's, field by field (completion wins)", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({
+      ...sessionInput,
+      billingDetails: { address: { line1: "9 Bill St", city: "NYC" } }, // session has street/city but no zip
+    });
+    await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: "tok_ok",
+      idempotencyKey: "k-complete",
+      billingDetails: { address: { postalCode: "90210" } }, // completion supplies the AVS zip
+    });
+    expect(fake.lastRequestBody).toMatchObject({ billingDetails: { street: "9 Bill St", city: "NYC", zip: "90210" } });
+  });
+
+  it("keeps the session's billing field when completion passes an explicit undefined (no clobber, no preventable 3004)", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({
+      ...sessionInput,
+      billingDetails: { address: { postalCode: "10001", country: "US" } },
+    });
+    await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: "tok_ok",
+      idempotencyKey: "k-complete",
+      billingDetails: { address: { postalCode: undefined, line1: "9 Bill St" } }, // zip left explicitly undefined
+    });
+    expect(fake.lastRequestBody).toMatchObject({ billingDetails: { zip: "10001", street: "9 Bill St", country: "US" } });
+  });
+
   it("omits the hashes entirely when the fields were not provided", async () => {
     const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession(sessionInput);

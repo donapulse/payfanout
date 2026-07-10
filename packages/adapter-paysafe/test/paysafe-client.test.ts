@@ -117,6 +117,24 @@ describe("PaysafeClientAdapter", () => {
     });
   });
 
+  it("coerces a digit-only merchantAccountId to the number Paysafe.js requires, but never rounds an oversized id", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    // A real per-currency account id is numeric — Paysafe.js rejects the string
+    // form with 9003, so setup() and tokenize() must receive a number.
+    const numericToken = sessionToken({ v: 1, amount: 2500, currency: "CAD", merchantAccountId: "1003178470", id: "o1" });
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: numericToken });
+    expect(fake.setupCalls[0]!.options["accountId"]).toBe(1003178470);
+    await adapter.confirm(handle);
+    expect(fake.tokenizeCalls[0]!["accountId"]).toBe(1003178470);
+
+    // An id too large to represent exactly stays a string — silently rounding it
+    // could route the tokenize to a different merchant account.
+    const huge = "9".repeat(20);
+    await adapter.mount(fakeContainer(), { clientSecret: sessionToken({ v: 1, amount: 2500, currency: "CAD", merchantAccountId: huge }) });
+    expect(fake.setupCalls[1]!.options["accountId"]).toBe(huge);
+  });
+
   it("maps tokenize failures to unified errors with raw preserved", async () => {
     stubBrowser();
     const declined = { error: { code: "9003", message: "Invalid card number" } };
@@ -131,6 +149,40 @@ describe("PaysafeClientAdapter", () => {
     expect(result.error?.code).toBe("invalid_card_data");
     expect(result.error?.raw).toBe(declined);
     expect(isPayFanoutError(result.error)).toBe(true);
+  });
+
+  it("maps a 9003 options.* configuration failure to invalid_request, not invalid_card_data", async () => {
+    stubBrowser();
+    // Paysafe.js reuses 9003 for bad setup/tokenize options (e.g. accountId). The
+    // cardholder must not be told a valid card is invalid.
+    const configError = {
+      code: "9003",
+      detailedMessage: "Invalid fields: options.accountId.",
+      fieldErrors: [{ message: "Invalid accountId parameter." }],
+    };
+    const fake = makeFakePaysafe(async () => {
+      throw configError;
+    });
+    const { adapter } = makeAdapter(fake);
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: TOKEN });
+    const result = await adapter.confirm(handle);
+    expect(result.status).toBe("failed");
+    expect(result.error?.code).toBe("invalid_request");
+    expect(result.error?.retryable).toBe(false);
+    expect(result.error?.message).toBe("The payment request was invalid.");
+    expect(result.error?.raw).toBe(configError);
+  });
+
+  it("keeps a genuine 9003 card-field failure as invalid_card_data", async () => {
+    stubBrowser();
+    const cardError = { code: "9003", detailedMessage: "Invalid fields: card number." };
+    const fake = makeFakePaysafe(async () => {
+      throw cardError;
+    });
+    const { adapter } = makeAdapter(fake);
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: TOKEN });
+    const result = await adapter.confirm(handle);
+    expect(result.error?.code).toBe("invalid_card_data");
   });
 
   it("cleans up its generated containers on unmount", async () => {

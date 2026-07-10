@@ -162,7 +162,7 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
         // Required by Paysafe.js — omitting it fails setup with error 9055
         // "Invalid currency parameter".
         currencyCode: session.currency,
-        ...(session.merchantAccountId ? { accountId: session.merchantAccountId } : {}),
+        ...(session.merchantAccountId ? { accountId: toPaysafeAccountId(session.merchantAccountId) } : {}),
         fields: {
           cardNumber: fieldConfig("cardNumber", { placeholder: "Card number" }),
           expiryDate: fieldConfig("expiryDate", { placeholder: "MM/YY" }),
@@ -203,7 +203,7 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
         paymentType: "CARD",
         amount: h.session.amount,
         currencyCode: h.session.currency,
-        ...(h.session.merchantAccountId ? { accountId: h.session.merchantAccountId } : {}),
+        ...(h.session.merchantAccountId ? { accountId: toPaysafeAccountId(h.session.merchantAccountId) } : {}),
         ...(h.session.id ? { merchantRefNum: h.session.id } : {}),
         ...(this.config.threeDs ? { threeDs: this.config.threeDs } : {}),
       });
@@ -269,18 +269,86 @@ function registerFieldStateEvents(instance: PaysafeFieldsInstanceLike, options: 
   }
 }
 
+/** The small cross-PSP appearance vocabulary hosts can pass regardless of PSP. */
+const COMMON_APPEARANCE_TOKENS = new Set([
+  "colorPrimary",
+  "colorText",
+  "colorDanger",
+  "colorBackground",
+  "fontFamily",
+  "fontSize",
+]);
+
+/** Common tokens Paysafe.js can honestly apply to its hosted card inputs. */
+const COMMON_APPEARANCE_TO_PAYSAFE: Record<string, string> = {
+  colorText: "color",
+  colorBackground: "background-color",
+  fontFamily: "font-family",
+  fontSize: "font-size",
+};
+
+/** Stripe Appearance API keys — meaningless to Paysafe.js; forwarding them breaks ALL styling. */
+const STRIPE_APPEARANCE_KEYS = new Set(["variables", "rules", "theme", "labels"]);
+
 /**
- * Paysafe's `style` option is a map of CSS selectors to property objects and
- * hard-fails (error 9021) on scalar values — e.g. Stripe-shaped tokens like
- * `theme: "flat"`. Forward only entries in the shape Paysafe accepts.
+ * Translates PaymentFields `appearance` into Paysafe.js's `style` option (a map of
+ * CSS selectors to property objects). It handles three kinds of entry:
+ *
+ * - **Common tokens** — the cross-PSP set is mapped onto the hosted `input`
+ *   selector (colorText→color, colorBackground→background-color,
+ *   fontFamily→font-family, fontSize→font-size) so one `appearance` styles either
+ *   PSP. `colorPrimary`/`colorDanger` have no honest hosted-card-input surface in
+ *   Paysafe.js, so they are recognized but not applied (never faked).
+ * - **Native Paysafe selectors** — object-valued entries (`input`, `:focus`, …)
+ *   pass through untouched for power users; a native `input` wins over the tokens.
+ * - **Stripe Appearance keys / other unusable entries** — dropped with a clear
+ *   warning; forwarding them makes Paysafe.js log a cryptic "Invalid css property"
+ *   and silently drop ALL styling.
  */
 function toPaysafeStyle(appearance: Record<string, unknown> | undefined): { style: Record<string, unknown> } | undefined {
   if (!appearance) return undefined;
   const style: Record<string, unknown> = {};
-  for (const [selector, value] of Object.entries(appearance)) {
-    if (value !== null && typeof value === "object" && !Array.isArray(value)) style[selector] = value;
+  const inputCss: Record<string, string> = {};
+  const dropped: string[] = [];
+  for (const [key, value] of Object.entries(appearance)) {
+    if (COMMON_APPEARANCE_TOKENS.has(key)) {
+      const cssProp = COMMON_APPEARANCE_TO_PAYSAFE[key];
+      if (cssProp !== undefined && typeof value === "string") inputCss[cssProp] = value;
+      // colorPrimary/colorDanger: recognized but not surfaced by Paysafe.js — ignore, don't warn.
+    } else if (STRIPE_APPEARANCE_KEYS.has(key)) {
+      dropped.push(key);
+    } else if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+      style[key] = value;
+    } else {
+      dropped.push(key);
+    }
+  }
+  if (Object.keys(inputCss).length > 0) {
+    style["input"] = { ...inputCss, ...((style["input"] as Record<string, unknown> | undefined) ?? {}) };
+  }
+  if (dropped.length > 0) {
+    console.warn(
+      `[payfanout] Paysafe ignored appearance entries it cannot apply: ${dropped.join(", ")}. ` +
+        `Paysafe hosted fields take a CSS selector-to-properties map (e.g. { input: { color, "font-family" } }) ` +
+        `or the common tokens colorText/colorBackground/fontFamily/fontSize; Stripe Appearance API keys ` +
+        `(variables/theme/rules/labels) do not apply to Paysafe.`,
+    );
   }
   return Object.keys(style).length > 0 ? { style } : undefined;
+}
+
+/**
+ * Paysafe.js validates `accountId` as a NUMBER — the string form produced by a
+ * `merchantAccountResolver` (typed `=> string | undefined`) fails setup/tokenize with error
+ * 9003 ("Invalid accountId parameter") before any card data is evaluated, even
+ * though the Paysafe REST API accepts both. Coerce a digit-only id to its
+ * numeric form; leave anything non-numeric, or too large to represent exactly
+ * (a silently rounded id could route to the wrong merchant account), untouched.
+ */
+function toPaysafeAccountId(id: string): string | number {
+  if (!/^\d+$/.test(id)) return id;
+  const numeric = Number(id);
+  return Number.isSafeInteger(numeric) ? numeric : id;
 }
 
 function asPaysafeHandle(handle: MountedFieldsHandle): PaysafeHandle {
@@ -323,7 +391,7 @@ function base64UrlDecode(value: string): string {
 }
 
 const PAYSAFE_JS_CODE_MAP: Record<string, UnifiedErrorCode> = {
-  "9003": "invalid_card_data", // invalid card number/format
+  "9003": "invalid_card_data", // invalid card field — remapped to invalid_request for options.* failures (see mapPaysafeJsError)
   "9004": "invalid_card_data",
   "9042": "invalid_card_data",
   "9125": "psp_unavailable",
@@ -331,10 +399,47 @@ const PAYSAFE_JS_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "9202": "authentication_required",
 };
 
+interface PaysafeJsErrorLike {
+  code?: string | number;
+  detailedMessage?: string;
+  fieldErrors?: Array<{ message?: string } | undefined>;
+  error?: { code?: string | number; message?: string; detailedMessage?: string };
+  message?: string;
+}
+
+/**
+ * True when a Paysafe.js failure names a setup/tokenize `options.*` parameter
+ * (e.g. detailedMessage "Invalid fields: options.accountId.") rather than a
+ * card field. Paysafe puts the offending field in detailedMessage; the top-level
+ * message, any nested error, and the per-field fieldErrors are also scanned
+ * defensively across SDK error shapes.
+ */
+function mentionsConfigOption(e: PaysafeJsErrorLike): boolean {
+  const haystack = [
+    e?.detailedMessage,
+    e?.message,
+    e?.error?.detailedMessage,
+    e?.error?.message,
+    ...(e?.fieldErrors ?? []).map((f) => f?.message),
+  ]
+    .filter((s): s is string => typeof s === "string")
+    .join(" ");
+  return /\boptions\./i.test(haystack);
+}
+
 function mapPaysafeJsError(err: unknown): UnifiedError {
-  const e = err as { code?: string | number; error?: { code?: string | number; message?: string }; message?: string };
+  const e = err as PaysafeJsErrorLike;
   const rawCode = String(e?.error?.code ?? e?.code ?? "");
-  const code: UnifiedErrorCode = PAYSAFE_JS_CODE_MAP[rawCode] ?? "processing_error";
+  let code: UnifiedErrorCode = PAYSAFE_JS_CODE_MAP[rawCode] ?? "processing_error";
+  // Paysafe.js overloads 9003 for BOTH invalid card fields AND invalid
+  // setup/tokenize OPTIONS (accountId, currencyCode, merchantRefNum, …). A
+  // configuration failure must not tell the cardholder their card is invalid,
+  // so a 9003 that names an `options.*` parameter surfaces as invalid_request
+  // (non-retryable, clearly not the shopper's card) — hosts then alert on
+  // configuration instead of the cardholder retyping a valid card.
+  if (rawCode === "9003" && mentionsConfigOption(e)) {
+    code = "invalid_request";
+  }
   return new PayFanoutError({
     code,
     message:
@@ -342,7 +447,9 @@ function mapPaysafeJsError(err: unknown): UnifiedError {
         ? "The card details are invalid."
         : code === "authentication_required"
           ? "Additional authentication is required."
-          : "The payment could not be processed. Please try again.",
+          : code === "invalid_request"
+            ? "The payment request was invalid."
+            : "The payment could not be processed. Please try again.",
     retryable: code === "processing_error" || code === "psp_unavailable",
     raw: err,
     pspName: "paysafe",

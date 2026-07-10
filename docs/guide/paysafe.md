@@ -144,16 +144,38 @@ const paysafe = new PaysafeClientAdapter({
   (`data-payfanout-field="cardNumber|expiryDate|cvv"`), see [React usage](/guide/react).
 
 ::: tip Content-Security-Policy
-Paysafe.js loads from `https://hosted.paysafe.com`. If you set a CSP, allow
-`script-src https://hosted.paysafe.com` and `frame-src https://hosted.paysafe.com`. Override
-the URL via the `sdkUrl` config field to pin/self-host.
+A CSP-enforcing page must allow every host Paysafe.js touches, or the fields fail
+quietly and each missing host looks like a different problem:
+
+- **`script-src`** — `https://hosted.paysafe.com` loads Paysafe.js. Blocking it
+  surfaces a retryable `psp_unavailable` ("Failed to load … paysafe.min.js").
+- **`frame-src`** — the card-field iframes. In **sandbox** they are served from
+  `https://hosted.test.paysafe.com` (LIVE uses `https://hosted.paysafe.com`), so
+  allowing only the LIVE host still breaks mounting under `environment: "sandbox"`.
+- **`connect-src`** — Paysafe.js issues XHRs **from the parent page**: client
+  telemetry to the `hosted` hosts, plus payment-method / merchant-configuration /
+  BIN lookups to `https://api.paysafe.com` / `https://api.test.paysafe.com`.
+  Blocking them degrades the mount with only console CSP violations to show for it.
+
+```
+script-src  https://hosted.paysafe.com
+frame-src   https://hosted.paysafe.com https://hosted.test.paysafe.com
+connect-src https://hosted.paysafe.com https://hosted.test.paysafe.com
+            https://api.paysafe.com https://api.test.paysafe.com
+```
+
+The `.test` hosts are exercised only by `environment: "sandbox"` and are harmless
+to allow in a production CSP (or gate them per environment). Override the script
+URL with the `sdkUrl` config field to pin a version or self-host.
 :::
 
 ## 6. Billing postal code is required
 
 Browser-tokenized handles carry no AVS data, so Paysafe rejects card charges without a
 billing postal/ZIP code (error `3004`). Supply `billingDetails.address` on
-`createPaymentSession` (the demo always does).
+`createPaymentSession` (the demo always does) — or, when the postal code is collected on
+the payment step, pass `billingDetails` to `completePayment` (step 7): it merges over the
+session's billing, so AVS-enforcing accounts complete without recreating the session.
 
 ## 7. The server-completion route (Paysafe-only)
 
@@ -168,6 +190,9 @@ app.post("/api/complete", express.json(), async (req, res) => {
     pspSessionId: req.body.pspSessionId,   // the signed session id from createPaymentSession
     clientToken: req.body.clientToken,     // the single-use handle from the browser
     idempotencyKey: req.body.orderId,      // required
+    // Optional AVS billing collected on the payment step; merged over the session's
+    // billing (an AVS-enforcing account needs at least a postal code, else Paysafe 3004).
+    ...(req.body.zip ? { billingDetails: { address: { postalCode: req.body.zip } } } : {}),
   });
   res.json(info);
 });

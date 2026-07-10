@@ -915,9 +915,10 @@ export function mapPaysafeError(httpStatus: number, body: unknown): PayFanoutErr
 }
 
 /**
- * Merge completion-time billingDetails over the session context's, field by field
- * (completion wins), so a postal code collected on the payment step augments —
- * rather than replaces — whatever the session already carried.
+ * Merge completion-time billingDetails over the session context's, field by field:
+ * a completion field with a DEFINED value wins, but an explicit `undefined` leaves
+ * the session's value intact — a host binding a maybe-empty form field to postalCode
+ * would otherwise clobber the session zip and re-trigger the very 3004 this prevents.
  */
 function mergeBillingDetails(
   base: PaysafeSessionContextV1["billingDetails"],
@@ -925,7 +926,16 @@ function mergeBillingDetails(
 ): PaysafeSessionContextV1["billingDetails"] {
   if (!base) return override;
   if (!override) return base;
-  return { ...base, ...override, address: { ...base.address, ...override.address } };
+  return {
+    ...base,
+    ...pruneUndefined(override),
+    address: { ...base.address, ...pruneUndefined(override.address) },
+  };
+}
+
+function pruneUndefined<T extends object>(obj: T | undefined): Partial<T> {
+  if (!obj) return {};
+  return Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as Partial<T>;
 }
 
 function toPaysafeBillingDetails(

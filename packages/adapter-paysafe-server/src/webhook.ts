@@ -63,6 +63,8 @@ const EVENT_TYPE_MAP: Record<string, UnifiedWebhookEventType> = {
 
 interface PaysafeWebhookBody {
   id?: string;
+  /** Real Payments-API deliveries carry the event here; `eventType`/`event` are legacy/synthetic shapes. */
+  eventName?: string;
   eventType?: string;
   event?: string;
   resourceId?: string;
@@ -102,7 +104,10 @@ export async function parsePaysafeWebhookEvent(rawBody: string): Promise<Unified
     });
   }
 
-  const rawType = (body.eventType ?? body.event ?? "").toUpperCase().replace(/[.\s-]/g, "_");
+  // Real Paysafe Payments-API deliveries carry the event in `eventName`; older/synthetic
+  // payloads used `eventType`/`event`. The top-level `type` is the resource CATEGORY
+  // ("PAYMENT"), not the event name, so it is deliberately never consulted here.
+  const rawType = (body.eventName ?? body.eventType ?? body.event ?? "").toUpperCase().replace(/[.\s-]/g, "_");
   const type = mapEventType(rawType);
   const amount = body.payload?.amount;
   const currency = body.payload?.currencyCode;

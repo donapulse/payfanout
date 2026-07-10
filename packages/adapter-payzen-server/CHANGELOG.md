@@ -1,5 +1,25 @@
 # @payfanout/adapter-payzen-server
 
+## 1.1.0
+
+### Minor Changes
+
+- 3be57b0: Add a declarative adapter onboarding descriptor and an optional credential probe.
+  `@payfanout/core` exports `AdapterOnboardingDescriptor` — credential-field metadata (kind,
+  scope, format hints, per-currency), the webhook signature scheme and event list, and CSP
+  hosts — plus `validateOnboardingDescriptor`, and `ServerPaymentAdapter` gains an optional
+  `verifyCredentials()` that reports whether the configured credentials authenticate (auth vs
+  network vs internal). Every server adapter (Stripe, Paysafe, PayPal, PayZen, GoCardless) now
+  exports a descriptor and implements `verifyCredentials`, and the conformance suite validates
+  each descriptor against its adapter. Hosts can render provider-settings forms, validate
+  credential shapes, drive webhook-subscription copy, build CSP headers, and offer a "Test
+  connection" button as generic loops over the descriptor — identical for every adapter.
+
+### Patch Changes
+
+- Updated dependencies [3be57b0]
+  - @payfanout/core@1.2.0
+
 ## 1.0.3
 
 ### Patch Changes

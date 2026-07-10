@@ -169,7 +169,7 @@ describe("PaysafeClientAdapter", () => {
     expect(result.status).toBe("failed");
     expect(result.error?.code).toBe("invalid_request");
     expect(result.error?.retryable).toBe(false);
-    expect(result.error?.message).not.toBe("The card details are invalid.");
+    expect(result.error?.message).toBe("The payment request was invalid.");
     expect(result.error?.raw).toBe(configError);
   });
 

@@ -380,10 +380,10 @@ function mapPaysafeJsError(err: unknown): UnifiedError {
   // Paysafe.js overloads 9003 for BOTH invalid card fields AND invalid
   // setup/tokenize OPTIONS (accountId, currencyCode, merchantRefNum, …). A
   // configuration failure must not tell the cardholder their card is invalid,
-  // so when the offending field is an `options.*` parameter, surface it as
-  // invalid_request (non-retryable, clearly not the shopper's card) — hosts then
-  // alert on configuration instead of the cardholder retyping a valid card.
-  if (code === "invalid_card_data" && mentionsConfigOption(e)) {
+  // so a 9003 that names an `options.*` parameter surfaces as invalid_request
+  // (non-retryable, clearly not the shopper's card) — hosts then alert on
+  // configuration instead of the cardholder retyping a valid card.
+  if (rawCode === "9003" && mentionsConfigOption(e)) {
     code = "invalid_request";
   }
   return new PayFanoutError({

@@ -61,13 +61,13 @@ at completion.
 
 ## Design-system customization (fully yours)
 
-Four independent axes, all PSP-vocabulary passthroughs, present AND future SDK options stay
+Four independent axes, all host-controlled — present AND future SDK options stay
 reachable without a library release:
 
 ```tsx
 <PaymentFields
   clientSecret={session.clientSecret}
-  appearance={tokens}                       // visual theme (Stripe Appearance API / Paysafe style map)
+  appearance={tokens}                       // common tokens (colorPrimary, colorText, …) OR PSP-native
   locale="fr-CA"                            // the PSP's own field texts
   fieldOptions={{                           // the SDK's full UI option surface:
     layout: { type: "accordion" },          //   Stripe: layout, paymentMethodOrder,
@@ -75,6 +75,15 @@ reachable without a library release:
   }}
 />
 ```
+
+**`appearance`** accepts a small cross-PSP **common token set** — `colorPrimary`,
+`colorText`, `colorDanger`, `colorBackground`, `fontFamily`, `fontSize` — that each adapter
+translates to its PSP's native format, so one object styles whichever PSP is active.
+PSP-native shapes still pass through for power users (Stripe's Appearance API
+`{ variables, theme, rules }`; Paysafe's `style` selector map like `{ input: { … } }`). The
+Paysafe adapter warns (console) about entries it can't apply — e.g. a Stripe `variables`
+object handed to Paysafe — instead of silently dropping all styling. (`colorPrimary` and
+`colorDanger` have no Paysafe hosted-input equivalent, so Paysafe applies the others only.)
 
 Split-field PSPs (Paysafe) let you own the layout via slots, any grid, rows, labels:
 

@@ -348,3 +348,21 @@ One atomic core+conformance+all-adapters change (major changesets across the boa
   (Stripe) never call `completePayment`, and the conformance suite is unchanged — so, like
   the PayPal payment-method-type addition, this deliberately did NOT go through the
   breaking adapter-contract-change process (core + conformance + all adapters).
+
+## Common appearance tokens (2026-07-10)
+
+- **`PaymentFields.appearance` gained a small cross-PSP common token set** —
+  `colorPrimary`, `colorText`, `colorDanger`, `colorBackground`, `fontFamily`, `fontSize` —
+  that each client adapter translates to its PSP's native format, making the
+  long-documented "style regardless of PSP" promise real for the common case. Stripe maps
+  them into the Appearance API `variables` (`fontSize`→`fontSizeBase`); Paysafe maps the
+  ones its hosted inputs can honestly surface onto the `input` selector (`colorText`→
+  `color`, `colorBackground`→`background-color`, `fontFamily`, `fontSize`) and leaves
+  `colorPrimary`/`colorDanger` unapplied — no honest hosted-card-input surface, so they are
+  recognized but never faked. PSP-native shapes still pass through for power users, and the
+  Paysafe adapter now `console.warn`s about entries it cannot apply (notably a Stripe
+  `variables`/`theme`/`rules`/`labels` object misrouted to Paysafe, which previously made
+  Paysafe.js log a cryptic "Invalid css property" and silently drop ALL styling). The common
+  vocabulary is shared by convention (documented in the `appearance` JSDoc), not a core
+  export — core stays UI-free. Not a contract change: `appearance` is
+  `Record<string, unknown>` and each adapter translates independently; conformance is unchanged.

@@ -337,7 +337,7 @@ function base64UrlDecode(value: string): string {
 }
 
 const PAYSAFE_JS_CODE_MAP: Record<string, UnifiedErrorCode> = {
-  "9003": "invalid_card_data", // invalid card number/format
+  "9003": "invalid_card_data", // invalid card field — remapped to invalid_request for options.* failures (see mapPaysafeJsError)
   "9004": "invalid_card_data",
   "9042": "invalid_card_data",
   "9125": "psp_unavailable",
@@ -345,10 +345,47 @@ const PAYSAFE_JS_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "9202": "authentication_required",
 };
 
+interface PaysafeJsErrorLike {
+  code?: string | number;
+  detailedMessage?: string;
+  fieldErrors?: Array<{ message?: string } | undefined>;
+  error?: { code?: string | number; message?: string; detailedMessage?: string };
+  message?: string;
+}
+
+/**
+ * True when a Paysafe.js failure names a setup/tokenize `options.*` parameter
+ * (e.g. detailedMessage "Invalid fields: options.accountId.") rather than a
+ * card field. Paysafe puts the offending field in detailedMessage; the top-level
+ * message, any nested error, and the per-field fieldErrors are also scanned
+ * defensively across SDK error shapes.
+ */
+function mentionsConfigOption(e: PaysafeJsErrorLike): boolean {
+  const haystack = [
+    e?.detailedMessage,
+    e?.message,
+    e?.error?.detailedMessage,
+    e?.error?.message,
+    ...(e?.fieldErrors ?? []).map((f) => f?.message),
+  ]
+    .filter((s): s is string => typeof s === "string")
+    .join(" ");
+  return /\boptions\./i.test(haystack);
+}
+
 function mapPaysafeJsError(err: unknown): UnifiedError {
-  const e = err as { code?: string | number; error?: { code?: string | number; message?: string }; message?: string };
+  const e = err as PaysafeJsErrorLike;
   const rawCode = String(e?.error?.code ?? e?.code ?? "");
-  const code: UnifiedErrorCode = PAYSAFE_JS_CODE_MAP[rawCode] ?? "processing_error";
+  let code: UnifiedErrorCode = PAYSAFE_JS_CODE_MAP[rawCode] ?? "processing_error";
+  // Paysafe.js overloads 9003 for BOTH invalid card fields AND invalid
+  // setup/tokenize OPTIONS (accountId, currencyCode, merchantRefNum, …). A
+  // configuration failure must not tell the cardholder their card is invalid,
+  // so a 9003 that names an `options.*` parameter surfaces as invalid_request
+  // (non-retryable, clearly not the shopper's card) — hosts then alert on
+  // configuration instead of the cardholder retyping a valid card.
+  if (rawCode === "9003" && mentionsConfigOption(e)) {
+    code = "invalid_request";
+  }
   return new PayFanoutError({
     code,
     message:
@@ -356,7 +393,9 @@ function mapPaysafeJsError(err: unknown): UnifiedError {
         ? "The card details are invalid."
         : code === "authentication_required"
           ? "Additional authentication is required."
-          : "The payment could not be processed. Please try again.",
+          : code === "invalid_request"
+            ? "The payment request was invalid."
+            : "The payment could not be processed. Please try again.",
     retryable: code === "processing_error" || code === "psp_unavailable",
     raw: err,
     pspName: "paysafe",

@@ -123,6 +123,16 @@ describe("StripeClientAdapter", () => {
     expect(fake.elementsCalls[0]!["appearance"]).toEqual({ theme: "flat", variables: { colorPrimary: "#635bff" } });
   });
 
+  it("maps common tokens into variables with no native Stripe appearance present", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    await adapter.mount({ id: "pay" } as unknown as HTMLElement, {
+      clientSecret: "pi_1_secret_x",
+      appearance: { colorPrimary: "#7c3aed", fontSize: "15px" },
+    });
+    expect(fake.elementsCalls[0]!["appearance"]).toEqual({ variables: { colorPrimary: "#7c3aed", fontSizeBase: "15px" } });
+  });
+
   it("confirm() finalizes on the client and never returns a clientToken (§4a confirm-on-client shape)", async () => {
     stubBrowser();
     const { adapter, fake } = makeAdapter({ paymentIntent: { status: "succeeded" } });

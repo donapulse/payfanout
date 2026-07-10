@@ -353,16 +353,20 @@ One atomic core+conformance+all-adapters change (major changesets across the boa
 
 - **`PaymentFields.appearance` gained a small cross-PSP common token set** —
   `colorPrimary`, `colorText`, `colorDanger`, `colorBackground`, `fontFamily`, `fontSize` —
-  that each client adapter translates to its PSP's native format, making the
-  long-documented "style regardless of PSP" promise real for the common case. Stripe maps
+  that the hosted-card-field adapters — today Stripe and Paysafe — translate to their
+  native format, making the long-documented "style regardless of PSP" promise real for the
+  common case (rather than the false blanket claim it was). Stripe maps
   them into the Appearance API `variables` (`fontSize`→`fontSizeBase`); Paysafe maps the
   ones its hosted inputs can honestly surface onto the `input` selector (`colorText`→
   `color`, `colorBackground`→`background-color`, `fontFamily`, `fontSize`) and leaves
   `colorPrimary`/`colorDanger` unapplied — no honest hosted-card-input surface, so they are
-  recognized but never faked. PSP-native shapes still pass through for power users, and the
+  recognized but never faked. Only these two hosted-card-field adapters translate the
+  tokens; PayPal (button `style`), GoCardless (`panel`), and PayZen style different surfaces
+  and keep their own native `appearance` shape — the common tokens do not apply to them.
+  PSP-native shapes still pass through for power users, and the
   Paysafe adapter now `console.warn`s about entries it cannot apply (notably a Stripe
   `variables`/`theme`/`rules`/`labels` object misrouted to Paysafe, which previously made
   Paysafe.js log a cryptic "Invalid css property" and silently drop ALL styling). The common
   vocabulary is shared by convention (documented in the `appearance` JSDoc), not a core
   export — core stays UI-free. Not a contract change: `appearance` is
-  `Record<string, unknown>` and each adapter translates independently; conformance is unchanged.
+  `Record<string, unknown>` and each adapter handles it independently; conformance is unchanged.

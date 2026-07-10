@@ -191,4 +191,17 @@ describe("Paysafe field customization", () => {
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("variables"));
     warn.mockRestore();
   });
+
+  it("hands Paysafe no style at all when every appearance entry is unusable (issue #62 payload)", async () => {
+    stubBrowser();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { adapter, fake } = makeAdapter();
+    await adapter.mount({ appendChild: () => {} } as never, {
+      clientSecret: TOKEN,
+      appearance: { variables: { colorPrimary: "#7c3aed" }, borderRadius: "8px" }, // Stripe object + a stray scalar
+    });
+    expect(fake.setupOptions[0]).not.toHaveProperty("style"); // no bogus { style: {} } — Paysafe.js gets no style option
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("variables"));
+    warn.mockRestore();
+  });
 });

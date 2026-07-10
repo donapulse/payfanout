@@ -20,8 +20,12 @@ export class FakePaysafeApi {
   uniqueRefundCreations = 0;
   uniqueCustomerCreations = 0;
   lastRequestBody: Record<string, unknown> | undefined;
+  /** Test levers for the verifyCredentials probe (bad key / transient outage). */
+  authFailure = false;
+  networkFailure = false;
 
   readonly fetch: typeof fetch = async (input, init) => {
+    if (this.networkFailure) throw new TypeError("simulated network failure");
     const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
     const method = init?.method ?? "GET";
     const parsed = new URL(url);
@@ -29,7 +33,7 @@ export class FakePaysafeApi {
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined;
     this.lastRequestBody = body;
 
-    if (!(init?.headers as Record<string, string>)?.["authorization"]?.startsWith("Basic ")) {
+    if (this.authFailure || !(init?.headers as Record<string, string>)?.["authorization"]?.startsWith("Basic ")) {
       return json(401, { error: { code: "5279", message: "Invalid credentials" } });
     }
 

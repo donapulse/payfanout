@@ -13,4 +13,5 @@ export {
   type DecodeSessionContextOptions,
   type PaysafeSessionContextV1,
 } from "./session-context.js";
+export { paysafeOnboarding } from "./onboarding.js";
 export { parsePaysafeWebhookEvent, verifyPaysafeWebhookSignature } from "./webhook.js";

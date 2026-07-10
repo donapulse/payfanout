@@ -401,3 +401,32 @@ One atomic core+conformance+all-adapters change (major changesets across the boa
   no adapter contract or conformance test changed — so, like the completion-time
   `billingDetails` and the appearance tokens, this did NOT go through the breaking
   core+conformance+all-adapters process. @payfanout/server and @payfanout/react bump minor.
+
+## Adapter onboarding descriptor + verifyCredentials (2026-07-10)
+
+- **`AdapterOnboardingDescriptor` (@payfanout/core) + a descriptor per server adapter** turn
+  the operator-facing onboarding path into generic loops. An adapter strictly typed its
+  config but exposed nothing a host could use to onboard a merchant: settings forms, key-shape
+  validation, "which events to subscribe", and CSP hosts were all rebuilt per PSP by reading
+  adapter source. Each `-server` adapter now exports a declarative descriptor
+  (`credentialFields` with kind/scope/format/perCurrency, `webhook.signature` +
+  `webhook.events`, `csp` hosts), so a host renders forms, validates inputs, drives
+  subscribe-copy, and builds CSP headers identically for every current and future adapter.
+- **The descriptor lives in the SERVER package** (it carries the webhook event list and pairs
+  with the server-only probe), even though it also describes client credential fields
+  (`scope: "client"`). Client adapter packages are unchanged.
+- **`webhook.events` is optional**: PayZen omits it (its IPNs are order-state snapshots, not
+  discrete subscribable event types); the other four list exactly their parser's recognized
+  provider event strings. `signature` is `hmac-sha256-hex` (Stripe/PayZen/GoCardless),
+  `hmac-sha256-base64` (Paysafe), or `provider-postback` (PayPal). GoCardless CSP is empty
+  (redirect-only, no browser SDK); PayPal CSP uses documented wildcards.
+- **`verifyCredentials?()` (optional on ServerPaymentAdapter)** is the runtime companion — a
+  "Test connection" probe that makes ONE side-effect-free call and classifies `auth` /
+  `network` / `internal`. Each adapter reuses an existing read-only path: Stripe `events.list`,
+  PayPal the OAuth client-credentials mint, Paysafe a customer-vault lookup, PayZen
+  `Charge/SDKTest`, GoCardless `GET /payments`.
+- **Additive, so NOT the breaking contract process.** `verifyCredentials` and the descriptor
+  are new optional/additive surface; `validateOnboardingDescriptor` + a new conformance
+  assertion validate the descriptor when a fixture provides it (existing external adapters
+  without one still pass — the fixture is optional). core, conformance, and the five `-server`
+  adapters bump minor; the client adapters are untouched.

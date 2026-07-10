@@ -32,6 +32,7 @@ import {
   type UnifiedPaymentStatus,
   type UnifiedWebhookEvent,
   type UpdatePaymentSessionInput,
+  type VerifyCredentialsResult,
   type VerifyPaymentMethodInput,
 } from "@payfanout/core";
 import { mapStripeError } from "./error-map.js";
@@ -493,6 +494,33 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       );
       return this.toPaymentInfo(pi);
     });
+  }
+
+  /**
+   * "Test connection" probe: one read-only GET /v1/events, classified so a host
+   * UI can tell a bad key (`auth`) from a transient outage (`network`). Returns a
+   * result on every path instead of throwing, and never surfaces the credential.
+   */
+  async verifyCredentials(): Promise<VerifyCredentialsResult> {
+    try {
+      const client = await this.getClient();
+      await client.events.list({ limit: 1 });
+      return { ok: true };
+    } catch (err) {
+      const e = (err ?? {}) as { type?: string; statusCode?: number };
+      if (
+        e.statusCode === 401 ||
+        e.statusCode === 403 ||
+        e.type === "StripeAuthenticationError" ||
+        e.type === "StripePermissionError"
+      ) {
+        return { ok: false, category: "auth", message: "Authentication failed — check the Stripe secret key." };
+      }
+      if (e.type === "StripeConnectionError" || e.statusCode === 429 || (e.statusCode ?? 0) >= 500) {
+        return { ok: false, category: "network", message: "Could not reach Stripe — try again." };
+      }
+      return { ok: false, category: "internal", message: "Could not verify Stripe credentials." };
+    }
   }
 
   async verifyWebhookSignature(rawBody: string, headers: Record<string, string>): Promise<boolean> {

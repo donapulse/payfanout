@@ -246,6 +246,53 @@ describe("GoCardless error mapping", () => {
   });
 });
 
+describe("GoCardless verifyCredentials (Test connection probe)", () => {
+  it("returns ok from a single read-only probe when the credentials authenticate", async () => {
+    const { adapter, fake } = makePair();
+    await expect(adapter.verifyCredentials()).resolves.toEqual({ ok: true });
+    // A cheap read-only GET, and exactly one HTTP round-trip.
+    expect(fake.lastRequestUrl).toContain("/payments?limit=1");
+    expect(fake.callCount).toBe(1);
+  });
+
+  it("classifies auth from the raw status, even when the error body omits error.code", async () => {
+    // The probe reads the HTTP status line, not error.code — so a 401/403 whose
+    // body lacks a numeric code (proxy/edge error page, non-JSON) is still auth.
+    const cases: Array<{ status: number; body: unknown }> = [
+      { status: 401, body: { error: { message: "Access token not found", type: "invalid_api_usage", code: 401 } } },
+      { status: 401, body: { error: { message: "Access token not found" } } }, // no numeric error.code
+      { status: 401, body: "Unauthorized" }, // a non-JSON proxy/edge body
+      { status: 403, body: { error: { message: "forbidden" } } }, // permission, code omitted
+    ];
+    for (const { status, body } of cases) {
+      const { adapter, fake } = makePair();
+      fake.failNextWith(status, body);
+      const result = await adapter.verifyCredentials();
+      expect(result, `${status} ${JSON.stringify(body)}`).toMatchObject({ ok: false, category: "auth" });
+      // The token must never leak into the surfaced result.
+      expect(JSON.stringify(result)).not.toContain("fake-sandbox-access-token");
+      // A bad key is never replayed — one shot, no transport-retry hang.
+      expect(fake.callCount).toBe(1);
+    }
+  });
+
+  it("classifies a transport failure, rate limiting, and 5xx as a network failure", async () => {
+    const down = makePair();
+    down.fake.failNextWithNetworkError();
+    await expect(down.adapter.verifyCredentials()).resolves.toMatchObject({ ok: false, category: "network" });
+
+    const throttled = makePair();
+    throttled.fake.failNextWith(429, { error: { message: "slow down", type: "invalid_api_usage", code: 429 } });
+    await expect(throttled.adapter.verifyCredentials()).resolves.toMatchObject({ ok: false, category: "network" });
+
+    const outage = makePair();
+    outage.fake.failNextWith(503, { error: { message: "down", type: "gocardless", code: 503 } });
+    await expect(outage.adapter.verifyCredentials()).resolves.toMatchObject({ ok: false, category: "network" });
+    // 5xx is the classic hang case — the single-shot probe must not retry it.
+    expect(outage.fake.callCount).toBe(1);
+  });
+});
+
 describe("GoCardless webhook signature", () => {
   it("verifies the docs fixture byte-exactly against the reference HMAC", async () => {
     const { adapter } = makePair({ webhookSecret: "my_webhook_secret" });

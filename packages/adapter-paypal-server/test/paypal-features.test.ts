@@ -84,6 +84,64 @@ describe("PayPal OAuth token lifecycle", () => {
   });
 });
 
+describe("PayPal verifyCredentials (test-connection probe)", () => {
+  it("returns { ok: true } when the client-credentials mint succeeds", async () => {
+    const { adapter } = makePair();
+    await expect(adapter.verifyCredentials()).resolves.toEqual({ ok: true });
+  });
+
+  it("classifies a rejected client id/secret as auth, and never retries it", async () => {
+    const { adapter, fake } = makePair({ clientSecret: "wrong-secret" });
+    const before = fake.requestCount;
+    await expect(adapter.verifyCredentials()).resolves.toEqual({
+      ok: false,
+      category: "auth",
+      message: "Authentication failed — check the PayPal client id and secret.",
+    });
+    expect(fake.requestCount - before).toBe(1); // one probe — an auth rejection is never replayed
+
+    // A 403 is an authorization problem too, not a transient outage.
+    const forbidden = makePair();
+    forbidden.fake.failNextWith(403, { name: "NOT_AUTHORIZED", message: "no access" });
+    await expect(forbidden.adapter.verifyCredentials()).resolves.toMatchObject({ ok: false, category: "auth" });
+  });
+
+  it("classifies a dropped connection, 429, or 5xx as a network failure", async () => {
+    const dropped = makePair();
+    dropped.fake.failNextWithNetworkError();
+    await expect(dropped.adapter.verifyCredentials()).resolves.toEqual({
+      ok: false,
+      category: "network",
+      message: "Could not reach PayPal — try again.",
+    });
+
+    for (const status of [429, 500, 503]) {
+      const { adapter, fake } = makePair();
+      fake.failNextWith(status, { name: "TRANSIENT" });
+      await expect(adapter.verifyCredentials(), `HTTP ${status}`).resolves.toMatchObject({
+        ok: false,
+        category: "network",
+      });
+    }
+  });
+
+  it("classifies an unexpected response as internal without leaking secrets", async () => {
+    // A 2xx that carries no token is neither an auth nor a transient failure.
+    const noToken = makePair();
+    noToken.fake.failNextWith(200, { scope: "https://uri.paypal.com/services/payments/payment" });
+    await expect(noToken.adapter.verifyCredentials()).resolves.toMatchObject({ ok: false, category: "internal" });
+
+    const { adapter, fake } = makePair();
+    fake.failNextWith(400, { error: "invalid_request", error_description: "malformed" });
+    const result = await adapter.verifyCredentials();
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.category).toBe("internal");
+      expect(result.message).not.toMatch(/secret/i); // never echoes credential material
+    }
+  });
+});
+
 describe("PayPal-Request-Id derivation", () => {
   it("passes keys of at most 38 bytes through untouched", async () => {
     await expect(derivePayPalRequestId("order-1234")).resolves.toBe("order-1234");

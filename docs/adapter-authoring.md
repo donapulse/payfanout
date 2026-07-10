@@ -148,6 +148,46 @@ and `PaymentService` will hold you to:
   rails emit `payment.processing` before their terminal event; disputes resolve into
   `payment.chargeback_won` / `payment.chargeback_lost`.
 
+### Onboarding descriptor & `verifyCredentials`
+
+Export a declarative `AdapterOnboardingDescriptor` (from `@payfanout/core`) so a host can
+build its provider-settings screen — credential fields, "events to subscribe", CSP hosts —
+as generic loops instead of per-PSP forms. Ship it from the **server** package (it carries
+the webhook event list and pairs with the server-only probe below), even though it also
+describes the client credential fields:
+
+```ts
+// packages/adapter-acme-server/src/onboarding.ts
+import type { AdapterOnboardingDescriptor } from "@payfanout/core";
+export const acmeOnboarding: AdapterOnboardingDescriptor = {
+  pspName: "acme",
+  credentialFields: [
+    { key: "secretKey", kind: "secret", scope: "server", format: { pattern: "^sk_", hint: "Acme secret key" } },
+    { key: "publishableKey", kind: "public", scope: "client", format: { pattern: "^pk_" } },
+    { key: "webhookSecret", kind: "secret", scope: "server" },
+  ],
+  // `events` = the exact provider strings your parser recognizes; OMIT it if the PSP has
+  // no discrete subscribable event types (PayZen sends order-state snapshots).
+  webhook: { signature: "hmac-sha256-hex", events: ["payment.succeeded", "payment.failed"] },
+  csp: { script: ["https://sdk.acme.test"], frame: [], connect: ["https://api.acme.test"] },
+};
+```
+
+Pass it as `onboarding` in the conformance fixtures and the suite asserts it via
+`validateOnboardingDescriptor`: `pspName` matches the adapter, credential fields are
+well-formed and unique with at least one `scope: "server"` field, each `format.pattern`
+compiles, and `webhook.events`/CSP hosts carry no blanks. Keep it honest and co-located with
+the config and webhook parser so it can't drift — `secret` fields are never redisplayed by a
+host, `perCurrency` marks per-currency accounts (Paysafe merchant accounts), and the
+`signature` is `hmac-sha256-hex` (Stripe/PayZen/GoCardless), `hmac-sha256-base64` (Paysafe),
+or `provider-postback` (PayPal).
+
+Optionally implement **`verifyCredentials()`** — a side-effect-free probe behind a host
+"Test connection" button. Make ONE read-only call (a vault/list read, an OAuth mint, a
+liveness endpoint) and classify: `{ ok: true }`, or `{ ok: false, category }` with `auth`
+(401/403 — wrong key), `network` (timeout/5xx/429 — transient), or `internal`. Never mutate
+PSP state, never retry an auth rejection, never log secrets.
+
 ## 2. Client adapter (`@payfanout/adapter-<psp>`)
 
 Implement `ClientPaymentAdapter`:
@@ -236,6 +276,8 @@ suite proves plumbing, then validate against the PSP sandbox manually before goi
 - [ ] `pnpm run check` green (typecheck + boundary check + all tests)
 - [ ] Server + client conformance suites pass — including every money-path case
 - [ ] Both webhook ingress patterns work with your adapter (per-adapter and unified)
+- [ ] Exports an `AdapterOnboardingDescriptor` wired into the conformance `onboarding`
+      fixture; `verifyCredentials()` implemented if the PSP has a safe read-only probe
 - [ ] Full + partial refund, over-refund rejection, cancel-before-capture, manual
       capture / multi-capture (if supported) exercised against the PSP sandbox
 - [ ] JPY and BHD amounts round-trip correctly end-to-end (or the constraint is

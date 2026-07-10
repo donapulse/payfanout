@@ -412,6 +412,72 @@ describe("Paysafe network timeouts", () => {
   });
 });
 
+describe("Paysafe verifyCredentials (Test connection probe)", () => {
+  it("returns { ok: true } when the probe authenticates — the absent probe id 404s, which still proves valid credentials", async () => {
+    // The customer-vault lookup is object-or-404: the fake 404s the random probe
+    // id exactly like the real API. A 404 means "authenticated, no such profile".
+    const { adapter } = makePair();
+    await expect(adapter.verifyCredentials()).resolves.toEqual({ ok: true });
+  });
+
+  it("classifies a 401 as category 'auth' without leaking the credentials", async () => {
+    const { adapter, fake } = makePair();
+    fake.authFailure = true;
+    const result = await adapter.verifyCredentials();
+    expect(result).toEqual({
+      ok: false,
+      category: "auth",
+      message: "Authentication failed — check the Paysafe username and password.",
+    });
+    expect(JSON.stringify(result)).not.toMatch(/api_user|api_pass/); // credentials never surface
+  });
+
+  it("classifies a 403 as category 'auth'", async () => {
+    const { adapter } = makePair({
+      fetch: async () => new Response(JSON.stringify({ error: { code: "5279" } }), { status: 403 }),
+    });
+    const result = await adapter.verifyCredentials();
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.category).toBe("auth");
+  });
+
+  it("classifies a network failure as category 'network'", async () => {
+    const { adapter, fake } = makePair();
+    fake.networkFailure = true;
+    const result = await adapter.verifyCredentials();
+    expect(result).toEqual({
+      ok: false,
+      category: "network",
+      message: "Could not reach Paysafe — try again.",
+    });
+  });
+
+  it("classifies a 429 and a 5xx as category 'network'", async () => {
+    for (const status of [429, 503]) {
+      const { adapter } = makePair({
+        fetch: async () => new Response(JSON.stringify({ error: { code: "1000" } }), { status }),
+      });
+      const result = await adapter.verifyCredentials();
+      expect(result.ok, `status ${status}`).toBe(false);
+      if (!result.ok) expect(result.category).toBe("network");
+    }
+  });
+
+  it("probes exactly once — an auth rejection is never retried", async () => {
+    let calls = 0;
+    const { adapter } = makePair({
+      fetch: async () => {
+        calls += 1;
+        return new Response(JSON.stringify({ error: { code: "5279" } }), { status: 401 });
+      },
+      maxNetworkRetries: 3,
+    });
+    const result = await adapter.verifyCredentials();
+    expect(result.ok).toBe(false);
+    expect(calls).toBe(1); // no transport-retry loop around the single probe
+  });
+});
+
 describe("Paysafe payment method details", () => {
   it("maps card.type/lastDigits/cardExpiry onto brand/last4/expMonth/expYear", async () => {
     const { adapter } = makePair();

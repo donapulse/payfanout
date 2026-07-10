@@ -2,7 +2,7 @@ import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { getRefundState, isPayFanoutError } from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
-import { GoCardlessServerAdapter, type GoCardlessServerAdapterConfig } from "../src/index.js";
+import { GoCardlessServerAdapter, gocardlessOnboarding, type GoCardlessServerAdapterConfig } from "../src/index.js";
 import { FakeGoCardlessApi } from "./fake-gocardless-api.js";
 
 const WEBHOOK_SECRET = "fake-webhook-endpoint-secret";
@@ -65,6 +65,7 @@ runServerAdapterConformanceTests(
     return adapter;
   },
   {
+    onboarding: gocardlessOnboarding,
     // GoCardless supports eight two-decimal currencies only (no JPY, no BHD),
     // and one-off billing request payments are GBP/EUR — the zero/three-decimal
     // fixtures do not apply.

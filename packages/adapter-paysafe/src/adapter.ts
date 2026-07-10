@@ -269,16 +269,70 @@ function registerFieldStateEvents(instance: PaysafeFieldsInstanceLike, options: 
   }
 }
 
+/** The small cross-PSP appearance vocabulary hosts can pass regardless of PSP. */
+const COMMON_APPEARANCE_TOKENS = new Set([
+  "colorPrimary",
+  "colorText",
+  "colorDanger",
+  "colorBackground",
+  "fontFamily",
+  "fontSize",
+]);
+
+/** Common tokens Paysafe.js can honestly apply to its hosted card inputs. */
+const COMMON_APPEARANCE_TO_PAYSAFE: Record<string, string> = {
+  colorText: "color",
+  colorBackground: "background-color",
+  fontFamily: "font-family",
+  fontSize: "font-size",
+};
+
+/** Stripe Appearance API keys — meaningless to Paysafe.js; forwarding them breaks ALL styling. */
+const STRIPE_APPEARANCE_KEYS = new Set(["variables", "rules", "theme", "labels"]);
+
 /**
- * Paysafe's `style` option is a map of CSS selectors to property objects and
- * hard-fails (error 9021) on scalar values — e.g. Stripe-shaped tokens like
- * `theme: "flat"`. Forward only entries in the shape Paysafe accepts.
+ * Translates PaymentFields `appearance` into Paysafe.js's `style` option (a map of
+ * CSS selectors to property objects). It handles three kinds of entry:
+ *
+ * - **Common tokens** — the cross-PSP set is mapped onto the hosted `input`
+ *   selector (colorText→color, colorBackground→background-color,
+ *   fontFamily→font-family, fontSize→font-size) so one `appearance` styles either
+ *   PSP. `colorPrimary`/`colorDanger` have no honest hosted-card-input surface in
+ *   Paysafe.js, so they are recognized but not applied (never faked).
+ * - **Native Paysafe selectors** — object-valued entries (`input`, `:focus`, …)
+ *   pass through untouched for power users; a native `input` wins over the tokens.
+ * - **Stripe Appearance keys / other unusable entries** — dropped with a clear
+ *   warning; forwarding them makes Paysafe.js log a cryptic "Invalid css property"
+ *   and silently drop ALL styling.
  */
 function toPaysafeStyle(appearance: Record<string, unknown> | undefined): { style: Record<string, unknown> } | undefined {
   if (!appearance) return undefined;
   const style: Record<string, unknown> = {};
-  for (const [selector, value] of Object.entries(appearance)) {
-    if (value !== null && typeof value === "object" && !Array.isArray(value)) style[selector] = value;
+  const inputCss: Record<string, string> = {};
+  const dropped: string[] = [];
+  for (const [key, value] of Object.entries(appearance)) {
+    if (COMMON_APPEARANCE_TOKENS.has(key)) {
+      const cssProp = COMMON_APPEARANCE_TO_PAYSAFE[key];
+      if (cssProp !== undefined && typeof value === "string") inputCss[cssProp] = value;
+      // colorPrimary/colorDanger: recognized but not surfaced by Paysafe.js — ignore, don't warn.
+    } else if (STRIPE_APPEARANCE_KEYS.has(key)) {
+      dropped.push(key);
+    } else if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+      style[key] = value;
+    } else {
+      dropped.push(key);
+    }
+  }
+  if (Object.keys(inputCss).length > 0) {
+    style["input"] = { ...inputCss, ...((style["input"] as Record<string, unknown> | undefined) ?? {}) };
+  }
+  if (dropped.length > 0) {
+    console.warn(
+      `[payfanout] Paysafe ignored appearance entries it cannot apply: ${dropped.join(", ")}. ` +
+        `Paysafe hosted fields take a CSS selector-to-properties map (e.g. { input: { color, "font-family" } }) ` +
+        `or the common tokens colorText/colorBackground/fontFamily/fontSize; Stripe Appearance API keys ` +
+        `(variables/theme/rules/labels) do not apply to Paysafe.`,
+    );
   }
   return Object.keys(style).length > 0 ? { style } : undefined;
 }

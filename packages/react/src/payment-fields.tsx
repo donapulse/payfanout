@@ -18,7 +18,18 @@ export interface PaymentFieldsProps {
   psp?: string;
   /** PaymentSession.clientSecret from the server's createPaymentSession. */
   clientSecret: string;
-  /** Design tokens forwarded to the adapter so fields match the host app regardless of PSP. */
+  /**
+   * Visual theme for the hosted fields. The adapters that render themeable hosted
+   * card fields — today **Stripe** and **Paysafe** — translate a small cross-PSP
+   * **common token set** (`colorPrimary`, `colorText`, `colorDanger`,
+   * `colorBackground`, `fontFamily`, `fontSize`) to their native format, so one
+   * `appearance` styles either of them. PSP-native shapes still pass through for
+   * power users (Stripe's Appearance API `{ variables, theme, rules }`; Paysafe's
+   * `style` selector map like `{ input: { … } }`): Stripe ignores unrecognized keys,
+   * and Paysafe warns (console) about entries it cannot apply. Other PSPs take their
+   * own native `appearance` shape (PayPal button `style`, GoCardless `panel`,
+   * PayZen); the common tokens do not apply to them.
+   */
   appearance?: Record<string, unknown>;
   /**
    * PSP-vocabulary UI options passed through to the SDK (Stripe: Payment

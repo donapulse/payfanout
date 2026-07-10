@@ -61,13 +61,13 @@ at completion.
 
 ## Design-system customization (fully yours)
 
-Four independent axes, all PSP-vocabulary passthroughs, present AND future SDK options stay
+Four independent axes, all host-controlled — present AND future SDK options stay
 reachable without a library release:
 
 ```tsx
 <PaymentFields
   clientSecret={session.clientSecret}
-  appearance={tokens}                       // visual theme (Stripe Appearance API / Paysafe style map)
+  appearance={tokens}                       // common tokens (colorPrimary, colorText, …) OR PSP-native
   locale="fr-CA"                            // the PSP's own field texts
   fieldOptions={{                           // the SDK's full UI option surface:
     layout: { type: "accordion" },          //   Stripe: layout, paymentMethodOrder,
@@ -75,6 +75,18 @@ reachable without a library release:
   }}
 />
 ```
+
+**`appearance`** accepts a small cross-PSP **common token set** — `colorPrimary`,
+`colorText`, `colorDanger`, `colorBackground`, `fontFamily`, `fontSize`. The adapters that
+render themeable hosted card fields — today **Stripe** and **Paysafe** — translate it to
+their native format, so one object styles either of them. PSP-native shapes still pass
+through for power users (Stripe's Appearance API `{ variables, theme, rules }`; Paysafe's
+`style` selector map like `{ input: { … } }`): Stripe ignores unrecognized keys, and Paysafe
+warns (console) about entries it can't apply — e.g. a Stripe `variables` object handed to
+Paysafe — instead of silently dropping all styling. (`colorPrimary`/`colorDanger` have no
+Paysafe hosted-input equivalent, so Paysafe applies the others only.) Other PSPs (PayPal
+button, GoCardless panel, PayZen) take their own native `appearance` shape — the common
+tokens do not apply to them.
 
 Split-field PSPs (Paysafe) let you own the layout via slots, any grid, rows, labels:
 

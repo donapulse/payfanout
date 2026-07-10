@@ -9,6 +9,7 @@ import {
 } from "../src/index.js";
 
 function makeFakeStripeJs(confirmResult: StripeJsConfirmResult): StripeJsLike & {
+  elementsCalls: Record<string, unknown>[];
   confirmPaymentCalls: Record<string, unknown>[];
   confirmSetupCalls: Record<string, unknown>[];
   element: StripeJsElementLike & { mounted: unknown; unmounted: boolean; destroyed: boolean };
@@ -34,9 +35,13 @@ function makeFakeStripeJs(confirmResult: StripeJsConfirmResult): StripeJsLike & 
   };
   const fake = {
     element: element as never,
+    elementsCalls: [] as Record<string, unknown>[],
     confirmPaymentCalls: [] as Record<string, unknown>[],
     confirmSetupCalls: [] as Record<string, unknown>[],
-    elements: () => ({ create: () => element as never }),
+    elements: (options: Record<string, unknown>) => {
+      fake.elementsCalls.push(options);
+      return { create: () => element as never };
+    },
     confirmPayment: async (options: Record<string, unknown>) => {
       fake.confirmPaymentCalls.push(options);
       return confirmResult;
@@ -93,6 +98,39 @@ describe("StripeClientAdapter", () => {
     });
     expect(fake.element.mounted).toBe(container);
     expect(ready).toBe(true);
+  });
+
+  it("translates common appearance tokens into Stripe variables, native keys winning on conflict", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    await adapter.mount({ id: "pay" } as unknown as HTMLElement, {
+      clientSecret: "pi_1_secret_x",
+      appearance: { colorPrimary: "#7c3aed", fontSize: "15px", theme: "flat", variables: { colorText: "#111" } },
+    });
+    expect(fake.elementsCalls[0]!["appearance"]).toEqual({
+      theme: "flat",
+      variables: { colorPrimary: "#7c3aed", fontSizeBase: "15px", colorText: "#111" },
+    });
+  });
+
+  it("forwards a native Stripe appearance unchanged when no common tokens are present", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    await adapter.mount({ id: "pay" } as unknown as HTMLElement, {
+      clientSecret: "pi_1_secret_x",
+      appearance: { theme: "flat", variables: { colorPrimary: "#635bff" } },
+    });
+    expect(fake.elementsCalls[0]!["appearance"]).toEqual({ theme: "flat", variables: { colorPrimary: "#635bff" } });
+  });
+
+  it("maps common tokens into variables with no native Stripe appearance present", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    await adapter.mount({ id: "pay" } as unknown as HTMLElement, {
+      clientSecret: "pi_1_secret_x",
+      appearance: { colorPrimary: "#7c3aed", fontSize: "15px" },
+    });
+    expect(fake.elementsCalls[0]!["appearance"]).toEqual({ variables: { colorPrimary: "#7c3aed", fontSizeBase: "15px" } });
   });
 
   it("confirm() finalizes on the client and never returns a clientToken (§4a confirm-on-client shape)", async () => {

@@ -1,5 +1,6 @@
 export { StripeServerAdapter, STRIPE_PSP_NAME } from "./adapter.js";
 export { mapStripeError } from "./error-map.js";
+export { stripeOnboarding } from "./onboarding.js";
 export {
   parseStripeWebhookEvent,
   stripeEventBodyToUnified,

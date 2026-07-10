@@ -11,6 +11,7 @@ export {
 export { PaymentFields, type PaymentFieldsProps, type SaveConsentOptions } from "./payment-fields.js";
 export { PayButton, type PayButtonProps } from "./pay-button.js";
 export {
+  createEndpointCompletion,
   resolveConfirmOutcome,
   type PayResult,
   type ServerCompletionCallback,

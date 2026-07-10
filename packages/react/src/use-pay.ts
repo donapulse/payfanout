@@ -1,13 +1,29 @@
 "use client";
 import { useCallback, useRef, useState } from "react";
-import { PayFanoutError } from "@payfanout/core";
-import { resolveConfirmOutcome, type PayResult, type ServerCompletionCallback } from "./pay-logic.js";
+import { PayFanoutError, type CompletePaymentInput } from "@payfanout/core";
+import {
+  createEndpointCompletion,
+  resolveConfirmOutcome,
+  type PayResult,
+  type ServerCompletionCallback,
+} from "./pay-logic.js";
 import { usePayFanoutContext } from "./provider.js";
 import { useLatestRef } from "./use-latest-ref.js";
 
 export interface UsePayOptions {
-  /** Same contract as <PayButton>: tokenize-first PSPs finish via the host's server route. */
+  /**
+   * Explicit completion transport for tokenize-first PSPs — the escape hatch.
+   * When omitted, `usePay` derives one from the provider's `completionEndpoint`
+   * if set; passing this always wins over the endpoint.
+   */
   onServerCompletion?: ServerCompletionCallback;
+  /**
+   * AVS billing gathered on the payment step (e.g. a postal code), forwarded to
+   * the completion endpoint and merged over the session's billing at
+   * completePayment. Only used by the derived `completionEndpoint` transport —
+   * ignored when you pass your own `onServerCompletion`.
+   */
+  billingDetails?: CompletePaymentInput["billingDetails"];
 }
 
 export interface UsePayResult {
@@ -34,7 +50,7 @@ export interface UsePayResult {
  *   <MyDesignSystemButton loading={paying} onClick={async () => show(await pay())} />
  */
 export function usePay(options: UsePayOptions = {}): UsePayResult {
-  const { adapters, mountedRef } = usePayFanoutContext();
+  const { adapters, mountedRef, completionEndpoint } = usePayFanoutContext();
   const [paying, setPaying] = useState(false);
   const optionsRef = useLatestRef(options);
   // Single-flight lives in a ref: state would be a stale closure, letting two
@@ -57,7 +73,15 @@ export function usePay(options: UsePayOptions = {}): UsePayResult {
     const flight = (async (): Promise<PayResult> => {
       try {
         const confirmResult = await adapter.confirm(mounted.handle);
-        return await resolveConfirmOutcome(confirmResult, optionsRef.current.onServerCompletion);
+        // Explicit onServerCompletion wins; otherwise derive one from the
+        // provider's completionEndpoint (the mounted clientSecret is the ref).
+        const opts = optionsRef.current;
+        const completion =
+          opts.onServerCompletion ??
+          (completionEndpoint !== undefined
+            ? createEndpointCompletion(completionEndpoint, mounted.sessionRef, opts.billingDetails)
+            : undefined);
+        return await resolveConfirmOutcome(confirmResult, completion);
       } catch (err) {
         return { status: "failed", error: PayFanoutError.wrap(err, { pspName: mounted.psp }) };
       } finally {
@@ -67,7 +91,7 @@ export function usePay(options: UsePayOptions = {}): UsePayResult {
     })();
     inFlightRef.current = flight;
     return flight;
-  }, [adapters, mountedRef, optionsRef]);
+  }, [adapters, mountedRef, completionEndpoint, optionsRef]);
 
   return { pay, paying };
 }

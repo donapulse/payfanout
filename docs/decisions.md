@@ -370,3 +370,63 @@ One atomic core+conformance+all-adapters change (major changesets across the boa
   vocabulary is shared by convention (documented in the `appearance` JSDoc), not a core
   export — core stays UI-free. Not a contract change: `appearance` is
   `Record<string, unknown>` and each adapter handles it independently; conformance is unchanged.
+
+## Built-in server-completion transport (2026-07-10)
+
+- **`createCompletionHandler` (@payfanout/server) + `completionEndpoint` (@payfanout/react)**
+  make `requiresServerCompletion` a mounted transport instead of per-host, per-surface
+  plumbing. The flag *described* the tokenize-first flow, but every host re-implemented the
+  same bridge: return a completion reference from each session endpoint, thread it through
+  every checkout surface, hand-write a `completePayment` route, wire `onServerCompletion` per
+  surface, and CSRF-exempt the route. Now the provider derives `onServerCompletion` from
+  `completionEndpoint` (POST `{ sessionRef, clientToken, billingDetails? }` → `PaymentInfo`)
+  and the server mounts one handler.
+- **The session's `clientSecret` is the completion reference.** The browser already holds it
+  (it mounted `<PaymentFields>` with it), so `<PaymentFields>` publishes it on the mounted
+  entry (`MountedEntry.sessionRef`) and `usePay` posts it — no host-minted id travels through
+  session-creation responses or checkout components. `resolveSession(sessionRef)` maps it to
+  `{ service, pspName, pspSessionId, idempotencyKey }`; for tokenize-first PSPs the session
+  token IS the `pspSessionId`.
+- **Web-standard `Request`/`Response`, deliberately diverging from the webhook handler's
+  neutral `{ rawBody, headers }` objects.** Those globals are native in
+  Next.js/Hono/workers/Node 18+, so the handler mounts as one route with no framework
+  dependency; Express bridges via `new Request(...)`. The error taxonomy maps to HTTP status
+  (`completionErrorStatus`: declines + `authentication_required` → 402, `invalid_request` →
+  400, `session_expired` → 410, `unsupported_operation` → 422, `rate_limited` → 429,
+  `psp_unavailable` → 503, `processing_error` → 502, `unknown` → 500) and the client rebuilds
+  the `PayFanoutError` from the `{ error }` body so `code`/`message`/`retryable` survive.
+- **Additive and backward-compatible**: the explicit `onServerCompletion` callback stays the
+  escape hatch (and always wins over the endpoint), `createCompletionHandler`/
+  `createEndpointCompletion` are new exports, `completionEndpoint` is a new optional prop, and
+  no adapter contract or conformance test changed — so, like the completion-time
+  `billingDetails` and the appearance tokens, this did NOT go through the breaking
+  core+conformance+all-adapters process. @payfanout/server and @payfanout/react bump minor.
+
+## Adapter onboarding descriptor + verifyCredentials (2026-07-10)
+
+- **`AdapterOnboardingDescriptor` (@payfanout/core) + a descriptor per server adapter** turn
+  the operator-facing onboarding path into generic loops. An adapter strictly typed its
+  config but exposed nothing a host could use to onboard a merchant: settings forms, key-shape
+  validation, "which events to subscribe", and CSP hosts were all rebuilt per PSP by reading
+  adapter source. Each `-server` adapter now exports a declarative descriptor
+  (`credentialFields` with kind/scope/format/perCurrency, `webhook.signature` +
+  `webhook.events`, `csp` hosts), so a host renders forms, validates inputs, drives
+  subscribe-copy, and builds CSP headers identically for every current and future adapter.
+- **The descriptor lives in the SERVER package** (it carries the webhook event list and pairs
+  with the server-only probe), even though it also describes client credential fields
+  (`scope: "client"`). Client adapter packages are unchanged.
+- **`webhook.events` is optional**: PayZen omits it (its IPNs are order-state snapshots, not
+  discrete subscribable event types); the other four list exactly their parser's recognized
+  provider event strings. `signature` is `hmac-sha256-hex` (Stripe/PayZen/GoCardless),
+  `hmac-sha256-base64` (Paysafe), or `provider-postback` (PayPal). GoCardless CSP is empty
+  (redirect-only, no browser SDK); PayPal CSP uses documented wildcards.
+- **`verifyCredentials?()` (optional on ServerPaymentAdapter)** is the runtime companion — a
+  "Test connection" probe that makes ONE side-effect-free call and classifies `auth` /
+  `network` / `internal`. Each adapter reuses an existing read-only path: Stripe `events.list`,
+  PayPal the OAuth client-credentials mint, Paysafe a customer-vault lookup, PayZen
+  `Charge/SDKTest`, GoCardless `GET /payments`.
+- **Additive, so NOT the breaking contract process.** `verifyCredentials` and the descriptor
+  are new optional/additive surface; `validateOnboardingDescriptor` + a new conformance
+  assertion validate the descriptor when a fixture provides it (existing external adapters
+  without one still pass — the fixture is optional). core, conformance, and the five `-server`
+  adapters bump minor; the client adapters are untouched.

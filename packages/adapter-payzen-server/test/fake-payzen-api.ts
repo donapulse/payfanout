@@ -135,6 +135,8 @@ export class FakePayZenApi {
     }
 
     switch (operation) {
+      case "Charge/SDKTest":
+        return this.sdkTest(body);
       case "Charge/CreatePayment":
         return this.createPayment(body);
       case "Order/Get":
@@ -235,6 +237,16 @@ export class FakePayZenApi {
   }
 
   // --- Endpoints -------------------------------------------------------------
+
+  /**
+   * Charge/SDKTest — a side-effect-free connection probe that echoes the
+   * submitted value on valid credentials. Auth is validated at the top of
+   * fetch, so wrong credentials answer INT_905 before reaching here; transport
+   * trouble is drivable via failNextWith (HTTP 5xx/429/network).
+   */
+  private sdkTest(body: Record<string, unknown>): Response {
+    return this.success("Charge/SDKTest", { value: body["value"] ?? null, _type: "V4/Charge/SDKTestResult" });
+  }
 
   private createPayment(body: Record<string, unknown>): Response {
     const amount = body["amount"];

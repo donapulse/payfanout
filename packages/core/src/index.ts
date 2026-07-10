@@ -111,6 +111,14 @@ export type {
   ServerPaymentAdapter,
   ShippingDetails,
   UpdatePaymentSessionInput,
+  VerifyCredentialsResult,
   VerifyPaymentMethodInput,
 } from "./adapters.js";
 export { brandMountedFieldsHandle, DATA_PAYFANOUT_FIELD } from "./adapters.js";
+
+export type {
+  AdapterOnboardingDescriptor,
+  CredentialFieldDescriptor,
+  WebhookSignatureScheme,
+} from "./onboarding.js";
+export { validateOnboardingDescriptor } from "./onboarding.js";

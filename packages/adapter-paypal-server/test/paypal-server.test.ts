@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { getRefundState, isPayFanoutError, type ServerPaymentAdapter } from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
-import { PAYPAL_SUPPORTED_CURRENCIES, PayPalServerAdapter, type PayPalServerAdapterConfig } from "../src/index.js";
+import {
+  PAYPAL_SUPPORTED_CURRENCIES,
+  PayPalServerAdapter,
+  paypalOnboarding,
+  type PayPalServerAdapterConfig,
+} from "../src/index.js";
 import { FakePayPalApi } from "./fake-paypal-api.js";
 
 const WEBHOOK_ID = "1JE4291016473214C";
@@ -161,6 +166,7 @@ runServerAdapterConformanceTests(
     }),
     // threeDecimalSessionInput is deliberately absent: PayPal supports no
     // 3-decimal currency at all (BHD/KWD/… are rejected locally).
+    onboarding: paypalOnboarding,
     webhook: {
       validRawBody: CAPTURE_COMPLETED_EVENT,
       validHeaders: WEBHOOK_HEADERS,

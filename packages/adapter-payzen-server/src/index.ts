@@ -10,6 +10,7 @@ export {
   type PayZenServerAdapterConfig,
   type PayZenTransactionLike,
 } from "./adapter.js";
+export { payzenOnboarding } from "./onboarding.js";
 export {
   parsePayZenWebhookEvent,
   resolveKrFields,

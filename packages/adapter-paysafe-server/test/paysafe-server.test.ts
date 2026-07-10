@@ -5,6 +5,7 @@ import { runServerAdapterConformanceTests } from "@payfanout/conformance";
 import {
   decodeSessionContext,
   encodeSessionContext,
+  paysafeOnboarding,
   PaysafeServerAdapter,
   type PaysafeServerAdapterConfig,
 } from "../src/index.js";
@@ -86,6 +87,7 @@ runServerAdapterConformanceTests(
     return adapter;
   },
   {
+    onboarding: paysafeOnboarding,
     createSessionInput: () => ({
       amount: 1099,
       currency: "USD",

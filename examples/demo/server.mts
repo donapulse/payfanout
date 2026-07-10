@@ -14,8 +14,10 @@ import {
   PaymentService,
   SubscriptionManager,
   createAdapterWebhookHandler,
+  createCompletionHandler,
   createUnifiedWebhookHandler,
 } from "@payfanout/server";
+import { PayFanoutError } from "@payfanout/core";
 import { StripeServerAdapter } from "@payfanout/adapter-stripe-server";
 import { PaysafeServerAdapter } from "@payfanout/adapter-paysafe-server";
 import { PayZenServerAdapter } from "@payfanout/adapter-payzen-server";
@@ -84,10 +86,20 @@ const router = new PaymentRouter({
 });
 
 // --- Host-owned state (PayFanout persists nothing) -------------------------
-const orders = new Map<
-  string,
-  { psp: string; pspSessionId: string; pspPaymentId?: string; amount: number; currency: string; save?: boolean }
->();
+type DemoOrder = {
+  orderId: string;
+  psp: string;
+  pspSessionId: string;
+  pspPaymentId?: string;
+  amount: number;
+  currency: string;
+  save?: boolean;
+};
+const orders = new Map<string, DemoOrder>();
+// Reverse index by clientSecret: the completion transport posts the session's
+// clientSecret as its reference (the browser already holds it), so the order
+// resolves from it — no host-minted id threads through the checkout surfaces.
+const ordersByRef = new Map<string, DemoOrder>();
 const processedEventIds = new Set<string>();
 // The host owns "its user -> PSP customer/token" — one demo user per PSP here.
 const vault = new Map<string, { pspCustomerId: string; tokens: string[] }>();
@@ -245,58 +257,84 @@ app.post("/api/session", async (req, res) => {
     // psp="auto": PaymentRouter picks by rules and cascades transient failures.
     const { session, pspName } =
       psp === "auto" ? await router.createPaymentSession(input) : { session: await payments.createPaymentSession(psp, input), pspName: psp };
-    orders.set(orderId, { psp: pspName, pspSessionId: session.pspSessionId, amount, currency, save });
+    const order: DemoOrder = { orderId, psp: pspName, pspSessionId: session.pspSessionId, amount, currency, save };
+    orders.set(orderId, order);
+    if (session.clientSecret) ordersByRef.set(session.clientSecret, order);
     res.json({ orderId, clientSecret: session.clientSecret, pspSessionId: session.pspSessionId, pspName });
   } catch (err) {
     respondError(res, err);
   }
 });
 
-// Server completion for tokenize-first PSPs (Paysafe): <PayButton>'s
-// onServerCompletion posts here with the clientToken from confirm().
+// The built-in server-completion transport: one mounted handler finalizes
+// tokenize-first payments. resolveSession maps the opaque reference the browser
+// sent (the session's clientSecret) to the routed PSP + session; the library
+// owns the { sessionRef, clientToken, billingDetails? } wire shape.
+const completionHandler = createCompletionHandler({
+  resolveSession: (sessionRef) => {
+    const order = ordersByRef.get(sessionRef);
+    if (!order) throw PayFanoutError.invalidRequest("unknown session reference");
+    return {
+      service: payments,
+      pspName: order.psp,
+      pspSessionId: order.pspSessionId,
+      idempotencyKey: `complete-${order.orderId}`,
+    };
+  },
+  onCompleted: (info, ctx) => {
+    const order = ordersByRef.get(ctx.sessionRef);
+    if (order) order.pspPaymentId = info.pspPaymentId; // host-owned id mapping
+  },
+});
+
+// Server completion for tokenize-first PSPs. The standard path delegates to the
+// library's completionHandler; the "save my card" path is a bespoke demo flow
+// (convert the single-use token to a stored MULTI_USE one, then charge it as
+// credential-on-file "initial") that isn't a plain completePayment, so it stays
+// hand-written.
 app.post("/api/complete", async (req, res) => {
-  const { orderId, clientToken } = req.body as { orderId: string; clientToken: string };
-  const order = orders.get(orderId);
-  if (!order) {
-    res.status(404).json({ error: "unknown order" });
-    return;
-  }
-  try {
-    let info;
-    if (order.save) {
-      // Tokenize-first save-and-pay: convert the single-use token into a
-      // stored MULTI_USE one, then charge the STORED token (credential-on-file
-      // "initial" — the customer is present right now).
+  const { sessionRef, clientToken } = req.body as { sessionRef?: string; clientToken?: string };
+  const order = sessionRef ? ordersByRef.get(sessionRef) : undefined;
+
+  if (order?.save && clientToken) {
+    try {
       const pspCustomerId = await ensureCustomer(order.psp);
       const saved = await payments.savePaymentMethod(order.psp, {
         pspCustomerId,
         clientToken,
-        idempotencyKey: `save-${orderId}`,
+        idempotencyKey: `save-${order.orderId}`,
       });
       rememberToken(order.psp, saved.token);
-      info = await payments.chargeSavedPaymentMethod(order.psp, {
+      const charged = await payments.chargeSavedPaymentMethod(order.psp, {
         pspCustomerId,
         savedPaymentMethodToken: saved.token,
         amount: order.amount,
         currency: order.currency,
-        id: orderId,
+        id: order.orderId,
         occurrence: "initial",
         billingDetails: { address: DEMO_BILLING[order.currency] ?? DEMO_BILLING["USD"] },
-        idempotencyKey: `complete-${orderId}`,
+        idempotencyKey: `complete-${order.orderId}`,
       });
-      info = { ...info, savedPaymentMethodToken: saved.token };
-    } else {
-      info = await payments.completePayment(order.psp, {
-        pspSessionId: order.pspSessionId,
-        clientToken,
-        idempotencyKey: `complete-${orderId}`,
-      });
+      order.pspPaymentId = charged.pspPaymentId;
+      res.json({ ...charged, savedPaymentMethodToken: saved.token });
+    } catch (err) {
+      respondError(res, err);
     }
-    order.pspPaymentId = info.pspPaymentId; // host-owned id mapping
-    res.json(info);
-  } catch (err) {
-    respondError(res, err);
+    return;
   }
+
+  // Standard completion — bridge Express's parsed body into a web-standard
+  // Request for the framework-agnostic handler and relay its Response.
+  const response = await completionHandler(
+    new Request(`${process.env.PUBLIC_URL || "http://localhost:4242"}/api/complete`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(req.body ?? {}),
+    }),
+  );
+  res.status(response.status);
+  res.setHeader("content-type", response.headers.get("content-type") ?? "application/json");
+  res.send(await response.text());
 });
 
 // After a Stripe save-during-checkout, the client fetches the outcome here —

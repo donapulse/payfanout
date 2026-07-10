@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { getRefundState, isPayFanoutError } from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
-import { PayZenServerAdapter, type PayZenServerAdapterConfig } from "../src/index.js";
+import { payzenOnboarding, PayZenServerAdapter, type PayZenServerAdapterConfig } from "../src/index.js";
 import { FakePayZenApi } from "./fake-payzen-api.js";
 
 function makePair(config: Partial<PayZenServerAdapterConfig> = {}): {
@@ -86,6 +86,7 @@ runServerAdapterConformanceTests(
     return adapter;
   },
   {
+    onboarding: payzenOnboarding,
     createSessionInput: () => ({ amount: 1099, currency: "EUR", idempotencyKey: key() }),
     zeroDecimalSessionInput: () => ({ amount: 500, currency: "JPY", idempotencyKey: key() }),
     // BHD is unsupported by PayZen (absent from its currency table) — KWD
@@ -672,5 +673,87 @@ describe("PayZenServerAdapter refunds", () => {
       idempotencyKey: "r",
     });
     expect(fake.lastRequestBody).toMatchObject({ comment: "requested_by_customer" });
+  });
+});
+
+describe("PayZenServerAdapter verifyCredentials (Test connection probe)", () => {
+  it("returns { ok: true } after one single-shot, side-effect-free Charge/SDKTest call", async () => {
+    const { adapter, fake } = makePair();
+    await expect(adapter.verifyCredentials()).resolves.toEqual({ ok: true });
+    expect(fake.lastOperation).toBe("Charge/SDKTest");
+    // No `mode` field — PayZen selects TEST/LIVE by the key set, not the body.
+    expect(fake.lastRequestBody).toEqual({ value: "connection-test" });
+    expect(fake.uniqueTransactionCreations).toBe(0); // nothing was mutated
+  });
+
+  it("classifies an INT_905 credential rejection as category 'auth'", async () => {
+    const { fake } = makePair();
+    const adapter = new PayZenServerAdapter({
+      shopId: fake.shopId,
+      password: "testpassword_WrongKey",
+      environment: "sandbox",
+      fetch: fake.fetch,
+      maxNetworkRetries: 0,
+    });
+    await expect(adapter.verifyCredentials()).resolves.toEqual({
+      ok: false,
+      category: "auth",
+      message: "Authentication failed — check the PayZen shop id and password.",
+    });
+  });
+
+  it("is single-shot: a transient failure returns 'network' instead of replaying into success", async () => {
+    // maxNetworkRetries would normally retry a transient failure; the probe
+    // disables transport retries, so one injected failure is the whole story
+    // (were it retried, the un-failed second attempt would return { ok: true }).
+    const { adapter, fake } = makePair({ maxNetworkRetries: 2 });
+    fake.failNextWith({ networkError: true });
+    await expect(adapter.verifyCredentials()).resolves.toEqual({
+      ok: false,
+      category: "network",
+      message: "Could not reach PayZen — try again.",
+    });
+  });
+
+  it("classifies an HTTP 5xx as category 'network'", async () => {
+    const { adapter, fake } = makePair();
+    fake.failNextWith({ status: 503 });
+    const result = await adapter.verifyCredentials();
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.category).toBe("network");
+  });
+
+  it("classifies an HTTP 429 as category 'network'", async () => {
+    const { adapter, fake } = makePair();
+    fake.failNextWith({ status: 429 });
+    const result = await adapter.verifyCredentials();
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.category).toBe("network");
+  });
+
+  it("classifies a bare 4xx from infrastructure (no PayZen envelope) as category 'internal', not auth", async () => {
+    // Only an INT_905 envelope proves a bad key; a raw proxy 4xx does not, so
+    // it is reported as an unexpected fault rather than mislabeled auth.
+    const { adapter, fake } = makePair();
+    fake.failNextWith({ status: 401 });
+    await expect(adapter.verifyCredentials()).resolves.toEqual({
+      ok: false,
+      category: "internal",
+      message: "Could not verify PayZen credentials.",
+    });
+  });
+
+  it("classifies an unexpected envelope error as category 'internal' without leaking details", async () => {
+    const { adapter, fake } = makePair();
+    // Neither an INT_905 auth rejection nor a transient outage — the catch-all.
+    fake.failNextEnvelope(
+      { errorCode: "INT_002", errorMessage: "unexpected", detailedErrorCode: null, detailedErrorMessage: null },
+      "Charge/SDKTest",
+    );
+    await expect(adapter.verifyCredentials()).resolves.toEqual({
+      ok: false,
+      category: "internal",
+      message: "Could not verify PayZen credentials.",
+    });
   });
 });

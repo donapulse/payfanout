@@ -90,6 +90,7 @@ export class FakePayPalApi {
   private readonly tokens = new Map<string, number>();
   private readonly webhookFixtures: WebhookFixture[] = [];
   private failQueue: Array<{ status: number; body: unknown }> = [];
+  private networkFailures = 0;
   private seededEvents: object[] = [];
   private seq = 0;
 
@@ -149,6 +150,11 @@ export class FakePayPalApi {
     for (let i = 0; i < times; i++) this.failQueue.push({ status, body });
   }
 
+  /** Makes the next N requests reject at the transport layer (a dropped connection). */
+  failNextWithNetworkError(times = 1): void {
+    this.networkFailures += times;
+  }
+
   /** Invalidates every issued token — the next call 401s and must re-mint. */
   revokeTokens(): void {
     this.tokens.clear();
@@ -165,6 +171,11 @@ export class FakePayPalApi {
     const rawBody = init?.body === undefined || init?.body === null ? undefined : String(init.body);
     this.requestCount++;
 
+    if (this.networkFailures > 0) {
+      this.networkFailures--;
+      // A dropped connection before any HTTP response — what fetch rejects with.
+      throw new TypeError("Failed to fetch");
+    }
     const queued = this.failQueue.shift();
     if (queued) return json(queued.status, queued.body);
 

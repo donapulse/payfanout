@@ -17,22 +17,17 @@ const adapters = [
   new PaysafeClientAdapter({ apiKey: "base64-public-key", environment: "sandbox" }),
 ];
 
-<PayFanoutProvider adapters={adapters} initialPsp="stripe">
+<PayFanoutProvider adapters={adapters} initialPsp="stripe" completionEndpoint="/api/complete">
   <PaymentFields
     clientSecret={session.clientSecret}
     appearance={designTokens}
     onChange={({ complete }) => setPayEnabled(complete)} // disable Pay until fields are valid
   />
-  <PayButton
-    onResult={(result) => …}
-    onServerCompletion={(clientToken) =>
-      // Only tokenize-first PSPs (Paysafe) invoke this: POST to YOUR route,
-      // which calls payments.completePayment(psp, { pspSessionId, clientToken, idempotencyKey }).
-      postToMyApi("/api/complete", { clientToken })
-    }
-  >
-    Pay
-  </PayButton>
+  {/* Tokenize-first PSPs (Paysafe, PayPal) finish through completionEndpoint
+      automatically — no per-button wiring. Mount createCompletionHandler at that
+      route (see the Server guide). Pass onServerCompletion only to override with
+      a custom transport. */}
+  <PayButton onResult={(result) => …}>Pay</PayButton>
 </PayFanoutProvider>
 ```
 
@@ -44,12 +39,29 @@ Stripe and Paysafe have inverted flows, and the abstraction models both as first
 - **Confirm-on-client (Stripe):** server creates the PaymentIntent → client mounts with
   `clientSecret` → `confirm()` finalizes (incl. inline 3DS). The server never touches
   confirmation, and `completePayment` is rejected for such PSPs.
-- **Tokenize-first (Paysafe):** the client tokenizes first (`confirm()` resolves
+- **Tokenize-first (Paysafe, PayPal):** the client tokenizes first (`confirm()` resolves
   `requires_confirmation` + `clientToken`), then the **server** finalizes via
-  `completePayment`. `<PayButton>` branches automatically through your `onServerCompletion`
-  callback.
+  `completePayment`. `<PayButton>` branches automatically.
 
 Any future tokenize-first PSP reuses the same path (`requiresServerCompletion: true`).
+
+### Built-in completion transport
+
+Set **`completionEndpoint`** on the provider and `usePay`/`<PayButton>` derive the whole
+server round-trip themselves: they POST `{ sessionRef, clientToken, billingDetails? }` to
+that route, where you mount `@payfanout/server`'s
+[`createCompletionHandler`](/guide/server#server-completion-tokenize-first). The session's
+`clientSecret` is the reference (the browser already holds it), so **no host-minted id
+threads through your checkout components** — one prop replaces the per-surface wiring.
+
+```tsx
+<PayFanoutProvider adapters={adapters} completionEndpoint="/api/complete">…</PayFanoutProvider>
+```
+
+Pass an explicit **`onServerCompletion`** (on `<PayButton>` or `usePay`) to override with a
+custom transport — it always wins over `completionEndpoint`. Collecting an AVS postal code on
+the payment step? Pass `billingDetails` to `<PayButton>` (or `usePay`) and it rides the same
+POST.
 
 ::: tip Why Paysafe's "session" is a signed token
 Because PayFanout is stateless, the Paysafe adapter's session is a **signed, self-contained
@@ -102,10 +114,11 @@ Split-field PSPs (Paysafe) let you own the layout via slots, any grid, rows, lab
 </PaymentFields>
 ```
 
-Bring your own button, `usePay()` is `<PayButton>`'s engine as a hook:
+Bring your own button, `usePay()` is `<PayButton>`'s engine as a hook — with
+`completionEndpoint` set it needs no completion wiring at all:
 
 ```tsx
-const { pay, paying } = usePay({ onServerCompletion });
+const { pay, paying } = usePay(); // tokenize-first completion derived from completionEndpoint
 <MyDesignSystemButton loading={paying} onClick={async () => show(await pay())} />
 ```
 

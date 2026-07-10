@@ -27,6 +27,7 @@ import {
   type UnifiedPaymentMethodType,
   type UnifiedPaymentStatus,
   type UnifiedWebhookEvent,
+  type VerifyCredentialsResult,
 } from "@payfanout/core";
 import {
   normalizeGoCardlessEvent,
@@ -237,6 +238,37 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       requiresServerCompletion: false, // the hosted flow fulfils the billing request itself
       paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };
+  }
+
+  /**
+   * Side-effect-free credential probe — the engine behind a host "Test
+   * connection" button. Makes ONE read-only GET /payments (limit 1) and reads
+   * the RAW HTTP status so an auth rejection (401/403) is told apart from an
+   * outage (429/5xx) directly from the status line, never from a body that a
+   * proxy or edge error page may not carry. A single shot with no transport
+   * retry loop: a "Test connection" click cannot hang on backoff, and a bad key
+   * is not replayed. Never mutates PSP state, never puts the token in the result.
+   */
+  async verifyCredentials(): Promise<VerifyCredentialsResult> {
+    let status: number;
+    try {
+      status = await this.probeStatus("/payments?limit=1");
+    } catch {
+      // requestWithTimeout rejects only on a network failure or timeout.
+      return { ok: false, category: "network", message: "Could not reach GoCardless — try again." };
+    }
+    if (status === 401 || status === 403) {
+      return {
+        ok: false,
+        category: "auth",
+        message: "Authentication failed — check the GoCardless access token.",
+      };
+    }
+    if (status === 429 || status >= 500) {
+      return { ok: false, category: "network", message: "Could not reach GoCardless — try again." };
+    }
+    // The read-only GET authenticated — a healthy probe answers 200 with the list.
+    return { ok: true };
   }
 
   /**
@@ -660,6 +692,34 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       attempts: 1 + (this.config.maxNetworkRetries ?? 2),
       sleep: this.config.sleep,
     });
+  }
+
+  /**
+   * One read-only exchange returning the RAW HTTP status instead of mapping a
+   * non-2xx into a PayFanoutError — verifyCredentials needs the status itself to
+   * tell an auth rejection (401/403) apart from an outage (429/5xx), without
+   * depending on the error body carrying a numeric code. No retry loop: a single
+   * probe is the contract. A network failure/timeout rejects.
+   */
+  private async probeStatus(path: string): Promise<number> {
+    const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
+    const { response } = await requestWithTimeout(
+      {
+        fetch: this.config.fetch ?? fetch,
+        timeoutMs,
+        onFailure: (_timedOut, cause) =>
+          cause instanceof Error ? cause : new Error("GoCardless connectivity probe failed"),
+      },
+      `${this.baseUrl}${path}`,
+      {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${this.config.accessToken}`,
+          "gocardless-version": this.config.goCardlessVersion ?? DEFAULT_GOCARDLESS_VERSION,
+        },
+      },
+    );
+    return response.status;
   }
 
   private async requestOnce<T>(method: "GET" | "POST", path: string, options: RequestOptions): Promise<T> {

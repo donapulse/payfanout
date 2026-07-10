@@ -7,6 +7,7 @@ import {
   PAYMENT_METHOD_TYPES,
   REFUND_STATUSES,
   WEBHOOK_EVENT_TYPES,
+  type AdapterOnboardingDescriptor,
   type CompletePaymentInput,
   type CreatePaymentSessionInput,
   type MinorUnitAmount,
@@ -15,6 +16,7 @@ import {
   type UnifiedErrorCode,
   type UnifiedWebhookEventType,
   validateAdapterCapabilities,
+  validateOnboardingDescriptor,
 } from "@payfanout/core";
 
 /**
@@ -91,6 +93,13 @@ export interface ServerConformanceFixtures {
   };
 
   /**
+   * The adapter's exported onboarding descriptor. When provided, the suite
+   * asserts it is well-formed and consistent with the adapter (pspName match,
+   * credential fields, webhook events, CSP hosts) via validateOnboardingDescriptor.
+   */
+  onboarding?: AdapterOnboardingDescriptor;
+
+  /**
    * Required when the adapter reports supportsSavedPaymentMethods: drives the
    * vault round-trip (create customer -> save -> list -> charge twice -> delete).
    */
@@ -131,6 +140,13 @@ export function runServerAdapterConformanceTests(
         expect(currency).toMatch(/^[A-Z]{3}$/);
       }
     });
+
+    if (fixtures.onboarding) {
+      const onboarding = fixtures.onboarding;
+      it("ships a valid onboarding descriptor consistent with its config", () => {
+        expect(validateOnboardingDescriptor(onboarding, makeAdapter())).toEqual([]);
+      });
+    }
 
     it("updates a session and hands back a usable session (when supported)", async () => {
       const adapter = makeAdapter();

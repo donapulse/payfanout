@@ -677,11 +677,12 @@ describe("PayZenServerAdapter refunds", () => {
 });
 
 describe("PayZenServerAdapter verifyCredentials (Test connection probe)", () => {
-  it("returns { ok: true } after one side-effect-free Charge/SDKTest call", async () => {
+  it("returns { ok: true } after one single-shot, side-effect-free Charge/SDKTest call", async () => {
     const { adapter, fake } = makePair();
     await expect(adapter.verifyCredentials()).resolves.toEqual({ ok: true });
     expect(fake.lastOperation).toBe("Charge/SDKTest");
-    expect(fake.lastRequestBody).toMatchObject({ value: "connection-test", mode: "TEST" });
+    // No `mode` field — PayZen selects TEST/LIVE by the key set, not the body.
+    expect(fake.lastRequestBody).toEqual({ value: "connection-test" });
     expect(fake.uniqueTransactionCreations).toBe(0); // nothing was mutated
   });
 
@@ -701,18 +702,11 @@ describe("PayZenServerAdapter verifyCredentials (Test connection probe)", () => 
     });
   });
 
-  it("classifies an HTTP 401 in front of the gateway as category 'auth'", async () => {
-    const { adapter, fake } = makePair();
-    fake.failNextWith({ status: 401 });
-    await expect(adapter.verifyCredentials()).resolves.toEqual({
-      ok: false,
-      category: "auth",
-      message: "Authentication failed — check the PayZen shop id and password.",
-    });
-  });
-
-  it("classifies a network failure as category 'network'", async () => {
-    const { adapter, fake } = makePair();
+  it("is single-shot: a transient failure returns 'network' instead of replaying into success", async () => {
+    // maxNetworkRetries would normally retry a transient failure; the probe
+    // disables transport retries, so one injected failure is the whole story
+    // (were it retried, the un-failed second attempt would return { ok: true }).
+    const { adapter, fake } = makePair({ maxNetworkRetries: 2 });
     fake.failNextWith({ networkError: true });
     await expect(adapter.verifyCredentials()).resolves.toEqual({
       ok: false,
@@ -729,9 +723,29 @@ describe("PayZenServerAdapter verifyCredentials (Test connection probe)", () => 
     if (!result.ok) expect(result.category).toBe("network");
   });
 
+  it("classifies an HTTP 429 as category 'network'", async () => {
+    const { adapter, fake } = makePair();
+    fake.failNextWith({ status: 429 });
+    const result = await adapter.verifyCredentials();
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.category).toBe("network");
+  });
+
+  it("classifies a bare 4xx from infrastructure (no PayZen envelope) as category 'internal', not auth", async () => {
+    // Only an INT_905 envelope proves a bad key; a raw proxy 4xx does not, so
+    // it is reported as an unexpected fault rather than mislabeled auth.
+    const { adapter, fake } = makePair();
+    fake.failNextWith({ status: 401 });
+    await expect(adapter.verifyCredentials()).resolves.toEqual({
+      ok: false,
+      category: "internal",
+      message: "Could not verify PayZen credentials.",
+    });
+  });
+
   it("classifies an unexpected envelope error as category 'internal' without leaking details", async () => {
     const { adapter, fake } = makePair();
-    // Neither an auth rejection nor a transient outage — the honest catch-all.
+    // Neither an INT_905 auth rejection nor a transient outage — the catch-all.
     fake.failNextEnvelope(
       { errorCode: "INT_002", errorMessage: "unexpected", detailedErrorCode: null, detailedErrorMessage: null },
       "Charge/SDKTest",
@@ -741,27 +755,5 @@ describe("PayZenServerAdapter verifyCredentials (Test connection probe)", () => 
       category: "internal",
       message: "Could not verify PayZen credentials.",
     });
-  });
-
-  it("sends mode PRODUCTION when configured for the live environment", async () => {
-    // The Back Office key set (not the URL) selects TEST vs LIVE; the probe
-    // still tags the request so the gateway echoes against the right mode.
-    let sentBody: Record<string, unknown> | undefined;
-    const echo: typeof fetch = async (_url, init) => {
-      sentBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      return new Response(
-        JSON.stringify({ status: "SUCCESS", answer: { value: sentBody["value"], _type: "V4/Charge/SDKTestResult" } }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
-    };
-    const live = new PayZenServerAdapter({
-      shopId: "69876357",
-      password: "prodpassword_LiveKey",
-      environment: "live",
-      fetch: echo,
-      maxNetworkRetries: 0,
-    });
-    await expect(live.verifyCredentials()).resolves.toEqual({ ok: true });
-    expect(sentBody).toMatchObject({ value: "connection-test", mode: "PRODUCTION" });
   });
 });

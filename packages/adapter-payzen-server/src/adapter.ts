@@ -436,33 +436,37 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
   }
 
   /**
-   * "Test connection" probe: one side-effect-free Charge/SDKTest call — PayZen's
-   * purpose-built connection test, which just echoes the submitted value back on
-   * valid credentials. The outcome is classified so a host UI can tell a wrong
-   * shopId/password (`auth`) from a transient outage (`network`); it resolves on
-   * every path instead of throwing, and never surfaces the credential.
+   * "Test connection" probe: one single-shot, side-effect-free Charge/SDKTest
+   * call — PayZen's purpose-built connection test, which just echoes the
+   * submitted value back on valid credentials. Transport retries are disabled so
+   * a transient failure surfaces promptly instead of replaying (a "Test
+   * connection" click must not hang for multiples of the timeout). PayZen
+   * selects TEST vs LIVE by the key set, so the probe body carries no mode. The
+   * outcome is classified so a host UI can tell a wrong shopId/password (`auth`)
+   * from a transient outage (`network`); it resolves on every path instead of
+   * throwing, and never surfaces the credential.
    */
   async verifyCredentials(): Promise<VerifyCredentialsResult> {
     try {
-      await this.call<{ value?: string }>("Charge/SDKTest", {
-        value: "connection-test",
-        mode: this.config.environment === "live" ? "PRODUCTION" : "TEST",
-      });
+      await this.call<{ value?: string }>("Charge/SDKTest", { value: "connection-test" }, { retryTransport: false });
       return { ok: true };
     } catch (err) {
-      const e = (err ?? {}) as { code?: string; retryable?: boolean; raw?: unknown };
-      const envelopeCode = readEnvelopeErrorCode(e.raw);
-      // INT_905 is PayZen's wrong shopId/password rejection (delivered inside an
-      // HTTP 200 ERROR envelope); an auth proxy in front of the gateway would
-      // answer HTTP 401/403, which classifyHttpFallback collapses to a bare,
-      // non-retryable invalid_request with no PayZen envelope. Both are auth.
-      if (envelopeCode === "INT_905" || (envelopeCode === undefined && e.code === "invalid_request")) {
+      // `call` with retryTransport:false strips the retryable flag off transport
+      // failures, so classify the transient bucket by the preserved taxonomy
+      // `code`, not `retryable`.
+      const e = (err ?? {}) as { code?: string; raw?: unknown };
+      // PayZen's wrong shopId/password rejection is the INT_905 ERROR envelope
+      // (delivered over HTTP 200) — the only unambiguous credential signal. A
+      // bare 4xx from infrastructure in front of the gateway is NOT proof of a
+      // bad key, so it is never labeled auth.
+      if (readEnvelopeErrorCode(e.raw) === "INT_905") {
         return { ok: false, category: "auth", message: "Authentication failed — check the PayZen shop id and password." };
       }
-      // rate_limited / psp_unavailable — the only transient (retryable) failures.
-      if (e.retryable === true) {
+      // Transient transport trouble — network/timeout, HTTP 429/5xx.
+      if (e.code === "psp_unavailable" || e.code === "rate_limited") {
         return { ok: false, category: "network", message: "Could not reach PayZen — try again." };
       }
+      // Anything else — including a rare non-envelope infra 4xx — is unexpected.
       return { ok: false, category: "internal", message: "Could not verify PayZen credentials." };
     }
   }

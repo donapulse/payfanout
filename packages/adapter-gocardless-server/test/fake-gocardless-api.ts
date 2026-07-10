@@ -59,6 +59,8 @@ export class FakeGoCardlessApi {
   mandateLookupFails = false;
   uniqueBillingRequestCreations = 0;
   uniqueRefundCreations = 0;
+  /** Total fetch invocations — asserts the verifyCredentials probe is single-shot. */
+  callCount = 0;
   lastRequestBody: Record<string, unknown> | undefined;
   lastRequestUrl: string | undefined;
   readonly idempotencyKeysSeen: Array<{ path: string; key: string }> = [];
@@ -74,6 +76,7 @@ export class FakeGoCardlessApi {
   }
 
   readonly fetch: typeof fetch = async (input, init) => {
+    this.callCount += 1;
     // A transport failure (DNS/connection/timeout): fetch rejects before the
     // request is processed, exercising the adapter's onFailure mapping.
     if (this.networkFailure > 0) {

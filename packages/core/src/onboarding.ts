@@ -21,7 +21,12 @@ export type WebhookSignatureScheme =
   | "provider-postback";
 
 export interface CredentialFieldDescriptor {
-  /** The adapter config key this field maps to (e.g. "secretKey", "publishableKey"). */
+  /**
+   * The credential a host collects — usually the adapter config key it maps to
+   * (e.g. "secretKey", "publishableKey"), but may be a descriptive name for a
+   * value the constructor takes differently (Paysafe's per-currency merchant
+   * account is a resolver function, surfaced here as "merchantAccount").
+   */
   key: string;
   /** Storage/redaction guidance: a `secret` value must never be redisplayed. */
   kind: "public" | "secret";

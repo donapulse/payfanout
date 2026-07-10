@@ -666,11 +666,14 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
 
   /**
    * "Test connection" probe: one side-effect-free read against the Customer
-   * Vault — look up an all-but-certainly-absent profile (good credentials answer
-   * 2xx with an empty match, bad ones 401/403). Classified so a host UI can tell
-   * a wrong key (`auth`) from a transient outage (`network`). It is a single
-   * call, never retried (an auth rejection must not be replayed), and the
-   * credentials never leak into the result.
+   * Vault — look up an all-but-certainly-absent profile. This endpoint is an
+   * object-or-404 point lookup, so authentication is settled BEFORE the resource
+   * is resolved: only 401/403 means bad credentials, while every other status —
+   * a 2xx match, the expected 404 "no such profile", or any business 4xx —
+   * proves the credentials authenticated. Classified so a host UI can tell a
+   * wrong key (`auth`) from a transient outage (`network`). It is a single call,
+   * never retried (an auth rejection must not be replayed), and the credentials
+   * never leak into the result.
    */
   async verifyCredentials(): Promise<VerifyCredentialsResult> {
     const probeCustomerId = `payfanout-verify-${crypto.randomUUID()}`;
@@ -683,7 +686,6 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       // requestWithTimeout rejects only on a network failure or timeout.
       return { ok: false, category: "network", message: "Could not reach Paysafe — try again." };
     }
-    if (status >= 200 && status < 300) return { ok: true };
     if (status === 401 || status === 403) {
       return {
         ok: false,
@@ -694,7 +696,9 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     if (status === 429 || status >= 500) {
       return { ok: false, category: "network", message: "Could not reach Paysafe — try again." };
     }
-    return { ok: false, category: "internal", message: `Paysafe returned an unexpected status (${status}).` };
+    // Anything else — a 2xx match or the expected 404 for the absent probe id —
+    // got past authentication to hit the account, so the credentials are valid.
+    return { ok: true };
   }
 
   async verifyWebhookSignature(rawBody: string, headers: Record<string, string>): Promise<boolean> {

@@ -58,10 +58,7 @@ export class FakePaysafeApi {
     if (method === "GET" && path === "/paymenthub/v1/customers" && parsed.searchParams.get("merchantCustomerId")) {
       const wanted = parsed.searchParams.get("merchantCustomerId");
       const found = [...this.customers.values()].find((c) => c.merchantCustomerId === wanted);
-      // The lookup endpoint returns a (possibly empty) match set, not a 404: an
-      // absent profile is 200 + empty list. createCustomer's 7505 recovery only
-      // queries ids it knows exist; verifyCredentials probes a random absent id.
-      if (!found) return json(200, { customers: [], meta: { numberOfRecords: 0 } });
+      if (!found) return json(404, { error: { code: "5269", message: "No such customer" } });
       return json(200, { id: found.id, merchantCustomerId: found.merchantCustomerId, status: "ACTIVE" });
     }
     const custHandlesMatch = /^\/paymenthub\/v1\/customers\/([^/?]+)\/paymenthandles$/.exec(path);

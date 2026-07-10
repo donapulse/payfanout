@@ -242,22 +242,33 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
 
   /**
    * Side-effect-free credential probe — the engine behind a host "Test
-   * connection" button. Makes ONE read-only GET /payments (limit 1) over the
-   * same transport listPayments/fetchEvents use, then classifies by the raw
-   * GoCardless HTTP status: 2xx authenticates; 401/403 is a wrong or
-   * under-scoped access token (`auth` — never retried, a bad key stays bad);
-   * network failure, timeout, 429 and 5xx are transient reach failures
-   * (`network`); anything else is `internal`. Never mutates PSP state, never
-   * puts the token in the message.
+   * connection" button. Makes ONE read-only GET /payments (limit 1) and reads
+   * the RAW HTTP status so an auth rejection (401/403) is told apart from an
+   * outage (429/5xx) directly from the status line, never from a body that a
+   * proxy or edge error page may not carry. A single shot with no transport
+   * retry loop: a "Test connection" click cannot hang on backoff, and a bad key
+   * is not replayed. Never mutates PSP state, never puts the token in the result.
    */
   async verifyCredentials(): Promise<VerifyCredentialsResult> {
+    let status: number;
     try {
-      // limit=1 keeps the probe cheap; the returned page is discarded.
-      await this.request<unknown>("GET", "/payments?limit=1");
-      return { ok: true };
-    } catch (err) {
-      return classifyVerifyCredentials(PayFanoutError.wrap(err, { pspName: this.pspName }));
+      status = await this.probeStatus("/payments?limit=1");
+    } catch {
+      // requestWithTimeout rejects only on a network failure or timeout.
+      return { ok: false, category: "network", message: "Could not reach GoCardless — try again." };
     }
+    if (status === 401 || status === 403) {
+      return {
+        ok: false,
+        category: "auth",
+        message: "Authentication failed — check the GoCardless access token.",
+      };
+    }
+    if (status === 429 || status >= 500) {
+      return { ok: false, category: "network", message: "Could not reach GoCardless — try again." };
+    }
+    // The read-only GET authenticated — a healthy probe answers 200 with the list.
+    return { ok: true };
   }
 
   /**
@@ -683,6 +694,34 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
     });
   }
 
+  /**
+   * One read-only exchange returning the RAW HTTP status instead of mapping a
+   * non-2xx into a PayFanoutError — verifyCredentials needs the status itself to
+   * tell an auth rejection (401/403) apart from an outage (429/5xx), without
+   * depending on the error body carrying a numeric code. No retry loop: a single
+   * probe is the contract. A network failure/timeout rejects.
+   */
+  private async probeStatus(path: string): Promise<number> {
+    const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
+    const { response } = await requestWithTimeout(
+      {
+        fetch: this.config.fetch ?? fetch,
+        timeoutMs,
+        onFailure: (_timedOut, cause) =>
+          cause instanceof Error ? cause : new Error("GoCardless connectivity probe failed"),
+      },
+      `${this.baseUrl}${path}`,
+      {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${this.config.accessToken}`,
+          "gocardless-version": this.config.goCardlessVersion ?? DEFAULT_GOCARDLESS_VERSION,
+        },
+      },
+    );
+    return response.status;
+  }
+
   private async requestOnce<T>(method: "GET" | "POST", path: string, options: RequestOptions): Promise<T> {
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
     const { response, text } = await requestWithTimeout(
@@ -844,35 +883,6 @@ function idempotentConflictResourceId(err: unknown): string | undefined {
     }
   }
   return undefined;
-}
-
-/**
- * Classifies a failed verifyCredentials probe. Auth is separated from network
- * by the raw HTTP status GoCardless echoes in its error envelope (401/403 = a
- * bad or under-scoped access token); the retryable transport taxonomy —
- * psp_unavailable / rate_limited, which mapGoCardlessError already derives from
- * network failures, timeouts, 429 and 5xx — is the network bucket; anything
- * else is an unexpected internal fault. No secret ever reaches the message.
- */
-function classifyVerifyCredentials(err: PayFanoutError): VerifyCredentialsResult {
-  const status = goCardlessErrorStatus(err);
-  if (status === 401 || status === 403) {
-    return {
-      ok: false,
-      category: "auth",
-      message: "Authentication failed — check the GoCardless access token.",
-    };
-  }
-  if (err.code === "psp_unavailable" || err.code === "rate_limited") {
-    return { ok: false, category: "network", message: "Could not reach GoCardless — try again." };
-  }
-  return { ok: false, category: "internal", message: "GoCardless credential check failed unexpectedly." };
-}
-
-/** The HTTP status GoCardless echoes in its error envelope (error.code), when present. */
-function goCardlessErrorStatus(err: PayFanoutError): number | undefined {
-  const code = (err.raw as { error?: { code?: unknown } } | undefined)?.error?.code;
-  return typeof code === "number" ? code : undefined;
 }
 
 /**

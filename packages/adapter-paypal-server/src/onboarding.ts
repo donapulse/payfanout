@@ -16,7 +16,7 @@ import type { AdapterOnboardingDescriptor } from "@payfanout/core";
 export const paypalOnboarding: AdapterOnboardingDescriptor = {
   pspName: "paypal",
   credentialFields: [
-    { key: "clientId", kind: "public", scope: "server", format: { hint: "REST app client id (also the browser SDK client id)" } },
+    { key: "clientId", kind: "public", scope: "server", format: { hint: "REST app client id — public; the browser SDK needs this same value, so expose it client-side too" } },
     { key: "clientSecret", kind: "secret", scope: "server", format: { hint: "REST app secret" } },
     {
       key: "webhookId",

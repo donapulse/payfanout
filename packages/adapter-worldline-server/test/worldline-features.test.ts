@@ -124,6 +124,8 @@ describe("mapWorldlineError", () => {
     [429, undefined, "rate_limited", true],
     [500, undefined, "psp_unavailable", true],
     [503, "1234", "psp_unavailable", true],
+    // 409 = an idempotent replay raced the still-in-flight original: retryable.
+    [409, undefined, "processing_error", true],
     [400, "1", "invalid_request", false],
     [404, undefined, "invalid_request", false],
     [401, undefined, "invalid_request", false],
@@ -181,7 +183,7 @@ describe("webhook parsing", () => {
 
   it("maps discrete refund outcomes and carries the refundId", async () => {
     const refunded = await parseWorldlineWebhookEvent(
-      JSON.stringify({ id: "e2", type: "refund.refunded", refund: { id: "ref_1", paymentId: "pay_9", refundOutput: { amountOfMoney: { amount: 500, currencyCode: "EUR" } } } }),
+      JSON.stringify({ id: "e2", type: "refund.refunded", refund: { id: "ref_1", refundOutput: { amountOfMoney: { amount: 500, currencyCode: "EUR" } } } }),
     );
     expect(refunded.type).toBe("payment.refunded");
     expect(refunded.refundId).toBe("ref_1");
@@ -203,8 +205,15 @@ describe("webhook parsing", () => {
     expect(second.id).toBe(first.id);
   });
 
-  it("throws invalid_request on a batched array, unparseable, or non-object payload", async () => {
-    for (const raw of ["[{}]", "not json", "null"]) {
+  it("unwraps a single-element array delivery (the docs example wraps one event in an array)", async () => {
+    const event = await parseWorldlineWebhookEvent(
+      JSON.stringify([{ id: "e9", created: "2026-07-14T10:00:00Z", type: "payment.captured", payment: { id: "pay_1", ...money } }]),
+    );
+    expect(event).toMatchObject({ id: "e9", pspPaymentId: "pay_1", type: "payment.succeeded" });
+  });
+
+  it("throws invalid_request on a multi-event array, empty array, unparseable, or non-object payload", async () => {
+    for (const raw of ["[{},{}]", "[]", "not json", "null"]) {
       try {
         await parseWorldlineWebhookEvent(raw);
         expect.unreachable();

@@ -2,10 +2,15 @@ import type { AdapterOnboardingDescriptor } from "@payfanout/core";
 
 /**
  * Declarative onboarding metadata for the Worldline Direct adapter pair: the
- * credentials a host collects, the provider event-type strings the webhook
- * parser recognizes, and the CSP hosts the Hosted Tokenization iframe touches.
- * The credential keys mirror `WorldlineServerAdapterConfig` and the event list
- * mirrors `webhook.ts`'s EVENT_TYPE_MAP — keep the three in step.
+ * credentials a host collects, the provider event-type strings a host
+ * subscribes to, and the CSP hosts the Hosted Tokenization iframe touches.
+ * The credential keys mirror `WorldlineServerAdapterConfig`. The event list is
+ * the DOCUMENTED payment/refund set only — `webhook.ts`'s EVENT_TYPE_MAP
+ * additionally tolerates a few undocumented variants, but this descriptor
+ * drives host subscription lists and must not present those as provider
+ * behavior. The documented terminal refund signal is `payment.refunded`; there
+ * is no documented refund-failure event, so refund failure is observed by
+ * polling `retrieveRefund`.
  *
  * There is no client-scope credential: the Hosted Tokenization iframe is
  * addressed entirely by the `hostedTokenizationUrl` the server session returns,
@@ -59,19 +64,14 @@ export const worldlineOnboarding: AdapterOnboardingDescriptor = {
       "payment.authorization_requested",
       "payment.pending_approval",
       "payment.pending_completion",
-      "payment.pending_fraud_approval",
       "payment.pending_capture",
       "payment.capture_requested",
       "payment.captured",
-      "payment.paid",
       "payment.rejected",
       "payment.rejected_capture",
       "payment.cancelled",
       "payment.refunded",
       "refund.refund_requested",
-      "refund.refunded",
-      "refund.rejected",
-      "refund.cancelled",
     ],
   },
   csp: {

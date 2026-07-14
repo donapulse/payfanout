@@ -40,7 +40,7 @@ export interface WorldlineSessionContextV1 {
   hostedTokenizationId: string;
   /** Epoch milliseconds. Tokens without it are rejected. */
   expiresAt: number;
-  /** 3-D Secure redirect return URL (cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl). */
+  /** 3-D Secure return URL (sent as both cardPaymentMethodSpecificInput.returnUrl and its threeDSecure.redirectionData form). */
   returnUrl?: string;
   /** Host-app internal id (PaymentSession.id), round-tripped via order.references.merchantReference. */
   id?: string;

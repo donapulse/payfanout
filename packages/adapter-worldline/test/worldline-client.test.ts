@@ -135,6 +135,24 @@ describe("WorldlineClientAdapter", () => {
     expect(() => new WorldlineClientAdapter({ environment: "prod" as never })).toThrowError(/sandbox.*live/);
   });
 
+  it("retries the SDK injection after a failed script load instead of caching the rejection", async () => {
+    stubBrowser();
+    let tokenizer: unknown;
+    let loads = 0;
+    const adapter = new WorldlineClientAdapter({
+      environment: "sandbox",
+      getWorldlineGlobal: () => tokenizer as never,
+      loadScript: async () => {
+        loads++;
+        if (loads === 1) throw new Error("network hiccup");
+        tokenizer = makeFakeTokenizer().Tokenizer;
+      },
+    });
+    await expect(adapter.loadSdk()).rejects.toThrowError(/hiccup/);
+    await expect(adapter.loadSdk()).resolves.toBeUndefined();
+    expect(loads).toBe(2);
+  });
+
   it("lists only the embedded card method (no redirect flow, so no handleRedirectReturn needed)", () => {
     const { adapter } = makeAdapter();
     const methods = adapter.listPaymentMethodCapabilities();

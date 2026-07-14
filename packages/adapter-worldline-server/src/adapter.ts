@@ -2,6 +2,8 @@ import {
   assertMinorUnitAmount,
   classifyHttpFallback,
   getUserMessage,
+  isPayFanoutError,
+  isTransportRetryable,
   normalizeCurrency,
   PayFanoutError,
   requestWithTimeout,
@@ -69,15 +71,17 @@ export interface WorldlineServerAdapterConfig {
   /**
    * Abort a hung Worldline connection after this many milliseconds (default
    * 30000). The timer covers the whole exchange including the response body
-   * read. Every mutating call carries a signed idempotence key, so a timed-out
-   * request is safe to retry. Timeouts surface as retryable psp_unavailable.
+   * read. Money-moving calls carry a signed idempotence key, so a timed-out
+   * request is safe to retry (a replayed tokenization create merely re-issues
+   * an amountless session). Timeouts surface as retryable psp_unavailable.
    */
   requestTimeoutMs?: number;
   /**
    * Automatic retries for transport-level trouble only (network failure,
    * timeout, HTTP 5xx, 429) with exponential backoff. Default 2. Safe because
-   * the idempotence key makes every mutating call idempotent. Business errors
-   * (declines, validation) are NEVER retried here.
+   * the idempotence key makes money-moving calls idempotent and a tokenization
+   * create is amountless. Business errors (declines, validation) are NEVER
+   * retried here.
    */
   maxNetworkRetries?: number;
   /** Account capabilities vary by contract — override instead of trusting defaults. */
@@ -133,13 +137,12 @@ export interface WorldlineCaptureLike {
   captureOutput?: { amountOfMoney?: { amount?: number; currencyCode?: string } };
 }
 
-/** A refund object (POST /refund, GET /refunds/{id}). */
+/** A refund object (POST /refund and the GET /payments/{id}/refunds list). */
 export interface WorldlineRefundLike {
   id: string;
   status?: string;
   statusOutput?: { statusCode?: number; statusCategory?: string };
   refundOutput?: { amountOfMoney?: { amount?: number; currencyCode?: string } };
-  paymentId?: string;
 }
 
 /** POST /hostedtokenizations response. */
@@ -240,6 +243,10 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
         `Worldline adapter does not support one of the requested payment method types: ${input.paymentMethodTypes.join(", ")}`,
       );
     }
+    // CreateHostedTokenization is not on Worldline's documented idempotent
+    // operations: the key is sent (harmless) but never relied on for dedupe.
+    // Tokenization is amountless — money-side safety comes from CreatePayment
+    // idempotency at completePayment.
     const tokenization = await this.request<WorldlineHostedTokenizationLike>(
       "POST",
       `/v2/${this.merchantPath()}/hostedtokenizations`,
@@ -304,11 +311,18 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
           ...(toWorldlineCustomer(billing, email) ?? {}),
           ...(toWorldlineShipping(context.shippingDetails) ?? {}),
         },
+        // hostedTokenizationId rides at the ROOT of CreatePayment — it replaces
+        // the card-data source; cardPaymentMethodSpecificInput has no such field.
+        hostedTokenizationId: input.clientToken,
         cardPaymentMethodSpecificInput: {
-          hostedTokenizationId: input.clientToken,
           authorizationMode: context.captureMethod === "manual" ? "PRE_AUTHORIZATION" : "SALE",
+          // The hosted-tokenization guide names the flattened returnUrl; the
+          // domain model also carries the threeDSecure form — send both.
           ...(context.returnUrl
-            ? { threeDSecure: { redirectionData: { returnUrl: context.returnUrl } } }
+            ? {
+                returnUrl: context.returnUrl,
+                threeDSecure: { redirectionData: { returnUrl: context.returnUrl } },
+              }
             : {}),
         },
       },
@@ -426,23 +440,45 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       req.idempotencyKey,
     );
     return {
-      refundId: refund.id,
+      // Worldline Direct has no refund-by-id read — retrieveRefund resolves this
+      // composite through the per-payment list. The part after the last ":" is
+      // Worldline's own refund id, the one webhooks report.
+      refundId: `${req.pspPaymentId}:${refund.id}`,
       status: mapRefundStatus(refund.status, refund.statusOutput?.statusCategory),
       amount: refund.refundOutput?.amountOfMoney?.amount ?? amount,
       raw: refund,
     };
   }
 
+  /**
+   * Polls a refund. Worldline Direct exposes no refund-by-id endpoint (that is
+   * a Connect-era surface) — the only read is `GET /payments/{id}/refunds` — so
+   * `refundId` is the composite `"{paymentId}:{refundId}"` that refundPayment
+   * returned, resolved here through the payment's refund list.
+   */
   async retrieveRefund(refundId: string): Promise<RefundInfo> {
-    const refund = await this.request<WorldlineRefundLike>(
+    const separator = refundId.lastIndexOf(":");
+    if (separator <= 0 || separator === refundId.length - 1) {
+      throw PayFanoutError.invalidRequest(
+        'Worldline refund ids are the composite "{paymentId}:{refundId}" returned by refundPayment',
+        { refundId },
+      );
+    }
+    const pspPaymentId = refundId.slice(0, separator);
+    const worldlineRefundId = refundId.slice(separator + 1);
+    const result = await this.request<{ refunds?: WorldlineRefundLike[] }>(
       "GET",
-      `/v2/${this.merchantPath()}/refunds/${encodeURIComponent(refundId)}`,
+      `/v2/${this.merchantPath()}/payments/${encodeURIComponent(pspPaymentId)}/refunds`,
     );
+    const refund = (result.refunds ?? []).find((r) => r.id === worldlineRefundId);
+    if (!refund) {
+      throw PayFanoutError.invalidRequest(`No refund ${worldlineRefundId} on payment ${pspPaymentId}`, { refundId });
+    }
     return {
-      refundId: refund.id,
+      refundId,
       status: mapRefundStatus(refund.status, refund.statusOutput?.statusCategory),
       amount: refund.refundOutput?.amountOfMoney?.amount ?? 0,
-      ...(refund.paymentId ? { pspPaymentId: refund.paymentId } : {}),
+      pspPaymentId,
       raw: refund,
     };
   }
@@ -583,6 +619,9 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     return withTransportRetries(() => this.requestOnce<T>(method, path, body, idempotencyKey), {
       attempts: 1 + (this.config.maxNetworkRetries ?? 2),
       sleep: this.config.sleep,
+      // Beyond transport trouble, a 409 (an idempotent replay racing the still
+      // in-flight original) resolves itself moments later — replay it too.
+      isRetryable: (err) => isTransportRetryable(err) || isIdempotenceReplayInFlight(err),
     });
   }
 
@@ -669,16 +708,17 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
   }
 }
 
-/** Worldline paymentProductId → lowercase brand names hosts can render. */
+/**
+ * Worldline paymentProductId → lowercase brand names hosts can render. Only
+ * ids confirmed on the current payment-method pages; an unknown id degrades to
+ * brandless details.
+ */
 const WORLDLINE_PRODUCT_TO_BRAND: Record<number, string> = {
   1: "visa",
   2: "amex",
   3: "mastercard",
-  114: "visa",
   117: "maestro",
-  118: "maestro",
   125: "jcb",
-  128: "discover",
   132: "diners",
 };
 
@@ -809,6 +849,11 @@ export function mapWorldlineError(httpStatus: number, body: unknown): PayFanoutE
   } else if (httpStatus === 402) {
     // A rejection with no finer code we recognize is still a decline.
     code = "card_declined";
+  } else if (httpStatus === 409) {
+    // The request with this idempotence key is still being processed — the
+    // outcome exists moments later, so a raced replay is retryable.
+    code = "processing_error";
+    retryable = true;
   } else {
     ({ code, retryable } = classifyHttpFallback(httpStatus));
   }
@@ -821,6 +866,11 @@ export function mapWorldlineError(httpStatus: number, body: unknown): PayFanoutE
     raw: body,
     pspName: WORLDLINE_PSP_NAME,
   });
+}
+
+/** The retryable processing_error only mapWorldlineError's 409 branch produces. */
+function isIdempotenceReplayInFlight(error: unknown): boolean {
+  return isPayFanoutError(error) && error.code === "processing_error" && error.retryable;
 }
 
 function mapWorldlineRejectedPayment(raw: unknown): PayFanoutError {

@@ -57,7 +57,6 @@ export async function verifyWorldlineWebhookSignature(
  */
 const EVENT_TYPE_MAP: Record<string, UnifiedWebhookEventType> = {
   "payment.captured": "payment.succeeded",
-  "payment.paid": "payment.succeeded",
   "payment.refunded": "payment.refunded",
   "payment.rejected": "payment.failed",
   "payment.rejected_capture": "payment.failed",
@@ -70,8 +69,12 @@ const EVENT_TYPE_MAP: Record<string, UnifiedWebhookEventType> = {
   "payment.pending_capture": "payment.processing",
   "payment.pending_approval": "payment.processing",
   "payment.pending_completion": "payment.processing",
+  // Everything below is NOT on the documented webhook event list (which ends at
+  // payment.refunded / refund.refund_requested) — tolerated here in case a
+  // contract variant delivers them, but hosts must not subscribe to or rely on
+  // them (the onboarding descriptor lists only the documented set).
+  "payment.paid": "payment.succeeded",
   "payment.pending_fraud_approval": "payment.processing",
-  // Terminal refund outcomes, when Worldline emits a discrete refund result.
   "refund.refunded": "payment.refunded",
   "refund.rejected": "payment.refund_failed",
   "refund.cancelled": "payment.refund_failed",
@@ -98,10 +101,12 @@ interface WorldlineWebhookBody {
 }
 
 /**
- * One event per delivery. A batched/array payload is rejected (invalid_request)
- * rather than partially processed — Worldline does not batch its webhooks, so an
- * array is a sign of a mis-wired ingress, and silently dropping trailing events
- * is never acceptable.
+ * One event per delivery, but the envelope is ambiguous in the official
+ * material: the webhooks page's example body is an ARRAY while the platform's
+ * own webhooks helper JSON-parses a single object. Both single-event shapes are
+ * accepted (a one-element array is unwrapped); a multi-event array is rejected
+ * (invalid_request) rather than partially processed — silently dropping
+ * trailing events is never acceptable.
  */
 export async function parseWorldlineWebhookEvent(rawBody: string): Promise<UnifiedWebhookEvent> {
   let parsed: unknown;
@@ -117,13 +122,16 @@ export async function parseWorldlineWebhookEvent(rawBody: string): Promise<Unifi
     });
   }
   if (Array.isArray(parsed)) {
-    throw new PayFanoutError({
-      code: "invalid_request",
-      message: "Worldline webhook payload is a batched array — Worldline delivers one event per request",
-      retryable: false,
-      raw: parsed,
-      pspName: "worldline",
-    });
+    if (parsed.length !== 1) {
+      throw new PayFanoutError({
+        code: "invalid_request",
+        message: "Worldline webhook payload is a batched array — Worldline delivers one event per request",
+        retryable: false,
+        raw: parsed,
+        pspName: "worldline",
+      });
+    }
+    parsed = parsed[0];
   }
   if (parsed === null || typeof parsed !== "object") {
     throw new PayFanoutError({

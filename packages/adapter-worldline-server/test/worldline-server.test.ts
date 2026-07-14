@@ -227,11 +227,15 @@ describe("WorldlineServerAdapter specifics", () => {
     expect(info.amountCaptured).toBe(2500);
     expect(info.paymentMethodDetails).toMatchObject({ brand: "visa", last4: "4675" });
     const body = fake.lastCreatePaymentBody as Record<string, Record<string, unknown>>;
+    // hostedTokenizationId is a ROOT CreatePayment property; the return URL is
+    // sent in both documented forms.
+    expect(body["hostedTokenizationId"]).toBe("htp_handle_1");
     expect(body["cardPaymentMethodSpecificInput"]).toMatchObject({
-      hostedTokenizationId: "htp_handle_1",
       authorizationMode: "SALE",
+      returnUrl: "https://host.example/return",
       threeDSecure: { redirectionData: { returnUrl: "https://host.example/return" } },
     });
+    expect(body["cardPaymentMethodSpecificInput"]).not.toHaveProperty("hostedTokenizationId");
     expect(body["order"]).toMatchObject({
       amountOfMoney: { amount: 2500, currencyCode: "EUR" },
       references: { merchantReference: "order-77" },
@@ -307,13 +311,54 @@ describe("WorldlineServerAdapter specifics", () => {
     expect(getRefundState(info)).toBe("full");
   });
 
-  it("polls a pending refund to a terminal state via retrieveRefund", async () => {
+  it("polls a pending refund through the per-payment refund list via the composite id", async () => {
     const { adapter, fake } = makePair();
-    const seeded = fake.seedRefund({ id: "ref_pending", status: "REFUND_REQUESTED", refundOutput: { amountOfMoney: { amount: 2500, currencyCode: "EUR" } } });
-    const info = await adapter.retrieveRefund(seeded.id);
-    expect(info.refundId).toBe("ref_pending");
+    fake.seedRefund("pay_seeded", { id: "ref_pending", status: "REFUND_REQUESTED", refundOutput: { amountOfMoney: { amount: 2500, currencyCode: "EUR" } } });
+    const info = await adapter.retrieveRefund("pay_seeded:ref_pending");
+    expect(info.refundId).toBe("pay_seeded:ref_pending"); // stable for re-polling
+    expect(info.pspPaymentId).toBe("pay_seeded");
     expect(info.status).toBe("pending");
     expect(info.amount).toBe(2500);
+  });
+
+  it("returns a composite refund id that retrieveRefund resolves, and rejects a bare Worldline id", async () => {
+    const { adapter } = makePair();
+    const session = await adapter.createPaymentSession({ amount: 3000, currency: "EUR", idempotencyKey: "k" });
+    const paid = await adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken: "htp_1", idempotencyKey: "c1" });
+    const refund = await adapter.refundPayment({ pspPaymentId: paid.pspPaymentId, amount: 1000, idempotencyKey: "r1" });
+    expect(refund.refundId).toBe(`${paid.pspPaymentId}:${(refund.raw as { id: string }).id}`);
+    const polled = await adapter.retrieveRefund(refund.refundId);
+    expect(polled.status).toBe("succeeded");
+    expect(polled.amount).toBe(1000);
+    expect(polled.pspPaymentId).toBe(paid.pspPaymentId);
+    // A raw Worldline refund id (e.g. straight off a webhook) is not resolvable
+    // without its payment — the composite format is required and documented.
+    await expect(adapter.retrieveRefund("ref_1")).rejects.toMatchObject({ code: "invalid_request" });
+  });
+
+  it("self-heals a 409 idempotence replay (original still in flight) by retrying", async () => {
+    const fake = new FakeWorldlineApi();
+    let conflicts = 1;
+    const adapter = new WorldlineServerAdapter({
+      apiKeyId: "api-key-id",
+      secretApiKey: "secret-api-key",
+      merchantId: "mid-1",
+      environment: "sandbox",
+      sessionSigningKey: SIGNING_KEY,
+      webhookKeys: [{ keyId: WEBHOOK_KEY_ID, secretKey: WEBHOOK_SECRET }],
+      sleep: async () => {},
+      fetch: async (input, init) => {
+        if (conflicts > 0 && init?.method === "POST" && String(input).endsWith("/payments")) {
+          conflicts--;
+          return new Response(JSON.stringify({ errorId: "dup", errors: [{ code: "1409", message: "request in progress", httpStatusCode: 409 }] }), { status: 409 });
+        }
+        return fake.fetch(input, init);
+      },
+    });
+    const session = await adapter.createPaymentSession({ amount: 2000, currency: "EUR", idempotencyKey: "k" });
+    const info = await adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken: "htp_1", idempotencyKey: "c1" });
+    expect(info.status).toBe("succeeded");
+    expect(conflicts).toBe(0);
   });
 
   it("verifyCredentials classifies auth, network, and success", async () => {

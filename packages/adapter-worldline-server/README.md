@@ -73,10 +73,11 @@ clock is an injectable `now()` seam. Every mutating call carries a signed, deter
 ## What's inside
 
 - **`WorldlineServerAdapter`**, the full server contract (create session / complete /
-  retrieve, capture and multi-capture, cancel, refunds, refund polling).
+  retrieve, manual capture, cancel, refunds, refund polling).
 - **Webhook helpers**, `verifyWorldlineWebhookSignature` and `parseWorldlineWebhookEvent`,
   operating on the **raw request bytes** and emitting a normalized `UnifiedWebhookEvent`. One
-  event per delivery; a batched/array payload is rejected rather than partially processed.
+  event per delivery; a single-event array wrapper is unwrapped, and a multi-event batch is
+  rejected rather than partially processed.
 - **`mapWorldlineError`**, unifies Worldline errors into `PayFanoutError` (business rejections
   are never replayed), and **`WORLDLINE_PSP_NAME`**.
 - **`buildV1HmacAuthorization`**, the request signer, exported for testing.
@@ -84,7 +85,11 @@ clock is an injectable `now()` seam. Every mutating call carries a signed, deter
 ## Notes
 
 - The transport retries timeouts/5xx/429 with backoff (`maxNetworkRetries`, default 2); every
-  mutating call is idempotent, so a replay can never double-charge.
+  money-moving call is idempotent, so a replay can never double-charge.
+- Worldline Direct has no refund-by-id endpoint, so `refundPayment` returns a **composite
+  `refundId`** (`{paymentId}:{refundId}`) that `retrieveRefund` resolves through the payment's
+  refund list. The part after the last `:` is Worldline's own refund id — the one webhooks
+  report.
 - Worldline Direct exposes no public events-list API (`supportsEventPolling: false`), so
   missed-webhook recovery falls back to `retrievePayment` per order.
 - Card vaulting, zero-amount verification, session update, and listing are out of scope for

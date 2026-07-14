@@ -154,7 +154,8 @@ the `sdkUrl` config field to pin a version or self-host.
 ## 6. 3-D Secure
 
 Pass a `returnUrl` on `createPaymentSession` and the adapter forwards it as
-`cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl`. A frictionless
+`cardPaymentMethodSpecificInput.returnUrl` (the field the Hosted Tokenization guide names)
+and in its `threeDSecure.redirectionData.returnUrl` form — both are current. A frictionless
 authentication completes inline; a challenge comes back as `requires_action` with the
 redirect URL on `PaymentInfo.raw` (`merchantAction.redirectData.redirectURL`). After the
 customer returns, reconcile the outcome with `retrievePayment`.
@@ -205,7 +206,8 @@ app.use(express.json()); // AFTER the webhook route
 
 Signatures are verified as `base64(HMAC-SHA256(webhookSecret, rawBody))` against
 `X-GCS-Signature`, with the key selected by `X-GCS-KeyId`. Worldline delivers **one event per
-request**, so a batched/array payload is rejected. Worldline exposes no public events-polling
+request**; a single-event array wrapper is unwrapped, and a multi-event batch is rejected
+rather than partially processed. Worldline exposes no public events-polling
 API (`supportsEventPolling: false`), for missed-webhook recovery, reconcile with
 `retrievePayment` per order. See [Webhooks](/guide/webhooks).
 

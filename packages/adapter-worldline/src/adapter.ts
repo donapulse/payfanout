@@ -77,7 +77,14 @@ export class WorldlineClientAdapter implements ClientPaymentAdapter {
     assertBrowser("WorldlineClientAdapter", "loadSdk");
     if (this.worldlineGlobal()) return;
     const url = this.config.sdkUrl ?? this.defaultSdkUrl();
-    this.sdkPromise ??= this.config.loadScript ? this.config.loadScript(url) : injectScript(url, this.pspName);
+    this.sdkPromise ??= (this.config.loadScript ? this.config.loadScript(url) : injectScript(url, this.pspName)).catch(
+      (err) => {
+        // A flaky script load must not poison every later mount — clear the
+        // cached promise so the next loadSdk() retries the injection.
+        this.sdkPromise = undefined;
+        throw err;
+      },
+    );
     await this.sdkPromise;
     if (!this.worldlineGlobal()) {
       throw new PayFanoutError({

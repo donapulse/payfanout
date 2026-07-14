@@ -8,11 +8,15 @@ import type {
  * In-memory Worldline Direct Online Payments API. Models the documented
  * behavior the adapter relies on:
  *   - v1HMAC auth is present (Authorization: GCS v1HMAC:…); a lever forces 401
- *   - X-GCS-Idempotence-Key dedupe on every mutating call (exactly one creation
- *     per key), so the conformance idempotency proof holds
+ *   - X-GCS-Idempotence-Key dedupe on the documented idempotent operations
+ *     (create payment / capture / refund — exactly one creation per key), so
+ *     the conformance idempotency proof holds; hostedtokenizations is
+ *     deliberately NOT deduped, since CreateHostedTokenization is not on
+ *     Worldline's idempotent-operations list
  *   - SALE (auto-capture) vs PRE_AUTHORIZATION (manual) payments, with separate
- *     capture and refund sub-resources (partial + multi-capture, over-refund
- *     rejection, cancel-before-capture)
+ *     capture and refund sub-resources (partial capture, over-refund
+ *     rejection, cancel-before-capture); refunds are read ONLY via the
+ *     per-payment list, as on the real platform (no refund-by-id route)
  *   - card declines as HTTP 402 with { errorId, errors, paymentResult }
  */
 interface StoredPayment {
@@ -37,7 +41,6 @@ const THREE_DS_TOKEN = "htp_3ds";
 
 export class FakeWorldlineApi {
   private readonly payments = new Map<string, StoredPayment>();
-  private readonly refundsById = new Map<string, WorldlineRefundLike>();
   private readonly paymentByIdemKey = new Map<string, StoredPayment>();
   private readonly captureByIdemKey = new Map<string, WorldlineCaptureLike>();
   private readonly refundByIdemKey = new Map<string, WorldlineRefundLike>();
@@ -108,12 +111,8 @@ export class FakeWorldlineApi {
       if (!payment) return notFound();
       return json(200, publicPayment(payment));
     }
-    const refundGetMatch = /^\/v2\/[^/]+\/refunds\/([^/]+)$/.exec(path);
-    if (method === "GET" && refundGetMatch) {
-      const refund = this.refundsById.get(decodeURIComponent(refundGetMatch[1]!));
-      if (!refund) return notFound();
-      return json(200, refund);
-    }
+    // Deliberately no GET /refunds/{id}: Worldline Direct has no refund-by-id
+    // endpoint — the per-payment list above is the only refund read surface.
     return notFound(`No route ${method} ${path}`);
   };
 
@@ -126,16 +125,17 @@ export class FakeWorldlineApi {
       amountOfMoney?: { amount?: number; currencyCode?: string };
       references?: { merchantReference?: string };
     };
+    // hostedTokenizationId is a ROOT CreatePayment property on the real platform.
+    const hostedTokenizationId = body["hostedTokenizationId"] as string | undefined;
     const card = (body["cardPaymentMethodSpecificInput"] ?? {}) as {
-      hostedTokenizationId?: string;
       authorizationMode?: string;
     };
     const amount = order.amountOfMoney?.amount ?? 0;
     const currencyCode = order.amountOfMoney?.currencyCode ?? "EUR";
-    if (!card.hostedTokenizationId) {
+    if (!hostedTokenizationId) {
       return json(400, {
         errorId: "val",
-        errors: [{ code: "1", propertyName: "cardPaymentMethodSpecificInput.hostedTokenizationId", message: "required", httpStatusCode: 400 }],
+        errors: [{ code: "1", propertyName: "hostedTokenizationId", message: "required", httpStatusCode: 400 }],
       });
     }
     if (amount === DECLINE_AMOUNT) {
@@ -153,7 +153,7 @@ export class FakeWorldlineApi {
     }
     const id = `pay_${++this.seq}`;
     const sale = (card.authorizationMode ?? "SALE").toUpperCase() !== "PRE_AUTHORIZATION";
-    if (card.hostedTokenizationId === THREE_DS_TOKEN) {
+    if (hostedTokenizationId === THREE_DS_TOKEN) {
       const payment: StoredPayment = {
         id, amount, currencyCode, merchantReference: order.references?.merchantReference,
         status: "REDIRECTED", statusCode: 46, statusCategory: "PENDING_CONNECT_OR_3RD_PARTY",
@@ -221,8 +221,10 @@ export class FakeWorldlineApi {
     if (payment.sale || payment.captures.length > 0) {
       return json(400, { errorId: "cxl", errors: [{ code: "5", message: "Payment cannot be cancelled", httpStatusCode: 400 }] });
     }
+    // Statuses reference: CANCELLED sits in the UNSUCCESSFUL category.
     payment.status = "CANCELLED";
-    payment.statusCategory = "CANCELLED";
+    payment.statusCode = 61;
+    payment.statusCategory = "UNSUCCESSFUL";
     payment.capturableRemaining = 0;
     return json(200, { payment: publicPayment(payment) });
   }
@@ -243,25 +245,43 @@ export class FakeWorldlineApi {
       status: "REFUNDED",
       statusOutput: { statusCode: 8, statusCategory: "REFUNDED" },
       refundOutput: { amountOfMoney: { amount, currencyCode: money.currencyCode ?? payment.currencyCode } },
-      paymentId: payment.id,
     };
     payment.refunds.push(refund);
-    this.refundsById.set(refund.id, refund);
     if (idemKey) this.refundByIdemKey.set(idemKey, refund);
     this.uniqueRefundCreations++;
     return json(201, refund);
   }
 
-  /** Test helper: seed a refund in an arbitrary status (e.g. pending) for retrieveRefund. */
-  seedRefund(refund: Partial<WorldlineRefundLike> & { id?: string }): WorldlineRefundLike {
+  /**
+   * Test helper: seed a refund in an arbitrary status (e.g. pending) under a
+   * payment, for retrieveRefund — refunds are only readable through the
+   * per-payment list, so a refund cannot exist without its payment.
+   */
+  seedRefund(paymentId: string, refund: Partial<WorldlineRefundLike> = {}): WorldlineRefundLike {
+    let payment = this.payments.get(paymentId);
+    if (!payment) {
+      payment = {
+        id: paymentId,
+        amount: 1000,
+        currencyCode: "EUR",
+        status: "CAPTURED",
+        statusCode: 9,
+        statusCategory: "COMPLETED",
+        sale: true,
+        capturableRemaining: 0,
+        captures: [],
+        refunds: [],
+      };
+      this.payments.set(paymentId, payment);
+    }
     const stored: WorldlineRefundLike = {
       id: refund.id ?? `ref_${++this.seq}`,
       status: refund.status ?? "REFUND_REQUESTED",
-      statusOutput: refund.statusOutput ?? { statusCode: 81, statusCategory: "PENDING_PAYMENT" },
+      // Statuses reference: REFUND_REQUESTED sits in PENDING_CONNECT_OR_3RD_PARTY.
+      statusOutput: refund.statusOutput ?? { statusCode: 81, statusCategory: "PENDING_CONNECT_OR_3RD_PARTY" },
       refundOutput: refund.refundOutput ?? { amountOfMoney: { amount: 1000, currencyCode: "EUR" } },
-      ...(refund.paymentId ? { paymentId: refund.paymentId } : {}),
     };
-    this.refundsById.set(stored.id, stored);
+    payment.refunds.push(stored);
     return stored;
   }
 }

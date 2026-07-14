@@ -59,7 +59,7 @@ jobs:
             echo "::warning::PAYZEN_SHOP_ID not configured — the PayZen integration suite will skip"
           fi
           if [ -z "$WORLDLINE_MERCHANT_ID" ]; then
-            echo "::warning::WORLDLINE_MERCHANT_ID not configured — the Worldline integration suite will skip"
+            echo "::warning::WORLDLINE_MERCHANT_ID not configured — needed once the planned Worldline integration suite lands"
           fi
       - run: pnpm run test:integration
         env:

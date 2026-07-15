@@ -681,6 +681,21 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   Sandbox probes are the validation instrument for this and for the per-rail request
   field names; `mandateReference` is surfaced on `PaymentInfo` from the payment response,
   falling back to the handle's.
+- **Sandbox verdict (run 2026-07-15, CAD sandbox account): EFT completed end-to-end** —
+  envelope → PAYABLE handle → charge → retrieve, from the documented simulation values —
+  which validates the shared request builder (lowercase rail object, profile-on-handle,
+  no returnLinks, settleWithAuth, merchantRefNum reuse across both calls) on the one
+  rail the account is provisioned for. ACH defers with PAYMENTHUB-1 (rail/currency not
+  provisioned), the known Interac shape. SEPA and BACS are refused with error 5005
+  "Creation of sepa/bacs single use payment handle is not supported": the request
+  parses (not 5023/5068), the operation is refused — on an account with no EUR/GBP
+  provisioning this is indistinguishable from a provisioning gap, but the wording
+  leaves open that the mandate rails may require a different handle vehicle. Both
+  readings are safe here: the rails ship `supported: false`, an opt-in merchant gets a
+  clean diagnostic `invalid_request` carrying Paysafe's own message on first use, and
+  the guide instructs validating one sandbox payment against a provisioned account
+  before enabling either rail in production. Re-run the rail probes when an EUR/GBP
+  sandbox account exists.
 - **ACH and EFT stay currency-ungated** — resolves the open note from the per-method
   currency gating entry: the provider pages still document no currency for either
   (re-verified 2026-07-15), so nothing is declared and the merchant account decides.

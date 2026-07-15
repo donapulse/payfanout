@@ -331,6 +331,18 @@ Sandbox test values (from Paysafe's pages): SEPA IBAN `NL77ABNA0492122466` (BIC
 `ABNANL2A`); Bacs sort code `086081`, account `51120177`; EFT institution `001`, transit
 `22446`, account `897543213`. ACH publishes no test values.
 
+::: warning Validate SEPA/Bacs against your own provisioned account first
+These rails are per-account provisioning like everything non-card at Paysafe. A CAD
+sandbox account answers EFT end-to-end, `PAYMENTHUB-1` for ACH, and — for SEPA/Bacs —
+error `5005` "Creation of sepa/bacs single use payment handle is not supported": the
+request parses, the operation is refused. On an unprovisioned account that is
+indistinguishable from a provisioning gap, so before enabling `sepa_debit` or
+`bacs_debit` in production, run one sandbox payment against **your** provisioned
+account and confirm the handle mints — if your account still answers `5005` with the
+rail provisioned, contact Paysafe support about the required handle setup before going
+live.
+:::
+
 ## 10. Register the webhook endpoint
 
 ::: warning Configured in the portal, not via the API

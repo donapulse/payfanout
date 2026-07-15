@@ -599,7 +599,16 @@ function isAccountCapabilityError(err: { raw?: unknown }): boolean {
   if (isFieldValidationError(err)) return false;
   return (
     /not supported for your account/i.test(errorMessageOf(err)) ||
-    paysafeErrorCode(err).startsWith("PAYMENTHUB")
+    paysafeErrorCode(err).startsWith("PAYMENTHUB") ||
+    // 5005 "Unsupported operation" — sandbox-verified 2026-07-15: this CAD
+    // account answers it for SEPA/BACS handle creation ("Creation of sepa
+    // single use payment handle is not supported"). The request PARSED (not
+    // 5023/5068); the operation is refused. On an account with no EUR/GBP
+    // provisioning that is indistinguishable from a provisioning gap, so it
+    // defers like PAYMENTHUB-1 — but the wording leaves open that mandate
+    // rails may need a different handle vehicle on provisioned accounts, so
+    // a merchant enabling SEPA/BACS must re-run this probe against theirs.
+    paysafeErrorCode(err) === "5005"
   );
 }
 

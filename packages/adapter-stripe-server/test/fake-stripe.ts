@@ -43,6 +43,8 @@ export class FakeStripe implements StripeClientLike {
   readonly listPaymentMethodsCalls: Array<Record<string, unknown> | undefined> = [];
   /** Params of the last paymentIntents.create/update call — for mapping assertions. */
   lastPaymentIntentParams: Record<string, unknown> | undefined;
+  /** Params of the last setupIntents.create call — for mapping assertions. */
+  lastSetupIntentParams: Record<string, unknown> | undefined;
   private nextError: object | undefined;
 
   failNextWith(err: object): void {
@@ -225,6 +227,7 @@ export class FakeStripe implements StripeClientLike {
     create: async (params: Record<string, unknown>, opts?: StripeRequestOptions): Promise<StripeSetupIntentLike> => {
       this.throwPending();
       void opts;
+      this.lastSetupIntentParams = params;
       const seti: StripeSetupIntentLike = {
         id: `seti_${++this.seq}`,
         object: "setup_intent",

@@ -16,7 +16,8 @@
     "@payfanout/core": "workspace:*"
   },
   "devDependencies": {
-    "@payfanout/conformance": "workspace:*"
+    "@payfanout/conformance": "workspace:*",
+    "jsdom": "^29.1.1"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json"

@@ -1,5 +1,6 @@
 import {
   assertMinorUnitAmount,
+  base64UrlToUtf8,
   classifyHttpFallback,
   getUserMessage,
   lowercaseKeys,
@@ -119,6 +120,16 @@ export interface PaysafeSettlementLike {
   txnTime?: string;
 }
 
+/** Masked bank-account facts as Paysafe's sepa/bacs payload objects echo them. */
+export interface PaysafeBankAccountLike {
+  lastDigits?: string;
+  accountHolderName?: string;
+  bic?: string;
+  sortCode?: string;
+  mandateReference?: string;
+  bankReference?: string;
+}
+
 export interface PaysafePaymentLike {
   id: string;
   merchantRefNum?: string;
@@ -131,12 +142,14 @@ export interface PaysafePaymentLike {
   txnTime?: string;
   paymentType?: string;
   card?: PaysafeCardLike;
+  sepa?: PaysafeBankAccountLike;
+  bacs?: PaysafeBankAccountLike;
   /** NOT populated by the real GET /payments — settlements are queried separately. */
   settlements?: PaysafeSettlementLike[];
   error?: { code?: string; message?: string };
 }
 
-/** Payment handle as POST /paymenthandles returns it for redirect rails. */
+/** Payment handle as POST /paymenthandles returns it for redirect and bank-debit rails. */
 export interface PaysafePaymentHandleLike {
   id: string;
   paymentHandleToken: string;
@@ -145,6 +158,8 @@ export interface PaysafePaymentHandleLike {
   /** "REDIRECT" when the customer must authenticate at the provider. */
   action?: string;
   paymentType?: string;
+  sepa?: PaysafeBankAccountLike;
+  bacs?: PaysafeBankAccountLike;
   links?: Array<{ rel?: string; href?: string }>;
 }
 
@@ -185,6 +200,17 @@ function toStoredMethod(
  */
 const INTERAC_CURRENCIES: string[] = ["CAD"];
 
+/**
+ * SEPA collects in euro and Bacs in pounds sterling, full stop (Paysafe: SEPA
+ * "Currency: EUR", BACS "Currency: GBP"). Same one-constant-two-readers rule
+ * as INTERAC_CURRENCIES: the capability gates routing, the session guard still
+ * rejects. ACH and EFT are deliberately absent — Paysafe documents no currency
+ * for either (see docs/decisions.md), and a guard the provider never stated
+ * would reject payments the account might accept.
+ */
+const SEPA_CURRENCIES: string[] = ["EUR"];
+const BACS_CURRENCIES: string[] = ["GBP"];
+
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "card", flow: "embedded", supported: true },
   // Real redirect/voucher methods stay honestly modeled — never forced into an
@@ -195,7 +221,27 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "neteller", flow: "redirect", supported: false },
   { type: "paysafecard", flow: "voucher_code", supported: false },
   { type: "paysafecash", flow: "voucher_code", supported: false },
+  // Bank-debit rails, Payments-API only like Interac (Paysafe.js cannot
+  // tokenize them): the host collects the bank details in-page, so the flow is
+  // embedded — no PSP-hosted redirect. Implemented, but off by default:
+  // enablement is per merchant account, and claiming rails most accounts do
+  // not carry would misreport them. An opt-in via config.paymentMethods
+  // replaces this list wholesale and must carry its own gates. ACH and EFT
+  // declare no currencies (Paysafe documents none for either — see
+  // docs/decisions.md) and SEPA no countries (a zone, not a country; a
+  // membership list would screen out valid payments the day it drifts).
+  { type: "sepa_debit", flow: "embedded", supported: false, currencies: [...SEPA_CURRENCIES] },
   { type: "ach", flow: "embedded", supported: false },
+  {
+    type: "bacs_debit",
+    flow: "embedded",
+    supported: false,
+    currencies: [...BACS_CURRENCIES],
+    // "Region: United Kingdom" — the scheme debits UK bank accounts.
+    countries: ["GB"],
+  },
+  // "Supported region: Canada" — Pre-Authorized Debit, which Paysafe calls EFT.
+  { type: "pad", flow: "embedded", supported: false, countries: ["CA"] },
   // Payments-API only (Paysafe.js cannot tokenize it): the handle is minted
   // server-side at session creation and the customer authenticates at Interac.
   // Implemented, but off by default like every other non-card rail — it is
@@ -217,9 +263,41 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
 const PAYSAFE_TYPE_TO_UNIFIED: Record<string, UnifiedPaymentMethodType> = {
   CARD: "card",
   INTERAC_ETRANSFER: "interac_etransfer",
+  SEPA: "sepa_debit",
+  ACH: "ach",
+  BACS: "bacs_debit",
+  EFT: "pad",
 };
 
 const INTERAC_PAYMENT_TYPE = "INTERAC_ETRANSFER";
+
+/**
+ * The bank-debit rails: unified type -> the paymentType a handle is minted
+ * with. Unlike Interac these are not redirect rails — the host collects the
+ * customer's bank details in-page and completePayment mints the handle and
+ * charges it in one server round trip.
+ */
+const BANK_DEBIT_PAYMENT_TYPES = {
+  sepa_debit: "SEPA",
+  ach: "ACH",
+  bacs_debit: "BACS",
+  pad: "EFT",
+} as const;
+
+type BankDebitRail = keyof typeof BANK_DEBIT_PAYMENT_TYPES;
+type BankDebitPaymentType = (typeof BANK_DEBIT_PAYMENT_TYPES)[BankDebitRail];
+
+const BANK_DEBIT_TYPE_SET = new Set<string>(Object.values(BANK_DEBIT_PAYMENT_TYPES));
+
+function isBankDebitPaymentType(paymentType: string | undefined): paymentType is BankDebitPaymentType {
+  return paymentType !== undefined && BANK_DEBIT_TYPE_SET.has(paymentType);
+}
+
+/** The single-currency rails' session guard reads the same constants the capabilities declare. */
+const BANK_DEBIT_CURRENCIES: Partial<Record<BankDebitPaymentType, string[]>> = {
+  SEPA: SEPA_CURRENCIES,
+  BACS: BACS_CURRENCIES,
+};
 
 /**
  * Every outcome returns to the host's single returnUrl. "on_completed" is also a
@@ -262,6 +340,145 @@ function isInteracRequest(types: UnifiedPaymentMethodType[] | undefined): boolea
     );
   }
   return true;
+}
+
+/**
+ * Bank-debit sessions are single-rail for the same reason Interac ones are: a
+ * handle is minted for exactly ONE paymentType, and the client mounts one
+ * bank-details form per session.
+ */
+function bankDebitRailOf(types: UnifiedPaymentMethodType[] | undefined): BankDebitRail | undefined {
+  if (!types) return undefined;
+  const rail = types.find((t): t is BankDebitRail => t in BANK_DEBIT_PAYMENT_TYPES);
+  if (rail === undefined) return undefined;
+  if (types.length > 1) {
+    throw PayFanoutError.invalidRequest(
+      `${rail} needs a session of its own — it cannot be combined with: ${types
+        .filter((t) => t !== rail)
+        .join(", ")}`,
+    );
+  }
+  return rail;
+}
+
+/**
+ * Wire prefix of the bank-details envelope confirm() produces on bank-debit
+ * sessions: "paysafe-bank." + base64url(JSON). Kept in step with the client
+ * adapter — the packages share no code, since a client-safe package cannot
+ * depend on a server one.
+ */
+const BANK_ENVELOPE_PREFIX = "paysafe-bank.";
+
+/**
+ * Completion-time bank details as the envelope carries them. Bank details are
+ * not card data (SAQ-A is unaffected), but they are still never logged and
+ * never echoed into error messages.
+ */
+interface PaysafeBankEnvelopeV1 {
+  v: 1;
+  paymentType: BankDebitPaymentType;
+  accountHolderName: string;
+  iban?: string;
+  bic?: string;
+  routingNumber?: string;
+  accountNumber?: string;
+  sortCode?: string;
+  transitNumber?: string;
+  institutionId?: string;
+  /** SEPA/BACS: the customer agreed to the direct-debit mandate. */
+  mandateConsent?: boolean;
+}
+
+/**
+ * Each rail's bank object fields: accountHolderName is universal, the rest are
+ * the coordinates the scheme routes by. SEPA's bic is the one documented
+ * optional field, forwarded separately when present.
+ */
+const BANK_REQUIRED_FIELDS: Record<BankDebitPaymentType, ReadonlyArray<keyof PaysafeBankEnvelopeV1 & string>> = {
+  SEPA: ["accountHolderName", "iban"],
+  ACH: ["accountHolderName", "routingNumber", "accountNumber"],
+  BACS: ["accountHolderName", "sortCode", "accountNumber"],
+  EFT: ["accountHolderName", "institutionId", "transitNumber", "accountNumber"],
+};
+
+/** Mandate schemes: a completion the customer never agreed to is not a payment we may take. */
+const BANK_MANDATE_PAYMENT_TYPES = new Set<BankDebitPaymentType>(["SEPA", "BACS"]);
+
+interface ParsedBankDetails {
+  accountHolderName: string;
+  /** The rail's bank object, keyed and shaped as POST /paymenthandles takes it. */
+  bank: Record<string, string>;
+}
+
+function parseBankEnvelope(
+  clientToken: string | undefined,
+  paymentType: BankDebitPaymentType,
+): ParsedBankDetails {
+  if (!clientToken || !clientToken.startsWith(BANK_ENVELOPE_PREFIX)) {
+    throw PayFanoutError.invalidRequest(
+      `This session collects ${paymentType} bank details — completePayment requires the ` +
+        `"${BANK_ENVELOPE_PREFIX}" envelope produced by confirm(), not a Paysafe.js token`,
+    );
+  }
+  let envelope: PaysafeBankEnvelopeV1;
+  try {
+    envelope = JSON.parse(base64UrlToUtf8(clientToken.slice(BANK_ENVELOPE_PREFIX.length))) as PaysafeBankEnvelopeV1;
+  } catch (err) {
+    // V8's JSON.parse message embeds a source snippet — a corrupted envelope
+    // would ride typed bank digits into `raw`, so only the error name survives.
+    throw PayFanoutError.invalidRequest("Bank-details envelope is not base64url-encoded JSON", {
+      name: err instanceof Error ? err.name : "Error",
+    });
+  }
+  if (envelope === null || typeof envelope !== "object" || envelope.v !== 1) {
+    throw PayFanoutError.invalidRequest("Bank-details envelope has an unsupported shape — expected version 1");
+  }
+  if (envelope.paymentType !== paymentType) {
+    throw PayFanoutError.invalidRequest(
+      `Bank-details envelope carries "${String(envelope.paymentType)}" details but this session was created for ${paymentType}`,
+    );
+  }
+  // Rejections name fields, never values — account numbers do not belong in
+  // error messages or logs, so `raw` stays a field list too.
+  const bank: Record<string, string> = {};
+  const missing: string[] = [];
+  for (const field of BANK_REQUIRED_FIELDS[paymentType]) {
+    const value = envelope[field];
+    if (typeof value === "string" && value.trim() !== "") bank[field] = value;
+    else missing.push(field);
+  }
+  if (missing.length > 0) {
+    throw PayFanoutError.invalidRequest(
+      `Bank-details envelope is missing required ${paymentType} field(s): ${missing.join(", ")}`,
+      { paymentType, missing },
+    );
+  }
+  if (BANK_MANDATE_PAYMENT_TYPES.has(paymentType) && envelope.mandateConsent !== true) {
+    throw PayFanoutError.invalidRequest(
+      `${paymentType} is a mandate scheme — the envelope must carry mandateConsent: true once the customer agrees to the direct-debit mandate`,
+    );
+  }
+  if (paymentType === "SEPA" && typeof envelope.bic === "string" && envelope.bic.trim() !== "") {
+    bank["bic"] = envelope.bic;
+  }
+  return { accountHolderName: envelope.accountHolderName, bank };
+}
+
+/**
+ * SEPA/BACS document a "create a customer profile" step; the profile data is
+ * embedded in the handle request instead of a separate /customers call —
+ * PayFanout is stateless, and Paysafe's public pages stop at the flow
+ * description (the field-level reference is not public). Wrong embedding fails
+ * closed: /paymenthandles strict-rejects unrecognized fields (error 5023).
+ * Same name split as createCustomer.
+ */
+function toBankProfile(accountHolderName: string, email: string | undefined): Record<string, string> {
+  const [firstName, ...rest] = accountHolderName.trim().split(/\s+/).filter(Boolean);
+  return {
+    ...(firstName ? { firstName } : {}),
+    ...(rest.length > 0 ? { lastName: rest.join(" ") } : {}),
+    ...(email ? { email } : {}),
+  };
 }
 
 export class PaysafeServerAdapter implements ServerPaymentAdapter {
@@ -359,6 +576,8 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       shippingDetails: input.shippingDetails,
     };
     if (isInteracRequest(input.paymentMethodTypes)) return this.createInteracSession(context, input);
+    const bankRail = bankDebitRailOf(input.paymentMethodTypes);
+    if (bankRail) return this.createBankDebitSession(bankRail, context);
     return this.toSession(context);
   }
 
@@ -438,6 +657,32 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   }
 
   /**
+   * Bank-debit rails (SEPA/ACH/BACS/EFT) are Payments-API only, like Interac —
+   * but nothing is minted here: the bank details do not exist until the
+   * customer types them into the host's form. The session only stamps the
+   * rail's paymentType into the signed context; completePayment mints the
+   * handle from the client's envelope and charges it in one round trip.
+   */
+  private createBankDebitSession(
+    rail: BankDebitRail,
+    context: PaysafeSessionContextV1,
+  ): Promise<PaymentSession> {
+    const paymentType = BANK_DEBIT_PAYMENT_TYPES[rail];
+    const currencies = BANK_DEBIT_CURRENCIES[paymentType];
+    if (currencies && !currencies.includes(context.currency)) {
+      throw PayFanoutError.invalidRequest(
+        `${rail} settles in ${currencies.join("/")} only — this session is ${context.currency}`,
+      );
+    }
+    if (context.captureMethod === "manual") {
+      throw PayFanoutError.invalidRequest(
+        `${rail} cannot be authorized without settling — use captureMethod "automatic"`,
+      );
+    }
+    return this.toSession({ ...context, paymentType });
+  }
+
+  /**
    * Stateless session update: verify + merge + re-sign. Paysafe has no PSP
    * object yet (tokenize-first), so the "update" re-issues the signed context
    * with the changes and a fresh TTL. The returned session carries a NEW
@@ -456,6 +701,18 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     }
     if (input.amount !== undefined) assertMinorUnitAmount(input.amount, "amount");
     const currency = input.currency !== undefined ? normalizeCurrency(input.currency) : context.currency;
+    // A bank-debit session keeps its rail across updates, so the rail's
+    // currency guard must hold for the NEW currency too — otherwise an update
+    // slips past the creation guard and dies at Paysafe instead of here.
+    if (input.currency !== undefined && isBankDebitPaymentType(context.paymentType)) {
+      const railCurrencies = BANK_DEBIT_CURRENCIES[context.paymentType];
+      if (railCurrencies && !railCurrencies.includes(currency)) {
+        throw PayFanoutError.invalidRequest(
+          `${PAYSAFE_TYPE_TO_UNIFIED[context.paymentType]} settles in ${railCurrencies.join("/")} only — ` +
+            `this session cannot be updated to ${currency}`,
+        );
+      }
+    }
     const merchantAccountId =
       input.currency !== undefined
         ? this.config.merchantAccountResolver(currency, context.country) || undefined
@@ -503,6 +760,12 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    */
   async completePayment(input: CompletePaymentInput): Promise<PaymentInfo> {
     const context = await this.decodeContext(input.pspSessionId);
+    // Bank-debit sessions have no handle yet at all: it is minted here, from
+    // the bank details the client's envelope carries.
+    const bankPaymentType = context.paymentType;
+    if (isBankDebitPaymentType(bankPaymentType)) {
+      return this.completeBankDebitPayment(context, bankPaymentType, input);
+    }
     // Redirect rails (Interac) minted their handle at session creation and carry
     // it in the signed context; the card path only has a token once the browser
     // has tokenized, so it still comes from the caller.
@@ -533,6 +796,65 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       ...(context.receiptEmail ? { profile: { email: context.receiptEmail } } : {}),
     });
     return this.toPaymentInfo(payment, context.id);
+  }
+
+  /**
+   * Bank-debit completion is two calls in one round trip: mint the handle from
+   * the envelope's bank details, then charge it. Both share the caller's
+   * idempotencyKey as merchantRefNum — Paysafe dedupes per endpoint, so a
+   * replayed completion re-reads the same handle and the same payment instead
+   * of minting or charging twice.
+   */
+  private async completeBankDebitPayment(
+    context: PaysafeSessionContextV1,
+    paymentType: BankDebitPaymentType,
+    input: CompletePaymentInput,
+  ): Promise<PaymentInfo> {
+    const details = parseBankEnvelope(input.clientToken, paymentType);
+    const billingDetails = mergeBillingDetails(context.billingDetails, input.billingDetails);
+    const handle = await this.request<PaysafePaymentHandleLike>("POST", "/paymenthub/v1/paymenthandles", {
+      merchantRefNum: input.idempotencyKey,
+      transactionType: "PAYMENT",
+      paymentType,
+      amount: context.amount,
+      currencyCode: context.currency,
+      ...(context.merchantAccountId ? { accountId: context.merchantAccountId } : {}),
+      profile: toBankProfile(details.accountHolderName, context.receiptEmail ?? context.billingDetails?.email),
+      ...(toPaysafeBillingDetails(billingDetails) ?? {}),
+      // The bank object is named after the paymentType in lowercase, exactly as
+      // the sepa/bacs objects appear in Paysafe's own payloads.
+      [paymentType.toLowerCase()]: details.bank,
+    });
+    // ACH/EFT document the handle as immediately PAYABLE; anything else cannot
+    // be charged, and surfacing it here beats a cryptic /payments rejection.
+    if ((handle.status ?? "").toUpperCase() !== "PAYABLE") {
+      throw new PayFanoutError({
+        code: "processing_error",
+        message: `Paysafe returned a ${paymentType} payment handle in status ${handle.status ?? "unknown"} instead of PAYABLE`,
+        retryable: false,
+        raw: handle,
+        pspName: this.pspName,
+      });
+    }
+    const payment = await this.request<PaysafePaymentLike>("POST", "/paymenthub/v1/payments", {
+      merchantRefNum: input.idempotencyKey,
+      amount: context.amount,
+      currencyCode: context.currency,
+      paymentHandleToken: handle.paymentHandleToken,
+      // Doc-verified: ACH/EFT require settleWithAuth true, and every SEPA/BACS
+      // payload example shows it true. Manual capture was already rejected at
+      // session creation, so this is unconditional.
+      settleWithAuth: true,
+      ...(context.merchantAccountId ? { accountId: context.merchantAccountId } : {}),
+      ...(toPaysafeBillingDetails(billingDetails) ?? {}),
+      ...(context.statementDescriptor
+        ? { merchantDescriptor: { dynamicDescriptor: context.statementDescriptor } }
+        : {}),
+      ...(context.receiptEmail ? { profile: { email: context.receiptEmail } } : {}),
+    });
+    // The scheme mandate (SEPA/BACS) rides the payment's bank object — or, when
+    // the payment echo omits it, the freshly minted handle's.
+    return this.toPaymentInfo(payment, context.id, undefined, bankMandateReference(handle));
   }
 
   /** Signature + TTL verification with the adapter's clock. */
@@ -896,8 +1218,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     payment: PaysafePaymentLike,
     payfanoutId?: string,
     knownSettled?: number,
+    fallbackMandateReference?: string,
   ): PaymentInfo {
     const methodDetails = toPaymentMethodDetails(payment.card);
+    const mandateReference = bankMandateReference(payment) ?? fallbackMandateReference;
     const settlements = (payment.settlements ?? []).filter(
       (s) => s.status !== "CANCELLED" && s.status !== "FAILED",
     );
@@ -943,6 +1267,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       currency: (payment.currencyCode ?? "").toUpperCase() || "USD",
       paymentMethodType: toUnifiedMethodType(payment.paymentType),
       ...(methodDetails ? { paymentMethodDetails: methodDetails } : {}),
+      ...(mandateReference ? { mandateReference } : {}),
       createdAt: payment.txnTime ?? "1970-01-01T00:00:00.000Z",
       ...(amountCaptured !== undefined && amountCaptured > 0 && settlements[0]?.txnTime
         ? { capturedAt: settlements[0].txnTime }
@@ -1047,6 +1372,18 @@ const PAYSAFE_CARD_TYPE_TO_BRAND: Record<string, string> = {
 function toUnifiedMethodType(paymentType: string | undefined): UnifiedPaymentMethodType {
   if (!paymentType) return "card";
   return PAYSAFE_TYPE_TO_UNIFIED[paymentType.toUpperCase()] ?? "other";
+}
+
+/**
+ * SEPA/BACS payloads carry the scheme mandate on their bank object (webhook
+ * examples show it on payments; the freshly minted handle is the
+ * completion-time witness). ACH/EFT document no equivalent.
+ */
+function bankMandateReference(source: {
+  sepa?: PaysafeBankAccountLike;
+  bacs?: PaysafeBankAccountLike;
+}): string | undefined {
+  return source.sepa?.mandateReference ?? source.bacs?.mandateReference;
 }
 
 function toPaymentMethodDetails(card: PaysafeCardLike | undefined): PaymentMethodDetails | undefined {

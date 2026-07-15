@@ -54,6 +54,15 @@ const EVENT_TYPE_MAP: Record<string, UnifiedWebhookEventType> = {
   PAYMENT_PENDING: "payment.processing",
   PAYMENT_RECEIVED: "payment.processing",
   PAYMENT_HELD: "payment.processing", // risk review — funds not moving yet
+  // Bank-debit rails: "Failed payment reported by the bank" AFTER completion —
+  // the late-failure flip. Paysafe's own pages spell it both ways (the event
+  // tables say RETURNED, every payload example sends eventName
+  // PAYMENT_RETURN_COMPLETED); mapping both costs nothing, while missing the
+  // wire spelling would downgrade a bank-reported failure to "unknown".
+  // SETTLEMENT_* stays unmapped like PAYMENT_HANDLE_PAYABLE: those payloads
+  // carry settlement ids, not payment ids.
+  PAYMENT_RETURN_COMPLETED: "payment.failed",
+  PAYMENT_RETURNED_COMPLETED: "payment.failed",
   REFUND_COMPLETED: "payment.refunded",
   // Async refund that did not go through — funds never returned to the customer.
   REFUND_FAILED: "payment.refund_failed",

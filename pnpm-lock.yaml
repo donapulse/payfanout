@@ -175,6 +175,9 @@ importers:
       '@payfanout/conformance':
         specifier: workspace:*
         version: link:../conformance
+      jsdom:
+        specifier: ^29.1.1
+        version: 29.1.1
 
   packages/adapter-paysafe-server:
     dependencies:

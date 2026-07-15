@@ -42,9 +42,11 @@ export interface PaysafeSessionContextV1 {
   /** Host-app internal id (PaymentSession.id), round-tripped for completePayment. */
   id?: string;
   /**
-   * Paysafe paymentType the handle was minted with, for rails that are not
-   * Paysafe.js-tokenizable (Interac e-Transfer). Absent on card sessions, which
-   * tokenize in the browser and learn their type only at completion.
+   * Paysafe paymentType for rails that are not Paysafe.js-tokenizable: the
+   * handle's type for redirect rails minted at session creation (Interac
+   * e-Transfer), the rail to mint at completion for bank debits
+   * (SEPA/ACH/BACS/EFT). Absent on card sessions, which tokenize in the
+   * browser and learn their type only at completion.
    */
   paymentType?: string;
   /**

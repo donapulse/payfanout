@@ -41,6 +41,22 @@ export interface PaysafeSessionContextV1 {
   returnUrl?: string;
   /** Host-app internal id (PaymentSession.id), round-tripped for completePayment. */
   id?: string;
+  /**
+   * Paysafe paymentType for rails that are not Paysafe.js-tokenizable: the
+   * handle's type for redirect rails minted at session creation (Interac
+   * e-Transfer), the rail to mint at completion for bank debits
+   * (SEPA/ACH/BACS/EFT). Absent on card sessions, which tokenize in the
+   * browser and learn their type only at completion.
+   */
+  paymentType?: string;
+  /**
+   * Redirect rails only: the handle minted at session creation. Card sessions
+   * have no token until the browser tokenizes, so completePayment takes it from
+   * the caller instead.
+   */
+  paymentHandleToken?: string;
+  /** Redirect rails only: the Paysafe-hosted URL the client adapter navigates to. */
+  redirectUrl?: string;
   metadata?: Record<string, string>;
   /** AVS data — Paysafe rejects card payments without a zip (error 3004). */
   billingDetails?: CreatePaymentSessionInput["billingDetails"];

@@ -71,16 +71,21 @@ const STRIPE_CHARGE_TYPE_TO_UNIFIED: Record<string, UnifiedPaymentMethodType> = 
 /**
  * Defaults mirror the client adapter. iDEAL/SEPA/ACH/Bacs are per-account
  * dashboard enablements — config.paymentMethods overrides for accounts that
- * differ.
+ * differ. Their currencies are the rail's, fixed by the customer's country
+ * rather than the account's: a US account collecting SEPA still presents EUR.
  */
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "card", flow: "embedded", supported: true },
   { type: "apple_pay", flow: "popup", supported: true },
   { type: "google_pay", flow: "popup", supported: true },
-  { type: "ideal", flow: "redirect", supported: true },
-  { type: "sepa_debit", flow: "embedded", supported: true },
-  { type: "ach", flow: "embedded", supported: true },
-  { type: "bacs_debit", flow: "embedded", supported: true },
+  // Countries are the CUSTOMER's, per Stripe's support matrix: iDEAL pays
+  // from Dutch accounts, ACH from US ones, Bacs from UK ones. SEPA stays
+  // country-unrestricted — the zone is a moving membership list, not a
+  // country, and a stale list would screen out valid payments.
+  { type: "ideal", flow: "redirect", supported: true, currencies: ["EUR"], countries: ["NL"] },
+  { type: "sepa_debit", flow: "embedded", supported: true, currencies: ["EUR"] },
+  { type: "ach", flow: "embedded", supported: true, currencies: ["USD"], countries: ["US"] },
+  { type: "bacs_debit", flow: "embedded", supported: true, currencies: ["GBP"], countries: ["GB"] },
 ];
 
 export class StripeServerAdapter implements ServerPaymentAdapter {
@@ -166,7 +171,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       // Vault-during-checkout: the confirmed PaymentMethod attaches to the
       // customer; the token surfaces on PaymentInfo.savedPaymentMethodToken.
       ...(input.savePaymentMethod ? { setup_future_usage: "off_session" } : {}),
-      ...this.paymentMethodParams(input.paymentMethodTypes),
+      ...this.paymentMethodParams(input.paymentMethodTypes, currency),
       ...checkoutFieldParams(input),
       ...scaParams(input.sca),
     };
@@ -588,13 +593,34 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     };
   }
 
-  private paymentMethodParams(types?: UnifiedPaymentMethodType[]): Record<string, unknown> {
+  /**
+   * `currency` is present on the PaymentIntent path only: an explicit
+   * `payment_method_types` entry that cannot settle the intent currency is
+   * dropped before the call, using the same declared per-method gates
+   * screening reads (config overrides included), so the drop is inspectable
+   * via getCapabilities(), never a PSP-side surprise. SetupIntents are
+   * currencyless — the verification path passes no currency and narrows
+   * nothing.
+   */
+  private paymentMethodParams(types?: UnifiedPaymentMethodType[], currency?: string): Record<string, unknown> {
     if (!types || types.length === 0) {
       // Embedded-first default: let Stripe choose, but never a full-page redirect.
       return { automatic_payment_methods: { enabled: true, allow_redirects: "never" } };
     }
+    const methods = this.getCapabilities().paymentMethods;
+    const eligible = !currency
+      ? types
+      : types.filter((type) => {
+          const declared = methods.find((m) => m.type === type)?.currencies;
+          return !declared?.length || declared.some((c) => c.toUpperCase() === currency);
+        });
+    if (eligible.length === 0) {
+      throw PayFanoutError.invalidRequest(
+        `None of the requested payment method types can settle in ${String(currency)}: ${types.join(", ")}`,
+      );
+    }
     const mapped = new Set<string>();
-    for (const type of types) {
+    for (const type of eligible) {
       const stripeType = METHOD_TYPE_TO_STRIPE[type];
       if (!stripeType) {
         throw PayFanoutError.invalidRequest(`Stripe adapter does not support payment method type "${type}"`);

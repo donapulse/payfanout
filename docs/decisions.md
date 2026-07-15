@@ -430,3 +430,359 @@ One atomic core+conformance+all-adapters change (major changesets across the boa
   assertion validate the descriptor when a fixture provides it (existing external adapters
   without one still pass — the fixture is optional). core, conformance, and the five `-server`
   adapters bump minor; the client adapters are untouched.
+
+## Worldline Direct adapter (2026-07-14)
+
+Tokenize-first pair (`adapter-worldline` / `adapter-worldline-server`, Online Payments REST
+v2 + Hosted Tokenization Page). New adapter packages only — no core/server/react/conformance
+changes. Platform facts and the choices they forced (all doc-verified against
+docs.direct.worldline-solutions.com unless noted):
+
+- **v1HMAC request signing on WebCrypto** (edge-compatible): `Authorization: GCS
+  v1HMAC:{apiKeyId}:{base64(HMAC-SHA256(secret, dataToSign))}`, where `dataToSign` is
+  method / Content-Type (empty for GET) / `Date` / sorted canonical `x-gcs-*` header lines /
+  resource path, each `\n`-terminated (trailing `\n` after the path). The `Date` header is
+  sent and signed (RFC-1123 GMT); the clock is an injectable `now()` so tests are
+  deterministic and hosts stay inside the platform's 5-minute skew. `X-GCS-Date` is noted in
+  code as the edge-runtime alternative when the `Date` header cannot be set.
+- **Idempotency** rides `X-GCS-Idempotence-Key` (max 40 ASCII). Arbitrary caller keys are
+  hashed to fit: `sha256Hex(idempotencyKey).slice(0,40)` — deterministic, so replays dedupe
+  at Worldline. The header is BOTH signed (in the canonical block) and sent on every mutating
+  call (create payment, capture, cancel, refund, and the amountless hostedtokenizations
+  create). Doc-verified 2026-07-15: the documented idempotent operations are CreatePayment /
+  CapturePayment / CancelPayment / RefundPayment / CompletePayment / CreatePayout /
+  SubsequentPayment — CreateHostedTokenization is NOT on the list, so the header on the
+  tokenization create is harmless but never relied on for dedupe (the fake mirrors this;
+  money-side safety comes from CreatePayment idempotency). A 409 means the request with
+  this idempotence key is still being processed, so it maps to a retryable
+  `processing_error` and the transport loop replays it instead of surfacing a hard error.
+- **Stateless session = signed context** (same pattern as Paysafe): createPaymentSession
+  calls `POST /hostedtokenizations` (no amount) and encodes amount/currency/captureMethod/
+  returnUrl/billing/hostedTokenizationId + enforced `expiresAt` into `pspSessionId`;
+  `clientSecret` is the `hostedTokenizationUrl` the browser iframe mounts from (no client
+  key). The host id round-trips via `order.references.merchantReference` only — Worldline has
+  no arbitrary metadata map — so conformance `money.expectations` is
+  `{ idRoundTrip: true, metadataEcho: false }`.
+- **CreatePayment wiring (corrected in review, 2026-07-15):** `hostedTokenizationId` rides
+  at the ROOT of the CreatePayment request — the platform's current domain model declares it
+  there and `CardPaymentMethodSpecificInput` has no such field (the guide's "replace the
+  card property" wording is about replacing card DATA, not a nesting instruction). The 3-D
+  Secure return URL is sent BOTH as `cardPaymentMethodSpecificInput.returnUrl` (the field
+  the Hosted Tokenization guide names) and in its `threeDSecure.redirectionData.returnUrl`
+  form — both are current in the models; sandbox-verify one challenge flow.
+- **Refund reads (corrected in review, 2026-07-15):** Direct has NO refund-by-id endpoint —
+  `GET /{merchantId}/refunds/{refundId}` is Connect-era; the only read surface is
+  `GET /v2/{merchantId}/payments/{paymentId}/refunds`. `refundPayment` therefore returns a
+  composite `refundId` (`{paymentId}:{refundId}`, the suffix being Worldline's raw refund
+  id, the one webhooks report) and `retrieveRefund` resolves it through the per-payment
+  list. With no documented refund-failure webhook (below), this polling path is the only
+  reliable refund-failure signal.
+- **paymentProductId → brand** map holds only ids confirmed on the current payment-method
+  pages (1 Visa, 2 Amex, 3 Mastercard, 117 Maestro, 125 JCB, 132 Diners); 114/118/128 were
+  unverified and dropped 2026-07-15 — an unknown id degrades to brandless details.
+- **Status mapping** leads with `statusOutput.statusCategory` (the forward-compatible band —
+  new statuses join an existing category), then `statusCode`, then the status string, with
+  `CANCELLED` checked first (it sits in the UNSUCCESSFUL band but must map to `canceled`,
+  not `failed`). Verified against the Statuses reference
+  (docs.direct.worldline-solutions.com/.../statuses): COMPLETED → `succeeded`,
+  PENDING_MERCHANT (PENDING_CAPTURE) → `requires_capture`, UNSUCCESSFUL
+  (REJECTED/REJECTED_CAPTURE/CANCELLED) → `failed`/`canceled`, PENDING_PAYMENT/CREATED →
+  `processing`. The **PENDING_CONNECT_OR_3RD_PARTY** band holds BOTH a genuine customer
+  action (REDIRECTED → `requires_action`) and async downstream states
+  (AUTHORIZATION_REQUESTED / CAPTURE_REQUESTED / REFUND_REQUESTED → `processing`), so the
+  adapter disambiguates on the status string rather than mapping the whole band to
+  `requires_action`. statusCode fallbacks: 9 (CAPTURED/settled) → `succeeded`,
+  5 → `requires_capture`, 2 → `failed`, 46 → `requires_action`. Refunds: REFUNDED →
+  `succeeded`, REJECTED/CANCELLED → `failed`, REFUND_REQUESTED/pending → `pending`.
+- **Manual capture (not multi-capture):** `PRE_AUTHORIZATION` authorizes, `POST /capture
+  { amount?, isFinal: true }` settles — a partial capture settles that amount and RELEASES
+  the uncaptured remainder (Worldline finalizes the capture, and referenced refunds are only
+  accepted once the capture is finalized). `supportsMultiCapture` is **false**: the core
+  `capturePayment(id, amount, key)` contract carries no `isFinal` signal, so an authorization
+  cannot be held open across several captures. `retrievePayment` sums `GET /captures` and
+  `GET /refunds` (separate sub-resources) for `amountCaptured` / `amountCapturable` (0 once
+  the payment is a completed sale/capture) / `amountRefunded`.
+- **Webhooks:** `X-GCS-Signature` = base64(HMAC-SHA256(webhookSecret, rawBody)) over the
+  EXACT raw bytes, key selected by `X-GCS-KeyId` (array of `{keyId, secretKey}` for
+  rotation, any active key verifying wins). One event per delivery. The documented event
+  list (2026-07-15) is `payment.created / redirected / authorization_requested /
+  pending_approval / pending_completion / pending_capture / capture_requested / captured /
+  rejected / rejected_capture / cancelled / refunded`, `refund.refund_requested`,
+  `paymentlink.*`, and `payment.test`; the documented terminal refund signal is
+  `payment.refunded`, and there is NO documented refund-failure event — refund failure is
+  observed by polling `retrieveRefund`. Mapping: `payment.captured` → `payment.succeeded`,
+  `payment.rejected`/`rejected_capture` → `payment.failed`, `payment.cancelled` →
+  `payment.canceled`, `payment.refunded` → `payment.refunded`, pending payment states →
+  `payment.processing`. `refund.refund_requested` maps to `unknown` deliberately — it is
+  recognized but non-terminal, and the unified vocabulary has no in-flight refund state;
+  fabricating a terminal type would misreport it. The parser additionally TOLERATES
+  `payment.paid`, `payment.pending_fraud_approval`, `refund.refunded`, `refund.rejected`
+  and `refund.cancelled` — none are on the documented list, and the onboarding descriptor
+  advertises only the documented set so hosts never subscribe to undocumented types.
+
+Items initially flagged AMBIGUOUS/undocumented, resolved conservatively — each notes its
+current status (remaining sandbox checks run via the dispatch-only integration workflow):
+
+- **Decline HTTP shape.** The API Troubleshooting reference documents declines as **HTTP 402**
+  with `{ errorId, errors, status, paymentResult }`; a separate Create-payment reference
+  summary suggested some declines arrive as `201` with `payment.status = "REJECTED"`. The
+  adapter handles both: non-2xx maps through `mapWorldlineError` (the primary decline path,
+  modeled in the fake), and a 2xx whose payment maps to `failed` is defensively surfaced as
+  `card_declined` rather than a "failed" PaymentInfo. Confirm the real sandbox shape.
+- **Decline sub-codes.** Only five reject codes are enumerated on the troubleshooting page
+  (30511001 insufficient funds, 30591001 fraud, 40001134 3-D Secure, 30171001 customer
+  cancelled, 30041001 issuer rejected); everything else on a 402 maps to the generic
+  `card_declined`. Enumerate expired-card / invalid-card-data codes from the sandbox.
+- **Sandbox triggers.** Doc-verified 2026-07-15: amount `1302` (EUR, `authorizationMode=SALE`)
+  is the test-cases page's documented unsuccessful-transaction trigger (statusCode 2), as the
+  fake models; the page also documents `1303`/`1309` (unsuccessful refund/capture) and
+  `1203`/`1209` (uncertain refund/capture) for future integration tests. The `htp_3ds` →
+  3-D Secure REDIRECT trigger remains fake-only — verify the real challenge flow in the
+  sandbox.
+- **`verifyCredentials` probe** uses `GET /v2/{merchantId}/services/testconnection` —
+  endpoint confirmed 2026-07-15 (verbatim in the platform's current services surface). The
+  status-based classification (401/403 = auth, 5xx/429 = network, else authenticated) stays,
+  so the probe remains robust across API evolutions; a live sandbox call is the remaining
+  check.
+- **Webhook envelope: array vs object.** The webhooks page's example body renders as a JSON
+  ARRAY, while the platform's own webhooks helper JSON-parses a single object. The parser
+  accepts both single-event shapes (a one-element array is unwrapped) and rejects
+  multi-event arrays rather than partially processing them. Confirm with the portal's
+  test-webhook feature once credentials exist.
+- **Minor-unit semantics for 0/3-decimal currencies.** Amounts are documented only as an
+  integer in "the least subunit … in some cases smaller"; nothing found on 0- or 3-decimal
+  currencies. ISO 4217 minor units are forwarded per the core invariant — run one sandbox
+  payment in a 0-decimal currency (JPY) before routing such currencies here, and declare an
+  adapter-local constraint (as with the PayZen CNY/KHR decision) if the platform disagrees.
+- **`card.expiryDate` format** is parsed as `MMYY` when building masked instrument details —
+  consistent with the platform's examples but worth one sandbox observation.
+- **`PaymentInfo.createdAt`** falls back to epoch — the Worldline payment object exposes no
+  stable creation timestamp in a documented field; hosts read the timestamp from the webhook
+  `created` or their own record. Revisit if the sandbox payment object carries one.
+
+## Paysafe Interac e-Transfer (2026-07-15)
+
+- **The sandbox account cannot exercise Interac.** Sandbox-verified 2026-07-15: creating an
+  `INTERAC_ETRANSFER` payment handle in CAD is refused with `PAYMENTHUB-1`, "The submitted
+  payment type and currency code combination is not supported for your account". That is an
+  account-provisioning fact, not a code defect — the rail must be enabled on the Paysafe
+  account before it can be verified end to end, and before any live enablement. The
+  integration suite tolerates this specific error the way it tolerates unbatched
+  settlements, and starts asserting for real once the capability exists.
+- **`interacEtransfer` vs `interacETransfer`.** Doc-verified 2026-07-15: the payment-handle
+  request field is spelled `interacEtransfer` (lowercase `t`). Paysafe's own OpenAPI spec
+  contradicts itself — the `interacObject` schema declares `interacETransfer`, but that
+  schema is flagged `x-internal: true`, while all seven request/response examples in the
+  same spec and the Interac integration guide's worked request use `interacEtransfer`. Two
+  independent public sources outweigh one internal-flagged schema, and the failure mode is
+  loud rather than silent (error `5023`, unrecognized field), so a wrong choice surfaces on
+  the first sandbox call. Partially corroborated 2026-07-15: the sandbox rejected the handle
+  with `PAYMENTHUB-1` (account capability) rather than `5023`, so the body — this field
+  included — parsed. That is evidence, not proof: the capability check may precede
+  instrument validation. Settle it on an account that has the rail enabled before going live.
+- **Handle lifetime vs session TTL.** Redirect payment handles report
+  `timeToLiveSeconds: 899` (~15 min) and the field is response-only, so it cannot be aligned
+  from our side. The adapter's default `sessionTtlSeconds` is 3600, meaning a signed session
+  can outlive the handle it references: a slow customer returns to a session that still
+  verifies but whose handle is `EXPIRED`. Hosts running this rail should lower
+  `sessionTtlSeconds` toward the handle window. Once that window closes Paysafe resolves the
+  handle itself (see the next entry), so a stale session's completion rejecting is a
+  reconcile-by-webhook situation, not a lost payment.
+- **The return trip is a fallback signal; `PAYMENT_HANDLE_PAYABLE` is the documented cue.**
+  Doc-verified 2026-07-15 (Interac guide, integration notes): the handle flips to `PAYABLE`
+  when the customer is *redirected* — before any bank approval — and the guide instructs
+  merchants to make the `POST /payments` call on receiving that webhook. Interac does not
+  redirect the customer back after a *completed* payment (the return links fire on the
+  failed/cancelled paths), so the client marker mostly resolves failure trips and manual
+  returns. If the merchant never completes, Paysafe completes on the merchant's behalf once
+  the handle TTL closes (customer-paid path: `PAYMENT_PROCESSING` → `PAYMENT_COMPLETED`) or
+  fails the handle (`PAYMENT_HANDLE_FAILED`, then `PAYMENT_FAILED` ~2 days later). A
+  completion attempt against a handle that already left `PAYABLE` rejects with error `5283`
+  — terminal for that call, reconciled by webhook. `PAYMENT_HANDLE_PAYABLE` stays mapped
+  `unknown` (its payload id is a handle id, not a payment id); hosts correlate via the
+  payload `merchantRefNum`, which is the session `idempotencyKey`.
+- **Return-trip completion carries a placeholder `clientToken`.** The standard completion
+  route requires a non-empty `clientToken` and the react transport only fires when one is
+  present, while the real handle token rides the signed session context. The client adapter
+  therefore resolves the marked return as `requires_confirmation` with
+  `clientToken: "paysafe-redirect-return"`, and the server adapter ignores the wire value
+  whenever the context already carries a minted handle — the signed context is the only
+  authority on which handle gets charged.
+- **`availableToRefund: 0` on an in-flight settlement means "not refundable yet".** Bank
+  rails attach a `PROCESSING` settlement to the payment immediately, sharing its
+  `merchantRefNum`; refunds are therefore only inferred from `availableToRefund` once the
+  settlement has left an in-flight status, and never from `refundedAmount`'s absence alone.
+
+## Per-method currency gating + the `pad` rail (2026-07-15)
+
+- **`PaymentMethodCapability` gained `currencies?: string[]`** (absent OR empty =
+  unrestricted, mirroring `supportedCurrencies` one level up; the PSP-wide list still
+  applies on top). `screenSessionInput` honors it, so a currency-ineligible rail is
+  skipped and the router fails over to a PSP that can settle it, instead of the rail
+  looking available and dying on a PSP-local rejection. Chosen over a per-method
+  `countries` field, or a nested `constraints` object, deliberately: country is a
+  genuinely different problem — GoCardless collects SEPA in EUR from *non*-Eurozone
+  countries, so country does not imply currency, and `CreatePaymentSessionInput.country`
+  is optional, leaving an absent country with no good screening answer. Both remain
+  addable later without a break, so neither was worth guessing at now.
+- **The declaration does not replace the adapter-local guard — it derives from it.**
+  Paysafe's Interac CAD check stays in `createInteracSession`; screening is bypassed
+  entirely when a host drives an adapter without `PaymentService`, and a host overriding
+  `config.paymentMethods` can drop the declared gate. One constant
+  (`INTERAC_CURRENCIES`), two readers, so they cannot drift.
+- **A rail gated to currencies the PSP does not accept is now a capability-coherence
+  violation** (`validateAdapterCapabilities`), not a silent dead method: screening would
+  reject such a session on `supportedCurrencies` before the method rule was ever
+  consulted. Enforced at PaymentService registration and by the conformance suite, which
+  both consume the same rule table.
+- **The new Canadian rail is `pad`, not `eft`.** The rail is Pre-Authorized Debit,
+  administered by Payments Canada. Its PSP names disagree — Stripe `acss_debit`
+  ("pre-authorized debit (PAD)"), GoCardless `pad`, Paysafe "Electronic Fund Transfer
+  (EFT)" — and the unified vocabulary is provider-agnostic, so it takes the scheme's own
+  name and each adapter maps to it. #87 proposed `eft`; that is Paysafe's word, and
+  naming core after one provider would have forced a future Stripe/GoCardless rail to
+  report under it. Doc-verified 2026-07-15.
+- **Not a single-currency rail: Stripe's PAD takes CAD *and* USD.** Doc-verified
+  2026-07-15 (docs.stripe.com/payments/acss-debit): "It's possible to accept PAD payments
+  in either CAD or USD" — the currency must match the customer's account denomination and
+  a mismatch fails up to 5 business days later. This is why the field is an array; a
+  scalar would have been wrong on the first rail that used it.
+- **Paysafe's EFT and ACH currencies are undocumented.** Doc-verified 2026-07-15: the
+  Paysafe EFT page states Canada as a country and no currency at all, and its ACH page
+  states neither; only SEPA (EUR), BACS (GBP) and Interac (CAD) are stated outright.
+  Both rails are `supported: false` today, so nothing is declared for them — encoding
+  EFT→CAD would assert something the provider does not document. Needs a sandbox check
+  or Paysafe's confirmation before #83 gates them.
+
+## Paysafe bank-debit rails — SEPA, ACH, BACS, EFT (2026-07-15)
+
+- **Bank details ride the completion `clientToken` as a versioned envelope**
+  (`"paysafe-bank." + base64url(JSON)`, `v: 1`, paymentType + per-rail fields +
+  `mandateConsent`), produced by the client adapter's own plain inputs and parsed by the
+  server adapter. Chosen over a core contract change (`CompletePaymentInput` gaining a
+  details payload): the golden rule is new rails = adapter packages only, the token is
+  "produced by the client adapter's confirm()" by contract, and the signed-session-context
+  precedent already encodes structured adapter state in opaque strings. The prefix and
+  shape are duplicated across the pair by convention, like the redirect marker — the
+  packages share no code across the client/server boundary.
+- **The rail is stamped into the signed session context at creation** (`paymentType`
+  SEPA/ACH/BACS/EFT) with no PSP call; the handle is minted and charged inside
+  `completePayment` (handle then payment, both with `merchantRefNum = idempotencyKey` —
+  Paysafe dedupes per endpoint, so one key is replay-safe across both calls).
+  `settleWithAuth: true` unconditionally (doc-required for ACH/EFT; shown true in every
+  SEPA/BACS payload example) and manual capture is rejected at session creation. One rail
+  per session, mixed requests rejected — the Interac rule, for the same reason (the
+  client mounts exactly one collection UI per session).
+- **Customer profile data is embedded in the handle request** rather than sent as
+  separate `/customers` + Mandate API calls: the SEPA/BACS pages prescribe a
+  profile→handle→mandate-link→payment sequence but publish no request bodies or mandate
+  endpoint (the API reference is a SPA that flattens for fetchers), while the payload
+  examples show `mandateReference` inside the handle/payment `sepa`/`bacs` objects.
+  Sandbox probes are the validation instrument for this and for the per-rail request
+  field names; `mandateReference` is surfaced on `PaymentInfo` from the payment response,
+  falling back to the handle's.
+- **Sandbox verdict (run 2026-07-15, CAD sandbox account): EFT completed end-to-end** —
+  envelope → PAYABLE handle → charge → retrieve, from the documented simulation values —
+  which validates the shared request builder (lowercase rail object, profile-on-handle,
+  no returnLinks, settleWithAuth, merchantRefNum reuse across both calls) on the one
+  rail the account is provisioned for. ACH defers with PAYMENTHUB-1 (rail/currency not
+  provisioned), the known Interac shape. SEPA and BACS are refused with error 5005
+  "Creation of sepa/bacs single use payment handle is not supported": the request
+  parses (not 5023/5068), the operation is refused — on an account with no EUR/GBP
+  provisioning this is indistinguishable from a provisioning gap, but the wording
+  leaves open that the mandate rails may require a different handle vehicle. Both
+  readings are safe here: the rails ship `supported: false`, an opt-in merchant gets a
+  clean diagnostic `invalid_request` carrying Paysafe's own message on first use, and
+  the guide instructs validating one sandbox payment against a provisioned account
+  before enabling either rail in production. Re-run the rail probes when an EUR/GBP
+  sandbox account exists.
+- **ACH and EFT stay currency-ungated** — resolves the open note from the per-method
+  currency gating entry: the provider pages still document no currency for either
+  (re-verified 2026-07-15), so nothing is declared and the merchant account decides.
+  Gates shipped: SEPA `currencies: ["EUR"]` (no countries — zone), BACS
+  `currencies: ["GBP"]`, `countries: ["GB"]`, EFT→`pad` `countries: ["CA"]`, ACH bare.
+  All four default `supported: false` (per-account enablement, the Interac precedent).
+- **Both returned-payment spellings map to `payment.failed`.** Paysafe's own pages are
+  internally inconsistent: the event-description tables say `PAYMENT_RETURNED_COMPLETED`,
+  the payload examples say `PAYMENT_RETURN_COMPLETED`. The map matches wire values
+  exactly and missing the real one would downgrade a bank-reported failure to `unknown`,
+  so both are mapped and mirrored in the onboarding descriptor. `SETTLEMENT_*` events
+  stay unmapped (delivered `unknown`): their payload ids are settlement ids, not payment
+  ids — the `PAYMENT_HANDLE_PAYABLE` reasoning; hosts correlate via `merchantRefNum`.
+  Paysafe documents refunds as not applicable for BACS; refund eligibility elsewhere
+  already rides the in-flight-settlement guard (`availableToRefund: 0` = not yet).
+- **A session whose context carries an unknown `paymentType` fails closed on the client**
+  (`invalid_request`) instead of falling back to card fields: on version skew, card
+  fields would tokenize a CARD charge against a session the server minted for another
+  rail — a mischarge risk. The client performs presence-only validation (no IBAN/sort
+  checksums — substance is Paysafe's to judge; a local checksum would drift).
+
+## Stripe: explicit payment_method_types vs intent currency (2026-07-15)
+
+- **Sandbox-verified 2026-07-15**: `POST /v1/payment_intents` REJECTS an explicit
+  `payment_method_types` entry that cannot settle the intent currency —
+  `StripeInvalidRequestError` at creation — and a mixed list is rejected whole
+  (`["sepa_debit", "card"]` on a GBP intent fails; nothing is silently filtered).
+  The API reference does not state this either way, so the integration suite pins
+  both cases against the real sandbox; if a pin flips, Stripe changed the contract
+  the adapter's narrowing rests on.
+- **The adapter narrows explicit `paymentMethodTypes` to currency-eligible rails
+  before creation**, reading the same declared per-method gates screening consults
+  (config overrides included). Chosen over rejecting the whole mixed request —
+  which would make `["sepa_debit", "card"]` behave worse than `["card"]`, inverting
+  what the host meant by offering more rails — and over forwarding untouched, which
+  the observed rejection rules out. The dropped rail stays visible in
+  `getCapabilities()`, so the narrowing is declared, inspectable behavior rather
+  than a silent loss.
+- **Narrowing to empty rejects with `invalid_request`** naming the rails and the
+  currency, before any Stripe call — the same code the Paysafe Interac currency
+  guard uses for the identical situation; `unsupported_operation` (floated in the
+  issue) would have been a third vocabulary for one condition.
+- **SetupIntents are never narrowed**: zero-amount verification sessions carry no
+  currency, so the session's nominal one must not disqualify the instrument being
+  verified. An override rail declared without `currencies` forwards unnarrowed.
+- **Conformance generalization examined and deferred**: GoCardless's billing-request
+  flow selects the scheme from the currency (doc-verified 2026-07-15,
+  developer.gocardless.com billing-requests guide: "You can pass currency rather than
+  a scheme and GoCardless automatically selects the optimal scheme for that
+  currency"), so it cannot express the mismatch; Paysafe already guards Interac
+  adapter-locally. A suite-level rule would need a shared narrowing/rejection
+  contract across differently-shaped adapters — a contract change, not part of
+  this fix.
+
+## Per-method country gating (2026-07-15)
+
+- **`countries` means the CUSTOMER's country, and the screening signal is a new
+  `CreatePaymentSessionInput.customerCountry`.** Rail eligibility follows the customer
+  (Stripe's support matrix keeps "business location" and "customer country" as separate
+  columns; Bacs pays from UK bank accounts wherever the merchant is), while the existing
+  `input.country` exists for merchant-account resolution — so reusing it would have had
+  every adapter declaring one thing and screening reading another. `country` keeps its
+  merchant meaning, now stated explicitly in its JSDoc; the two cannot be conflated
+  again. `billingDetails.address.country` is deliberately NOT read as a fallback: a
+  billing address is not a bank-account country (a French billing address pays a German
+  IBAN over SEPA), and a silent fallback would screen PSPs out on a false signal.
+- **An absent `customerCountry` screens nothing.** The alternative — screening the
+  candidate out — breaks every existing caller, and the constraint it would enforce is
+  unknowable at session creation for most checkouts anyway (the binding fact is the bank
+  account the customer eventually brings). The field is documented as a best-effort
+  router pre-filter, not an eligibility guarantee: it only does work for hosts that know
+  the customer's country, which is exactly the population offering country-bound rails.
+  This resolves the question #88 deferred.
+- **When a rail fails both gates the currency diagnosis wins** — currency is the harder
+  constraint (the PSP cannot settle it at all) and preserving the existing message keeps
+  #88's router-surface strings stable for hosts that match on them.
+- **Declared only where the provider states a country outright** (all doc-verified
+  2026-07-15): Stripe iDEAL → NL (docs.stripe.com/payments/ideal, customer location
+  "Netherlands"), Stripe ACH → US (payments/ach-direct-debit, "customers who have a US
+  bank account"; support matrix customer country "US"), Stripe Bacs → GB
+  (payments/payment-methods/bacs-debit, "customers who hold a British bank account"),
+  GoCardless Bacs → GB (support.gocardless.com Schemes-and-Requirements, "GBP from UK
+  bank accounts"), Paysafe Interac → CA (interac-e-transfer page, "Supported region:
+  Canada"). SEPA stays undeclared on both Stripe and GoCardless: the providers state a
+  zone, not a country (Stripe "Europe", GoCardless "the Eurozone" on the support page,
+  while collecting from non-Eurozone SEPA countries per the API docs — the two GoCardless
+  statements do not even agree on the zone's edge), and a hardcoded membership list would
+  screen out valid payments the day it drifts. No PSP-wide `supportedCountries` exists,
+  so there is no coherence rule to add — shape (`/^[A-Z]{2}$/`) is asserted by the
+  conformance suite on both halves, mirroring `currencies`.

@@ -173,8 +173,11 @@ interface RequestOptions {
  */
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "bank_redirect_generic", flow: "redirect", supported: true },
-  { type: "sepa_debit", flow: "redirect", supported: true },
-  { type: "bacs_debit", flow: "redirect", supported: true },
+  // Bacs is GB-only ("GBP from UK bank accounts" per GoCardless). SEPA is a
+  // zone, not a country — GoCardless states "the Eurozone" — so it carries no
+  // country gate; a stale membership list would screen out valid payments.
+  { type: "sepa_debit", flow: "redirect", supported: true, currencies: ["EUR"] },
+  { type: "bacs_debit", flow: "redirect", supported: true, currencies: ["GBP"], countries: ["GB"] },
   { type: "ach", flow: "redirect", supported: false },
 ];
 

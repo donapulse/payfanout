@@ -85,6 +85,18 @@ const payments = new PaymentService({ adapters: [stripe] });
 Every mutating call takes an integer **minor-unit** `amount` and a required
 `idempotencyKey`, see [Server usage](/guide/server) for the full lifecycle.
 
+When a session restricts `paymentMethodTypes`, the adapter forwards only the
+requested rails that can settle the session currency, per the same declared
+per-method `currencies` gates that `getCapabilities()` exposes — Stripe rejects
+a PaymentIntent whose explicit `payment_method_types` carries a
+currency-incompatible entry, so `["sepa_debit", "card"]` in GBP becomes a
+card-only session rather than a failed one (sandbox-verified). If **no**
+requested rail can settle the currency the adapter rejects with
+`invalid_request` before calling Stripe, naming the rails and the currency.
+Zero-amount verification sessions are SetupIntents, which carry no currency —
+they are never narrowed. An overridden `config.paymentMethods` list carries its
+own gates: a rail declared without `currencies` is forwarded unnarrowed.
+
 ## 5. Wire the client adapter
 
 ```tsx

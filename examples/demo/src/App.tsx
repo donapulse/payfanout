@@ -12,6 +12,7 @@ import { PaysafeClientAdapter } from "@payfanout/adapter-paysafe";
 import { PayZenClientAdapter } from "@payfanout/adapter-payzen";
 import { GoCardlessClientAdapter } from "@payfanout/adapter-gocardless";
 import { PayPalClientAdapter } from "@payfanout/adapter-paypal";
+import { WorldlineClientAdapter } from "@payfanout/adapter-worldline";
 import { PayFanoutProvider, PaymentFields, usePay, usePayFanout, type PayResult } from "@payfanout/react";
 import { localizeError, PayFanoutError } from "@payfanout/core";
 import { I18nProvider, LOCALES, useI18n } from "./i18n.js";
@@ -35,6 +36,8 @@ const adapters = [
     clientId: import.meta.env.VITE_PAYPAL_CLIENT_ID ?? "replace_me",
     environment: "sandbox",
   }),
+  // No client key at all: the session's clientSecret carries the hosted tokenization URL.
+  new WorldlineClientAdapter({ environment: "sandbox" }),
 ];
 
 // The order total, shown verbatim in every language (a real app would format
@@ -64,6 +67,7 @@ const CURRENCY_BY_PSP: Record<string, string> = {
   gocardless: "GBP", // one-off GoCardless bank payments are GBP/EUR only
   // The PayPal JS SDK fixes its currency at load time — the adapter defaults to USD.
   paypal: "USD",
+  worldline: "EUR", // Worldline Direct sandbox contracts are typically EUR
   // "auto" lets the SERVER pick the PSP via PaymentRouter rules (by currency) —
   // using the Paysafe account's currency demonstrates routing AWAY from the default.
   auto: import.meta.env.VITE_PAYSAFE_CURRENCY ?? "USD",

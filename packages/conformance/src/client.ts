@@ -41,6 +41,15 @@ export function runClientAdapterConformanceTests(
         expect(PAYMENT_METHOD_TYPES).toContain(method.type);
         expect(PAYMENT_METHOD_FLOWS).toContain(method.flow);
         expect(typeof method.supported).toBe("boolean");
+        // The client half declares the same rail constraints as its server
+        // half — hosts render from this list, so a malformed code here offers
+        // a rail the server will refuse.
+        for (const currency of method.currencies ?? []) {
+          expect(currency).toMatch(/^[A-Z]{3}$/);
+        }
+        for (const country of method.countries ?? []) {
+          expect(country).toMatch(/^[A-Z]{2}$/);
+        }
       }
       for (const expected of fixtures.expectedMethodTypes ?? []) {
         expect(methods.map((m) => m.type)).toContain(expected);

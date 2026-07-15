@@ -16,6 +16,7 @@ const CLIENT_SAFE = new Set([
   "@payfanout/adapter-gocardless",
   "@payfanout/adapter-paypal",
   "@payfanout/adapter-payzen",
+  "@payfanout/adapter-worldline",
 ]);
 // Server-side or test-only packages — may hold secret-bearing dependencies.
 const SERVER_SIDE = [

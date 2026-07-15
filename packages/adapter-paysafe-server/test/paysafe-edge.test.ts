@@ -199,6 +199,14 @@ describe("webhook edge cases", () => {
       ["CHARGEBACK_OPENED", "payment.chargeback"],
       ["DISPUTE_WON", "payment.chargeback_won"],
       ["CHARGEBACK_LOST", "payment.chargeback_lost"],
+      // A bank return arrives under BOTH spellings — Paysafe's event tables say
+      // RETURNED, its payload examples say RETURN. Either wire value must
+      // finalize the debit as failed, never land as unknown.
+      ["PAYMENT_RETURNED_COMPLETED", "payment.failed"],
+      ["PAYMENT_RETURN_COMPLETED", "payment.failed"],
+      // Settlement-lifecycle payloads carry settlement ids, not payment ids —
+      // deliberately unmapped so a settlement id is never served as a payment id.
+      ["SETTLEMENT_COMPLETED", "unknown"],
       ["SOMETHING_ELSE", "unknown"],
     ];
     for (const [eventType, expected] of variants) {
@@ -233,6 +241,30 @@ describe("webhook edge cases", () => {
     expect(event.currency).toBe("CAD");
     expect(event.occurredAt).toBe("2026-07-10T15:07:39.000Z");
     expect(event.id).toMatch(/^paysafe_/); // no top-level id -> stable raw-body hash
+  });
+
+  it("finalizes a bank return delivered in the eventName form, payment id intact", async () => {
+    // The late-failure event for a returned debit, in the Payments-API delivery
+    // shape (eventName + payload; docs show the RETURN spelling in payloads).
+    const rawBody = JSON.stringify({
+      payload: {
+        id: "9f01ab23-0000-0000-0000-000000000000",
+        merchantRefNum: "sepa-ref-1",
+        amount: 677,
+        currencyCode: "EUR",
+        status: "FAILED",
+        txnTime: "2026-07-20T09:00:00Z",
+      },
+      type: "PAYMENT",
+      resourceId: "9f01ab23-0000-0000-0000-000000000000",
+      eventDate: "2026-07-20T09:00:00Z",
+      eventName: "PAYMENT_RETURN_COMPLETED",
+    });
+    const event = await parsePaysafeWebhookEvent(rawBody);
+    expect(event.type).toBe("payment.failed");
+    expect(event.pspPaymentId).toBe("9f01ab23-0000-0000-0000-000000000000");
+    expect(event.amount).toBe(677);
+    expect(event.currency).toBe("EUR");
   });
 
   it("still reads legacy eventType/event fields and never treats the resource-category type as the event", async () => {
@@ -295,7 +327,7 @@ describe("transport edge cases", () => {
       adapter.createPaymentSession({
         amount: 100,
         currency: "USD",
-        paymentMethodTypes: ["bacs_debit"], // not in the Paysafe capability list
+        paymentMethodTypes: ["ideal"], // not in the Paysafe capability list
         idempotencyKey: "k",
       }),
     ).rejects.toThrowError(/does not support one of the requested/);

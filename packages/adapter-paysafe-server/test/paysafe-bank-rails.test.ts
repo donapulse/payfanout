@@ -509,12 +509,12 @@ describe("Paysafe bank-debit envelope guards", () => {
       await adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken: corrupted, idempotencyKey: "k" });
       expect.unreachable("completion must reject a corrupted envelope");
     } catch (err) {
-      const flattened = JSON.stringify({
-        message: (err as Error).message,
-        raw: (err as { raw?: unknown }).raw ?? null,
-      });
-      expect(flattened).not.toContain("NL77");
-      expect(flattened).not.toContain("0492122466");
+      // Shape pin, not just a digit scan: a raw SyntaxError instance would
+      // flatten to {} under JSON.stringify (Error props are non-enumerable)
+      // and slip a digit scan while still carrying the V8 source snippet.
+      expect((err as { raw?: unknown }).raw).toStrictEqual({ name: "SyntaxError" });
+      expect((err as Error).message).not.toContain("NL77");
+      expect((err as Error).message).not.toContain("0492122466");
     }
   });
 

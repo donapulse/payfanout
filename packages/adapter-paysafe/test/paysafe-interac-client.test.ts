@@ -121,6 +121,7 @@ describe("Paysafe Interac e-Transfer client", () => {
       flow: "redirect",
       supported: false,
       currencies: ["CAD"],
+      countries: ["CA"],
     });
   });
 });

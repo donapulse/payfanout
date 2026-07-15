@@ -142,3 +142,81 @@ describe("screenSessionInput — per-method currencies", () => {
     );
   });
 });
+
+describe("screenSessionInput — per-method countries", () => {
+  const rails = caps({
+    paymentMethods: [
+      { type: "card", flow: "embedded", supported: true },
+      { type: "bacs_debit", flow: "embedded", supported: true, currencies: ["GBP"], countries: ["GB"] },
+      { type: "interac_etransfer", flow: "redirect", supported: true, currencies: ["CAD"], countries: ["CA"] },
+    ],
+  });
+
+  it("skips a rail requested for a customer outside its countries, and says so", () => {
+    expect(
+      screenSessionInput(
+        rails,
+        input({ currency: "GBP", customerCountry: "US", paymentMethodTypes: ["bacs_debit"] }),
+      ),
+    ).toMatch(/none of the requested payment method types for customer country US: bacs_debit/);
+    expect(
+      screenSessionInput(
+        rails,
+        input({ currency: "GBP", customerCountry: "GB", paymentMethodTypes: ["bacs_debit"] }),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("screens nothing when the session does not state customerCountry", () => {
+    // The constraint is real but unknowable without the field — the rail must
+    // stay routable rather than be guessed away. This is the decided answer to
+    // "what does an absent country mean": absent screens nothing.
+    expect(
+      screenSessionInput(rails, input({ currency: "GBP", paymentMethodTypes: ["bacs_debit"] })),
+    ).toBeUndefined();
+  });
+
+  it("matches case-insensitively and trims; absent or empty countries means unrestricted", () => {
+    expect(
+      screenSessionInput(
+        rails,
+        input({ currency: "CAD", customerCountry: " ca ", paymentMethodTypes: ["interac_etransfer"] }),
+      ),
+    ).toBeUndefined();
+    expect(
+      screenSessionInput(rails, input({ currency: "USD", customerCountry: "JP", paymentMethodTypes: ["card"] })),
+    ).toBeUndefined();
+    const empty = caps({
+      paymentMethods: [{ type: "card", flow: "embedded", supported: true, countries: [] }],
+    });
+    expect(
+      screenSessionInput(empty, input({ currency: "USD", customerCountry: "JP", paymentMethodTypes: ["card"] })),
+    ).toBeUndefined();
+  });
+
+  it("prefers the currency diagnosis when a rail fails both gates", () => {
+    expect(
+      screenSessionInput(
+        rails,
+        input({ currency: "EUR", customerCountry: "US", paymentMethodTypes: ["bacs_debit"] }),
+      ),
+    ).toMatch(/in EUR/);
+  });
+
+  it("one country-eligible rail carries a multi-method request", () => {
+    // Same predicate contract as currencies: screening answers "can this
+    // candidate serve the payment at all" — via card, it can.
+    expect(
+      screenSessionInput(
+        rails,
+        input({ currency: "GBP", customerCountry: "US", paymentMethodTypes: ["bacs_debit", "card"] }),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("distinguishes a country-ineligible rail from an unsupported one", () => {
+    expect(
+      screenSessionInput(rails, input({ currency: "GBP", customerCountry: "US", paymentMethodTypes: ["ideal"] })),
+    ).not.toMatch(/customer country/);
+  });
+});

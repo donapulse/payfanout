@@ -71,6 +71,19 @@ export interface PaymentMethodCapability {
    * eligible PSP, not attempted and rejected at the PSP.
    */
   currencies?: string[];
+  /**
+   * Hard per-method CUSTOMER-country constraint (ISO 3166-1 alpha-2,
+   * uppercase) — a rail only customers in specific countries can pay with
+   * (Bacs needs a UK bank account, Interac a Canadian one). ABSENT or empty
+   * means unrestricted. Screening consults it only when the session states
+   * `customerCountry`; with no country stated the rail passes — a best-effort
+   * pre-filter, never an eligibility guarantee, because the true constraint
+   * is the bank account the customer brings. Declare only what the provider
+   * documents as a country (or a short closed list); a zone rail (SEPA) stays
+   * undeclared — encoding the zone's membership would screen out valid
+   * payments the day it drifts.
+   */
+  countries?: string[];
 }
 
 export interface AdapterCapabilities {

@@ -653,3 +653,40 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   Both rails are `supported: false` today, so nothing is declared for them — encoding
   EFT→CAD would assert something the provider does not document. Needs a sandbox check
   or Paysafe's confirmation before #83 gates them.
+
+## Per-method country gating (2026-07-15)
+
+- **`countries` means the CUSTOMER's country, and the screening signal is a new
+  `CreatePaymentSessionInput.customerCountry`.** Rail eligibility follows the customer
+  (Stripe's support matrix keeps "business location" and "customer country" as separate
+  columns; Bacs pays from UK bank accounts wherever the merchant is), while the existing
+  `input.country` exists for merchant-account resolution — so reusing it would have had
+  every adapter declaring one thing and screening reading another. `country` keeps its
+  merchant meaning, now stated explicitly in its JSDoc; the two cannot be conflated
+  again. `billingDetails.address.country` is deliberately NOT read as a fallback: a
+  billing address is not a bank-account country (a French billing address pays a German
+  IBAN over SEPA), and a silent fallback would screen PSPs out on a false signal.
+- **An absent `customerCountry` screens nothing.** The alternative — screening the
+  candidate out — breaks every existing caller, and the constraint it would enforce is
+  unknowable at session creation for most checkouts anyway (the binding fact is the bank
+  account the customer eventually brings). The field is documented as a best-effort
+  router pre-filter, not an eligibility guarantee: it only does work for hosts that know
+  the customer's country, which is exactly the population offering country-bound rails.
+  This resolves the question #88 deferred.
+- **When a rail fails both gates the currency diagnosis wins** — currency is the harder
+  constraint (the PSP cannot settle it at all) and preserving the existing message keeps
+  #88's router-surface strings stable for hosts that match on them.
+- **Declared only where the provider states a country outright** (all doc-verified
+  2026-07-15): Stripe iDEAL → NL (docs.stripe.com/payments/ideal, customer location
+  "Netherlands"), Stripe ACH → US (payments/ach-direct-debit, "customers who have a US
+  bank account"; support matrix customer country "US"), Stripe Bacs → GB
+  (payments/payment-methods/bacs-debit, "customers who hold a British bank account"),
+  GoCardless Bacs → GB (support.gocardless.com Schemes-and-Requirements, "GBP from UK
+  bank accounts"), Paysafe Interac → CA (interac-e-transfer page, "Supported region:
+  Canada"). SEPA stays undeclared on both Stripe and GoCardless: the providers state a
+  zone, not a country (Stripe "Europe", GoCardless "the Eurozone" on the support page,
+  while collecting from non-Eurozone SEPA countries per the API docs — the two GoCardless
+  statements do not even agree on the zone's edge), and a hardcoded membership list would
+  screen out valid payments the day it drifts. No PSP-wide `supportedCountries` exists,
+  so there is no coherence rule to add — shape (`/^[A-Z]{2}$/`) is asserted by the
+  conformance suite on both halves, mirroring `currencies`.

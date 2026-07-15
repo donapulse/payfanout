@@ -35,27 +35,44 @@ export function screenSessionInput(
   if (input.savePaymentMethod && !caps.supportsSavedPaymentMethods) {
     return `"${psp}" does not support saved payment methods`;
   }
+  const customerCountry = input.customerCountry?.trim().toUpperCase();
   const requested = input.paymentMethodTypes;
   if (requested && requested.length > 0) {
-    // A supported-but-currency-ineligible rail (SEPA asked for in GBP) and an
-    // outright unsupported one are different diagnoses: both skip the
-    // candidate, but the router surfaces these strings when every candidate
-    // was skipped, and "we don't do SEPA" would be a lie about the first.
+    // A supported-but-ineligible rail (SEPA asked for in GBP, Bacs asked for
+    // a US customer) and an outright unsupported one are different diagnoses:
+    // all skip the candidate, but the router surfaces these strings when
+    // every candidate was skipped, and "we don't do SEPA" would be a lie
+    // about the first two.
     let ineligibleByCurrency = false;
+    let ineligibleByCountry = false;
     let eligible = false;
     for (const method of caps.paymentMethods) {
       if (!method.supported || !requested.includes(method.type)) continue;
       // Absent OR empty means unrestricted, exactly as supportedCurrencies reads.
-      if (!method.currencies?.length || method.currencies.some((c) => c.toUpperCase() === currency)) {
+      const currencyOk =
+        !method.currencies?.length || method.currencies.some((c) => c.toUpperCase() === currency);
+      // Country additionally screens nothing when the session does not state
+      // customerCountry — the constraint is real but unknowable here, so the
+      // rail must stay routable rather than be guessed away.
+      const countryOk =
+        !customerCountry ||
+        !method.countries?.length ||
+        method.countries.some((c) => c.toUpperCase() === customerCountry);
+      if (currencyOk && countryOk) {
         eligible = true;
         break;
       }
-      ineligibleByCurrency = true;
+      if (!currencyOk) ineligibleByCurrency = true;
+      else ineligibleByCountry = true;
     }
     if (!eligible) {
-      return ineligibleByCurrency
-        ? `"${psp}" supports none of the requested payment method types in ${String(input.currency)}: ${requested.join(", ")}`
-        : `"${psp}" supports none of the requested payment method types: ${requested.join(", ")}`;
+      if (ineligibleByCurrency) {
+        return `"${psp}" supports none of the requested payment method types in ${String(input.currency)}: ${requested.join(", ")}`;
+      }
+      if (ineligibleByCountry) {
+        return `"${psp}" supports none of the requested payment method types for customer country ${String(input.customerCountry)}: ${requested.join(", ")}`;
+      }
+      return `"${psp}" supports none of the requested payment method types: ${requested.join(", ")}`;
     }
   }
   return undefined;

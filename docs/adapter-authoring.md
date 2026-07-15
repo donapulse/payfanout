@@ -71,6 +71,14 @@ and `PaymentService` will hold you to:
   `paymentMethods` wholesale. Derive both from one constant so they cannot drift. A rail
   gated to currencies your `supportedCurrencies` excludes is unroutable and
   `validateAdapterCapabilities` rejects it.
+- **Per-rail country constraints** are the customer-side sibling:
+  `countries: ["GB"]` (uppercase ISO 3166-1 alpha-2) on a rail only customers in those
+  countries can pay with — Bacs needs a UK bank account, Interac a Canadian one.
+  Screening consults it only when the session states `customerCountry`; absent input
+  screens nothing, so declaring it never hides your PSP from a host that doesn't know
+  the customer's country. Declare only what the provider documents as a country or a
+  short closed list; a zone rail (SEPA) stays undeclared — zone membership drifts, and
+  a stale list would screen out valid payments.
 - **Errors:** every rejection is a `PayFanoutError` with a taxonomy `code`, a user-safe
   `message` (use core's `getUserMessage(code)` catalog — never a third English variant),
   an honest `retryable`, `pspName`, and the untouched PSP error on `raw`. Even

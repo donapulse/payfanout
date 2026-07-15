@@ -78,10 +78,14 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "card", flow: "embedded", supported: true },
   { type: "apple_pay", flow: "popup", supported: true },
   { type: "google_pay", flow: "popup", supported: true },
-  { type: "ideal", flow: "redirect", supported: true, currencies: ["EUR"] },
+  // Countries are the CUSTOMER's, per Stripe's support matrix: iDEAL pays
+  // from Dutch accounts, ACH from US ones, Bacs from UK ones. SEPA stays
+  // country-unrestricted — the zone is a moving membership list, not a
+  // country, and a stale list would screen out valid payments.
+  { type: "ideal", flow: "redirect", supported: true, currencies: ["EUR"], countries: ["NL"] },
   { type: "sepa_debit", flow: "embedded", supported: true, currencies: ["EUR"] },
-  { type: "ach", flow: "embedded", supported: true, currencies: ["USD"] },
-  { type: "bacs_debit", flow: "embedded", supported: true, currencies: ["GBP"] },
+  { type: "ach", flow: "embedded", supported: true, currencies: ["USD"], countries: ["US"] },
+  { type: "bacs_debit", flow: "embedded", supported: true, currencies: ["GBP"], countries: ["GB"] },
 ];
 
 export class StripeServerAdapter implements ServerPaymentAdapter {

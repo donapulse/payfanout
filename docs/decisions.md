@@ -654,6 +654,37 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   EFT→CAD would assert something the provider does not document. Needs a sandbox check
   or Paysafe's confirmation before #83 gates them.
 
+## Stripe: explicit payment_method_types vs intent currency (2026-07-15)
+
+- **Sandbox-verified 2026-07-15**: `POST /v1/payment_intents` REJECTS an explicit
+  `payment_method_types` entry that cannot settle the intent currency —
+  `StripeInvalidRequestError` at creation — and a mixed list is rejected whole
+  (`["sepa_debit", "card"]` on a GBP intent fails; nothing is silently filtered).
+  The API reference does not state this either way, so the integration suite pins
+  both cases against the real sandbox; if a pin flips, Stripe changed the contract
+  the adapter's narrowing rests on.
+- **The adapter narrows explicit `paymentMethodTypes` to currency-eligible rails
+  before creation**, reading the same declared per-method gates screening consults
+  (config overrides included). Chosen over rejecting the whole mixed request —
+  which would make `["sepa_debit", "card"]` behave worse than `["card"]`, inverting
+  what the host meant by offering more rails — and over forwarding untouched, which
+  the observed rejection rules out. The dropped rail stays visible in
+  `getCapabilities()`, so the narrowing is declared, inspectable behavior rather
+  than a silent loss.
+- **Narrowing to empty rejects with `invalid_request`** naming the rails and the
+  currency, before any Stripe call — the same code the Paysafe Interac currency
+  guard uses for the identical situation; `unsupported_operation` (floated in the
+  issue) would have been a third vocabulary for one condition.
+- **SetupIntents are never narrowed**: zero-amount verification sessions carry no
+  currency, so the session's nominal one must not disqualify the instrument being
+  verified. An override rail declared without `currencies` forwards unnarrowed.
+- **Conformance generalization examined and deferred**: GoCardless's billing-request
+  flow selects the scheme from the currency (recorded from its API reference in the
+  per-method currency gating entry), so it cannot express the mismatch; Paysafe
+  already guards Interac adapter-locally. A suite-level rule would need a shared
+  narrowing/rejection contract across differently-shaped adapters — a contract
+  change, not part of this fix.
+
 ## Per-method country gating (2026-07-15)
 
 - **`countries` means the CUSTOMER's country, and the screening signal is a new

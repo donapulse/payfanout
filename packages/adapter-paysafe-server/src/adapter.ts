@@ -202,7 +202,15 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
   // per-account enablement AND Canada/CAD only, so claiming it for every account
   // would misreport the majority of them. Canadian merchants opt in via
   // config.paymentMethods.
-  { type: "interac_etransfer", flow: "redirect", supported: false, currencies: [...INTERAC_CURRENCIES] },
+  {
+    type: "interac_etransfer",
+    flow: "redirect",
+    supported: false,
+    currencies: [...INTERAC_CURRENCIES],
+    // "Supported region: Canada" — the customer authenticates at a Canadian
+    // bank. An opt-in override carries its own gates (see the note above).
+    countries: ["CA"],
+  },
 ];
 
 /** Paysafe paymentType -> the unified vocabulary. Everything else stays "other". */

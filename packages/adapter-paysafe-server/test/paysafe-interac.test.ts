@@ -171,6 +171,7 @@ describe("Paysafe Interac e-Transfer sessions", () => {
       flow: "redirect",
       supported: false,
       currencies: ["CAD"],
+      countries: ["CA"],
     });
   });
 

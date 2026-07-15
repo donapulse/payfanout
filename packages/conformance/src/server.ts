@@ -140,6 +140,12 @@ export function runServerAdapterConformanceTests(
         for (const currency of method.currencies ?? []) {
           expect(currency).toMatch(/^[A-Z]{3}$/);
         }
+        // Countries mirror currencies (ISO 3166-1 alpha-2, customer side): a
+        // malformed code never matches a session's customerCountry, so the
+        // rail silently screens out for every session that states one.
+        for (const country of method.countries ?? []) {
+          expect(country).toMatch(/^[A-Z]{2}$/);
+        }
       }
       // supportedCurrencies is a router pre-screen input — malformed codes
       // would silently disable a PSP for every payment.

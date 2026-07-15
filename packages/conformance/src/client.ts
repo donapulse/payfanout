@@ -47,6 +47,9 @@ export function runClientAdapterConformanceTests(
         for (const currency of method.currencies ?? []) {
           expect(currency).toMatch(/^[A-Z]{3}$/);
         }
+        for (const country of method.countries ?? []) {
+          expect(country).toMatch(/^[A-Z]{2}$/);
+        }
       }
       for (const expected of fixtures.expectedMethodTypes ?? []) {
         expect(methods.map((m) => m.type)).toContain(expected);

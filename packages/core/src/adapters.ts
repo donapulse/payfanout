@@ -50,8 +50,22 @@ export interface CreatePaymentSessionInput {
   id?: string;
   amount: MinorUnitAmount;
   currency: string;
-  /** Needed for merchant-account resolution (Paysafe). */
+  /**
+   * The MERCHANT side: needed for merchant-account resolution (Paysafe).
+   * Never consulted for rail eligibility — that reads `customerCountry`.
+   */
   country?: string;
+  /**
+   * The CUSTOMER's country (ISO 3166-1 alpha-2), when the host knows it —
+   * an explicit country selector, account data, delivery country. Screening
+   * uses it to skip a PSP whose requested rails declare `countries` excluding
+   * the customer (Bacs outside the UK); ABSENT means country-restricted rails
+   * are not screened at all, so omitting it never hides a PSP. Deliberately
+   * distinct from `billingDetails.address.country`: a billing address is not
+   * a bank-account country — a French billing address can pay a German IBAN
+   * over SEPA — so that field is never read as a screening signal.
+   */
+  customerCountry?: string;
   /** Restrict what the session accepts. */
   paymentMethodTypes?: UnifiedPaymentMethodType[];
   /** Only honored if getCapabilities().supportsManualCapture. */

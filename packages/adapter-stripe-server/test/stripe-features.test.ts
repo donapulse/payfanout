@@ -395,6 +395,68 @@ describe("Stripe capability declaration", () => {
   });
 });
 
+describe("payment_method_types honor declared rail currencies (#89)", () => {
+  it("narrows a mixed request to the rails that settle the intent currency", async () => {
+    // Screening deliberately lets this session through (card can serve it);
+    // the adapter must not then hand Stripe the rail core knows is EUR-only —
+    // Stripe rejects the whole creation over it.
+    const { adapter, fake } = makePair();
+    await adapter.createPaymentSession({
+      amount: 1000,
+      currency: "GBP",
+      paymentMethodTypes: ["sepa_debit", "card"],
+      idempotencyKey: "k",
+    });
+    expect(fake.lastPaymentIntentParams?.["payment_method_types"]).toEqual(["card"]);
+  });
+
+  it("rejects before any Stripe call when no requested rail settles the currency", async () => {
+    const { adapter, fake } = makePair();
+    await expect(
+      adapter.createPaymentSession({
+        amount: 1000,
+        currency: "GBP",
+        paymentMethodTypes: ["sepa_debit", "ideal"],
+        idempotencyKey: "k",
+      }),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringMatching(/can settle in GBP: sepa_debit, ideal/) as string,
+    });
+    expect(fake.lastPaymentIntentParams).toBeUndefined();
+  });
+
+  it("does not narrow a rail whose override declares no currency gate", async () => {
+    // config.paymentMethods replaces the defaults wholesale — an override
+    // without `currencies` reads unrestricted, so the adapter forwards the
+    // rail and the account's own Stripe settings decide.
+    const { adapter, fake } = makePair({
+      paymentMethods: [{ type: "ideal", flow: "redirect", supported: true }],
+    });
+    await adapter.createPaymentSession({
+      amount: 1000,
+      currency: "GBP",
+      paymentMethodTypes: ["ideal"],
+      idempotencyKey: "k",
+    });
+    expect(fake.lastPaymentIntentParams?.["payment_method_types"]).toEqual(["ideal"]);
+  });
+
+  it("never narrows the currencyless SetupIntent path", async () => {
+    // A zero-amount verification vaults/validates the instrument for FUTURE
+    // charges; SetupIntents carry no currency, so the session's nominal one
+    // must not disqualify the rail being verified.
+    const { adapter, fake } = makePair();
+    await adapter.createPaymentSession({
+      amount: 0,
+      currency: "GBP",
+      paymentMethodTypes: ["sepa_debit"],
+      idempotencyKey: "k",
+    });
+    expect(fake.lastSetupIntentParams?.["payment_method_types"]).toEqual(["sepa_debit"]);
+  });
+});
+
 describe("Stripe SDK client construction (lazy load)", () => {
   it("pins apiVersion and threads maxNetworkRetries/requestTimeoutMs into the client", async () => {
     const defaults = new StripeServerAdapter({

@@ -28,8 +28,10 @@ describe("StripeServerAdapter edges", () => {
       idempotencyKey: "k",
     });
     const pi = await fake.paymentIntents.retrieve(session.pspSessionId);
-    // apple_pay rides the card rails; ach maps to us_bank_account; no duplicates.
-    expect(pi.payment_method_types).toEqual(["card", "ideal", "us_bank_account"]);
+    // apple_pay rides the card rails; ach maps to us_bank_account; no
+    // duplicates. iDEAL declares EUR, so a USD intent must not carry it —
+    // Stripe rejects a currency-incompatible explicit entry outright.
+    expect(pi.payment_method_types).toEqual(["card", "us_bank_account"]);
   });
 
   it("rejects method types Stripe cannot express", async () => {

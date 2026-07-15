@@ -188,8 +188,11 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "ach", flow: "embedded", supported: false },
   // Payments-API only (Paysafe.js cannot tokenize it): the handle is minted
   // server-side at session creation and the customer authenticates at Interac.
-  // CAD/Canada only — INTERAC_CURRENCY gates it.
-  { type: "interac_etransfer", flow: "redirect", supported: true },
+  // Implemented, but off by default like every other non-card rail — it is
+  // per-account enablement AND Canada/CAD only, so claiming it for every account
+  // would misreport the majority of them. Canadian merchants opt in via
+  // config.paymentMethods.
+  { type: "interac_etransfer", flow: "redirect", supported: false },
 ];
 
 /** Paysafe paymentType -> the unified vocabulary. Everything else stays "other". */
@@ -385,6 +388,11 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       paymentType: INTERAC_PAYMENT_TYPE,
       amount: context.amount,
       currencyCode: context.currency,
+      // "interacEtransfer" (lowercase t) is contested: Paysafe's OpenAPI schema
+      // interacObject spells it "interacETransfer", but that schema is flagged
+      // x-internal, while every request example and the integration guide use
+      // this spelling. Getting it wrong fails closed (error 5023, unrecognized
+      // field). See docs/decisions.md.
       interacEtransfer: { consumerId, type: "EMAIL" },
       ...(context.merchantAccountId ? { accountId: context.merchantAccountId } : {}),
       // The same URL for every outcome: the browser's landing spot is a hint, not
@@ -423,6 +431,14 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    */
   async updatePaymentSession(input: UpdatePaymentSessionInput): Promise<PaymentSession> {
     const context = await this.decodeContext(input.pspSessionId);
+    // A minted handle is fixed at its amount/currency: the customer authorizes THAT
+    // handle at their bank. Re-signing a context around it would charge an amount
+    // they never approved, and would slip past the rail's own creation guards.
+    if (context.paymentHandleToken) {
+      throw PayFanoutError.invalidRequest(
+        "This session's payment handle is already minted and cannot be amended — create a new payment session instead",
+      );
+    }
     if (input.amount !== undefined) assertMinorUnitAmount(input.amount, "amount");
     const currency = input.currency !== undefined ? normalizeCurrency(input.currency) : context.currency;
     const merchantAccountId =
@@ -884,15 +900,14 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       // whatever left availableToSettle has been captured.
       settled = Math.max(0, (payment.amount ?? 0) - payment.availableToSettle);
     }
-    // availableToRefund decreases as refunds land; refundedAmount is a legacy fallback.
-    const refunded = settlements.reduce(
-      (sum, s) => sum + (s.refundedAmount ?? Math.max(0, (s.amount ?? 0) - (s.availableToRefund ?? s.amount ?? 0))),
-      0,
-    );
+    const refunded = settlements.reduce((sum, s) => sum + settlementRefunded(s), 0);
     // amountCaptured is only claimed with a witness: settlements/derivation for
     // manual capture, or the settle-with-auth completion itself (full amount).
     let amountCaptured: number | undefined;
-    if (settled > 0) amountCaptured = settled;
+    // A settlement sum is only evidence of capture once the payment itself has
+    // completed (or a void told us what was settled first) — a bank rail is
+    // PROCESSING with a settlement attached long before any money has moved.
+    if (settled > 0 && (completed || knownSettled !== undefined)) amountCaptured = settled;
     else if (completed && payment.settleWithAuth) amountCaptured = payment.amount ?? 0;
     else if (completed && (typeof payment.availableToSettle === "number" || knownSettled !== undefined)) {
       amountCaptured = 0;
@@ -914,7 +929,9 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       paymentMethodType: toUnifiedMethodType(payment.paymentType),
       ...(methodDetails ? { paymentMethodDetails: methodDetails } : {}),
       createdAt: payment.txnTime ?? "1970-01-01T00:00:00.000Z",
-      ...(settled > 0 && settlements[0]?.txnTime ? { capturedAt: settlements[0].txnTime } : {}),
+      ...(amountCaptured !== undefined && amountCaptured > 0 && settlements[0]?.txnTime
+        ? { capturedAt: settlements[0].txnTime }
+        : {}),
       raw: payment,
     };
   }
@@ -1029,6 +1046,23 @@ function toPaymentMethodDetails(card: PaysafeCardLike | undefined): PaymentMetho
     ...(typeof card.cardExpiry?.year === "number" ? { expYear: card.cardExpiry.year } : {}),
   };
   return Object.keys(details).length > 0 ? details : undefined;
+}
+
+/** A settlement Paysafe has not finished moving — nothing has been refunded out of it yet. */
+const IN_FLIGHT_SETTLEMENT_STATUSES = new Set(["INITIATED", "PENDING", "PROCESSING", "RECEIVED"]);
+
+/**
+ * How much of a settlement came back. `refundedAmount` is authoritative where the
+ * API reports it; otherwise refunds are inferred from the drop in
+ * availableToRefund. That inference only holds once the settlement has left the
+ * flight: bank rails answer `availableToRefund: 0` on a perfectly healthy
+ * PROCESSING settlement (it means "not refundable yet"), and subtracting that
+ * would report an in-flight debit as fully refunded.
+ */
+function settlementRefunded(settlement: PaysafeSettlementLike): number {
+  if (typeof settlement.refundedAmount === "number") return settlement.refundedAmount;
+  if (IN_FLIGHT_SETTLEMENT_STATUSES.has((settlement.status ?? "").toUpperCase())) return 0;
+  return Math.max(0, (settlement.amount ?? 0) - (settlement.availableToRefund ?? settlement.amount ?? 0));
 }
 
 /** Authorized-but-unsettled remainder — the explicit amount full captures and voids need. */

@@ -69,9 +69,10 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "neteller", flow: "redirect", supported: false },
   { type: "paysafecard", flow: "voucher_code", supported: false },
   { type: "paysafecash", flow: "voucher_code", supported: false },
-  // Mirrors the server adapter: the handle is minted server-side and the
-  // customer authenticates at Interac. CAD/Canada only.
-  { type: "interac_etransfer", flow: "redirect", supported: true },
+  // Mirrors the server adapter: implemented, but off by default — per-account
+  // enablement and Canada/CAD only. Canadian merchants opt in via
+  // config.paymentMethods.
+  { type: "interac_etransfer", flow: "redirect", supported: false },
 ];
 
 /** The payload half of the server's signed session context (signature verified server-side only). */

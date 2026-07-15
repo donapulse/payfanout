@@ -112,7 +112,7 @@ describe("Paysafe Interac e-Transfer sessions", () => {
     expect(info.currency).toBe("CAD");
   });
 
-  it("reports the rail on retrievePayment", async () => {
+  it("reports an in-flight debit as neither refunded nor captured", async () => {
     const { adapter } = makePair();
     const session = await adapter.createPaymentSession({ ...interacInput });
     const completed = await adapter.completePayment({
@@ -120,9 +120,31 @@ describe("Paysafe Interac e-Transfer sessions", () => {
       clientToken: "",
       idempotencyKey: "k-complete",
     });
+    // Reconciliation re-reads the payment, which resolves the PROCESSING
+    // settlement Paysafe attaches immediately (availableToRefund: 0 there means
+    // "not refundable yet" — reading it as a refund would tell the host the
+    // customer had been paid back).
     const info = await adapter.retrievePayment(completed.pspPaymentId);
     expect(info.paymentMethodType).toBe("interac_etransfer");
     expect(info.status).toBe("processing");
+    expect(info.amountRefunded).toBe(0);
+    expect(info.amountCaptured).toBeUndefined();
+    expect(info.capturedAt).toBeUndefined();
+    expect(info.amount).toBe(5_44);
+  });
+
+  it("refuses to amend a session whose handle is already minted", async () => {
+    const { adapter } = makePair();
+    const session = await adapter.createPaymentSession({ ...interacInput });
+    // The customer authorizes the handle's amount at their bank — re-signing a
+    // context around it would charge an amount they never approved.
+    await expect(
+      adapter.updatePaymentSession({
+        pspSessionId: session.pspSessionId,
+        amount: 99_99,
+        idempotencyKey: "k-update",
+      }),
+    ).rejects.toThrow(/already minted/);
   });
 
   it("dedupes handle creation on merchantRefNum, like the real API", async () => {
@@ -132,12 +154,22 @@ describe("Paysafe Interac e-Transfer sessions", () => {
     expect(fake.uniqueHandleCreations).toBe(1);
   });
 
-  it("declares the rail supported and honestly redirect-flowed", () => {
+  it("models the rail honestly: redirect flow, and off until the account opts in", () => {
     const { adapter } = makePair();
     const interac = adapter
       .getCapabilities()
       .paymentMethods.find((m) => m.type === "interac_etransfer");
-    expect(interac).toEqual({ type: "interac_etransfer", flow: "redirect", supported: true });
+    // Implemented, but Canada/CAD and per-account — claiming it by default would
+    // misreport every non-Canadian account.
+    expect(interac).toEqual({ type: "interac_etransfer", flow: "redirect", supported: false });
+  });
+
+  it("serves accounts that opt the rail in", async () => {
+    const { adapter, fake } = makePair({
+      paymentMethods: [{ type: "interac_etransfer", flow: "redirect", supported: true }],
+    });
+    await adapter.createPaymentSession({ ...interacInput });
+    expect(fake.uniqueHandleCreations).toBe(1);
   });
 });
 

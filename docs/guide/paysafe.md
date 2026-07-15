@@ -206,6 +206,16 @@ mints the payment handle **server-side, inside `createPaymentSession`**, and the
 authenticates at their bank. It is the one Paysafe session that calls Paysafe before the
 client mounts.
 
+Like every non-card rail, it is **off by default** — enablement is per-account and this one
+is Canada-only, so opt in on both adapters:
+
+```ts
+paymentMethods: [
+  { type: "card", flow: "embedded", supported: true },
+  { type: "interac_etransfer", flow: "redirect", supported: true },
+],
+```
+
 Give the session its own `paymentMethodTypes` (a handle is minted for exactly one payment
 type, so it cannot share a session with cards), plus a `returnUrl` and the customer's email —
 Paysafe collects from that alias, so it is the instrument, not a receipt nicety:
@@ -227,6 +237,17 @@ hosted card fields (override the copy with `fieldOptions.description`), and `<Pa
 navigates to Interac. On the way back, `<RedirectReturn>` resolves
 `requires_confirmation` — finalize through the same server-completion route as §7. No
 `clientToken` is involved: the handle token rides the signed session context.
+
+The session cannot be amended once its handle exists (`updatePaymentSession` throws) — the
+customer authorizes *that* handle at their bank, so a changed cart needs a new session.
+
+::: warning Lower `sessionTtlSeconds` for this rail
+Paysafe expires a redirect handle after **~15 minutes**, and the value is response-only, so
+the adapter cannot align to it. The default `sessionTtlSeconds` is `3600`, so a signed
+session can outlive its handle by ~45 minutes: a slow customer returns to a session that
+still verifies but whose handle is gone. Set `sessionTtlSeconds` near the handle window if
+you run Interac.
+:::
 
 ::: warning The landing URL is not the outcome
 Paysafe signals results by *which* return link it uses, and PayFanout points them all at your

@@ -1,6 +1,9 @@
 // @vitest-environment jsdom
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { PaysafeClientAdapter } from "../src/index.js";
+
+// The location stub below would otherwise leak into every later test in this file.
+afterEach(() => vi.restoreAllMocks());
 
 /** The payload half of a signed session context — the client never verifies the signature. */
 function clientSecret(payload: Record<string, unknown>): string {
@@ -105,10 +108,11 @@ describe("Paysafe Interac e-Transfer client", () => {
     await expect(adapter.handleRedirectReturn({ search: "?payfanout_psp=stripe" })).resolves.toBeNull();
   });
 
-  it("declares the rail supported and honestly redirect-flowed", () => {
+  it("models the rail honestly: redirect flow, and off until the account opts in", () => {
     const interac = makeAdapter()
       .listPaymentMethodCapabilities()
       .find((m) => m.type === "interac_etransfer");
-    expect(interac).toEqual({ type: "interac_etransfer", flow: "redirect", supported: true });
+    // Mirrors the server adapter: Canada/CAD and per-account enablement.
+    expect(interac).toEqual({ type: "interac_etransfer", flow: "redirect", supported: false });
   });
 });

@@ -244,10 +244,23 @@ export class FakePaysafeApi {
     const redirectHandle = this.redirectHandles.get(token);
     if (redirectHandle) {
       // Bank rails do not authorize on the spot: the real API answers PROCESSING
-      // and the outcome lands later by webhook.
+      // and the outcome lands later by webhook. The settlement exists immediately,
+      // in flight, sharing the payment's refNum — and reports availableToRefund: 0,
+      // which means "not refundable yet", NOT "already refunded".
       payment.paymentType = redirectHandle.paymentType;
       payment.status = "PROCESSING";
+      payment.availableToSettle = 0;
       delete payment.card;
+      const settlement = {
+        id: `stl_${++this.seq}`,
+        merchantRefNum: refNum,
+        status: "PROCESSING",
+        amount,
+        availableToRefund: 0,
+        txnTime: "2026-07-04T10:00:01Z",
+      };
+      payment.settlements = [settlement];
+      this.settlementRefs.set(refNum, settlement);
     }
     if (settleWithAuth && !redirectHandle) {
       // Real API: auto-capture creates an implicit settlement sharing the

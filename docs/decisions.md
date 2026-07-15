@@ -559,3 +559,30 @@ current status (remaining sandbox checks run via the dispatch-only integration w
 - **`PaymentInfo.createdAt`** falls back to epoch — the Worldline payment object exposes no
   stable creation timestamp in a documented field; hosts read the timestamp from the webhook
   `created` or their own record. Revisit if the sandbox payment object carries one.
+
+## Paysafe Interac e-Transfer (2026-07-15)
+
+- **`interacEtransfer` vs `interacETransfer`.** Doc-verified 2026-07-15: the payment-handle
+  request field is spelled `interacEtransfer` (lowercase `t`). Paysafe's own OpenAPI spec
+  contradicts itself — the `interacObject` schema declares `interacETransfer`, but that
+  schema is flagged `x-internal: true`, while all seven request/response examples in the
+  same spec and the Interac integration guide's worked request use `interacEtransfer`. Two
+  independent public sources outweigh one internal-flagged schema, and the failure mode is
+  loud rather than silent (error `5023`, unrecognized field), so a wrong choice surfaces on
+  the first sandbox call. Confirm against the sandbox before enabling the rail for a live
+  account.
+- **Handle lifetime vs session TTL.** Redirect payment handles report
+  `timeToLiveSeconds: 899` (~15 min) and the field is response-only, so it cannot be aligned
+  from our side. The adapter's default `sessionTtlSeconds` is 3600, meaning a signed session
+  can outlive the handle it references: a slow customer returns to a session that still
+  verifies but whose handle is `EXPIRED`. Hosts running this rail should lower
+  `sessionTtlSeconds` toward the handle window.
+- **Completion is triggered by the redirect return, not by `PAYMENT_HANDLE_PAYABLE`.** The
+  documented sequence has the handle reach `PAYABLE` before `POST /payments` is valid, and
+  the webhook announcing it may lag the browser's return. Unverified whether a return can
+  beat `PAYABLE` in practice; if it can, completion needs to treat the resulting rejection
+  as retryable rather than terminal. Sandbox-verify before live enablement.
+- **`availableToRefund: 0` on an in-flight settlement means "not refundable yet".** Bank
+  rails attach a `PROCESSING` settlement to the payment immediately, sharing its
+  `merchantRefNum`; refunds are therefore only inferred from `availableToRefund` once the
+  settlement has left an in-flight status, and never from `refundedAmount`'s absence alone.

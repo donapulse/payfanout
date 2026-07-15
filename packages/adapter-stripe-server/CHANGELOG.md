@@ -1,5 +1,20 @@
 # @payfanout/adapter-stripe-server
 
+## 1.1.1
+
+### Patch Changes
+
+- 78faed5: Explicit `paymentMethodTypes` are now narrowed to the rails that can settle the session currency before the PaymentIntent is created, using the same declared per-method `currencies` gates that `getCapabilities()` exposes. Stripe rejects a PaymentIntent whose explicit `payment_method_types` carries a currency-incompatible entry, so a mixed request like `["sepa_debit", "card"]` in GBP previously failed outright; it now creates a card-only session. When no requested rail can settle the currency the adapter rejects with `invalid_request` naming the rails and the currency, without calling Stripe. Zero-amount verification sessions (SetupIntents, which carry no currency) are never narrowed, and an overridden `config.paymentMethods` rail declared without `currencies` is forwarded unnarrowed.
+- 80b9bb6: Country-bound rails now declare the customer countries they serve, so a session that states `customerCountry` routes past them when the customer cannot pay with them: iDEAL (NL), ACH (US) and Bacs (GB) on Stripe; Bacs (GB) on GoCardless; Interac e-Transfer (CA) on Paysafe. SEPA stays country-unrestricted on every adapter — the providers document a zone, not a country. As with the currency gates, a `config.paymentMethods` override replaces the declared defaults wholesale, so an override must carry its own `countries` for the router to pre-screen by them.
+- d1d42fa: Bank rails now declare the currency they settle in, so the router skips them for a payment they could never have completed: iDEAL and SEPA in EUR, ACH in USD, Bacs in GBP on Stripe; SEPA in EUR and Bacs in GBP on GoCardless. Previously a EUR-only rail looked available for a GBP payment and failed at the PSP.
+
+  Paysafe's Interac e-Transfer declares CAD as well, but the rail stays off by default, and `config.paymentMethods` replaces the declared defaults wholesale — so an account that opts the rail in must carry `currencies: ["CAD"]` in its own override for the router to pre-screen it. The adapter's CAD check is unchanged either way.
+
+- bb4c1d5: Raise the Stripe SDK floor to 22.3.1, which restores public type exports missing since v22 (`Stripe.StripeConfig`, `Stripe.Webhooks`, the `HttpClient` interfaces, and others). No API or runtime behavior changes.
+- Updated dependencies [80b9bb6]
+- Updated dependencies [d1d42fa]
+  - @payfanout/core@2.0.0
+
 ## 1.1.0
 
 ### Minor Changes

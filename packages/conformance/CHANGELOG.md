@@ -1,5 +1,18 @@
 # @payfanout/conformance
 
+## 2.0.0
+
+### Major Changes
+
+- 80b9bb6: The capability suites now assert that any `countries` an adapter declares on a payment method are well-formed ISO 3166-1 alpha-2 codes, on both the server and client halves. An adapter declaring malformed country codes will newly fail the suite — a malformed code never matches a session's `customerCountry`, silently screening the rail out instead of gating it.
+- d1d42fa: The capability suites now assert that any `currencies` an adapter declares on a payment method are well-formed ISO 4217 codes, on both the server and client halves. An adapter whose method-level currency codes are malformed, or which offers a rail gated to currencies its `supportedCurrencies` excludes, will newly fail the suite — both cases silently disable the rail at routing time.
+
+### Patch Changes
+
+- Updated dependencies [80b9bb6]
+- Updated dependencies [d1d42fa]
+  - @payfanout/core@2.0.0
+
 ## 1.1.0
 
 ### Minor Changes

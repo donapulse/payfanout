@@ -505,15 +505,26 @@ describeIf("Paysafe Interac e-Transfer (real sandbox)", () => {
   const itIfCad = CURRENCY === "CAD" ? it : it.skip;
 
   itIfCad("mints a payment handle and returns a redirect link", async () => {
-    const session = await makeAdapter().createPaymentSession({
-      amount: 5_44,
-      currency: "CAD",
-      country: "CA",
-      paymentMethodTypes: ["interac_etransfer"],
-      returnUrl: "https://example.com/return",
-      receiptEmail: "payfanout-integration@example.com",
-      idempotencyKey: key(),
-    });
+    let session;
+    try {
+      session = await makeAdapter().createPaymentSession({
+        amount: 5_44,
+        currency: "CAD",
+        country: "CA",
+        paymentMethodTypes: ["interac_etransfer"],
+        returnUrl: "https://example.com/return",
+        receiptEmail: "payfanout-integration@example.com",
+        idempotencyKey: key(),
+      });
+    } catch (err) {
+      // The unified message deliberately hides provider detail, but the whole
+      // point of this test is the provider's own code: 5023 means the field
+      // name is wrong, anything else means it isn't.
+      if (isPayFanoutError(err)) {
+        console.error("[paysafe-integration] Interac handle rejected:", JSON.stringify(err.raw));
+      }
+      throw err;
+    }
 
     expect(session.status).toBe("requires_action");
     const context = await decodeSessionContext(session.pspSessionId, "integration-session-signing-key");

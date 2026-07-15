@@ -1,5 +1,13 @@
 # @payfanout/adapter-payzen
 
+## 0.2.5
+
+### Patch Changes
+
+- Updated dependencies [80b9bb6]
+- Updated dependencies [d1d42fa]
+  - @payfanout/core@2.0.0
+
 ## 0.2.4
 
 ### Patch Changes

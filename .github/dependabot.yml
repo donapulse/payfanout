@@ -13,6 +13,12 @@ updates:
       production-dependencies:
         dependency-type: production
     open-pull-requests-limit: 5
+    ignore:
+      # Compiler majors are adopted deliberately, not via the weekly group:
+      # typescript-eslint has no TypeScript 7 support yet, so a grouped bump
+      # crashes the lint gate.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: "/"

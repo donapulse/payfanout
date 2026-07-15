@@ -201,9 +201,12 @@ const { phase, result } = useRedirectReturn({ onResult: showOutcome });
 // phase: "checking" | "none" (normal page load) | "complete"
 ```
 
-Implemented for Stripe today (`payment_intent_client_secret` params → real intent status,
-not the `redirect_status` hint). Paysafe redirect methods stay capability-off until an
-account with them enabled lets us verify the return params.
+Implemented for Stripe (`payment_intent_client_secret` params → real intent status, not
+the `redirect_status` hint), GoCardless (resolves `"processing"`; webhooks carry the
+outcome) and Paysafe Interac e-Transfer, which resolves `requires_confirmation` plus a
+placeholder `clientToken`: pass `onServerCompletion` so the completion transport can finish
+the payment — the real handle token rides the signed session context (see the
+[Paysafe guide](/guide/paysafe#_8-interac-e-transfer-canada)).
 
 ## Async rails: polling to a terminal state
 

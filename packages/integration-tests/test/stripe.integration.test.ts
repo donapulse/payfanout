@@ -409,3 +409,52 @@ describeIf("Stripe sandbox integration", () => {
     }
   });
 });
+
+describeIf("Stripe payment_method_types vs intent currency", () => {
+  // The API reference does not state what an explicit payment_method_types
+  // entry incompatible with the intent currency does, so the behavior is
+  // pinned here against the real sandbox rather than assumed. If either pin
+  // flips, Stripe changed the contract the adapter's narrowing rests on —
+  // revisit docs/decisions.md before touching the narrowing.
+  it("rejects creating a GBP PaymentIntent restricted to sepa_debit", async () => {
+    await expect(
+      rawStripe().paymentIntents.create({ amount: 1000, currency: "gbp", payment_method_types: ["sepa_debit"] }),
+    ).rejects.toMatchObject({ type: "StripeInvalidRequestError" });
+  });
+
+  it("rejects a mixed GBP PaymentIntent carrying sepa_debit alongside card", async () => {
+    // The incompatible entry is not silently filtered — it fails the whole
+    // creation, which is why the adapter must narrow before the call.
+    await expect(
+      rawStripe().paymentIntents.create({
+        amount: 1000,
+        currency: "gbp",
+        payment_method_types: ["sepa_debit", "card"],
+      }),
+    ).rejects.toMatchObject({ type: "StripeInvalidRequestError" });
+  });
+
+  it("the adapter narrows a mixed request to the rails that settle the currency", async () => {
+    const adapter = makeAdapter();
+    const session = await adapter.createPaymentSession({
+      amount: 1000,
+      currency: "GBP",
+      paymentMethodTypes: ["sepa_debit", "card"],
+      idempotencyKey: key(),
+    });
+    const pi = await rawStripe().paymentIntents.retrieve(session.pspSessionId);
+    expect(pi.payment_method_types).toEqual(["card"]);
+  });
+
+  it("the adapter rejects an all-ineligible request without calling Stripe", async () => {
+    const adapter = makeAdapter();
+    await expect(
+      adapter.createPaymentSession({
+        amount: 1000,
+        currency: "GBP",
+        paymentMethodTypes: ["sepa_debit"],
+        idempotencyKey: key(),
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+  });
+});

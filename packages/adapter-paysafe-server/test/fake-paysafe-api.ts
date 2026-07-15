@@ -1,4 +1,4 @@
-import type { PaysafePaymentLike, PaysafeStoredHandleLike } from "../src/index.js";
+import type { PaysafeBankAccountLike, PaysafePaymentLike, PaysafeStoredHandleLike } from "../src/index.js";
 
 /**
  * In-memory Paysafe Payments API. Dedupes on merchantRefNum exactly like the
@@ -15,11 +15,20 @@ export class FakePaysafeApi {
   private readonly customers = new Map<string, { id: string; merchantCustomerId?: string; handles: PaysafeStoredHandleLike[] }>();
   private readonly multiUseTokens = new Set<string>();
   private readonly storedHandleRefs = new Map<string, PaysafeStoredHandleLike>();
+  /** Redirect/bank-rail handles, keyed by token, so createPayment can echo their paymentType and bank object. */
+  private readonly railHandles = new Map<
+    string,
+    { paymentType: string; sepa?: PaysafeBankAccountLike; bacs?: PaysafeBankAccountLike }
+  >();
+  private readonly handleRefs = new Map<string, Record<string, unknown>>();
   private seq = 0;
+  uniqueHandleCreations = 0;
   uniquePaymentCreations = 0;
   uniqueRefundCreations = 0;
   uniqueCustomerCreations = 0;
   lastRequestBody: Record<string, unknown> | undefined;
+  /** Bank completion makes TWO calls; lastRequestBody ends on the payment, this keeps the handle. */
+  lastHandleRequestBody: Record<string, unknown> | undefined;
   /** Test levers for the verifyCredentials probe (bad key / transient outage). */
   authFailure = false;
   networkFailure = false;
@@ -38,6 +47,7 @@ export class FakePaysafeApi {
     }
 
     if (method === "POST" && path === "/paymenthub/v1/payments") return this.createPayment(body!);
+    if (method === "POST" && path === "/paymenthub/v1/paymenthandles") return this.createPaymentHandle(body!);
     if (method === "POST" && path === "/paymenthub/v1/customers") {
       const merchantCustomerId = body!["merchantCustomerId"] as string;
       // Real API 409s with 7505 on duplicate merchantCustomerId.
@@ -157,6 +167,97 @@ export class FakePaysafeApi {
     return json(404, { error: { code: "5269", message: `No route ${method} ${path}` } });
   };
 
+  /**
+   * POST /paymenthandles for redirect and bank-debit rails. Redirect (Interac)
+   * mirrors the documented response: INITIATED + action REDIRECT + the
+   * redirect_payment link. Bank rails come back immediately PAYABLE.
+   */
+  private createPaymentHandle(body: Record<string, unknown>): Response {
+    this.lastHandleRequestBody = body;
+    const refNum = body["merchantRefNum"] as string;
+    const existing = this.handleRefs.get(refNum);
+    if (existing) return json(200, existing);
+    const paymentType = body["paymentType"] as string;
+    if (["SEPA", "ACH", "BACS", "EFT"].includes(paymentType)) {
+      return this.createBankHandle(refNum, paymentType, body);
+    }
+    const interac = body["interacEtransfer"] as { consumerId?: string } | undefined;
+    if (paymentType === "INTERAC_ETRANSFER" && !interac?.consumerId) {
+      return json(400, {
+        error: { code: "5068", message: "Field error(s)", fieldErrors: [{ field: "interacEtransfer.consumerId", error: "Either invalid or no value provided" }] },
+      });
+    }
+    if (!Array.isArray(body["returnLinks"])) {
+      return json(400, {
+        error: { code: "5068", message: "Field error(s)", fieldErrors: [{ field: "returnLinks", error: "Either invalid or no value provided" }] },
+      });
+    }
+    const id = `ph_${++this.seq}`;
+    const handle = {
+      id,
+      paymentHandleToken: `PH${this.seq}Token`,
+      merchantRefNum: refNum,
+      paymentType,
+      currencyCode: body["currencyCode"] as string,
+      amount: body["amount"] as number,
+      status: "INITIATED",
+      action: "REDIRECT",
+      txnTime: "2026-07-04T10:00:00Z",
+      links: [{ rel: "redirect_payment", href: `https://api.test.paysafe.com/alternatepayments/v1/redirect?paymentHandleId=${id}` }],
+    };
+    this.handleRefs.set(refNum, handle);
+    this.railHandles.set(handle.paymentHandleToken, { paymentType });
+    this.uniqueHandleCreations++;
+    return json(201, handle);
+  }
+
+  /**
+   * Bank-debit handles: immediately PAYABLE (doc: ACH/EFT handles "should
+   * immediately have the status of PAYABLE"), no redirect and no returnLinks.
+   * SEPA/BACS echo their bank object with the scheme mandate reference, like
+   * the real payloads do; the object is required, as the rail cannot debit an
+   * account it was never told about.
+   */
+  private createBankHandle(refNum: string, paymentType: string, body: Record<string, unknown>): Response {
+    const railKey = paymentType.toLowerCase();
+    const bank = body[railKey] as Record<string, string> | undefined;
+    if (!bank || typeof bank !== "object") {
+      return json(400, {
+        error: { code: "5068", message: "Field error(s)", fieldErrors: [{ field: railKey, error: "Either invalid or no value provided" }] },
+      });
+    }
+    const id = `ph_${++this.seq}`;
+    const account = bank["iban"] ?? bank["accountNumber"] ?? "";
+    const echo: PaysafeBankAccountLike | undefined =
+      paymentType === "SEPA" || paymentType === "BACS"
+        ? {
+            accountHolderName: bank["accountHolderName"],
+            lastDigits: account.slice(-4),
+            mandateReference: `MND${this.seq}REF`,
+          }
+        : undefined;
+    const handle = {
+      id,
+      paymentHandleToken: `PH${this.seq}Token`,
+      merchantRefNum: refNum,
+      paymentType,
+      currencyCode: body["currencyCode"] as string,
+      amount: body["amount"] as number,
+      status: "PAYABLE",
+      usage: "SINGLE_USE",
+      txnTime: "2026-07-04T10:00:00Z",
+      ...(echo ? { [railKey]: echo } : {}),
+    };
+    this.handleRefs.set(refNum, handle);
+    this.railHandles.set(handle.paymentHandleToken, {
+      paymentType,
+      ...(echo && paymentType === "SEPA" ? { sepa: echo } : {}),
+      ...(echo && paymentType === "BACS" ? { bacs: echo } : {}),
+    });
+    this.uniqueHandleCreations++;
+    return json(201, handle);
+  }
+
   private createPayment(body: Record<string, unknown>): Response {
     // Real API strict-parses the body: webhook/returnLinks/shippingDetails are
     // handle-level fields and get rejected here (error 5023).
@@ -196,9 +297,34 @@ export class FakePaysafeApi {
       card: { cardType: "VI", lastDigits: "1111", cardExpiry: { month: 12, year: 2030 } },
       settlements: [],
     };
-    if (settleWithAuth) {
+    const railHandle = this.railHandles.get(token);
+    if (railHandle) {
+      // Bank rails do not authorize on the spot: the real API answers PROCESSING
+      // and the outcome lands later by webhook. The settlement exists immediately,
+      // in flight, sharing the payment's refNum — and reports availableToRefund: 0,
+      // which means "not refundable yet", NOT "already refunded". SEPA/BACS
+      // payments echo their bank object (webhook payloads show it there).
+      payment.paymentType = railHandle.paymentType;
+      payment.status = "PROCESSING";
+      payment.availableToSettle = 0;
+      delete payment.card;
+      if (railHandle.sepa) payment.sepa = railHandle.sepa;
+      if (railHandle.bacs) payment.bacs = railHandle.bacs;
+      const settlement = {
+        id: `stl_${++this.seq}`,
+        merchantRefNum: refNum,
+        status: "PROCESSING",
+        amount,
+        availableToRefund: 0,
+        txnTime: "2026-07-04T10:00:01Z",
+      };
+      payment.settlements = [settlement];
+      this.settlementRefs.set(refNum, settlement);
+    }
+    if (settleWithAuth && !railHandle) {
       // Real API: auto-capture creates an implicit settlement sharing the
       // payment's merchantRefNum, discoverable only via the settlements query.
+      // Nothing settles while a bank rail is still PROCESSING.
       const settlement = {
         id: `stl_${++this.seq}`,
         merchantRefNum: refNum,

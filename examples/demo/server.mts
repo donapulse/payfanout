@@ -23,6 +23,7 @@ import { PaysafeServerAdapter } from "@payfanout/adapter-paysafe-server";
 import { PayZenServerAdapter } from "@payfanout/adapter-payzen-server";
 import { GoCardlessServerAdapter, parseGoCardlessWebhookEvents } from "@payfanout/adapter-gocardless-server";
 import { PayPalServerAdapter } from "@payfanout/adapter-paypal-server";
+import { WorldlineServerAdapter } from "@payfanout/adapter-worldline-server";
 
 const stripe = new StripeServerAdapter({
   // Unset CI secrets render as EMPTY strings, not undefined — || treats them as absent.
@@ -64,8 +65,23 @@ const paypal = new PayPalServerAdapter({
   webhookId: process.env.PAYPAL_WEBHOOK_ID,
 });
 
+const worldline = new WorldlineServerAdapter({
+  apiKeyId: process.env.WORLDLINE_API_KEY_ID || "replace_me",
+  secretApiKey: process.env.WORLDLINE_SECRET_API_KEY || "replace_me",
+  merchantId: process.env.WORLDLINE_MERCHANT_ID || "replace_me",
+  environment: "sandbox",
+  sessionSigningKey: process.env.WORLDLINE_SESSION_KEY || "dev-only-session-signing-key",
+  // string keyId + secret per webhook key; pass several to rotate with no cutover.
+  webhookKeys: [
+    {
+      keyId: process.env.WORLDLINE_WEBHOOKS_KEY_ID || "replace_me",
+      secretKey: process.env.WORLDLINE_WEBHOOKS_SECRET_KEY || "dev-only-webhook-secret",
+    },
+  ],
+});
+
 const payments = new PaymentService({
-  adapters: [stripe, paysafe, gocardless, paypal, payzen],
+  adapters: [stripe, paysafe, gocardless, paypal, payzen, worldline],
   // Observability seam: one metadata-only record per adapter call. In
   // production this feeds metrics/tracing; the demo just shows it exists.
   telemetry: (t) =>
@@ -168,14 +184,16 @@ const stripeHook = createAdapterWebhookHandler(stripe, { onEvent, log: console.l
 const paysafeHook = createAdapterWebhookHandler(paysafe, { onEvent, log: console.log });
 const payzenHook = createAdapterWebhookHandler(payzen, { onEvent, log: console.log });
 const paypalHook = createAdapterWebhookHandler(paypal, { onEvent, log: console.log });
+const worldlineHook = createAdapterWebhookHandler(worldline, { onEvent, log: console.log });
 // PayZen stays out of the unified route (form-urlencoded IPNs, not JSON);
 // gocardless here handles single-event deliveries only — batched deliveries 400; /webhooks/gocardless below is the real ingress.
-const unifiedHook = createUnifiedWebhookHandler([stripe, paysafe, gocardless, paypal], { onEvent, log: console.log });
+const unifiedHook = createUnifiedWebhookHandler([stripe, paysafe, gocardless, paypal, worldline], { onEvent, log: console.log });
 
 for (const [path, handler] of [
   ["/webhooks/stripe", stripeHook],
   ["/webhooks/paysafe", paysafeHook],
   ["/webhooks/paypal", paypalHook],
+  ["/webhooks/worldline", worldlineHook],
   ["/webhooks/unified", unifiedHook], // single shared entry point variant
 ] as const) {
   app.post(path, express.raw({ type: "application/json" }), async (req, res) => {

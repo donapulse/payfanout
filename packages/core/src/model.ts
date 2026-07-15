@@ -42,6 +42,10 @@ export const PAYMENT_METHOD_TYPES = [
   "sepa_debit",
   "ach",
   "bacs_debit",
+  // Pre-Authorized Debit, the Payments Canada scheme for pulling debits from
+  // Canadian accounts. PSPs name it inconsistently — Stripe "acss_debit",
+  // GoCardless "pad", Paysafe "EFT" — so the scheme name is the neutral one.
+  "pad",
   "interac_etransfer",
   "skrill",
   "neteller",
@@ -58,6 +62,28 @@ export interface PaymentMethodCapability {
   type: UnifiedPaymentMethodType;
   flow: PaymentMethodFlow;
   supported: boolean;
+  /**
+   * Hard per-method currency constraint (ISO 4217, uppercase) — a rail that
+   * settles in one currency only (SEPA in EUR, Bacs in GBP). ABSENT means
+   * unrestricted; the PSP-wide `AdapterCapabilities.supportedCurrencies` still
+   * applies on top. Declared rather than guarded privately so the router can
+   * pre-screen: a currency-ineligible rail must be skipped in favour of an
+   * eligible PSP, not attempted and rejected at the PSP.
+   */
+  currencies?: string[];
+  /**
+   * Hard per-method CUSTOMER-country constraint (ISO 3166-1 alpha-2,
+   * uppercase) — a rail only customers in specific countries can pay with
+   * (Bacs needs a UK bank account, Interac a Canadian one). ABSENT or empty
+   * means unrestricted. Screening consults it only when the session states
+   * `customerCountry`; with no country stated the rail passes — a best-effort
+   * pre-filter, never an eligibility guarantee, because the true constraint
+   * is the bank account the customer brings. Declare only what the provider
+   * documents as a country (or a short closed list); a zone rail (SEPA) stays
+   * undeclared — encoding the zone's membership would screen out valid
+   * payments the day it drifts.
+   */
+  countries?: string[];
 }
 
 export interface AdapterCapabilities {

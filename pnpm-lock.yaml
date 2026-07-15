@@ -79,6 +79,12 @@ importers:
       '@payfanout/adapter-stripe-server':
         specifier: workspace:*
         version: link:../../packages/adapter-stripe-server
+      '@payfanout/adapter-worldline':
+        specifier: workspace:*
+        version: link:../../packages/adapter-worldline
+      '@payfanout/adapter-worldline-server':
+        specifier: workspace:*
+        version: link:../../packages/adapter-worldline-server
       '@payfanout/core':
         specifier: workspace:*
         version: link:../../packages/core
@@ -169,6 +175,9 @@ importers:
       '@payfanout/conformance':
         specifier: workspace:*
         version: link:../conformance
+      jsdom:
+        specifier: ^29.1.1
+        version: 29.1.1
 
   packages/adapter-paysafe-server:
     dependencies:
@@ -218,6 +227,26 @@ importers:
       stripe:
         specifier: ^22.3.0
         version: 22.3.0(@types/node@26.1.1)
+    devDependencies:
+      '@payfanout/conformance':
+        specifier: workspace:*
+        version: link:../conformance
+
+  packages/adapter-worldline:
+    dependencies:
+      '@payfanout/core':
+        specifier: workspace:*
+        version: link:../core
+    devDependencies:
+      '@payfanout/conformance':
+        specifier: workspace:*
+        version: link:../conformance
+
+  packages/adapter-worldline-server:
+    dependencies:
+      '@payfanout/core':
+        specifier: workspace:*
+        version: link:../core
     devDependencies:
       '@payfanout/conformance':
         specifier: workspace:*

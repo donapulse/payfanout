@@ -45,6 +45,8 @@ Two more non-negotiables baked into the design:
 | `@payfanout/adapter-paypal` | client | PayPal Buttons: popup approval, no card fields (tokenize-first). |
 | `@payfanout/adapter-payzen-server` | server | PayZen (Lyra) REST API V4: payments, validation capture, refunds, IPN verification. **Edge-runtime compatible** (WebCrypto, no Node builtins). |
 | `@payfanout/adapter-payzen` | client | PayZen krypton-client embedded card fields (confirm-on-client, 3DS inline). |
+| `@payfanout/adapter-worldline-server` | server | Worldline Direct Online Payments REST v2: Hosted Tokenization, payments, captures, refunds, webhooks. **Edge-runtime compatible** (WebCrypto, no Node builtins). |
+| `@payfanout/adapter-worldline` | client | Worldline Direct Hosted Tokenization Page iframe (tokenize-first). |
 | `@payfanout/conformance` | tests | The contract suite every adapter, present or future, must pass. |
 
 Client packages have **zero** dependency on anything holding secrets; this is enforced

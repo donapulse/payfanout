@@ -16,7 +16,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { getRefundState, isPayFanoutError, isUnifiedPaymentStatus } from "@payfanout/core";
-import { PaysafeServerAdapter } from "@payfanout/adapter-paysafe-server";
+import { decodeSessionContext, PaysafeServerAdapter } from "@payfanout/adapter-paysafe-server";
 import { isLiveHost } from "./live-host-guard.js";
 
 const USERNAME = process.env.PAYSAFE_USERNAME;
@@ -486,4 +486,282 @@ describeIf("Paysafe sandbox integration", () => {
       adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken: "irrelevant", idempotencyKey: key() }),
     ).rejects.toThrowError(/expired/);
   });
+});
+
+/**
+ * Interac e-Transfer. The point of this suite is to settle a contradiction in
+ * Paysafe's own documentation that no amount of reading can resolve: the
+ * request field is spelled `interacETransfer` by the OpenAPI schema
+ * (`interacObject`, flagged x-internal) and `interacEtransfer` by every request
+ * example and the integration guide. The adapter sends the latter. Paysafe
+ * strict-rejects unrecognized fields with error 5023, so the sandbox is the
+ * arbiter — if the spelling is wrong, creating the session fails here.
+ *
+ * Nothing is charged: the handle stops at INITIATED because no customer ever
+ * authenticates at Interac.
+ */
+/** The provider's own message, which the unified error deliberately replaces. */
+function errorMessageOf(err: { raw?: unknown }): string {
+  return (err.raw as { error?: { message?: string } } | undefined)?.error?.message ?? "";
+}
+
+describeIf("Paysafe Interac e-Transfer (real sandbox)", () => {
+  // The rail is Canada-only; a non-CAD sandbox account cannot exercise it.
+  const itIfCad = CURRENCY === "CAD" ? it : it.skip;
+
+  itIfCad("mints a payment handle and returns a redirect link", async () => {
+    let session;
+    try {
+      session = await makeAdapter().createPaymentSession({
+        amount: 5_44,
+        currency: "CAD",
+        country: "CA",
+        paymentMethodTypes: ["interac_etransfer"],
+        returnUrl: "https://example.com/return",
+        receiptEmail: "payfanout-integration@example.com",
+        idempotencyKey: key(),
+      });
+    } catch (err) {
+      // Sandbox-verified 2026-07-15: this account answers PAYMENTHUB-1, "payment
+      // type and currency code combination is not supported for your account" —
+      // it has no Interac capability, which is an account provisioning fact and
+      // not a code defect (same tolerance as the unbatched-settlement cases
+      // above). Notably NOT 5023 "field not recognized", so the request body —
+      // interacEtransfer included — parsed. Once Paysafe enables the rail, this
+      // test starts asserting for real.
+      if (isPayFanoutError(err) && /not supported for your account/i.test(errorMessageOf(err))) {
+        console.warn(
+          "[paysafe-integration] Interac deferred — no INTERAC_ETRANSFER/CAD capability on this sandbox account:",
+          JSON.stringify(err.raw),
+        );
+        return;
+      }
+      // Anything else is the answer this suite exists to get: log it verbatim,
+      // because the unified message hides the provider code that explains it.
+      if (isPayFanoutError(err)) {
+        console.error("[paysafe-integration] Interac handle rejected:", JSON.stringify(err.raw));
+      }
+      throw err;
+    }
+
+    expect(session.status).toBe("requires_action");
+    const context = await decodeSessionContext(session.pspSessionId, "integration-session-signing-key");
+    expect(context.paymentHandleToken).toBeTruthy();
+    // Proves Paysafe accepted `interacEtransfer` AND issued the redirect the
+    // customer is sent to.
+    expect(context.redirectUrl).toMatch(/^https:\/\//);
+  }, 30_000);
+
+  itIfCad("rejects the rail in a currency it does not settle", async () => {
+    await expect(
+      makeAdapter().createPaymentSession({
+        amount: 5_44,
+        currency: "USD",
+        country: "US",
+        paymentMethodTypes: ["interac_etransfer"],
+        returnUrl: "https://example.com/return",
+        receiptEmail: "payfanout-integration@example.com",
+        idempotencyKey: key(),
+      }),
+    ).rejects.toThrowError(/CAD only/);
+  });
+});
+
+/**
+ * Bank-debit rails (SEPA/ACH/BACS/EFT). Paysafe's public pages stop at the
+ * flow description — the per-rail request field lists, the profile embedding,
+ * and the mandate linkage are not public (the API reference is a SPA) — so
+ * these probes are the arbiter for the request shape the adapter sends: the
+ * lowercase bank object and its field names, profile-on-handle, settleWithAuth
+ * on the payment, and merchantRefNum reuse across the handle and payment
+ * calls. Field-validation rejections (5023 unrecognized field, 5068
+ * missing/invalid field) mean the shape is wrong and MUST fail the probe; a
+ * capability rejection only proves this sandbox account is not provisioned for
+ * the rail/currency (the known shape: PAYMENTHUB-1, "payment type and currency
+ * code combination is not supported for your account") — the same tolerance
+ * the Interac suite above applies.
+ */
+const bankEnvelope = (details: Record<string, unknown>): string =>
+  `paysafe-bank.${Buffer.from(JSON.stringify(details)).toString("base64url")}`;
+
+function paysafeErrorCode(err: { raw?: unknown }): string {
+  return (err.raw as { error?: { code?: string } } | undefined)?.error?.code ?? "";
+}
+
+/** 5023 = unrecognized field, 5068 = missing/invalid field — the shape-is-wrong signals. */
+function isFieldValidationError(err: { raw?: unknown }): boolean {
+  const code = paysafeErrorCode(err);
+  return code === "5023" || code === "5068";
+}
+
+/** Rail/currency not provisioned on this sandbox account — a provisioning fact, not a code defect. */
+function isAccountCapabilityError(err: { raw?: unknown }): boolean {
+  if (isFieldValidationError(err)) return false;
+  return (
+    /not supported for your account/i.test(errorMessageOf(err)) ||
+    paysafeErrorCode(err).startsWith("PAYMENTHUB") ||
+    // 5005 "Unsupported operation" — sandbox-verified 2026-07-15: this CAD
+    // account answers it for SEPA/BACS handle creation ("Creation of sepa
+    // single use payment handle is not supported"). The request PARSED (not
+    // 5023/5068); the operation is refused. On an account with no EUR/GBP
+    // provisioning that is indistinguishable from a provisioning gap, so it
+    // defers like PAYMENTHUB-1 — but the wording leaves open that mandate
+    // rails may need a different handle vehicle on provisioned accounts, so
+    // a merchant enabling SEPA/BACS must re-run this probe against theirs.
+    paysafeErrorCode(err) === "5005"
+  );
+}
+
+describeIf("Paysafe bank-debit rails (real sandbox)", () => {
+  // EFT is the CAD rail, so the CAD sandbox account is the one that can run
+  // the full probe: envelope -> PAYABLE handle -> charge -> retrieve.
+  const itIfCad = CURRENCY === "CAD" ? it : it.skip;
+
+  itIfCad("EFT: completes a payment from the documented simulation values", async () => {
+    const adapter = makeAdapter();
+    const session = await adapter.createPaymentSession({
+      amount: 5_66,
+      currency: "CAD",
+      country: "CA",
+      paymentMethodTypes: ["pad"],
+      billingDetails: {
+        address: { line1: "1 Integration Way", city: "Toronto", postalCode: "M5V 3L9", country: "CA" },
+      },
+      receiptEmail: "payfanout-integration@example.com",
+      idempotencyKey: key(),
+    });
+    expect(session.status).toBe("requires_payment_method");
+    let info;
+    try {
+      info = await adapter.completePayment({
+        pspSessionId: session.pspSessionId,
+        clientToken: bankEnvelope({
+          v: 1,
+          paymentType: "EFT",
+          accountHolderName: "PayFanout Integration",
+          // Documented simulation values: institution 001 + transit 22446
+          // simulates success; 897543213 is the only account number the EFT
+          // page publishes (its error row keys on transit 00109, not on it).
+          institutionId: "001",
+          transitNumber: "22446",
+          accountNumber: "897543213",
+        }),
+        idempotencyKey: key(),
+      });
+    } catch (err) {
+      if (isPayFanoutError(err) && isAccountCapabilityError(err)) {
+        console.warn(
+          "[paysafe-integration] EFT deferred — no EFT/CAD capability on this sandbox account:",
+          JSON.stringify(err.raw),
+        );
+        return;
+      }
+      if (isPayFanoutError(err)) {
+        console.error("[paysafe-integration] EFT completion rejected:", JSON.stringify(err.raw));
+      }
+      throw err;
+    }
+    expect(["processing", "succeeded"]).toContain(info.status);
+    expect(info.amount).toBe(5_66);
+    expect(info.currency).toBe("CAD");
+    const retrieved = await adapter.retrievePayment(info.pspPaymentId);
+    expect(retrieved.pspPaymentId).toBe(info.pspPaymentId);
+    expect(retrieved.amount).toBe(5_66);
+  }, 30_000);
+
+  const railProbes = [
+    {
+      name: "SEPA",
+      rail: "sepa_debit" as const,
+      currency: "EUR",
+      country: "DE",
+      billing: { line1: "9 Integration Str", city: "Berlin", postalCode: "10115", country: "DE" },
+      envelope: {
+        v: 1,
+        paymentType: "SEPA",
+        accountHolderName: "PayFanout Integration",
+        iban: "NL77ABNA0492122466", // documented SEPA test IBAN
+        bic: "ABNANL2A",
+        mandateConsent: true,
+      },
+    },
+    {
+      name: "BACS",
+      rail: "bacs_debit" as const,
+      currency: "GBP",
+      country: "GB",
+      billing: { line1: "9 Integration Rd", city: "London", postalCode: "SW1A 1AA", country: "GB" },
+      envelope: {
+        v: 1,
+        paymentType: "BACS",
+        accountHolderName: "PayFanout Integration",
+        sortCode: "086081", // documented BACS test values
+        accountNumber: "51120177",
+        mandateConsent: true,
+      },
+    },
+    {
+      name: "ACH",
+      rail: "ach" as const,
+      currency: "USD",
+      country: "US",
+      billing: { line1: "9 Integration Ave", city: "New York", postalCode: "10001", country: "US" },
+      // Paysafe publishes no ACH simulation values (pages checked 2026-07-15),
+      // so these coordinates are synthetic and this probe validates request
+      // shape only. Should the account ever gain ACH capability, value-level
+      // rejections will surface here and the values need Paysafe's official ones.
+      envelope: {
+        v: 1,
+        paymentType: "ACH",
+        accountHolderName: "PayFanout Integration",
+        routingNumber: "123456789",
+        accountNumber: "1234567890",
+      },
+    },
+  ];
+
+  for (const probe of railProbes) {
+    it(`${probe.name}: the adapter's request shape parses (payment or capability rejection)`, async () => {
+      const adapter = makeAdapter();
+      const session = await adapter.createPaymentSession({
+        amount: 6_77,
+        currency: probe.currency,
+        country: probe.country,
+        paymentMethodTypes: [probe.rail],
+        billingDetails: { address: probe.billing },
+        receiptEmail: "payfanout-integration@example.com",
+        idempotencyKey: key(),
+      });
+      try {
+        const info = await adapter.completePayment({
+          pspSessionId: session.pspSessionId,
+          clientToken: bankEnvelope(probe.envelope),
+          idempotencyKey: key(),
+        });
+        expect(["processing", "succeeded"]).toContain(info.status);
+        expect(info.amount).toBe(6_77);
+        // Where the SEPA/BACS mandate reference first appears is undocumented —
+        // record what the sandbox answered.
+        console.warn(
+          `[paysafe-integration] ${probe.name} completed; mandateReference=${info.mandateReference ?? "(absent)"}`,
+        );
+      } catch (err) {
+        if (isPayFanoutError(err) && isAccountCapabilityError(err)) {
+          // Expected on a single-currency (CAD) sandbox account. Notably NOT
+          // 5023/5068 — the request body parsed, which is what this probe is for.
+          console.warn(
+            `[paysafe-integration] ${probe.name} deferred — rail/currency not provisioned on this sandbox account:`,
+            JSON.stringify(err.raw),
+          );
+          return;
+        }
+        // A field-validation rejection means the adapter's request shape is
+        // wrong — exactly what must fail loudly here.
+        if (isPayFanoutError(err)) {
+          console.error(`[paysafe-integration] ${probe.name} completion rejected:`, JSON.stringify(err.raw));
+        }
+        throw err;
+      }
+    }, 30_000);
+  }
 });

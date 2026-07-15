@@ -133,6 +133,19 @@ export function runServerAdapterConformanceTests(
         expect(PAYMENT_METHOD_TYPES).toContain(method.type);
         expect(PAYMENT_METHOD_FLOWS).toContain(method.flow);
         expect(typeof method.supported).toBe("boolean");
+        // Per-method currencies is the same pre-screen input at rail scope: a
+        // malformed code never matches, silently disabling the rail instead of
+        // gating it. A single-currency rail (SEPA/EUR) that omits it routes
+        // dishonestly — but only the adapter knows, so shape is what's checkable.
+        for (const currency of method.currencies ?? []) {
+          expect(currency).toMatch(/^[A-Z]{3}$/);
+        }
+        // Countries mirror currencies (ISO 3166-1 alpha-2, customer side): a
+        // malformed code never matches a session's customerCountry, so the
+        // rail silently screens out for every session that states one.
+        for (const country of method.countries ?? []) {
+          expect(country).toMatch(/^[A-Z]{2}$/);
+        }
       }
       // supportedCurrencies is a router pre-screen input — malformed codes
       // would silently disable a PSP for every payment.

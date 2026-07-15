@@ -3,11 +3,13 @@ import {
   brandMountedFieldsHandle,
   injectScript,
   PayFanoutError,
+  utf8ToBase64Url,
   type ClientPaymentAdapter,
   type ConfirmResult,
   type MountedFieldsHandle,
   type MountOptions,
   type PaymentMethodCapability,
+  type RedirectReturnLocation,
   type UnifiedError,
   type UnifiedErrorCode,
 } from "@payfanout/core";
@@ -52,6 +54,24 @@ export interface PaysafeClientAdapterConfig {
 
 const PAYSAFE_JS_URL = "https://hosted.paysafe.com/js/v1/latest/paysafe.min.js";
 
+/**
+ * Query parameter the SERVER adapter appends to the returnLinks it registers, so
+ * the return trip is identifiable (Paysafe itself adds nothing). Kept in step
+ * with PAYSAFE_RETURN_MARKER in adapter-paysafe-server — the packages share no
+ * code, since a client-safe package cannot depend on a server one.
+ */
+const PAYSAFE_RETURN_MARKER = "payfanout_psp";
+
+/**
+ * What the marked return trip resolves as its clientToken. The value is a
+ * placeholder: the real handle token rides the signed session context, and the
+ * server adapter ignores the wire token for a session whose handle is already
+ * minted. It still has to be non-empty — the react transport only invokes the
+ * host's completion callback when a clientToken is present, and the standard
+ * completion route rejects an empty string.
+ */
+const PAYSAFE_REDIRECT_CLIENT_TOKEN = "paysafe-redirect-return";
+
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "card", flow: "embedded", supported: true },
   { type: "apple_pay", flow: "popup", supported: false },
@@ -60,6 +80,23 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "neteller", flow: "redirect", supported: false },
   { type: "paysafecard", flow: "voucher_code", supported: false },
   { type: "paysafecash", flow: "voucher_code", supported: false },
+  // Bank-debit rails, mirroring the server adapter: implemented, but off by
+  // default — enablement is per merchant account, and an opt-in override via
+  // config.paymentMethods must carry its own gates. ACH and EFT declare no
+  // currencies (Paysafe documents none for either) and SEPA no countries (a
+  // zone, not a country). The currency/country literals are kept in step with
+  // adapter-paysafe-server — the packages share no code, since a client-safe
+  // package cannot depend on a server one.
+  { type: "sepa_debit", flow: "embedded", supported: false, currencies: ["EUR"] },
+  { type: "ach", flow: "embedded", supported: false },
+  { type: "bacs_debit", flow: "embedded", supported: false, currencies: ["GBP"], countries: ["GB"] },
+  { type: "pad", flow: "embedded", supported: false, countries: ["CA"] },
+  // Mirrors the server adapter: implemented, but off by default — per-account
+  // enablement and Canada/CAD only. Canadian merchants opt in via
+  // config.paymentMethods, and their override carries the gates. The CAD/CA
+  // literals are kept in step with adapter-paysafe-server — the packages share
+  // no code, since a client-safe package cannot depend on a server one.
+  { type: "interac_etransfer", flow: "redirect", supported: false, currencies: ["CAD"], countries: ["CA"] },
 ];
 
 /** The payload half of the server's signed session context (signature verified server-side only). */
@@ -69,14 +106,151 @@ interface PaysafeSessionPayload {
   currency: string;
   merchantAccountId?: string;
   id?: string;
+  /**
+   * Paysafe paymentType for rails Paysafe.js cannot tokenize: the minted
+   * handle's type on redirect rails, the rail to collect bank details for on
+   * bank-debit sessions (SEPA/ACH/BACS/EFT). Absent on card sessions.
+   */
+  paymentType?: string;
+  /**
+   * Present only for redirect rails (Interac e-Transfer): the server already
+   * minted the handle, and this is where the customer authenticates.
+   */
+  redirectUrl?: string;
 }
 
-interface PaysafeHandle {
+/**
+ * The bank-debit rails, by the paymentType the server stamps into the session
+ * context. Paysafe.js cannot tokenize any of them (Payments API only), so the
+ * adapter collects the details with its own plain inputs and confirm() packs
+ * them into the envelope the server's completePayment parses. Kept in step
+ * with BANK_DEBIT_PAYMENT_TYPES in adapter-paysafe-server — the packages share
+ * no code, since a client-safe package cannot depend on a server one.
+ */
+const BANK_DEBIT_PAYMENT_TYPES = ["SEPA", "ACH", "BACS", "EFT"] as const;
+
+type BankDebitPaymentType = (typeof BANK_DEBIT_PAYMENT_TYPES)[number];
+
+const BANK_DEBIT_TYPE_SET = new Set<string>(BANK_DEBIT_PAYMENT_TYPES);
+
+function isBankDebitPaymentType(paymentType: string | undefined): paymentType is BankDebitPaymentType {
+  return paymentType !== undefined && BANK_DEBIT_TYPE_SET.has(paymentType);
+}
+
+/**
+ * Wire prefix of the bank-details envelope confirm() produces on bank-debit
+ * sessions: "paysafe-bank." + base64url(JSON). Kept in step with the server
+ * adapter, which parses it.
+ */
+const BANK_ENVELOPE_PREFIX = "paysafe-bank.";
+
+/**
+ * The envelope, mirroring the server's PaysafeBankEnvelopeV1 field for field.
+ * Bank details are not card data (SAQ-A is unaffected), but they get the same
+ * discipline: never logged, never echoed into errors, alive only in the DOM
+ * until confirm() reads them.
+ */
+interface PaysafeBankEnvelopeV1 {
+  v: 1;
+  paymentType: BankDebitPaymentType;
+  accountHolderName: string;
+  iban?: string;
+  bic?: string;
+  routingNumber?: string;
+  accountNumber?: string;
+  sortCode?: string;
+  transitNumber?: string;
+  institutionId?: string;
+  /** SEPA/BACS: the customer ticked the direct-debit mandate consent box. */
+  mandateConsent?: boolean;
+}
+
+type BankFieldName = Exclude<keyof PaysafeBankEnvelopeV1, "v" | "paymentType" | "mandateConsent">;
+
+interface BankFieldSpec {
+  name: BankFieldName;
+  label: string;
+  /** No autocomplete tokens exist for bank coordinates — only the holder's name has one. */
+  autocomplete: "name" | "off";
+  /** Digit-only coordinates get the numeric keyboard on touch devices. */
+  numeric?: boolean;
+  /** SEPA's bic is the one optional field; blank means omitted from the envelope. */
+  optional?: boolean;
+}
+
+/**
+ * Per-rail inputs, in render order. Names triple as envelope keys, input
+ * names, and host slot names ([data-payfanout-field="iban"]); the required
+ * sets are kept in step with the server's BANK_REQUIRED_FIELDS. Presence is
+ * the only client-side validation — IBAN/sort-code substance is for the
+ * server and Paysafe to judge, and a local checksum would reject valid
+ * accounts the day it drifted.
+ */
+const BANK_FIELDS: Record<BankDebitPaymentType, readonly BankFieldSpec[]> = {
+  SEPA: [
+    { name: "accountHolderName", label: "Account holder name", autocomplete: "name" },
+    { name: "iban", label: "IBAN", autocomplete: "off" },
+    { name: "bic", label: "BIC (optional)", autocomplete: "off", optional: true },
+  ],
+  ACH: [
+    { name: "accountHolderName", label: "Account holder name", autocomplete: "name" },
+    { name: "routingNumber", label: "Routing number", autocomplete: "off", numeric: true },
+    { name: "accountNumber", label: "Account number", autocomplete: "off", numeric: true },
+  ],
+  BACS: [
+    { name: "accountHolderName", label: "Account holder name", autocomplete: "name" },
+    { name: "sortCode", label: "Sort code", autocomplete: "off", numeric: true },
+    { name: "accountNumber", label: "Account number", autocomplete: "off", numeric: true },
+  ],
+  EFT: [
+    { name: "accountHolderName", label: "Account holder name", autocomplete: "name" },
+    { name: "institutionId", label: "Institution number", autocomplete: "off", numeric: true },
+    { name: "transitNumber", label: "Transit number", autocomplete: "off", numeric: true },
+    { name: "accountNumber", label: "Account number", autocomplete: "off", numeric: true },
+  ],
+};
+
+/** Mandate schemes: SEPA and BACS collect an explicit direct-debit consent. */
+const BANK_MANDATE_PAYMENT_TYPES = new Set<BankDebitPaymentType>(["SEPA", "BACS"]);
+
+/**
+ * Deliberately generic — the mandate's legal text is the host's to provide
+ * (fieldOptions.mandateText); this line only makes the checkbox meaningful.
+ */
+const DEFAULT_MANDATE_TEXT =
+  "I authorise this payment to be collected by direct debit from the account above.";
+
+interface PaysafeCardHandle {
   pspName: "paysafe";
+  kind: "card";
   instance: PaysafeFieldsInstanceLike;
   session: PaysafeSessionPayload;
   cleanup: () => void;
 }
+
+/** Redirect rails have no SDK, no fields and no key in the browser — only the URL. */
+interface PaysafeRedirectHandle {
+  pspName: "paysafe";
+  kind: "redirect";
+  redirectUrl: string;
+  cleanup: () => void;
+}
+
+/** Bank-debit rails render adapter-owned plain inputs — no SDK, no iframes. */
+interface PaysafeBankHandle {
+  pspName: "paysafe";
+  kind: "bank";
+  paymentType: BankDebitPaymentType;
+  inputs: ReadonlyMap<BankFieldName, HTMLInputElement>;
+  /** Present on mandate rails (SEPA/BACS) only. */
+  consent?: HTMLInputElement;
+  cleanup: () => void;
+}
+
+type PaysafeHandle = PaysafeCardHandle | PaysafeRedirectHandle | PaysafeBankHandle;
+
+const DEFAULT_REDIRECT_PANEL_TEXT =
+  "You will be redirected to Interac to authorise this payment with your bank.";
 
 let mountCounter = 0;
 
@@ -120,8 +294,25 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
    */
   async mount(container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
     assertBrowser("PaysafeClientAdapter", "mount");
-    await this.loadSdk();
     const session = decodeSessionPayload(options.clientSecret);
+    // A redirect session carries no card fields, so Paysafe.js is never loaded.
+    if (session.redirectUrl) return this.mountRedirectPanel(container, options, session.redirectUrl);
+    // Bank-debit rails skip Paysafe.js too — it cannot tokenize them, so the
+    // adapter's own inputs collect the details.
+    if (isBankDebitPaymentType(session.paymentType)) {
+      return this.mountBankFields(container, options, session.paymentType);
+    }
+    // The server never mints a typed session outside the rails above (card
+    // sessions carry no paymentType at all), so a type this adapter does not
+    // recognize is version skew. Falling through would tokenize a CARD
+    // payment against a session created for another rail, so fail cleanly
+    // instead — the type names a rail, never account data.
+    if (session.paymentType !== undefined) {
+      throw PayFanoutError.invalidRequest(
+        `This Paysafe session collects "${session.paymentType}" details, which this version of the adapter cannot mount`,
+      );
+    }
+    await this.loadSdk();
     const suffix = `payfanout-psf-${++mountCounter}`;
     const created: HTMLElement[] = [];
     const selectors: Record<string, string> = {};
@@ -172,8 +363,9 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
       });
       options.onReady?.();
       registerFieldStateEvents(instance, options);
-      const handle: PaysafeHandle = {
+      const handle: PaysafeCardHandle = {
         pspName: "paysafe",
+        kind: "card",
         instance,
         session,
         // Removes ONLY our wrappers (and the iframes inside them) — host
@@ -190,13 +382,169 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
   }
 
   /**
+   * Nothing is collected here — the server already minted the handle — so the
+   * panel is plain and unbranded and the fields report complete immediately
+   * (initialized false first, so button state stays deterministic).
+   * `fieldOptions.description` overrides the text; `appearance.panel` carries
+   * inline CSS. The Interac page itself is not themeable from here.
+   */
+  private mountRedirectPanel(
+    container: HTMLElement,
+    options: MountOptions,
+    redirectUrl: string,
+  ): MountedFieldsHandle {
+    const panel = document.createElement("div");
+    panel.setAttribute("data-payfanout-paysafe-panel", "");
+    const description = options.fieldOptions?.["description"];
+    panel.textContent = typeof description === "string" ? description : DEFAULT_REDIRECT_PANEL_TEXT;
+    const style = options.appearance?.["panel"];
+    if (style !== null && typeof style === "object" && !Array.isArray(style)) {
+      Object.assign(panel.style, style);
+    }
+    container.appendChild(panel);
+    options.onChange?.({ complete: false, empty: true });
+    options.onChange?.({ complete: true });
+    options.onReady?.();
+    const handle: PaysafeRedirectHandle = {
+      pspName: "paysafe",
+      kind: "redirect",
+      redirectUrl,
+      cleanup: () => panel.remove(),
+    };
+    return brandMountedFieldsHandle(handle);
+  }
+
+  /**
+   * Bank-debit rails (SEPA/ACH/BACS/EFT) collect the customer's bank details
+   * with adapter-owned plain inputs — Paysafe.js cannot tokenize these rails,
+   * which is exactly why they exist as Payments-API envelopes. Bank account
+   * data is not card data (SAQ-A is unaffected), but it gets the same
+   * discipline: values live only in the DOM until confirm() reads them.
+   *
+   * Layout follows the card path's slot convention: host elements carrying
+   * data-payfanout-field="accountHolderName|iban|…|mandateConsent" become the
+   * mount points; missing slots fall back to adapter-created stacked wrappers.
+   * fieldOptions.fields.<name>.label/.placeholder override the texts (the
+   * whole honest surface of a plain input), fieldOptions.mandateText replaces
+   * the consent line, and the `appearance` translation the card path uses is
+   * applied inline to the inputs.
+   */
+  private mountBankFields(
+    container: HTMLElement,
+    options: MountOptions,
+    paymentType: BankDebitPaymentType,
+  ): MountedFieldsHandle {
+    const suffix = `payfanout-psf-${++mountCounter}`;
+    const created: HTMLElement[] = [];
+    // Same ownership rule as the card path: our wrapper inside the host's
+    // slot (or stacked in the container), so cleanup never touches host
+    // elements and concurrent mounts stay isolated.
+    const mountPoint = (name: string): HTMLElement => {
+      const slot = container.querySelector?.(`[data-payfanout-field="${name}"]`) as HTMLElement | null;
+      const div = document.createElement("div");
+      div.id = `${suffix}-${name}`;
+      (slot ?? container).appendChild(div);
+      created.push(div);
+      return div;
+    };
+
+    const hostFields = (options.fieldOptions?.["fields"] ?? {}) as Record<
+      string,
+      Record<string, unknown> | undefined
+    >;
+    const hostText = (name: string, key: "label" | "placeholder"): string | undefined => {
+      const value = hostFields[name]?.[key];
+      return typeof value === "string" ? value : undefined;
+    };
+    // The card path's appearance translation, applied to our own inputs: the
+    // `input` selector's properties go inline (pseudo-class selectors have no
+    // inline equivalent and are ignored).
+    const inputCss = toPaysafeStyle(options.appearance)?.style["input"] as
+      | Record<string, unknown>
+      | undefined;
+
+    const inputs = new Map<BankFieldName, HTMLInputElement>();
+    for (const spec of BANK_FIELDS[paymentType]) {
+      const wrapper = mountPoint(spec.name);
+      const input = document.createElement("input");
+      input.type = "text"; // never "number" — account coordinates keep leading zeros
+      input.id = `${wrapper.id}-input`;
+      input.name = spec.name;
+      input.autocomplete = spec.autocomplete;
+      input.spellcheck = false;
+      if (spec.numeric) input.inputMode = "numeric";
+      const placeholder = hostText(spec.name, "placeholder");
+      if (placeholder !== undefined) input.placeholder = placeholder;
+      for (const [prop, value] of Object.entries(inputCss ?? {})) {
+        if (typeof value === "string") input.style.setProperty(prop, value);
+      }
+      const label = document.createElement("label");
+      label.htmlFor = input.id;
+      label.textContent = hostText(spec.name, "label") ?? spec.label;
+      wrapper.appendChild(label);
+      wrapper.appendChild(input);
+      inputs.set(spec.name, input);
+    }
+
+    let consent: HTMLInputElement | undefined;
+    if (BANK_MANDATE_PAYMENT_TYPES.has(paymentType)) {
+      const wrapper = mountPoint("mandateConsent");
+      consent = document.createElement("input");
+      consent.type = "checkbox";
+      consent.id = `${wrapper.id}-input`;
+      consent.name = "mandateConsent";
+      const label = document.createElement("label");
+      label.htmlFor = consent.id;
+      const mandateText = options.fieldOptions?.["mandateText"];
+      label.textContent = typeof mandateText === "string" ? mandateText : DEFAULT_MANDATE_TEXT;
+      wrapper.appendChild(consent);
+      wrapper.appendChild(label);
+    }
+
+    options.onReady?.();
+    options.onChange?.({ complete: false, empty: true });
+    if (options.onChange) {
+      const notify = (): void =>
+        options.onChange?.({ complete: isBankFormComplete(paymentType, inputs, consent) });
+      for (const input of inputs.values()) input.addEventListener("input", notify);
+      consent?.addEventListener("change", notify);
+    }
+
+    const handle: PaysafeBankHandle = {
+      pspName: "paysafe",
+      kind: "bank",
+      paymentType,
+      inputs,
+      ...(consent ? { consent } : {}),
+      // Removing our wrappers drops the inputs — and the typed account
+      // details with them — along with their listeners.
+      cleanup: () => created.forEach((el) => el.remove()),
+    };
+    return brandMountedFieldsHandle(handle);
+  }
+
+  /**
    * Tokenize-first shape (§4a): resolves with requires_confirmation plus the
    * Payment Handle token. The host passes that clientToken to the server's
    * completePayment — <PayButton> wires this automatically. 3DS runs inline
    * inside Paysafe.js during tokenize (challenge iframe), never a navigation.
+   *
+   * Redirect rails have no token to produce: confirm() hands the page to the
+   * provider and the outcome resolves server-side after the return trip.
+   *
+   * Bank-debit rails tokenize nothing: confirm() reads the typed details and
+   * packs them into the envelope the server's completePayment mints the
+   * handle from.
    */
   async confirm(handle: MountedFieldsHandle): Promise<ConfirmResult> {
     const h = asPaysafeHandle(handle);
+    if (h.kind === "redirect") {
+      assertBrowser("PaysafeClientAdapter", "confirm");
+      window.location.assign(h.redirectUrl);
+      // The navigation unloads the page, so this promise intentionally never settles.
+      return new Promise<ConfirmResult>(() => {});
+    }
+    if (h.kind === "bank") return confirmBankDetails(h);
     try {
       const { token } = await h.instance.tokenize({
         transactionType: "PAYMENT",
@@ -218,6 +566,28 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
 
   unmount(handle: MountedFieldsHandle): void {
     asPaysafeHandle(handle).cleanup();
+  }
+
+  /**
+   * Paysafe documents no query parameters on the return trip — it signals the
+   * outcome by WHICH returnLinks rel it sends the customer to, and the server
+   * adapter deliberately points them all at the host's one returnUrl. So the
+   * marker the server plants there is the only reliable evidence a Paysafe
+   * redirect landed, and the landing spot never decides the outcome: the rail
+   * is server-completed, so the host finalizes with completePayment. The
+   * clientToken is a placeholder — the real handle token rides the signed
+   * session context and the server ignores the wire value once a handle is
+   * minted — but it must be present and non-empty, because the standard
+   * completion transport only fires when a clientToken exists and the
+   * completion route rejects an empty one.
+   * Returns null on any other URL, so a router can probe every adapter safely.
+   */
+  async handleRedirectReturn(location: RedirectReturnLocation): Promise<ConfirmResult | null> {
+    const params = new URLSearchParams(
+      location.search.startsWith("?") ? location.search.slice(1) : location.search,
+    );
+    if (params.get(PAYSAFE_RETURN_MARKER) !== "paysafe") return null;
+    return { status: "requires_confirmation", clientToken: PAYSAFE_REDIRECT_CLIENT_TOKEN };
   }
 
   listPaymentMethodCapabilities(): PaymentMethodCapability[] {
@@ -267,6 +637,60 @@ function registerFieldStateEvents(instance: PaysafeFieldsInstanceLike, options: 
   } catch {
     // Event registration is best-effort — SDK variations must not break mount.
   }
+}
+
+/** Required inputs filled (whitespace is not a value) and the mandate ticked, where one exists. */
+function isBankFormComplete(
+  paymentType: BankDebitPaymentType,
+  inputs: ReadonlyMap<BankFieldName, HTMLInputElement>,
+  consent: HTMLInputElement | undefined,
+): boolean {
+  for (const spec of BANK_FIELDS[paymentType]) {
+    if (!spec.optional && (inputs.get(spec.name)?.value ?? "").trim() === "") return false;
+  }
+  return consent === undefined || consent.checked;
+}
+
+/**
+ * Reads the typed details, validates presence per rail (naming fields, never
+ * values — account numbers do not belong in error messages or `raw`), and
+ * packs the envelope the server parses. Failures resolve as
+ * { status: "failed" }, exactly like the card path's tokenize failures.
+ */
+function confirmBankDetails(h: PaysafeBankHandle): ConfirmResult {
+  const values: Partial<Record<BankFieldName, string>> = {};
+  const missing: string[] = [];
+  for (const spec of BANK_FIELDS[h.paymentType]) {
+    const value = (h.inputs.get(spec.name)?.value ?? "").trim();
+    if (value !== "") values[spec.name] = value;
+    else if (!spec.optional) missing.push(spec.name);
+  }
+  if (h.consent && !h.consent.checked) missing.push("mandateConsent");
+  if (missing.length > 0) {
+    return {
+      status: "failed",
+      error: new PayFanoutError({
+        code: "invalid_request",
+        message: `The ${h.paymentType} details are incomplete — missing: ${missing.join(", ")}`,
+        retryable: false,
+        raw: { paymentType: h.paymentType, missing },
+        pspName: "paysafe",
+      }),
+    };
+  }
+  const envelope: PaysafeBankEnvelopeV1 = {
+    v: 1,
+    paymentType: h.paymentType,
+    ...values,
+    // Required on every rail, so the missing gate above guarantees it here.
+    accountHolderName: values.accountHolderName!,
+    // The consent gate above makes this unconditionally true when present.
+    ...(h.consent ? { mandateConsent: true } : {}),
+  };
+  return {
+    status: "requires_confirmation",
+    clientToken: `${BANK_ENVELOPE_PREFIX}${utf8ToBase64Url(JSON.stringify(envelope))}`,
+  };
 }
 
 /** The small cross-PSP appearance vocabulary hosts can pass regardless of PSP. */
@@ -353,7 +777,12 @@ function toPaysafeAccountId(id: string): string | number {
 
 function asPaysafeHandle(handle: MountedFieldsHandle): PaysafeHandle {
   const h = handle as unknown as PaysafeHandle;
-  if (h?.pspName !== "paysafe" || !h.instance) {
+  const known =
+    h?.pspName === "paysafe" &&
+    ((h.kind === "card" && !!h.instance) ||
+      (h.kind === "redirect" && typeof h.redirectUrl === "string") ||
+      (h.kind === "bank" && !!h.inputs));
+  if (!known) {
     throw PayFanoutError.invalidRequest("Handle was not produced by PaysafeClientAdapter.mount");
   }
   return h;

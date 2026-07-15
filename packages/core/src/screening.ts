@@ -18,8 +18,8 @@ export function screenSessionInput(
   input: CreatePaymentSessionInput,
 ): string | undefined {
   const psp = caps.pspName;
+  const currency = input.currency?.trim().toUpperCase();
   if (caps.supportedCurrencies && caps.supportedCurrencies.length > 0) {
-    const currency = input.currency?.trim().toUpperCase();
     if (!caps.supportedCurrencies.some((c) => c.toUpperCase() === currency)) {
       return `"${psp}" does not support currency ${String(input.currency)}`;
     }
@@ -35,10 +35,44 @@ export function screenSessionInput(
   if (input.savePaymentMethod && !caps.supportsSavedPaymentMethods) {
     return `"${psp}" does not support saved payment methods`;
   }
-  if (input.paymentMethodTypes && input.paymentMethodTypes.length > 0) {
-    const supported = new Set(caps.paymentMethods.filter((m) => m.supported).map((m) => m.type as string));
-    if (!input.paymentMethodTypes.some((t) => supported.has(t))) {
-      return `"${psp}" supports none of the requested payment method types: ${input.paymentMethodTypes.join(", ")}`;
+  const customerCountry = input.customerCountry?.trim().toUpperCase();
+  const requested = input.paymentMethodTypes;
+  if (requested && requested.length > 0) {
+    // A supported-but-ineligible rail (SEPA asked for in GBP, Bacs asked for
+    // a US customer) and an outright unsupported one are different diagnoses:
+    // all skip the candidate, but the router surfaces these strings when
+    // every candidate was skipped, and "we don't do SEPA" would be a lie
+    // about the first two.
+    let ineligibleByCurrency = false;
+    let ineligibleByCountry = false;
+    let eligible = false;
+    for (const method of caps.paymentMethods) {
+      if (!method.supported || !requested.includes(method.type)) continue;
+      // Absent OR empty means unrestricted, exactly as supportedCurrencies reads.
+      const currencyOk =
+        !method.currencies?.length || method.currencies.some((c) => c.toUpperCase() === currency);
+      // Country additionally screens nothing when the session does not state
+      // customerCountry — the constraint is real but unknowable here, so the
+      // rail must stay routable rather than be guessed away.
+      const countryOk =
+        !customerCountry ||
+        !method.countries?.length ||
+        method.countries.some((c) => c.toUpperCase() === customerCountry);
+      if (currencyOk && countryOk) {
+        eligible = true;
+        break;
+      }
+      if (!currencyOk) ineligibleByCurrency = true;
+      else ineligibleByCountry = true;
+    }
+    if (!eligible) {
+      if (ineligibleByCurrency) {
+        return `"${psp}" supports none of the requested payment method types in ${String(input.currency)}: ${requested.join(", ")}`;
+      }
+      if (ineligibleByCountry) {
+        return `"${psp}" supports none of the requested payment method types for customer country ${String(input.customerCountry)}: ${requested.join(", ")}`;
+      }
+      return `"${psp}" supports none of the requested payment method types: ${requested.join(", ")}`;
     }
   }
   return undefined;

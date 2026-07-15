@@ -135,9 +135,16 @@ const { session, pspName, attempts } = await router.createPaymentSession(input);
 ```
 
 Candidates that can't serve the input (no manual capture, no vaulting for a
-`savePaymentMethod` session, unsupported method types…) are skipped without a PSP call —
+`savePaymentMethod` session, no zero-amount verification, unsupported method types, a
+currency the PSP or the requested rail itself cannot settle — SEPA asked for in GBP…) are
+skipped without a PSP call —
 the router and `PaymentService` share one predicate, `screenSessionInput` from
 `@payfanout/core`, so a skipped candidate is exactly one the service would have rejected.
+Country-bound rails (Bacs pays from UK bank accounts, Interac from Canadian ones) screen
+the same way **when the session states `customerCountry`** (ISO 3166-1 alpha-2, the
+customer's country — not `country`, which resolves the merchant account). Omit it and
+country-restricted rails stay routable: the pre-screen is best-effort, never a guarantee,
+because the real constraint is the bank account the customer eventually brings.
 Business rejections (`invalid_request`, `card_declined`) abort the cascade, only transient
 trouble (`psp_unavailable`, `rate_limited`, `processing_error`, or `retryable` errors)
 fails over. `attempts` is your audit trail. Note a vault session is inherently pinned to

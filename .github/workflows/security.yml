@@ -45,10 +45,13 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Not `pnpm audit`: npm retired the endpoints it calls (410) and no
+      # released pnpm has migrated. scripts/audit-deps.mjs queries the same
+      # advisory database, with the same severity gate. See the script header.
       - name: Audit production dependencies (fail on high+)
-        run: pnpm audit --prod --audit-level high
+        run: node scripts/audit-deps.mjs
       - name: Audit dev dependencies (informational)
-        run: pnpm audit --audit-level high || echo "::warning::dev-dependency advisories found — review the log"
+        run: node scripts/audit-deps.mjs --all --warn-only
 
   secret-scan:
     runs-on: ubuntu-latest

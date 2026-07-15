@@ -61,6 +61,16 @@ const PAYSAFE_JS_URL = "https://hosted.paysafe.com/js/v1/latest/paysafe.min.js";
  */
 const PAYSAFE_RETURN_MARKER = "payfanout_psp";
 
+/**
+ * What the marked return trip resolves as its clientToken. The value is a
+ * placeholder: the real handle token rides the signed session context, and the
+ * server adapter ignores the wire token for a session whose handle is already
+ * minted. It still has to be non-empty — the react transport only invokes the
+ * host's completion callback when a clientToken is present, and the standard
+ * completion route rejects an empty string.
+ */
+const PAYSAFE_REDIRECT_CLIENT_TOKEN = "paysafe-redirect-return";
+
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "card", flow: "embedded", supported: true },
   { type: "apple_pay", flow: "popup", supported: false },
@@ -303,8 +313,12 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
    * adapter deliberately points them all at the host's one returnUrl. So the
    * marker the server plants there is the only reliable evidence a Paysafe
    * redirect landed, and the landing spot never decides the outcome: the rail
-   * is server-completed, so the host finalizes with completePayment (the handle
-   * token rides the signed session context, hence no clientToken here).
+   * is server-completed, so the host finalizes with completePayment. The
+   * clientToken is a placeholder — the real handle token rides the signed
+   * session context and the server ignores the wire value once a handle is
+   * minted — but it must be present and non-empty, because the standard
+   * completion transport only fires when a clientToken exists and the
+   * completion route rejects an empty one.
    * Returns null on any other URL, so a router can probe every adapter safely.
    */
   async handleRedirectReturn(location: RedirectReturnLocation): Promise<ConfirmResult | null> {
@@ -312,7 +326,7 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
       location.search.startsWith("?") ? location.search.slice(1) : location.search,
     );
     if (params.get(PAYSAFE_RETURN_MARKER) !== "paysafe") return null;
-    return { status: "requires_confirmation" };
+    return { status: "requires_confirmation", clientToken: PAYSAFE_REDIRECT_CLIENT_TOKEN };
   }
 
   listPaymentMethodCapabilities(): PaymentMethodCapability[] {

@@ -16,6 +16,7 @@
     "e2e": "pnpm --filter @payfanout/e2e e2e",
     "typecheck": "tsc -p tsconfig.json",
     "check:boundaries": "node scripts/check-boundaries.mjs",
+    "audit:deps": "node scripts/audit-deps.mjs",
     "check": "pnpm run typecheck && pnpm run lint && pnpm run check:boundaries && pnpm run test",
     "changeset": "changeset",
     "build": "pnpm -r run build",

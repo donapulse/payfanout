@@ -585,12 +585,29 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   from our side. The adapter's default `sessionTtlSeconds` is 3600, meaning a signed session
   can outlive the handle it references: a slow customer returns to a session that still
   verifies but whose handle is `EXPIRED`. Hosts running this rail should lower
-  `sessionTtlSeconds` toward the handle window.
-- **Completion is triggered by the redirect return, not by `PAYMENT_HANDLE_PAYABLE`.** The
-  documented sequence has the handle reach `PAYABLE` before `POST /payments` is valid, and
-  the webhook announcing it may lag the browser's return. Unverified whether a return can
-  beat `PAYABLE` in practice; if it can, completion needs to treat the resulting rejection
-  as retryable rather than terminal. Sandbox-verify before live enablement.
+  `sessionTtlSeconds` toward the handle window. Once that window closes Paysafe resolves the
+  handle itself (see the next entry), so a stale session's completion rejecting is a
+  reconcile-by-webhook situation, not a lost payment.
+- **The return trip is a fallback signal; `PAYMENT_HANDLE_PAYABLE` is the documented cue.**
+  Doc-verified 2026-07-15 (Interac guide, integration notes): the handle flips to `PAYABLE`
+  when the customer is *redirected* — before any bank approval — and the guide instructs
+  merchants to make the `POST /payments` call on receiving that webhook. Interac does not
+  redirect the customer back after a *completed* payment (the return links fire on the
+  failed/cancelled paths), so the client marker mostly resolves failure trips and manual
+  returns. If the merchant never completes, Paysafe completes on the merchant's behalf once
+  the handle TTL closes (customer-paid path: `PAYMENT_PROCESSING` → `PAYMENT_COMPLETED`) or
+  fails the handle (`PAYMENT_HANDLE_FAILED`, then `PAYMENT_FAILED` ~2 days later). A
+  completion attempt against a handle that already left `PAYABLE` rejects with error `5283`
+  — terminal for that call, reconciled by webhook. `PAYMENT_HANDLE_PAYABLE` stays mapped
+  `unknown` (its payload id is a handle id, not a payment id); hosts correlate via the
+  payload `merchantRefNum`, which is the session `idempotencyKey`.
+- **Return-trip completion carries a placeholder `clientToken`.** The standard completion
+  route requires a non-empty `clientToken` and the react transport only fires when one is
+  present, while the real handle token rides the signed session context. The client adapter
+  therefore resolves the marked return as `requires_confirmation` with
+  `clientToken: "paysafe-redirect-return"`, and the server adapter ignores the wire value
+  whenever the context already carries a minted handle — the signed context is the only
+  authority on which handle gets charged.
 - **`availableToRefund: 0` on an in-flight settlement means "not refundable yet".** Bank
   rails attach a `PROCESSING` settlement to the payment immediately, sharing its
   `merchantRefNum`; refunds are therefore only inferred from `availableToRefund` once the

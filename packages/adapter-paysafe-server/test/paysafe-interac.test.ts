@@ -94,17 +94,22 @@ describe("Paysafe Interac e-Transfer sessions", () => {
     });
   });
 
-  it("charges the context's handle token without a clientToken from the browser", async () => {
-    const { adapter } = makePair();
+  it("charges the context's handle token, ignoring whatever clientToken rode the wire", async () => {
+    const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession({ ...interacInput });
+    const context = await decodeSessionContext(session.pspSessionId, SIGNING_KEY);
 
-    // The redirect rail never produces a clientToken — confirm() navigates away.
+    // The redirect rail never produces a real clientToken — the return trip
+    // resolves with a placeholder so the standard completion route fires. The
+    // signed context is the only authority on which handle gets charged, so a
+    // tampered wire value must not reach Paysafe either.
     const info = await adapter.completePayment({
       pspSessionId: session.pspSessionId,
-      clientToken: "",
+      clientToken: "paysafe-redirect-return",
       idempotencyKey: "k-complete",
     });
 
+    expect(fake.lastRequestBody?.["paymentHandleToken"]).toBe(context.paymentHandleToken);
     expect(info.paymentMethodType).toBe("interac_etransfer");
     // Bank rails settle later: the terminal outcome arrives by webhook.
     expect(info.status).toBe("processing");

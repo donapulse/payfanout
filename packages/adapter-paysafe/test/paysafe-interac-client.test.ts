@@ -95,10 +95,13 @@ describe("Paysafe Interac e-Transfer client", () => {
   });
 
   it("resolves the marked return trip as needing server completion", async () => {
-    // No clientToken: the handle token rides the signed session context.
+    // The clientToken is a placeholder (the handle token rides the signed
+    // session context, and the server ignores the wire value once a handle is
+    // minted) — but it must be non-empty, or the standard completion transport
+    // never fires and the completion route rejects the request.
     await expect(
       makeAdapter().handleRedirectReturn({ search: "?payfanout_psp=paysafe&order=42" }),
-    ).resolves.toEqual({ status: "requires_confirmation" });
+    ).resolves.toEqual({ status: "requires_confirmation", clientToken: "paysafe-redirect-return" });
   });
 
   it("ignores a return URL that is not its own, so a router can probe every adapter", async () => {

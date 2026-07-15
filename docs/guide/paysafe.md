@@ -234,9 +234,13 @@ const session = await payments.createPaymentSession({
 
 The session comes back `requires_action`: `<PaymentFields>` renders a plain panel instead of
 hosted card fields (override the copy with `fieldOptions.description`), and `<PayButton>`
-navigates to Interac. On the way back, `<RedirectReturn>` resolves
-`requires_confirmation` — finalize through the same server-completion route as §7. No
-`clientToken` is involved: the handle token rides the signed session context.
+navigates to Interac. When the customer lands back on your `returnUrl`, `<RedirectReturn>`
+resolves `requires_confirmation` with a **placeholder** `clientToken` — pass
+`onServerCompletion` (same contract as `<PayButton>`, reusing the session reference you
+stored before navigating) and the §7 server-completion route finishes the payment
+unchanged. The placeholder is deliberate: the real handle token rides the signed session
+context, and the server adapter ignores the wire value for a session whose handle is
+already minted.
 
 The session cannot be amended once its handle exists (`updatePaymentSession` throws) — the
 customer authorizes *that* handle at their bank, so a changed cart needs a new session.
@@ -249,11 +253,21 @@ still verifies but whose handle is gone. Set `sessionTtlSeconds` near the handle
 you run Interac.
 :::
 
-::: warning The landing URL is not the outcome
-Paysafe signals results by *which* return link it uses, and PayFanout points them all at your
-one `returnUrl`. So the return trip only means the customer came back — the payment resolves
-server-side, and the terminal state arrives by webhook (`PAYMENT_COMPLETED` / `PAYMENT_FAILED`).
-Bank debits settle later: `completePayment` returns `processing`, not `succeeded`.
+::: warning The return trip is a hint — webhooks are the outcome
+Paysafe signals results by *which* return link it uses, PayFanout points them all at your one
+`returnUrl`, and Paysafe's Interac integration notes are explicit that Interac does **not**
+redirect the customer back at all after a *completed* payment — the links fire on the
+failed/cancelled paths. So tell the customer to come back (the panel copy is a good place)
+and never gate the order on the return trip. The handle flips to `PAYABLE` as soon as the
+customer is redirected, announced by a `PAYMENT_HANDLE_PAYABLE` webhook (delivered as
+`unknown`; its payload `merchantRefNum` is your session `idempotencyKey`) — that event is
+Paysafe's documented cue to complete. If you never complete, Paysafe completes on your
+behalf once the ~15-minute handle window closes (when the customer paid) or fails the
+handle. Either way the terminal state arrives on the mapped webhooks (`PAYMENT_COMPLETED` /
+`PAYMENT_FAILED`), so a completion attempt that rejects because the handle already left
+`PAYABLE` means "reconcile by webhook", not "the customer failed". Bank debits settle
+later: `completePayment` usually returns `processing` (`succeeded` once Interac has already
+confirmed the transfer to Paysafe).
 :::
 
 ## 9. Register the webhook endpoint

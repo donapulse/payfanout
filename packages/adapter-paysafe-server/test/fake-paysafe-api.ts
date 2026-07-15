@@ -15,7 +15,11 @@ export class FakePaysafeApi {
   private readonly customers = new Map<string, { id: string; merchantCustomerId?: string; handles: PaysafeStoredHandleLike[] }>();
   private readonly multiUseTokens = new Set<string>();
   private readonly storedHandleRefs = new Map<string, PaysafeStoredHandleLike>();
+  /** Redirect-rail handles, keyed by token, so createPayment can echo their paymentType. */
+  private readonly redirectHandles = new Map<string, { paymentType: string }>();
+  private readonly handleRefs = new Map<string, Record<string, unknown>>();
   private seq = 0;
+  uniqueHandleCreations = 0;
   uniquePaymentCreations = 0;
   uniqueRefundCreations = 0;
   uniqueCustomerCreations = 0;
@@ -38,6 +42,7 @@ export class FakePaysafeApi {
     }
 
     if (method === "POST" && path === "/paymenthub/v1/payments") return this.createPayment(body!);
+    if (method === "POST" && path === "/paymenthub/v1/paymenthandles") return this.createPaymentHandle(body!);
     if (method === "POST" && path === "/paymenthub/v1/customers") {
       const merchantCustomerId = body!["merchantCustomerId"] as string;
       // Real API 409s with 7505 on duplicate merchantCustomerId.
@@ -157,6 +162,46 @@ export class FakePaysafeApi {
     return json(404, { error: { code: "5269", message: `No route ${method} ${path}` } });
   };
 
+  /**
+   * POST /paymenthandles for redirect rails. Mirrors the documented Interac
+   * response: INITIATED + action REDIRECT + the redirect_payment link the
+   * customer is sent to.
+   */
+  private createPaymentHandle(body: Record<string, unknown>): Response {
+    const refNum = body["merchantRefNum"] as string;
+    const existing = this.handleRefs.get(refNum);
+    if (existing) return json(200, existing);
+    const paymentType = body["paymentType"] as string;
+    const interac = body["interacEtransfer"] as { consumerId?: string } | undefined;
+    if (paymentType === "INTERAC_ETRANSFER" && !interac?.consumerId) {
+      return json(400, {
+        error: { code: "5068", message: "Field error(s)", fieldErrors: [{ field: "interacEtransfer.consumerId", error: "Either invalid or no value provided" }] },
+      });
+    }
+    if (!Array.isArray(body["returnLinks"])) {
+      return json(400, {
+        error: { code: "5068", message: "Field error(s)", fieldErrors: [{ field: "returnLinks", error: "Either invalid or no value provided" }] },
+      });
+    }
+    const id = `ph_${++this.seq}`;
+    const handle = {
+      id,
+      paymentHandleToken: `PH${this.seq}Token`,
+      merchantRefNum: refNum,
+      paymentType,
+      currencyCode: body["currencyCode"] as string,
+      amount: body["amount"] as number,
+      status: "INITIATED",
+      action: "REDIRECT",
+      txnTime: "2026-07-04T10:00:00Z",
+      links: [{ rel: "redirect_payment", href: `https://api.test.paysafe.com/alternatepayments/v1/redirect?paymentHandleId=${id}` }],
+    };
+    this.handleRefs.set(refNum, handle);
+    this.redirectHandles.set(handle.paymentHandleToken, { paymentType });
+    this.uniqueHandleCreations++;
+    return json(201, handle);
+  }
+
   private createPayment(body: Record<string, unknown>): Response {
     // Real API strict-parses the body: webhook/returnLinks/shippingDetails are
     // handle-level fields and get rejected here (error 5023).
@@ -196,9 +241,31 @@ export class FakePaysafeApi {
       card: { cardType: "VI", lastDigits: "1111", cardExpiry: { month: 12, year: 2030 } },
       settlements: [],
     };
-    if (settleWithAuth) {
+    const redirectHandle = this.redirectHandles.get(token);
+    if (redirectHandle) {
+      // Bank rails do not authorize on the spot: the real API answers PROCESSING
+      // and the outcome lands later by webhook. The settlement exists immediately,
+      // in flight, sharing the payment's refNum — and reports availableToRefund: 0,
+      // which means "not refundable yet", NOT "already refunded".
+      payment.paymentType = redirectHandle.paymentType;
+      payment.status = "PROCESSING";
+      payment.availableToSettle = 0;
+      delete payment.card;
+      const settlement = {
+        id: `stl_${++this.seq}`,
+        merchantRefNum: refNum,
+        status: "PROCESSING",
+        amount,
+        availableToRefund: 0,
+        txnTime: "2026-07-04T10:00:01Z",
+      };
+      payment.settlements = [settlement];
+      this.settlementRefs.set(refNum, settlement);
+    }
+    if (settleWithAuth && !redirectHandle) {
       // Real API: auto-capture creates an implicit settlement sharing the
       // payment's merchantRefNum, discoverable only via the settlements query.
+      // Nothing settles while a bank rail is still PROCESSING.
       const settlement = {
         id: `stl_${++this.seq}`,
         merchantRefNum: refNum,

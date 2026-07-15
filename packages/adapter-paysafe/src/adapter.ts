@@ -8,6 +8,7 @@ import {
   type MountedFieldsHandle,
   type MountOptions,
   type PaymentMethodCapability,
+  type RedirectReturnLocation,
   type UnifiedError,
   type UnifiedErrorCode,
 } from "@payfanout/core";
@@ -52,6 +53,24 @@ export interface PaysafeClientAdapterConfig {
 
 const PAYSAFE_JS_URL = "https://hosted.paysafe.com/js/v1/latest/paysafe.min.js";
 
+/**
+ * Query parameter the SERVER adapter appends to the returnLinks it registers, so
+ * the return trip is identifiable (Paysafe itself adds nothing). Kept in step
+ * with PAYSAFE_RETURN_MARKER in adapter-paysafe-server — the packages share no
+ * code, since a client-safe package cannot depend on a server one.
+ */
+const PAYSAFE_RETURN_MARKER = "payfanout_psp";
+
+/**
+ * What the marked return trip resolves as its clientToken. The value is a
+ * placeholder: the real handle token rides the signed session context, and the
+ * server adapter ignores the wire token for a session whose handle is already
+ * minted. It still has to be non-empty — the react transport only invokes the
+ * host's completion callback when a clientToken is present, and the standard
+ * completion route rejects an empty string.
+ */
+const PAYSAFE_REDIRECT_CLIENT_TOKEN = "paysafe-redirect-return";
+
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "card", flow: "embedded", supported: true },
   { type: "apple_pay", flow: "popup", supported: false },
@@ -60,6 +79,10 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "neteller", flow: "redirect", supported: false },
   { type: "paysafecard", flow: "voucher_code", supported: false },
   { type: "paysafecash", flow: "voucher_code", supported: false },
+  // Mirrors the server adapter: implemented, but off by default — per-account
+  // enablement and Canada/CAD only. Canadian merchants opt in via
+  // config.paymentMethods.
+  { type: "interac_etransfer", flow: "redirect", supported: false },
 ];
 
 /** The payload half of the server's signed session context (signature verified server-side only). */
@@ -69,14 +92,33 @@ interface PaysafeSessionPayload {
   currency: string;
   merchantAccountId?: string;
   id?: string;
+  /**
+   * Present only for rails Paysafe.js cannot tokenize (Interac e-Transfer): the
+   * server already minted the handle, and this is where the customer authenticates.
+   */
+  redirectUrl?: string;
 }
 
-interface PaysafeHandle {
+interface PaysafeCardHandle {
   pspName: "paysafe";
+  kind: "card";
   instance: PaysafeFieldsInstanceLike;
   session: PaysafeSessionPayload;
   cleanup: () => void;
 }
+
+/** Redirect rails have no SDK, no fields and no key in the browser — only the URL. */
+interface PaysafeRedirectHandle {
+  pspName: "paysafe";
+  kind: "redirect";
+  redirectUrl: string;
+  cleanup: () => void;
+}
+
+type PaysafeHandle = PaysafeCardHandle | PaysafeRedirectHandle;
+
+const DEFAULT_REDIRECT_PANEL_TEXT =
+  "You will be redirected to Interac to authorise this payment with your bank.";
 
 let mountCounter = 0;
 
@@ -120,8 +162,10 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
    */
   async mount(container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
     assertBrowser("PaysafeClientAdapter", "mount");
-    await this.loadSdk();
     const session = decodeSessionPayload(options.clientSecret);
+    // A redirect session carries no card fields, so Paysafe.js is never loaded.
+    if (session.redirectUrl) return this.mountRedirectPanel(container, options, session.redirectUrl);
+    await this.loadSdk();
     const suffix = `payfanout-psf-${++mountCounter}`;
     const created: HTMLElement[] = [];
     const selectors: Record<string, string> = {};
@@ -172,8 +216,9 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
       });
       options.onReady?.();
       registerFieldStateEvents(instance, options);
-      const handle: PaysafeHandle = {
+      const handle: PaysafeCardHandle = {
         pspName: "paysafe",
+        kind: "card",
         instance,
         session,
         // Removes ONLY our wrappers (and the iframes inside them) — host
@@ -190,13 +235,55 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
   }
 
   /**
+   * Nothing is collected here — the server already minted the handle — so the
+   * panel is plain and unbranded and the fields report complete immediately
+   * (initialized false first, so button state stays deterministic).
+   * `fieldOptions.description` overrides the text; `appearance.panel` carries
+   * inline CSS. The Interac page itself is not themeable from here.
+   */
+  private mountRedirectPanel(
+    container: HTMLElement,
+    options: MountOptions,
+    redirectUrl: string,
+  ): MountedFieldsHandle {
+    const panel = document.createElement("div");
+    panel.setAttribute("data-payfanout-paysafe-panel", "");
+    const description = options.fieldOptions?.["description"];
+    panel.textContent = typeof description === "string" ? description : DEFAULT_REDIRECT_PANEL_TEXT;
+    const style = options.appearance?.["panel"];
+    if (style !== null && typeof style === "object" && !Array.isArray(style)) {
+      Object.assign(panel.style, style);
+    }
+    container.appendChild(panel);
+    options.onChange?.({ complete: false, empty: true });
+    options.onChange?.({ complete: true });
+    options.onReady?.();
+    const handle: PaysafeRedirectHandle = {
+      pspName: "paysafe",
+      kind: "redirect",
+      redirectUrl,
+      cleanup: () => panel.remove(),
+    };
+    return brandMountedFieldsHandle(handle);
+  }
+
+  /**
    * Tokenize-first shape (§4a): resolves with requires_confirmation plus the
    * Payment Handle token. The host passes that clientToken to the server's
    * completePayment — <PayButton> wires this automatically. 3DS runs inline
    * inside Paysafe.js during tokenize (challenge iframe), never a navigation.
+   *
+   * Redirect rails have no token to produce: confirm() hands the page to the
+   * provider and the outcome resolves server-side after the return trip.
    */
   async confirm(handle: MountedFieldsHandle): Promise<ConfirmResult> {
     const h = asPaysafeHandle(handle);
+    if (h.kind === "redirect") {
+      assertBrowser("PaysafeClientAdapter", "confirm");
+      window.location.assign(h.redirectUrl);
+      // The navigation unloads the page, so this promise intentionally never settles.
+      return new Promise<ConfirmResult>(() => {});
+    }
     try {
       const { token } = await h.instance.tokenize({
         transactionType: "PAYMENT",
@@ -218,6 +305,28 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
 
   unmount(handle: MountedFieldsHandle): void {
     asPaysafeHandle(handle).cleanup();
+  }
+
+  /**
+   * Paysafe documents no query parameters on the return trip — it signals the
+   * outcome by WHICH returnLinks rel it sends the customer to, and the server
+   * adapter deliberately points them all at the host's one returnUrl. So the
+   * marker the server plants there is the only reliable evidence a Paysafe
+   * redirect landed, and the landing spot never decides the outcome: the rail
+   * is server-completed, so the host finalizes with completePayment. The
+   * clientToken is a placeholder — the real handle token rides the signed
+   * session context and the server ignores the wire value once a handle is
+   * minted — but it must be present and non-empty, because the standard
+   * completion transport only fires when a clientToken exists and the
+   * completion route rejects an empty one.
+   * Returns null on any other URL, so a router can probe every adapter safely.
+   */
+  async handleRedirectReturn(location: RedirectReturnLocation): Promise<ConfirmResult | null> {
+    const params = new URLSearchParams(
+      location.search.startsWith("?") ? location.search.slice(1) : location.search,
+    );
+    if (params.get(PAYSAFE_RETURN_MARKER) !== "paysafe") return null;
+    return { status: "requires_confirmation", clientToken: PAYSAFE_REDIRECT_CLIENT_TOKEN };
   }
 
   listPaymentMethodCapabilities(): PaymentMethodCapability[] {
@@ -353,7 +462,10 @@ function toPaysafeAccountId(id: string): string | number {
 
 function asPaysafeHandle(handle: MountedFieldsHandle): PaysafeHandle {
   const h = handle as unknown as PaysafeHandle;
-  if (h?.pspName !== "paysafe" || !h.instance) {
+  const known =
+    h?.pspName === "paysafe" &&
+    ((h.kind === "card" && !!h.instance) || (h.kind === "redirect" && typeof h.redirectUrl === "string"));
+  if (!known) {
     throw PayFanoutError.invalidRequest("Handle was not produced by PaysafeClientAdapter.mount");
   }
   return h;

@@ -559,3 +559,56 @@ current status (remaining sandbox checks run via the dispatch-only integration w
 - **`PaymentInfo.createdAt`** falls back to epoch — the Worldline payment object exposes no
   stable creation timestamp in a documented field; hosts read the timestamp from the webhook
   `created` or their own record. Revisit if the sandbox payment object carries one.
+
+## Paysafe Interac e-Transfer (2026-07-15)
+
+- **The sandbox account cannot exercise Interac.** Sandbox-verified 2026-07-15: creating an
+  `INTERAC_ETRANSFER` payment handle in CAD is refused with `PAYMENTHUB-1`, "The submitted
+  payment type and currency code combination is not supported for your account". That is an
+  account-provisioning fact, not a code defect — the rail must be enabled on the Paysafe
+  account before it can be verified end to end, and before any live enablement. The
+  integration suite tolerates this specific error the way it tolerates unbatched
+  settlements, and starts asserting for real once the capability exists.
+- **`interacEtransfer` vs `interacETransfer`.** Doc-verified 2026-07-15: the payment-handle
+  request field is spelled `interacEtransfer` (lowercase `t`). Paysafe's own OpenAPI spec
+  contradicts itself — the `interacObject` schema declares `interacETransfer`, but that
+  schema is flagged `x-internal: true`, while all seven request/response examples in the
+  same spec and the Interac integration guide's worked request use `interacEtransfer`. Two
+  independent public sources outweigh one internal-flagged schema, and the failure mode is
+  loud rather than silent (error `5023`, unrecognized field), so a wrong choice surfaces on
+  the first sandbox call. Partially corroborated 2026-07-15: the sandbox rejected the handle
+  with `PAYMENTHUB-1` (account capability) rather than `5023`, so the body — this field
+  included — parsed. That is evidence, not proof: the capability check may precede
+  instrument validation. Settle it on an account that has the rail enabled before going live.
+- **Handle lifetime vs session TTL.** Redirect payment handles report
+  `timeToLiveSeconds: 899` (~15 min) and the field is response-only, so it cannot be aligned
+  from our side. The adapter's default `sessionTtlSeconds` is 3600, meaning a signed session
+  can outlive the handle it references: a slow customer returns to a session that still
+  verifies but whose handle is `EXPIRED`. Hosts running this rail should lower
+  `sessionTtlSeconds` toward the handle window. Once that window closes Paysafe resolves the
+  handle itself (see the next entry), so a stale session's completion rejecting is a
+  reconcile-by-webhook situation, not a lost payment.
+- **The return trip is a fallback signal; `PAYMENT_HANDLE_PAYABLE` is the documented cue.**
+  Doc-verified 2026-07-15 (Interac guide, integration notes): the handle flips to `PAYABLE`
+  when the customer is *redirected* — before any bank approval — and the guide instructs
+  merchants to make the `POST /payments` call on receiving that webhook. Interac does not
+  redirect the customer back after a *completed* payment (the return links fire on the
+  failed/cancelled paths), so the client marker mostly resolves failure trips and manual
+  returns. If the merchant never completes, Paysafe completes on the merchant's behalf once
+  the handle TTL closes (customer-paid path: `PAYMENT_PROCESSING` → `PAYMENT_COMPLETED`) or
+  fails the handle (`PAYMENT_HANDLE_FAILED`, then `PAYMENT_FAILED` ~2 days later). A
+  completion attempt against a handle that already left `PAYABLE` rejects with error `5283`
+  — terminal for that call, reconciled by webhook. `PAYMENT_HANDLE_PAYABLE` stays mapped
+  `unknown` (its payload id is a handle id, not a payment id); hosts correlate via the
+  payload `merchantRefNum`, which is the session `idempotencyKey`.
+- **Return-trip completion carries a placeholder `clientToken`.** The standard completion
+  route requires a non-empty `clientToken` and the react transport only fires when one is
+  present, while the real handle token rides the signed session context. The client adapter
+  therefore resolves the marked return as `requires_confirmation` with
+  `clientToken: "paysafe-redirect-return"`, and the server adapter ignores the wire value
+  whenever the context already carries a minted handle — the signed context is the only
+  authority on which handle gets charged.
+- **`availableToRefund: 0` on an in-flight settlement means "not refundable yet".** Bank
+  rails attach a `PROCESSING` settlement to the payment immediately, sharing its
+  `merchantRefNum`; refunds are therefore only inferred from `availableToRefund` once the
+  settlement has left an in-flight status, and never from `refundedAmount`'s absence alone.

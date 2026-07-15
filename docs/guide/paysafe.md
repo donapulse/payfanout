@@ -71,7 +71,7 @@ PAYSAFE_WEBHOOK_HMAC_KEY=…
 
 # client bundle, must be VITE_-prefixed to reach the browser
 VITE_PAYSAFE_PUBLIC_KEY=…         # the public single-use-token Base64 key
-VITE_PAYSAFE_CURRENCY=CAD         # match your sandbox account's currency (see §9)
+VITE_PAYSAFE_CURRENCY=CAD         # match your sandbox account's currency (see §10)
 ```
 
 Env-var names deliberately **differ** from config field names, e.g. `PAYSAFE_SESSION_KEY`
@@ -108,10 +108,11 @@ const payments = new PaymentService({ adapters: [paysafe] });
 | `requestTimeoutMs` | - | `30000` | Abort a hung Paysafe connection; surfaces as a retryable `psp_unavailable`. |
 | `maxNetworkRetries` | - | `2` | Retries transport trouble (network/timeout/5xx/429) only, never business errors like declines. |
 
-::: tip `createPaymentSession` makes no network call
-For Paysafe it just mints and signs the self-contained session token locally, the first
-real API call is `completePayment` (step 7). That is why the session must carry everything
-completion needs, signed.
+::: tip `createPaymentSession` makes no network call — for cards
+For a card session it just mints and signs the self-contained session token locally, the
+first real API call is `completePayment` (step 7). That is why the session must carry
+everything completion needs, signed. Interac e-Transfer is the exception: Paysafe.js cannot
+tokenize it, so the handle is minted server-side at session creation (§8).
 :::
 
 ## 5. Wire the client adapter
@@ -135,7 +136,7 @@ const paysafe = new PaysafeClientAdapter({
 - `apiKey` must be the **public** Base64 tokenization key, never the server
   username/password. It can only mint single-use tokens and holds no secret authority.
 - **Currency comes from the signed session**, not from client config. It must be a currency
-  your Paysafe account supports, or Paysafe.js fails to set up (error `9055`). See §9.
+  your Paysafe account supports, or Paysafe.js fails to set up (error `9055`). See §10.
 - Split card fields let you own the layout via slots
   (`data-payfanout-field="cardNumber|expiryDate|cvv"`), see [React usage](/guide/react).
 
@@ -198,7 +199,78 @@ on a confirm-on-client PSP (Stripe) throws — it exists only for tokenize-first
 directly; both forms are in [Server usage](/guide/server#server-completion-tokenize-first), and
 the client side is [React usage](/guide/react#built-in-completion-transport).
 
-## 8. Register the webhook endpoint
+## 8. Interac e-Transfer (Canada)
+
+Paysafe.js cannot tokenize Interac e-Transfer — it is a Payments-API rail — so PayFanout
+mints the payment handle **server-side, inside `createPaymentSession`**, and the customer
+authenticates at their bank. It is the one Paysafe session that calls Paysafe before the
+client mounts.
+
+Like every non-card rail, it is **off by default** — enablement is per-account and this one
+is Canada-only, so opt in on both adapters:
+
+```ts
+paymentMethods: [
+  { type: "card", flow: "embedded", supported: true },
+  { type: "interac_etransfer", flow: "redirect", supported: true },
+],
+```
+
+Give the session its own `paymentMethodTypes` (a handle is minted for exactly one payment
+type, so it cannot share a session with cards), plus a `returnUrl` and the customer's email —
+Paysafe collects from that alias, so it is the instrument, not a receipt nicety:
+
+```ts
+const session = await payments.createPaymentSession({
+  amount: 5_44, // CAD only
+  currency: "CAD",
+  country: "CA",
+  paymentMethodTypes: ["interac_etransfer"],
+  returnUrl: "https://shop.example/return",
+  receiptEmail: "payer@example.com", // or billingDetails.email
+  idempotencyKey: `interac-${order.id}`,
+});
+```
+
+The session comes back `requires_action`: `<PaymentFields>` renders a plain panel instead of
+hosted card fields (override the copy with `fieldOptions.description`), and `<PayButton>`
+navigates to Interac. When the customer lands back on your `returnUrl`, `<RedirectReturn>`
+resolves `requires_confirmation` with a **placeholder** `clientToken` — pass
+`onServerCompletion` (same contract as `<PayButton>`, reusing the session reference you
+stored before navigating) and the §7 server-completion route finishes the payment
+unchanged. The placeholder is deliberate: the real handle token rides the signed session
+context, and the server adapter ignores the wire value for a session whose handle is
+already minted.
+
+The session cannot be amended once its handle exists (`updatePaymentSession` throws) — the
+customer authorizes *that* handle at their bank, so a changed cart needs a new session.
+
+::: warning Lower `sessionTtlSeconds` for this rail
+Paysafe expires a redirect handle after **~15 minutes**, and the value is response-only, so
+the adapter cannot align to it. The default `sessionTtlSeconds` is `3600`, so a signed
+session can outlive its handle by ~45 minutes: a slow customer returns to a session that
+still verifies but whose handle is gone. Set `sessionTtlSeconds` near the handle window if
+you run Interac.
+:::
+
+::: warning The return trip is a hint — webhooks are the outcome
+Paysafe signals results by *which* return link it uses, PayFanout points them all at your one
+`returnUrl`, and Paysafe's Interac integration notes are explicit that Interac does **not**
+redirect the customer back at all after a *completed* payment — the links fire on the
+failed/cancelled paths. So tell the customer to come back (the panel copy is a good place)
+and never gate the order on the return trip. The handle flips to `PAYABLE` as soon as the
+customer is redirected, announced by a `PAYMENT_HANDLE_PAYABLE` webhook (delivered as
+`unknown`; its payload `merchantRefNum` is your session `idempotencyKey`) — that event is
+Paysafe's documented cue to complete. If you never complete, Paysafe completes on your
+behalf once the ~15-minute handle window closes (when the customer paid) or fails the
+handle. Either way the terminal state arrives on the mapped webhooks (`PAYMENT_COMPLETED` /
+`PAYMENT_FAILED`), so a completion attempt that rejects because the handle already left
+`PAYABLE` means "reconcile by webhook", not "the customer failed". Bank debits settle
+later: `completePayment` usually returns `processing` (`succeeded` once Interac has already
+confirmed the transfer to Paysafe).
+:::
+
+## 9. Register the webhook endpoint
 
 ::: warning Configured in the portal, not via the API
 Paysafe's `POST /payments` **rejects** webhook/return-link fields (error `5023`), so you
@@ -228,7 +300,7 @@ and return fast. Paysafe has no public events-polling API
 (`supportsEventPolling: false`), for missed-webhook recovery, reconcile with
 `retrievePayment` per order. See [Webhooks](/guide/webhooks).
 
-## 9. Test cards & the sandbox-currency trap
+## 10. Test cards & the sandbox-currency trap
 
 ::: danger Match your account's currency
 Paysafe sandbox accounts are usually provisioned for a **single currency** (the reference
@@ -243,7 +315,7 @@ amount) depends on your account configuration. A commonly available test Visa is
 `4111 1111 1111 1111`; **confirm the current list, decline triggers, and 3DS test cards in
 your Paysafe portal** rather than assuming.
 
-## 10. Go live
+## 11. Go live
 
 - [ ] Swap in the **live** API username/password and the **live** public tokenization key.
 - [ ] Set `environment: "live"` on **both** adapters (host flips to `api.paysafe.com`).

@@ -16,7 +16,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { getRefundState, isPayFanoutError, isUnifiedPaymentStatus } from "@payfanout/core";
-import { PaysafeServerAdapter } from "@payfanout/adapter-paysafe-server";
+import { decodeSessionContext, PaysafeServerAdapter } from "@payfanout/adapter-paysafe-server";
 import { isLiveHost } from "./live-host-guard.js";
 
 const USERNAME = process.env.PAYSAFE_USERNAME;
@@ -485,5 +485,84 @@ describeIf("Paysafe sandbox integration", () => {
     await expect(
       adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken: "irrelevant", idempotencyKey: key() }),
     ).rejects.toThrowError(/expired/);
+  });
+});
+
+/**
+ * Interac e-Transfer. The point of this suite is to settle a contradiction in
+ * Paysafe's own documentation that no amount of reading can resolve: the
+ * request field is spelled `interacETransfer` by the OpenAPI schema
+ * (`interacObject`, flagged x-internal) and `interacEtransfer` by every request
+ * example and the integration guide. The adapter sends the latter. Paysafe
+ * strict-rejects unrecognized fields with error 5023, so the sandbox is the
+ * arbiter — if the spelling is wrong, creating the session fails here.
+ *
+ * Nothing is charged: the handle stops at INITIATED because no customer ever
+ * authenticates at Interac.
+ */
+/** The provider's own message, which the unified error deliberately replaces. */
+function errorMessageOf(err: { raw?: unknown }): string {
+  return (err.raw as { error?: { message?: string } } | undefined)?.error?.message ?? "";
+}
+
+describeIf("Paysafe Interac e-Transfer (real sandbox)", () => {
+  // The rail is Canada-only; a non-CAD sandbox account cannot exercise it.
+  const itIfCad = CURRENCY === "CAD" ? it : it.skip;
+
+  itIfCad("mints a payment handle and returns a redirect link", async () => {
+    let session;
+    try {
+      session = await makeAdapter().createPaymentSession({
+        amount: 5_44,
+        currency: "CAD",
+        country: "CA",
+        paymentMethodTypes: ["interac_etransfer"],
+        returnUrl: "https://example.com/return",
+        receiptEmail: "payfanout-integration@example.com",
+        idempotencyKey: key(),
+      });
+    } catch (err) {
+      // Sandbox-verified 2026-07-15: this account answers PAYMENTHUB-1, "payment
+      // type and currency code combination is not supported for your account" —
+      // it has no Interac capability, which is an account provisioning fact and
+      // not a code defect (same tolerance as the unbatched-settlement cases
+      // above). Notably NOT 5023 "field not recognized", so the request body —
+      // interacEtransfer included — parsed. Once Paysafe enables the rail, this
+      // test starts asserting for real.
+      if (isPayFanoutError(err) && /not supported for your account/i.test(errorMessageOf(err))) {
+        console.warn(
+          "[paysafe-integration] Interac deferred — no INTERAC_ETRANSFER/CAD capability on this sandbox account:",
+          JSON.stringify(err.raw),
+        );
+        return;
+      }
+      // Anything else is the answer this suite exists to get: log it verbatim,
+      // because the unified message hides the provider code that explains it.
+      if (isPayFanoutError(err)) {
+        console.error("[paysafe-integration] Interac handle rejected:", JSON.stringify(err.raw));
+      }
+      throw err;
+    }
+
+    expect(session.status).toBe("requires_action");
+    const context = await decodeSessionContext(session.pspSessionId, "integration-session-signing-key");
+    expect(context.paymentHandleToken).toBeTruthy();
+    // Proves Paysafe accepted `interacEtransfer` AND issued the redirect the
+    // customer is sent to.
+    expect(context.redirectUrl).toMatch(/^https:\/\//);
+  }, 30_000);
+
+  itIfCad("rejects the rail in a currency it does not settle", async () => {
+    await expect(
+      makeAdapter().createPaymentSession({
+        amount: 5_44,
+        currency: "USD",
+        country: "US",
+        paymentMethodTypes: ["interac_etransfer"],
+        returnUrl: "https://example.com/return",
+        receiptEmail: "payfanout-integration@example.com",
+        idempotencyKey: key(),
+      }),
+    ).rejects.toThrowError(/CAD only/);
   });
 });

@@ -28,6 +28,7 @@ import {
   type SavePaymentMethodInput,
   type ServerPaymentAdapter,
   type UnifiedErrorCode,
+  type UnifiedPaymentMethodType,
   type UnifiedPaymentStatus,
   type UnifiedWebhookEvent,
   type UpdatePaymentSessionInput,
@@ -135,6 +136,18 @@ export interface PaysafePaymentLike {
   error?: { code?: string; message?: string };
 }
 
+/** Payment handle as POST /paymenthandles returns it for redirect rails. */
+export interface PaysafePaymentHandleLike {
+  id: string;
+  paymentHandleToken: string;
+  merchantRefNum?: string;
+  status?: string;
+  /** "REDIRECT" when the customer must authenticate at the provider. */
+  action?: string;
+  paymentType?: string;
+  links?: Array<{ rel?: string; href?: string }>;
+}
+
 /** Stored (MULTI_USE) handle as the vault reports it. */
 export interface PaysafeStoredHandleLike {
   id: string;
@@ -156,7 +169,7 @@ function toStoredMethod(
     token: handle.paymentHandleToken,
     pspName,
     pspCustomerId,
-    paymentMethodType: handle.paymentType === "CARD" || !handle.paymentType ? "card" : "other",
+    paymentMethodType: toUnifiedMethodType(handle.paymentType),
     ...(details ? { details } : {}),
     raw: handle,
   };
@@ -173,8 +186,68 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "paysafecard", flow: "voucher_code", supported: false },
   { type: "paysafecash", flow: "voucher_code", supported: false },
   { type: "ach", flow: "embedded", supported: false },
+  // Payments-API only (Paysafe.js cannot tokenize it): the handle is minted
+  // server-side at session creation and the customer authenticates at Interac.
+  // Implemented, but off by default like every other non-card rail — it is
+  // per-account enablement AND Canada/CAD only, so claiming it for every account
+  // would misreport the majority of them. Canadian merchants opt in via
+  // config.paymentMethods.
   { type: "interac_etransfer", flow: "redirect", supported: false },
 ];
+
+/** Paysafe paymentType -> the unified vocabulary. Everything else stays "other". */
+const PAYSAFE_TYPE_TO_UNIFIED: Record<string, UnifiedPaymentMethodType> = {
+  CARD: "card",
+  INTERAC_ETRANSFER: "interac_etransfer",
+};
+
+const INTERAC_PAYMENT_TYPE = "INTERAC_ETRANSFER";
+
+/** Interac e-Transfer settles in Canadian dollars only. */
+const INTERAC_CURRENCY = "CAD";
+
+/**
+ * Every outcome returns to the host's single returnUrl. "on_completed" is also a
+ * valid rel, but "default" already covers it and splitting them would imply the
+ * landing URL is proof of the outcome.
+ */
+const INTERAC_RETURN_RELS = ["default", "on_failed", "on_cancelled"] as const;
+
+/**
+ * Paysafe appends nothing to the return URL, so the client adapter would have no
+ * way to recognize its own return trip. Planting a marker on the links we
+ * register is that evidence. Kept in step with PAYSAFE_RETURN_MARKER in
+ * adapter-paysafe — the packages share no code, since a client-safe package
+ * cannot depend on a server one.
+ */
+const PAYSAFE_RETURN_MARKER = "payfanout_psp";
+
+function withReturnMarker(returnUrl: string): string {
+  let url: URL;
+  try {
+    url = new URL(returnUrl);
+  } catch (err) {
+    throw PayFanoutError.invalidRequest(`returnUrl is not a valid absolute URL: ${returnUrl}`, err);
+  }
+  url.searchParams.set(PAYSAFE_RETURN_MARKER, "paysafe");
+  return url.href;
+}
+
+/**
+ * A handle is minted for exactly ONE paymentType, so a redirect rail cannot share
+ * a session with the card path — asking for both is a request we cannot honor.
+ */
+function isInteracRequest(types: UnifiedPaymentMethodType[] | undefined): boolean {
+  if (!types?.includes("interac_etransfer")) return false;
+  if (types.length > 1) {
+    throw PayFanoutError.invalidRequest(
+      `Interac e-Transfer needs a session of its own — it cannot be combined with: ${types
+        .filter((t) => t !== "interac_etransfer")
+        .join(", ")}`,
+    );
+  }
+  return true;
+}
 
 export class PaysafeServerAdapter implements ServerPaymentAdapter {
   readonly pspName = PAYSAFE_PSP_NAME;
@@ -270,7 +343,83 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       receiptEmail: input.receiptEmail,
       shippingDetails: input.shippingDetails,
     };
+    if (isInteracRequest(input.paymentMethodTypes)) return this.createInteracSession(context, input);
     return this.toSession(context);
+  }
+
+  /**
+   * Interac e-Transfer is Payments-API only — Paysafe.js cannot tokenize it, so
+   * unlike the card path this session DOES call Paysafe: the redirect URL has to
+   * exist before the client can send the customer to their bank. The resulting
+   * handle token rides the signed context, which is what keeps completion
+   * stateless.
+   */
+  private async createInteracSession(
+    context: PaysafeSessionContextV1,
+    input: CreatePaymentSessionInput,
+  ): Promise<PaymentSession> {
+    if (context.currency !== INTERAC_CURRENCY) {
+      throw PayFanoutError.invalidRequest(
+        `Interac e-Transfer settles in ${INTERAC_CURRENCY} only — this session is ${context.currency}`,
+      );
+    }
+    if (context.captureMethod === "manual") {
+      throw PayFanoutError.invalidRequest(
+        "Interac e-Transfer cannot be authorized without settling — use captureMethod \"automatic\"",
+      );
+    }
+    if (!input.returnUrl) {
+      throw PayFanoutError.invalidRequest(
+        "Interac e-Transfer requires returnUrl — Paysafe returns the customer to it after they authenticate at their bank",
+      );
+    }
+    // Paysafe collects from an alias, so the customer's email is the instrument
+    // itself, not a receipt nicety.
+    const consumerId = input.receiptEmail ?? input.billingDetails?.email;
+    if (!consumerId) {
+      throw PayFanoutError.invalidRequest(
+        "Interac e-Transfer requires the customer's email — pass receiptEmail or billingDetails.email",
+      );
+    }
+    const returnHref = withReturnMarker(input.returnUrl);
+    const handle = await this.request<PaysafePaymentHandleLike>("POST", "/paymenthub/v1/paymenthandles", {
+      merchantRefNum: input.idempotencyKey,
+      transactionType: "PAYMENT",
+      paymentType: INTERAC_PAYMENT_TYPE,
+      amount: context.amount,
+      currencyCode: context.currency,
+      // "interacEtransfer" (lowercase t) is contested: Paysafe's OpenAPI schema
+      // interacObject spells it "interacETransfer", but that schema is flagged
+      // x-internal, while every request example and the integration guide use
+      // this spelling. Getting it wrong fails closed (error 5023, unrecognized
+      // field). See docs/decisions.md.
+      interacEtransfer: { consumerId, type: "EMAIL" },
+      ...(context.merchantAccountId ? { accountId: context.merchantAccountId } : {}),
+      // The same URL for every outcome: the browser's landing spot is a hint, not
+      // evidence — the real result comes from completePayment/the webhook.
+      returnLinks: INTERAC_RETURN_RELS.map((rel) => ({ rel, href: returnHref })),
+      ...(toPaysafeBillingDetails(context.billingDetails) ?? {}),
+    });
+    const redirectUrl = handle.links?.find((link) => link.rel === "redirect_payment")?.href;
+    if (!redirectUrl) {
+      throw new PayFanoutError({
+        code: "processing_error",
+        message: "Paysafe returned an Interac payment handle with no redirect link",
+        retryable: false,
+        raw: handle,
+        pspName: this.pspName,
+      });
+    }
+    return this.toSession(
+      {
+        ...context,
+        paymentType: INTERAC_PAYMENT_TYPE,
+        paymentHandleToken: handle.paymentHandleToken,
+        redirectUrl,
+      },
+      // The handle exists; what remains is the customer authenticating at Interac.
+      "requires_action",
+    );
   }
 
   /**
@@ -282,6 +431,14 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    */
   async updatePaymentSession(input: UpdatePaymentSessionInput): Promise<PaymentSession> {
     const context = await this.decodeContext(input.pspSessionId);
+    // A minted handle is fixed at its amount/currency: the customer authorizes THAT
+    // handle at their bank. Re-signing a context around it would charge an amount
+    // they never approved, and would slip past the rail's own creation guards.
+    if (context.paymentHandleToken) {
+      throw PayFanoutError.invalidRequest(
+        "This session's payment handle is already minted and cannot be amended — create a new payment session instead",
+      );
+    }
     if (input.amount !== undefined) assertMinorUnitAmount(input.amount, "amount");
     const currency = input.currency !== undefined ? normalizeCurrency(input.currency) : context.currency;
     const merchantAccountId =
@@ -302,16 +459,19 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     return this.toSession(updated);
   }
 
-  private async toSession(context: PaysafeSessionContextV1): Promise<PaymentSession> {
+  private async toSession(
+    context: PaysafeSessionContextV1,
+    status: UnifiedPaymentStatus = "requires_payment_method",
+  ): Promise<PaymentSession> {
     const token = await encodeSessionContext(context, this.config.sessionSigningKey);
     return {
       id: context.id ?? token,
       pspName: this.pspName,
       pspSessionId: token,
-      clientSecret: token, // the client adapter decodes the payload half for tokenize params
+      clientSecret: token, // the client adapter decodes the payload half for tokenize/redirect params
       amount: context.amount,
       currency: context.currency,
-      status: "requires_payment_method",
+      status,
       metadata: context.metadata,
     };
   }
@@ -327,15 +487,19 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * handle-level flows (redirect methods) and future API support.
    */
   async completePayment(input: CompletePaymentInput): Promise<PaymentInfo> {
-    if (!input.clientToken) {
+    const context = await this.decodeContext(input.pspSessionId);
+    // Redirect rails (Interac) minted their handle at session creation and carry
+    // it in the signed context; the card path only has a token once the browser
+    // has tokenized, so it still comes from the caller.
+    const paymentHandleToken = context.paymentHandleToken ?? input.clientToken;
+    if (!paymentHandleToken) {
       throw PayFanoutError.invalidRequest("completePayment requires the clientToken produced by confirm()");
     }
-    const context = await this.decodeContext(input.pspSessionId);
     const payment = await this.request<PaysafePaymentLike>("POST", "/paymenthub/v1/payments", {
       merchantRefNum: input.idempotencyKey, // Paysafe dedupes on merchantRefNum — the idempotency mechanism
       amount: context.amount,
       currencyCode: context.currency,
-      paymentHandleToken: input.clientToken,
+      paymentHandleToken,
       settleWithAuth: context.captureMethod !== "manual",
       ...(context.merchantAccountId ? { accountId: context.merchantAccountId } : {}),
       // Browser-tokenized handles carry no AVS data — Paysafe rejects card
@@ -736,15 +900,14 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       // whatever left availableToSettle has been captured.
       settled = Math.max(0, (payment.amount ?? 0) - payment.availableToSettle);
     }
-    // availableToRefund decreases as refunds land; refundedAmount is a legacy fallback.
-    const refunded = settlements.reduce(
-      (sum, s) => sum + (s.refundedAmount ?? Math.max(0, (s.amount ?? 0) - (s.availableToRefund ?? s.amount ?? 0))),
-      0,
-    );
+    const refunded = settlements.reduce((sum, s) => sum + settlementRefunded(s), 0);
     // amountCaptured is only claimed with a witness: settlements/derivation for
     // manual capture, or the settle-with-auth completion itself (full amount).
     let amountCaptured: number | undefined;
-    if (settled > 0) amountCaptured = settled;
+    // A settlement sum is only evidence of capture once the payment itself has
+    // completed (or a void told us what was settled first) — a bank rail is
+    // PROCESSING with a settlement attached long before any money has moved.
+    if (settled > 0 && (completed || knownSettled !== undefined)) amountCaptured = settled;
     else if (completed && payment.settleWithAuth) amountCaptured = payment.amount ?? 0;
     else if (completed && (typeof payment.availableToSettle === "number" || knownSettled !== undefined)) {
       amountCaptured = 0;
@@ -763,10 +926,12 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
         ? { amountCapturable: payment.availableToSettle }
         : {}),
       currency: (payment.currencyCode ?? "").toUpperCase() || "USD",
-      paymentMethodType: payment.paymentType === "CARD" || !payment.paymentType ? "card" : "other",
+      paymentMethodType: toUnifiedMethodType(payment.paymentType),
       ...(methodDetails ? { paymentMethodDetails: methodDetails } : {}),
       createdAt: payment.txnTime ?? "1970-01-01T00:00:00.000Z",
-      ...(settled > 0 && settlements[0]?.txnTime ? { capturedAt: settlements[0].txnTime } : {}),
+      ...(amountCaptured !== undefined && amountCaptured > 0 && settlements[0]?.txnTime
+        ? { capturedAt: settlements[0].txnTime }
+        : {}),
       raw: payment,
     };
   }
@@ -863,6 +1028,12 @@ const PAYSAFE_CARD_TYPE_TO_BRAND: Record<string, string> = {
   UP: "unionpay",
 };
 
+/** An absent paymentType means card: the vault and the card payment path both predate the field. */
+function toUnifiedMethodType(paymentType: string | undefined): UnifiedPaymentMethodType {
+  if (!paymentType) return "card";
+  return PAYSAFE_TYPE_TO_UNIFIED[paymentType.toUpperCase()] ?? "other";
+}
+
 function toPaymentMethodDetails(card: PaysafeCardLike | undefined): PaymentMethodDetails | undefined {
   if (!card) return undefined;
   const brand =
@@ -875,6 +1046,23 @@ function toPaymentMethodDetails(card: PaysafeCardLike | undefined): PaymentMetho
     ...(typeof card.cardExpiry?.year === "number" ? { expYear: card.cardExpiry.year } : {}),
   };
   return Object.keys(details).length > 0 ? details : undefined;
+}
+
+/** A settlement Paysafe has not finished moving — nothing has been refunded out of it yet. */
+const IN_FLIGHT_SETTLEMENT_STATUSES = new Set(["INITIATED", "PENDING", "PROCESSING", "RECEIVED"]);
+
+/**
+ * How much of a settlement came back. `refundedAmount` is authoritative where the
+ * API reports it; otherwise refunds are inferred from the drop in
+ * availableToRefund. That inference only holds once the settlement has left the
+ * flight: bank rails answer `availableToRefund: 0` on a perfectly healthy
+ * PROCESSING settlement (it means "not refundable yet"), and subtracting that
+ * would report an in-flight debit as fully refunded.
+ */
+function settlementRefunded(settlement: PaysafeSettlementLike): number {
+  if (typeof settlement.refundedAmount === "number") return settlement.refundedAmount;
+  if (IN_FLIGHT_SETTLEMENT_STATUSES.has((settlement.status ?? "").toUpperCase())) return 0;
+  return Math.max(0, (settlement.amount ?? 0) - (settlement.availableToRefund ?? settlement.amount ?? 0));
 }
 
 /** Authorized-but-unsettled remainder — the explicit amount full captures and voids need. */

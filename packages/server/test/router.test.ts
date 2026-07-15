@@ -239,6 +239,36 @@ describe("PaymentRouter failover cascade", () => {
     expect(cardOnly.calls.length).toBe(0);
   });
 
+  it("fails a currency-ineligible rail over to a PSP that settles it", async () => {
+    // A host offering "pay by bank debit" in GBP. Both PSPs do bank debit and
+    // both take GBP — but SEPA settles in EUR only, so the euro PSP cannot
+    // serve this payment. Before the per-method gate it looked available and
+    // the cascade died on its PSP-local rejection instead of failing over.
+    const sepaPsp = new FakeAdapter({
+      pspName: "sepa-psp",
+      capabilities: {
+        paymentMethods: [{ type: "sepa_debit", flow: "embedded", supported: true, currencies: ["EUR"] }],
+      },
+    });
+    const bacsPsp = new FakeAdapter({
+      pspName: "bacs-psp",
+      capabilities: {
+        paymentMethods: [{ type: "bacs_debit", flow: "embedded", supported: true, currencies: ["GBP"] }],
+      },
+    });
+    const router = new PaymentRouter({
+      service: new PaymentService({ adapters: [sepaPsp, bacsPsp] }),
+    });
+
+    const result = await router.createPaymentSession(
+      input({ currency: "GBP", paymentMethodTypes: ["sepa_debit", "bacs_debit"] }),
+    );
+    expect(result.pspName).toBe("bacs-psp");
+    expect(result.attempts[0]).toMatchObject({ pspName: "sepa-psp", skipped: true });
+    expect(result.attempts[0]?.error.message).toMatch(/in GBP/);
+    expect(sepaPsp.calls.length).toBe(0); // screened out before any adapter call
+  });
+
   it("fails with a diagnostic error when every candidate is ineligible", async () => {
     const noManualA = new FakeAdapter({
       pspName: "nm-a",

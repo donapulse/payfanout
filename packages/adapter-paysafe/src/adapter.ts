@@ -81,8 +81,11 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "paysafecash", flow: "voucher_code", supported: false },
   // Mirrors the server adapter: implemented, but off by default — per-account
   // enablement and Canada/CAD only. Canadian merchants opt in via
-  // config.paymentMethods.
-  { type: "interac_etransfer", flow: "redirect", supported: false },
+  // config.paymentMethods, and their override carries the gate. The CAD literal
+  // is kept in step with INTERAC_CURRENCIES in adapter-paysafe-server — the
+  // packages share no code, since a client-safe package cannot depend on a
+  // server one.
+  { type: "interac_etransfer", flow: "redirect", supported: false, currencies: ["CAD"] },
 ];
 
 /** The payload half of the server's signed session context (signature verified server-side only). */

@@ -82,3 +82,63 @@ describe("screenSessionInput — supportedCurrencies", () => {
     expect(screenSessionInput(caps({ supportedCurrencies: [] }), input({ currency: "XCD" }))).toBeUndefined();
   });
 });
+
+describe("screenSessionInput — per-method currencies", () => {
+  const rails = caps({
+    paymentMethods: [
+      { type: "card", flow: "embedded", supported: true },
+      { type: "sepa_debit", flow: "embedded", supported: true, currencies: ["EUR"] },
+      { type: "pad", flow: "redirect", supported: true, currencies: ["CAD", "USD"] },
+    ],
+  });
+
+  it("skips a rail requested outside its currency, and says so", () => {
+    expect(screenSessionInput(rails, input({ currency: "GBP", paymentMethodTypes: ["sepa_debit"] }))).toMatch(
+      /none of the requested payment method types in GBP: sepa_debit/,
+    );
+    expect(screenSessionInput(rails, input({ currency: "EUR", paymentMethodTypes: ["sepa_debit"] }))).toBeUndefined();
+  });
+
+  it("distinguishes an unsupported rail from a currency-ineligible one", () => {
+    // Both skip the candidate, but the router surfaces these strings when every
+    // candidate was skipped — "we don't do SEPA" would be a lie about the first.
+    expect(screenSessionInput(rails, input({ currency: "GBP", paymentMethodTypes: ["sepa_debit"] }))).toMatch(
+      /in GBP/,
+    );
+    expect(screenSessionInput(rails, input({ currency: "GBP", paymentMethodTypes: ["ideal"] }))).not.toMatch(/in GBP/);
+  });
+
+  it("a rail listing several currencies matches any of them, case-insensitively", () => {
+    expect(screenSessionInput(rails, input({ currency: "CAD", paymentMethodTypes: ["pad"] }))).toBeUndefined();
+    expect(screenSessionInput(rails, input({ currency: "usd", paymentMethodTypes: ["pad"] }))).toBeUndefined();
+    expect(screenSessionInput(rails, input({ currency: "EUR", paymentMethodTypes: ["pad"] }))).toMatch(/in EUR/);
+  });
+
+  it("absent or empty means unrestricted, exactly as supportedCurrencies reads", () => {
+    expect(screenSessionInput(rails, input({ currency: "JPY", paymentMethodTypes: ["card"] }))).toBeUndefined();
+    const empty = caps({ paymentMethods: [{ type: "card", flow: "embedded", supported: true, currencies: [] }] });
+    expect(screenSessionInput(empty, input({ currency: "JPY", paymentMethodTypes: ["card"] }))).toBeUndefined();
+  });
+
+  it("one eligible rail carries a multi-method request", () => {
+    // Screening answers "can this candidate serve the payment at all" — via
+    // card, it can, so the router must not skip it. Narrowing what the adapter
+    // then offers the PSP is the adapter's own concern, not this predicate's
+    // (see #89 — Stripe still forwards the ineligible rail today).
+    expect(
+      screenSessionInput(rails, input({ currency: "GBP", paymentMethodTypes: ["sepa_debit", "card"] })),
+    ).toBeUndefined();
+  });
+
+  it("ignores the constraint on a rail the PSP does not support", () => {
+    const off = caps({
+      paymentMethods: [
+        { type: "card", flow: "embedded", supported: true },
+        { type: "sepa_debit", flow: "embedded", supported: false, currencies: ["EUR"] },
+      ],
+    });
+    expect(screenSessionInput(off, input({ currency: "EUR", paymentMethodTypes: ["sepa_debit"] }))).toMatch(
+      /none of the requested payment method types: sepa_debit/,
+    );
+  });
+});

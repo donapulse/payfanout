@@ -212,7 +212,10 @@ is Canada-only, so opt in on both adapters:
 ```ts
 paymentMethods: [
   { type: "card", flow: "embedded", supported: true },
-  { type: "interac_etransfer", flow: "redirect", supported: true },
+  // Keep the CAD gate: this list replaces the defaults wholesale, and without
+  // it the router cannot skip Paysafe for a non-CAD session — it would offer
+  // the rail, then fail on the adapter's own check instead of failing over.
+  { type: "interac_etransfer", flow: "redirect", supported: true, currencies: ["CAD"] },
 ],
 ```
 

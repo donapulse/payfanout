@@ -116,6 +116,11 @@ describe("Paysafe Interac e-Transfer client", () => {
       .listPaymentMethodCapabilities()
       .find((m) => m.type === "interac_etransfer");
     // Mirrors the server adapter: Canada/CAD and per-account enablement.
-    expect(interac).toEqual({ type: "interac_etransfer", flow: "redirect", supported: false });
+    expect(interac).toEqual({
+      type: "interac_etransfer",
+      flow: "redirect",
+      supported: false,
+      currencies: ["CAD"],
+    });
   });
 });

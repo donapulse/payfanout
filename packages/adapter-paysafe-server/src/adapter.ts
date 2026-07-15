@@ -175,6 +175,16 @@ function toStoredMethod(
   };
 }
 
+/**
+ * Interac e-Transfer settles in Canadian dollars only (Paysafe: "Supported
+ * currency: CAD"). One constant, two readers: the capability below, so the
+ * router skips a non-CAD session instead of failing at Paysafe, and
+ * createInteracSession, which still rejects — screening is bypassed entirely
+ * when a host drives the adapter without PaymentService, and a host overriding
+ * config.paymentMethods can drop the declared gate.
+ */
+const INTERAC_CURRENCIES: string[] = ["CAD"];
+
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "card", flow: "embedded", supported: true },
   // Real redirect/voucher methods stay honestly modeled — never forced into an
@@ -192,7 +202,7 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
   // per-account enablement AND Canada/CAD only, so claiming it for every account
   // would misreport the majority of them. Canadian merchants opt in via
   // config.paymentMethods.
-  { type: "interac_etransfer", flow: "redirect", supported: false },
+  { type: "interac_etransfer", flow: "redirect", supported: false, currencies: [...INTERAC_CURRENCIES] },
 ];
 
 /** Paysafe paymentType -> the unified vocabulary. Everything else stays "other". */
@@ -202,9 +212,6 @@ const PAYSAFE_TYPE_TO_UNIFIED: Record<string, UnifiedPaymentMethodType> = {
 };
 
 const INTERAC_PAYMENT_TYPE = "INTERAC_ETRANSFER";
-
-/** Interac e-Transfer settles in Canadian dollars only. */
-const INTERAC_CURRENCY = "CAD";
 
 /**
  * Every outcome returns to the host's single returnUrl. "on_completed" is also a
@@ -358,9 +365,9 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     context: PaysafeSessionContextV1,
     input: CreatePaymentSessionInput,
   ): Promise<PaymentSession> {
-    if (context.currency !== INTERAC_CURRENCY) {
+    if (!INTERAC_CURRENCIES.includes(context.currency)) {
       throw PayFanoutError.invalidRequest(
-        `Interac e-Transfer settles in ${INTERAC_CURRENCY} only — this session is ${context.currency}`,
+        `Interac e-Transfer settles in ${INTERAC_CURRENCIES.join("/")} only — this session is ${context.currency}`,
       );
     }
     if (context.captureMethod === "manual") {

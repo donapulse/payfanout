@@ -375,10 +375,12 @@ describe("Stripe capability declaration", () => {
       { type: "card", flow: "embedded", supported: true },
       { type: "apple_pay", flow: "popup", supported: true },
       { type: "google_pay", flow: "popup", supported: true },
-      { type: "ideal", flow: "redirect", supported: true },
-      { type: "sepa_debit", flow: "embedded", supported: true },
-      { type: "ach", flow: "embedded", supported: true },
-      { type: "bacs_debit", flow: "embedded", supported: true },
+      // The rails are single-currency; card/wallets follow the account's
+      // presentment list, which is not a per-method constraint.
+      { type: "ideal", flow: "redirect", supported: true, currencies: ["EUR"] },
+      { type: "sepa_debit", flow: "embedded", supported: true, currencies: ["EUR"] },
+      { type: "ach", flow: "embedded", supported: true, currencies: ["USD"] },
+      { type: "bacs_debit", flow: "embedded", supported: true, currencies: ["GBP"] },
     ]);
   });
 

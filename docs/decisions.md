@@ -612,3 +612,44 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   rails attach a `PROCESSING` settlement to the payment immediately, sharing its
   `merchantRefNum`; refunds are therefore only inferred from `availableToRefund` once the
   settlement has left an in-flight status, and never from `refundedAmount`'s absence alone.
+
+## Per-method currency gating + the `pad` rail (2026-07-15)
+
+- **`PaymentMethodCapability` gained `currencies?: string[]`** (absent OR empty =
+  unrestricted, mirroring `supportedCurrencies` one level up; the PSP-wide list still
+  applies on top). `screenSessionInput` honors it, so a currency-ineligible rail is
+  skipped and the router fails over to a PSP that can settle it, instead of the rail
+  looking available and dying on a PSP-local rejection. Chosen over a per-method
+  `countries` field, or a nested `constraints` object, deliberately: country is a
+  genuinely different problem — GoCardless collects SEPA in EUR from *non*-Eurozone
+  countries, so country does not imply currency, and `CreatePaymentSessionInput.country`
+  is optional, leaving an absent country with no good screening answer. Both remain
+  addable later without a break, so neither was worth guessing at now.
+- **The declaration does not replace the adapter-local guard — it derives from it.**
+  Paysafe's Interac CAD check stays in `createInteracSession`; screening is bypassed
+  entirely when a host drives an adapter without `PaymentService`, and a host overriding
+  `config.paymentMethods` can drop the declared gate. One constant
+  (`INTERAC_CURRENCIES`), two readers, so they cannot drift.
+- **A rail gated to currencies the PSP does not accept is now a capability-coherence
+  violation** (`validateAdapterCapabilities`), not a silent dead method: screening would
+  reject such a session on `supportedCurrencies` before the method rule was ever
+  consulted. Enforced at PaymentService registration and by the conformance suite, which
+  both consume the same rule table.
+- **The new Canadian rail is `pad`, not `eft`.** The rail is Pre-Authorized Debit,
+  administered by Payments Canada. Its PSP names disagree — Stripe `acss_debit`
+  ("pre-authorized debit (PAD)"), GoCardless `pad`, Paysafe "Electronic Fund Transfer
+  (EFT)" — and the unified vocabulary is provider-agnostic, so it takes the scheme's own
+  name and each adapter maps to it. #87 proposed `eft`; that is Paysafe's word, and
+  naming core after one provider would have forced a future Stripe/GoCardless rail to
+  report under it. Doc-verified 2026-07-15.
+- **Not a single-currency rail: Stripe's PAD takes CAD *and* USD.** Doc-verified
+  2026-07-15 (docs.stripe.com/payments/acss-debit): "It's possible to accept PAD payments
+  in either CAD or USD" — the currency must match the customer's account denomination and
+  a mismatch fails up to 5 business days later. This is why the field is an array; a
+  scalar would have been wrong on the first rail that used it.
+- **Paysafe's EFT and ACH currencies are undocumented.** Doc-verified 2026-07-15: the
+  Paysafe EFT page states Canada as a country and no currency at all, and its ACH page
+  states neither; only SEPA (EUR), BACS (GBP) and Interac (CAD) are stated outright.
+  Both rails are `supported: false` today, so nothing is declared for them — encoding
+  EFT→CAD would assert something the provider does not document. Needs a sandbox check
+  or Paysafe's confirmation before #83 gates them.

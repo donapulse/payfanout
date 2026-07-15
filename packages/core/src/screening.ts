@@ -18,8 +18,8 @@ export function screenSessionInput(
   input: CreatePaymentSessionInput,
 ): string | undefined {
   const psp = caps.pspName;
+  const currency = input.currency?.trim().toUpperCase();
   if (caps.supportedCurrencies && caps.supportedCurrencies.length > 0) {
-    const currency = input.currency?.trim().toUpperCase();
     if (!caps.supportedCurrencies.some((c) => c.toUpperCase() === currency)) {
       return `"${psp}" does not support currency ${String(input.currency)}`;
     }
@@ -35,10 +35,27 @@ export function screenSessionInput(
   if (input.savePaymentMethod && !caps.supportsSavedPaymentMethods) {
     return `"${psp}" does not support saved payment methods`;
   }
-  if (input.paymentMethodTypes && input.paymentMethodTypes.length > 0) {
-    const supported = new Set(caps.paymentMethods.filter((m) => m.supported).map((m) => m.type as string));
-    if (!input.paymentMethodTypes.some((t) => supported.has(t))) {
-      return `"${psp}" supports none of the requested payment method types: ${input.paymentMethodTypes.join(", ")}`;
+  const requested = input.paymentMethodTypes;
+  if (requested && requested.length > 0) {
+    // A supported-but-currency-ineligible rail (SEPA asked for in GBP) and an
+    // outright unsupported one are different diagnoses: both skip the
+    // candidate, but the router surfaces these strings when every candidate
+    // was skipped, and "we don't do SEPA" would be a lie about the first.
+    let ineligibleByCurrency = false;
+    let eligible = false;
+    for (const method of caps.paymentMethods) {
+      if (!method.supported || !requested.includes(method.type)) continue;
+      // Absent OR empty means unrestricted, exactly as supportedCurrencies reads.
+      if (!method.currencies?.length || method.currencies.some((c) => c.toUpperCase() === currency)) {
+        eligible = true;
+        break;
+      }
+      ineligibleByCurrency = true;
+    }
+    if (!eligible) {
+      return ineligibleByCurrency
+        ? `"${psp}" supports none of the requested payment method types in ${String(input.currency)}: ${requested.join(", ")}`
+        : `"${psp}" supports none of the requested payment method types: ${requested.join(", ")}`;
     }
   }
   return undefined;

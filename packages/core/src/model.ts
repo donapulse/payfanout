@@ -42,6 +42,10 @@ export const PAYMENT_METHOD_TYPES = [
   "sepa_debit",
   "ach",
   "bacs_debit",
+  // Pre-Authorized Debit, the Payments Canada scheme for pulling debits from
+  // Canadian accounts. PSPs name it inconsistently — Stripe "acss_debit",
+  // GoCardless "pad", Paysafe "EFT" — so the scheme name is the neutral one.
+  "pad",
   "interac_etransfer",
   "skrill",
   "neteller",
@@ -58,6 +62,15 @@ export interface PaymentMethodCapability {
   type: UnifiedPaymentMethodType;
   flow: PaymentMethodFlow;
   supported: boolean;
+  /**
+   * Hard per-method currency constraint (ISO 4217, uppercase) — a rail that
+   * settles in one currency only (SEPA in EUR, Bacs in GBP). ABSENT means
+   * unrestricted; the PSP-wide `AdapterCapabilities.supportedCurrencies` still
+   * applies on top. Declared rather than guarded privately so the router can
+   * pre-screen: a currency-ineligible rail must be skipped in favour of an
+   * eligible PSP, not attempted and rejected at the PSP.
+   */
+  currencies?: string[];
 }
 
 export interface AdapterCapabilities {

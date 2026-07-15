@@ -124,4 +124,38 @@ describe("validateAdapterCapabilities", () => {
       validateAdapterCapabilities(makeAdapter({ supportsManualCapture: true, supportsSessionUpdate: true })),
     ).toEqual([expect.stringMatching(/manual capture/), expect.stringMatching(/session update/)]);
   });
+
+  it("a rail gated to currencies the adapter does not declare can never be routed", () => {
+    const issues = validateAdapterCapabilities(
+      makeAdapter({
+        supportedCurrencies: ["GBP", "EUR"],
+        paymentMethods: [
+          { type: "card", flow: "embedded", supported: true },
+          { type: "pad", flow: "redirect", supported: true, currencies: ["CAD"] },
+        ],
+      }),
+    );
+    expect(issues).toHaveLength(1);
+    // Scoped to the adapter's own declaration, not the provider's real reach.
+    expect(issues[0]).toMatch(/offers pad in CAD but declares supportedCurrencies GBP\/EUR/);
+    expect(issues[0]).toMatch(/never be routed/);
+  });
+
+  it("accepts coherent, unconstrained, and unsupported-rail currency declarations", () => {
+    const methods = (paymentMethods: AdapterCapabilities["paymentMethods"]) =>
+      validateAdapterCapabilities(makeAdapter({ supportedCurrencies: ["GBP", "EUR"], paymentMethods }));
+    // Overlaps the declared list (case-insensitively).
+    expect(methods([{ type: "sepa_debit", flow: "embedded", supported: true, currencies: ["eur"] }])).toEqual([]);
+    // Unrestricted rails are always reachable.
+    expect(methods([{ type: "card", flow: "embedded", supported: true }])).toEqual([]);
+    expect(methods([{ type: "card", flow: "embedded", supported: true, currencies: [] }])).toEqual([]);
+    // An unsupported rail's gate is inert — nothing to misroute.
+    expect(methods([{ type: "pad", flow: "redirect", supported: false, currencies: ["CAD"] }])).toEqual([]);
+    // An adapter that declares no currency list constrains nothing.
+    expect(
+      validateAdapterCapabilities(
+        makeAdapter({ paymentMethods: [{ type: "pad", flow: "redirect", supported: true, currencies: ["CAD"] }] }),
+      ),
+    ).toEqual([]);
+  });
 });

@@ -1,5 +1,23 @@
 # @payfanout/adapter-paysafe-server
 
+## 1.3.0
+
+### Minor Changes
+
+- b23ca0e: Support Interac e-Transfer on Paysafe (Canada, CAD). Paysafe.js cannot tokenize this rail, so `createPaymentSession` mints the payment handle server-side and the customer authenticates at their bank; the return trip resolves through `handleRedirectReturn` and the existing server-completion route, with the terminal outcome arriving by webhook. Request a session with `paymentMethodTypes: ["interac_etransfer"]`, a `returnUrl`, and the customer's email.
+- 9fa81c4: Support Paysafe's direct-debit rails: SEPA (`sepa_debit`, EUR), ACH (`ach`), BACS (`bacs_debit`, GBP/UK), and EFT (`pad`, Canada). These are Payments-API rails Paysafe.js cannot tokenize, so the client adapter renders its own bank-details fields (account holder + IBAN, routing + account, sort code + account, or institution + transit + account), with a mandate-consent checkbox on SEPA and BACS, and the details travel to the server through the existing completion route. The server adapter mints the payment handle and charges it with `settleWithAuth: true` in one completion step, surfaces the SEPA/BACS mandate reference on `PaymentInfo.mandateReference`, and maps Paysafe's returned-payment webhook (both documented spellings) to `payment.failed` so late bank returns finalize the payment. All four rails are off by default — enablement is per-account; opt in via `config.paymentMethods`, keeping each rail's declared currency and country gates, and restrict each session to exactly one bank rail.
+
+### Patch Changes
+
+- 80b9bb6: Country-bound rails now declare the customer countries they serve, so a session that states `customerCountry` routes past them when the customer cannot pay with them: iDEAL (NL), ACH (US) and Bacs (GB) on Stripe; Bacs (GB) on GoCardless; Interac e-Transfer (CA) on Paysafe. SEPA stays country-unrestricted on every adapter — the providers document a zone, not a country. As with the currency gates, a `config.paymentMethods` override replaces the declared defaults wholesale, so an override must carry its own `countries` for the router to pre-screen by them.
+- d1d42fa: Bank rails now declare the currency they settle in, so the router skips them for a payment they could never have completed: iDEAL and SEPA in EUR, ACH in USD, Bacs in GBP on Stripe; SEPA in EUR and Bacs in GBP on GoCardless. Previously a EUR-only rail looked available for a GBP payment and failed at the PSP.
+
+  Paysafe's Interac e-Transfer declares CAD as well, but the rail stays off by default, and `config.paymentMethods` replaces the declared defaults wholesale — so an account that opts the rail in must carry `currencies: ["CAD"]` in its own override for the router to pre-screen it. The adapter's CAD check is unchanged either way.
+
+- Updated dependencies [80b9bb6]
+- Updated dependencies [d1d42fa]
+  - @payfanout/core@2.0.0
+
 ## 1.2.1
 
 ### Patch Changes

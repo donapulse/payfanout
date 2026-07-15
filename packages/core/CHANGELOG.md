@@ -1,5 +1,19 @@
 # @payfanout/core
 
+## 2.0.0
+
+### Major Changes
+
+- d1d42fa: Payment methods can now declare the currencies they settle in. `PaymentMethodCapability.currencies` (uppercase ISO 4217; absent or empty means unrestricted, and the PSP-wide `supportedCurrencies` still applies on top) is honored by session screening, so a rail requested outside its currencies — SEPA in GBP — is reported ineligible instead of attempted, and the router can fail over to a PSP that settles it.
+
+  Adds `pad` to `PAYMENT_METHOD_TYPES` for Pre-Authorized Debit, the Payments Canada scheme that Stripe calls `acss_debit`, GoCardless calls `pad`, and Paysafe calls EFT. This widens `UnifiedPaymentMethodType`: an exhaustive `switch` or a non-partial `Record` over it will need a `pad` arm.
+
+  `validateAdapterCapabilities` now reports a supported method gated to currencies that the adapter's own `supportedCurrencies` excludes — such a method can never be routed, so `PaymentService` rejects it at registration rather than offering a rail that always screens out.
+
+### Minor Changes
+
+- 80b9bb6: Payment methods can now declare the customer countries they serve. `PaymentMethodCapability.countries` (uppercase ISO 3166-1 alpha-2; absent or empty means unrestricted) is the customer-side sibling of `currencies`: Bacs pays from UK bank accounts, Interac from Canadian ones. Session screening honors it through a new `CreatePaymentSessionInput.customerCountry` field — when the host states the customer's country, a rail that cannot serve it is reported ineligible and the router can fail over; when the host omits it, country-restricted rails are not screened at all, so existing callers see no change. `customerCountry` is distinct from `country`, which resolves the merchant account and is never read for rail eligibility.
+
 ## 1.2.0
 
 ### Minor Changes

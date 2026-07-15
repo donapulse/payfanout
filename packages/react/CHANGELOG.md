@@ -1,5 +1,13 @@
 # @payfanout/react
 
+## 0.3.1
+
+### Patch Changes
+
+- Updated dependencies [80b9bb6]
+- Updated dependencies [d1d42fa]
+  - @payfanout/core@2.0.0
+
 ## 0.3.0
 
 ### Minor Changes

@@ -1,6 +1,6 @@
 {
   "name": "@payfanout/adapter-paysafe",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "license": "MIT",
   "description": "Client-side Paysafe adapter for PayFanout (Paysafe.js hosted iframe fields, tokenize-first). No secrets, no server code.",
   "type": "module",

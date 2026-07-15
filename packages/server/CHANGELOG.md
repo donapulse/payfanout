@@ -1,5 +1,18 @@
 # @payfanout/server
 
+## 1.2.0
+
+### Minor Changes
+
+- d1d42fa: `PaymentRouter` and `PaymentService` now pre-screen candidates by the currencies a payment method declares. A PSP whose requested rail cannot settle the session's currency is skipped before any PSP call, so the cascade continues to a PSP that can serve it instead of aborting on that PSP's own rejection. The skip reason distinguishes a rail the PSP does not offer from one it offers in other currencies.
+- 80b9bb6: `PaymentRouter` and `PaymentService` now pre-screen candidates by the customer countries a payment method declares, when the session states `customerCountry`. A PSP whose requested rail cannot serve the customer's country is skipped before any PSP call, and the skip reason names the country. Sessions without `customerCountry` screen exactly as before.
+
+### Patch Changes
+
+- Updated dependencies [80b9bb6]
+- Updated dependencies [d1d42fa]
+  - @payfanout/core@2.0.0
+
 ## 1.1.0
 
 ### Minor Changes

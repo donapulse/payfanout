@@ -225,8 +225,8 @@ importers:
         specifier: workspace:*
         version: link:../core
       stripe:
-        specifier: ^22.3.0
-        version: 22.3.0(@types/node@26.1.1)
+        specifier: ^22.3.1
+        version: 22.3.1(@types/node@26.1.1)
     devDependencies:
       '@payfanout/conformance':
         specifier: workspace:*
@@ -297,8 +297,8 @@ importers:
         specifier: workspace:*
         version: link:../server
       stripe:
-        specifier: ^22.3.0
-        version: 22.3.0(@types/node@26.1.1)
+        specifier: ^22.3.1
+        version: 22.3.1(@types/node@26.1.1)
 
   packages/react:
     dependencies:
@@ -2587,8 +2587,8 @@ packages:
     resolution: {integrity: sha512-vavAMRXOgBVNF6nyEEmL3DBK19iRpDcoIwW+swQ+CbGiu7lju6t+JklA1MHweoWtadgt4ISVUsXLyDq34ddcwA==}
     engines: {node: '>=4'}
 
-  stripe@22.3.0:
-    resolution: {integrity: sha512-ypO6xjVrMWs9SmIMeHr8naCx3dAQ0clxMdUTxn7Ejd7hmY9meBGfE+N4pVHkf9sUNebAHp6uJo6mV3GxDIc2cA==}
+  stripe@22.3.1:
+    resolution: {integrity: sha512-6XSLN0KK0IdfXqDHqMg6CDoO3eO62ye9dhzw0fZp55AUOzHR1YRJOqYHTsuCi4QJ4Ni/usEmXtq69c9ghKDmYw==}
     engines: {node: '>=18'}
     peerDependencies:
       '@types/node': '>=18'
@@ -5381,7 +5381,7 @@ snapshots:
 
   strip-bom@3.0.0: {}
 
-  stripe@22.3.0(@types/node@26.1.1):
+  stripe@22.3.1(@types/node@26.1.1):
     optionalDependencies:
       '@types/node': 26.1.1
 

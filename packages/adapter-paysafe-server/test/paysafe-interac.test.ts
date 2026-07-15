@@ -176,7 +176,9 @@ describe("Paysafe Interac e-Transfer sessions", () => {
 
   it("serves accounts that opt the rail in", async () => {
     const { adapter, fake } = makePair({
-      paymentMethods: [{ type: "interac_etransfer", flow: "redirect", supported: true }],
+      paymentMethods: [
+        { type: "interac_etransfer", flow: "redirect", supported: true, currencies: ["CAD"] },
+      ],
     });
     await adapter.createPaymentSession({ ...interacInput });
     expect(fake.uniqueHandleCreations).toBe(1);

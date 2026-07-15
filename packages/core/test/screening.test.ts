@@ -123,7 +123,8 @@ describe("screenSessionInput — per-method currencies", () => {
   it("one eligible rail carries a multi-method request", () => {
     // Screening answers "can this candidate serve the payment at all" — via
     // card, it can, so the router must not skip it. Narrowing what the adapter
-    // then offers the PSP is the adapter's own concern, not this predicate's.
+    // then offers the PSP is the adapter's own concern, not this predicate's
+    // (see #89 — Stripe still forwards the ineligible rail today).
     expect(
       screenSessionInput(rails, input({ currency: "GBP", paymentMethodTypes: ["sepa_debit", "card"] })),
     ).toBeUndefined();

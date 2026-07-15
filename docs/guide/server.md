@@ -135,7 +135,8 @@ const { session, pspName, attempts } = await router.createPaymentSession(input);
 ```
 
 Candidates that can't serve the input (no manual capture, no vaulting for a
-`savePaymentMethod` session, unsupported method types…) are skipped without a PSP call —
+`savePaymentMethod` session, unsupported method types, a currency the PSP or the requested
+rail itself cannot settle — SEPA asked for in GBP) are skipped without a PSP call —
 the router and `PaymentService` share one predicate, `screenSessionInput` from
 `@payfanout/core`, so a skipped candidate is exactly one the service would have rejected.
 Business rejections (`invalid_request`, `card_declined`) abort the cascade, only transient

@@ -37,20 +37,23 @@ export function validateAdapterCapabilities(adapter: ServerPaymentAdapter): stri
   if (caps.supportsMultiCapture && !caps.supportsManualCapture) {
     issues.push(`Adapter "${adapter.pspName}" claims multi-capture without manual capture support`);
   }
-  // A rail gated to currencies the PSP itself does not accept can never be
+  // A rail gated to currencies the adapter itself does not accept can never be
   // routed: screening rejects the session on supportedCurrencies before the
   // method rule is ever consulted. Offering it is dead capability, not a gate.
-  const pspCurrencies = caps.supportedCurrencies ?? [];
-  if (pspCurrencies.length > 0) {
+  // Scoped to the ADAPTER, not the provider — supportedCurrencies is often the
+  // narrower thing an adapter's flow reaches (GoCardless declares its one-off
+  // currencies, while the platform collects more over flows it cannot reach).
+  const declared = caps.supportedCurrencies ?? [];
+  if (declared.length > 0) {
     for (const method of caps.paymentMethods) {
       if (!method.supported || !method.currencies?.length) continue;
       const reachable = method.currencies.some((c) =>
-        pspCurrencies.some((s) => s.toUpperCase() === c.toUpperCase()),
+        declared.some((s) => s.toUpperCase() === c.toUpperCase()),
       );
       if (!reachable) {
         issues.push(
-          `Adapter "${adapter.pspName}" offers ${method.type} in ${method.currencies.join("/")} but the PSP ` +
-            `supports none of those currencies — the method can never be routed`,
+          `Adapter "${adapter.pspName}" offers ${method.type} in ${method.currencies.join("/")} but declares ` +
+            `supportedCurrencies ${declared.join("/")} — the method can never be routed`,
         );
       }
     }

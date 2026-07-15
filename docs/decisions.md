@@ -562,6 +562,13 @@ current status (remaining sandbox checks run via the dispatch-only integration w
 
 ## Paysafe Interac e-Transfer (2026-07-15)
 
+- **The sandbox account cannot exercise Interac.** Sandbox-verified 2026-07-15: creating an
+  `INTERAC_ETRANSFER` payment handle in CAD is refused with `PAYMENTHUB-1`, "The submitted
+  payment type and currency code combination is not supported for your account". That is an
+  account-provisioning fact, not a code defect — the rail must be enabled on the Paysafe
+  account before it can be verified end to end, and before any live enablement. The
+  integration suite tolerates this specific error the way it tolerates unbatched
+  settlements, and starts asserting for real once the capability exists.
 - **`interacEtransfer` vs `interacETransfer`.** Doc-verified 2026-07-15: the payment-handle
   request field is spelled `interacEtransfer` (lowercase `t`). Paysafe's own OpenAPI spec
   contradicts itself — the `interacObject` schema declares `interacETransfer`, but that
@@ -569,8 +576,10 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   same spec and the Interac integration guide's worked request use `interacEtransfer`. Two
   independent public sources outweigh one internal-flagged schema, and the failure mode is
   loud rather than silent (error `5023`, unrecognized field), so a wrong choice surfaces on
-  the first sandbox call. Confirm against the sandbox before enabling the rail for a live
-  account.
+  the first sandbox call. Partially corroborated 2026-07-15: the sandbox rejected the handle
+  with `PAYMENTHUB-1` (account capability) rather than `5023`, so the body — this field
+  included — parsed. That is evidence, not proof: the capability check may precede
+  instrument validation. Settle it on an account that has the rail enabled before going live.
 - **Handle lifetime vs session TTL.** Redirect payment handles report
   `timeToLiveSeconds: 899` (~15 min) and the field is response-only, so it cannot be aligned
   from our side. The adapter's default `sessionTtlSeconds` is 3600, meaning a signed session

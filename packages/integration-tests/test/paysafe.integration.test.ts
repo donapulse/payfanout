@@ -500,6 +500,11 @@ describeIf("Paysafe sandbox integration", () => {
  * Nothing is charged: the handle stops at INITIATED because no customer ever
  * authenticates at Interac.
  */
+/** The provider's own message, which the unified error deliberately replaces. */
+function errorMessageOf(err: { raw?: unknown }): string {
+  return (err.raw as { error?: { message?: string } } | undefined)?.error?.message ?? "";
+}
+
 describeIf("Paysafe Interac e-Transfer (real sandbox)", () => {
   // The rail is Canada-only; a non-CAD sandbox account cannot exercise it.
   const itIfCad = CURRENCY === "CAD" ? it : it.skip;
@@ -517,9 +522,22 @@ describeIf("Paysafe Interac e-Transfer (real sandbox)", () => {
         idempotencyKey: key(),
       });
     } catch (err) {
-      // The unified message deliberately hides provider detail, but the whole
-      // point of this test is the provider's own code: 5023 means the field
-      // name is wrong, anything else means it isn't.
+      // Sandbox-verified 2026-07-15: this account answers PAYMENTHUB-1, "payment
+      // type and currency code combination is not supported for your account" —
+      // it has no Interac capability, which is an account provisioning fact and
+      // not a code defect (same tolerance as the unbatched-settlement cases
+      // above). Notably NOT 5023 "field not recognized", so the request body —
+      // interacEtransfer included — parsed. Once Paysafe enables the rail, this
+      // test starts asserting for real.
+      if (isPayFanoutError(err) && /not supported for your account/i.test(errorMessageOf(err))) {
+        console.warn(
+          "[paysafe-integration] Interac deferred — no INTERAC_ETRANSFER/CAD capability on this sandbox account:",
+          JSON.stringify(err.raw),
+        );
+        return;
+      }
+      // Anything else is the answer this suite exists to get: log it verbatim,
+      // because the unified message hides the provider code that explains it.
       if (isPayFanoutError(err)) {
         console.error("[paysafe-integration] Interac handle rejected:", JSON.stringify(err.raw));
       }

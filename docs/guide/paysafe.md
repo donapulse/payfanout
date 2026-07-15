@@ -71,7 +71,7 @@ PAYSAFE_WEBHOOK_HMAC_KEY=…
 
 # client bundle, must be VITE_-prefixed to reach the browser
 VITE_PAYSAFE_PUBLIC_KEY=…         # the public single-use-token Base64 key
-VITE_PAYSAFE_CURRENCY=CAD         # match your sandbox account's currency (see §10)
+VITE_PAYSAFE_CURRENCY=CAD         # match your sandbox account's currency (see §11)
 ```
 
 Env-var names deliberately **differ** from config field names, e.g. `PAYSAFE_SESSION_KEY`
@@ -136,7 +136,7 @@ const paysafe = new PaysafeClientAdapter({
 - `apiKey` must be the **public** Base64 tokenization key, never the server
   username/password. It can only mint single-use tokens and holds no secret authority.
 - **Currency comes from the signed session**, not from client config. It must be a currency
-  your Paysafe account supports, or Paysafe.js fails to set up (error `9055`). See §10.
+  your Paysafe account supports, or Paysafe.js fails to set up (error `9055`). See §11.
 - Split card fields let you own the layout via slots
   (`data-payfanout-field="cardNumber|expiryDate|cvv"`), see [React usage](/guide/react).
 
@@ -273,7 +273,65 @@ later: `completePayment` usually returns `processing` (`succeeded` once Interac 
 confirmed the transfer to Paysafe).
 :::
 
-## 9. Register the webhook endpoint
+## 9. Bank debits — SEPA, ACH, Bacs, EFT (Canada)
+
+Paysafe's direct-debit rails are Payments-API-only like Interac, but with no redirect: the
+customer's bank details are the instrument, so the client adapter renders its **own**
+plain inputs (Paysafe.js is never loaded for these sessions) and the details ride the
+completion request. The unified types are `sepa_debit`, `ach`, `bacs_debit`, and `pad`
+(Pre-Authorized Debit — Paysafe's word for it is EFT).
+
+All four are **off by default** (per-account enablement). Opt in on both adapters, keeping
+the declared gates — the list replaces the defaults wholesale:
+
+```ts
+paymentMethods: [
+  { type: "card", flow: "embedded", supported: true },
+  { type: "sepa_debit", flow: "embedded", supported: true, currencies: ["EUR"] },
+  { type: "bacs_debit", flow: "embedded", supported: true, currencies: ["GBP"], countries: ["GB"] },
+  { type: "pad", flow: "embedded", supported: true, countries: ["CA"] },
+],
+```
+
+(Paysafe documents no currency for ACH or EFT, so those rails carry no `currencies` gate —
+your merchant-account currencies decide, see the sandbox-currency section below.)
+
+A bank-debit session is restricted to exactly **one** rail (the client mounts one
+collection UI per session, same rule as Interac): request
+`paymentMethodTypes: ["sepa_debit"]` with `currency: "EUR"`, `["bacs_debit"]` with GBP,
+`["ach"]` or `["pad"]` with what your account settles. Manual capture is rejected — debits
+settle with authorization.
+
+`<PaymentFields>` renders the rail's fields (account holder + IBAN for SEPA, routing +
+account for ACH, sort code + account for Bacs, institution + transit + account for
+EFT/PAD), with labels and placeholders overridable via `fieldOptions.fields.<name>`.
+**SEPA and Bacs additionally render a mandate-consent checkbox** — the scheme's
+authorization requirement, not a nicety; override the wording with
+`fieldOptions.mandateText` to match your terms. `<PayButton>` stays disabled until the
+required fields (and consent, where required) are filled. On confirm, the details travel
+as the session's `clientToken` through the §7 server-completion route unchanged: the
+server adapter mints the payment handle and charges it with `settleWithAuth: true` in one
+step, and the mandate reference (SEPA/Bacs) surfaces on `PaymentInfo.mandateReference`.
+
+::: warning Bank debits settle in days, not seconds
+`completePayment` normally returns `processing`. The money truth arrives by webhook:
+`PAYMENT_COMPLETED` when the request is accepted into the banking network, and — days
+later — `PAYMENT_RETURNED_COMPLETED` (also delivered by Paysafe as
+`PAYMENT_RETURN_COMPLETED`; both map to `payment.failed`) when the bank bounces the
+debit. Bacs runs a ~10-business-day cycle. Never ship the order on `processing`.
+Settlement-lifecycle events (`SETTLEMENT_*`) carry settlement ids, not payment ids, and
+are delivered as `unknown` — correlate by payload `merchantRefNum` (your
+`idempotencyKey`) if you consume them. Paysafe documents **no refunds for Bacs**; refund
+support on the other rails follows your account, and an in-flight settlement reports
+`availableToRefund: 0` ("not refundable yet"), so refunds only open up once settlement
+completes.
+:::
+
+Sandbox test values (from Paysafe's pages): SEPA IBAN `NL77ABNA0492122466` (BIC
+`ABNANL2A`); Bacs sort code `086081`, account `51120177`; EFT institution `001`, transit
+`22446`, account `897543213`. ACH publishes no test values.
+
+## 10. Register the webhook endpoint
 
 ::: warning Configured in the portal, not via the API
 Paysafe's `POST /payments` **rejects** webhook/return-link fields (error `5023`), so you
@@ -303,7 +361,7 @@ and return fast. Paysafe has no public events-polling API
 (`supportsEventPolling: false`), for missed-webhook recovery, reconcile with
 `retrievePayment` per order. See [Webhooks](/guide/webhooks).
 
-## 10. Test cards & the sandbox-currency trap
+## 11. Test cards & the sandbox-currency trap
 
 ::: danger Match your account's currency
 Paysafe sandbox accounts are usually provisioned for a **single currency** (the reference
@@ -318,7 +376,7 @@ amount) depends on your account configuration. A commonly available test Visa is
 `4111 1111 1111 1111`; **confirm the current list, decline triggers, and 3DS test cards in
 your Paysafe portal** rather than assuming.
 
-## 11. Go live
+## 12. Go live
 
 - [ ] Swap in the **live** API username/password and the **live** public tokenization key.
 - [ ] Set `environment: "live"` on **both** adapters (host flips to `api.paysafe.com`).

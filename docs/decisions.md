@@ -654,6 +654,54 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   EFT→CAD would assert something the provider does not document. Needs a sandbox check
   or Paysafe's confirmation before #83 gates them.
 
+## Paysafe bank-debit rails — SEPA, ACH, BACS, EFT (2026-07-15)
+
+- **Bank details ride the completion `clientToken` as a versioned envelope**
+  (`"paysafe-bank." + base64url(JSON)`, `v: 1`, paymentType + per-rail fields +
+  `mandateConsent`), produced by the client adapter's own plain inputs and parsed by the
+  server adapter. Chosen over a core contract change (`CompletePaymentInput` gaining a
+  details payload): the golden rule is new rails = adapter packages only, the token is
+  "produced by the client adapter's confirm()" by contract, and the signed-session-context
+  precedent already encodes structured adapter state in opaque strings. The prefix and
+  shape are duplicated across the pair by convention, like the redirect marker — the
+  packages share no code across the client/server boundary.
+- **The rail is stamped into the signed session context at creation** (`paymentType`
+  SEPA/ACH/BACS/EFT) with no PSP call; the handle is minted and charged inside
+  `completePayment` (handle then payment, both with `merchantRefNum = idempotencyKey` —
+  Paysafe dedupes per endpoint, so one key is replay-safe across both calls).
+  `settleWithAuth: true` unconditionally (doc-required for ACH/EFT; shown true in every
+  SEPA/BACS payload example) and manual capture is rejected at session creation. One rail
+  per session, mixed requests rejected — the Interac rule, for the same reason (the
+  client mounts exactly one collection UI per session).
+- **Customer profile data is embedded in the handle request** rather than sent as
+  separate `/customers` + Mandate API calls: the SEPA/BACS pages prescribe a
+  profile→handle→mandate-link→payment sequence but publish no request bodies or mandate
+  endpoint (the API reference is a SPA that flattens for fetchers), while the payload
+  examples show `mandateReference` inside the handle/payment `sepa`/`bacs` objects.
+  Sandbox probes are the validation instrument for this and for the per-rail request
+  field names; `mandateReference` is surfaced on `PaymentInfo` from the payment response,
+  falling back to the handle's.
+- **ACH and EFT stay currency-ungated** — resolves the open note from the per-method
+  currency gating entry: the provider pages still document no currency for either
+  (re-verified 2026-07-15), so nothing is declared and the merchant account decides.
+  Gates shipped: SEPA `currencies: ["EUR"]` (no countries — zone), BACS
+  `currencies: ["GBP"]`, `countries: ["GB"]`, EFT→`pad` `countries: ["CA"]`, ACH bare.
+  All four default `supported: false` (per-account enablement, the Interac precedent).
+- **Both returned-payment spellings map to `payment.failed`.** Paysafe's own pages are
+  internally inconsistent: the event-description tables say `PAYMENT_RETURNED_COMPLETED`,
+  the payload examples say `PAYMENT_RETURN_COMPLETED`. The map matches wire values
+  exactly and missing the real one would downgrade a bank-reported failure to `unknown`,
+  so both are mapped and mirrored in the onboarding descriptor. `SETTLEMENT_*` events
+  stay unmapped (delivered `unknown`): their payload ids are settlement ids, not payment
+  ids — the `PAYMENT_HANDLE_PAYABLE` reasoning; hosts correlate via `merchantRefNum`.
+  Paysafe documents refunds as not applicable for BACS; refund eligibility elsewhere
+  already rides the in-flight-settlement guard (`availableToRefund: 0` = not yet).
+- **A session whose context carries an unknown `paymentType` fails closed on the client**
+  (`invalid_request`) instead of falling back to card fields: on version skew, card
+  fields would tokenize a CARD charge against a session the server minted for another
+  rail — a mischarge risk. The client performs presence-only validation (no IBAN/sort
+  checksums — substance is Paysafe's to judge; a local checksum would drift).
+
 ## Stripe: explicit payment_method_types vs intent currency (2026-07-15)
 
 - **Sandbox-verified 2026-07-15**: `POST /v1/payment_intents` REJECTS an explicit

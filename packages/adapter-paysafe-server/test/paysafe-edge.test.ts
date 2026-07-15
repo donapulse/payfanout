@@ -295,7 +295,7 @@ describe("transport edge cases", () => {
       adapter.createPaymentSession({
         amount: 100,
         currency: "USD",
-        paymentMethodTypes: ["bacs_debit"], // not in the Paysafe capability list
+        paymentMethodTypes: ["ideal"], // not in the Paysafe capability list
         idempotencyKey: "k",
       }),
     ).rejects.toThrowError(/does not support one of the requested/);

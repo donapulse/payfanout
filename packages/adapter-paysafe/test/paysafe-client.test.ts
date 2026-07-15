@@ -74,7 +74,7 @@ function fakeContainer(): HTMLElement & { children: FakeChild[] } {
 }
 
 runClientAdapterConformanceTests("paysafe", () => makeAdapter().adapter, {
-  expectedMethodTypes: ["card", "paysafecard", "skrill"],
+  expectedMethodTypes: ["card", "paysafecard", "skrill", "sepa_debit", "ach", "bacs_debit", "pad"],
 });
 
 describe("PaysafeClientAdapter", () => {

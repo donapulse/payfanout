@@ -53,6 +53,8 @@ export const paysafeOnboarding: AdapterOnboardingDescriptor = {
       "PAYMENT_PENDING",
       "PAYMENT_RECEIVED",
       "PAYMENT_HELD",
+      "PAYMENT_RETURN_COMPLETED",
+      "PAYMENT_RETURNED_COMPLETED",
       "REFUND_COMPLETED",
       "REFUND_FAILED",
       "REFUND_DECLINED",

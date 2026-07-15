@@ -69,14 +69,15 @@ export interface StripeClientAdapterConfig {
 
 const STRIPE_JS_URL = "https://js.stripe.com/v3";
 
+/** Mirrors the server adapter's defaults, currency gates included. */
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "card", flow: "embedded", supported: true },
   { type: "apple_pay", flow: "popup", supported: true },
   { type: "google_pay", flow: "popup", supported: true },
-  { type: "ideal", flow: "redirect", supported: true },
-  { type: "sepa_debit", flow: "embedded", supported: true },
-  { type: "ach", flow: "embedded", supported: true },
-  { type: "bacs_debit", flow: "embedded", supported: true },
+  { type: "ideal", flow: "redirect", supported: true, currencies: ["EUR"] },
+  { type: "sepa_debit", flow: "embedded", supported: true, currencies: ["EUR"] },
+  { type: "ach", flow: "embedded", supported: true, currencies: ["USD"] },
+  { type: "bacs_debit", flow: "embedded", supported: true, currencies: ["GBP"] },
 ];
 
 interface StripeHandle {

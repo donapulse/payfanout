@@ -166,7 +166,12 @@ describe("Paysafe Interac e-Transfer sessions", () => {
       .paymentMethods.find((m) => m.type === "interac_etransfer");
     // Implemented, but Canada/CAD and per-account — claiming it by default would
     // misreport every non-Canadian account.
-    expect(interac).toEqual({ type: "interac_etransfer", flow: "redirect", supported: false });
+    expect(interac).toEqual({
+      type: "interac_etransfer",
+      flow: "redirect",
+      supported: false,
+      currencies: ["CAD"],
+    });
   });
 
   it("serves accounts that opt the rail in", async () => {

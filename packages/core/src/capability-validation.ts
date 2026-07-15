@@ -37,6 +37,24 @@ export function validateAdapterCapabilities(adapter: ServerPaymentAdapter): stri
   if (caps.supportsMultiCapture && !caps.supportsManualCapture) {
     issues.push(`Adapter "${adapter.pspName}" claims multi-capture without manual capture support`);
   }
+  // A rail gated to currencies the PSP itself does not accept can never be
+  // routed: screening rejects the session on supportedCurrencies before the
+  // method rule is ever consulted. Offering it is dead capability, not a gate.
+  const pspCurrencies = caps.supportedCurrencies ?? [];
+  if (pspCurrencies.length > 0) {
+    for (const method of caps.paymentMethods) {
+      if (!method.supported || !method.currencies?.length) continue;
+      const reachable = method.currencies.some((c) =>
+        pspCurrencies.some((s) => s.toUpperCase() === c.toUpperCase()),
+      );
+      if (!reachable) {
+        issues.push(
+          `Adapter "${adapter.pspName}" offers ${method.type} in ${method.currencies.join("/")} but the PSP ` +
+            `supports none of those currencies — the method can never be routed`,
+        );
+      }
+    }
+  }
   if (caps.supportsSessionUpdate && typeof adapter.updatePaymentSession !== "function") {
     issues.push(
       `Adapter "${adapter.pspName}" claims session update but does not implement updatePaymentSession`,

@@ -173,8 +173,8 @@ interface RequestOptions {
  */
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "bank_redirect_generic", flow: "redirect", supported: true },
-  { type: "sepa_debit", flow: "redirect", supported: true },
-  { type: "bacs_debit", flow: "redirect", supported: true },
+  { type: "sepa_debit", flow: "redirect", supported: true, currencies: ["EUR"] },
+  { type: "bacs_debit", flow: "redirect", supported: true, currencies: ["GBP"] },
   { type: "ach", flow: "redirect", supported: false },
 ];
 

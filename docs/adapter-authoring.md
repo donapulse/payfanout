@@ -60,6 +60,17 @@ and `PaymentService` will hold you to:
   ISO 4217; omit when unrestricted). The router pre-screens candidates with it — a
   declared constraint means a mismatched payment skips your PSP instead of aborting the
   failover cascade on your local rejection. Keep the local validation as defense.
+- **Per-rail currency constraints** go in the same shape one level down, on the method:
+  `paymentMethods: [{ type: "sepa_debit", flow: "embedded", supported: true, currencies: ["EUR"] }]`.
+  Absent or empty means unrestricted, exactly as `supportedCurrencies` reads, and the
+  PSP-wide list still applies on top. Declare it for any rail that settles in fixed
+  currencies (SEPA/EUR, Bacs/GBP, PAD/CAD) — a guard you keep private instead makes a
+  CAD-only rail look available for a USD payment, so the router cannot fail over to a
+  PSP that could have served it. Same rule as above: declare it *and* keep the local
+  check, since a host can drive the adapter without the router and can override
+  `paymentMethods` wholesale. Derive both from one constant so they cannot drift. A rail
+  gated to currencies your `supportedCurrencies` excludes is unroutable and
+  `validateAdapterCapabilities` rejects it.
 - **Errors:** every rejection is a `PayFanoutError` with a taxonomy `code`, a user-safe
   `message` (use core's `getUserMessage(code)` catalog — never a third English variant),
   an honest `retryable`, `pspName`, and the untouched PSP error on `raw`. Even

@@ -71,16 +71,17 @@ const STRIPE_CHARGE_TYPE_TO_UNIFIED: Record<string, UnifiedPaymentMethodType> = 
 /**
  * Defaults mirror the client adapter. iDEAL/SEPA/ACH/Bacs are per-account
  * dashboard enablements — config.paymentMethods overrides for accounts that
- * differ.
+ * differ. Their currencies are the rail's, fixed by the customer's country
+ * rather than the account's: a US account collecting SEPA still presents EUR.
  */
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "card", flow: "embedded", supported: true },
   { type: "apple_pay", flow: "popup", supported: true },
   { type: "google_pay", flow: "popup", supported: true },
-  { type: "ideal", flow: "redirect", supported: true },
-  { type: "sepa_debit", flow: "embedded", supported: true },
-  { type: "ach", flow: "embedded", supported: true },
-  { type: "bacs_debit", flow: "embedded", supported: true },
+  { type: "ideal", flow: "redirect", supported: true, currencies: ["EUR"] },
+  { type: "sepa_debit", flow: "embedded", supported: true, currencies: ["EUR"] },
+  { type: "ach", flow: "embedded", supported: true, currencies: ["USD"] },
+  { type: "bacs_debit", flow: "embedded", supported: true, currencies: ["GBP"] },
 ];
 
 export class StripeServerAdapter implements ServerPaymentAdapter {

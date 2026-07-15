@@ -82,7 +82,7 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
   // Mirrors the server adapter: implemented, but off by default — per-account
   // enablement and Canada/CAD only. Canadian merchants opt in via
   // config.paymentMethods.
-  { type: "interac_etransfer", flow: "redirect", supported: false },
+  { type: "interac_etransfer", flow: "redirect", supported: false, currencies: ["CAD"] },
 ];
 
 /** The payload half of the server's signed session context (signature verified server-side only). */

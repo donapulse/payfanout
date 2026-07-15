@@ -446,6 +446,26 @@ describe("Paysafe bank-debit session guards", () => {
       /session of its own/,
     );
   });
+
+  it("holds the rail's currency guard across session updates", async () => {
+    // The session keeps its rail when re-signed, so an update must not carry
+    // it into a currency the rail cannot settle — that would slip past the
+    // creation guard and die at Paysafe instead of here.
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession(sessionInput(RAILS[0]!));
+    await expect(
+      adapter.updatePaymentSession({ pspSessionId: session.pspSessionId, currency: "USD", idempotencyKey: "k-up" }),
+    ).rejects.toThrow(/EUR only/);
+    // An amount-only update keeps the rail and stays valid.
+    const updated = await adapter.updatePaymentSession({
+      pspSessionId: session.pspSessionId,
+      amount: 901,
+      idempotencyKey: "k-up2",
+    });
+    expect(updated.amount).toBe(901);
+    expect(updated.currency).toBe("EUR");
+    expect(fake.uniqueHandleCreations).toBe(0);
+  });
 });
 
 describe("Paysafe bank-debit envelope guards", () => {
@@ -475,6 +495,27 @@ describe("Paysafe bank-debit envelope guards", () => {
 
   it("rejects an envelope that is not base64url JSON", async () => {
     await rejectsCompletion("paysafe-bank.not%json", /not base64url-encoded JSON/);
+  });
+
+  it("keeps typed bank digits out of the malformed-envelope error, raw included", async () => {
+    // V8's JSON.parse message quotes a source snippet — a truncated envelope
+    // must not ride an IBAN or account number into `raw`, which hosts log.
+    const { adapter } = makePair();
+    const session = await adapter.createPaymentSession(sessionInput(fixture));
+    const corrupted =
+      "paysafe-bank." +
+      Buffer.from('{"v":1,"paymentType":"SEPA","iban": NL77ABNA0492122466', "utf8").toString("base64url");
+    try {
+      await adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken: corrupted, idempotencyKey: "k" });
+      expect.unreachable("completion must reject a corrupted envelope");
+    } catch (err) {
+      const flattened = JSON.stringify({
+        message: (err as Error).message,
+        raw: (err as { raw?: unknown }).raw ?? null,
+      });
+      expect(flattened).not.toContain("NL77");
+      expect(flattened).not.toContain("0492122466");
+    }
   });
 
   it("rejects an unsupported envelope version", async () => {

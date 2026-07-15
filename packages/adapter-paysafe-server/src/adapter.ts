@@ -424,7 +424,11 @@ function parseBankEnvelope(
   try {
     envelope = JSON.parse(base64UrlToUtf8(clientToken.slice(BANK_ENVELOPE_PREFIX.length))) as PaysafeBankEnvelopeV1;
   } catch (err) {
-    throw PayFanoutError.invalidRequest("Bank-details envelope is not base64url-encoded JSON", err);
+    // V8's JSON.parse message embeds a source snippet — a corrupted envelope
+    // would ride typed bank digits into `raw`, so only the error name survives.
+    throw PayFanoutError.invalidRequest("Bank-details envelope is not base64url-encoded JSON", {
+      name: err instanceof Error ? err.name : "Error",
+    });
   }
   if (envelope === null || typeof envelope !== "object" || envelope.v !== 1) {
     throw PayFanoutError.invalidRequest("Bank-details envelope has an unsupported shape — expected version 1");
@@ -697,6 +701,18 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     }
     if (input.amount !== undefined) assertMinorUnitAmount(input.amount, "amount");
     const currency = input.currency !== undefined ? normalizeCurrency(input.currency) : context.currency;
+    // A bank-debit session keeps its rail across updates, so the rail's
+    // currency guard must hold for the NEW currency too — otherwise an update
+    // slips past the creation guard and dies at Paysafe instead of here.
+    if (input.currency !== undefined && isBankDebitPaymentType(context.paymentType)) {
+      const railCurrencies = BANK_DEBIT_CURRENCIES[context.paymentType];
+      if (railCurrencies && !railCurrencies.includes(currency)) {
+        throw PayFanoutError.invalidRequest(
+          `${PAYSAFE_TYPE_TO_UNIFIED[context.paymentType]} settles in ${railCurrencies.join("/")} only — ` +
+            `this session cannot be updated to ${currency}`,
+        );
+      }
+    }
     const merchantAccountId =
       input.currency !== undefined
         ? this.config.merchantAccountResolver(currency, context.country) || undefined

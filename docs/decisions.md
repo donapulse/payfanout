@@ -679,11 +679,13 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   currency, so the session's nominal one must not disqualify the instrument being
   verified. An override rail declared without `currencies` forwards unnarrowed.
 - **Conformance generalization examined and deferred**: GoCardless's billing-request
-  flow selects the scheme from the currency (recorded from its API reference in the
-  per-method currency gating entry), so it cannot express the mismatch; Paysafe
-  already guards Interac adapter-locally. A suite-level rule would need a shared
-  narrowing/rejection contract across differently-shaped adapters — a contract
-  change, not part of this fix.
+  flow selects the scheme from the currency (doc-verified 2026-07-15,
+  developer.gocardless.com billing-requests guide: "You can pass currency rather than
+  a scheme and GoCardless automatically selects the optimal scheme for that
+  currency"), so it cannot express the mismatch; Paysafe already guards Interac
+  adapter-locally. A suite-level rule would need a shared narrowing/rejection
+  contract across differently-shaped adapters — a contract change, not part of
+  this fix.
 
 ## Per-method country gating (2026-07-15)
 

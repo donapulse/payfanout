@@ -44,6 +44,16 @@ describe("StripeServerAdapter edges", () => {
         idempotencyKey: "k",
       }),
     ).rejects.toThrowError(/does not support payment method type "paysafecard"/);
+    // Precedence when mixed with a currency-ineligible rail: the currency
+    // filter drops sepa_debit, then the unknown type still fails the mapping.
+    await expect(
+      adapter.createPaymentSession({
+        amount: 1000,
+        currency: "USD",
+        paymentMethodTypes: ["paysafecard", "sepa_debit"],
+        idempotencyKey: "k",
+      }),
+    ).rejects.toThrowError(/does not support payment method type "paysafecard"/);
   });
 
   it("passes every canonical refund reason through in Stripe's own vocabulary", async () => {

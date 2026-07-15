@@ -40,6 +40,7 @@ jobs:
           GOCARDLESS_ACCESS_TOKEN: ${{ secrets.GOCARDLESS_ACCESS_TOKEN }}
           PAYPAL_CLIENT_ID: ${{ secrets.PAYPAL_CLIENT_ID }}
           PAYZEN_SHOP_ID: ${{ secrets.PAYZEN_SHOP_ID }}
+          WORLDLINE_MERCHANT_ID: ${{ secrets.WORLDLINE_MERCHANT_ID }}
         run: |
           # The suites skip silently when a provider's env is absent, so a
           # deleted/expired secret would otherwise turn drift detection into a
@@ -56,6 +57,9 @@ jobs:
           fi
           if [ -z "$PAYZEN_SHOP_ID" ]; then
             echo "::warning::PAYZEN_SHOP_ID not configured — the PayZen integration suite will skip"
+          fi
+          if [ -z "$WORLDLINE_MERCHANT_ID" ]; then
+            echo "::warning::WORLDLINE_MERCHANT_ID not configured — needed once the planned Worldline integration suite lands"
           fi
       - run: pnpm run test:integration
         env:
@@ -74,3 +78,8 @@ jobs:
           PAYZEN_SHOP_ID: ${{ secrets.PAYZEN_SHOP_ID }}
           PAYZEN_PASSWORD: ${{ secrets.PAYZEN_PASSWORD }}
           PAYZEN_HMAC_KEY: ${{ secrets.PAYZEN_HMAC_KEY }}
+          WORLDLINE_API_KEY_ID: ${{ secrets.WORLDLINE_API_KEY_ID }}
+          WORLDLINE_SECRET_API_KEY: ${{ secrets.WORLDLINE_SECRET_API_KEY }}
+          WORLDLINE_MERCHANT_ID: ${{ secrets.WORLDLINE_MERCHANT_ID }}
+          WORLDLINE_WEBHOOKS_KEY_ID: ${{ secrets.WORLDLINE_WEBHOOKS_KEY_ID }}
+          WORLDLINE_WEBHOOKS_SECRET_KEY: ${{ secrets.WORLDLINE_WEBHOOKS_SECRET_KEY }}

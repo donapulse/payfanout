@@ -19,6 +19,8 @@
     "@payfanout/adapter-payzen-server": "workspace:*",
     "@payfanout/adapter-stripe": "workspace:*",
     "@payfanout/adapter-stripe-server": "workspace:*",
+    "@payfanout/adapter-worldline": "workspace:*",
+    "@payfanout/adapter-worldline-server": "workspace:*",
     "@payfanout/core": "workspace:*",
     "@payfanout/react": "workspace:*",
     "@payfanout/server": "workspace:*",

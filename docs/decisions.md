@@ -430,3 +430,132 @@ One atomic core+conformance+all-adapters change (major changesets across the boa
   assertion validate the descriptor when a fixture provides it (existing external adapters
   without one still pass — the fixture is optional). core, conformance, and the five `-server`
   adapters bump minor; the client adapters are untouched.
+
+## Worldline Direct adapter (2026-07-14)
+
+Tokenize-first pair (`adapter-worldline` / `adapter-worldline-server`, Online Payments REST
+v2 + Hosted Tokenization Page). New adapter packages only — no core/server/react/conformance
+changes. Platform facts and the choices they forced (all doc-verified against
+docs.direct.worldline-solutions.com unless noted):
+
+- **v1HMAC request signing on WebCrypto** (edge-compatible): `Authorization: GCS
+  v1HMAC:{apiKeyId}:{base64(HMAC-SHA256(secret, dataToSign))}`, where `dataToSign` is
+  method / Content-Type (empty for GET) / `Date` / sorted canonical `x-gcs-*` header lines /
+  resource path, each `\n`-terminated (trailing `\n` after the path). The `Date` header is
+  sent and signed (RFC-1123 GMT); the clock is an injectable `now()` so tests are
+  deterministic and hosts stay inside the platform's 5-minute skew. `X-GCS-Date` is noted in
+  code as the edge-runtime alternative when the `Date` header cannot be set.
+- **Idempotency** rides `X-GCS-Idempotence-Key` (max 40 ASCII). Arbitrary caller keys are
+  hashed to fit: `sha256Hex(idempotencyKey).slice(0,40)` — deterministic, so replays dedupe
+  at Worldline. The header is BOTH signed (in the canonical block) and sent on every mutating
+  call (create payment, capture, cancel, refund, and the amountless hostedtokenizations
+  create). Doc-verified 2026-07-15: the documented idempotent operations are CreatePayment /
+  CapturePayment / CancelPayment / RefundPayment / CompletePayment / CreatePayout /
+  SubsequentPayment — CreateHostedTokenization is NOT on the list, so the header on the
+  tokenization create is harmless but never relied on for dedupe (the fake mirrors this;
+  money-side safety comes from CreatePayment idempotency). A 409 means the request with
+  this idempotence key is still being processed, so it maps to a retryable
+  `processing_error` and the transport loop replays it instead of surfacing a hard error.
+- **Stateless session = signed context** (same pattern as Paysafe): createPaymentSession
+  calls `POST /hostedtokenizations` (no amount) and encodes amount/currency/captureMethod/
+  returnUrl/billing/hostedTokenizationId + enforced `expiresAt` into `pspSessionId`;
+  `clientSecret` is the `hostedTokenizationUrl` the browser iframe mounts from (no client
+  key). The host id round-trips via `order.references.merchantReference` only — Worldline has
+  no arbitrary metadata map — so conformance `money.expectations` is
+  `{ idRoundTrip: true, metadataEcho: false }`.
+- **CreatePayment wiring (corrected in review, 2026-07-15):** `hostedTokenizationId` rides
+  at the ROOT of the CreatePayment request — the platform's current domain model declares it
+  there and `CardPaymentMethodSpecificInput` has no such field (the guide's "replace the
+  card property" wording is about replacing card DATA, not a nesting instruction). The 3-D
+  Secure return URL is sent BOTH as `cardPaymentMethodSpecificInput.returnUrl` (the field
+  the Hosted Tokenization guide names) and in its `threeDSecure.redirectionData.returnUrl`
+  form — both are current in the models; sandbox-verify one challenge flow.
+- **Refund reads (corrected in review, 2026-07-15):** Direct has NO refund-by-id endpoint —
+  `GET /{merchantId}/refunds/{refundId}` is Connect-era; the only read surface is
+  `GET /v2/{merchantId}/payments/{paymentId}/refunds`. `refundPayment` therefore returns a
+  composite `refundId` (`{paymentId}:{refundId}`, the suffix being Worldline's raw refund
+  id, the one webhooks report) and `retrieveRefund` resolves it through the per-payment
+  list. With no documented refund-failure webhook (below), this polling path is the only
+  reliable refund-failure signal.
+- **paymentProductId → brand** map holds only ids confirmed on the current payment-method
+  pages (1 Visa, 2 Amex, 3 Mastercard, 117 Maestro, 125 JCB, 132 Diners); 114/118/128 were
+  unverified and dropped 2026-07-15 — an unknown id degrades to brandless details.
+- **Status mapping** leads with `statusOutput.statusCategory` (the forward-compatible band —
+  new statuses join an existing category), then `statusCode`, then the status string, with
+  `CANCELLED` checked first (it sits in the UNSUCCESSFUL band but must map to `canceled`,
+  not `failed`). Verified against the Statuses reference
+  (docs.direct.worldline-solutions.com/.../statuses): COMPLETED → `succeeded`,
+  PENDING_MERCHANT (PENDING_CAPTURE) → `requires_capture`, UNSUCCESSFUL
+  (REJECTED/REJECTED_CAPTURE/CANCELLED) → `failed`/`canceled`, PENDING_PAYMENT/CREATED →
+  `processing`. The **PENDING_CONNECT_OR_3RD_PARTY** band holds BOTH a genuine customer
+  action (REDIRECTED → `requires_action`) and async downstream states
+  (AUTHORIZATION_REQUESTED / CAPTURE_REQUESTED / REFUND_REQUESTED → `processing`), so the
+  adapter disambiguates on the status string rather than mapping the whole band to
+  `requires_action`. statusCode fallbacks: 9 (CAPTURED/settled) → `succeeded`,
+  5 → `requires_capture`, 2 → `failed`, 46 → `requires_action`. Refunds: REFUNDED →
+  `succeeded`, REJECTED/CANCELLED → `failed`, REFUND_REQUESTED/pending → `pending`.
+- **Manual capture (not multi-capture):** `PRE_AUTHORIZATION` authorizes, `POST /capture
+  { amount?, isFinal: true }` settles — a partial capture settles that amount and RELEASES
+  the uncaptured remainder (Worldline finalizes the capture, and referenced refunds are only
+  accepted once the capture is finalized). `supportsMultiCapture` is **false**: the core
+  `capturePayment(id, amount, key)` contract carries no `isFinal` signal, so an authorization
+  cannot be held open across several captures. `retrievePayment` sums `GET /captures` and
+  `GET /refunds` (separate sub-resources) for `amountCaptured` / `amountCapturable` (0 once
+  the payment is a completed sale/capture) / `amountRefunded`.
+- **Webhooks:** `X-GCS-Signature` = base64(HMAC-SHA256(webhookSecret, rawBody)) over the
+  EXACT raw bytes, key selected by `X-GCS-KeyId` (array of `{keyId, secretKey}` for
+  rotation, any active key verifying wins). One event per delivery. The documented event
+  list (2026-07-15) is `payment.created / redirected / authorization_requested /
+  pending_approval / pending_completion / pending_capture / capture_requested / captured /
+  rejected / rejected_capture / cancelled / refunded`, `refund.refund_requested`,
+  `paymentlink.*`, and `payment.test`; the documented terminal refund signal is
+  `payment.refunded`, and there is NO documented refund-failure event — refund failure is
+  observed by polling `retrieveRefund`. Mapping: `payment.captured` → `payment.succeeded`,
+  `payment.rejected`/`rejected_capture` → `payment.failed`, `payment.cancelled` →
+  `payment.canceled`, `payment.refunded` → `payment.refunded`, pending payment states →
+  `payment.processing`. `refund.refund_requested` maps to `unknown` deliberately — it is
+  recognized but non-terminal, and the unified vocabulary has no in-flight refund state;
+  fabricating a terminal type would misreport it. The parser additionally TOLERATES
+  `payment.paid`, `payment.pending_fraud_approval`, `refund.refunded`, `refund.rejected`
+  and `refund.cancelled` — none are on the documented list, and the onboarding descriptor
+  advertises only the documented set so hosts never subscribe to undocumented types.
+
+Items initially flagged AMBIGUOUS/undocumented, resolved conservatively — each notes its
+current status (remaining sandbox checks run via the dispatch-only integration workflow):
+
+- **Decline HTTP shape.** The API Troubleshooting reference documents declines as **HTTP 402**
+  with `{ errorId, errors, status, paymentResult }`; a separate Create-payment reference
+  summary suggested some declines arrive as `201` with `payment.status = "REJECTED"`. The
+  adapter handles both: non-2xx maps through `mapWorldlineError` (the primary decline path,
+  modeled in the fake), and a 2xx whose payment maps to `failed` is defensively surfaced as
+  `card_declined` rather than a "failed" PaymentInfo. Confirm the real sandbox shape.
+- **Decline sub-codes.** Only five reject codes are enumerated on the troubleshooting page
+  (30511001 insufficient funds, 30591001 fraud, 40001134 3-D Secure, 30171001 customer
+  cancelled, 30041001 issuer rejected); everything else on a 402 maps to the generic
+  `card_declined`. Enumerate expired-card / invalid-card-data codes from the sandbox.
+- **Sandbox triggers.** Doc-verified 2026-07-15: amount `1302` (EUR, `authorizationMode=SALE`)
+  is the test-cases page's documented unsuccessful-transaction trigger (statusCode 2), as the
+  fake models; the page also documents `1303`/`1309` (unsuccessful refund/capture) and
+  `1203`/`1209` (uncertain refund/capture) for future integration tests. The `htp_3ds` →
+  3-D Secure REDIRECT trigger remains fake-only — verify the real challenge flow in the
+  sandbox.
+- **`verifyCredentials` probe** uses `GET /v2/{merchantId}/services/testconnection` —
+  endpoint confirmed 2026-07-15 (verbatim in the platform's current services surface). The
+  status-based classification (401/403 = auth, 5xx/429 = network, else authenticated) stays,
+  so the probe remains robust across API evolutions; a live sandbox call is the remaining
+  check.
+- **Webhook envelope: array vs object.** The webhooks page's example body renders as a JSON
+  ARRAY, while the platform's own webhooks helper JSON-parses a single object. The parser
+  accepts both single-event shapes (a one-element array is unwrapped) and rejects
+  multi-event arrays rather than partially processing them. Confirm with the portal's
+  test-webhook feature once credentials exist.
+- **Minor-unit semantics for 0/3-decimal currencies.** Amounts are documented only as an
+  integer in "the least subunit … in some cases smaller"; nothing found on 0- or 3-decimal
+  currencies. ISO 4217 minor units are forwarded per the core invariant — run one sandbox
+  payment in a 0-decimal currency (JPY) before routing such currencies here, and declare an
+  adapter-local constraint (as with the PayZen CNY/KHR decision) if the platform disagrees.
+- **`card.expiryDate` format** is parsed as `MMYY` when building masked instrument details —
+  consistent with the platform's examples but worth one sandbox observation.
+- **`PaymentInfo.createdAt`** falls back to epoch — the Worldline payment object exposes no
+  stable creation timestamp in a documented field; hosts read the timestamp from the webhook
+  `created` or their own record. Revisit if the sandbox payment object carries one.

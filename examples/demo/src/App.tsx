@@ -1,5 +1,5 @@
 /**
- * All six PSPs behind identical UI, switchable at runtime — and the whole checkout
+ * All shipped PSPs behind identical UI, switchable at runtime — and the whole checkout
  * localizes at runtime across en/fr/de/es. UI chrome comes from the demo's own
  * `t()` dictionary; payment error text comes from the LIBRARY via
  * `localizeError` (proving @payfanout/core ships those translations); and the

@@ -447,7 +447,7 @@ assumption the fakes encode) → Playwright E2E through the demo app (real Strip
 Paysafe.js iframes, inline 3DS). CI runs the first layer on every push; the integration
 layer runs via workflow dispatch with repo secrets.
 
-The demo app (`examples/demo`) shows all six PSPs behind identical UI, switchable at
+The demo app (`examples/demo`) shows every shipped PSP behind identical UI, switchable at
 runtime, including the tokenize-first server-completion flow behind the same `<PayButton>`:
 
 ```bash

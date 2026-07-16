@@ -10,9 +10,9 @@ whole interface.
 ## 0. Decide your PSP's completion shape first
 
 This is the one architectural decision, everything else is mapping. Ask: *how does a
-payment reach its terminal state?* Five shipped adapters cover three shapes:
+payment reach its terminal state?* The shipped adapters cover three shapes:
 
-| | Confirm-on-client (Stripe, PayZen) | Tokenize-first (Paysafe, PayPal) | Redirect / hosted (GoCardless) |
+| | Confirm-on-client (Stripe, PayZen) | Tokenize-first (Paysafe, PayPal, Worldline) | Redirect / hosted (GoCardless) |
 | --- | --- | --- | --- |
 | Server session call | creates the PSP intent object | may create nothing, see "stateless sessions" | creates the PSP object + hosted URL |
 | Client `confirm()` | finalizes, returns terminal status | returns `requires_confirmation` + `clientToken` | navigates to the hosted flow |

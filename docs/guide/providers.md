@@ -56,7 +56,7 @@ data migration between sandbox and live, the switch is credentials only.
 
 Another PSP is **a new adapter package, not a fork**. You implement the
 `ServerPaymentAdapter` / `ClientPaymentAdapter` contracts from `@payfanout/core`, prove
-the adapter against `@payfanout/conformance`, the same suite all six shipped adapters pass,
+the adapter against `@payfanout/conformance`, the same suite every shipped adapter passes,
 and it drops into the exact four steps above with **zero changes to core, server, React,
 or your application code**. The step-by-step build is [Writing an adapter](/adapter-authoring),
 and [Conformance](/guide/conformance) is how "extensible" stays a guarantee rather than a

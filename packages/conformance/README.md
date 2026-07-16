@@ -46,9 +46,8 @@ runServerAdapterConformanceTests("acme", () => makeAdapterWithFake(), serverFixt
 runClientAdapterConformanceTests("acme", () => makeClientAdapter(), clientFixtures);
 ```
 
-All five shipped adapter pairs (Stripe, Paysafe, GoCardless, PayPal, PayZen) are wired
-into these runners. A new adapter is **done when the suite is green**, and core, server,
-React, and every consuming app stay untouched.
+Every shipped adapter pair is wired into these runners. A new adapter is **done when the
+suite is green**, and core, server, React, and every consuming app stay untouched.
 
 ## Where it fits
 

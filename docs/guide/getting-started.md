@@ -26,10 +26,10 @@ app is expected to keep.
   is no raw card `<input>` anywhere. Saved cards / recurring payments change nothing about
   this: the **PSP** vaults the card and hands back an opaque token, your database stores
   that token exactly like it stores a `pspPaymentId`, never a PAN.
-- **No redirect to a hosted payment page for cards.** Fields render embedded in your UI,
-  styled by your design tokens. 3DS/SCA challenges run inline (iframe/modal). Genuinely
-  redirect/voucher payment methods (iDEAL, PaysafeCard, Skrill…) are modeled honestly via
-  the `flow` capability field, never forced into an embedded illusion.
+- **Payment flows are modeled honestly.** Embedded card fields render in your UI, styled
+  by your design tokens, and 3DS/SCA challenges run inline (iframe/modal). Genuinely
+  redirect/voucher payment methods (iDEAL, PaysafeCard, Skrill…) are modeled via the
+  `flow` capability field, never forced into an embedded illusion.
 
 ## The packages
 

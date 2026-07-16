@@ -23,10 +23,10 @@ Two more non-negotiables baked into the design:
   is no raw card `<input>` anywhere. Saved cards / recurring payments (below) change
   nothing about this: the **PSP** vaults the card and hands back an opaque token, your
   database stores that token exactly like it stores a `pspPaymentId`, never a PAN.
-- **No redirect to a hosted payment page for cards.** Fields render embedded in your UI,
-  styled by your design tokens. 3DS/SCA challenges run inline (iframe/modal). Genuinely
-  redirect/voucher payment methods (iDEAL, PaysafeCard, Skrill…) are modeled honestly via
-  the `flow` capability field, never forced into an embedded illusion.
+- **Payment flows are modeled honestly.** Embedded card fields render in your UI, styled
+  by your design tokens, and 3DS/SCA challenges run inline (iframe/modal). Genuinely
+  redirect/voucher payment methods (iDEAL, PaysafeCard, Skrill…) are modeled via the
+  `flow` capability field, never forced into an embedded illusion.
 
 ## Packages
 
@@ -317,9 +317,10 @@ carries an idempotent `merchantRefNum`).
 
 ### Redirect payment methods: the return trip
 
-Cards stay embedded, but genuinely redirect methods (iDEAL, bank redirects) leave the
-page. Mount the return-trip helper on your `returnUrl` page, it probes every registered
-client adapter, resolves the outcome, and reports the same `PayResult` as `<PayButton>`:
+Card fields render embedded, while genuinely redirect methods (iDEAL, bank redirects)
+leave the page. Mount the return-trip helper on your `returnUrl` page, it probes every
+registered client adapter, resolves the outcome, and reports the same `PayResult` as
+`<PayButton>`:
 
 ```tsx
 import { useRedirectReturn } from "@payfanout/react";
@@ -443,10 +444,10 @@ Set `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` / `VITE_STRIPE_PUBLISHABLE_KEY
 
 ### Non-goals
 
-No hosted-checkout fallback · no built-in fraud engine beyond PSP-native signals ·
-no marketplace/split payments (yet, direction in docs) · **no persistence layer of any
-kind** (saved-card tokens and subscription records live in YOUR database; the
-`SubscriptionStore` seam and the customer/token mapping are the host's).
+No built-in fraud engine beyond PSP-native signals · no marketplace/split payments
+(yet, direction in docs) · **no persistence layer of any kind** (saved-card tokens and
+subscription records live in YOUR database; the `SubscriptionStore` seam and the
+customer/token mapping are the host's).
 [docs/future-designs.md](docs/future-designs.md) holds the designs and their unblock
 conditions; [docs/decisions.md](docs/decisions.md) is the running decision log,
 including the 2026-07-04 decision that deliberately enabled PSP-side vaulting and

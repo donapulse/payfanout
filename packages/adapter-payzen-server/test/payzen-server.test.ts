@@ -369,7 +369,7 @@ describe("PayZenServerAdapter sessions", () => {
     });
   });
 
-  it("rejects non-card payment method requests", async () => {
+  it("rejects payment method types the platform has no mapping for", async () => {
     const { adapter } = makePair();
     await expect(
       adapter.createPaymentSession({
@@ -378,7 +378,10 @@ describe("PayZenServerAdapter sessions", () => {
         paymentMethodTypes: ["card", "ideal"],
         idempotencyKey: "k",
       }),
-    ).rejects.toMatchObject({ code: "invalid_request" });
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining('"ideal"') as string,
+    });
   });
 
   it("keeps zero- and three-decimal amounts untouched end to end (JPY, KWD)", async () => {
@@ -395,6 +398,80 @@ describe("PayZenServerAdapter sessions", () => {
     expect(kwdInfo.amount).toBe(1234); // KWD 1.234 — integer minor units at every boundary
     expect(kwdInfo.currency).toBe("KWD");
   });
+});
+
+describe("PayZenServerAdapter payment method selection", () => {
+  const ALL_ENABLED = [
+    { type: "card", flow: "embedded", supported: true },
+    { type: "apple_pay", flow: "popup", supported: true },
+    { type: "paypal", flow: "popup", supported: true },
+  ] as const;
+
+  it("declares conservative smartForm capabilities and honors the config override wholesale", () => {
+    const methods = makePair().adapter.getCapabilities().paymentMethods;
+    expect(methods).toContainEqual({ type: "card", flow: "embedded", supported: true });
+    // Wallet/APM contracts are per-shop — never claimed available by default.
+    expect(methods).toContainEqual({ type: "apple_pay", flow: "popup", supported: false });
+    expect(methods).toContainEqual({ type: "paypal", flow: "popup", supported: false });
+
+    const overridden = makePair({ paymentMethods: [...ALL_ENABLED] }).adapter.getCapabilities().paymentMethods;
+    expect(overridden.filter((m) => m.supported)).toHaveLength(3);
+  });
+
+  it("maps requested types onto the documented paymentMethods codes, deduplicated", async () => {
+    const { adapter, fake } = makePair({ paymentMethods: [...ALL_ENABLED] });
+    await adapter.createPaymentSession({
+      amount: 100,
+      currency: "EUR",
+      paymentMethodTypes: ["card", "paypal", "apple_pay", "card"],
+      idempotencyKey: "k-methods",
+    });
+    expect(fake.lastRequestBody).toMatchObject({ paymentMethods: ["CARDS", "PAYPAL", "APPLE_PAY"] });
+
+    // A single-method restriction still sends the field — PayZen then renders
+    // that method's entry page directly.
+    await adapter.createPaymentSession({
+      amount: 100,
+      currency: "EUR",
+      paymentMethodTypes: ["card"],
+      idempotencyKey: "k-card-only",
+    });
+    expect(fake.lastRequestBody).toMatchObject({ paymentMethods: ["CARDS"] });
+  });
+
+  it("omits the paymentMethods field for unrestricted sessions (PayZen offers all shop-eligible methods)", async () => {
+    const { adapter, fake } = makePair({ paymentMethods: [...ALL_ENABLED] });
+    await adapter.createPaymentSession({ amount: 100, currency: "EUR", idempotencyKey: "k-all" });
+    expect(fake.lastRequestBody).not.toHaveProperty("paymentMethods");
+  });
+
+  it("rejects methods declared unsupported for the shop, pointing at the config override", async () => {
+    const { adapter } = makePair(); // default declaration: wallets exist but supported: false
+    await expect(
+      adapter.createPaymentSession({
+        amount: 100,
+        currency: "EUR",
+        paymentMethodTypes: ["card", "paypal"],
+        idempotencyKey: "k",
+      }),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining("config.paymentMethods") as string,
+    });
+  });
+
+  it("reports the unified method type of non-card transactions", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({ amount: 700, currency: "EUR", idempotencyKey: "k-pp" });
+    const tx = fake.payOrder(session.pspSessionId);
+    tx.paymentMethodType = "PAYPAL";
+    expect((await adapter.retrievePayment(session.pspSessionId)).paymentMethodType).toBe("paypal");
+    tx.paymentMethodType = "APPLE_PAY";
+    expect((await adapter.retrievePayment(session.pspSessionId)).paymentMethodType).toBe("apple_pay");
+    tx.paymentMethodType = "PAYCONIQ"; // outside the adapter's vocabulary — honest "other"
+    expect((await adapter.retrievePayment(session.pspSessionId)).paymentMethodType).toBe("other");
+  });
+
 });
 
 describe("PayZenServerAdapter reads", () => {

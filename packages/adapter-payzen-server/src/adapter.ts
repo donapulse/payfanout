@@ -17,6 +17,7 @@ import {
   type PaymentMethodCapability,
   type PaymentMethodDetails,
   type PaymentSession,
+  type UnifiedPaymentMethodType,
   type RefundInfo,
   type RefundRequest,
   type RefundResult,
@@ -76,6 +77,13 @@ export interface PayZenServerAdapterConfig {
    * retryable: false so callers cannot replay them blindly.
    */
   maxNetworkRetries?: number;
+  /**
+   * Wallet/APM enablement varies per shop contract — override the
+   * conservative card-only default once the Back Office lists the contract
+   * (e.g. flip `{ type: "paypal", flow: "popup", supported: true }`).
+   * Overrides wholesale, like every adapter with per-account rails.
+   */
+  paymentMethods?: PaymentMethodCapability[];
   /** Injected for tests. */
   fetch?: typeof fetch;
   /** Injected backoff sleep for retry tests; defaults to real setTimeout. */
@@ -159,11 +167,44 @@ const MISMATCHED_EXPONENT_CURRENCIES = new Map([
 
 const UUID_RE = /^[0-9a-f]{32}$/i;
 
-const PAYMENT_METHODS: PaymentMethodCapability[] = [
-  // SmartForm wallets/APMs exist on the platform but are per-contract and use
-  // a different form mode — card via the embedded krypton form is v1.
+/**
+ * Methods the adapter can request on a formToken. Card exists on every shop;
+ * the smartForm wallets/APMs (Apple Pay, PayPal) are platform-compatible but
+ * need a per-shop contract, so they default to supported: false — hosts flip
+ * them via `config.paymentMethods` once the Back Office lists the contract.
+ * Their flow is "popup": the smartForm runs every method without leaving the
+ * merchant site (the client adapter's smartform mode renders the surface).
+ */
+const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "card", flow: "embedded", supported: true },
+  { type: "apple_pay", flow: "popup", supported: false },
+  { type: "paypal", flow: "popup", supported: false },
 ];
+
+/**
+ * Unified type → Charge/CreatePayment `paymentMethods` value. The REST field
+ * shares the kr-payment-method vocabulary (CARDS selects all card brands).
+ * PAYPAL follows the official request samples, which send it against the
+ * TEST demo shop; the client-side button table separately lists PAYPAL_SB
+ * for the sandbox wallet, so verify PayPal end-to-end in TEST before live.
+ */
+const METHOD_TYPE_TO_PAYZEN: Partial<Record<UnifiedPaymentMethodType, string>> = {
+  card: "CARDS",
+  apple_pay: "APPLE_PAY",
+  paypal: "PAYPAL",
+};
+
+/**
+ * Transaction.paymentMethodType → unified type. Best-effort: the published
+ * vocabulary for the RESPONSE field documents CARD (wallet labels are not
+ * enumerated), so the wallet entries normalize the expected labels when they
+ * appear and anything else stays an honest "other".
+ */
+const PAYZEN_METHOD_TYPE_TO_UNIFIED: Record<string, UnifiedPaymentMethodType> = {
+  CARD: "card",
+  APPLE_PAY: "apple_pay",
+  PAYPAL: "paypal",
+};
 
 export class PayZenServerAdapter implements ServerPaymentAdapter {
   readonly pspName = PAYZEN_PSP_NAME;
@@ -227,7 +268,7 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       supportsEventPolling: false, // IPN only — no events API exists
       supportsListing: false, // Order/Get is per-order; no cross-order query exists
       requiresServerCompletion: false, // confirm-on-client: the krypton form creates the transaction
-      paymentMethods: PAYMENT_METHODS,
+      paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };
   }
 
@@ -245,11 +286,7 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertMinorUnitAmount(input.amount, "amount");
     const currency = this.assertSupportedCurrency(input.currency);
-    if (input.paymentMethodTypes?.some((t) => t !== "card")) {
-      throw PayFanoutError.invalidRequest(
-        `PayZen adapter supports card only; requested: ${input.paymentMethodTypes.join(", ")}`,
-      );
-    }
+    const paymentMethods = this.toPayZenPaymentMethods(input.paymentMethodTypes);
     const orderId = await derivePayZenOrderId(input.idempotencyKey);
     const customer = toPayZenCustomer(input);
     const cardOptions = {
@@ -262,6 +299,10 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       currency,
       orderId,
       contrib: "payfanout",
+      // Omitted when the session does not restrict methods — PayZen's
+      // documented (and recommended) default then offers every method the
+      // shop is eligible for.
+      ...(paymentMethods ? { paymentMethods } : {}),
       ...(customer ? { customer } : {}),
       ...(input.sca?.challenge === "force" ? { strongAuthentication: "CHALLENGE_REQUESTED" } : {}),
       ...(Object.keys(cardOptions).length > 0 ? { transactionOptions: { cardOptions } } : {}),
@@ -496,6 +537,39 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
     return { transaction, order };
   }
 
+  /**
+   * `paymentMethodTypes` → the Charge/CreatePayment `paymentMethods` array.
+   * Undefined/empty requests omit the field (PayZen then offers all
+   * shop-eligible methods). EVERY requested type must be declared supported
+   * in the capability list — stricter than router screening, which passes a
+   * candidate when ANY requested type is eligible — because sending PayZen a
+   * method the shop has no contract for would surface as a broken form, not
+   * a clean rejection.
+   */
+  private toPayZenPaymentMethods(types: UnifiedPaymentMethodType[] | undefined): string[] | undefined {
+    if (!types || types.length === 0) return undefined;
+    const declared = this.config.paymentMethods ?? DEFAULT_METHODS;
+    const codes = new Set<string>();
+    for (const type of types) {
+      const code = METHOD_TYPE_TO_PAYZEN[type];
+      const method = declared.find((m) => m.type === type);
+      if (!code || !method) {
+        throw PayFanoutError.invalidRequest(`PayZen adapter does not support payment method type "${type}"`, {
+          requested: types,
+        });
+      }
+      if (!method.supported) {
+        throw PayFanoutError.invalidRequest(
+          `Payment method type "${type}" is not enabled for this PayZen shop — its contract is per-shop; ` +
+            "declare it supported via config.paymentMethods once the Back Office lists it",
+          { requested: types },
+        );
+      }
+      codes.add(code);
+    }
+    return [...codes];
+  }
+
   private assertSupportedCurrency(currency: string): string {
     const code = normalizeCurrency(currency);
     const payzenDigits = MISMATCHED_EXPONENT_CURRENCIES.get(code);
@@ -536,7 +610,11 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       ...(detailedStatus === "AUTHORISED_TO_VALIDATE" ? { amountCapturable: tx.amount ?? 0 } : {}),
       // Never fabricate a currency: empty is more honest when PayZen omits it.
       currency: (tx.currency ?? "").toUpperCase(),
-      paymentMethodType: tx.paymentMethodType === "CARD" || !tx.paymentMethodType ? "card" : "other",
+      // Absent on some snapshots — card is the only method that predates the
+      // field on this platform, so it stays the honest fallback.
+      paymentMethodType: !tx.paymentMethodType
+        ? "card"
+        : (PAYZEN_METHOD_TYPE_TO_UNIFIED[tx.paymentMethodType] ?? "other"),
       // Echoed verbatim as stored at the PSP — the payfanout_* stamps included
       // (they are genuinely on the transaction and visible in the Back Office).
       ...(tx.metadata && Object.keys(tx.metadata).length > 0 ? { metadata: tx.metadata } : {}),
@@ -671,6 +749,7 @@ export function mapPayZenDetailedStatus(detailedStatus: string | undefined): Uni
     case "WAITING_AUTHORISATION":
     case "WAITING_FOR_PAYMENT":
     case "UNDER_VERIFICATION":
+    case "INITIAL": // temporary — no acquirer response yet
     case "REFUND_TO_RETRY":
       return "processing";
     case "REFUSED":
@@ -734,12 +813,15 @@ function toPaymentMethodDetails(
   return Object.keys(details).length > 0 ? details : undefined;
 }
 
-/** Acquirer refusal codes (ACQ_001 / PSP_101 detailedErrorCode) → decline refinement. */
+/** Acquirer refusal codes (ACQ_001 / PSP_101 detailedErrorCode) → decline refinement (CB network table). */
 const ACQUIRER_DECLINE_MAP: Record<string, UnifiedErrorCode> = {
   "51": "insufficient_funds",
   "33": "expired_card",
+  "38": "expired_card",
   "54": "expired_card",
   "14": "invalid_card_data",
+  "34": "fraud_suspected", // suspected fraud
+  "41": "fraud_suspected", // lost card
   "43": "fraud_suspected", // stolen card
   "59": "fraud_suspected", // suspected fraud
   "1A": "authentication_required", // SCA soft decline

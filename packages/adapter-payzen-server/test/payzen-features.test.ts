@@ -84,6 +84,7 @@ describe("detailedStatus mapping (complete catalog)", () => {
     ["WAITING_AUTHORISATION", "processing"],
     ["WAITING_FOR_PAYMENT", "processing"],
     ["UNDER_VERIFICATION", "processing"],
+    ["INITIAL", "processing"], // temporary — no acquirer response yet
     ["REFUND_TO_RETRY", "processing"],
     ["REFUSED", "failed"],
     ["ERROR", "failed"],
@@ -118,6 +119,9 @@ describe("mapPayZenError (envelope taxonomy)", () => {
     ["ACQ_001", "14", "invalid_card_data", false],
     ["ACQ_001", "43", "fraud_suspected", false],
     ["ACQ_001", "59", "fraud_suspected", false],
+    ["ACQ_001", "34", "fraud_suspected", false], // suspected fraud
+    ["ACQ_001", "41", "fraud_suspected", false], // lost card
+    ["ACQ_001", "38", "expired_card", false],
     ["ACQ_001", "1A", "authentication_required", false],
     ["ACQ_001", "05", "card_declined", false],
     ["ACQ_001", null, "card_declined", false],
@@ -546,6 +550,7 @@ describe("PayZen webhook event parsing", () => {
     [{ uuid: "1".repeat(32), operationType: "DEBIT", detailedStatus: "EXPIRED" }, "payment.canceled"],
     [{ uuid: "1".repeat(32), operationType: "DEBIT", detailedStatus: "UNDER_VERIFICATION" }, "payment.processing"],
     [{ uuid: "1".repeat(32), operationType: "DEBIT", detailedStatus: "WAITING_AUTHORISATION" }, "payment.processing"],
+    [{ uuid: "1".repeat(32), operationType: "DEBIT", detailedStatus: "INITIAL" }, "payment.processing"],
     // Awaiting a MERCHANT validation — payment.requires_action would misdirect.
     [{ uuid: "1".repeat(32), operationType: "DEBIT", detailedStatus: "AUTHORISED_TO_VALIDATE" }, "unknown"],
     [{ uuid: "1".repeat(32), operationType: "CREDIT", detailedStatus: "CAPTURED" }, "payment.refunded"],

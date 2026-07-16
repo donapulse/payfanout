@@ -786,3 +786,104 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   screen out valid payments the day it drifts. No PSP-wide `supportedCountries` exists,
   so there is no coherence rule to add — shape (`/^[A-Z]{2}$/`) is asserted by the
   conformance suite on both halves, mirroring `currencies`.
+
+## PayZen smartForm payment-method selection (2026-07-16)
+
+Multi-method support for the PayZen pair, doc-verified against payzen.io the same day
+(CreatePayment playground, smartForm reference/quick start, JS client reference,
+KR.getPaymentMethods page, error-code tables, currency table):
+
+- **Session-side restriction rides `Charge/CreatePayment.paymentMethods`** — the field
+  shares the kr-payment-method vocabulary (`CARDS`, `APPLE_PAY`, `PAYPAL`, …), an empty/
+  omitted field is PayZen's documented "offer all shop-eligible methods" default (kept
+  for unrestricted sessions), and per the playground field description a single-entry
+  list renders that method's entry page directly. The adapter sends `PAYPAL` in both
+  environments, matching the official request samples (sent against the TEST demo
+  shop); the client-side smart-button table separately lists `PAYPAL_SB` as the
+  TEST-mode selector, and the docs never state which value the REST field expects in
+  TEST — verify PayPal end-to-end in TEST before going live.
+- **Unified mapping covers card/apple_pay/paypal.** Other smartForm methods (Bizum,
+  Alma, meal vouchers) have no unified type: they surface when a session is
+  unrestricted and report as `paymentMethodType: "other"` on reads. Google Pay is not
+  on PayZen's compatible-methods list at all. Read-side normalization of wallet
+  transactions is best-effort: the published vocabulary for the RESPONSE field
+  `Transaction.paymentMethodType` documents CARD but does not enumerate wallet labels,
+  so `PAYPAL`/`APPLE_PAY` map when they appear and anything unknown stays `other` —
+  sandbox verification of the actual wallet labels is pending.
+- **Wallet/APM enablement is a per-shop contract**, invisible to the API config-wise, so
+  both adapters declare a conservative card-only default and take the established
+  `paymentMethods` wholesale config override; `createPaymentSession` validates requests
+  against the declared list so a direct-driven adapter cannot mint sessions the router
+  would have screened out. The client's `fetchAvailablePaymentMethods()` wraps the
+  documented `KR.getPaymentMethods()` for live enablement checks.
+- **The smartForm owns submission.** It renders per-method pay buttons, and while
+  `KR.openPaymentMethod()` can open a chosen method's pop-in, it is documented as
+  incompatible with Apple Pay (which needs the buyer's own gesture) and nothing submits
+  a method programmatically — so in `form: "smartform"`/`"smartform-expanded"` the
+  client adapter's `confirm()` uniformly awaits the buyer's in-form completion instead
+  of driving `KR.submit()`; outcomes that land before `confirm()` are buffered on the
+  handle and consumed by the next call. Wallet/APM flows are declared `flow: "popup"`
+  on the strength of the smartForm's documented promise that the buyer completes
+  without leaving the merchant site.
+- **CLIENT_-prefixed errors are browser-local and pre-transaction** (documented), so on
+  the smartForm the recoverable ones (CLIENT_3xx validation, CLIENT_7xx warnings,
+  CLIENT_101 abandoned 3DS) route to `onError` while the await continues; fatal client
+  errors (bad key/token, CLIENT_5xx, 997–999) and every gateway-side rejection settle
+  it. The embedded form's semantics are unchanged.
+- Doc-sweep refinements landed with the feature: CB refusal codes 34/41 map to
+  `fraud_suspected` and 38 to `expired_card`; `CLIENT_305` ("no formToken defined") is
+  `invalid_request`, and unmapped CLIENT_ codes stop falling into retryable
+  `processing_error`; `detailedStatus: INITIAL` explicitly maps to `processing` in
+  reads and IPN parsing — INITIAL appears in the rendered playground Transaction
+  reference ("temporary… no response received from the acquirer") though the
+  transaction-lifecycle kb page and the machine-readable schema, which both lag the
+  playground, omit it. The 2026 currency table re-check confirmed the shipped list
+  exactly (38 currencies, CNY=1/KHR=0 fractional digits, BHD absent).
+
+## PayZen bank rails via hosted payment orders (2026-07-16)
+
+The bank rails (SEPA Direct Debit, the DSP2 pay-by-bank family, iDEAL, Multibanco) have
+no embedded/smartForm surface on PayZen — their documented home is the hosted payment
+page. Doc-verified against payzen.io the same day (CreatePaymentOrder playground +
+url_payment_order kb, PaymentOrder answer reference, the vads_payment_cards data
+dictionary, and each rail's technical-information table):
+
+- **Transport is `Charge/CreatePaymentOrder` (channel URL), not the legacy vads form**:
+  same REST auth/envelope as every adapter call, `paymentMethods` restriction with the
+  identical single-method/offer-all semantics as CreatePayment, `returnMode: GET` +
+  `returnUrl`, per-order `ipnTargetUrl`, and the standard V4 IPN for outcomes — so the
+  webhook path needed zero changes. The answer's `paymentURL` rides
+  `PaymentSession.clientSecret` (GoCardless precedent) with `status: "requires_action"`;
+  `pspSessionId` stays the derived orderId, keeping Order/Get reads and the idempotency
+  synthesis identical across both routes. CreatePaymentOrder documents no `contrib`
+  field, so the hosted route never sends one.
+- **Method mapping (vads_payment_cards vocabulary, per-rail constraints from the
+  technical-information tables)**: sepa_debit → SDD (EUR; zone countries deliberately
+  undeclared — the SEPA-membership list would drift); ideal → IDEAL (EUR, NL);
+  bank_redirect_generic → the pay-by-bank family IP_WIRE + IP_WIRE_INST (EUR, FR),
+  MYBANK (EUR; ES/GR/IT), PRZELEWY24 (EUR+PLN, PL) — one unified type, the buyer picks
+  the concrete rail on the hosted page, session requests narrow the code list to
+  currency-eligible entries; voucher_generic → MULTIBANCO (EUR, PT). All four default
+  supported: false (per-shop contracts), same override pattern as the smartForm wallets.
+- **Sessions never mix surfaces**: a request combining embedded types (card, wallets)
+  with bank rails is rejected — mapping card onto the hosted page would mean guessing a
+  brand list, and the two surfaces have different completion shapes. `returnUrl` is
+  required on the hosted route.
+- **The return trip is display-only by design** (the platform documents that return
+  data must not drive database processing): handleRedirectReturn resolves a kr-shaped
+  return (kr-answer in the query string) to a UX-grade outcome exactly like the
+  embedded browser answer, any vads-shaped return to `processing`, and foreign URLs to
+  null. The IPN / retrievePayment remain the source of truth.
+- **Per-rail operational facts recorded from the tables**: SDD is deferred-capture
+  (15-day authorization validity, manual validation supported, cancel before capture,
+  refunds go out as wire transfers); iDEAL/MyBank/P24 capture immediately (refund yes,
+  cancel no); Multibanco has no refund channel; IP_WIRE sits in WAITING_AUTHORISATION
+  until the bank settles and has neither refund nor cancel. Payment orders expire per
+  the shop default, 90 days maximum.
+- Evidence-level notes: the REST `paymentMethods` field is an open string array (no
+  schema enum) whose description mirrors vads_payment_cards semantics word-for-word;
+  passing the bank-rail codes through it follows that parallel plus the field's own
+  "eligible methods of the store" contract, and each rail deserves one TEST-mode pass
+  before production (the guide says so). Google Pay also exists on the hosted page
+  (GOOGLEPAY) but is deliberately not wired — it would belong to the smartForm/wallet
+  story, a separate decision.

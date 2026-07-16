@@ -17,6 +17,7 @@ import {
   type PaymentMethodCapability,
   type PaymentMethodDetails,
   type PaymentSession,
+  type UnifiedPaymentMethodType,
   type RefundInfo,
   type RefundRequest,
   type RefundResult,
@@ -76,6 +77,13 @@ export interface PayZenServerAdapterConfig {
    * retryable: false so callers cannot replay them blindly.
    */
   maxNetworkRetries?: number;
+  /**
+   * Wallet/APM enablement varies per shop contract — override the
+   * conservative card-only default once the Back Office lists the contract
+   * (e.g. flip `{ type: "paypal", flow: "popup", supported: true }`).
+   * Overrides wholesale, like every adapter with per-account rails.
+   */
+  paymentMethods?: PaymentMethodCapability[];
   /** Injected for tests. */
   fetch?: typeof fetch;
   /** Injected backoff sleep for retry tests; defaults to real setTimeout. */
@@ -159,11 +167,93 @@ const MISMATCHED_EXPONENT_CURRENCIES = new Map([
 
 const UUID_RE = /^[0-9a-f]{32}$/i;
 
-const PAYMENT_METHODS: PaymentMethodCapability[] = [
-  // SmartForm wallets/APMs exist on the platform but are per-contract and use
-  // a different form mode — card via the embedded krypton form is v1.
+/**
+ * Methods the adapter can request. Card exists on every shop; everything else
+ * needs a per-shop contract, so it defaults to supported: false — hosts flip
+ * entries via `config.paymentMethods` once the Back Office lists the
+ * contract. Two surfaces exist:
+ *
+ *   - flow "embedded"/"popup" — the krypton form/smartForm on the merchant
+ *     page (formToken sessions).
+ *   - flow "redirect" — PayZen's hosted payment page reached through a
+ *     Charge/CreatePaymentOrder URL: the bank rails (SEPA Direct Debit, the
+ *     DSP2 pay-by-bank family, iDEAL, Multibanco) only exist there.
+ *
+ * Redirect-rail constraints come from each method's technical-information
+ * table. `bank_redirect_generic` groups the platform's bank-redirect products
+ * (SEPA Credit Transfer / instant via payment initiation, MyBank,
+ * Przelewy24): the buyer picks the concrete rail on the hosted page, so the
+ * declared constraints are the family's union. SEPA Direct Debit declares no
+ * countries: it is a zone rail, and encoding the zone's membership would
+ * screen out valid payments the day it drifts.
+ */
+const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "card", flow: "embedded", supported: true },
+  { type: "apple_pay", flow: "popup", supported: false },
+  { type: "paypal", flow: "popup", supported: false },
+  { type: "sepa_debit", flow: "redirect", supported: false, currencies: ["EUR"] },
+  { type: "ideal", flow: "redirect", supported: false, currencies: ["EUR"], countries: ["NL"] },
+  {
+    type: "bank_redirect_generic",
+    flow: "redirect",
+    supported: false,
+    currencies: ["EUR", "PLN"],
+    countries: ["FR", "ES", "GR", "IT", "PL"],
+  },
+  { type: "voucher_generic", flow: "redirect", supported: false, currencies: ["EUR"], countries: ["PT"] },
 ];
+
+/**
+ * Unified type → Charge/CreatePayment `paymentMethods` value. The REST field
+ * shares the kr-payment-method vocabulary (CARDS selects all card brands).
+ * PAYPAL follows the official request samples, which send it against the
+ * TEST demo shop; the client-side button table separately lists PAYPAL_SB
+ * for the sandbox wallet, so verify PayPal end-to-end in TEST before live.
+ */
+const METHOD_TYPE_TO_PAYZEN: Partial<Record<UnifiedPaymentMethodType, string>> = {
+  card: "CARDS",
+  apple_pay: "APPLE_PAY",
+  paypal: "PAYPAL",
+};
+
+/**
+ * Transaction.paymentMethodType → unified type. The published vocabulary for
+ * the RESPONSE field documents CARD and SDD; the remaining entries normalize
+ * the request-side method codes best-effort when the platform echoes them,
+ * and anything else stays an honest "other".
+ */
+const PAYZEN_METHOD_TYPE_TO_UNIFIED: Record<string, UnifiedPaymentMethodType> = {
+  CARD: "card",
+  APPLE_PAY: "apple_pay",
+  PAYPAL: "paypal",
+  SDD: "sepa_debit",
+  IDEAL: "ideal",
+  IP_WIRE: "bank_redirect_generic",
+  IP_WIRE_INST: "bank_redirect_generic",
+  MYBANK: "bank_redirect_generic",
+  PRZELEWY24: "bank_redirect_generic",
+  MULTIBANCO: "voucher_generic",
+};
+
+/**
+ * Redirect-rail unified type → hosted-page method codes (the
+ * vads_payment_cards vocabulary), with each code's documented settlement
+ * currencies. A session request sends every code of the type that can settle
+ * in the session currency — the hosted page then narrows to what the shop's
+ * contracts actually enable.
+ */
+const REDIRECT_METHOD_CODES: Partial<Record<UnifiedPaymentMethodType, Array<{ code: string; currencies: string[] }>>> =
+  {
+    sepa_debit: [{ code: "SDD", currencies: ["EUR"] }],
+    ideal: [{ code: "IDEAL", currencies: ["EUR"] }],
+    bank_redirect_generic: [
+      { code: "IP_WIRE", currencies: ["EUR"] },
+      { code: "IP_WIRE_INST", currencies: ["EUR"] },
+      { code: "MYBANK", currencies: ["EUR"] },
+      { code: "PRZELEWY24", currencies: ["EUR", "PLN"] },
+    ],
+    voucher_generic: [{ code: "MULTIBANCO", currencies: ["EUR"] }],
+  };
 
 export class PayZenServerAdapter implements ServerPaymentAdapter {
   readonly pspName = PAYZEN_PSP_NAME;
@@ -227,29 +317,36 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       supportsEventPolling: false, // IPN only — no events API exists
       supportsListing: false, // Order/Get is per-order; no cross-order query exists
       requiresServerCompletion: false, // confirm-on-client: the krypton form creates the transaction
-      paymentMethods: PAYMENT_METHODS,
+      paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };
   }
 
   /**
-   * Charge/CreatePayment → formToken (the client secret the krypton form
-   * mounts with). No transaction exists until the shopper pays, and the
-   * formToken expires after ~15 minutes — sessions are cheap to re-create.
+   * Two session shapes, routed by the requested payment method types:
+   *
+   *   - Embedded (default, card/wallet types): Charge/CreatePayment →
+   *     formToken (the client secret the krypton form mounts with). No
+   *     transaction exists until the shopper pays, and the formToken expires
+   *     after ~15 minutes — sessions are cheap to re-create.
+   *   - Hosted redirect (any bank-rail type): Charge/CreatePaymentOrder →
+   *     paymentURL (the client secret the client adapter redirects to). See
+   *     createHostedPaymentSession.
    *
    * PayZen has no idempotency mechanism, so the adapter synthesizes traceable
    * replays: orderId derives deterministically from the idempotencyKey and the
-   * key is stamped into metadata. A replayed call mints another formToken for
-   * the SAME orderId — harmless (no money moves until the shopper completes
-   * the form) and reconcilable via Order/Get.
+   * key is stamped into metadata. A replayed call mints another formToken (or
+   * payment order) for the SAME orderId — harmless (no money moves until the
+   * shopper completes) and reconcilable via Order/Get.
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertMinorUnitAmount(input.amount, "amount");
     const currency = this.assertSupportedCurrency(input.currency);
-    if (input.paymentMethodTypes?.some((t) => t !== "card")) {
-      throw PayFanoutError.invalidRequest(
-        `PayZen adapter supports card only; requested: ${input.paymentMethodTypes.join(", ")}`,
-      );
+    const requested = input.paymentMethodTypes ?? [];
+    this.assertRequestedTypesEnabled(requested);
+    if (requested.some((type) => REDIRECT_METHOD_CODES[type] !== undefined)) {
+      return this.createHostedPaymentSession(input, currency, requested);
     }
+    const paymentMethods = this.toPayZenPaymentMethods(requested);
     const orderId = await derivePayZenOrderId(input.idempotencyKey);
     const customer = toPayZenCustomer(input);
     const cardOptions = {
@@ -262,6 +359,10 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       currency,
       orderId,
       contrib: "payfanout",
+      // Omitted when the session does not restrict methods — PayZen's
+      // documented (and recommended) default then offers every method the
+      // shop is eligible for.
+      ...(paymentMethods ? { paymentMethods } : {}),
       ...(customer ? { customer } : {}),
       ...(input.sca?.challenge === "force" ? { strongAuthentication: "CHALLENGE_REQUESTED" } : {}),
       ...(Object.keys(cardOptions).length > 0 ? { transactionOptions: { cardOptions } } : {}),
@@ -496,6 +597,141 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
     return { transaction, order };
   }
 
+  /**
+   * EVERY requested type must be known to the adapter AND declared supported
+   * in the capability list — stricter than router screening, which passes a
+   * candidate when ANY requested type is eligible — because sending PayZen a
+   * method the shop has no contract for would surface as a broken form, not
+   * a clean rejection.
+   */
+  private assertRequestedTypesEnabled(types: UnifiedPaymentMethodType[]): void {
+    const declared = this.config.paymentMethods ?? DEFAULT_METHODS;
+    for (const type of types) {
+      const known = METHOD_TYPE_TO_PAYZEN[type] !== undefined || REDIRECT_METHOD_CODES[type] !== undefined;
+      const method = declared.find((m) => m.type === type);
+      if (!known || !method) {
+        throw PayFanoutError.invalidRequest(`PayZen adapter does not support payment method type "${type}"`, {
+          requested: types,
+        });
+      }
+      if (!method.supported) {
+        throw PayFanoutError.invalidRequest(
+          `Payment method type "${type}" is not enabled for this PayZen shop — its contract is per-shop; ` +
+            "declare it supported via config.paymentMethods once the Back Office lists it",
+          { requested: types },
+        );
+      }
+    }
+  }
+
+  /**
+   * Embedded-route `paymentMethodTypes` → the Charge/CreatePayment
+   * `paymentMethods` array. Empty requests omit the field (PayZen then
+   * offers all shop-eligible methods). Types are pre-validated by
+   * assertRequestedTypesEnabled and pre-routed, so only embedded codes reach
+   * this mapping.
+   */
+  private toPayZenPaymentMethods(types: UnifiedPaymentMethodType[]): string[] | undefined {
+    if (types.length === 0) return undefined;
+    return [...new Set(types.map((type) => METHOD_TYPE_TO_PAYZEN[type]!))];
+  }
+
+  /**
+   * The hosted-payment route: bank rails have no embedded/smartForm surface,
+   * so the session becomes a payment order (Charge/CreatePaymentOrder,
+   * channel URL) whose paymentURL the client adapter redirects to — the
+   * documented home of SDD, the DSP2 pay-by-bank family, iDEAL and
+   * Multibanco. The buyer completes on PayZen's hosted page and lands back
+   * on `returnUrl` (returnMode GET); outcomes reach the host via the same V4
+   * IPN and Order/Get reads as every other PayZen payment. Embedded types
+   * cannot share the session: the two surfaces are different products, and a
+   * card brand list for the hosted page would be guessed, not mapped.
+   */
+  private async createHostedPaymentSession(
+    input: CreatePaymentSessionInput,
+    currency: string,
+    requested: UnifiedPaymentMethodType[],
+  ): Promise<PaymentSession> {
+    const embedded = requested.filter((type) => REDIRECT_METHOD_CODES[type] === undefined);
+    if (embedded.length > 0) {
+      throw PayFanoutError.invalidRequest(
+        `PayZen cannot mix embedded methods (${embedded.join(", ")}) with hosted bank rails in one session — ` +
+          "create one session per surface",
+        { requested },
+      );
+    }
+    if (!input.returnUrl) {
+      throw PayFanoutError.invalidRequest(
+        "returnUrl is required for PayZen bank rails — the hosted payment page sends the buyer back to it",
+        { requested },
+      );
+    }
+    const codes = new Set<string>();
+    for (const type of requested) {
+      const eligible = REDIRECT_METHOD_CODES[type]!.filter((entry) => entry.currencies.includes(currency));
+      if (eligible.length === 0) {
+        throw PayFanoutError.invalidRequest(
+          `Payment method type "${type}" cannot settle in ${currency} on PayZen`,
+          { requested, currency },
+        );
+      }
+      for (const entry of eligible) codes.add(entry.code);
+    }
+    const orderId = await derivePayZenOrderId(input.idempotencyKey);
+    const customer = toPayZenCustomer(input);
+    // CreatePaymentOrder documents manualValidation but NO paymentSource — the
+    // MOTO exemption is a card-form concept, so it is withheld here rather
+    // than sent as an undocumented field.
+    const cardOptions = {
+      ...(input.captureMethod === "manual" ? { manualValidation: "YES" } : {}),
+    };
+    const answer = await this.call<{ paymentOrderId?: string; paymentURL?: string; paymentOrderStatus?: string }>(
+      "Charge/CreatePaymentOrder",
+      {
+        amount: input.amount,
+        currency,
+        orderId,
+        channelOptions: { channelType: "URL" },
+        paymentMethods: [...codes],
+        // One returnUrl covers every outcome (success/refused/cancel/error
+        // default to it); GET puts the return fields in the query string,
+        // where the client adapter's handleRedirectReturn can read them.
+        returnMode: "GET",
+        returnUrl: input.returnUrl,
+        ...(input.webhookUrl ? { ipnTargetUrl: input.webhookUrl } : {}),
+        ...(input.sca?.challenge === "force" ? { strongAuthentication: "CHALLENGE_REQUESTED" } : {}),
+        ...(Object.keys(cardOptions).length > 0 ? { transactionOptions: { cardOptions } } : {}),
+        ...(customer ? { customer } : {}),
+        metadata: {
+          ...input.metadata,
+          payfanout_key: input.idempotencyKey,
+          ...(input.id ? { payfanout_id: input.id } : {}),
+        },
+      },
+    );
+    if (typeof answer?.paymentURL !== "string" || answer.paymentURL.length === 0) {
+      throw new PayFanoutError({
+        code: "processing_error",
+        message: "PayZen did not return a payment URL.",
+        retryable: false,
+        raw: answer,
+        pspName: this.pspName,
+      });
+    }
+    return {
+      id: input.id ?? orderId,
+      pspName: this.pspName,
+      pspSessionId: orderId,
+      clientSecret: answer.paymentURL,
+      amount: input.amount,
+      currency,
+      // The next step is the buyer authorising at their bank — the same
+      // shape redirect-only PSPs report.
+      status: "requires_action",
+      ...(input.metadata ? { metadata: input.metadata } : {}),
+    };
+  }
+
   private assertSupportedCurrency(currency: string): string {
     const code = normalizeCurrency(currency);
     const payzenDigits = MISMATCHED_EXPONENT_CURRENCIES.get(code);
@@ -536,7 +772,11 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       ...(detailedStatus === "AUTHORISED_TO_VALIDATE" ? { amountCapturable: tx.amount ?? 0 } : {}),
       // Never fabricate a currency: empty is more honest when PayZen omits it.
       currency: (tx.currency ?? "").toUpperCase(),
-      paymentMethodType: tx.paymentMethodType === "CARD" || !tx.paymentMethodType ? "card" : "other",
+      // Absent on some snapshots — card is the only method that predates the
+      // field on this platform, so it stays the honest fallback.
+      paymentMethodType: !tx.paymentMethodType
+        ? "card"
+        : (PAYZEN_METHOD_TYPE_TO_UNIFIED[tx.paymentMethodType] ?? "other"),
       // Echoed verbatim as stored at the PSP — the payfanout_* stamps included
       // (they are genuinely on the transaction and visible in the Back Office).
       ...(tx.metadata && Object.keys(tx.metadata).length > 0 ? { metadata: tx.metadata } : {}),
@@ -671,6 +911,7 @@ export function mapPayZenDetailedStatus(detailedStatus: string | undefined): Uni
     case "WAITING_AUTHORISATION":
     case "WAITING_FOR_PAYMENT":
     case "UNDER_VERIFICATION":
+    case "INITIAL": // temporary — no acquirer response yet
     case "REFUND_TO_RETRY":
       return "processing";
     case "REFUSED":
@@ -734,12 +975,15 @@ function toPaymentMethodDetails(
   return Object.keys(details).length > 0 ? details : undefined;
 }
 
-/** Acquirer refusal codes (ACQ_001 / PSP_101 detailedErrorCode) → decline refinement. */
+/** Acquirer refusal codes (ACQ_001 / PSP_101 detailedErrorCode) → decline refinement (CB network table). */
 const ACQUIRER_DECLINE_MAP: Record<string, UnifiedErrorCode> = {
   "51": "insufficient_funds",
   "33": "expired_card",
+  "38": "expired_card",
   "54": "expired_card",
   "14": "invalid_card_data",
+  "34": "fraud_suspected", // suspected fraud
+  "41": "fraud_suspected", // lost card
   "43": "fraud_suspected", // stolen card
   "59": "fraud_suspected", // suspected fraud
   "1A": "authentication_required", // SCA soft decline

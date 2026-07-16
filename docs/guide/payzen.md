@@ -89,8 +89,9 @@ const payments = new PaymentService({ adapters: [payzen] });
 | `environment` | ✅ | - | Exactly `"sandbox"` or `"live"`. The adapter refuses a password from the other family. |
 | `hmacKey` | - | - | The HMAC-SHA-256 key; only needed to validate **browser-return** kr-answers. Accepts `string[]`. |
 | `apiBaseUrl` | - | `https://api.payzen.eu/api-payment` | Your Back Office "Server name" + `/api-payment` — sister platforms differ. |
-| `requestTimeoutMs` | - | `30000` | Abort a hung connection; surfaces as `psp_unavailable` (non-retryable on refund/cancel/validate — see §8). |
-| `maxNetworkRetries` | - | `2` | Transport trouble only (network/timeout/5xx/429). PayZen answers HTTP 200 even for errors, so business errors never retry — and refund/cancel/validate calls are **never** auto-retried at all (see §8). |
+| `paymentMethods` | - | card only | Capability declaration for router screening and `paymentMethodTypes` validation. Wallets/APMs are per-shop contracts, so they default to `supported: false` — override once the Back Office lists them (see §6). |
+| `requestTimeoutMs` | - | `30000` | Abort a hung connection; surfaces as `psp_unavailable` (non-retryable on refund/cancel/validate — see §10). |
+| `maxNetworkRetries` | - | `2` | Transport trouble only (network/timeout/5xx/429). PayZen answers HTTP 200 even for errors, so business errors never retry — and refund/cancel/validate calls are **never** auto-retried at all (see §10). |
 
 ::: tip Sessions are cheap and short-lived
 `createPaymentSession` calls `Charge/CreatePayment` and returns the `formToken` as
@@ -131,6 +132,9 @@ const payzen = new PayZenClientAdapter({
 - The signed browser answer is **not** verified client-side (the validation keys are
   server secrets) — treat the client outcome as UX feedback and confirm server-side via
   the IPN or `retrievePayment`.
+- The card-only embedded form shown here is the default. To present several payment
+  methods (Apple Pay, PayPal, …) with PayZen's smartForm, see §6 — submission ownership
+  changes there, so read it before adding `form: "smartform"`.
 
 ::: tip Content-Security-Policy
 krypton-client loads from `https://static.payzen.eu` — if you set a CSP, allow it under
@@ -139,7 +143,160 @@ your form actually uses (watch the console in TEST mode; hosts vary per platform
 Override the URLs via `scriptUrl` / `cssUrl` (your Back Office "JavaScript URL").
 :::
 
-## 6. Register the IPN (webhook) endpoint
+## 6. Offer several payment methods (smartForm)
+
+PayZen's **smartForm** presents a payment-method list — cards plus, per your shop's
+Back Office contracts, Apple Pay, PayPal, Bizum, Alma, meal-voucher cards, … — inside
+the same embedded surface, and the buyer completes without leaving your site. Three
+opt-in pieces, all backward compatible (the default stays the card-only embedded form):
+
+**1. Declare the shop's contracts on BOTH adapters.** Wallets/APMs are per-shop
+contracts, so the adapters ship a conservative card-only declaration; override it
+once the Back Office lists the contract:
+
+```ts
+const methods = [
+  { type: "card", flow: "embedded", supported: true },
+  { type: "paypal", flow: "popup", supported: true },
+  { type: "apple_pay", flow: "popup", supported: true },
+] as const;
+
+new PayZenServerAdapter({ /* …§4… */ paymentMethods: [...methods] });
+new PayZenClientAdapter({ /* …§5… */ form: "smartform", paymentMethods: [...methods] });
+```
+
+**2. Choose the session's methods server-side.** `paymentMethodTypes` maps onto
+PayZen's `paymentMethods` field (`card` → `CARDS`, `apple_pay` → `APPLE_PAY`,
+`paypal` → `PAYPAL`); a single entry renders that method's entry page directly.
+Omit it and PayZen offers **every** method the shop is eligible for (currency,
+amount, and contract constraints applied by the platform):
+
+```ts
+const session = await payments.createPaymentSession({
+  amount: 4990,
+  currency: "EUR",
+  paymentMethodTypes: ["card", "paypal"], // optional restriction
+  idempotencyKey: "order-1-attempt-1",
+});
+```
+
+**3. Render the smartForm and await the outcome.** Set `form: "smartform"` (method
+list) or `"smartform-expanded"` (card fields pre-expanded in the list). The smartForm
+renders its **own** pay buttons — Apple Pay requires the buyer's gesture, and each
+method drives its own flow — so do **not** render `<PayButton>`. Instead, start
+awaiting the buyer's in-form completion once the fields are ready:
+
+```tsx
+const { status } = usePayFanout();
+const { pay } = usePay();
+const awaiting = useRef(false);
+
+useEffect(() => {
+  if (status !== "ready" || awaiting.current) return;
+  awaiting.current = true;
+  void pay().then((result) => {
+    awaiting.current = false;
+    showOutcome(result); // on a failed retryable outcome, call pay() again to keep awaiting
+  });
+}, [status, pay]);
+
+<PaymentFields clientSecret={session.clientSecret} />;
+```
+
+A completion that lands before your `pay()` call is buffered and returned by it, so
+the race is safe. Local validation errors, integration warnings, and an abandoned 3DS
+pop-in surface via `onError` while the await continues (the buyer is still in front
+of a usable form); gateway rejections and fatal client errors settle it as `failed`.
+The IPN remains the server-side source of truth either way.
+
+Worth knowing:
+
+- Recoverable in-form errors reach `onError`, and `<PaymentFields>` mirrors every
+  `onError` into `usePayFanout().status = "error"` / `lastError` — so a buyer typo on
+  the form's own pay button flips the provider status while the form stays usable and
+  the await keeps running. Key banners or disabled states on the `pay()` outcome, not
+  on `status`, in smartForm mode.
+- A smartForm whose session/shop resolves to **cards only** renders the plain card
+  fields directly — `form: "smartform"` is safe before any wallet contract exists.
+- The **material theme is incompatible** with the smartForm (`CLIENT_505`); the
+  default neon reset works.
+- `payzenClient.fetchAvailablePaymentMethods()` returns the shop's **live** method
+  list (via `KR.getPaymentMethods()`) as `{ types, methods, cardBrands }` — build a
+  dynamic method chooser from it instead of hard-coding enablement.
+- Apple Pay works in production only in Safari on Apple devices; TEST mode simulates
+  it on other browsers.
+
+## 7. Pay by bank: SEPA and the other bank rails (hosted redirect)
+
+PayZen's bank rails live on its **hosted payment page**, not in the embedded/smartForm
+surface. The adapter reaches them through a payment order (`Charge/CreatePaymentOrder`,
+URL channel): the session's `clientSecret` becomes the hosted page URL, `confirm()` is
+the redirect, and the outcome comes back server-side. The unified types map onto the
+documented method codes:
+
+| `paymentMethodTypes` entry | PayZen method(s) | Currencies | Customer countries | Refund | Cancel |
+| --- | --- | --- | --- | --- | --- |
+| `sepa_debit` | SEPA Direct Debit (`SDD`) — one-off mandate signed on the page | EUR | SEPA zone (undeclared — zone membership drifts) | by wire transfer | ✅ before capture |
+| `ideal` | iDEAL (`IDEAL`) | EUR | NL | ✅ | ❌ (immediate capture) |
+| `bank_redirect_generic` | the pay-by-bank family: SEPA Credit Transfer via payment initiation (`IP_WIRE`, `IP_WIRE_INST`), MyBank (`MYBANK`), Przelewy24 (`PRZELEWY24`) — the buyer picks on the page | EUR (P24 also PLN) | FR / ES, GR, IT / PL | rail-dependent (wire transfers: ❌) | ❌ |
+| `voucher_generic` | Multibanco (`MULTIBANCO`) — reference paid out of band | EUR | PT | ❌ | ❌ |
+
+Each rail needs its own Back Office contract, so all four default to
+`supported: false` — declare what your shop has on **both** adapter configs, exactly
+like the smartForm wallets in §6:
+
+```ts
+const methods = [
+  { type: "card", flow: "embedded", supported: true },
+  { type: "sepa_debit", flow: "redirect", supported: true, currencies: ["EUR"] },
+  { type: "ideal", flow: "redirect", supported: true, currencies: ["EUR"], countries: ["NL"] },
+] as const;
+```
+
+Then request a session with the rail and a `returnUrl` (required — the hosted page
+sends the buyer back to it), and drive the standard redirect flow:
+
+```tsx
+// server
+const session = await payments.createPaymentSession({
+  amount: 2500,
+  currency: "EUR",
+  paymentMethodTypes: ["sepa_debit"],
+  returnUrl: "https://shop.example/checkout/return",
+  idempotencyKey: "order-9-attempt-1",
+});
+// session.status === "requires_action"; session.clientSecret is the hosted page URL
+
+// client — <PaymentFields> renders an informational panel (customize via
+// fieldOptions.description / appearance.panel); the pay button redirects.
+<PaymentFields clientSecret={session.clientSecret} />
+<PayButton onResult={showOutcome}>Pay by bank</PayButton>
+
+// on the returnUrl page: resolve the return trip
+<RedirectReturn onResult={(result) => refreshOrder(result)} />
+```
+
+What to expect operationally:
+
+- **The IPN and `retrievePayment` are the source of truth.** The return trip resolves
+  a kr-shaped return to a UX-grade outcome and everything else to `processing` — the
+  hosted page's return data is display-only by design. Register the notification URL in
+  the Back Office **REST API** section (§8), same as for the embedded form.
+- **A session cannot mix surfaces**: bank rails and embedded methods (card, wallets)
+  take separate sessions — the adapter rejects a mixed `paymentMethodTypes` list.
+- **SEPA Direct Debit is a deferred rail**: the mandate is signed on the page, capture
+  follows the shop's capture delay (authorization stays valid 15 days), `captureMethod:
+  "manual"` works (`Transaction/Validate`), `cancelPayment` voids before capture, and
+  refunds go out as wire transfers.
+- **Wire transfers (`IP_WIRE*`) sit in `WAITING_AUTHORISATION`** until the buyer's bank
+  settles — treat `processing` as normal, and expect no refund or cancel channel.
+- The payment order expires per the shop default (or 90 days max) — an expired order
+  simply never produces a transaction; create a fresh session.
+- Verify each rail end to end against your shop's TEST mode before enabling it in
+  production: contract eligibility and the hosted page's method availability are
+  per-shop facts the adapter cannot check for you.
+
+## 8. Register the IPN (webhook) endpoint
 
 In the Back Office: Settings → Notification rules → **Instant Payment Notification URL at
 the end of the payment** (enable the rules you care about — end of payment, cancellation,
@@ -200,7 +357,7 @@ Notes that matter in production:
 - Restrict ingress to PayZen's documented IPN source range (`194.50.38.0/24`) if you
   filter by IP.
 
-## 7. Capture, cancel, refund semantics
+## 9. Capture, cancel, refund semantics
 
 - **Capture is automatic by default** (same-evening remittance, or `captureDelay`).
   `captureMethod: "manual"` maps to PayZen's manual-validation mode: the transaction
@@ -216,7 +373,7 @@ Notes that matter in production:
   result still reports honestly — the customer was never charged). Poll async refunds
   with `retrieveRefund(refundId)`.
 
-## 8. Idempotency — PayZen has none; know what the adapter synthesizes
+## 10. Idempotency — PayZen has none; know what the adapter synthesizes
 
 PayZen's V4 API has **no idempotency mechanism** (verified against the live gateway):
 replaying an identical `Charge/CreatePayment` mints a new formToken, and replaying a
@@ -236,7 +393,7 @@ original. The adapter narrows the blast radius:
   `amountRefunded`; the refund request has no field a replayed key could be matched
   against, so the adapter cannot detect duplicates for you.
 
-## 9. Currencies
+## 11. Currencies
 
 Amounts are integer minor units everywhere, including 0-decimal (JPY, KRW, XOF, XPF)
 and 3-decimal (KWD, TND) currencies. Three deliberate gaps, rejected locally with
@@ -250,7 +407,7 @@ and 3-decimal (KWD, TND) currencies. Three deliberate gaps, rejected locally wit
 Currencies outside your MID's contract need the shop's currency-conversion option, or
 PayZen answers `PSP_610` ("no acceptance agreement").
 
-## 10. Test cards
+## 12. Test cards
 
 In TEST mode the form shows a debug toolbar with an auto-fill "Test cards" tab (hide it
 with `fieldOptions: { "kr-hide-debug-toolbar": true }`). Highlights from the
@@ -267,10 +424,12 @@ expiry, any CVV; the card **number** selects the behavior (no amount-triggered d
 | `4051700000003926` | Accepted in JPY |
 | `4515450000004140` | Accepted in KWD |
 
-## 11. Limitations (v1, by design)
+## 13. Limitations (by design)
 
-- **Card only.** SmartForm wallets/APMs (Apple Pay, PayPal, …) use a different form mode
-  and per-contract enablement — not exposed yet.
+- **Unified method types cover card, Apple Pay, and PayPal.** The smartForm can also
+  offer the platform's other methods (Bizum, Alma, meal vouchers, …) when a session
+  does not restrict `paymentMethodTypes` — but they have no unified type, so they
+  cannot be requested individually and report as `paymentMethodType: "other"`.
 - **No vaulting yet** (`supportsSavedPaymentMethods: false`). PayZen's
   `REGISTER_PAY`/token path is the documented route for a future version.
 - **No verification-only flow** — `Charge/CreateToken` always stores an instrument.
@@ -279,7 +438,7 @@ expiry, any CVV; the card **number** selects the behavior (no amount-triggered d
 - **No statement descriptor field** exists in V4 (descriptors are acquirer-contract
   matters); the session field is withheld rather than failing the payment.
 
-## 12. Go live
+## 14. Go live
 
 - [ ] Complete PayZen's mandatory test payments, then generate the **production**
       password + HMAC key in the Back Office.

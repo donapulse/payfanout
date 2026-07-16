@@ -25,9 +25,9 @@ features:
   - title: Stateless by design
     details: No database, persists nothing. PayFanout orchestrates and normalizes; your app owns id mapping, webhook dedupe, and audit logs.
   - title: We never store card data
-    details: Card capture lives only in the PSP's hosted, embedded card fields (SAQ-A eligible). No raw card input anywhere, saved cards are opaque PSP tokens.
-  - title: Embedded, not redirected
-    details: Fields render inside your UI, styled by your design tokens; 3DS/SCA runs inline. Genuinely redirect methods (iDEAL, PaysafeCard…) are modeled honestly via a flow capability.
+    details: Card capture lives only in the PSP's hosted card fields (SAQ-A eligible). No raw card input anywhere, saved cards are opaque PSP tokens.
+  - title: Embedded fields, honest flows
+    details: Embedded card fields render inside your UI, styled by your design tokens; 3DS/SCA runs inline. Every method declares its real flow (embedded, redirect, voucher) via a flow capability.
   - title: Failover & circuit breaking
     details: PaymentRouter cascades transient failures across PSPs per currency/country, with a circuit breaker that skips known-down providers, the attempts array is your audit trail.
   - title: Proven extensible

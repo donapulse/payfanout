@@ -117,8 +117,6 @@ the expected seam).
   surface to keep the abstraction honest.
 - **Dispute/chargeback management:** today the library surfaces `payment.chargeback` webhooks;
   evidence submission stays in PSP dashboards. Unblock: real merchant demand.
-- **Hosted-checkout fallback:** rejected (embedded-only is a product
-  identity, both shipped PSPs do embedded). Revisit only if a future PSP cannot.
 - **Niche until demanded** (unchanged): Level 2/3 card data, DCC, surcharging,
   per-adapter health checks, incremental authorization (Stripe supports it only on
   select processors; Paysafe reauth semantics unverified).

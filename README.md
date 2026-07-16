@@ -317,9 +317,10 @@ carries an idempotent `merchantRefNum`).
 
 ### Redirect payment methods: the return trip
 
-Cards stay embedded, but genuinely redirect methods (iDEAL, bank redirects) leave the
-page. Mount the return-trip helper on your `returnUrl` page, it probes every registered
-client adapter, resolves the outcome, and reports the same `PayResult` as `<PayButton>`:
+Card fields render embedded, while genuinely redirect methods (iDEAL, bank redirects)
+leave the page. Mount the return-trip helper on your `returnUrl` page, it probes every
+registered client adapter, resolves the outcome, and reports the same `PayResult` as
+`<PayButton>`:
 
 ```tsx
 import { useRedirectReturn } from "@payfanout/react";

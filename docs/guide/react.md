@@ -33,17 +33,17 @@ const adapters = [
 
 ## The two completion shapes
 
-Stripe and Paysafe have inverted flows, and the abstraction models both as first-class,
+PSPs come with inverted flows, and the abstraction models both as first-class,
 **the UI code is identical either way**:
 
-- **Confirm-on-client (Stripe):** server creates the PaymentIntent → client mounts with
-  `clientSecret` → `confirm()` finalizes (incl. inline 3DS). The server never touches
-  confirmation, and `completePayment` is rejected for such PSPs.
-- **Tokenize-first (Paysafe, PayPal):** the client tokenizes first (`confirm()` resolves
-  `requires_confirmation` + `clientToken`), then the **server** finalizes via
+- **Confirm-on-client (Stripe, PayZen):** server creates the payment session → client
+  mounts with `clientSecret` → `confirm()` finalizes (incl. inline 3DS). The server never
+  touches confirmation, and `completePayment` is rejected for such PSPs.
+- **Tokenize-first (Paysafe, PayPal, Worldline):** the client tokenizes first (`confirm()`
+  resolves `requires_confirmation` + `clientToken`), then the **server** finalizes via
   `completePayment`. `<PayButton>` branches automatically.
 
-Any future tokenize-first PSP reuses the same path (`requiresServerCompletion: true`).
+Every tokenize-first PSP reuses the same path (`requiresServerCompletion: true`).
 
 ### Built-in completion transport
 

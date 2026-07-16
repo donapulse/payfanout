@@ -22,7 +22,8 @@ app is expected to keep.
 ## Two non-negotiables baked into the design
 
 - **We never store card data, and neither do you.** Card capture happens exclusively in
-  Stripe's Payment Element / Paysafe.js hosted iframe fields, both SAQ-A eligible; there
+  each PSP's hosted surface (Stripe's Payment Element, Paysafe.js fields, PayZen's
+  krypton form, Worldline's Hosted Tokenization iframe — all SAQ-A eligible); there
   is no raw card `<input>` anywhere. Saved cards / recurring payments change nothing about
   this: the **PSP** vaults the card and hands back an opaque token, your database stores
   that token exactly like it stores a `pspPaymentId`, never a PAN.

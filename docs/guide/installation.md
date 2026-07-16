@@ -25,7 +25,7 @@ pnpm add @payfanout/server \
 - The **Paysafe** server adapter talks to the Payments REST API directly and is
   **edge-runtime compatible** (WebCrypto only, no Node builtins), it runs on Cloudflare
   Workers / Next.js edge routes.
-- You don't have to install both adapters, add only the PSP(s) you use.
+- You don't have to install every adapter, add only the PSP(s) you use.
 
 ### Client side (React)
 
@@ -69,11 +69,12 @@ Client vars must be `VITE_`-prefixed for Vite to expose them to the browser bund
 ## Next: set up your PSP
 
 Package install is only half the job. The **per-PSP setup guides** take you from
-credentials to a working payment, obtaining keys, wiring both adapters, registering the
-webhook, and test cards:
+credentials to a working payment, obtaining keys, wiring both adapter halves, registering
+the webhook, and test values:
 
 - [Payment providers overview](/guide/providers), the shared four-step shape.
-- [Set up Stripe](/guide/stripe) · [Set up Paysafe](/guide/paysafe)
+- [Stripe](/guide/stripe) · [Paysafe](/guide/paysafe) · [GoCardless](/guide/gocardless) ·
+  [PayPal](/guide/paypal) · [PayZen](/guide/payzen) · [Worldline](/guide/worldline)
 - [Writing an adapter](/adapter-authoring), install a PSP we don't ship yet.
 
 ## Building from source (contributing)
@@ -106,14 +107,15 @@ end-to-end, run the demo app described in [Getting started](/guide/getting-start
 
 ## Try the demo app
 
-The demo (`examples/demo`) shows both PSPs behind identical UI, switchable at runtime:
+The demo (`examples/demo`) shows all six PSPs behind identical UI, switchable at runtime:
 
 ```bash
 pnpm --filter payfanout-demo dev:server   # Express API + webhook endpoints on :4242
 pnpm --filter payfanout-demo dev:web      # Vite dev server (proxies /api and /webhooks)
 ```
 
-Set the Stripe and Paysafe variables from the [table above](#environment-variables) to hit
+Set the Stripe and Paysafe variables from the [table above](#environment-variables), and
+the other PSPs' equivalents (see `examples/demo/server.mts`), to hit
 the real sandboxes, including the **`VITE_`-prefixed client keys**
 (`VITE_STRIPE_PUBLISHABLE_KEY`, `VITE_PAYSAFE_PUBLIC_KEY`) and `VITE_PAYSAFE_CURRENCY`,
 which a bare `PAYSAFE_*` glob would miss. Unset variables fall back to inert placeholders,

@@ -41,7 +41,7 @@ The guides follow the identical arc, only the credential names and a few quirks 
 
 ::: tip Which side do I need?
 Server-only backend? Steps 1, 2, 4. Adding the embedded card fields? Also step 3. You do
-not have to install both PSPs, add only the one(s) you use.
+not have to install every PSP, add only the one(s) you use.
 :::
 
 ## Sandbox first, always
@@ -54,9 +54,9 @@ data migration between sandbox and live, the switch is credentials only.
 
 ## Installing a PSP we don't ship yet
 
-A third, fourth, or fifth PSP is **a new adapter package, not a fork**. You implement the
+Another PSP is **a new adapter package, not a fork**. You implement the
 `ServerPaymentAdapter` / `ClientPaymentAdapter` contracts from `@payfanout/core`, prove
-the adapter against `@payfanout/conformance`, the same suite Stripe and Paysafe pass,
+the adapter against `@payfanout/conformance`, the same suite all six shipped adapters pass,
 and it drops into the exact four steps above with **zero changes to core, server, React,
 or your application code**. The step-by-step build is [Writing an adapter](/adapter-authoring),
 and [Conformance](/guide/conformance) is how "extensible" stays a guarantee rather than a

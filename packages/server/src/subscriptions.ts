@@ -21,8 +21,9 @@ import type { PaymentService } from "./payment-service.js";
  *                  host's SubscriptionStore                 PSP vault token
  *
  * PSP-native billing products (Stripe Billing) are NOT wrapped —
- * Paysafe has no equivalent, and an abstraction over one PSP is not an
- * abstraction. This engine gives BOTH PSPs identical subscription behavior.
+ * most PSPs have no equivalent, and an abstraction over one PSP is not an
+ * abstraction. This engine gives every vaulting-capable PSP identical
+ * subscription behavior.
  */
 export type SubscriptionStatus = "active" | "trialing" | "past_due" | "paused" | "canceled";
 

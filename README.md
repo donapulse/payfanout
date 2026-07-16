@@ -6,6 +6,9 @@ never knows which PSP is active. PayFanout is provider-agnostic: implement any p
 by writing a new adapter package only, **zero changes to core, zero
 changes to consuming application code**, verified by a shared conformance suite.
 
+**Documentation:** guides and the full API reference live at
+**<https://donapulse.github.io/payfanout/>**.
+
 > **PayFanout is stateless. It has no database and persists nothing.**
 > The consuming application owns:
 > - the mapping between its internal payment/order ids and `pspPaymentId`s,
@@ -19,7 +22,8 @@ changes to consuming application code**, verified by a shared conformance suite.
 Two more non-negotiables baked into the design:
 
 - **We never store card data, and neither do you.** Card capture happens exclusively in
-  Stripe's Payment Element / Paysafe.js hosted iframe fields, both SAQ-A eligible; there
+  each PSP's hosted surface (Stripe's Payment Element, Paysafe.js fields, PayZen's
+  krypton form, Worldline's Hosted Tokenization iframe — all SAQ-A eligible); there
   is no raw card `<input>` anywhere. Saved cards / recurring payments (below) change
   nothing about this: the **PSP** vaults the card and hands back an opaque token, your
   database stores that token exactly like it stores a `pspPaymentId`, never a PAN.
@@ -55,11 +59,17 @@ convention. Every adapter config requires an explicit `environment: "sandbox" | 
 never inferred from key prefixes.
 
 > **Installing & wiring a specific PSP?** The step-by-step setup guides, credentials from
-> each dashboard, both adapters, webhook registration, test cards, and go-live, live in the
-> docs: [Set up Stripe](docs/guide/stripe.md) · [Set up Paysafe](docs/guide/paysafe.md)
-> ([overview](docs/guide/providers.md)). Installing a PSP we don't ship yet:
-> [docs/adapter-authoring.md](docs/adapter-authoring.md). The quick starts below are the
-> condensed version.
+> each dashboard, both adapter halves, webhook registration, test values, and go-live, live
+> on the docs site:
+> [Stripe](https://donapulse.github.io/payfanout/guide/stripe) ·
+> [Paysafe](https://donapulse.github.io/payfanout/guide/paysafe) ·
+> [GoCardless](https://donapulse.github.io/payfanout/guide/gocardless) ·
+> [PayPal](https://donapulse.github.io/payfanout/guide/paypal) ·
+> [PayZen](https://donapulse.github.io/payfanout/guide/payzen) ·
+> [Worldline](https://donapulse.github.io/payfanout/guide/worldline)
+> ([overview](https://donapulse.github.io/payfanout/guide/providers)). Installing a PSP we
+> don't ship yet: [adapter authoring](https://donapulse.github.io/payfanout/adapter-authoring).
+> The quick starts below are the condensed version.
 
 ## Server quick start
 
@@ -178,15 +188,17 @@ await subs.chargeDueSubscriptions();   // renews, retries (24h/72h dunning), can
 Off-session charges that hit a bank's authentication demand surface as
 `authentication_required`, bring the customer back on-session; the dunning schedule
 handles the retries. PSP-native billing (Stripe Billing) is deliberately not wrapped:
-Paysafe has no equivalent, and this engine gives both PSPs identical behavior.
+most PSPs have no equivalent, and this engine gives every vaulting-capable PSP
+(Stripe and Paysafe today) identical behavior.
 
 ### Retries, the machinery behind `retryable`
 
 Idempotency keys are mandatory on every mutating call, so transient failures are safe
 to replay. Three layers act on that: the Stripe SDK retries network failures itself
-(`maxNetworkRetries`, default 2); the Paysafe transport retries timeouts/5xx/429 with
-backoff (`maxNetworkRetries`, default 2, business errors like declines or 3406 are
-never replayed); and `withRetry(fn, policy)` from `@payfanout/core` wraps any call with
+(`maxNetworkRetries`, default 2); every REST adapter's transport (Paysafe, GoCardless,
+PayPal, PayZen, Worldline) retries timeouts/5xx/429 with backoff (`maxNetworkRetries`,
+business errors like declines are never replayed); and `withRetry(fn, policy)` from
+`@payfanout/core` wraps any call with
 exponential backoff + jitter for `PayFanoutError.retryable` rejections.
 
 ### Observability
@@ -288,22 +300,22 @@ const { pay, paying } = usePay({ onServerCompletion });
 
 Adapters keep only the keys they must own to function (Stripe: `clientSecret`;
 Paysafe: environment/currency/account/mount selectors), everything else is yours.
-The demo shows both PSPs restyled (accordion + method order on Stripe; French
+The demo restyles them (accordion + method order on Stripe; French
 placeholders + a two-column slot grid on Paysafe + a fully custom gradient button).
 
 ### The two completion shapes (§4a, designed in, not bolted on)
 
-Stripe and Paysafe have inverted flows, and the abstraction models both as first-class:
+PSPs come with inverted flows, and the abstraction models both as first-class:
 
-- **Confirm-on-client (Stripe):** server creates the PaymentIntent → client mounts with
-  `clientSecret` → `confirm()` finalizes (incl. inline 3DS). Done, the server never
-  touches confirmation, and `completePayment` is rejected for such PSPs.
-- **Tokenize-first (Paysafe):** the client tokenizes first (`confirm()` resolves
-  `requires_confirmation` + `clientToken`), then the **server** finalizes via
+- **Confirm-on-client (Stripe, PayZen):** server creates the payment session → client
+  mounts with `clientSecret` → `confirm()` finalizes (incl. inline 3DS). Done, the server
+  never touches confirmation, and `completePayment` is rejected for such PSPs.
+- **Tokenize-first (Paysafe, PayPal, Worldline):** the client tokenizes first (`confirm()`
+  resolves `requires_confirmation` + `clientToken`), then the **server** finalizes via
   `completePayment`. `<PayButton>` branches automatically through your
   `onServerCompletion` callback; the UI code is identical either way.
 
-Any future tokenize-first PSP reuses the same path (`requiresServerCompletion: true`).
+Every tokenize-first PSP reuses the same path (`requiresServerCompletion: true`).
 
 Because PayFanout is stateless, the Paysafe adapter's "session" is a **signed,
 self-contained context**: amount/currency/merchant-account are HMAC-signed into
@@ -328,9 +340,10 @@ const { phase, result } = useRedirectReturn({ onResult: showOutcome });
 // phase: "checking" | "none" (normal page load) | "complete"
 ```
 
-Implemented for Stripe today (`payment_intent_client_secret` params → real intent
-status, not the `redirect_status` hint). Paysafe redirect methods stay capability-off
-until an account with them enabled lets us verify the return params (see
+Implemented for Stripe (`payment_intent_client_secret` params → real intent status,
+not the `redirect_status` hint), GoCardless (hosted bank authorisation), and PayZen
+(hosted-page bank rails). Paysafe wires the same probe, but its redirect methods stay
+capability-off until an account with them enabled lets us verify the return params (see
 docs/future-designs.md).
 
 ## Webhooks
@@ -376,9 +389,10 @@ retries effectively forever until it sees success. **Dedupe is yours:** `event.i
 stable key; keep the seen-set in your store. **Ordering is not guaranteed** by any PSP,
 treat events as unordered facts and reconcile with `retrievePayment` when sequence matters.
 
-**Secret rotation without cutover:** both adapters accept an *array* of signing
-secrets/HMAC keys, register the new one, keep the old until the PSP switches, then drop
-it. **Missed-webhook recovery:** `payments.fetchEvents("stripe", { since, cursor })`
+**Secret rotation without cutover:** the adapters accept an *array* of signing
+secrets/HMAC keys (Worldline's as `{ keyId, secretKey }` pairs matched by the webhook's
+key id; PayPal verifies by postback, so there is nothing to rotate locally), register
+the new one, keep the old until the PSP switches, then drop it. **Missed-webhook recovery:** `payments.fetchEvents("stripe", { since, cursor })`
 replays recent events as the same normalized `UnifiedWebhookEvent`s (same ids, your
 dedupe makes replays no-ops); Paysafe has no public events API (`supportsEventPolling:
 false`), so its fallback stays `retrievePayment` per order. **Refund outcomes are
@@ -431,8 +445,8 @@ assumption the fakes encode) → Playwright E2E through the demo app (real Strip
 Paysafe.js iframes, inline 3DS). CI runs the first layer on every push; the integration
 layer runs via workflow dispatch with repo secrets.
 
-The demo app (`examples/demo`) shows both PSPs behind identical UI, switchable at
-runtime, including the Paysafe server-completion flow behind the same `<PayButton>`:
+The demo app (`examples/demo`) shows all six PSPs behind identical UI, switchable at
+runtime, including the tokenize-first server-completion flow behind the same `<PayButton>`:
 
 ```bash
 pnpm --filter payfanout-demo dev:server   # Express API + webhook endpoints on :4242
@@ -440,7 +454,7 @@ pnpm --filter payfanout-demo dev:web      # Vite dev server (proxies /api and /w
 ```
 
 Set `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` / `VITE_STRIPE_PUBLISHABLE_KEY` and the
-`PAYSAFE_*` equivalents to hit real sandboxes.
+other PSPs' equivalents (see `examples/demo/server.mts`) to hit real sandboxes.
 
 ### Non-goals
 
@@ -455,10 +469,10 @@ recurring payments (previously excluded by scope).
 
 ### Caveat on PSP API details
 
-Paysafe endpoint paths, webhook header names, and error codes evolve; the adapter
-isolates them in one place each (`adapter.ts`, `webhook.ts`) with structural types and
+PSP endpoint paths, webhook header names, and error codes evolve; each adapter
+isolates them in one place (`adapter.ts`, `webhook.ts`) with structural types and
 injected transport so they can be re-verified against current docs and adjusted without
-touching core, server, or app code. Re-check against the Paysafe developer portal before
+touching core, server, or app code. Re-check against your PSPs' developer portals before
 going live.
 
 ## License

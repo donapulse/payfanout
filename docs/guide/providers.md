@@ -41,7 +41,7 @@ The guides follow the identical arc, only the credential names and a few quirks 
 
 ::: tip Which side do I need?
 Server-only backend? Steps 1, 2, 4. Adding the embedded card fields? Also step 3. You do
-not have to install both PSPs, add only the one(s) you use.
+not have to install every PSP, add only the one(s) you use.
 :::
 
 ## Sandbox first, always

@@ -106,7 +106,7 @@ end-to-end, run the demo app described in [Getting started](/guide/getting-start
 
 ## Try the demo app
 
-The demo (`examples/demo`) shows both PSPs behind identical UI, switchable at runtime:
+The demo (`examples/demo`) shows all six PSPs behind identical UI, switchable at runtime:
 
 ```bash
 pnpm --filter payfanout-demo dev:server   # Express API + webhook endpoints on :4242

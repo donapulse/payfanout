@@ -124,8 +124,9 @@ next run replays the same attempt key, which the PSP answers from cache instead 
 charging again.
 
 ::: info Why not wrap Stripe Billing?
-PSP-native billing (Stripe Billing) is deliberately not wrapped: Paysafe has no equivalent,
-and this engine gives both PSPs identical behavior.
+PSP-native billing (Stripe Billing) is deliberately not wrapped: most PSPs have no
+equivalent, and this engine gives every vaulting-capable PSP (Stripe and Paysafe today)
+identical behavior.
 :::
 
 ::: warning Storage is the host's job

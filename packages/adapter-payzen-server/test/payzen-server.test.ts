@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getRefundState, isPayFanoutError } from "@payfanout/core";
+import { getRefundState, isPayFanoutError, type PaymentMethodCapability } from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
 import { payzenOnboarding, PayZenServerAdapter, type PayZenServerAdapterConfig } from "../src/index.js";
 import { FakePayZenApi } from "./fake-payzen-api.js";
@@ -472,6 +472,248 @@ describe("PayZenServerAdapter payment method selection", () => {
     expect((await adapter.retrievePayment(session.pspSessionId)).paymentMethodType).toBe("other");
   });
 
+});
+
+describe("PayZenServerAdapter hosted bank rails", () => {
+  const REDIRECT_ENABLED: PaymentMethodCapability[] = [
+    { type: "card", flow: "embedded", supported: true },
+    { type: "sepa_debit", flow: "redirect", supported: true, currencies: ["EUR"] },
+    { type: "ideal", flow: "redirect", supported: true, currencies: ["EUR"], countries: ["NL"] },
+    {
+      type: "bank_redirect_generic",
+      flow: "redirect",
+      supported: true,
+      currencies: ["EUR", "PLN"],
+      countries: ["FR", "ES", "GR", "IT", "PL"],
+    },
+    { type: "voucher_generic", flow: "redirect", supported: true, currencies: ["EUR"], countries: ["PT"] },
+  ];
+  const makeRedirectPair = (): ReturnType<typeof makePair> => makePair({ paymentMethods: [...REDIRECT_ENABLED] });
+
+  it("declares the bank rails conservatively with their documented constraints", () => {
+    const methods = makePair().adapter.getCapabilities().paymentMethods;
+    expect(methods).toContainEqual({ type: "sepa_debit", flow: "redirect", supported: false, currencies: ["EUR"] });
+    expect(methods).toContainEqual({
+      type: "ideal",
+      flow: "redirect",
+      supported: false,
+      currencies: ["EUR"],
+      countries: ["NL"],
+    });
+    expect(methods.find((m) => m.type === "bank_redirect_generic")).toMatchObject({
+      flow: "redirect",
+      supported: false,
+      currencies: ["EUR", "PLN"],
+      countries: ["FR", "ES", "GR", "IT", "PL"],
+    });
+    expect(methods).toContainEqual({
+      type: "voucher_generic",
+      flow: "redirect",
+      supported: false,
+      currencies: ["EUR"],
+      countries: ["PT"],
+    });
+  });
+
+  it("creates a payment order with the documented method codes and returns the hosted page URL", async () => {
+    const { adapter, fake } = makeRedirectPair();
+    const session = await adapter.createPaymentSession({
+      id: "order-42",
+      amount: 4990,
+      currency: "EUR",
+      paymentMethodTypes: ["sepa_debit", "ideal"],
+      returnUrl: "https://host.example/checkout/return",
+      webhookUrl: "https://host.example/webhooks/payzen",
+      captureMethod: "manual",
+      sca: { challenge: "force" },
+      metadata: { plan: "pro" },
+      idempotencyKey: "order-42-attempt-1",
+    });
+    expect(session).toMatchObject({
+      id: "order-42",
+      pspName: "payzen",
+      pspSessionId: "pf-order-42-attempt-1",
+      amount: 4990,
+      currency: "EUR",
+      status: "requires_action", // the buyer authorises at the hosted page next
+      metadata: { plan: "pro" },
+    });
+    expect(session.clientSecret).toMatch(/^https:\/\/secure\.payzen\.eu\//);
+    expect(fake.lastRequestBody).toMatchObject({
+      amount: 4990,
+      currency: "EUR",
+      orderId: "pf-order-42-attempt-1",
+      channelOptions: { channelType: "URL" },
+      paymentMethods: ["SDD", "IDEAL"],
+      returnMode: "GET",
+      returnUrl: "https://host.example/checkout/return",
+      ipnTargetUrl: "https://host.example/webhooks/payzen",
+      strongAuthentication: "CHALLENGE_REQUESTED",
+      transactionOptions: { cardOptions: { manualValidation: "YES" } },
+      metadata: { plan: "pro", payfanout_key: "order-42-attempt-1", payfanout_id: "order-42" },
+    });
+    // CreatePaymentOrder documents no contrib field — never sent on this route.
+    expect(fake.lastRequestBody).not.toHaveProperty("contrib");
+    expect(fake.uniquePaymentOrderCreations).toBe(1);
+    expect(fake.uniqueFormTokenCreations).toBe(0); // the embedded route stayed out of this
+  });
+
+  it("withholds the MOTO exemption on the hosted route (undocumented on CreatePaymentOrder)", async () => {
+    const { adapter, fake } = makeRedirectPair();
+    await adapter.createPaymentSession({
+      amount: 100,
+      currency: "EUR",
+      paymentMethodTypes: ["sepa_debit"],
+      returnUrl: "https://h.example/r",
+      sca: { exemption: "moto" },
+      idempotencyKey: "k-moto",
+    });
+    expect(fake.lastRequestBody).not.toHaveProperty("transactionOptions");
+  });
+
+  it("maps a payment order answer without a paymentURL to a non-retryable processing_error", async () => {
+    // The fake only injects ERROR envelopes, so a raw fetch stands in for the
+    // degenerate SUCCESS answer.
+    const broken = new PayZenServerAdapter({
+      shopId: "69876357",
+      password: "testpassword_UnitOnly",
+      environment: "sandbox",
+      paymentMethods: [...REDIRECT_ENABLED],
+      maxNetworkRetries: 0,
+      fetch: async () =>
+        new Response(
+          JSON.stringify({ status: "SUCCESS", answer: { paymentOrderStatus: "RUNNING", _type: "V4/PaymentOrder" } }),
+          { status: 200 },
+        ),
+    });
+    await expect(
+      broken.createPaymentSession({
+        amount: 100,
+        currency: "EUR",
+        paymentMethodTypes: ["ideal"],
+        returnUrl: "https://h.example/r",
+        idempotencyKey: "k-nourl",
+      }),
+    ).rejects.toMatchObject({ code: "processing_error", retryable: false });
+  });
+
+  it("narrows the pay-by-bank family to currency-eligible codes", async () => {
+    const { adapter, fake } = makeRedirectPair();
+    await adapter.createPaymentSession({
+      amount: 100,
+      currency: "EUR",
+      paymentMethodTypes: ["bank_redirect_generic"],
+      returnUrl: "https://h.example/r",
+      idempotencyKey: "k-eur",
+    });
+    expect(fake.lastRequestBody).toMatchObject({
+      paymentMethods: ["IP_WIRE", "IP_WIRE_INST", "MYBANK", "PRZELEWY24"],
+    });
+    await adapter.createPaymentSession({
+      amount: 100,
+      currency: "PLN",
+      paymentMethodTypes: ["bank_redirect_generic"],
+      returnUrl: "https://h.example/r",
+      idempotencyKey: "k-pln",
+    });
+    expect(fake.lastRequestBody).toMatchObject({ paymentMethods: ["PRZELEWY24"] });
+  });
+
+  it("rejects rails that cannot settle in the session currency", async () => {
+    const { adapter } = makeRedirectPair();
+    await expect(
+      adapter.createPaymentSession({
+        amount: 100,
+        currency: "USD",
+        paymentMethodTypes: ["sepa_debit"],
+        returnUrl: "https://h.example/r",
+        idempotencyKey: "k",
+      }),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining("USD") as string,
+    });
+  });
+
+  it("requires returnUrl and refuses mixing the two surfaces", async () => {
+    const { adapter } = makeRedirectPair();
+    await expect(
+      adapter.createPaymentSession({
+        amount: 100,
+        currency: "EUR",
+        paymentMethodTypes: ["ideal"],
+        idempotencyKey: "k",
+      }),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining("returnUrl") as string,
+    });
+    await expect(
+      adapter.createPaymentSession({
+        amount: 100,
+        currency: "EUR",
+        paymentMethodTypes: ["card", "sepa_debit"],
+        returnUrl: "https://h.example/r",
+        idempotencyKey: "k",
+      }),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining("mix") as string,
+    });
+  });
+
+  it("keeps the bank rails behind the per-shop contract gate", async () => {
+    const { adapter } = makePair(); // defaults: redirect rails declared but supported: false
+    await expect(
+      adapter.createPaymentSession({
+        amount: 100,
+        currency: "EUR",
+        paymentMethodTypes: ["sepa_debit"],
+        returnUrl: "https://h.example/r",
+        idempotencyKey: "k",
+      }),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining("config.paymentMethods") as string,
+    });
+  });
+
+  it("round-trips a hosted payment end to end with honest bank-rail method types", async () => {
+    const { adapter, fake } = makeRedirectPair();
+    const session = await adapter.createPaymentSession({
+      id: "order-77",
+      amount: 2500,
+      currency: "EUR",
+      paymentMethodTypes: ["sepa_debit"],
+      returnUrl: "https://h.example/r",
+      idempotencyKey: "k-77",
+    });
+    const tx = fake.payOrder(session.pspSessionId);
+    tx.paymentMethodType = "SDD";
+    const info = await adapter.retrievePayment(session.pspSessionId);
+    expect(info.status).toBe("succeeded");
+    expect(info.id).toBe("order-77"); // payfanout_id round-trips via metadata
+    expect(info.paymentMethodType).toBe("sepa_debit");
+    tx.paymentMethodType = "MYBANK";
+    expect((await adapter.retrievePayment(session.pspSessionId)).paymentMethodType).toBe("bank_redirect_generic");
+    tx.paymentMethodType = "MULTIBANCO";
+    expect((await adapter.retrievePayment(session.pspSessionId)).paymentMethodType).toBe("voucher_generic");
+  });
+
+  it("replays converge on the same orderId with a fresh payment order each time", async () => {
+    const { adapter, fake } = makeRedirectPair();
+    const input = {
+      amount: 900,
+      currency: "EUR",
+      returnUrl: "https://h.example/r",
+      idempotencyKey: "replay-po",
+    };
+    const first = await adapter.createPaymentSession({ ...input, paymentMethodTypes: ["ideal"] });
+    const second = await adapter.createPaymentSession({ ...input, paymentMethodTypes: ["ideal"] });
+    expect(second.pspSessionId).toBe(first.pspSessionId); // deterministic derivation
+    expect(second.clientSecret).not.toBe(first.clientSecret); // a new payment order every call
+    expect(fake.uniquePaymentOrderCreations).toBe(2);
+  });
 });
 
 describe("PayZenServerAdapter reads", () => {

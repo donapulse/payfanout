@@ -839,3 +839,51 @@ KR.getPaymentMethods page, error-code tables, currency table):
   transaction-lifecycle kb page and the machine-readable schema, which both lag the
   playground, omit it. The 2026 currency table re-check confirmed the shipped list
   exactly (38 currencies, CNY=1/KHR=0 fractional digits, BHD absent).
+
+## PayZen bank rails via hosted payment orders (2026-07-16)
+
+The bank rails (SEPA Direct Debit, the DSP2 pay-by-bank family, iDEAL, Multibanco) have
+no embedded/smartForm surface on PayZen — their documented home is the hosted payment
+page. Doc-verified against payzen.io the same day (CreatePaymentOrder playground +
+url_payment_order kb, PaymentOrder answer reference, the vads_payment_cards data
+dictionary, and each rail's technical-information table):
+
+- **Transport is `Charge/CreatePaymentOrder` (channel URL), not the legacy vads form**:
+  same REST auth/envelope as every adapter call, `paymentMethods` restriction with the
+  identical single-method/offer-all semantics as CreatePayment, `returnMode: GET` +
+  `returnUrl`, per-order `ipnTargetUrl`, and the standard V4 IPN for outcomes — so the
+  webhook path needed zero changes. The answer's `paymentURL` rides
+  `PaymentSession.clientSecret` (GoCardless precedent) with `status: "requires_action"`;
+  `pspSessionId` stays the derived orderId, keeping Order/Get reads and the idempotency
+  synthesis identical across both routes. CreatePaymentOrder documents no `contrib`
+  field, so the hosted route never sends one.
+- **Method mapping (vads_payment_cards vocabulary, per-rail constraints from the
+  technical-information tables)**: sepa_debit → SDD (EUR; zone countries deliberately
+  undeclared — the SEPA-membership list would drift); ideal → IDEAL (EUR, NL);
+  bank_redirect_generic → the pay-by-bank family IP_WIRE + IP_WIRE_INST (EUR, FR),
+  MYBANK (EUR; ES/GR/IT), PRZELEWY24 (EUR+PLN, PL) — one unified type, the buyer picks
+  the concrete rail on the hosted page, session requests narrow the code list to
+  currency-eligible entries; voucher_generic → MULTIBANCO (EUR, PT). All four default
+  supported: false (per-shop contracts), same override pattern as the smartForm wallets.
+- **Sessions never mix surfaces**: a request combining embedded types (card, wallets)
+  with bank rails is rejected — mapping card onto the hosted page would mean guessing a
+  brand list, and the two surfaces have different completion shapes. `returnUrl` is
+  required on the hosted route.
+- **The return trip is display-only by design** (the platform documents that return
+  data must not drive database processing): handleRedirectReturn resolves a kr-shaped
+  return (kr-answer in the query string) to a UX-grade outcome exactly like the
+  embedded browser answer, any vads-shaped return to `processing`, and foreign URLs to
+  null. The IPN / retrievePayment remain the source of truth.
+- **Per-rail operational facts recorded from the tables**: SDD is deferred-capture
+  (15-day authorization validity, manual validation supported, cancel before capture,
+  refunds go out as wire transfers); iDEAL/MyBank/P24 capture immediately (refund yes,
+  cancel no); Multibanco has no refund channel; IP_WIRE sits in WAITING_AUTHORISATION
+  until the bank settles and has neither refund nor cancel. Payment orders expire per
+  the shop default, 90 days maximum.
+- Evidence-level notes: the REST `paymentMethods` field is an open string array (no
+  schema enum) whose description mirrors vads_payment_cards semantics word-for-word;
+  passing the bank-rail codes through it follows that parallel plus the field's own
+  "eligible methods of the store" contract, and each rail deserves one TEST-mode pass
+  before production (the guide says so). Google Pay also exists on the hosted page
+  (GOOGLEPAY) but is deliberately not wired — it would belong to the smartForm/wallet
+  story, a separate decision.

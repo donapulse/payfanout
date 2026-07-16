@@ -71,7 +71,7 @@ export class FakePayZenApi {
   readonly password = "testpassword_DEMOPRIVATEKEY23G4475zXZQ2UA5x7M";
   readonly hmacKey = "38453613e7f44dc58732bad3dca2bca3";
   /** Currencies the fake "shop" has an acceptance agreement for. */
-  acceptedCurrencies = new Set(["EUR", "USD", "JPY", "KWD", "TND", "GBP", "CAD"]);
+  acceptedCurrencies = new Set(["EUR", "USD", "JPY", "KWD", "TND", "GBP", "CAD", "PLN"]);
 
   private readonly sessionsByToken = new Map<string, FakeSession>();
   private readonly sessionsByOrder = new Map<string, FakeSession>();
@@ -83,6 +83,7 @@ export class FakePayZenApi {
   private nextEnvelopeError: { answer: Record<string, unknown>; forOperation?: string } | undefined;
 
   uniqueFormTokenCreations = 0;
+  uniquePaymentOrderCreations = 0;
   uniqueTransactionCreations = 0;
   uniqueRefundCreations = 0;
   lastRequestBody: Record<string, unknown> | undefined;
@@ -139,6 +140,8 @@ export class FakePayZenApi {
         return this.sdkTest(body);
       case "Charge/CreatePayment":
         return this.createPayment(body);
+      case "Charge/CreatePaymentOrder":
+        return this.createPaymentOrder(body);
       case "Order/Get":
         return this.orderGet(body);
       case "Transaction/Get":
@@ -294,6 +297,63 @@ export class FakePayZenApi {
     this.sessionsByOrder.set(orderId, session);
     this.uniqueFormTokenCreations++;
     return this.success("Charge/CreatePayment", { formToken, _type: "V4/Charge/PaymentForm" });
+  }
+
+  /**
+   * Charge/CreatePaymentOrder — the hosted-payment channel: mints a payment
+   * order id + hosted page URL, no transaction until the buyer pays there
+   * (payOrder() stands in for the hosted page exactly as it does for the
+   * krypton form). Like CreatePayment, NEVER dedupes — the platform has no
+   * idempotency channel here either.
+   */
+  private createPaymentOrder(body: Record<string, unknown>): Response {
+    const amount = body["amount"];
+    if (typeof amount !== "number" || !Number.isInteger(amount) || amount <= 0) {
+      return this.error("Charge/CreatePaymentOrder", {
+        errorCode: "INT_009",
+        errorMessage: "invalid amount",
+        detailedErrorCode: null,
+        detailedErrorMessage: `Invalid input amount [value=${String(amount)}]`,
+        ticket: "null",
+        shopId: this.shopId,
+        _type: "V4/WebService/WebServiceError",
+      });
+    }
+    const currency = String(body["currency"] ?? "");
+    if (!this.acceptedCurrencies.has(currency)) {
+      return this.error("Charge/CreatePaymentOrder", {
+        errorCode: "PSP_610",
+        errorMessage: "No merchant acceptance agreement available",
+        detailedErrorCode: "NO_ACCEPTANCE_AGREEMENT_AVAILABLE",
+        detailedErrorMessage:
+          "No acceptance agreement available, check input parameters (amount, currency, mode, etc.)",
+        ticket: "null",
+        shopId: this.shopId,
+        _type: "V4/WebService/WebServiceError",
+      });
+    }
+    const orderId = String(body["orderId"] ?? `noorder-${this.seq + 1}`);
+    const manualValidation =
+      (body["transactionOptions"] as { cardOptions?: { manualValidation?: string } } | undefined)?.cardOptions
+        ?.manualValidation === "YES";
+    const session: FakeSession = {
+      orderId,
+      amount,
+      currency,
+      metadata: (body["metadata"] as Record<string, string> | undefined) ?? null,
+      manualValidation,
+      body,
+    };
+    this.sessionsByOrder.set(orderId, session);
+    const paymentOrderId = `po${++this.seq}fakepayzenorder`;
+    this.uniquePaymentOrderCreations++;
+    return this.success("Charge/CreatePaymentOrder", {
+      paymentOrderId,
+      paymentOrderStatus: "RUNNING",
+      paymentURL: `https://secure.payzen.eu/t/${paymentOrderId}`,
+      creationDate: this.nextDate(),
+      _type: "V4/PaymentOrder",
+    });
   }
 
   private transactionGet(body: Record<string, unknown>): Response {

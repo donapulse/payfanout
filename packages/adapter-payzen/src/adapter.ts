@@ -7,6 +7,7 @@ import {
   type MountedFieldsHandle,
   type MountOptions,
   type PaymentMethodCapability,
+  type RedirectReturnLocation,
   type UnifiedError,
   type UnifiedErrorCode,
   type UnifiedPaymentMethodType,
@@ -120,16 +121,30 @@ const KR_SCRIPT_URL = "https://static.payzen.eu/static/js/krypton-client/V4.0/st
 const KR_CSS_URL = "https://static.payzen.eu/static/js/krypton-client/V4.0/ext/neon-reset.min.css";
 
 /**
- * Mirror of the server adapter's declaration: card is on every shop; the
- * smartForm wallets/APMs are per-shop contracts, so they default to
- * supported: false until the host flips them via `config.paymentMethods`.
- * Flow "popup": the smartForm runs its methods without leaving the page.
+ * Mirror of the server adapter's declaration: card is on every shop;
+ * everything else is a per-shop contract, so it defaults to supported: false
+ * until the host flips entries via `config.paymentMethods`. Flow "popup"
+ * methods run inside the smartForm without leaving the page; flow "redirect"
+ * methods (the bank rails) live on PayZen's hosted payment page — their
+ * session's clientSecret is the page URL and confirm() is the redirect.
  */
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "card", flow: "embedded", supported: true },
   { type: "apple_pay", flow: "popup", supported: false },
   { type: "paypal", flow: "popup", supported: false },
+  { type: "sepa_debit", flow: "redirect", supported: false, currencies: ["EUR"] },
+  { type: "ideal", flow: "redirect", supported: false, currencies: ["EUR"], countries: ["NL"] },
+  {
+    type: "bank_redirect_generic",
+    flow: "redirect",
+    supported: false,
+    currencies: ["EUR", "PLN"],
+    countries: ["FR", "ES", "GR", "IT", "PL"],
+  },
+  { type: "voucher_generic", flow: "redirect", supported: false, currencies: ["EUR"], countries: ["PT"] },
 ];
+
+const DEFAULT_PANEL_TEXT = "You will be redirected to the payment page to complete this payment.";
 
 /** KR.getPaymentMethods() code → unified type, for the methods this adapter maps. */
 const PAYZEN_CODE_TO_UNIFIED: Record<string, UnifiedPaymentMethodType> = {
@@ -159,6 +174,13 @@ interface PayZenHandle {
   kr: KrLike;
   state: PayZenMountState;
   cleanup: () => void;
+}
+
+/** Hosted-redirect sessions mount no krypton form — the handle carries the page URL. */
+interface PayZenRedirectHandle {
+  pspName: "payzen";
+  paymentUrl: string;
+  panel: HTMLElement;
 }
 
 let mountCounter = 0;
@@ -246,6 +268,27 @@ export class PayZenClientAdapter implements ClientPaymentAdapter {
    */
   async mount(container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
     assertBrowser("PayZenClientAdapter", "mount");
+    // Hosted-redirect sessions (bank rails): the clientSecret is the hosted
+    // payment page URL, not a formToken — nothing renders client-side, so
+    // mount shows an informational panel and skips krypton entirely.
+    // `fieldOptions.description` overrides the text; `appearance.panel`
+    // carries inline CSS for it (the payment UI itself is PayZen-hosted).
+    if (/^https:\/\//.test(options.clientSecret)) {
+      const panel = document.createElement("div");
+      panel.setAttribute("data-payfanout-payzen-panel", "");
+      const description = options.fieldOptions?.["description"];
+      panel.textContent = typeof description === "string" ? description : DEFAULT_PANEL_TEXT;
+      const style = options.appearance?.["panel"];
+      if (style !== null && typeof style === "object" && !Array.isArray(style)) {
+        Object.assign(panel.style, style);
+      }
+      container.appendChild(panel);
+      options.onChange?.({ complete: false });
+      options.onChange?.({ complete: true }); // nothing to fill — the hosted page collects everything
+      options.onReady?.();
+      const handle: PayZenRedirectHandle = { pspName: "payzen", paymentUrl: options.clientSecret, panel };
+      return brandMountedFieldsHandle(handle);
+    }
     await this.loadSdk();
     const kr = this.kr()!;
     const form = this.config.form ?? "embedded";
@@ -331,6 +374,16 @@ export class PayZenClientAdapter implements ClientPaymentAdapter {
    * retrievePayment).
    */
   async confirm(handle: MountedFieldsHandle): Promise<ConfirmResult> {
+    const redirect = asRedirectHandle(handle);
+    if (redirect) {
+      // Bank rails complete on PayZen's hosted page — confirm IS the
+      // redirect, and the promise never settles because the navigation
+      // unloads the page. The outcome resolves on returnUrl via
+      // handleRedirectReturn plus a server-side retrievePayment / the IPN.
+      assertBrowser("PayZenClientAdapter", "confirm");
+      window.location.assign(redirect.paymentUrl);
+      return new Promise<ConfirmResult>(() => {});
+    }
     const h = asPayZenHandle(handle);
     if (h.state.settled) {
       // The buyer completed through the form's own buttons before the host
@@ -384,7 +437,47 @@ export class PayZenClientAdapter implements ClientPaymentAdapter {
   }
 
   unmount(handle: MountedFieldsHandle): void {
+    const redirect = asRedirectHandle(handle);
+    if (redirect) {
+      // Only the adapter-created panel — host elements are never touched.
+      redirect.panel.remove();
+      return;
+    }
     asPayZenHandle(handle).cleanup();
+  }
+
+  /**
+   * Return trip from the hosted payment page. Two documented return shapes
+   * exist, and both resolve here:
+   *
+   *   - kr-* fields (the V4 return): the signed kr-answer is parsed for a
+   *     UX-grade outcome — the signature is NOT checked here (its keys are
+   *     server secrets), exactly like the embedded form's browser answer.
+   *   - vads_* fields (the hosted page's classic return): the browser has no
+   *     way to verify them, and the platform documents that return data must
+   *     only display a visual context — so they resolve "processing" and the
+   *     host confirms server-side via retrievePayment or the IPN.
+   *
+   * Returns null when the URL carries neither, so a router can probe every
+   * registered adapter safely.
+   */
+  async handleRedirectReturn(location: RedirectReturnLocation): Promise<ConfirmResult | null> {
+    const params = new URLSearchParams(
+      location.search.startsWith("?") ? location.search.slice(1) : location.search,
+    );
+    const krAnswer = params.get("kr-answer");
+    if (krAnswer) {
+      try {
+        return confirmResultFrom({ clientAnswer: JSON.parse(krAnswer) as KrClientAnswerLike });
+      } catch {
+        // Present but unreadable — still a PayZen return; the server decides.
+        return { status: "processing" };
+      }
+    }
+    if (params.get("vads_trans_uuid") || params.get("vads_trans_status") || params.get("vads_order_id")) {
+      return { status: "processing" };
+    }
+    return null;
   }
 
   listPaymentMethodCapabilities(): PaymentMethodCapability[] {
@@ -610,6 +703,12 @@ function asPayZenHandle(handle: MountedFieldsHandle): PayZenHandle {
     throw PayFanoutError.invalidRequest("Handle was not produced by PayZenClientAdapter.mount");
   }
   return h;
+}
+
+/** The redirect-shaped sibling of asPayZenHandle — returns undefined for krypton handles. */
+function asRedirectHandle(handle: MountedFieldsHandle): PayZenRedirectHandle | undefined {
+  const h = handle as unknown as PayZenRedirectHandle;
+  return h?.pspName === "payzen" && typeof h.paymentUrl === "string" && h.paymentUrl.length > 0 ? h : undefined;
 }
 
 /**

@@ -203,7 +203,10 @@ const { phase, result } = useRedirectReturn({ onResult: showOutcome });
 
 Implemented for Stripe (`payment_intent_client_secret` params → real intent status, not
 the `redirect_status` hint), GoCardless (resolves `"processing"`; webhooks carry the
-outcome) and Paysafe Interac e-Transfer, which resolves `requires_confirmation` plus a
+outcome), PayZen's bank rails (a kr-shaped return parses to a UX-grade outcome, the
+hosted page's classic `vads_*` return resolves `"processing"` — see the
+[PayZen guide](/guide/payzen#_7-pay-by-bank-sepa-and-the-other-bank-rails-hosted-redirect))
+and Paysafe Interac e-Transfer, which resolves `requires_confirmation` plus a
 placeholder `clientToken`: pass `onServerCompletion` so the completion transport can finish
 the payment — the real handle token rides the signed session context (see the
 [Paysafe guide](/guide/paysafe#_8-interac-e-transfer-canada)).

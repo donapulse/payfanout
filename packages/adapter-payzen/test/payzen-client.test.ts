@@ -93,6 +93,8 @@ interface FakeElement {
   href?: string;
   src?: string;
   async?: boolean;
+  textContent?: string;
+  style: Record<string, unknown>;
   children: FakeElement[];
   attributes: Record<string, string>;
   onload?: () => void;
@@ -106,6 +108,7 @@ function fakeElement(): FakeElement {
   const el: FakeElement = {
     className: "",
     id: "",
+    style: {},
     children: [],
     attributes: {},
     appendChild(child: FakeElement) {
@@ -158,6 +161,29 @@ runClientAdapterConformanceTests(
       ],
     }).adapter,
   { expectedMethodTypes: ["card", "apple_pay", "paypal"] },
+);
+
+// And so does the hosted-redirect shape — supported redirect flows make the
+// suite demand handleRedirectReturn.
+runClientAdapterConformanceTests(
+  "payzen (hosted bank rails)",
+  () =>
+    makeAdapter(makeFakeKr(), {
+      paymentMethods: [
+        { type: "card", flow: "embedded", supported: true },
+        { type: "sepa_debit", flow: "redirect", supported: true, currencies: ["EUR"] },
+        { type: "ideal", flow: "redirect", supported: true, currencies: ["EUR"], countries: ["NL"] },
+        {
+          type: "bank_redirect_generic",
+          flow: "redirect",
+          supported: true,
+          currencies: ["EUR", "PLN"],
+          countries: ["FR", "ES", "GR", "IT", "PL"],
+        },
+        { type: "voucher_generic", flow: "redirect", supported: true, currencies: ["EUR"], countries: ["PT"] },
+      ],
+    }).adapter,
+  { expectedMethodTypes: ["card", "sepa_debit", "ideal", "bank_redirect_generic", "voucher_generic"] },
 );
 
 afterEach(() => vi.unstubAllGlobals());
@@ -589,6 +615,94 @@ describe("PayZenClientAdapter fetchAvailablePaymentMethods", () => {
     fake.paymentMethodsRejection = { errorCode: "CLIENT_999" };
     const { adapter } = makeAdapter(fake);
     await expect(adapter.fetchAvailablePaymentMethods()).rejects.toMatchObject({ code: "psp_unavailable" });
+  });
+});
+
+describe("PayZenClientAdapter hosted redirect", () => {
+  const PAYMENT_URL = "https://secure.payzen.eu/t/po1fakepayzenorder";
+
+  it("mounts an informational panel for paymentURL sessions without touching krypton", async () => {
+    stubBrowser();
+    let injected = 0;
+    const fake = makeFakeKr();
+    const { adapter } = makeAdapter(fake, {
+      loadScript: async () => {
+        injected++;
+      },
+    });
+    const container = fakeContainer();
+    const changes: boolean[] = [];
+    let ready = false;
+    const handle = await adapter.mount(container, {
+      clientSecret: PAYMENT_URL,
+      fieldOptions: { description: "You will finish this payment at your bank." },
+      appearance: { panel: { marginTop: "8px" } },
+      onChange: (s) => changes.push(s.complete),
+      onReady: () => {
+        ready = true;
+      },
+    });
+    expect(injected).toBe(0); // no krypton for hosted sessions
+    expect(fake.configCalls).toHaveLength(0);
+    const panel = container.children[0]!;
+    expect(panel.attributes["data-payfanout-payzen-panel"]).toBe("");
+    expect(panel.textContent).toBe("You will finish this payment at your bank.");
+    expect(panel.style["marginTop"]).toBe("8px");
+    expect(changes).toEqual([false, true]); // nothing to fill client-side
+    expect(ready).toBe(true);
+    adapter.unmount(handle);
+    expect(panel.remove).toHaveBeenCalled();
+    expect(container.remove).not.toHaveBeenCalled();
+  });
+
+  it("confirm() redirects to the hosted page and never settles", async () => {
+    stubBrowser();
+    const assign = vi.fn();
+    vi.stubGlobal("window", { location: { assign } });
+    const { adapter } = makeAdapter();
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: PAYMENT_URL });
+    let settled = false;
+    void adapter.confirm(handle).finally(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(assign).toHaveBeenCalledWith(PAYMENT_URL);
+    expect(settled).toBe(false); // the navigation unloads the page — nothing to settle
+  });
+
+  it("resolves kr-shaped returns to a UX-grade outcome", async () => {
+    const { adapter } = makeAdapter();
+    const paid = JSON.stringify({ orderStatus: "PAID" });
+    await expect(
+      adapter.handleRedirectReturn({ search: `?kr-answer=${encodeURIComponent(paid)}&kr-hash=abc` }),
+    ).resolves.toEqual({ status: "succeeded" });
+
+    const refused = JSON.stringify({
+      orderStatus: "UNPAID",
+      transactions: [{ uuid: "u1", detailedStatus: "REFUSED", errorCode: "ACQ_001", detailedErrorCode: "51" }],
+    });
+    const result = await adapter.handleRedirectReturn({
+      search: `?kr-answer=${encodeURIComponent(refused)}`,
+    });
+    expect(result?.status).toBe("failed");
+    expect(result?.error?.code).toBe("insufficient_funds");
+  });
+
+  it("resolves classic hosted-page returns as processing — the server confirms", async () => {
+    const { adapter } = makeAdapter();
+    await expect(
+      adapter.handleRedirectReturn({ search: "?vads_trans_status=AUTHORISED&vads_order_id=pf-1" }),
+    ).resolves.toEqual({ status: "processing" });
+    // An unreadable kr-answer is still a PayZen return — never dropped.
+    await expect(adapter.handleRedirectReturn({ search: "?kr-answer=%7Bnot-json" })).resolves.toEqual({
+      status: "processing",
+    });
+  });
+
+  it("returns null for URLs that carry no PayZen return params", async () => {
+    const { adapter } = makeAdapter();
+    await expect(adapter.handleRedirectReturn({ search: "?utm_source=mail&session_id=x" })).resolves.toBeNull();
+    await expect(adapter.handleRedirectReturn({ search: "" })).resolves.toBeNull();
   });
 });
 

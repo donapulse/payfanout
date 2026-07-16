@@ -786,3 +786,56 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   screen out valid payments the day it drifts. No PSP-wide `supportedCountries` exists,
   so there is no coherence rule to add — shape (`/^[A-Z]{2}$/`) is asserted by the
   conformance suite on both halves, mirroring `currencies`.
+
+## PayZen smartForm payment-method selection (2026-07-16)
+
+Multi-method support for the PayZen pair, doc-verified against payzen.io the same day
+(CreatePayment playground, smartForm reference/quick start, JS client reference,
+KR.getPaymentMethods page, error-code tables, currency table):
+
+- **Session-side restriction rides `Charge/CreatePayment.paymentMethods`** — the field
+  shares the kr-payment-method vocabulary (`CARDS`, `APPLE_PAY`, `PAYPAL`, …), an empty/
+  omitted field is PayZen's documented "offer all shop-eligible methods" default (kept
+  for unrestricted sessions), and per the playground field description a single-entry
+  list renders that method's entry page directly. The adapter sends `PAYPAL` in both
+  environments, matching the official request samples (sent against the TEST demo
+  shop); the client-side smart-button table separately lists `PAYPAL_SB` as the
+  TEST-mode selector, and the docs never state which value the REST field expects in
+  TEST — verify PayPal end-to-end in TEST before going live.
+- **Unified mapping covers card/apple_pay/paypal.** Other smartForm methods (Bizum,
+  Alma, meal vouchers) have no unified type: they surface when a session is
+  unrestricted and report as `paymentMethodType: "other"` on reads. Google Pay is not
+  on PayZen's compatible-methods list at all. Read-side normalization of wallet
+  transactions is best-effort: the published vocabulary for the RESPONSE field
+  `Transaction.paymentMethodType` documents CARD but does not enumerate wallet labels,
+  so `PAYPAL`/`APPLE_PAY` map when they appear and anything unknown stays `other` —
+  sandbox verification of the actual wallet labels is pending.
+- **Wallet/APM enablement is a per-shop contract**, invisible to the API config-wise, so
+  both adapters declare a conservative card-only default and take the established
+  `paymentMethods` wholesale config override; `createPaymentSession` validates requests
+  against the declared list so a direct-driven adapter cannot mint sessions the router
+  would have screened out. The client's `fetchAvailablePaymentMethods()` wraps the
+  documented `KR.getPaymentMethods()` for live enablement checks.
+- **The smartForm owns submission.** It renders per-method pay buttons, and while
+  `KR.openPaymentMethod()` can open a chosen method's pop-in, it is documented as
+  incompatible with Apple Pay (which needs the buyer's own gesture) and nothing submits
+  a method programmatically — so in `form: "smartform"`/`"smartform-expanded"` the
+  client adapter's `confirm()` uniformly awaits the buyer's in-form completion instead
+  of driving `KR.submit()`; outcomes that land before `confirm()` are buffered on the
+  handle and consumed by the next call. Wallet/APM flows are declared `flow: "popup"`
+  on the strength of the smartForm's documented promise that the buyer completes
+  without leaving the merchant site.
+- **CLIENT_-prefixed errors are browser-local and pre-transaction** (documented), so on
+  the smartForm the recoverable ones (CLIENT_3xx validation, CLIENT_7xx warnings,
+  CLIENT_101 abandoned 3DS) route to `onError` while the await continues; fatal client
+  errors (bad key/token, CLIENT_5xx, 997–999) and every gateway-side rejection settle
+  it. The embedded form's semantics are unchanged.
+- Doc-sweep refinements landed with the feature: CB refusal codes 34/41 map to
+  `fraud_suspected` and 38 to `expired_card`; `CLIENT_305` ("no formToken defined") is
+  `invalid_request`, and unmapped CLIENT_ codes stop falling into retryable
+  `processing_error`; `detailedStatus: INITIAL` explicitly maps to `processing` in
+  reads and IPN parsing — INITIAL appears in the rendered playground Transaction
+  reference ("temporary… no response received from the acquirer") though the
+  transaction-lifecycle kb page and the machine-readable schema, which both lag the
+  playground, omit it. The 2026 currency table re-check confirmed the shipped list
+  exactly (38 currencies, CNY=1/KHR=0 fractional digits, BHD absent).

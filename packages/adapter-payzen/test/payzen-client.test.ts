@@ -16,10 +16,14 @@ interface FakeKr extends KrLike {
   renderedSelectors: string[];
   submitCalls: number;
   removeFormsCalls: number;
+  validateCalls: number;
   /** When set, validateForm() rejects with this value. */
   validateRejection?: unknown;
   /** When set, submit() misbehaves this way. */
   submitFailure?: { sync?: unknown; async?: unknown };
+  /** KR.getPaymentMethods() outcome: a value to resolve, or a thrower. */
+  paymentMethodsResult?: unknown;
+  paymentMethodsRejection?: unknown;
   formValidCb?: () => void;
   errorCb?: (error: KrErrorLike) => void;
   submitCb?: (response: KrPaymentResponseLike) => boolean;
@@ -31,6 +35,7 @@ function makeFakeKr(): FakeKr {
     renderedSelectors: [],
     submitCalls: 0,
     removeFormsCalls: 0,
+    validateCalls: 0,
     setFormConfig: async (config: Record<string, unknown>) => {
       fake.configCalls.push(config);
     },
@@ -56,18 +61,27 @@ function makeFakeKr(): FakeKr {
       fake.removeFormsCalls++;
     },
     validateForm: async () => {
+      fake.validateCalls++;
       if (fake.validateRejection) throw fake.validateRejection;
+    },
+    getPaymentMethods: async () => {
+      if (fake.paymentMethodsRejection) throw fake.paymentMethodsRejection;
+      return fake.paymentMethodsResult;
     },
   };
   return fake;
 }
 
-function makeAdapter(fake: FakeKr = makeFakeKr()): { adapter: PayZenClientAdapter; fake: FakeKr } {
+function makeAdapter(
+  fake: FakeKr = makeFakeKr(),
+  config: Partial<ConstructorParameters<typeof PayZenClientAdapter>[0]> = {},
+): { adapter: PayZenClientAdapter; fake: FakeKr } {
   const adapter = new PayZenClientAdapter({
     publicKey: PUBLIC_KEY,
     environment: "sandbox",
     getKrGlobal: () => fake,
     loadScript: async () => {},
+    ...config,
   });
   return { adapter, fake };
 }
@@ -130,6 +144,21 @@ function fakeContainer(): HTMLElement & { children: FakeElement[] } {
 runClientAdapterConformanceTests("payzen", () => makeAdapter().adapter, {
   expectedMethodTypes: ["card"],
 });
+
+// The smartForm shape passes the same client contract with wallets enabled.
+runClientAdapterConformanceTests(
+  "payzen (smartform)",
+  () =>
+    makeAdapter(makeFakeKr(), {
+      form: "smartform",
+      paymentMethods: [
+        { type: "card", flow: "embedded", supported: true },
+        { type: "apple_pay", flow: "popup", supported: true },
+        { type: "paypal", flow: "popup", supported: true },
+      ],
+    }).adapter,
+  { expectedMethodTypes: ["card", "apple_pay", "paypal"] },
+);
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -402,6 +431,167 @@ describe("PayZenClientAdapter confirm", () => {
   });
 });
 
+describe("PayZenClientAdapter smartform", () => {
+  const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  async function mountedSmart(
+    form: "smartform" | "smartform-expanded" = "smartform",
+    fake: FakeKr = makeFakeKr(),
+  ): Promise<{
+    adapter: PayZenClientAdapter;
+    fake: FakeKr;
+    handle: Awaited<ReturnType<PayZenClientAdapter["mount"]>>;
+    container: ReturnType<typeof fakeContainer>;
+    errors: unknown[];
+  }> {
+    stubBrowser();
+    const { adapter } = makeAdapter(fake, { form });
+    const container = fakeContainer();
+    const errors: unknown[] = [];
+    const handle = await adapter.mount(container, {
+      clientSecret: FORM_TOKEN,
+      onError: (e) => errors.push(e),
+    });
+    return { adapter, fake, handle, container, errors };
+  }
+
+  it("renders an empty kr-smart-form element inside the selector wrapper", async () => {
+    const { fake, container } = await mountedSmart();
+    const wrapper = container.children[0]!;
+    expect(wrapper.className).toBe(""); // the selector wrapper carries only the id
+    expect(wrapper.children).toHaveLength(1);
+    const smart = wrapper.children[0]!;
+    expect(smart.className).toBe("kr-smart-form");
+    expect(smart.children).toHaveLength(0); // the library renders the whole surface, buttons included
+    expect(smart.attributes).not.toHaveProperty("kr-card-form-expanded");
+    expect(fake.renderedSelectors[0]).toBe(`#${wrapper.id}`);
+    expect(fake.configCalls[0]).toMatchObject({
+      formToken: FORM_TOKEN,
+      "kr-public-key": PUBLIC_KEY,
+      "kr-spa-mode": true,
+    });
+  });
+
+  it("pre-expands the card form in smartform-expanded mode", async () => {
+    const { container } = await mountedSmart("smartform-expanded");
+    const smart = container.children[0]!.children[0]!;
+    expect(smart.attributes["kr-card-form-expanded"]).toBe("");
+  });
+
+  it("confirm() awaits the buyer's in-form completion without driving KR.submit", async () => {
+    const { adapter, fake, handle } = await mountedSmart();
+    const pending = adapter.confirm(handle);
+    await flush();
+    expect(fake.submitCalls).toBe(0); // the form owns its pay buttons
+    expect(fake.validateCalls).toBe(0); // local card validation belongs to the form too
+    fake.submitCb?.({ clientAnswer: { orderStatus: "PAID" } });
+    await expect(pending).resolves.toEqual({ status: "succeeded" });
+  });
+
+  it("buffers an outcome that lands before confirm() and hands it to the next call, once", async () => {
+    const { adapter, fake, handle } = await mountedSmart();
+    expect(fake.submitCb?.({ clientAnswer: { orderStatus: "PAID" } })).toBe(false); // still never POSTs
+    await expect(adapter.confirm(handle)).resolves.toEqual({ status: "succeeded" });
+    // Consumed — the next confirm() awaits a NEW outcome instead of replaying.
+    const second = adapter.confirm(handle);
+    await flush();
+    fake.submitCb?.({ clientAnswer: { orderStatus: "RUNNING" } });
+    await expect(second).resolves.toEqual({ status: "processing" });
+  });
+
+  it("keeps awaiting through recoverable browser-side errors, which flow to options.onError", async () => {
+    const { adapter, fake, handle, errors } = await mountedSmart();
+    const pending = adapter.confirm(handle);
+    await flush();
+    fake.errorCb?.({ errorCode: "CLIENT_301", errorMessage: "invalid card number" }); // local validation
+    fake.errorCb?.({ errorCode: "CLIENT_101", errorMessage: "aborted" }); // closed 3DS pop-in — the form recovers
+    fake.errorCb?.({ errorCode: "CLIENT_704", errorMessage: "load Font Awesome" }); // integration warning
+    expect(errors).toHaveLength(3);
+    fake.submitCb?.({ clientAnswer: { orderStatus: "PAID" } }); // the buyer retried and succeeded
+    await expect(pending).resolves.toEqual({ status: "succeeded" });
+  });
+
+  it("settles the await on gateway-side rejections and on fatal client errors", async () => {
+    const refused = await mountedSmart();
+    const pendingRefused = refused.adapter.confirm(refused.handle);
+    await flush();
+    refused.fake.errorCb?.({ errorCode: "ACQ_001", detailedErrorCode: "51" });
+    expect((await pendingRefused).error?.code).toBe("insufficient_funds");
+
+    const fatal = await mountedSmart();
+    const pendingFatal = fatal.adapter.confirm(fatal.handle);
+    await flush();
+    fatal.fake.errorCb?.({ errorCode: "CLIENT_999" }); // unusable form — awaiting would hang forever
+    expect((await pendingFatal).error?.code).toBe("psp_unavailable");
+
+    // CLIENT_305 ("no formToken defined") sits INSIDE the recoverable 3xx
+    // range numerically but is fatal — the regression trap for the range check.
+    const noToken = await mountedSmart();
+    const pendingNoToken = noToken.adapter.confirm(noToken.handle);
+    await flush();
+    noToken.fake.errorCb?.({ errorCode: "CLIENT_305" });
+    expect((await pendingNoToken).error?.code).toBe("invalid_request");
+  });
+
+  it("unmount settles a pending smartform await as failed", async () => {
+    const { adapter, handle } = await mountedSmart();
+    const pending = adapter.confirm(handle);
+    await flush();
+    adapter.unmount(handle);
+    const result = await pending;
+    expect(result.status).toBe("failed");
+    expect(result.error?.message).toMatch(/unmounted during confirmation/);
+  });
+});
+
+describe("PayZenClientAdapter fetchAvailablePaymentMethods", () => {
+  it("maps the shop's live method codes onto unified types, raw lists preserved", async () => {
+    stubBrowser();
+    const fake = makeFakeKr();
+    fake.paymentMethodsResult = {
+      paymentMethods: ["PAYPAL", "CARDS", "APPLE_PAY", "ALMA_3X"],
+      cardBrands: ["VISA", "MASTERCARD"],
+    };
+    const { adapter } = makeAdapter(fake);
+    await expect(adapter.fetchAvailablePaymentMethods()).resolves.toEqual({
+      types: ["paypal", "card", "apple_pay"], // ALMA_3X has no unified type — raw only
+      methods: ["PAYPAL", "CARDS", "APPLE_PAY", "ALMA_3X"],
+      cardBrands: ["VISA", "MASTERCARD"],
+    });
+  });
+
+  it("tolerates missing fields and dedupes the sandbox wallet alias", async () => {
+    stubBrowser();
+    const fake = makeFakeKr();
+    fake.paymentMethodsResult = { paymentMethods: ["PAYPAL", "PAYPAL_SB"] };
+    const { adapter } = makeAdapter(fake);
+    await expect(adapter.fetchAvailablePaymentMethods()).resolves.toEqual({
+      types: ["paypal"],
+      methods: ["PAYPAL", "PAYPAL_SB"],
+      cardBrands: [],
+    });
+  });
+
+  it("reports an SDK build without KR.getPaymentMethods as psp_unavailable", async () => {
+    stubBrowser();
+    const fake = makeFakeKr();
+    delete (fake as Partial<KrLike>).getPaymentMethods;
+    const { adapter } = makeAdapter(fake);
+    await expect(adapter.fetchAvailablePaymentMethods()).rejects.toMatchObject({
+      code: "psp_unavailable",
+      retryable: false,
+    });
+  });
+
+  it("maps KR rejections onto the taxonomy", async () => {
+    stubBrowser();
+    const fake = makeFakeKr();
+    fake.paymentMethodsRejection = { errorCode: "CLIENT_999" };
+    const { adapter } = makeAdapter(fake);
+    await expect(adapter.fetchAvailablePaymentMethods()).rejects.toMatchObject({ code: "psp_unavailable" });
+  });
+});
+
 describe("PayZenClientAdapter error mapping", () => {
   async function mountedWithErrors(): Promise<{ fake: FakeKr; errors: Array<{ code: string; retryable: boolean }> }> {
     stubBrowser();
@@ -421,12 +611,18 @@ describe("PayZenClientAdapter error mapping", () => {
       [{ errorCode: "CLIENT_301" }, "invalid_card_data", false],
       [{ errorCode: "CLIENT_101" }, "authentication_required", false], // closed 3DS pop-in
       [{ errorCode: "CLIENT_100" }, "invalid_request", false], // expired/invalid formToken
+      [{ errorCode: "CLIENT_305" }, "invalid_request", false], // no formToken defined — integration, not card data
       [{ errorCode: "CLIENT_502" }, "invalid_request", false], // integration errors
+      [{ errorCode: "CLIENT_505" }, "invalid_request", false], // smartForm rejects the current theme
+      [{ errorCode: "CLIENT_704" }, "invalid_request", false], // integration warnings — retrying cannot help
       [{ errorCode: "CLIENT_997" }, "invalid_request", false], // formToken from a sister platform's endpoint
       [{ errorCode: "CLIENT_999" }, "psp_unavailable", true],
       [{ errorCode: "PSP_108" }, "session_expired", false], // formToken expiry recovers via a new session
       [{ errorCode: "ACQ_001", detailedErrorCode: "54" }, "expired_card", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "38" }, "expired_card", false],
       [{ errorCode: "ACQ_001", detailedErrorCode: "59" }, "fraud_suspected", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "34" }, "fraud_suspected", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "41" }, "fraud_suspected", false],
       [{ errorCode: "ACQ_001", detailedErrorCode: "1A" }, "authentication_required", false],
       [{ errorCode: "AUTH_149" }, "authentication_required", false],
       [{ errorCode: "SOMETHING_ELSE" }, "processing_error", true], // shopper may safely retry

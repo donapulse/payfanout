@@ -115,6 +115,7 @@ const PROCESSING_STATUSES = new Set([
   "WAITING_AUTHORISATION",
   "WAITING_FOR_PAYMENT",
   "UNDER_VERIFICATION",
+  "INITIAL", // temporary — no acquirer response yet
 ]);
 
 /**

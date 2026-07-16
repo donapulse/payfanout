@@ -226,7 +226,7 @@ Worth knowing:
 - Apple Pay works in production only in Safari on Apple devices; TEST mode simulates
   it on other browsers.
 
-## 7. Pay by bank — SEPA and the other bank rails (hosted redirect)
+## 7. Pay by bank: SEPA and the other bank rails (hosted redirect)
 
 PayZen's bank rails live on its **hosted payment page**, not in the embedded/smartForm
 surface. The adapter reaches them through a payment order (`Charge/CreatePaymentOrder`,

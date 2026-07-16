@@ -307,9 +307,10 @@ placeholders + a two-column slot grid on Paysafe + a fully custom gradient butto
 
 PSPs come with inverted flows, and the abstraction models both as first-class:
 
-- **Confirm-on-client (Stripe, PayZen):** server creates the payment session → client
-  mounts with `clientSecret` → `confirm()` finalizes (incl. inline 3DS). Done, the server
-  never touches confirmation, and `completePayment` is rejected for such PSPs.
+- **Confirm-on-client (Stripe, PayZen; GoCardless via its hosted redirect):** server
+  creates the payment session → client mounts with `clientSecret` → `confirm()` finalizes
+  (incl. inline 3DS). Done, the server never touches confirmation, and `completePayment`
+  is rejected for such PSPs.
 - **Tokenize-first (Paysafe, PayPal, Worldline):** the client tokenizes first (`confirm()`
   resolves `requires_confirmation` + `clientToken`), then the **server** finalizes via
   `completePayment`. `<PayButton>` branches automatically through your
@@ -342,9 +343,10 @@ const { phase, result } = useRedirectReturn({ onResult: showOutcome });
 
 Implemented for Stripe (`payment_intent_client_secret` params → real intent status,
 not the `redirect_status` hint), GoCardless (hosted bank authorisation), and PayZen
-(hosted-page bank rails). Paysafe wires the same probe, but its redirect methods stay
-capability-off until an account with them enabled lets us verify the return params (see
-docs/future-designs.md).
+(hosted-page bank rails). Paysafe wires the same probe: Interac e-Transfer ships
+end-to-end (enable it on the account), while its other redirect methods (Skrill,
+Neteller, vouchers) stay capability-off until an account with them enabled lets us
+verify the return params (see docs/future-designs.md).
 
 ## Webhooks
 

@@ -12,12 +12,19 @@ import {
   utf8ToBase64,
   withTransportRetries,
   type AdapterCapabilities,
+  type CancelNativeSubscriptionInput,
   type ChargeSavedPaymentMethodInput,
   type CompletePaymentInput,
   type CreateCustomerInput,
+  type CreateNativeSubscriptionInput,
   type CreatePaymentSessionInput,
   type CustomerRef,
+  type ListNativeSubscriptionsInput,
+  type ListNativeSubscriptionsResult,
   type MinorUnitAmount,
+  type NativeSubscriptionInterval,
+  type NativeSubscriptionRecord,
+  type NativeSubscriptionStatus,
   type PaymentInfo,
   type PaymentMethodCapability,
   type PaymentMethodDetails,
@@ -25,6 +32,7 @@ import {
   type RefundInfo,
   type RefundRequest,
   type RefundResult,
+  type RetrieveNativeSubscriptionInput,
   type SavedPaymentMethod,
   type SavePaymentMethodInput,
   type ServerPaymentAdapter,
@@ -172,6 +180,58 @@ export interface PaysafeStoredHandleLike {
   usage?: string;
   paymentType?: string;
   card?: PaysafeCardLike;
+}
+
+/**
+ * Plan as the Payment Scheduler API (subscriptionsplans/v1) reports it.
+ * `amount` is integer minor units, exactly like the Payments API; the cadence
+ * lives in billingCycle (frequency DAILY/MONTHLY/YEARLY, interval 1-365,
+ * numberOfCycles 0 = infinite).
+ */
+export interface PaysafePlanLike {
+  id?: string;
+  name?: string;
+  amount?: number;
+  currencyCode?: string;
+  billingCycle?: { frequency?: string; interval?: number; numberOfCycles?: number };
+  status?: string;
+}
+
+/** One scheduled charge as paymentsInformation.nextPayment/previousPayment report it. */
+export interface PaysafeScheduledPaymentLike {
+  id?: string;
+  amount?: number;
+  scheduledTime?: string;
+}
+
+/**
+ * Subscription as the Payment Scheduler API reports it. amount/currency ride
+ * the nested plan (the subscription itself carries neither); plan,
+ * customerProfile, and paymentsInformation are requestable sub-components.
+ */
+export interface PaysafeSubscriptionLike {
+  id: string;
+  merchantRefNum?: string;
+  accountId?: string;
+  /** The MULTI_USE token the scheduler charges each installment against. */
+  paymentHandleToken?: string;
+  status?: string;
+  startTime?: string;
+  creationTime?: string;
+  paymentType?: string;
+  plan?: PaysafePlanLike;
+  customerProfile?: {
+    id?: string;
+    firstName?: string;
+    lastName?: string;
+    email?: string;
+    phone?: string;
+    locale?: string;
+  };
+  paymentsInformation?: {
+    nextPayment?: PaysafeScheduledPaymentLike;
+    previousPayment?: PaysafeScheduledPaymentLike;
+  };
 }
 
 function toStoredMethod(
@@ -465,6 +525,118 @@ function parseBankEnvelope(
 }
 
 /**
+ * Payment Scheduler path prefix. The scheduler lives beside the Payments API
+ * on the same hosts (api.test.paysafe.com / api.paysafe.com) under its own
+ * version root, and authenticates with the same Basic server-to-server API
+ * key — the docs' "Back Office" is where that key is retrieved, not a
+ * separate credential.
+ */
+const SCHEDULER_BASE = "/subscriptionsplans/v1";
+
+/**
+ * plan/customerProfile/paymentsInformation are requestable sub-components
+ * (`fields`) and the spec never promises them by default — requested
+ * explicitly on every read so amount/currency/period facts cannot silently
+ * vanish behind a provider-side default.
+ */
+const SUBSCRIPTION_FIELDS = "fields=plan,customerProfile,paymentsInformation";
+
+/** GET /subscriptions paging bounds per the scheduler spec: default 10, max 50. */
+const SUBSCRIPTION_LIST_DEFAULT_LIMIT = 10;
+const SUBSCRIPTION_LIST_MAX_LIMIT = 50;
+
+/**
+ * The scheduler bills DAILY/MONTHLY/YEARLY only — WEEKLY does not exist, so
+ * interval "week" (like any RRULE schedule) is rejected, never approximated.
+ */
+const INTERVAL_TO_FREQUENCY: Partial<Record<NativeSubscriptionInterval, string>> = {
+  day: "DAILY",
+  month: "MONTHLY",
+  year: "YEARLY",
+};
+
+const FREQUENCY_TO_INTERVAL: Record<string, NativeSubscriptionInterval> = {
+  DAILY: "day",
+  MONTHLY: "month",
+  YEARLY: "year",
+};
+
+/**
+ * Wire statuses -> unified: ACTIVE -> active, CANCELLED (double L, final) ->
+ * canceled, SUSPENDED (reversible, no charges while suspended) -> paused,
+ * COMPLETED (a finite schedule ran all its cycles) -> completed. Anything new
+ * on the wire stays "unknown" — never dropped, never guessed.
+ */
+const SUBSCRIPTION_STATUS_MAP: Record<string, NativeSubscriptionStatus> = {
+  ACTIVE: "active",
+  CANCELLED: "canceled",
+  SUSPENDED: "paused",
+  COMPLETED: "completed",
+};
+
+function mapSubscriptionStatus(status: string | undefined): NativeSubscriptionStatus {
+  return SUBSCRIPTION_STATUS_MAP[(status ?? "").toUpperCase()] ?? "unknown";
+}
+
+/** The scheduler cadence a create input resolves to: plan billingCycle terms. */
+interface SchedulerCadence {
+  frequency: string;
+  interval: number;
+}
+
+function toSchedulerCadence(input: CreateNativeSubscriptionInput): SchedulerCadence {
+  if (input.schedule !== undefined) {
+    throw PayFanoutError.invalidRequest(
+      "Paysafe's Payment Scheduler accepts no RRULE schedule — express the cadence as interval day/month/year",
+    );
+  }
+  if (!input.interval) {
+    throw PayFanoutError.invalidRequest(
+      "createNativeSubscription requires a billing interval (day, month, or year)",
+    );
+  }
+  const frequency = INTERVAL_TO_FREQUENCY[input.interval];
+  if (!frequency) {
+    throw PayFanoutError.invalidRequest(
+      `Paysafe's Payment Scheduler bills daily, monthly, or yearly — interval "${input.interval}" cannot be expressed faithfully`,
+    );
+  }
+  const interval = input.intervalCount ?? 1;
+  if (!Number.isInteger(interval) || interval < 1 || interval > 365) {
+    throw PayFanoutError.invalidRequest(
+      `intervalCount must be an integer between 1 and 365 for Paysafe, got: ${String(input.intervalCount)}`,
+    );
+  }
+  return { frequency, interval };
+}
+
+function resolveSubscriptionListLimit(limit: number | undefined): number {
+  if (limit === undefined) return SUBSCRIPTION_LIST_DEFAULT_LIMIT;
+  if (!Number.isInteger(limit) || limit < 1) {
+    throw PayFanoutError.invalidRequest(
+      `listNativeSubscriptions limit must be a positive integer, got: ${String(limit)}`,
+    );
+  }
+  // The PSP's own maximum wins — an oversized hint is clamped, not rejected.
+  return Math.min(limit, SUBSCRIPTION_LIST_MAX_LIMIT);
+}
+
+/** The scheduler pages by offset; the opaque cursor is the next offset as a string. */
+function parseSubscriptionCursor(cursor: string | undefined): number {
+  if (cursor === undefined) return 0;
+  if (!/^\d{1,9}$/.test(cursor)) {
+    throw PayFanoutError.invalidRequest(
+      `listNativeSubscriptions cursor is not one this adapter issued: ${cursor}`,
+    );
+  }
+  return Number(cursor);
+}
+
+function isIsoParseable(value: string | undefined): value is string {
+  return typeof value === "string" && !Number.isNaN(Date.parse(value));
+}
+
+/**
  * SEPA/BACS document a "create a customer profile" step; the profile data is
  * embedded in the handle request instead of a separate /customers call —
  * PayFanout is stateless, and Paysafe's public pages stop at the flow
@@ -537,6 +709,11 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       supportsSessionUpdate: true, // stateless re-issue: verify -> merge -> re-sign
       supportsEventPolling: false, // Paysafe exposes no public events-list API
       supportsListing: false, // /payments and /settlements query by merchantRefNum only
+      // Payment Scheduler (subscriptionsplans/v1): the full surface — paged
+      // list, retrieve, server-only create against a MULTI_USE token, and
+      // cancel — behind the same Basic API key as the Payments API, so no
+      // extra credential gates the flags.
+      nativeSubscriptions: { list: true, retrieve: true, create: true, cancel: true },
       requiresServerCompletion: true, // tokenize-first (§4a): the client alone cannot finalize
       paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };
@@ -1165,6 +1342,293 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     return customer.paymentHandles ?? [];
   }
 
+  // --- PSP-native subscriptions (Payment Scheduler) ------
+
+  /**
+   * Pages the Payment Scheduler's subscriptions as unified records. The
+   * scheduler paginates by offset (limit default 10, max 50); the opaque
+   * cursor is the next offset. A full page always yields a nextCursor — the
+   * follow-up page comes back empty with none — because the spec does not pin
+   * whether meta.numberOfRecords counts the total or the page, and a wrong
+   * guess would either drop records or never terminate.
+   */
+  async listNativeSubscriptions(
+    input?: ListNativeSubscriptionsInput,
+  ): Promise<ListNativeSubscriptionsResult> {
+    const limit = resolveSubscriptionListLimit(input?.limit);
+    const offset = parseSubscriptionCursor(input?.cursor);
+    const result = await this.request<{ subscriptions?: PaysafeSubscriptionLike[] }>(
+      "GET",
+      `${SCHEDULER_BASE}/subscriptions?limit=${limit}&offset=${offset}&${SUBSCRIPTION_FIELDS}`,
+    );
+    const records = result.subscriptions ?? [];
+    return {
+      subscriptions: records.map((s) => this.toNativeSubscription(s)),
+      ...(records.length === limit ? { nextCursor: String(offset + records.length) } : {}),
+    };
+  }
+
+  /** GET /subscriptions/{id}. Paysafe keys by id alone — savedPaymentMethodToken is not needed. */
+  async retrieveNativeSubscription(
+    input: RetrieveNativeSubscriptionInput,
+  ): Promise<NativeSubscriptionRecord> {
+    if (!input.subscriptionId) {
+      throw PayFanoutError.invalidRequest("retrieveNativeSubscription requires subscriptionId");
+    }
+    return this.toNativeSubscription(await this.fetchSubscription(input.subscriptionId));
+  }
+
+  /**
+   * Creates a subscription the scheduler bills itself, against an
+   * already-vaulted MULTI_USE token (savePaymentMethod's output — a
+   * single-use Paysafe.js token is rejected by the scheduler). Subscriptions
+   * attach to a PLAN: pass `planId` to bill from a host-managed plan (the
+   * input amount/currency/cadence must match it — the adapter verifies and
+   * rejects a mismatch rather than silently billing something else), or omit
+   * it and the adapter creates a dedicated open-ended plan
+   * (numberOfCycles 0 = infinite) from the input inline.
+   *
+   * Idempotency: `merchantRefNum` is the scheduler's dedupe field ("unique
+   * for this accountId") and doubles as the lookup key, so input.merchantRefNum
+   * wins when supplied — passing it transfers the idempotency duty to it —
+   * and idempotencyKey fills it otherwise. A replayed create recovers the
+   * existing subscription by that refNum instead of failing. The inline PLAN
+   * has no refNum channel, so a transport-retried creation can leave an
+   * orphan plan behind; the subscription itself stays exactly-once, so no
+   * double billing can result.
+   *
+   * `pspCustomerId` and `metadata` have no scheduler channel and are
+   * withheld: the customer profile derives from the vaulted token, and the
+   * subscription object carries no metadata field.
+   */
+  async createNativeSubscription(
+    input: CreateNativeSubscriptionInput,
+  ): Promise<NativeSubscriptionRecord> {
+    assertMinorUnitAmount(input.amount, "amount");
+    if (input.amount < 1) {
+      throw PayFanoutError.invalidRequest("Paysafe subscription installments must be at least 1 minor unit");
+    }
+    const currency = normalizeCurrency(input.currency);
+    if (!input.savedPaymentMethodToken) {
+      throw PayFanoutError.invalidRequest(
+        "createNativeSubscription requires savedPaymentMethodToken — the MULTI_USE token savePaymentMethod returned",
+      );
+    }
+    const cadence = toSchedulerCadence(input);
+    const merchantRefNum = input.merchantRefNum ?? input.idempotencyKey;
+    const accountId = this.config.merchantAccountResolver(currency, undefined) || undefined;
+    const plan = input.planId
+      ? await this.validatedPlan(input.planId, input.amount, currency, cadence)
+      : await this.request<PaysafePlanLike>("POST", `${SCHEDULER_BASE}/plans`, {
+          // Plan names are 4-50 chars; the refNum keeps the plan traceable to
+          // its subscription in the Paysafe portal.
+          name: `payfanout-${merchantRefNum}`.slice(0, 50),
+          amount: input.amount,
+          currencyCode: currency,
+          billingCycle: {
+            frequency: cadence.frequency,
+            interval: cadence.interval,
+            numberOfCycles: 0,
+          },
+          // Subscriptions attach to ACTIVE plans only (plans default INITIAL).
+          status: "ACTIVE",
+        });
+    const planId = input.planId ?? plan.id;
+    if (!planId) {
+      throw new PayFanoutError({
+        code: "processing_error",
+        message: "Paysafe returned a subscription plan without an id",
+        retryable: false,
+        raw: plan,
+        pspName: this.pspName,
+      });
+    }
+    try {
+      const created = await this.request<PaysafeSubscriptionLike>(
+        "POST",
+        `${SCHEDULER_BASE}/plans/${encodeURIComponent(planId)}/subscriptions`,
+        {
+          merchantRefNum,
+          paymentHandleToken: input.savedPaymentMethodToken,
+          status: "ACTIVE",
+          ...(accountId ? { accountId } : {}),
+          // The scheduler bills from "now" when startTime is omitted and
+          // rejects instants in the past.
+          ...(input.startAt ? { startTime: input.startAt } : {}),
+        },
+      );
+      return this.toNativeSubscription(created, plan);
+    } catch (err) {
+      if (!(err instanceof PayFanoutError)) throw err;
+      // merchantRefNum is "unique for this accountId": whatever shape the
+      // rejection takes, an existing subscription under this refNum means the
+      // create already happened — return it instead of failing the replay.
+      const existing = await this.findSubscriptionByRefNum(merchantRefNum);
+      if (existing) return this.toNativeSubscription(existing, plan);
+      throw err;
+    }
+  }
+
+  /**
+   * PATCH /subscriptions/{id} to CANCELLED — the FINAL status ("cannot be
+   * re-activated"); SUSPENDED is the reversible pause and is deliberately not
+   * used here. Verified-idempotent: the scheduler does not document patching
+   * an already-terminal subscription, so on any rejection the adapter
+   * re-fetches and treats CANCELLED/COMPLETED as success — billing that is
+   * already stopped can never fail a replayed cancel. The PATCH carries no
+   * merchantRefNum (the scheduler has none there); replay safety comes from
+   * CANCELLED being absorbing plus that re-fetch, which is why the required
+   * idempotencyKey has no wire mapping on this call.
+   */
+  async cancelNativeSubscription(
+    input: CancelNativeSubscriptionInput,
+  ): Promise<NativeSubscriptionRecord> {
+    if (!input.subscriptionId) {
+      throw PayFanoutError.invalidRequest("cancelNativeSubscription requires subscriptionId");
+    }
+    try {
+      const patched = await this.request<PaysafeSubscriptionLike>(
+        "PATCH",
+        `${SCHEDULER_BASE}/subscriptions/${encodeURIComponent(input.subscriptionId)}`,
+        { status: "CANCELLED" },
+      );
+      if (patched.plan) return this.toNativeSubscription(patched);
+      // PATCH takes no `fields`, so its response is not guaranteed to carry
+      // the plan sub-component — re-read so the canceled record still reports
+      // its money facts, and fall back to the PATCH echo if that read fails
+      // (the cancellation itself already succeeded).
+      try {
+        return this.toNativeSubscription(await this.fetchSubscription(input.subscriptionId));
+      } catch {
+        return this.toNativeSubscription(patched);
+      }
+    } catch (err) {
+      if (!(err instanceof PayFanoutError)) throw err;
+      let current: PaysafeSubscriptionLike;
+      try {
+        current = await this.fetchSubscription(input.subscriptionId);
+      } catch {
+        // The re-fetch failing adds nothing — the PATCH rejection is the fact.
+        throw err;
+      }
+      const record = this.toNativeSubscription(current);
+      if (record.status === "canceled" || record.status === "completed") return record;
+      throw err;
+    }
+  }
+
+  private fetchSubscription(subscriptionId: string): Promise<PaysafeSubscriptionLike> {
+    return this.request<PaysafeSubscriptionLike>(
+      "GET",
+      `${SCHEDULER_BASE}/subscriptions/${encodeURIComponent(subscriptionId)}?${SUBSCRIPTION_FIELDS}`,
+    );
+  }
+
+  /**
+   * The create-with-planId guard: the host stated an amount/currency/cadence,
+   * and the plan is what actually bills — a mismatch must reject before a
+   * subscription exists, never bill silently different terms.
+   */
+  private async validatedPlan(
+    planId: string,
+    amount: MinorUnitAmount,
+    currency: string,
+    cadence: SchedulerCadence,
+  ): Promise<PaysafePlanLike> {
+    const plan = await this.request<PaysafePlanLike>(
+      "GET",
+      `${SCHEDULER_BASE}/plans/${encodeURIComponent(planId)}`,
+    );
+    const mismatches: string[] = [];
+    if (plan.amount !== amount) {
+      mismatches.push(`amount (plan bills ${String(plan.amount)}, input says ${amount})`);
+    }
+    if ((plan.currencyCode ?? "").toUpperCase() !== currency) {
+      mismatches.push(`currency (plan bills ${String(plan.currencyCode)}, input says ${currency})`);
+    }
+    const planFrequency = (plan.billingCycle?.frequency ?? "").toUpperCase();
+    const planInterval = plan.billingCycle?.interval ?? 1;
+    if (planFrequency !== cadence.frequency || planInterval !== cadence.interval) {
+      mismatches.push(
+        `cadence (plan bills every ${planInterval} ${planFrequency || "unknown"}, input says every ${cadence.interval} ${cadence.frequency})`,
+      );
+    }
+    if (mismatches.length > 0) {
+      throw PayFanoutError.invalidRequest(
+        `Plan ${planId} does not match the requested subscription: ${mismatches.join("; ")}`,
+        plan,
+      );
+    }
+    return plan;
+  }
+
+  /** Replay recovery: the scheduler's list endpoint looks subscriptions up by refNum. */
+  private async findSubscriptionByRefNum(
+    merchantRefNum: string,
+  ): Promise<PaysafeSubscriptionLike | undefined> {
+    try {
+      const result = await this.request<{ subscriptions?: PaysafeSubscriptionLike[] }>(
+        "GET",
+        `${SCHEDULER_BASE}/subscriptions?merchantRefNum=${encodeURIComponent(merchantRefNum)}&${SUBSCRIPTION_FIELDS}`,
+      );
+      const matches = result.subscriptions ?? [];
+      return matches.length === 1 ? matches[0] : undefined;
+    } catch {
+      // Recovery is best-effort; the caller rethrows the original rejection.
+      return undefined;
+    }
+  }
+
+  /**
+   * amount/currency come from the nested plan — the scheduler's own statement
+   * of the next charge wins where present, since it reflects
+   * discount/quantity adjustments the plan amount does not. The period bounds
+   * are the previous and next scheduled charges.
+   */
+  private toNativeSubscription(
+    sub: PaysafeSubscriptionLike,
+    fallbackPlan?: PaysafePlanLike,
+  ): NativeSubscriptionRecord {
+    const plan = sub.plan ?? fallbackPlan;
+    const interval = FREQUENCY_TO_INTERVAL[(plan?.billingCycle?.frequency ?? "").toUpperCase()];
+    const planInterval = plan?.billingCycle?.interval;
+    const intervalCount =
+      typeof planInterval === "number" && Number.isInteger(planInterval) && planInterval >= 1
+        ? planInterval
+        : undefined;
+    const nextPayment = sub.paymentsInformation?.nextPayment;
+    const previousPayment = sub.paymentsInformation?.previousPayment;
+    const periodStart = previousPayment?.scheduledTime;
+    const periodEnd = nextPayment?.scheduledTime;
+    const profile = sub.customerProfile;
+    const customer = {
+      ...(profile?.email ? { email: profile.email } : {}),
+      ...(profile?.firstName ? { firstName: profile.firstName } : {}),
+      ...(profile?.lastName ? { lastName: profile.lastName } : {}),
+      ...(profile?.phone ? { phone: profile.phone } : {}),
+      ...(profile?.locale ? { locale: profile.locale } : {}),
+    };
+    return {
+      id: sub.id,
+      pspName: this.pspName,
+      status: mapSubscriptionStatus(sub.status),
+      amount: nextPayment?.amount ?? plan?.amount ?? 0,
+      currency: (plan?.currencyCode ?? "").toUpperCase() || "USD",
+      // An unrecognized frequency yields NO interval (absent = "no faithful
+      // projection"), and intervalCount only rides along with one.
+      ...(interval ? { interval } : {}),
+      ...(interval && intervalCount !== undefined ? { intervalCount } : {}),
+      ...(isIsoParseable(periodStart) ? { currentPeriodStart: periodStart } : {}),
+      ...(isIsoParseable(periodEnd) ? { currentPeriodEnd: periodEnd } : {}),
+      ...(sub.paymentHandleToken ? { savedPaymentMethodToken: sub.paymentHandleToken } : {}),
+      ...(profile?.id ? { pspCustomerId: profile.id } : {}),
+      ...(Object.keys(customer).length > 0 ? { customer } : {}),
+      ...(sub.merchantRefNum ? { merchantRefNum: sub.merchantRefNum } : {}),
+      ...(plan?.id ? { planId: plan.id } : {}),
+      raw: sub,
+    };
+  }
+
   /**
    * "Test connection" probe: one side-effect-free read against the Customer
    * Vault — look up an all-but-certainly-absent profile. This endpoint is an
@@ -1287,14 +1751,18 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * core's isTransportRetryable deliberately ignores `error.retryable` (3406,
    * unbatched settlement, is retryable *hours* later, not milliseconds).
    */
-  private request<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
+  private request<T>(method: "GET" | "POST" | "PATCH" | "DELETE", path: string, body?: unknown): Promise<T> {
     return withTransportRetries(() => this.requestOnce<T>(method, path, body), {
       attempts: 1 + (this.config.maxNetworkRetries ?? 2),
       sleep: this.config.sleep,
     });
   }
 
-  private async requestOnce<T>(method: "GET" | "POST" | "DELETE", path: string, body?: unknown): Promise<T> {
+  private async requestOnce<T>(
+    method: "GET" | "POST" | "PATCH" | "DELETE",
+    path: string,
+    body?: unknown,
+  ): Promise<T> {
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
     const { response, text } = await requestWithTimeout(
       {

@@ -6,8 +6,11 @@ export {
   type PaysafeCardLike,
   type PaysafePaymentHandleLike,
   type PaysafePaymentLike,
+  type PaysafePlanLike,
+  type PaysafeScheduledPaymentLike,
   type PaysafeServerAdapterConfig,
   type PaysafeStoredHandleLike,
+  type PaysafeSubscriptionLike,
 } from "./adapter.js";
 export {
   decodeSessionContext,

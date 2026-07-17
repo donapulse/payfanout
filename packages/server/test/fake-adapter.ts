@@ -1,22 +1,28 @@
 import type {
   AdapterCapabilities,
+  CancelNativeSubscriptionInput,
   ChargeSavedPaymentMethodInput,
   CompletePaymentInput,
   CreateCustomerInput,
+  CreateNativeSubscriptionInput,
   CreatePaymentSessionInput,
   CustomerRef,
   FetchEventsInput,
   FetchEventsResult,
+  ListNativeSubscriptionsInput,
+  ListNativeSubscriptionsResult,
   ListPaymentsInput,
   ListPaymentsResult,
   ListRefundsInput,
   ListRefundsResult,
   MinorUnitAmount,
+  NativeSubscriptionRecord,
   PaymentInfo,
   PaymentSession,
   RefundInfo,
   RefundRequest,
   RefundResult,
+  RetrieveNativeSubscriptionInput,
   SavedPaymentMethod,
   SavePaymentMethodInput,
   ServerPaymentAdapter,
@@ -69,6 +75,10 @@ export class FakeAdapter implements ServerPaymentAdapter {
   listSavedPaymentMethods?: (pspCustomerId: string) => Promise<SavedPaymentMethod[]>;
   deleteSavedPaymentMethod?: (pspCustomerId: string, token: string) => Promise<void>;
   chargeSavedPaymentMethod?: (input: ChargeSavedPaymentMethodInput) => Promise<PaymentInfo>;
+  listNativeSubscriptions?: (input?: ListNativeSubscriptionsInput) => Promise<ListNativeSubscriptionsResult>;
+  retrieveNativeSubscription?: (input: RetrieveNativeSubscriptionInput) => Promise<NativeSubscriptionRecord>;
+  createNativeSubscription?: (input: CreateNativeSubscriptionInput) => Promise<NativeSubscriptionRecord>;
+  cancelNativeSubscription?: (input: CancelNativeSubscriptionInput) => Promise<NativeSubscriptionRecord>;
 
   constructor(options: FakeAdapterOptions = {}) {
     this.pspName = options.pspName ?? "fake";
@@ -84,6 +94,7 @@ export class FakeAdapter implements ServerPaymentAdapter {
       supportsSessionUpdate: true,
       supportsEventPolling: true,
       supportsListing: true,
+      nativeSubscriptions: { list: true, retrieve: true, create: true, cancel: true },
       requiresServerCompletion: false,
       paymentMethods: [{ type: "card", flow: "embedded", supported: true }],
       ...options.capabilities,
@@ -194,6 +205,66 @@ export class FakeAdapter implements ServerPaymentAdapter {
             currency: input.currency,
           });
         };
+      }
+      const subCaps = this.caps.nativeSubscriptions;
+      if (subCaps.list || subCaps.retrieve || subCaps.create || subCaps.cancel) {
+        const subscriptions = new Map<string, NativeSubscriptionRecord>();
+        let sequence = 0;
+        const fallback = (subscriptionId: string): NativeSubscriptionRecord => ({
+          id: subscriptionId,
+          pspName: this.pspName,
+          status: "active",
+          amount: 1500,
+          currency: "USD",
+          interval: "month",
+          intervalCount: 1,
+          raw: {},
+        });
+        if (subCaps.create) {
+          this.createNativeSubscription = async (input) => {
+            this.calls.push({ method: "createNativeSubscription", args: [input] });
+            const record: NativeSubscriptionRecord = {
+              id: `sub_${++sequence}`,
+              pspName: this.pspName,
+              status: "active",
+              amount: input.amount,
+              currency: input.currency.toUpperCase(),
+              ...(input.interval ? { interval: input.interval, intervalCount: input.intervalCount ?? 1 } : {}),
+              ...(input.schedule ? { schedule: input.schedule } : {}),
+              savedPaymentMethodToken: input.savedPaymentMethodToken,
+              raw: {},
+            };
+            subscriptions.set(record.id, record);
+            return record;
+          };
+        }
+        if (subCaps.retrieve) {
+          this.retrieveNativeSubscription = async (input) => {
+            this.calls.push({ method: "retrieveNativeSubscription", args: [input] });
+            return subscriptions.get(input.subscriptionId) ?? fallback(input.subscriptionId);
+          };
+        }
+        if (subCaps.list) {
+          this.listNativeSubscriptions = async (input) => {
+            this.calls.push({ method: "listNativeSubscriptions", args: [input] });
+            const all = [...subscriptions.values()];
+            const start = input?.cursor ? Number(input.cursor) : 0;
+            const page = input?.limit !== undefined ? all.slice(start, start + input.limit) : all.slice(start);
+            const next = start + page.length;
+            return { subscriptions: page, ...(next < all.length ? { nextCursor: String(next) } : {}) };
+          };
+        }
+        if (subCaps.cancel) {
+          this.cancelNativeSubscription = async (input) => {
+            this.calls.push({ method: "cancelNativeSubscription", args: [input] });
+            const canceled: NativeSubscriptionRecord = {
+              ...(subscriptions.get(input.subscriptionId) ?? fallback(input.subscriptionId)),
+              status: "canceled",
+            };
+            subscriptions.set(canceled.id, canceled);
+            return canceled;
+          };
+        }
       }
     }
   }

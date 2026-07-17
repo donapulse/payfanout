@@ -48,7 +48,10 @@ Paysafe: re-issues the signed context, **always continue with the returned sessi
 
 Later calls in the lifecycle: `retrievePayment` · `capturePayment` · `cancelPayment` ·
 `refundPayment` · `retrieveRefund` (poll `"pending"` refunds) · `verifyPaymentMethod` ·
-`fetchEvents` · `listPayments` · `listRefunds` (capability-gated passthroughs).
+`fetchEvents` · `listPayments` · `listRefunds` (capability-gated passthroughs) ·
+`listNativeSubscriptions` · `retrieveNativeSubscription` · `createNativeSubscription` ·
+`cancelNativeSubscription` (per-operation capability gates — see
+[PSP-native subscriptions](/guide/native-subscriptions)).
 Capture, cancel, and verify take a **required `idempotencyKey`** like every other
 mutating call — under multi-capture, each partial capture is its own charge with its own
 key. `PaymentInfo` reports `amountCaptured`/`amountCapturable` and echoes your `metadata`

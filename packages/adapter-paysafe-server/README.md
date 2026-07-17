@@ -1,8 +1,8 @@
 # @payfanout/adapter-paysafe-server
 
 Server-side Paysafe adapter for [PayFanout](https://donapulse.github.io/payfanout/):
-Payment Handles, Payments, Settlements, Refunds, and Webhooks, over the Paysafe Payments
-REST API.
+Payment Handles, Payments, Settlements, Refunds, Webhooks, and Payment Scheduler
+subscriptions, over the Paysafe REST APIs.
 
 > **Holds secrets.** This package uses your Paysafe REST credentials. Never bundle it
 > client-side.
@@ -59,12 +59,40 @@ exported for advanced use.
 
 - **`PaysafeServerAdapter`**, the full server contract (create/update/complete/retrieve,
   captures, refunds, settlements, verification via the Verifications API, saved-card
-  charging).
+  charging, native subscriptions).
 - **Webhook helpers**, `verifyPaysafeWebhookSignature` and `parsePaysafeWebhookEvent`,
   operating on the **raw request bytes** and emitting a normalized `UnifiedWebhookEvent`.
   Paysafe retries webhooks effectively forever until it sees a 2xx.
 - **`mapPaysafeError`**, unifies Paysafe errors into `PayFanoutError` (business errors like
   declines or `3406` are never replayed), and **`PAYSAFE_PSP_NAME`**.
+
+## PSP-native subscriptions (Payment Scheduler)
+
+The adapter declares `nativeSubscriptions: { list, retrieve, create, cancel }` all true,
+backed by Paysafe's Payment Scheduler (`subscriptionsplans/v1`, same hosts and the same
+Basic API key as the Payments API — the docs' "Back Office" is where that key is
+retrieved, not a separate credential).
+
+- **Create** bills an already-vaulted **MULTI_USE token** (`savePaymentMethod`'s output;
+  the scheduler rejects single-use Paysafe.js tokens). Subscriptions attach to a plan:
+  pass `planId` to bill from a plan you manage (the input amount/currency/cadence must
+  match it — mismatches reject instead of silently billing different terms), or omit it
+  and the adapter creates a dedicated open-ended plan from the input inline.
+- **Cadence** is `day`/`month`/`year` (+ `intervalCount` 1-365). The scheduler has no
+  weekly frequency and no RRULE input — `interval: "week"` and any `schedule` reject
+  with `invalid_request` rather than approximating.
+- **Idempotency** rides `merchantRefNum` ("unique for this accountId"):
+  `input.merchantRefNum` wins when supplied, `idempotencyKey` fills it otherwise, and a
+  replayed create recovers the existing subscription by that refNum. A transport-retried
+  inline plan creation can leave an orphan plan (plans carry no refNum); the
+  subscription itself stays exactly-once, so nothing double-bills.
+- **Cancel** PATCHes the final `CANCELLED` status (never the reversible `SUSPENDED`) and
+  is verified-idempotent: on a rejection the adapter re-reads the subscription and
+  treats `CANCELLED`/`COMPLETED` as success.
+- **Status mapping:** `ACTIVE` → `active`, `CANCELLED` → `canceled`, `SUSPENDED` →
+  `paused`, `COMPLETED` → `completed`; anything else on the wire → `unknown`.
+- `pspCustomerId` and `metadata` have no scheduler channel and are withheld; the
+  customer profile derives from the vaulted token.
 
 ## Notes
 
@@ -72,6 +100,9 @@ exported for advanced use.
   default 2).
 - Paysafe has no public events API (`supportsEventPolling: false`), so missed-webhook
   recovery falls back to `retrievePayment` per order.
+- Scheduler availability is per merchant account, like every Paysafe product option —
+  the capability flags state what the adapter implements; an account without the
+  scheduler answers with its own rejection.
 
 ## Documentation
 

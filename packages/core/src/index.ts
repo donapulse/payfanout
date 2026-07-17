@@ -57,6 +57,10 @@ export { validateAdapterCapabilities } from "./capability-validation.js";
 export type {
   AdapterCapabilities,
   CustomerRef,
+  NativeSubscriptionCapabilities,
+  NativeSubscriptionInterval,
+  NativeSubscriptionRecord,
+  NativeSubscriptionStatus,
   PaymentInfo,
   PaymentMethodCapability,
   PaymentMethodDetails,
@@ -74,9 +78,12 @@ export type {
   UnifiedWebhookEventType,
 } from "./model.js";
 export {
+  isNativeSubscriptionStatus,
   isUnifiedPaymentMethodType,
   isUnifiedPaymentStatus,
   isUnifiedWebhookEventType,
+  NATIVE_SUBSCRIPTION_INTERVALS,
+  NATIVE_SUBSCRIPTION_STATUSES,
   PAYMENT_METHOD_FLOWS,
   PAYMENT_METHOD_TYPES,
   PAYMENT_STATUSES,
@@ -90,16 +97,20 @@ export { getRefundState } from "./refunds.js";
 export { screenSessionInput } from "./screening.js";
 
 export type {
+  CancelNativeSubscriptionInput,
   ChargeSavedPaymentMethodInput,
   ClientPaymentAdapter,
   CompletePaymentInput,
   ConfirmResult,
   CreateCustomerInput,
+  CreateNativeSubscriptionInput,
   CreatePaymentSessionInput,
   FetchEventsInput,
   FetchEventsResult,
   FieldsChangeState,
   SavePaymentMethodInput,
+  ListNativeSubscriptionsInput,
+  ListNativeSubscriptionsResult,
   ListPaymentsInput,
   ListPaymentsResult,
   ListRefundsInput,
@@ -107,6 +118,7 @@ export type {
   MountedFieldsHandle,
   MountOptions,
   RedirectReturnLocation,
+  RetrieveNativeSubscriptionInput,
   ScaPreference,
   ServerPaymentAdapter,
   ShippingDetails,

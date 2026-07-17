@@ -3,6 +3,8 @@ import type { UnifiedError } from "./errors.js";
 import type {
   AdapterCapabilities,
   CustomerRef,
+  NativeSubscriptionInterval,
+  NativeSubscriptionRecord,
   PaymentInfo,
   PaymentMethodCapability,
   PaymentSession,
@@ -225,6 +227,75 @@ export interface ListRefundsResult {
   nextCursor?: string;
 }
 
+export interface ListNativeSubscriptionsInput {
+  /** Page-size hint; the PSP's own maximum wins. */
+  limit?: number;
+  /** Opaque continuation cursor from a previous ListNativeSubscriptionsResult. */
+  cursor?: string;
+}
+
+export interface ListNativeSubscriptionsResult {
+  subscriptions: NativeSubscriptionRecord[];
+  /** Present when another page exists — pass back as ListNativeSubscriptionsInput.cursor. */
+  nextCursor?: string;
+}
+
+export interface RetrieveNativeSubscriptionInput {
+  /** The PSP's subscription id (NativeSubscriptionRecord.id). */
+  subscriptionId: string;
+  /**
+   * Some PSPs key subscriptions by id + vault token (PayZen) — required there,
+   * ignored elsewhere. Hosts adopting subscriptions should retain both.
+   */
+  savedPaymentMethodToken?: string;
+}
+
+/**
+ * Creates a subscription the PSP itself bills — server-only, against an
+ * already-vaulted instrument (a stored token or mandate; card capture still
+ * happens exclusively on PSP-hosted surfaces). The cadence is exactly one of
+ * `interval` (+ optional `intervalCount`) or `schedule`; adapters reject a
+ * schedule their PSP cannot express faithfully rather than approximating it.
+ */
+export interface CreateNativeSubscriptionInput {
+  /** Vault token / mandate the PSP charges each installment against. */
+  savedPaymentMethodToken: string;
+  /** PSP customer the subscription belongs to — required by some PSPs (adapters document it). */
+  pspCustomerId?: string;
+  /** Amount of each installment. Integer minor units. */
+  amount: MinorUnitAmount;
+  currency: string;
+  /** Simple cadence unit. Exactly one of interval or schedule is required. */
+  interval?: NativeSubscriptionInterval;
+  /** e.g. every 3 months -> interval "month", intervalCount 3. Default 1. */
+  intervalCount?: number;
+  /** RFC 5545 RRULE for richer cadences, where the PSP accepts one. */
+  schedule?: string;
+  /** ISO 8601 instant billing starts; the PSP's own "now" when omitted. */
+  startAt?: string;
+  /** PSP plan/price to bill from, where the PSP models one (adapters document it). */
+  planId?: string;
+  /** Merchant reference, where the PSP has a dedicated field for one. */
+  merchantRefNum?: string;
+  metadata?: Record<string, string>;
+  idempotencyKey: string;
+}
+
+/**
+ * Cancellation must be VERIFIED-IDEMPOTENT: adapters treat an already-terminal
+ * subscription as success (re-fetching on a cancel rejection where needed), so
+ * a replayed cancel can never fail an adoption flow that depends on stopping
+ * PSP-side billing exactly once.
+ */
+export interface CancelNativeSubscriptionInput {
+  /** The PSP's subscription id (NativeSubscriptionRecord.id). */
+  subscriptionId: string;
+  /** Required by PSPs that key subscriptions by id + vault token (PayZen). */
+  savedPaymentMethodToken?: string;
+  /** Cancel stops money movement — mutating, so the key is required. */
+  idempotencyKey: string;
+}
+
 export interface CompletePaymentInput {
   pspSessionId: string;
   /** Token produced by the client adapter's confirm() (e.g. Paysafe Payment Handle token). */
@@ -303,6 +374,25 @@ export interface ServerPaymentAdapter {
 
   /** Reconciliation passthrough. Only present if getCapabilities().supportsListing. */
   listRefunds?(input?: ListRefundsInput): Promise<ListRefundsResult>;
+
+  // --- PSP-native subscriptions — per-operation, present iff the matching
+  // --- getCapabilities().nativeSubscriptions flag is true. The PSP bills;
+  // --- contrast the host-side SubscriptionManager, which bills vault tokens.
+
+  /** Pages the PSP's native subscriptions (cursor/limit) as unified records. */
+  listNativeSubscriptions?(input?: ListNativeSubscriptionsInput): Promise<ListNativeSubscriptionsResult>;
+
+  retrieveNativeSubscription?(input: RetrieveNativeSubscriptionInput): Promise<NativeSubscriptionRecord>;
+
+  /** Server-only creation against an already-vaulted instrument. */
+  createNativeSubscription?(input: CreateNativeSubscriptionInput): Promise<NativeSubscriptionRecord>;
+
+  /**
+   * Stops PSP-side billing. Verified-idempotent: an already-terminal
+   * subscription resolves as success (adapters re-fetch on cancel rejections
+   * where needed), never as an error — adoption flows replay cancels.
+   */
+  cancelNativeSubscription?(input: CancelNativeSubscriptionInput): Promise<NativeSubscriptionRecord>;
 
   /** Zero-amount validation, no charge, no storage — see the vaulting caveat in the README. */
   verifyPaymentMethod?(input: VerifyPaymentMethodInput): Promise<PaymentInfo>;

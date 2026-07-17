@@ -10,9 +10,9 @@ whole interface.
 ## 0. Decide your PSP's completion shape first
 
 This is the one architectural decision, everything else is mapping. Ask: *how does a
-payment reach its terminal state?* Five shipped adapters cover three shapes:
+payment reach its terminal state?* The shipped adapters cover three shapes:
 
-| | Confirm-on-client (Stripe, PayZen) | Tokenize-first (Paysafe, PayPal) | Redirect / hosted (GoCardless) |
+| | Confirm-on-client (Stripe, PayZen) | Tokenize-first (Paysafe, PayPal, Worldline) | Redirect / hosted (GoCardless) |
 | --- | --- | --- | --- |
 | Server session call | creates the PSP intent object | may create nothing, see "stateless sessions" | creates the PSP object + hosted URL |
 | Client `confirm()` | finalizes, returns terminal status | returns `requires_confirmation` + `clientToken` | navigates to the hosted flow |
@@ -121,6 +121,22 @@ and `PaymentService` will hold you to:
   `listPayments`/`listRefunds` ↔ `supportsListing`, and `supportsMultiCapture`
   (requires `supportsManualCapture`; every partial capture is its own charge with its
   own idempotency key).
+- **PSP-native subscriptions — the `nativeSubscriptions` block is REQUIRED** and
+  per-operation: `{ list, retrieve, create, cancel }`, each flag pairing with its
+  method (`listNativeSubscriptions` ↔ `list`, `retrieveNativeSubscription` ↔
+  `retrieve`, `createNativeSubscription` ↔ `create`, `cancelNativeSubscription` ↔
+  `cancel`). All-false is the explicit "this PSP has no native billing product"
+  declaration — never omit the block. Declare only what the provider's own product
+  supports (no list API → `list: false`; approval-gated creation → `create: false`).
+  Records normalize into `NativeSubscriptionRecord`: integer minor-unit amounts, the
+  unified status union (unmappable provider states → `"unknown"`, never dropped),
+  cadence as `interval`/`intervalCount` or the source RRULE on `schedule` — reject
+  cadences your PSP cannot express (`invalid_request`) instead of approximating.
+  `cancelNativeSubscription` must be VERIFIED-IDEMPOTENT: on a cancel rejection,
+  re-fetch and resolve an already-terminal subscription as success, rethrowing the
+  original error otherwise — the conformance suite replays every cancel. Any flag
+  true ⇒ supply the `nativeSubscriptions` conformance fixtures (`createInput` for
+  create-capable adapters; `seedSubscriptions` when `create` is false).
 - **Vaulting (`supportsSavedPaymentMethods`) is optional and must be honest.** Card
   rails that can vault should (Stripe, Paysafe, PayZen candidates); rails that cannot
   meet the contract's instantly-succeeded off-session charge declare `false` — as

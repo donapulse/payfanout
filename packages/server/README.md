@@ -52,7 +52,11 @@ const session = await payments.createPaymentSession("stripe", {
 
 Later lifecycle calls: `retrievePayment`, `capturePayment`, `cancelPayment`,
 `refundPayment`, `retrieveRefund` (poll `"pending"` refunds), `verifyPaymentMethod`,
-`fetchEvents`, `listPayments`, `listRefunds` (capability-gated passthroughs).
+`fetchEvents`, `listPayments`, `listRefunds` (capability-gated passthroughs), and the
+PSP-native subscription passthroughs `listNativeSubscriptions`,
+`retrieveNativeSubscription`, `createNativeSubscription`, `cancelNativeSubscription` —
+each gated on its own `nativeSubscriptions` capability flag, since provider support is
+per operation.
 
 ## What's inside
 

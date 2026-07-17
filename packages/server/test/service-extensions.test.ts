@@ -84,6 +84,7 @@ describe("PaymentService — refund lifecycle / session update / recovery passth
   });
 
   it("rejects registration when new capability claims lack implementations", () => {
+    const noNativeSubscriptions = { list: false, retrieve: false, create: false, cancel: false };
     const allOff = {
       supportsManualCapture: false,
       supportsMultiCapture: false,
@@ -93,12 +94,29 @@ describe("PaymentService — refund lifecycle / session update / recovery passth
       supportsSessionUpdate: false,
       supportsEventPolling: false,
       supportsListing: false,
+      nativeSubscriptions: noNativeSubscriptions,
     };
     for (const [claim, message] of [
       [{ supportsSessionUpdate: true }, /does not implement updatePaymentSession/],
       [{ supportsEventPolling: true }, /does not implement fetchEvents/],
       [{ supportsListing: true }, /does not implement listPayments/],
       [{ supportsRefunds: true }, /does not implement retrieveRefund/],
+      [
+        { nativeSubscriptions: { ...noNativeSubscriptions, list: true } },
+        /does not implement listNativeSubscriptions/,
+      ],
+      [
+        { nativeSubscriptions: { ...noNativeSubscriptions, retrieve: true } },
+        /does not implement retrieveNativeSubscription/,
+      ],
+      [
+        { nativeSubscriptions: { ...noNativeSubscriptions, create: true } },
+        /does not implement createNativeSubscription/,
+      ],
+      [
+        { nativeSubscriptions: { ...noNativeSubscriptions, cancel: true } },
+        /does not implement cancelNativeSubscription/,
+      ],
     ] as const) {
       const adapter = new FakeAdapter({
         capabilities: { ...allOff, ...claim },
@@ -223,6 +241,154 @@ describe("PaymentService vault surface", () => {
         currency: "USD",
         idempotencyKey: "  ",
       }),
+      /idempotencyKey/,
+    );
+  });
+});
+
+describe("PaymentService native-subscription surface", () => {
+  const NO_NATIVE = { list: false, retrieve: false, create: false, cancel: false };
+
+  it("routes create -> retrieve -> list (paged) -> cancel to the adapter", async () => {
+    const adapter = new FakeAdapter();
+    const service = new PaymentService({ adapters: [adapter] });
+
+    const created = await service.createNativeSubscription("fake", {
+      savedPaymentMethodToken: "tok_1",
+      amount: 1500,
+      currency: "usd",
+      interval: "month",
+      intervalCount: 3,
+      idempotencyKey: "k1",
+    });
+    expect(created.status).toBe("active");
+    expect(created.currency).toBe("USD");
+    expect(created.interval).toBe("month");
+
+    const second = await service.createNativeSubscription("fake", {
+      savedPaymentMethodToken: "tok_2",
+      amount: 900,
+      currency: "USD",
+      schedule: "FREQ=MONTHLY;BYMONTHDAY=15",
+      idempotencyKey: "k2",
+    });
+    expect(second.schedule).toBe("FREQ=MONTHLY;BYMONTHDAY=15");
+
+    const retrieved = await service.retrieveNativeSubscription("fake", { subscriptionId: created.id });
+    expect(retrieved.id).toBe(created.id);
+
+    const page1 = await service.listNativeSubscriptions("fake", { limit: 1 });
+    expect(page1.subscriptions).toHaveLength(1);
+    expect(page1.nextCursor).toBeDefined();
+    const page2 = await service.listNativeSubscriptions("fake", { limit: 1, cursor: page1.nextCursor! });
+    expect(page2.subscriptions[0]!.id).not.toBe(page1.subscriptions[0]!.id);
+
+    const canceled = await service.cancelNativeSubscription("fake", {
+      subscriptionId: created.id,
+      idempotencyKey: "k3",
+    });
+    expect(canceled.status).toBe("canceled");
+    // Verified-idempotent: a replayed cancel resolves as success, still terminal.
+    const replayed = await service.cancelNativeSubscription("fake", {
+      subscriptionId: created.id,
+      idempotencyKey: "k4",
+    });
+    expect(replayed.status).toBe("canceled");
+  });
+
+  it("guards each operation behind its own capability flag", async () => {
+    const none = new FakeAdapter({ pspName: "none", capabilities: { nativeSubscriptions: NO_NATIVE } });
+    // PayZen-shaped: everything but list.
+    const noList = new FakeAdapter({
+      pspName: "no-list",
+      capabilities: { nativeSubscriptions: { ...NO_NATIVE, retrieve: true, create: true, cancel: true } },
+    });
+    const service = new PaymentService({ adapters: [none, noList] });
+
+    await expectUnsupported(service.listNativeSubscriptions("none"), /listing native subscriptions/);
+    await expectUnsupported(
+      service.retrieveNativeSubscription("none", { subscriptionId: "s1" }),
+      /retrieving native subscriptions/,
+    );
+    await expectUnsupported(
+      service.createNativeSubscription("none", {
+        savedPaymentMethodToken: "t",
+        amount: 100,
+        currency: "USD",
+        interval: "month",
+        idempotencyKey: "k",
+      }),
+      /creating native subscriptions/,
+    );
+    await expectUnsupported(
+      service.cancelNativeSubscription("none", { subscriptionId: "s1", idempotencyKey: "k" }),
+      /canceling native subscriptions/,
+    );
+
+    await expectUnsupported(service.listNativeSubscriptions("no-list"), /listing native subscriptions/);
+    const record = await service.createNativeSubscription("no-list", {
+      savedPaymentMethodToken: "t",
+      amount: 100,
+      currency: "USD",
+      interval: "month",
+      idempotencyKey: "k",
+    });
+    expect(record.status).toBe("active");
+  });
+
+  it("validates create input: amount, cadence exclusivity, intervalCount, startAt, key", async () => {
+    const service = new PaymentService({ adapters: [new FakeAdapter()] });
+    const base = {
+      savedPaymentMethodToken: "t",
+      amount: 100,
+      currency: "USD",
+      interval: "month",
+      idempotencyKey: "k",
+    } as const;
+
+    await expectInvalidRequest(
+      service.createNativeSubscription("fake", { ...base, amount: 10.5 }),
+      /minor units/,
+    );
+    await expectInvalidRequest(
+      service.createNativeSubscription("fake", { ...base, amount: 0 }),
+      /positive amount/,
+    );
+    await expectInvalidRequest(
+      service.createNativeSubscription("fake", { ...base, interval: undefined }),
+      /requires a billing cadence/,
+    );
+    await expectInvalidRequest(
+      service.createNativeSubscription("fake", { ...base, schedule: "FREQ=MONTHLY" }),
+      /not both/,
+    );
+    await expectInvalidRequest(
+      service.createNativeSubscription("fake", {
+        ...base,
+        interval: undefined,
+        schedule: "FREQ=MONTHLY",
+        intervalCount: 2,
+      }),
+      /intervalCount requires interval/,
+    );
+    await expectInvalidRequest(
+      service.createNativeSubscription("fake", { ...base, intervalCount: 0 }),
+      /positive integer/,
+    );
+    await expectInvalidRequest(
+      service.createNativeSubscription("fake", { ...base, intervalCount: 1.5 }),
+      /positive integer/,
+    );
+    await expectInvalidRequest(
+      service.createNativeSubscription("fake", { ...base, startAt: "not-a-date" }),
+      /ISO 8601/,
+    );
+    await expectInvalidRequest(
+      service.createNativeSubscription("fake", { ...base, idempotencyKey: " " }),
+      /idempotencyKey/,
+    );
+    await expectInvalidRequest(
+      service.cancelNativeSubscription("fake", { subscriptionId: "s", idempotencyKey: "" }),
       /idempotencyKey/,
     );
   });

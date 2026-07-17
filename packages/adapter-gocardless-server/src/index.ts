@@ -6,6 +6,7 @@ export {
   type GoCardlessPaymentLike,
   type GoCardlessRefundLike,
   type GoCardlessServerAdapterConfig,
+  type GoCardlessSubscriptionLike,
 } from "./adapter.js";
 export { gocardlessOnboarding } from "./onboarding.js";
 export {

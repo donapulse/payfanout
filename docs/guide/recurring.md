@@ -123,9 +123,12 @@ charge never enters dunning: the run reports it under `ChargeDueResult.errors` a
 next run replays the same attempt key, which the PSP answers from cache instead of
 charging again.
 
-::: info Why not wrap Stripe Billing?
-PSP-native billing (Stripe Billing) is deliberately not wrapped: Paysafe has no equivalent,
-and this engine gives both PSPs identical behavior.
+::: info Where PSP-native billing fits
+This engine bills from **your** cron with identical behavior on every vaulting-capable
+PSP. Providers that ship their own billing product are reachable too — see
+[PSP-native subscriptions](/guide/native-subscriptions) for the normalized
+list/retrieve/create/cancel surface and the adoption flow that migrates merchants from
+PSP-native billing onto this engine.
 :::
 
 ::: warning Storage is the host's job

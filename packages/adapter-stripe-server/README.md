@@ -46,6 +46,12 @@ Pair it on the browser with [`@payfanout/adapter-stripe`](../adapter-stripe). Th
 
 - **`StripeServerAdapter`**, the full server contract (create/update/retrieve/capture/cancel,
   refunds, payment-method verification, saved-card charging, `fetchEvents`).
+- **Native subscriptions (Stripe Billing)** — list/retrieve/create/cancel. Creation is
+  server-only against a vaulted PaymentMethod: pass an existing Price id as `planId`, or
+  omit it and the adapter builds the price inline (creating a Product on the fly, named
+  after `merchantRefNum`). Listing returns Stripe's default set — every subscription that
+  has not been canceled. Cancel is verified-idempotent: replaying it on an
+  already-canceled subscription resolves as success.
 - **Webhook helpers**, `verifyStripeWebhookSignature`, `parseStripeWebhookEvent`, and
   `stripeEventBodyToUnified`, all operating on the **raw request bytes** and emitting a
   normalized `UnifiedWebhookEvent`.
@@ -56,6 +62,11 @@ Pair it on the browser with [`@payfanout/adapter-stripe`](../adapter-stripe). Th
 ## Notes
 
 - The Stripe SDK retries network failures itself (`maxNetworkRetries`, default 2).
+- Subscription creation sends `payment_behavior: "error_if_incomplete"`: a first invoice
+  that cannot be paid rejects with the mapped card error instead of leaving an
+  `incomplete` subscription behind. Canceling a subscription is a `DELETE`, where Stripe
+  ignores idempotency keys — replay safety comes from re-fetching on rejection and
+  treating an already-canceled subscription as success.
 - Zero-amount payment-method verification uses a SetupIntent and **detaches the
   PaymentMethod on every path** to honor the no-storage constraint; set
   `verifyPaymentMethodStrategy: "disabled"` to turn the capability off instead.

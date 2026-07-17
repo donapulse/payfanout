@@ -66,8 +66,10 @@ until it sees success.
 
 ## Operational concerns
 
-**Secret rotation without cutover:** both adapters accept an *array* of signing
-secrets/HMAC keys, register the new one, keep the old until the PSP switches, then drop it.
+**Secret rotation without cutover:** the adapters accept an *array* of signing
+secrets/HMAC keys (Worldline's as `{ keyId, secretKey }` pairs matched by the webhook's
+key id; PayPal verifies by postback, so there is nothing to rotate locally), register the
+new one, keep the old until the PSP switches, then drop it.
 
 **Missed-webhook recovery:** `payments.fetchEvents("stripe", { since, cursor })` replays
 recent events as the same normalized `UnifiedWebhookEvent`s (same ids, your dedupe makes

@@ -86,6 +86,25 @@ export interface PaymentMethodCapability {
   countries?: string[];
 }
 
+/**
+ * Per-operation support for the PSP's native subscription product. Provider
+ * support is uneven (some PSPs expose no list endpoint, some no server-only
+ * create), so one boolean would either fake or hide support — each operation
+ * declares itself and `PaymentService` guards each passthrough separately.
+ * All-false means the PSP has no native subscription engine (recurring runs
+ * on the vault surface + the host-side SubscriptionManager instead).
+ */
+export interface NativeSubscriptionCapabilities {
+  /** listNativeSubscriptions is available. */
+  list: boolean;
+  /** retrieveNativeSubscription is available. */
+  retrieve: boolean;
+  /** createNativeSubscription is available (server-only creation against a vaulted token). */
+  create: boolean;
+  /** cancelNativeSubscription is available. */
+  cancel: boolean;
+}
+
 export interface AdapterCapabilities {
   pspName: string;
   /**
@@ -123,6 +142,12 @@ export interface AdapterCapabilities {
   supportsEventPolling: boolean;
   /** listPayments()/listRefunds() reconciliation passthroughs are available. */
   supportsListing: boolean;
+  /**
+   * Which PSP-native subscription operations the adapter implements — see
+   * NativeSubscriptionCapabilities. Honesty is per operation; declare only
+   * what the provider's own billing product supports.
+   */
+  nativeSubscriptions: NativeSubscriptionCapabilities;
   /**
    * True if the PSP flow is client-tokenize-first and the server must finalize
    * the payment via completePayment (Paysafe: true, Stripe: false).
@@ -276,6 +301,78 @@ export interface SavedPaymentMethod {
   /** ISO 8601, when known. */
   createdAt?: string;
   raw: unknown;
+}
+
+export const NATIVE_SUBSCRIPTION_STATUSES = [
+  /** Created but not yet billing (awaiting first charge, approval, or start date). */
+  "pending",
+  "trialing",
+  "active",
+  /** A renewal charge failed; the PSP is retrying or awaiting intervention. */
+  "past_due",
+  /** Suspended at the PSP — resumable, no charges while paused. */
+  "paused",
+  "canceled",
+  /** A finite schedule ran all its installments. */
+  "completed",
+  /** Provider state with no faithful projection — never dropped, never guessed. */
+  "unknown",
+] as const;
+
+/**
+ * Unified status of a PSP-native subscription. Adapters document their
+ * provider-state mapping; anything unmappable normalizes to "unknown".
+ */
+export type NativeSubscriptionStatus = (typeof NATIVE_SUBSCRIPTION_STATUSES)[number];
+
+export function isNativeSubscriptionStatus(value: unknown): value is NativeSubscriptionStatus {
+  return (
+    typeof value === "string" && (NATIVE_SUBSCRIPTION_STATUSES as readonly string[]).includes(value)
+  );
+}
+
+export const NATIVE_SUBSCRIPTION_INTERVALS = ["day", "week", "month", "year"] as const;
+
+/** Simple billing cadence unit (every N days/weeks/months/years). */
+export type NativeSubscriptionInterval = (typeof NATIVE_SUBSCRIPTION_INTERVALS)[number];
+
+/**
+ * A subscription that lives at the PSP — the PSP schedules and collects each
+ * charge itself. Distinct from `@payfanout/server`'s host-side
+ * SubscriptionManager, where the HOST bills on vault tokens: these records are
+ * read from / written to the provider's own billing product, the primitive
+ * under migrating merchants off PSP-native billing (list at the PSP, re-create
+ * in the host engine, cancel at the PSP).
+ */
+export interface NativeSubscriptionRecord {
+  /** The PSP's subscription id — the handle retrieve/cancel operate on. */
+  id: string;
+  pspName: string;
+  status: NativeSubscriptionStatus;
+  /** Amount of each installment. Integer minor units. */
+  amount: MinorUnitAmount;
+  /** Uppercase ISO 4217. */
+  currency: string;
+  /** Absent when the source cadence has no faithful day/week/month/year projection. */
+  interval?: NativeSubscriptionInterval;
+  /** e.g. every 3 months -> interval "month", intervalCount 3. */
+  intervalCount?: number;
+  /** The source schedule for richer cadences (RFC 5545 RRULE), where the PSP has one. */
+  schedule?: string;
+  /** ISO 8601. */
+  currentPeriodStart?: string;
+  /** ISO 8601 — when the next charge is due. */
+  currentPeriodEnd?: string;
+  /** Vault token / mandate the PSP charges, when the PSP reports it. */
+  savedPaymentMethodToken?: string;
+  pspCustomerId?: string;
+  /** Contact facts as stored at the PSP, for host-side matching during adoption. */
+  customer?: { email?: string; firstName?: string; lastName?: string; phone?: string; locale?: string };
+  /** Merchant reference stored on the PSP subscription, where the PSP has one. */
+  merchantRefNum?: string;
+  /** The PSP plan/price the subscription bills from, where the PSP models one. */
+  planId?: string;
+  raw?: unknown;
 }
 
 export const WEBHOOK_EVENT_TYPES = [

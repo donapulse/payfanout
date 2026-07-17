@@ -3,10 +3,12 @@ import { describe, expect, it } from "vitest";
 import { isPayFanoutError, type UnifiedErrorCode, type UnifiedPaymentStatus } from "@payfanout/core";
 import {
   derivePayZenOrderId,
+  derivePayZenSubscriptionStatus,
   mapPayZenDetailedStatus,
   mapPayZenError,
   parsePayZenWebhookEvent,
   PayZenServerAdapter,
+  projectPayZenRrule,
   verifyPayZenWebhookSignature,
   type PayZenServerAdapterConfig,
 } from "../src/index.js";
@@ -71,6 +73,61 @@ describe("derivePayZenOrderId", () => {
     expect(long).toBe(await derivePayZenOrderId("x".repeat(200)));
     expect(long).not.toBe(await derivePayZenOrderId("x".repeat(201)));
   });
+});
+
+describe("derivePayZenSubscriptionStatus (V4/Subscription has no status field)", () => {
+  const NOW = Date.UTC(2026, 6, 7, 10, 0, 0);
+  const base = { effectDate: "2026-07-01T00:00:00+00:00", cancelDate: null, pastPaymentsNumber: 1, totalPaymentsNumber: 0 };
+
+  it("cancelDate set -> canceled, before anything else (a canceled finite schedule stays canceled)", () => {
+    expect(derivePayZenSubscriptionStatus({ ...base, cancelDate: "2026-07-05T00:00:00+00:00" }, NOW)).toBe("canceled");
+    expect(
+      derivePayZenSubscriptionStatus(
+        { ...base, cancelDate: "2026-07-05T00:00:00+00:00", pastPaymentsNumber: 2, totalPaymentsNumber: 2 },
+        NOW,
+      ),
+    ).toBe("canceled");
+  });
+
+  it("a finite schedule that ran all installments -> completed", () => {
+    expect(derivePayZenSubscriptionStatus({ ...base, pastPaymentsNumber: 2, totalPaymentsNumber: 2 }, NOW)).toBe("completed");
+    expect(derivePayZenSubscriptionStatus({ ...base, pastPaymentsNumber: 3, totalPaymentsNumber: 2 }, NOW)).toBe("completed");
+  });
+
+  it("open-ended schedules (totalPaymentsNumber 0) never complete", () => {
+    expect(derivePayZenSubscriptionStatus({ ...base, pastPaymentsNumber: 500, totalPaymentsNumber: 0 }, NOW)).toBe("active");
+  });
+
+  it("a future effectDate -> pending; started or unparseable -> active", () => {
+    expect(derivePayZenSubscriptionStatus({ ...base, effectDate: "2026-08-01T00:00:00+00:00" }, NOW)).toBe("pending");
+    expect(derivePayZenSubscriptionStatus(base, NOW)).toBe("active");
+    // The boundary instant is already billing, not pending.
+    expect(derivePayZenSubscriptionStatus({ ...base, effectDate: "2026-07-07T10:00:00+00:00" }, NOW)).toBe("active");
+    expect(derivePayZenSubscriptionStatus({ ...base, effectDate: undefined }, NOW)).toBe("active");
+  });
+});
+
+describe("projectPayZenRrule (faithful cadence projections only)", () => {
+  const cases: Array<[string, { interval: string; intervalCount: number } | undefined]> = [
+    ["RRULE:FREQ=DAILY;INTERVAL=1", { interval: "day", intervalCount: 1 }],
+    ["RRULE:FREQ=WEEKLY;INTERVAL=2", { interval: "week", intervalCount: 2 }],
+    ["FREQ=MONTHLY", { interval: "month", intervalCount: 1 }], // INTERVAL defaults to 1; prefix optional
+    ["RRULE:FREQ=YEARLY;COUNT=5", { interval: "year", intervalCount: 1 }], // COUNT bounds installments, not cadence
+    ["RRULE:FREQ=WEEKLY;INTERVAL=2;", { interval: "week", intervalCount: 2 }], // trailing ; as in PayZen's own examples
+    ["RRULE:FREQ=MONTHLY;BYMONTHDAY=10;COUNT=12", undefined], // BYMONTHDAY shifts occurrences
+    ["RRULE:FREQ=WEEKLY;BYDAY=MO", undefined],
+    ["RRULE:FREQ=MONTHLY;BYMONTHDAY=28,29,30,31;BYSETPOS=-1;COUNT=12", undefined], // the documented month-end rule
+    ["RRULE:FREQ=YEARLY;BYMONTHDAY=-1;BYMONTH=1,4,7,10;UNTIL=20221231", undefined],
+    ["RRULE:FREQ=HOURLY;INTERVAL=6", undefined], // sub-daily — PayZen ignores these frequencies
+    ["RRULE:FREQ=MONTHLY;INTERVAL=0", undefined], // no valid cadence
+    ["RRULE:INTERVAL=2", undefined], // no FREQ at all
+    ["garbage", undefined],
+  ];
+  for (const [rrule, expected] of cases) {
+    it(`${rrule} -> ${expected ? `${expected.interval} x${String(expected.intervalCount)}` : "no projection"}`, () => {
+      expect(projectPayZenRrule(rrule)).toEqual(expected);
+    });
+  }
 });
 
 describe("detailedStatus mapping (complete catalog)", () => {
@@ -143,6 +200,15 @@ describe("mapPayZenError (envelope taxonomy)", () => {
     ["PSP_999", null, "psp_unavailable", true],
     ["PSP_514", null, "psp_unavailable", true],
     ["PSP_010", null, "invalid_request", false],
+    ["PSP_030", null, "invalid_request", false], // token not found
+    ["PSP_031", null, "invalid_request", false], // invalid token
+    ["PSP_032", null, "invalid_request", false], // subscriptionId not found
+    ["PSP_033", null, "invalid_request", false], // rrule invalid / recurring payment already canceled
+    ["PSP_563", null, "invalid_request", false], // recurring payment already exists
+    ["PSP_564", null, "invalid_request", false], // recurring payment already terminated
+    ["PSP_565", null, "invalid_request", false],
+    ["PSP_566", null, "invalid_request", false], // invalid recurrence rule
+    ["PSP_567", null, "processing_error", false], // creation failed, cause unstated — never cascades
     ["PSP_108", null, "session_expired", false], // expired formToken — a fresh session recovers, a replay never does
     ["PSP_610", null, "invalid_request", false],
     ["PSP_075", null, "invalid_request", false],

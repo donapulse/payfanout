@@ -3,14 +3,18 @@ import {
   getRefundState,
   isPayFanoutError,
   isUnifiedPaymentStatus,
+  NATIVE_SUBSCRIPTION_INTERVALS,
+  NATIVE_SUBSCRIPTION_STATUSES,
   PAYMENT_METHOD_FLOWS,
   PAYMENT_METHOD_TYPES,
   REFUND_STATUSES,
   WEBHOOK_EVENT_TYPES,
   type AdapterOnboardingDescriptor,
   type CompletePaymentInput,
+  type CreateNativeSubscriptionInput,
   type CreatePaymentSessionInput,
   type MinorUnitAmount,
+  type NativeSubscriptionRecord,
   type PaymentSession,
   type ServerPaymentAdapter,
   type UnifiedErrorCode,
@@ -112,6 +116,28 @@ export interface ServerConformanceFixtures {
      * the fake supports.
      */
     storedToken?(adapter: ServerPaymentAdapter, pspCustomerId: string): Promise<string>;
+  };
+
+  /**
+   * Required when ANY getCapabilities().nativeSubscriptions flag is true —
+   * drives the capability-gated round-trip (create/seed -> retrieve -> paged
+   * list -> cancel, cancel repeated to prove verified idempotency).
+   */
+  nativeSubscriptions?: {
+    /**
+     * create-capable adapters: fresh, valid input the fake accepts. Called
+     * several times per run — every call must be independently creatable
+     * (unique idempotency key, a cadence the PSP supports).
+     */
+    createInput?(): CreateNativeSubscriptionInput;
+    /**
+     * Adapters whose PSP has no server-only create (capability create: false):
+     * plant `count` live subscriptions in the fake and resolve their keys.
+     */
+    seedSubscriptions?(
+      adapter: ServerPaymentAdapter,
+      count: number,
+    ): Promise<Array<{ subscriptionId: string; savedPaymentMethodToken?: string }>>;
   };
 }
 
@@ -238,6 +264,133 @@ export function runServerAdapterConformanceTests(
       await adapter.deleteSavedPaymentMethod!(customer.pspCustomerId, token);
       const afterDelete = await adapter.listSavedPaymentMethods!(customer.pspCustomerId);
       expect(afterDelete.map((m) => m.token)).not.toContain(token);
+    });
+
+    // --- PSP-native subscriptions — every case gates on its own capability
+    // --- flag, so an all-false adapter (no native billing product) skips the
+    // --- whole surface and a partial adapter proves exactly what it declares.
+
+    function expectValidNativeSubscription(record: NativeSubscriptionRecord, pspName: string): void {
+      expect(record.id.length).toBeGreaterThan(0);
+      expect(record.pspName).toBe(pspName);
+      expect(NATIVE_SUBSCRIPTION_STATUSES).toContain(record.status);
+      expect(Number.isSafeInteger(record.amount)).toBe(true);
+      expect(record.currency).toMatch(/^[A-Z]{3}$/);
+      if (record.interval !== undefined) expect(NATIVE_SUBSCRIPTION_INTERVALS).toContain(record.interval);
+      if (record.intervalCount !== undefined) {
+        expect(Number.isInteger(record.intervalCount)).toBe(true);
+        expect(record.intervalCount).toBeGreaterThanOrEqual(1);
+      }
+      if (record.currentPeriodStart) expect(Number.isNaN(Date.parse(record.currentPeriodStart))).toBe(false);
+      if (record.currentPeriodEnd) expect(Number.isNaN(Date.parse(record.currentPeriodEnd))).toBe(false);
+    }
+
+    /** Live subscriptions to run the gated cases against — created, or seeded when the PSP has no create. */
+    async function seedNativeSubscriptions(
+      adapter: ServerPaymentAdapter,
+      count: number,
+    ): Promise<Array<{ subscriptionId: string; savedPaymentMethodToken?: string }>> {
+      if (adapter.getCapabilities().nativeSubscriptions.create) {
+        const keys: Array<{ subscriptionId: string; savedPaymentMethodToken?: string }> = [];
+        for (let i = 0; i < count; i += 1) {
+          const input = fixtures.nativeSubscriptions!.createInput!();
+          const record = await adapter.createNativeSubscription!(input);
+          expectValidNativeSubscription(record, adapter.pspName);
+          const token = record.savedPaymentMethodToken ?? input.savedPaymentMethodToken;
+          keys.push({ subscriptionId: record.id, ...(token ? { savedPaymentMethodToken: token } : {}) });
+        }
+        return keys;
+      }
+      return fixtures.nativeSubscriptions!.seedSubscriptions!(adapter, count);
+    }
+
+    it("supplies native-subscription fixtures for its capabilities", () => {
+      const caps = makeAdapter().getCapabilities().nativeSubscriptions;
+      if (!caps.list && !caps.retrieve && !caps.create && !caps.cancel) return;
+      expect(
+        fixtures.nativeSubscriptions,
+        "adapters declaring native-subscription operations must supply nativeSubscriptions fixtures",
+      ).toBeDefined();
+      if (caps.create) {
+        expect(fixtures.nativeSubscriptions!.createInput, "create-capable adapters must supply createInput").toBeDefined();
+      } else {
+        expect(
+          fixtures.nativeSubscriptions!.seedSubscriptions,
+          "adapters without create must supply seedSubscriptions",
+        ).toBeDefined();
+      }
+    });
+
+    it("creates a native subscription from a vaulted instrument (when supported)", async () => {
+      const adapter = makeAdapter();
+      if (!adapter.getCapabilities().nativeSubscriptions.create) return;
+      const input = fixtures.nativeSubscriptions!.createInput!();
+      const record = await adapter.createNativeSubscription!(input);
+      expectValidNativeSubscription(record, adapter.pspName);
+      expect(record.amount).toBe(input.amount);
+      expect(record.currency).toBe(input.currency.toUpperCase());
+      // A fresh subscription is billable, never born terminal.
+      expect(record.status).not.toBe("canceled");
+      expect(record.status).not.toBe("completed");
+      // The cadence round-trips honestly, not approximately.
+      if (input.interval) expect(record.interval).toBe(input.interval);
+    });
+
+    it("retrieves a native subscription by id (when supported)", async () => {
+      const adapter = makeAdapter();
+      if (!adapter.getCapabilities().nativeSubscriptions.retrieve) return;
+      const [key] = await seedNativeSubscriptions(adapter, 1);
+      const record = await adapter.retrieveNativeSubscription!({
+        subscriptionId: key!.subscriptionId,
+        ...(key!.savedPaymentMethodToken ? { savedPaymentMethodToken: key!.savedPaymentMethodToken } : {}),
+      });
+      expect(record.id).toBe(key!.subscriptionId);
+      expectValidNativeSubscription(record, adapter.pspName);
+    });
+
+    it("pages native subscriptions honoring limit and nextCursor (when supported)", async () => {
+      const adapter = makeAdapter();
+      if (!adapter.getCapabilities().nativeSubscriptions.list) return;
+      const seeded = await seedNativeSubscriptions(adapter, 2);
+      const seen = new Set<string>();
+      let cursor: string | undefined;
+      // Bounded walk: a fake that never exhausts its cursor must fail, not hang.
+      for (let page = 0; page < 10; page += 1) {
+        const result = await adapter.listNativeSubscriptions!({ limit: 1, ...(cursor ? { cursor } : {}) });
+        expect(result.subscriptions.length).toBeLessThanOrEqual(1);
+        for (const record of result.subscriptions) {
+          expectValidNativeSubscription(record, adapter.pspName);
+          expect(seen.has(record.id), `duplicate id ${record.id} across pages`).toBe(false);
+          seen.add(record.id);
+        }
+        if (!result.nextCursor) break;
+        cursor = result.nextCursor;
+      }
+      for (const key of seeded) expect(seen).toContain(key.subscriptionId);
+      expect(seen.size).toBeGreaterThanOrEqual(2);
+    });
+
+    it("cancels a native subscription and treats a repeat cancel as success (when supported)", async () => {
+      const adapter = makeAdapter();
+      if (!adapter.getCapabilities().nativeSubscriptions.cancel) return;
+      const [key] = await seedNativeSubscriptions(adapter, 1);
+      const target = {
+        subscriptionId: key!.subscriptionId,
+        ...(key!.savedPaymentMethodToken ? { savedPaymentMethodToken: key!.savedPaymentMethodToken } : {}),
+      };
+      const canceled = await adapter.cancelNativeSubscription!({
+        ...target,
+        idempotencyKey: `conformance-${name}-nsub-cancel`,
+      });
+      expectValidNativeSubscription(canceled, adapter.pspName);
+      expect(canceled.status).toBe("canceled");
+      // Verified-idempotent: stopping billing that is already stopped is
+      // success, never an error — adoption flows replay cancels.
+      const replayed = await adapter.cancelNativeSubscription!({
+        ...target,
+        idempotencyKey: `conformance-${name}-nsub-cancel-again`,
+      });
+      expect(replayed.status).toBe("canceled");
     });
 
     it("supplies money fixtures for its money capabilities", () => {

@@ -3,6 +3,7 @@ import type {
   GoCardlessEventLike,
   GoCardlessPaymentLike,
   GoCardlessRefundLike,
+  GoCardlessSubscriptionLike,
 } from "../src/index.js";
 
 interface FakeBillingRequest extends GoCardlessBillingRequestLike {
@@ -37,10 +38,12 @@ const BASE_TIME = Date.parse("2026-07-07T10:00:00.000Z");
  * the HTTP layer. Reproduces the documented behaviors the adapter depends on:
  * envelope-wrapped JSON, Bearer + GoCardless-Version header requirements,
  * Idempotency-Key consumption answering 409 idempotent_creation_conflict with
- * links.conflicting_resource_id (billing requests and refunds — flow creates
- * never dedupe, matching the sandbox), invalid_state on bad transitions, the
- * refunds feature gate (403 until enabled), total_amount_confirmation
- * checking, the ?payment= filter on GET /refunds, and cursor pagination.
+ * links.conflicting_resource_id (billing requests, refunds, and subscriptions
+ * — flow creates never dedupe, matching the sandbox), invalid_state on bad
+ * transitions (including cancelling an already-cancelled/finished
+ * subscription), the refunds feature gate (403 until enabled),
+ * total_amount_confirmation checking, the ?payment= filter on GET /refunds,
+ * and cursor pagination.
  */
 export class FakeGoCardlessApi {
   private readonly billingRequests = new Map<string, FakeBillingRequest>();
@@ -48,6 +51,7 @@ export class FakeGoCardlessApi {
   private readonly payments = new Map<string, GoCardlessPaymentLike>();
   private readonly refunds = new Map<string, GoCardlessRefundLike>();
   private readonly mandates = new Map<string, FakeMandate>();
+  private readonly subscriptions = new Map<string, GoCardlessSubscriptionLike>();
   private readonly events: Array<GoCardlessEventLike & { id: string; created_at: string }> = [];
   /** Consumed Idempotency-Keys per collection — replay 409s like the real API. */
   private readonly idempotencyKeys = new Map<string, string>();
@@ -59,6 +63,7 @@ export class FakeGoCardlessApi {
   mandateLookupFails = false;
   uniqueBillingRequestCreations = 0;
   uniqueRefundCreations = 0;
+  uniqueSubscriptionCreations = 0;
   /** Total fetch invocations — asserts the verifyCredentials probe is single-shot. */
   callCount = 0;
   lastRequestBody: Record<string, unknown> | undefined;
@@ -118,6 +123,33 @@ export class FakeGoCardlessApi {
       return this.createFlow(body!);
     }
     if (method === "POST" && path === "/refunds") return this.createRefund(body!, idempotencyKey);
+    if (method === "POST" && path === "/subscriptions") {
+      return this.createSubscription(body!, idempotencyKey);
+    }
+    if (method === "GET" && path === "/subscriptions") {
+      const { page, after } = this.paginate([...this.subscriptions.values()], parsed.searchParams);
+      return json(200, { subscriptions: page, meta: { cursors: { before: null, after }, limit: 50 } });
+    }
+    const subCancelMatch = /^\/subscriptions\/([^/]+)\/actions\/cancel$/.exec(path);
+    if (method === "POST" && subCancelMatch) {
+      const subscription = this.subscriptions.get(decodeURIComponent(subCancelMatch[1]!));
+      if (!subscription) return notFound("subscription");
+      // Real API: cancel fails with cancellation_failed once the subscription
+      // is already cancelled or finished.
+      if (subscription.status === "cancelled" || subscription.status === "finished") {
+        return invalidState("Subscription is already cancelled or finished");
+      }
+      subscription.status = "cancelled";
+      subscription.upcoming_payments = [];
+      this.recordEvent("subscriptions", "cancelled", { subscription: subscription.id });
+      return json(200, { subscriptions: subscription });
+    }
+    const subMatch = /^\/subscriptions\/([^/]+)$/.exec(path);
+    if (method === "GET" && subMatch) {
+      const subscription = this.subscriptions.get(decodeURIComponent(subMatch[1]!));
+      if (!subscription) return notFound("subscription");
+      return json(200, { subscriptions: subscription });
+    }
 
     const brMatch = /^\/billing_requests\/([^/]+)$/.exec(path);
     if (method === "GET" && brMatch) {
@@ -329,6 +361,69 @@ export class FakeGoCardlessApi {
     return json(201, { refunds: refund });
   }
 
+  private createSubscription(body: Record<string, unknown>, idempotencyKey?: string): Response {
+    const replay = this.idempotentReplay("subscriptions", idempotencyKey);
+    if (replay) return replay;
+    const request = body["subscriptions"] as {
+      amount?: number;
+      currency?: string;
+      interval_unit?: string;
+      interval?: number;
+      start_date?: string;
+      name?: string;
+      metadata?: Record<string, string>;
+      links?: { mandate?: string };
+    };
+    const mandateId = request?.links?.mandate;
+    if (!mandateId || !this.mandates.has(mandateId)) {
+      return validationFailed("links.mandate", "must exist");
+    }
+    if (typeof request.amount !== "number" || request.amount <= 0) {
+      return validationFailed("amount", "must be greater than 0");
+    }
+    if (!["AUD", "CAD", "DKK", "EUR", "GBP", "NZD", "SEK", "USD"].includes(request.currency ?? "")) {
+      return validationFailed("currency", "is not a supported subscription currency");
+    }
+    if (!["weekly", "monthly", "yearly"].includes(request.interval_unit ?? "")) {
+      return validationFailed("interval_unit", "must be one of weekly, monthly, yearly");
+    }
+    if (request.start_date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(request.start_date)) {
+      return validationFailed("start_date", "must be formatted YYYY-MM-DD");
+    }
+    if (request.metadata && Object.keys(request.metadata).length > 3) {
+      return validationFailed("metadata", "must have at most 3 keys");
+    }
+    if (request.name !== undefined && request.name.length > 255) {
+      return validationFailed("name", "must not exceed 255 characters");
+    }
+    const interval = request.interval ?? 1;
+    // Real API: start_date defaults to the mandate's next_possible_charge_date.
+    const start = request.start_date ?? this.nextTimestamp().slice(0, 10);
+    const stepDays = request.interval_unit === "weekly" ? 7 : request.interval_unit === "monthly" ? 30 : 365;
+    const subscription: GoCardlessSubscriptionLike = {
+      id: `SB${String(++this.seq).padStart(6, "0")}`,
+      created_at: this.nextTimestamp(),
+      amount: request.amount,
+      currency: request.currency!,
+      status: "active",
+      start_date: start,
+      interval,
+      interval_unit: request.interval_unit!,
+      upcoming_payments: [
+        { charge_date: start, amount: request.amount },
+        { charge_date: addDays(start, stepDays * interval), amount: request.amount },
+      ],
+      ...(request.name !== undefined ? { name: request.name } : {}),
+      ...(request.metadata ? { metadata: request.metadata } : {}),
+      links: { mandate: mandateId },
+    };
+    this.subscriptions.set(subscription.id, subscription);
+    this.consumeKey("subscriptions", idempotencyKey, subscription.id);
+    this.uniqueSubscriptionCreations++;
+    this.recordEvent("subscriptions", "created", { subscription: subscription.id });
+    return json(201, { subscriptions: subscription });
+  }
+
   // --- Scenario helpers (sandbox-simulator stand-ins) ------------------------
 
   /** Hosted-flow completion: fulfils the billing request, creating its payment + mandate. */
@@ -393,6 +488,43 @@ export class FakeGoCardlessApi {
     const refund = this.refunds.get(refundId);
     if (!refund) throw new Error(`no refund ${refundId}`);
     refund.status = status;
+  }
+
+  /** Seeds an active mandate directly — the charging handle subscriptions require. */
+  seedMandate(fields: Partial<FakeMandate> = {}): { id: string } {
+    const mandate: FakeMandate = {
+      id: `MD${String(++this.seq).padStart(6, "0")}`,
+      reference: `REF-${this.seq}`,
+      scheme: "bacs",
+      status: "active",
+      created_at: this.nextTimestamp(),
+      ...fields,
+    };
+    this.mandates.set(mandate.id, mandate);
+    return { id: mandate.id };
+  }
+
+  /** Seeds a subscription directly (status tables, mapping tests). */
+  seedSubscription(fields: Partial<GoCardlessSubscriptionLike> = {}): GoCardlessSubscriptionLike {
+    const subscription: GoCardlessSubscriptionLike = {
+      id: `SB${String(++this.seq).padStart(6, "0")}`,
+      created_at: this.nextTimestamp(),
+      amount: 2500,
+      currency: "GBP",
+      status: "active",
+      interval: 1,
+      interval_unit: "monthly",
+      links: { mandate: this.seedMandate().id },
+      ...fields,
+    };
+    this.subscriptions.set(subscription.id, subscription);
+    return subscription;
+  }
+
+  setSubscriptionStatus(subscriptionId: string, status: string): void {
+    const subscription = this.subscriptions.get(subscriptionId);
+    if (!subscription) throw new Error(`no subscription ${subscriptionId}`);
+    subscription.status = status;
   }
 
   /** Seeds a payment directly (status tables, listing tests). */
@@ -480,6 +612,10 @@ export class FakeGoCardlessApi {
   private consumeKey(collection: string, idempotencyKey: string | undefined, resourceId: string): void {
     if (idempotencyKey) this.idempotencyKeys.set(`${collection}:${idempotencyKey}`, resourceId);
   }
+}
+
+function addDays(date: string, days: number): string {
+  return new Date(Date.parse(`${date}T00:00:00.000Z`) + days * 86_400_000).toISOString().slice(0, 10);
 }
 
 function json(status: number, body: unknown): Response {

@@ -188,6 +188,18 @@ runServerAdapterConformanceTests(
         expectedCode: "rate_limited",
       },
     ],
+    nativeSubscriptions: {
+      // A GoCardless subscription charges a MANDATE — the mandate id is the
+      // savedPaymentMethodToken. Each call seeds its own mandate so every
+      // create is independently creatable.
+      createInput: () => ({
+        savedPaymentMethodToken: lastFake.seedMandate().id,
+        amount: 1099,
+        currency: "GBP",
+        interval: "month",
+        idempotencyKey: `k-nsub-${Math.random()}`,
+      }),
+    },
     idempotency: {
       // Sessions cannot prove byte-identical replays: GoCardless never
       // dedupes flow creates (sandbox-verified), so a replayed session gets a

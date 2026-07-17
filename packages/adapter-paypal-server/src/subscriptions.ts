@@ -102,11 +102,20 @@ const INTERVAL_MAP: Record<string, NativeSubscriptionInterval> = {
 
 /**
  * Normalizes a Subscriptions v1 subscription object into the unified record.
- * The recurring amount comes from the first REGULAR billing cycle's
- * pricing_scheme.fixed_price (requires the GET to have carried `fields=plan`);
- * tier-priced plans have no fixed_price, so the last collected payment amount
- * is the fallback. A subscription reporting neither is rejected rather than
- * given an invented amount.
+ * The recurring amount ladder (each rung falls through when unusable):
+ *
+ * 1. The first REGULAR billing cycle's pricing_scheme.fixed_price — a
+ *    PER-UNIT price on quantity-based plans, so it is multiplied by the
+ *    subscription's `quantity` (integer minor units × integer count stays
+ *    exact; the default single unit applies when quantity is absent, and a
+ *    non-integer or unparsable quantity invalidates the rung rather than
+ *    rounding an invented number). Requires the GET to have carried
+ *    `fields=plan`.
+ * 2. billing_info.last_payment.amount — already the collected TOTAL for the
+ *    whole quantity, so it is NEVER multiplied.
+ * 3. Amount 0 with the truth on `raw` — an un-projectable subscription (e.g.
+ *    a tier-priced plan that never billed) must not reject a whole list page
+ *    or stall an adoption walk over one record.
  */
 export function paypalSubscriptionToRecord(subscription: PayPalSubscriptionLike): NativeSubscriptionRecord {
   const id = subscription.id;
@@ -114,21 +123,14 @@ export function paypalSubscriptionToRecord(subscription: PayPalSubscriptionLike)
     throw PayFanoutError.invalidRequest("PayPal returned a subscription without an id", subscription);
   }
   const regular = regularBillingCycle(subscription);
-  const money = regular?.pricing_scheme?.fixed_price?.value !== undefined
-    ? regular.pricing_scheme.fixed_price
-    : subscription.billing_info?.last_payment?.amount;
-  if (money?.value === undefined || !money.currency_code) {
-    throw new PayFanoutError({
-      code: "invalid_request",
-      message:
-        `PayPal subscription "${id}" reports no recurring amount — the plan's regular billing cycle has no ` +
-        "fixed_price and no payment has been collected yet",
-      retryable: false,
-      raw: subscription,
-      pspName: PAYPAL_PSP_NAME,
-    });
-  }
-  const currency = normalizeCurrency(money.currency_code);
+  const fixedPrice = regular?.pricing_scheme?.fixed_price;
+  const lastPayment = subscription.billing_info?.last_payment?.amount;
+  const projected =
+    perUnitTimesQuantity(fixedPrice, subscription.quantity) ??
+    moneyToMinor(lastPayment) ?? {
+      amount: 0,
+      currency: fallbackCurrency(subscription, fixedPrice),
+    };
   const interval = INTERVAL_MAP[(regular?.frequency?.interval_unit ?? "").toUpperCase()];
   const intervalCount = regular?.frequency?.interval_count;
   const customer = subscriptionCustomer(subscription);
@@ -137,8 +139,8 @@ export function paypalSubscriptionToRecord(subscription: PayPalSubscriptionLike)
     id,
     pspName: PAYPAL_PSP_NAME,
     status: mapPayPalSubscriptionStatus(subscription.status),
-    amount: fromPayPalValue(money.value, currency),
-    currency,
+    amount: projected.amount,
+    currency: projected.currency,
     ...(interval ? { interval } : {}),
     ...(interval
       ? { intervalCount: Number.isInteger(intervalCount) && intervalCount! >= 1 ? intervalCount! : 1 }
@@ -153,6 +155,68 @@ export function paypalSubscriptionToRecord(subscription: PayPalSubscriptionLike)
     ...(subscription.plan_id ? { planId: subscription.plan_id } : {}),
     raw: subscription,
   };
+}
+
+/**
+ * Rung 1: fixed_price is the documented per-unit price ("$4 per unit × 10
+ * units" in PayPal's pricing-plans guide), so the recurring charge is
+ * per-unit × quantity. Minor units are multiplied AFTER conversion (integer ×
+ * integer stays exact); an unsafe product invalidates the rung.
+ */
+function perUnitTimesQuantity(
+  fixedPrice: PayPalSubscriptionMoney | undefined,
+  quantity: string | undefined,
+): { amount: number; currency: string } | undefined {
+  const perUnit = moneyToMinor(fixedPrice);
+  const count = parseQuantity(quantity);
+  if (!perUnit || count === undefined) return undefined;
+  const amount = perUnit.amount * count;
+  return Number.isSafeInteger(amount) ? { amount, currency: perUnit.currency } : undefined;
+}
+
+/**
+ * The subscription `quantity` is a decimal string on the wire. Absent means a
+ * single unit; anything that is not a positive integer count makes the
+ * per-unit rung unusable — never rounded into an invented amount.
+ */
+function parseQuantity(quantity: string | undefined): number | undefined {
+  if (quantity === undefined) return 1;
+  if (!/^\d+$/.test(quantity)) return undefined;
+  const count = Number(quantity);
+  return Number.isSafeInteger(count) && count >= 1 ? count : undefined;
+}
+
+/** Converts a PayPal money object; an incomplete or unconvertible one disables its rung instead of throwing. */
+function moneyToMinor(
+  money: PayPalSubscriptionMoney | undefined,
+): { amount: number; currency: string } | undefined {
+  if (money?.value === undefined || !money.currency_code) return undefined;
+  try {
+    const currency = normalizeCurrency(money.currency_code);
+    return { amount: fromPayPalValue(money.value, currency), currency };
+  } catch {
+    // Unparsable value or a currency outside PayPal's own set — this rung
+    // cannot produce a faithful amount, and one bad money object must not
+    // reject the record (or the whole list page carrying it).
+    return undefined;
+  }
+}
+
+/** Best currency fact for the 0-amount projection; "" when the subscription carries no money object at all. */
+function fallbackCurrency(
+  subscription: PayPalSubscriptionLike,
+  fixedPrice: PayPalSubscriptionMoney | undefined,
+): string {
+  const candidates = [
+    fixedPrice?.currency_code,
+    subscription.billing_info?.last_payment?.amount?.currency_code,
+    subscription.billing_info?.outstanding_balance?.currency_code,
+  ];
+  for (const candidate of candidates) {
+    const code = candidate?.trim().toUpperCase();
+    if (code && /^[A-Z]{3}$/.test(code)) return code;
+  }
+  return "";
 }
 
 /** The first REGULAR cycle by sequence — trial cycles run first and are temporary, never the recurring price. */

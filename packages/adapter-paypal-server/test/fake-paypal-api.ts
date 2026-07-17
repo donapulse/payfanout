@@ -107,6 +107,8 @@ export interface SeedSubscriptionOptions {
   tieredPricing?: boolean;
   /** billing_info.last_payment amount; absent -> no payment collected yet. */
   lastPaymentValue?: string;
+  /** Decimal-string unit count (default "1"); quantity plans price per unit. */
+  quantity?: string;
   customId?: string;
   email?: string;
   /** subscriber.payment_source.card.attributes.vault.id (a vaulted card token). */
@@ -232,7 +234,7 @@ export class FakePayPalApi {
       status_update_time: this.iso(),
       plan_id: options.planId ?? "P-5ML4271244454362WXNWU5NQ",
       ...(options.customId !== undefined ? { custom_id: options.customId } : {}),
-      quantity: "1",
+      quantity: options.quantity ?? "1",
       start_time: this.iso(),
       create_time: this.iso(),
       update_time: this.iso(),

@@ -159,6 +159,44 @@ describe("PayPal retrieveNativeSubscription", () => {
     expect(record.interval).toBe("year");
   });
 
+  it("multiplies the per-unit fixed_price by the subscription quantity", async () => {
+    // Quantity plans price per unit ("$4 per unit × 10 units" in PayPal's
+    // pricing-plans guide) — the recurring charge is per-unit × quantity.
+    const { adapter, fake } = makePair();
+    const doubled = await adapter.retrieveNativeSubscription({
+      subscriptionId: fake.seedSubscription({ value: "15.00", quantity: "2" }),
+    });
+    expect(doubled.amount).toBe(3000);
+
+    // Absent quantity means a single unit — the per-unit price stands alone.
+    const single = paypalSubscriptionToRecord(subscriptionBody("I-ONE"));
+    expect(single.amount).toBe(1500);
+  });
+
+  it("never multiplies the last_payment fallback — it is already the collected total", async () => {
+    const { adapter, fake } = makePair();
+    const id = fake.seedSubscription({ tieredPricing: true, lastPaymentValue: "7.50", quantity: "3" });
+    const record = await adapter.retrieveNativeSubscription({ subscriptionId: id });
+    expect(record.amount).toBe(750); // the total PayPal collected, not 3 x 7.50
+  });
+
+  it("a non-integer quantity disables the per-unit rung instead of rounding", async () => {
+    const { adapter, fake } = makePair();
+    // With a collected payment the ladder lands on that total.
+    const paid = await adapter.retrieveNativeSubscription({
+      subscriptionId: fake.seedSubscription({ value: "15.00", quantity: "2.5", lastPaymentValue: "37.50" }),
+    });
+    expect(paid.amount).toBe(3750);
+    // Without one, the projection is 0 — never a rounded invention.
+    const unpaid = await adapter.retrieveNativeSubscription({
+      subscriptionId: fake.seedSubscription({ value: "15.00", quantity: "2.5" }),
+    });
+    expect(unpaid.amount).toBe(0);
+    expect(unpaid.currency).toBe("USD");
+    // A zero count is no count either.
+    expect(paypalSubscriptionToRecord(subscriptionBody("I-ZERO", { quantity: "0" })).amount).toBe(0);
+  });
+
   it("supports whole-unit currencies through the shared money helpers", async () => {
     const { adapter, fake } = makePair();
     const id = fake.seedSubscription({ currency: "JPY", value: "500" });
@@ -175,13 +213,17 @@ describe("PayPal retrieveNativeSubscription", () => {
     expect(record.interval).toBe("month"); // the cycle's frequency still projects
   });
 
-  it("rejects a subscription with no documented amount source instead of inventing one", async () => {
+  it("projects amount 0 with the truth on raw when no documented amount source exists", async () => {
+    // A tier-priced plan that never billed: no fixed_price, no last_payment.
+    // Rejecting would make the record (and any list page carrying it)
+    // unreachable — the projection keeps the walk alive and raw keeps the truth.
     const { adapter, fake } = makePair();
     const id = fake.seedSubscription({ tieredPricing: true, status: "APPROVAL_PENDING" });
-    await expect(adapter.retrieveNativeSubscription({ subscriptionId: id })).rejects.toMatchObject({
-      code: "invalid_request",
-      message: expect.stringMatching(/no recurring amount/),
-    });
+    const record = await adapter.retrieveNativeSubscription({ subscriptionId: id });
+    expect(record.amount).toBe(0);
+    expect(record.currency).toBe("USD"); // the outstanding_balance currency fact
+    expect(record.status).toBe("pending");
+    expect(record.raw).toBeDefined();
   });
 
   it("maps every documented status and normalizes novelties to unknown", async () => {
@@ -296,7 +338,10 @@ describe("PayPal retrieveNativeSubscription", () => {
       },
     });
     delete body.billing_info;
-    expect(() => paypalSubscriptionToRecord(body)).toThrowError(/no recurring amount/);
+    const record = paypalSubscriptionToRecord(body);
+    expect(record.amount).toBe(0); // never an invented 900
+    expect(record.currency).toBe(""); // no money object carries a currency fact
+    expect(record.raw).toBe(body);
   });
 });
 
@@ -345,6 +390,18 @@ describe("PayPal listNativeSubscriptions", () => {
     const page = await adapter.listNativeSubscriptions();
     expect(page.subscriptions).toEqual([]);
     expect(page.nextCursor).toBeUndefined();
+  });
+
+  it("keeps a page alive when one item has no projectable amount", async () => {
+    const { adapter, fake } = makePair();
+    const priced = fake.seedSubscription({ value: "12.00" });
+    const unpriced = fake.seedSubscription({ tieredPricing: true, status: "APPROVAL_PENDING" });
+    const page = await adapter.listNativeSubscriptions({ limit: 5 });
+    expect(page.subscriptions.map((s) => s.id)).toEqual([priced, unpriced]);
+    expect(page.subscriptions[0]!.amount).toBe(1200);
+    // The un-projectable record rides along as amount 0 instead of failing the walk.
+    expect(page.subscriptions[1]!.amount).toBe(0);
+    expect(page.subscriptions[1]!.raw).toBeDefined();
   });
 
   it("rejects cursors it did not produce", async () => {

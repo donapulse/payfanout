@@ -961,8 +961,12 @@ contract now carries them.
   recurring amount requires `GET {id}?fields=plan` (documented `fields` values are
   exactly `last_failed_payment` and `plan`); list items omit the inline plan, so a list
   page costs 1 + N requests (N ≤ page_size ≤ 20) — amount ladder: REGULAR-cycle
-  `fixed_price` → `billing_info.last_payment.amount` (tiered plans) → reject rather than
-  invent. Cancel declares no PayPal-Request-Id parameter and requires a `reason` body
+  `fixed_price` × `quantity` (per-unit when the plan is quantity-supported, per the
+  pricing-plans guide; quantity parsed as a positive integer, anything else invalidates
+  the rung) → `billing_info.last_payment.amount` (already a collected total, never
+  multiplied) → amount 0 with the truth on `raw` (never invented, and one
+  un-projectable record cannot fail a list page or the adoption walk).
+  Cancel declares no PayPal-Request-Id parameter and requires a `reason` body
   (fixed "Canceled by merchant"); replay safety is the ACTIVE/SUSPENDED-only state
   machine + re-fetch on 422 SUBSCRIPTION_STATUS_INVALID. Statuses:
   APPROVAL_PENDING/APPROVED→pending, SUSPENDED→paused, EXPIRED→completed (finite

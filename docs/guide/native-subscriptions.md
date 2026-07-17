@@ -12,7 +12,7 @@ const made = await payments.createNativeSubscription("stripe", {
   savedPaymentMethodToken: token,      // the vaulted instrument the PSP will charge
   pspCustomerId: customer.pspCustomerId,
   amount: 1099, currency: "USD",
-  interval: "month",                   // or intervalCount: 3, or schedule: "FREQ=..."
+  interval: "month",                   // + optional intervalCount: 3 — or schedule: "FREQ=..."
   idempotencyKey,
 });
 const gone = await payments.cancelNativeSubscription("stripe", { subscriptionId, idempotencyKey });

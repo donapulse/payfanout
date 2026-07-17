@@ -635,12 +635,14 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
   /**
    * Stops PayPal-side billing, verified-idempotent. The cancel endpoint
    * accepts only ACTIVE/SUSPENDED subscriptions (anything else answers 422
-   * SUBSCRIPTION_STATUS_INVALID) and declares no PayPal-Request-Id channel —
-   * the replay guarantee is the state machine itself: on any cancel
-   * rejection the subscription is re-fetched, and a terminal billing state
-   * (CANCELLED or EXPIRED — billing already stopped) resolves as success
-   * with the honest record. Non-terminal states rethrow the cancel error.
-   * The required `reason` body field is filled with a fixed factual default.
+   * SUBSCRIPTION_STATUS_INVALID). The derived PayPal-Request-Id header is
+   * forwarded best-effort even though the cancel operation declares no such
+   * parameter — replay safety rests on the state machine plus re-fetch: on
+   * any cancel rejection the subscription is re-fetched, and a terminal
+   * billing state (CANCELLED or EXPIRED — billing already stopped) resolves
+   * as success with the honest record. Non-terminal states rethrow the
+   * cancel error. The required `reason` body field is filled with a fixed
+   * factual default.
    */
   async cancelNativeSubscription(input: CancelNativeSubscriptionInput): Promise<NativeSubscriptionRecord> {
     if (!input.subscriptionId) {

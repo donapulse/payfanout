@@ -55,10 +55,13 @@ The adapter passes PayPal's own billing product through as unified records —
   a raw card number, which PayFanout never touches). Subscriptions are created in your
   PayPal-hosted flow; PayFanout lists, retrieves, and cancels them.
 - **Recurring amount**: read from the effective plan's REGULAR billing cycle
-  `pricing_scheme.fixed_price` (the detail GET carries `fields=plan` to expand it).
-  Tier-priced plans have no fixed price, so the last collected payment amount is the
-  fallback; a subscription reporting neither is rejected rather than given an invented
-  amount. Taxes, shipping, and quantity multipliers stay on `raw`.
+  `pricing_scheme.fixed_price` (the detail GET carries `fields=plan` to expand it) — a
+  per-unit price, multiplied by the subscription's `quantity` (absent means one unit; a
+  non-integer quantity disables this source rather than rounding). Tier-priced plans have
+  no fixed price, so the last collected payment amount — already the total, never
+  multiplied — is the fallback; a subscription reporting neither projects amount 0 with
+  the truth on `raw`, so one un-projectable record never fails a list page. Taxes and
+  shipping stay on `raw`.
 - **Statuses**: `APPROVAL_PENDING`/`APPROVED` → `pending`, `ACTIVE` → `active`,
   `SUSPENDED` → `paused`, `CANCELLED` → `canceled`, `EXPIRED` → `completed` (a finite
   schedule that ran its cycles), anything unrecognized → `unknown`.
@@ -67,9 +70,11 @@ The adapter passes PayPal's own billing product through as unified records —
   GET per item (≤ 20) on top of the list call. The unfiltered list returns PayPal's own
   default status set — the reference does not enumerate it.
 - **Cancel** is verified-idempotent: the endpoint accepts only ACTIVE/SUSPENDED
-  subscriptions and declares no `PayPal-Request-Id` channel, so on any cancel rejection
-  the adapter re-fetches and treats an already-terminal subscription (CANCELLED/EXPIRED)
-  as success. The required cancel `reason` is filled with a fixed factual default
+  subscriptions, so on any cancel rejection the adapter re-fetches and treats an
+  already-terminal subscription (CANCELLED/EXPIRED) as success. The derived
+  `PayPal-Request-Id` header is forwarded best-effort even though the cancel operation
+  declares no such parameter — replay safety rests on that state machine plus re-fetch.
+  The required cancel `reason` is filled with a fixed factual default
   (`PAYPAL_SUBSCRIPTION_CANCEL_REASON`).
 
 See the [PayPal set-up guide](https://donapulse.github.io/payfanout/guide/paypal) for

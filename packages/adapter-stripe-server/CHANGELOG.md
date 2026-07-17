@@ -1,5 +1,16 @@
 # @payfanout/adapter-stripe-server
 
+## 1.2.0
+
+### Minor Changes
+
+- eed2987: Add PSP-native subscription support over the Stripe Billing Subscriptions API: `listNativeSubscriptions` (cursor paging over Stripe's default not-canceled set), `retrieveNativeSubscription`, `createNativeSubscription`, and `cancelNativeSubscription`. Creation bills an existing Price when `planId` is given, or mints a Product and inline price data under a derived idempotency key when it is not, always with `off_session: true` and `payment_behavior: "error_if_incomplete"` so declined first invoices reject instead of stranding an incomplete subscription; `startAt` maps to a future `billing_cycle_anchor` with proration disabled. Cancellation is verified-idempotent: Stripe ignores idempotency keys on DELETE, so a rejected cancel re-fetches and treats an already-canceled subscription as success. Statuses map into the unified union (`incomplete` to `pending`, `incomplete_expired` to `canceled`, `unpaid` to `past_due`); period bounds are read from the subscription or its items, covering API versions on both sides of 2025-03-31.basil.
+
+### Patch Changes
+
+- Updated dependencies [eed2987]
+  - @payfanout/core@3.0.0
+
 ## 1.1.1
 
 ### Patch Changes

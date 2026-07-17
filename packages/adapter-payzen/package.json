@@ -1,6 +1,6 @@
 {
   "name": "@payfanout/adapter-payzen",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "license": "MIT",
   "description": "Client-side PayZen (Lyra) adapter for PayFanout (krypton-client embedded card fields, confirm-on-client, inline 3DS). No secrets, no server code.",
   "type": "module",

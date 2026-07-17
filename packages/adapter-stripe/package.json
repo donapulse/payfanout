@@ -1,6 +1,6 @@
 {
   "name": "@payfanout/adapter-stripe",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "license": "MIT",
   "description": "Client-side Stripe adapter for PayFanout (Stripe.js + Payment Element). No secrets, no server code.",
   "type": "module",

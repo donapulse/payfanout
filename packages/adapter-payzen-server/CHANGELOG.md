@@ -1,5 +1,16 @@
 # @payfanout/adapter-payzen-server
 
+## 1.3.0
+
+### Minor Changes
+
+- eed2987: Add PSP-native subscription support over the PayZen REST V4 recurrence operations: `retrieveNativeSubscription`, `createNativeSubscription` (`Charge/CreateSubscription`), and `cancelNativeSubscription` (`Subscription/Cancel`). PayZen has no list operation, so `nativeSubscriptions.list` stays false — retain both `subscriptionId` and `paymentMethodToken`, which PayZen requires together on retrieve and cancel. Simple intervals synthesize an `RRULE:FREQ=…;INTERVAL=…` value and RFC 5545 schedules pass through (sub-daily frequencies reject); the subscription's status is derived from `cancelDate`, installment counters, and `effectDate`, since the V4 object carries no status field. Creation applies immediately and PayZen offers no idempotency channel — the adapter never auto-retries it, stamps a deterministic order id for traceability, and documents the at-most-once expectation; cancellation is verified-idempotent by re-fetch across both PayZen rejection channels.
+
+### Patch Changes
+
+- Updated dependencies [eed2987]
+  - @payfanout/core@3.0.0
+
 ## 1.2.0
 
 ### Minor Changes

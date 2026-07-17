@@ -1,5 +1,16 @@
 # @payfanout/adapter-paypal-server
 
+## 1.2.0
+
+### Minor Changes
+
+- eed2987: Add PSP-native subscription support over the PayPal Subscriptions v1 API: `listNativeSubscriptions` (page-number pagination surfaced as an opaque cursor), `retrieveNativeSubscription`, and `cancelNativeSubscription`. Creation is deliberately not offered (`nativeSubscriptions.create: false`): PayPal subscription creation is buyer-approval-gated, so a server-only create against a vaulted token would fake support. Amounts resolve from the plan's regular billing cycle via `?fields=plan` — per-unit price times the subscription quantity — falling back to the last collected payment for tier-priced plans, and degrading to zero with the provider payload preserved on `raw` when no documented amount source exists; list pages complete each item with a detail request. Cancellation sends the required reason and is verified-idempotent: a `SUBSCRIPTION_STATUS_INVALID` rejection re-fetches and treats already-cancelled or expired subscriptions as success. Statuses map into the unified union (`APPROVAL_PENDING`/`APPROVED` to `pending`, `SUSPENDED` to `paused`, `EXPIRED` to `completed`).
+
+### Patch Changes
+
+- Updated dependencies [eed2987]
+  - @payfanout/core@3.0.0
+
 ## 1.1.1
 
 ### Patch Changes

@@ -1,5 +1,12 @@
 # @payfanout/adapter-gocardless
 
+## 0.2.7
+
+### Patch Changes
+
+- Updated dependencies [eed2987]
+  - @payfanout/core@3.0.0
+
 ## 0.2.6
 
 ### Patch Changes

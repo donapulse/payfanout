@@ -1,6 +1,6 @@
 {
   "name": "@payfanout/adapter-worldline-server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "description": "Server-side Worldline Direct adapter for PayFanout (Online Payments REST v2: Hosted Tokenization, Payments, Captures, Refunds, Webhooks). Holds secrets — never bundle client-side.",
   "type": "module",

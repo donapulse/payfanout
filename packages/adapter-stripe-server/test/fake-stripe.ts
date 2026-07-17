@@ -5,9 +5,12 @@ import type {
   StripeListLike,
   StripePaymentIntentLike,
   StripePaymentMethodLike,
+  StripePriceLike,
+  StripeProductLike,
   StripeRefundLike,
   StripeRequestOptions,
   StripeSetupIntentLike,
+  StripeSubscriptionLike,
 } from "../src/index.js";
 
 /** Plain-object Stripe-style error, matching the SDK's structural shape. */
@@ -33,11 +36,18 @@ export class FakeStripe implements StripeClientLike {
   private readonly storedEvents: StripeEventLike[] = [];
   private readonly storedCustomers = new Map<string, StripeCustomerLike>();
   private readonly storedPaymentMethods = new Map<string, StripePaymentMethodLike>();
+  private readonly storedSubscriptions = new Map<string, StripeSubscriptionLike>();
+  private readonly storedPrices = new Map<string, StripePriceLike>();
+  private readonly storedProducts = new Map<string, StripeProductLike>();
   private readonly idempotentCreates = new Map<string, StripePaymentIntentLike>();
   private readonly idempotentRefunds = new Map<string, StripeRefundLike>();
+  private readonly idempotentSubscriptions = new Map<string, StripeSubscriptionLike>();
+  private readonly idempotentProducts = new Map<string, StripeProductLike>();
   private seq = 0;
   uniquePaymentIntentCreations = 0;
   uniqueRefundCreations = 0;
+  uniqueSubscriptionCreations = 0;
+  uniqueProductCreations = 0;
   readonly detachedPaymentMethods: string[] = [];
   /** Params of every customers.listPaymentMethods call — for pagination assertions. */
   readonly listPaymentMethodsCalls: Array<Record<string, unknown> | undefined> = [];
@@ -45,6 +55,10 @@ export class FakeStripe implements StripeClientLike {
   lastPaymentIntentParams: Record<string, unknown> | undefined;
   /** Params of the last setupIntents.create call — for mapping assertions. */
   lastSetupIntentParams: Record<string, unknown> | undefined;
+  /** Params of the last subscriptions.create call — for mapping assertions. */
+  lastSubscriptionParams: Record<string, unknown> | undefined;
+  /** Params of the last products.create call — for mapping assertions. */
+  lastProductParams: Record<string, unknown> | undefined;
   private nextError: object | undefined;
 
   failNextWith(err: object): void {
@@ -386,6 +400,248 @@ export class FakeStripe implements StripeClientLike {
       return paginate(refunds, params, (r) => r.id, (r) => r.created ?? 0);
     },
   };
+
+  products = {
+    create: async (params: Record<string, unknown>, opts?: StripeRequestOptions): Promise<StripeProductLike> => {
+      this.throwPending();
+      this.lastProductParams = params;
+      if (opts?.idempotencyKey && this.idempotentProducts.has(opts.idempotencyKey)) {
+        return this.idempotentProducts.get(opts.idempotencyKey)!;
+      }
+      if (typeof params["name"] !== "string" || params["name"].length === 0) {
+        throw stripeError({
+          type: "StripeInvalidRequestError",
+          statusCode: 400,
+          message: "Missing required param: name.",
+        });
+      }
+      const product: StripeProductLike = { id: `prod_${++this.seq}`, name: params["name"] };
+      this.storedProducts.set(product.id, product);
+      this.uniqueProductCreations++;
+      if (opts?.idempotencyKey) this.idempotentProducts.set(opts.idempotencyKey, product);
+      return product;
+    },
+  };
+
+  subscriptions = {
+    create: async (params: Record<string, unknown>, opts?: StripeRequestOptions): Promise<StripeSubscriptionLike> => {
+      this.throwPending();
+      this.lastSubscriptionParams = params;
+      if (opts?.idempotencyKey && this.idempotentSubscriptions.has(opts.idempotencyKey)) {
+        return this.idempotentSubscriptions.get(opts.idempotencyKey)!;
+      }
+      const customerId = params["customer"] as string | undefined;
+      if (!customerId || !this.storedCustomers.has(customerId)) this.notFound("customer", String(customerId));
+      const items = params["items"] as Array<Record<string, unknown>> | undefined;
+      const firstItem = items?.[0];
+      if (!firstItem) {
+        throw stripeError({
+          type: "StripeInvalidRequestError",
+          statusCode: 400,
+          message: "Missing required param: items.",
+        });
+      }
+      let price: StripePriceLike;
+      if (typeof firstItem["price"] === "string") {
+        const existing = this.storedPrices.get(firstItem["price"]);
+        if (!existing) this.notFound("price", firstItem["price"]);
+        price = existing;
+      } else {
+        // Real Stripe requires an EXISTING product id inside price_data —
+        // subscription items accept no inline product_data.
+        const priceData = firstItem["price_data"] as Record<string, unknown> | undefined;
+        const productId = priceData?.["product"];
+        if (typeof productId !== "string") {
+          throw stripeError({
+            type: "StripeInvalidRequestError",
+            statusCode: 400,
+            message: "Missing required param: items[0][price_data][product].",
+          });
+        }
+        if (!this.storedProducts.has(productId)) this.notFound("product", productId);
+        const recurring = priceData?.["recurring"] as Record<string, unknown> | undefined;
+        if (typeof recurring?.["interval"] !== "string") {
+          throw stripeError({
+            type: "StripeInvalidRequestError",
+            statusCode: 400,
+            message: "Missing required param: items[0][price_data][recurring][interval].",
+          });
+        }
+        price = {
+          id: `price_${++this.seq}`,
+          currency: priceData?.["currency"] as string,
+          unit_amount: priceData?.["unit_amount"] as number,
+          recurring: {
+            interval: recurring["interval"],
+            ...(typeof recurring["interval_count"] === "number"
+              ? { interval_count: recurring["interval_count"] }
+              : {}),
+          },
+        };
+        this.storedPrices.set(price.id, price);
+      }
+      const pmId = params["default_payment_method"] as string | undefined;
+      const pm = pmId ? this.storedPaymentMethods.get(pmId) : undefined;
+      if (!pm) this.notFound("payment_method", String(pmId));
+      const owner = typeof pm.customer === "string" ? pm.customer : pm.customer?.id;
+      if (owner !== customerId) {
+        throw stripeError({
+          type: "StripeInvalidRequestError",
+          statusCode: 400,
+          message: "The default payment method must be attached to the customer.",
+        });
+      }
+      // A future billing_cycle_anchor with proration "none" invoices nothing
+      // at creation — only an immediate first invoice can fail the create
+      // under payment_behavior error_if_incomplete.
+      const anchor = params["billing_cycle_anchor"] as number | undefined;
+      const invoicedNow = anchor === undefined;
+      if (invoicedNow && params["payment_behavior"] === "error_if_incomplete") {
+        if ((pm as unknown as Record<string, unknown>)["__behavior"] === "auth_required") {
+          throw stripeError({
+            type: "StripeCardError",
+            statusCode: 402,
+            code: "authentication_required",
+            decline_code: "authentication_required",
+            message: "This payment requires authentication.",
+          });
+        }
+        if ((pm as unknown as Record<string, unknown>)["__behavior"] === "declined") {
+          throw stripeError({
+            type: "StripeCardError",
+            statusCode: 402,
+            code: "card_declined",
+            decline_code: "insufficient_funds",
+            message: "Your card has insufficient funds.",
+          });
+        }
+      }
+      const created = 1_780_000_000 + this.seq;
+      const sub: StripeSubscriptionLike = {
+        id: `sub_${++this.seq}`,
+        object: "subscription",
+        status: "active",
+        currency: price.currency,
+        customer: customerId,
+        default_payment_method: pm.id,
+        items: { data: [{ id: `si_${++this.seq}`, price, quantity: 1 }] },
+        metadata: (params["metadata"] as Record<string, string>) ?? {},
+        created,
+        canceled_at: null,
+        // Pinned-version (2024-06-20) shape: the billing period lives on the
+        // subscription itself; basil-shaped records come from seedSubscription.
+        current_period_start: created,
+        current_period_end: anchor ?? created + 2_592_000,
+      };
+      this.storedSubscriptions.set(sub.id, sub);
+      this.uniqueSubscriptionCreations++;
+      if (opts?.idempotencyKey) this.idempotentSubscriptions.set(opts.idempotencyKey, sub);
+      return sub;
+    },
+    retrieve: async (id: string): Promise<StripeSubscriptionLike> => {
+      this.throwPending();
+      const sub = this.storedSubscriptions.get(id);
+      if (!sub) this.notFound("subscription", id);
+      return sub;
+    },
+    list: async (params?: Record<string, unknown>): Promise<StripeListLike<StripeSubscriptionLike>> => {
+      this.throwPending();
+      let subs = [...this.storedSubscriptions.values()].reverse();
+      const status = params?.["status"];
+      // Real default: everything that has NOT been canceled.
+      if (status === undefined) subs = subs.filter((s) => s.status !== "canceled");
+      else if (status !== "all") subs = subs.filter((s) => s.status === status);
+      return paginate(subs, params, (s) => s.id, (s) => s.created);
+    },
+    cancel: async (id: string): Promise<StripeSubscriptionLike> => {
+      this.throwPending();
+      const sub = this.storedSubscriptions.get(id);
+      if (!sub) this.notFound("subscription", id);
+      if (sub.status === "canceled") {
+        throw stripeError({
+          type: "StripeInvalidRequestError",
+          statusCode: 400,
+          message: `Subscription ${id} is already canceled and cannot be canceled again.`,
+        });
+      }
+      sub.status = "canceled";
+      sub.canceled_at = 1_780_000_400;
+      return sub;
+    },
+  };
+
+  /** Test helper: a customer the fixtures can reference synchronously. */
+  seedCustomer(id?: string): StripeCustomerLike {
+    const customer: StripeCustomerLike = { id: id ?? `cus_${++this.seq}`, email: null, name: null, metadata: {} };
+    this.storedCustomers.set(customer.id, customer);
+    return customer;
+  }
+
+  /** Test helper: an existing recurring Price (the planId path). */
+  seedPrice(
+    opts: {
+      id?: string;
+      currency?: string;
+      unitAmount?: number | null;
+      interval?: string;
+      intervalCount?: number;
+      usageType?: string;
+    } = {},
+  ): StripePriceLike {
+    const price: StripePriceLike = {
+      id: opts.id ?? `price_${++this.seq}`,
+      currency: opts.currency ?? "usd",
+      unit_amount: opts.unitAmount === undefined ? 1000 : opts.unitAmount,
+      recurring: {
+        interval: opts.interval ?? "month",
+        ...(opts.intervalCount !== undefined ? { interval_count: opts.intervalCount } : {}),
+        ...(opts.usageType !== undefined ? { usage_type: opts.usageType } : {}),
+      },
+    };
+    this.storedPrices.set(price.id, price);
+    return price;
+  }
+
+  /** Test helper: a stored subscription in an arbitrary shape (statuses, basil item-level periods, multi-item). */
+  seedSubscription(
+    opts: {
+      status?: string;
+      currency?: string;
+      customer?: string;
+      defaultPaymentMethod?: string | null;
+      metadata?: Record<string, string>;
+      items?: Array<{ price: StripePriceLike; quantity?: number | null }>;
+      /** Basil-and-later shape: periods on the items, none on the subscription. */
+      periodsOnItems?: boolean;
+      created?: number;
+    } = {},
+  ): StripeSubscriptionLike {
+    const created = opts.created ?? 1_780_000_000 + this.seq;
+    const itemInputs = opts.items ?? [{ price: this.seedPrice() }];
+    const periodFields = { current_period_start: created, current_period_end: created + 2_592_000 };
+    const sub: StripeSubscriptionLike = {
+      id: `sub_${++this.seq}`,
+      object: "subscription",
+      status: opts.status ?? "active",
+      currency: opts.currency ?? "usd",
+      customer: opts.customer ?? `cus_${++this.seq}`,
+      default_payment_method: opts.defaultPaymentMethod === undefined ? `pm_${++this.seq}` : opts.defaultPaymentMethod,
+      items: {
+        data: itemInputs.map((item) => ({
+          id: `si_${++this.seq}`,
+          price: item.price,
+          quantity: item.quantity === undefined ? 1 : item.quantity,
+          ...(opts.periodsOnItems ? periodFields : {}),
+        })),
+      },
+      metadata: opts.metadata ?? {},
+      created,
+      canceled_at: opts.status === "canceled" ? created + 100 : null,
+      ...(opts.periodsOnItems ? {} : periodFields),
+    };
+    this.storedSubscriptions.set(sub.id, sub);
+    return sub;
+  }
 
   events = {
     list: async (params?: Record<string, unknown>): Promise<StripeListLike<StripeEventLike>> => {

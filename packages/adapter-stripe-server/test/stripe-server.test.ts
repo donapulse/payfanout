@@ -113,6 +113,23 @@ runServerAdapterConformanceTests(
         return session.pspSessionId;
       },
     },
+    nativeSubscriptions: {
+      // Server-only creation needs a customer + an attached vaulted
+      // instrument — seeded synchronously in the fake, like a prior checkout
+      // with savePaymentMethod would have left behind.
+      createInput: () => {
+        const customer = lastFake.seedCustomer();
+        const pm = lastFake.seedPaymentMethod(customer.id);
+        return {
+          pspCustomerId: customer.id,
+          savedPaymentMethodToken: pm.id,
+          amount: 1499,
+          currency: "USD",
+          interval: "month",
+          idempotencyKey: `nsub-${Math.random()}`,
+        };
+      },
+    },
     vault: {
       // Confirm-on-client PSP: vault during checkout, then hand back the token.
       storedToken: async (adapter, pspCustomerId) => {

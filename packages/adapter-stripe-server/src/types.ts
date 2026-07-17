@@ -104,6 +104,53 @@ export interface StripeRefundLike {
   created?: number;
 }
 
+/** Recurring price attached to a subscription item. `unit_amount` is null for tiered/custom pricing. */
+export interface StripePriceLike {
+  id: string;
+  /** Lowercase ISO 4217. */
+  currency?: string;
+  /** Integer minor units per unit; null when billing_scheme is not per_unit. */
+  unit_amount?: number | null;
+  /** usage_type "metered" bills by reported usage — no fixed per-period amount exists. */
+  recurring?: { interval?: string; interval_count?: number; usage_type?: string } | null;
+}
+
+export interface StripeSubscriptionItemLike {
+  id: string;
+  price?: StripePriceLike | null;
+  quantity?: number | null;
+  /** API 2025-03-31.basil moved the billing period from the subscription onto its items. */
+  current_period_start?: number;
+  current_period_end?: number;
+}
+
+/**
+ * Subscription `status` stays a plain string: Stripe's vocabulary is wider
+ * than the unified one and future values must fall through to "unknown"
+ * instead of failing a cast.
+ */
+export interface StripeSubscriptionLike {
+  id: string;
+  object: "subscription";
+  status: string;
+  /** Lowercase ISO 4217 (top-level since long before the pinned version). */
+  currency?: string;
+  customer?: string | { id: string } | null;
+  default_payment_method?: string | { id: string } | null;
+  items?: { data: StripeSubscriptionItemLike[] };
+  metadata?: Record<string, string>;
+  created: number;
+  canceled_at?: number | null;
+  /** Present on API versions before 2025-03-31.basil (the pinned 2024-06-20 included). */
+  current_period_start?: number;
+  current_period_end?: number;
+}
+
+export interface StripeProductLike {
+  id: string;
+  name?: string;
+}
+
 /** Stripe list envelope (auto-pagination is not used — cursors stay explicit). */
 export interface StripeListLike<T> {
   data: T[];
@@ -146,6 +193,16 @@ export interface StripeClientLike {
     create(params: Record<string, unknown>, opts?: StripeRequestOptions): Promise<StripeRefundLike>;
     retrieve(id: string): Promise<StripeRefundLike>;
     list(params?: Record<string, unknown>): Promise<StripeListLike<StripeRefundLike>>;
+  };
+  subscriptions: {
+    create(params: Record<string, unknown>, opts?: StripeRequestOptions): Promise<StripeSubscriptionLike>;
+    retrieve(id: string): Promise<StripeSubscriptionLike>;
+    list(params?: Record<string, unknown>): Promise<StripeListLike<StripeSubscriptionLike>>;
+    /** DELETE — Stripe ignores idempotency keys on it, so cancel takes no request options. */
+    cancel(id: string): Promise<StripeSubscriptionLike>;
+  };
+  products: {
+    create(params: Record<string, unknown>, opts?: StripeRequestOptions): Promise<StripeProductLike>;
   };
   events: {
     list(params?: Record<string, unknown>): Promise<StripeListLike<StripeEventLike>>;

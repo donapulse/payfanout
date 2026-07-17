@@ -2,21 +2,29 @@ import {
   assertMinorUnitAmount,
   getCurrencyExponent,
   lowercaseKeys,
+  NATIVE_SUBSCRIPTION_INTERVALS,
   normalizeCurrency,
   normalizeSecrets,
   PayFanoutError,
   type AdapterCapabilities,
+  type CancelNativeSubscriptionInput,
   type ChargeSavedPaymentMethodInput,
   type CreateCustomerInput,
+  type CreateNativeSubscriptionInput,
   type CreatePaymentSessionInput,
   type CustomerRef,
   type FetchEventsInput,
   type FetchEventsResult,
+  type ListNativeSubscriptionsInput,
+  type ListNativeSubscriptionsResult,
   type ListPaymentsInput,
   type ListPaymentsResult,
   type ListRefundsInput,
   type ListRefundsResult,
   type MinorUnitAmount,
+  type NativeSubscriptionInterval,
+  type NativeSubscriptionRecord,
+  type NativeSubscriptionStatus,
   type PaymentInfo,
   type PaymentMethodCapability,
   type PaymentMethodDetails,
@@ -24,6 +32,7 @@ import {
   type RefundInfo,
   type RefundRequest,
   type RefundResult,
+  type RetrieveNativeSubscriptionInput,
   type SavedPaymentMethod,
   type ScaPreference,
   type ServerPaymentAdapter,
@@ -44,6 +53,7 @@ import type {
   StripeRefundLike,
   StripeServerAdapterConfig,
   StripeSetupIntentLike,
+  StripeSubscriptionLike,
 } from "./types.js";
 import { parseStripeWebhookEvent, stripeEventBodyToUnified, verifyStripeWebhookSignature } from "./webhook.js";
 
@@ -138,6 +148,9 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       supportsSessionUpdate: true, // PaymentIntents update in place
       supportsEventPolling: true, // GET /v1/events
       supportsListing: true,
+      // Stripe Billing subscriptions: the PSP schedules and collects each
+      // installment itself, against a vaulted PaymentMethod.
+      nativeSubscriptions: { list: true, retrieve: true, create: true, cancel: true },
       requiresServerCompletion: false, // Stripe confirms on the client (§4a)
       paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };
@@ -319,6 +332,138 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       const refunds = page.data.map((refund) => toRefundInfo(refund));
       const last = page.data[page.data.length - 1];
       return { refunds, ...(page.has_more && last ? { nextCursor: last.id } : {}) };
+    });
+  }
+
+  // --- PSP-native subscriptions (Stripe Billing) --------------------------
+
+  /**
+   * Pages GET /v1/subscriptions. Stripe's default listing is what this
+   * returns: every subscription that has NOT been canceled (canceled ones are
+   * excluded unless queried directly by id) — the live set an adoption flow
+   * needs, newest first.
+   */
+  async listNativeSubscriptions(input: ListNativeSubscriptionsInput = {}): Promise<ListNativeSubscriptionsResult> {
+    const params: Record<string, unknown> = {
+      limit: clampPageSize(input.limit),
+      ...(input.cursor ? { starting_after: input.cursor } : {}),
+    };
+    return this.run(async (client) => {
+      const page = await client.subscriptions.list(params);
+      const subscriptions = page.data.map((sub) => this.toNativeSubscription(sub));
+      const last = page.data[page.data.length - 1];
+      return { subscriptions, ...(page.has_more && last ? { nextCursor: last.id } : {}) };
+    });
+  }
+
+  /** Stripe keys subscriptions by id alone — `savedPaymentMethodToken` is not needed and ignored. */
+  async retrieveNativeSubscription(input: RetrieveNativeSubscriptionInput): Promise<NativeSubscriptionRecord> {
+    return this.run(async (client) => this.toNativeSubscription(await client.subscriptions.retrieve(input.subscriptionId)));
+  }
+
+  /**
+   * POST /v1/subscriptions against `customer` + `default_payment_method` (the
+   * vaulted token — it must belong to that customer, so `pspCustomerId` is
+   * required here). `planId` (when given) is an existing Stripe Price id;
+   * without one the adapter builds the price inline via `items[].price_data`,
+   * which requires an existing Product — created on the fly (name
+   * `merchantRefNum`, falling back to "Subscription"; it shows on customer
+   * invoices) under a derived idempotency key so replays reuse it.
+   * `off_session: true` + `payment_behavior: "error_if_incomplete"`: a first
+   * invoice that cannot be paid rejects with the mapped card error instead of
+   * leaving an incomplete subscription behind — server-only creation has no
+   * customer present to finish authentication. `startAt` maps to a future
+   * `billing_cycle_anchor` with `proration_behavior: "none"`, making the span
+   * until the anchor free and the first full invoice due at `startAt`.
+   */
+  async createNativeSubscription(input: CreateNativeSubscriptionInput): Promise<NativeSubscriptionRecord> {
+    if (!input.pspCustomerId) {
+      throw PayFanoutError.invalidRequest(
+        "Stripe subscriptions belong to a customer — pspCustomerId is required (create one with createCustomer first)",
+      );
+    }
+    if (input.schedule !== undefined) {
+      throw PayFanoutError.invalidRequest(
+        "Stripe subscriptions accept no RRULE schedule — express the cadence as interval (+ optional intervalCount)",
+      );
+    }
+    if (!input.interval) {
+      throw PayFanoutError.invalidRequest("createNativeSubscription requires interval (day, week, month, or year)");
+    }
+    if (input.intervalCount !== undefined && (!Number.isInteger(input.intervalCount) || input.intervalCount < 1)) {
+      throw PayFanoutError.invalidRequest("intervalCount must be a positive integer");
+    }
+    assertMinorUnitAmount(input.amount, "amount");
+    if (input.amount === 0) {
+      throw PayFanoutError.invalidRequest("createNativeSubscription requires a positive amount");
+    }
+    const currency = normalizeCurrency(input.currency);
+    if (getCurrencyExponent(currency) === 3 && input.amount % 10 !== 0) {
+      throw PayFanoutError.invalidRequest(
+        `Stripe requires three-decimal ${currency} amounts to be a multiple of 10 minor units, got ${input.amount}`,
+      );
+    }
+    const anchor = input.startAt !== undefined ? toEpochSeconds(input.startAt, "startAt") : undefined;
+    const metadata = withMerchantRef(input.metadata, input.merchantRefNum);
+
+    return this.run(async (client) => {
+      let item: Record<string, unknown>;
+      if (input.planId) {
+        item = { price: input.planId };
+      } else {
+        const product = await client.products.create(
+          { name: input.merchantRefNum ?? "Subscription" },
+          { idempotencyKey: `${input.idempotencyKey}-product` },
+        );
+        item = {
+          price_data: {
+            currency: currency.toLowerCase(),
+            product: product.id,
+            recurring: {
+              interval: input.interval,
+              ...(input.intervalCount !== undefined ? { interval_count: input.intervalCount } : {}),
+            },
+            unit_amount: input.amount,
+          },
+        };
+      }
+      const sub = await client.subscriptions.create(
+        {
+          customer: input.pspCustomerId,
+          items: [item],
+          default_payment_method: input.savedPaymentMethodToken,
+          off_session: true,
+          payment_behavior: "error_if_incomplete",
+          ...(anchor !== undefined ? { billing_cycle_anchor: anchor, proration_behavior: "none" } : {}),
+          ...(metadata ? { metadata } : {}),
+        },
+        { idempotencyKey: input.idempotencyKey },
+      );
+      return this.toNativeSubscription(sub);
+    });
+  }
+
+  /**
+   * DELETE /v1/subscriptions/:id — immediate cancellation. Stripe ignores
+   * idempotency keys on DELETE ("no effect" per its idempotency docs), so
+   * none is sent; replay safety is verified instead: when the cancel call
+   * rejects, the subscription is re-fetched and an already-canceled one
+   * resolves as success — a replayed cancel can never fail on its own
+   * earlier success.
+   */
+  async cancelNativeSubscription(input: CancelNativeSubscriptionInput): Promise<NativeSubscriptionRecord> {
+    return this.run(async (client) => {
+      try {
+        return this.toNativeSubscription(await client.subscriptions.cancel(input.subscriptionId));
+      } catch (err) {
+        try {
+          const sub = await client.subscriptions.retrieve(input.subscriptionId);
+          if (mapSubscriptionStatus(sub.status) === "canceled") return this.toNativeSubscription(sub);
+        } catch {
+          // The re-fetch adds nothing here — surface the original cancel error below.
+        }
+        throw mapStripeError(err);
+      }
     });
   }
 
@@ -666,6 +811,56 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     };
   }
 
+  /**
+   * Unified projection of a Stripe subscription. Amount is the per-installment
+   * total: Σ price.unit_amount × quantity over the items — tiered/custom
+   * prices (unit_amount null) and metered prices (billed by reported usage)
+   * have no fixed installment and contribute 0 rather than an invented one;
+   * `raw` keeps the truth. Cadence comes from the first item's price (Stripe
+   * holds every item on a subscription to one shared billing interval).
+   * Period bounds read the subscription's own current_period_* (API versions
+   * before 2025-03-31.basil, the pinned 2024-06-20 included) and fall back to
+   * the first item's (basil moved them there).
+   */
+  private toNativeSubscription(sub: StripeSubscriptionLike): NativeSubscriptionRecord {
+    const items = sub.items?.data ?? [];
+    const first = items[0];
+    const price = first?.price ?? undefined;
+    let amount = 0;
+    for (const item of items) {
+      if (typeof item.price?.unit_amount !== "number") continue;
+      if (item.price.recurring?.usage_type === "metered") continue;
+      amount += item.price.unit_amount * (item.quantity ?? 1);
+    }
+    const recurring = price?.recurring ?? undefined;
+    const interval =
+      recurring?.interval && (NATIVE_SUBSCRIPTION_INTERVALS as readonly string[]).includes(recurring.interval)
+        ? (recurring.interval as NativeSubscriptionInterval)
+        : undefined;
+    const periodStart = sub.current_period_start ?? first?.current_period_start;
+    const periodEnd = sub.current_period_end ?? first?.current_period_end;
+    const pspCustomerId = typeof sub.customer === "string" ? sub.customer : sub.customer?.id;
+    const token =
+      typeof sub.default_payment_method === "string" ? sub.default_payment_method : sub.default_payment_method?.id;
+    const merchantRefNum = sub.metadata?.[MERCHANT_REF_METADATA_KEY];
+    return {
+      id: sub.id,
+      pspName: this.pspName,
+      status: mapSubscriptionStatus(sub.status),
+      amount,
+      currency: (sub.currency ?? price?.currency ?? "").toUpperCase(),
+      ...(interval ? { interval } : {}),
+      ...(interval && recurring?.interval_count !== undefined ? { intervalCount: recurring.interval_count } : {}),
+      ...(periodStart !== undefined ? { currentPeriodStart: new Date(periodStart * 1000).toISOString() } : {}),
+      ...(periodEnd !== undefined ? { currentPeriodEnd: new Date(periodEnd * 1000).toISOString() } : {}),
+      ...(token ? { savedPaymentMethodToken: token } : {}),
+      ...(pspCustomerId ? { pspCustomerId } : {}),
+      ...(merchantRefNum ? { merchantRefNum } : {}),
+      ...(price ? { planId: price.id } : {}),
+      raw: sub,
+    };
+  }
+
   private verificationEnabled(): boolean {
     return (this.config.verifyPaymentMethodStrategy ?? "setup_intent_detach") !== "disabled";
   }
@@ -704,6 +899,50 @@ function withPayfanoutId(
 ): Record<string, string> | undefined {
   if (!id) return metadata;
   return { ...metadata, payfanout_id: id };
+}
+
+/**
+ * Stripe subscriptions have no dedicated merchant-reference field (the
+ * `description` is customer-facing), so `merchantRefNum` rides metadata under
+ * this key and is echoed back from it on every read.
+ */
+const MERCHANT_REF_METADATA_KEY = "payfanout_merchant_ref";
+
+function withMerchantRef(
+  metadata: Record<string, string> | undefined,
+  merchantRefNum: string | undefined,
+): Record<string, string> | undefined {
+  if (!merchantRefNum) return metadata;
+  return { ...metadata, [MERCHANT_REF_METADATA_KEY]: merchantRefNum };
+}
+
+/**
+ * Stripe subscription statuses onto the unified vocabulary. Every wire value
+ * is mapped deliberately:
+ *  - incomplete: awaiting its first successful invoice payment (23-hour
+ *    window) -> "pending".
+ *  - incomplete_expired: that window lapsed — terminal, invoice voided,
+ *    nothing was ever billed -> "canceled".
+ *  - unpaid: retries exhausted, invoicing continues but collection stopped
+ *    pending intervention -> "past_due" (still owed, not terminated).
+ *  - paused: Stripe's paused state (trial ended without a payment method);
+ *    resumable, no invoices while paused -> "paused".
+ * Stripe has no finite-installment plans, so nothing maps to "completed";
+ * unrecognized values fall through to "unknown", never dropped.
+ */
+const STRIPE_SUBSCRIPTION_STATUS_TO_UNIFIED: Record<string, NativeSubscriptionStatus> = {
+  incomplete: "pending",
+  incomplete_expired: "canceled",
+  trialing: "trialing",
+  active: "active",
+  past_due: "past_due",
+  unpaid: "past_due",
+  canceled: "canceled",
+  paused: "paused",
+};
+
+function mapSubscriptionStatus(status: string): NativeSubscriptionStatus {
+  return STRIPE_SUBSCRIPTION_STATUS_TO_UNIFIED[status] ?? "unknown";
 }
 
 /**

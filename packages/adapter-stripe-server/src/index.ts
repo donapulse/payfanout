@@ -14,8 +14,12 @@ export type {
   StripeListLike,
   StripePaymentIntentLike,
   StripePaymentMethodLike,
+  StripePriceLike,
+  StripeProductLike,
   StripeRefundLike,
   StripeRequestOptions,
   StripeServerAdapterConfig,
   StripeSetupIntentLike,
+  StripeSubscriptionItemLike,
+  StripeSubscriptionLike,
 } from "./types.js";

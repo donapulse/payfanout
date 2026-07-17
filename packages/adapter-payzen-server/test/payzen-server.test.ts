@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { getRefundState, isPayFanoutError, type PaymentMethodCapability } from "@payfanout/core";
+import {
+  getRefundState,
+  isPayFanoutError,
+  type NativeSubscriptionInterval,
+  type PaymentMethodCapability,
+} from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
 import { payzenOnboarding, PayZenServerAdapter, type PayZenServerAdapterConfig } from "../src/index.js";
 import { FakePayZenApi } from "./fake-payzen-api.js";
@@ -67,6 +72,13 @@ const UNKNOWN_IPN_HEADERS = {
 
 const key = (): string => `k-${Math.random().toString(36).slice(2)}`;
 
+/**
+ * A fake vaulted paymentMethodToken in the platform's shape (the request
+ * schema's own sample value). The fake accepts any non-empty token and keys
+ * each subscription by subscriptionId + this token, like the real gateway.
+ */
+const MUT = "c701ad46ef37493cab6a7b2b060e4a68";
+
 // ---------------------------------------------------------------------------
 // The exact same conformance contract the Stripe and Paysafe adapters pass.
 //
@@ -131,6 +143,18 @@ runServerAdapterConformanceTests(
         const session = await adapter.createPaymentSession({ amount: 2000, currency: "EUR", idempotencyKey: key() });
         return lastFake.payOrder(session.pspSessionId).uuid; // AUTHORISED — cancelable until the batch
       },
+    },
+    // The suite skips the list case by itself (capability list: false — PayZen
+    // has no subscription list/search API) and threads the token from the
+    // created record into retrieve/cancel, exactly what hosts must do.
+    nativeSubscriptions: {
+      createInput: () => ({
+        savedPaymentMethodToken: MUT,
+        amount: 990,
+        currency: "EUR",
+        interval: "month",
+        idempotencyKey: key(),
+      }),
     },
     failingCalls: [
       {
@@ -1074,5 +1098,528 @@ describe("PayZenServerAdapter verifyCredentials (Test connection probe)", () => 
       category: "internal",
       message: "Could not verify PayZen credentials.",
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PSP-native subscriptions: Charge/CreateSubscription, Subscription/Get,
+// Subscription/Cancel — keyed by subscriptionId + paymentMethodToken.
+// ---------------------------------------------------------------------------
+describe("PayZenServerAdapter native subscriptions", () => {
+  const NOW = Date.UTC(2026, 6, 7, 10, 0, 0);
+  const makeSubPair = (config: Parameters<typeof makePair>[0] = {}): ReturnType<typeof makePair> =>
+    makePair({ now: () => NOW, ...config });
+  const createInput = (overrides: Record<string, unknown> = {}): Parameters<PayZenServerAdapter["createNativeSubscription"]>[0] =>
+    ({
+      savedPaymentMethodToken: MUT,
+      amount: 990,
+      currency: "EUR",
+      interval: "month",
+      idempotencyKey: key(),
+      ...overrides,
+    }) as Parameters<PayZenServerAdapter["createNativeSubscription"]>[0];
+
+  it("declares the per-operation capability block honestly — PayZen has no list API", () => {
+    expect(makePair().adapter.getCapabilities().nativeSubscriptions).toEqual({
+      list: false,
+      retrieve: true,
+      create: true,
+      cancel: true,
+    });
+  });
+
+  it("creates a subscription with exactly the documented fields, stamps, and derived orderId", async () => {
+    const { adapter, fake } = makeSubPair();
+    const record = await adapter.createNativeSubscription({
+      savedPaymentMethodToken: MUT,
+      amount: 2500,
+      currency: "EUR",
+      interval: "month",
+      intervalCount: 3,
+      metadata: { plan: "pro" },
+      idempotencyKey: "sub-9-attempt-1",
+    });
+    // toEqual, not toMatchObject: CreateSubscriptionRequest declares
+    // additionalProperties: false — undocumented fields (contrib,
+    // pspCustomerId, …) must never be sent.
+    expect(fake.lastRequestBody).toEqual({
+      amount: 2500,
+      currency: "EUR",
+      effectDate: "2026-07-07T10:00:00+00:00", // REQUIRED — defaults to the adapter clock's now
+      rrule: "RRULE:FREQ=MONTHLY;INTERVAL=3",
+      paymentMethodToken: MUT,
+      orderId: "pf-sub-9-attempt-1",
+      metadata: { plan: "pro", payfanout_key: "sub-9-attempt-1" },
+    });
+    expect(record).toMatchObject({
+      id: expect.stringMatching(/^[0-9a-f]{32}$/) as string,
+      pspName: "payzen",
+      status: "active", // effectDate == now — billing starts on the next occurrence
+      amount: 2500,
+      currency: "EUR",
+      interval: "month",
+      intervalCount: 3,
+      schedule: "RRULE:FREQ=MONTHLY;INTERVAL=3",
+      savedPaymentMethodToken: MUT, // echoed so hosts can retain the composite key
+      merchantRefNum: "pf-sub-9-attempt-1",
+    });
+    expect((record.raw as { subscriptionId?: string }).subscriptionId).toBe(record.id);
+  });
+
+  const rruleCases: Array<[NativeSubscriptionInterval, number | undefined, string]> = [
+    ["day", undefined, "RRULE:FREQ=DAILY;INTERVAL=1"],
+    ["week", 2, "RRULE:FREQ=WEEKLY;INTERVAL=2"],
+    ["month", undefined, "RRULE:FREQ=MONTHLY;INTERVAL=1"],
+    ["year", 1, "RRULE:FREQ=YEARLY;INTERVAL=1"],
+  ];
+  for (const [interval, intervalCount, expected] of rruleCases) {
+    it(`synthesizes ${expected} from interval "${interval}"${intervalCount ? ` x${String(intervalCount)}` : ""} and round-trips it`, async () => {
+      const { adapter, fake } = makeSubPair();
+      const record = await adapter.createNativeSubscription(
+        createInput(intervalCount === undefined ? { interval } : { interval, intervalCount }),
+      );
+      expect(fake.lastRequestBody).toMatchObject({ rrule: expected });
+      expect(record.interval).toBe(interval);
+      expect(record.intervalCount).toBe(intervalCount ?? 1);
+      expect(record.schedule).toBe(expected);
+    });
+  }
+
+  it("passes a host schedule through in PayZen's documented RRULE: form, without an interval projection", async () => {
+    const { adapter, fake } = makeSubPair();
+    const record = await adapter.createNativeSubscription(
+      createInput({ interval: undefined, schedule: "FREQ=MONTHLY;BYMONTHDAY=1;COUNT=12" }),
+    );
+    expect(fake.lastRequestBody).toMatchObject({ rrule: "RRULE:FREQ=MONTHLY;BYMONTHDAY=1;COUNT=12" });
+    expect(record.schedule).toBe("RRULE:FREQ=MONTHLY;BYMONTHDAY=1;COUNT=12"); // verbatim as PayZen stores it
+    expect(record.interval).toBeUndefined(); // BYMONTHDAY has no faithful day/week/month/year projection
+    expect(record.intervalCount).toBeUndefined();
+  });
+
+  it("accepts an already-prefixed schedule (trailing semicolon included, as PayZen's own examples show)", async () => {
+    const { adapter, fake } = makeSubPair();
+    const record = await adapter.createNativeSubscription(
+      createInput({ interval: undefined, schedule: "RRULE:FREQ=WEEKLY;INTERVAL=2;" }),
+    );
+    expect(fake.lastRequestBody).toMatchObject({ rrule: "RRULE:FREQ=WEEKLY;INTERVAL=2;" });
+    expect(record.interval).toBe("week"); // FREQ+INTERVAL only — still faithfully projectable
+    expect(record.intervalCount).toBe(2);
+  });
+
+  it("rejects schedules PayZen cannot honor instead of approximating them", async () => {
+    const { adapter } = makeSubPair();
+    await expect(
+      adapter.createNativeSubscription(createInput({ interval: undefined, schedule: "every monday" })),
+    ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringContaining("FREQ=") as string });
+    // Sub-daily periods are documented as "not taken into account" — sending
+    // one would silently rebill on a different cadence than the host asked.
+    await expect(
+      adapter.createNativeSubscription(createInput({ interval: undefined, schedule: "FREQ=HOURLY;INTERVAL=6" })),
+    ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringContaining("below one day") as string });
+    await expect(
+      adapter.createNativeSubscription(createInput({ interval: undefined, schedule: "FREQ=FORTNIGHTLY" })),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+  });
+
+  it("requires exactly one cadence and a coherent intervalCount", async () => {
+    const { adapter } = makeSubPair();
+    await expect(
+      adapter.createNativeSubscription(createInput({ interval: undefined })),
+    ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringContaining("cadence") as string });
+    await expect(
+      adapter.createNativeSubscription(createInput({ schedule: "FREQ=WEEKLY" })),
+    ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringContaining("not both") as string });
+    await expect(
+      adapter.createNativeSubscription(createInput({ interval: undefined, schedule: "FREQ=WEEKLY", intervalCount: 2 })),
+    ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringContaining("requires interval") as string });
+    await expect(
+      adapter.createNativeSubscription(createInput({ intervalCount: 0 })),
+    ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringContaining("positive integer") as string });
+  });
+
+  it("rejects planId (no plan model), zero amounts, missing tokens, and the excluded currencies", async () => {
+    const { adapter } = makeSubPair();
+    await expect(adapter.createNativeSubscription(createInput({ planId: "plan_1" }))).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining("plan") as string,
+    });
+    await expect(adapter.createNativeSubscription(createInput({ amount: 0 }))).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+    await expect(adapter.createNativeSubscription(createInput({ savedPaymentMethodToken: "" }))).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining("savedPaymentMethodToken") as string,
+    });
+    await expect(adapter.createNativeSubscription(createInput({ currency: "CNY" }))).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining("adapter excludes CNY") as string,
+    });
+  });
+
+  it("withholds pspCustomerId — PayZen keys subscriptions by token, not by a customer object", async () => {
+    const { adapter, fake } = makeSubPair();
+    await adapter.createNativeSubscription(createInput({ pspCustomerId: "cust-1" }));
+    expect(fake.lastRequestBody).not.toHaveProperty("pspCustomerId");
+    expect(fake.lastRequestBody).not.toHaveProperty("customer");
+  });
+
+  it("sends merchantRefNum on the dedicated orderId field, replacing the derived one", async () => {
+    const { adapter, fake } = makeSubPair();
+    const record = await adapter.createNativeSubscription(
+      createInput({ merchantRefNum: "SUB-REF-1", idempotencyKey: "sub-ref-key" }),
+    );
+    expect(fake.lastRequestBody).toMatchObject({
+      orderId: "SUB-REF-1",
+      metadata: { payfanout_key: "sub-ref-key" }, // the replay stamp rides metadata either way
+    });
+    expect(record.merchantRefNum).toBe("SUB-REF-1");
+  });
+
+  it("normalizes startAt to the 25-character effectDate shape and reports a future start as pending", async () => {
+    const { adapter, fake } = makeSubPair();
+    const record = await adapter.createNativeSubscription(createInput({ startAt: "2026-08-01T00:00:00.000Z" }));
+    expect(fake.lastRequestBody).toMatchObject({ effectDate: "2026-08-01T00:00:00+00:00" });
+    expect(record.status).toBe("pending"); // created, not yet billing
+    await expect(adapter.createNativeSubscription(createInput({ startAt: "not-a-date" }))).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining("startAt") as string,
+    });
+  });
+
+  it("keeps zero- and three-decimal installment amounts untouched (JPY, KWD)", async () => {
+    const { adapter } = makeSubPair();
+    const jpy = await adapter.createNativeSubscription(createInput({ amount: 500, currency: "JPY" }));
+    expect(jpy.amount).toBe(500);
+    expect(jpy.currency).toBe("JPY");
+    const kwd = await adapter.createNativeSubscription(createInput({ amount: 1234, currency: "KWD" }));
+    expect(kwd.amount).toBe(1234); // KWD 1.234 — integer minor units at every boundary
+    expect(kwd.currency).toBe("KWD");
+  });
+
+  it("a replayed create mints a SECOND live subscription — PayZen offers no dedupe channel", async () => {
+    // This documents the platform gap honestly: unlike a formToken, a
+    // subscription is a live billing schedule the moment it is created.
+    // The shared orderId + payfanout_key stamp keep duplicates traceable.
+    const { adapter, fake } = makeSubPair();
+    const input = createInput({ idempotencyKey: "replay-sub" });
+    const first = await adapter.createNativeSubscription(input);
+    const second = await adapter.createNativeSubscription(input);
+    expect(fake.uniqueSubscriptionCreations).toBe(2);
+    expect(second.id).not.toBe(first.id);
+    expect(second.merchantRefNum).toBe(first.merchantRefNum); // both reconcile to pf-replay-sub
+  });
+
+  it("never transport-retries creation: a lost response may mean a live schedule exists", async () => {
+    let calls = 0;
+    const adapter = new PayZenServerAdapter({
+      shopId: "69876357",
+      password: "testpassword_UnitOnly",
+      environment: "sandbox",
+      maxNetworkRetries: 3,
+      sleep: async () => {},
+      fetch: async () => {
+        calls++;
+        return new Response("bad gateway", { status: 502 });
+      },
+    });
+    try {
+      await adapter.createNativeSubscription(createInput());
+      expect.unreachable("expected rejection");
+    } catch (err) {
+      expect(isPayFanoutError(err)).toBe(true);
+      if (isPayFanoutError(err)) {
+        expect(err.code).toBe("psp_unavailable");
+        expect(err.retryable).toBe(false); // a blind replay could bill the shopper twice per period
+        expect(err.message).toMatch(/outcome of Charge\/CreateSubscription is unknown/);
+        expect(err.message).toMatch(/second active subscription/);
+      }
+    }
+    expect(calls).toBe(1);
+  });
+
+  it("maps a create answer without a subscriptionId to a non-retryable processing_error", async () => {
+    const adapter = new PayZenServerAdapter({
+      shopId: "69876357",
+      password: "testpassword_UnitOnly",
+      environment: "sandbox",
+      maxNetworkRetries: 0,
+      fetch: async () => new Response(JSON.stringify({ status: "SUCCESS", answer: {} }), { status: 200 }),
+    });
+    await expect(adapter.createNativeSubscription(createInput())).rejects.toMatchObject({
+      code: "processing_error",
+      retryable: false,
+    });
+  });
+
+  it("retrieves by the composite key and echoes it on the record", async () => {
+    const { adapter, fake } = makeSubPair();
+    const created = await adapter.createNativeSubscription(createInput({ idempotencyKey: "sub-read" }));
+    const record = await adapter.retrieveNativeSubscription({
+      subscriptionId: created.id,
+      savedPaymentMethodToken: MUT,
+    });
+    expect(fake.lastOperation).toBe("Subscription/Get");
+    expect(fake.lastRequestBody).toEqual({ subscriptionId: created.id, paymentMethodToken: MUT });
+    expect(record).toMatchObject({
+      id: created.id,
+      pspName: "payzen",
+      status: "active",
+      amount: 990,
+      currency: "EUR",
+      interval: "month",
+      schedule: "RRULE:FREQ=MONTHLY;INTERVAL=1",
+      savedPaymentMethodToken: MUT,
+      merchantRefNum: "pf-sub-read",
+    });
+    expect((record.raw as { shopId?: string }).shopId).toBe(fake.shopId); // the untouched answer
+  });
+
+  it("requires both halves of the composite key on retrieve and cancel", async () => {
+    const { adapter } = makeSubPair();
+    for (const invoke of [
+      (): Promise<unknown> => adapter.retrieveNativeSubscription({ subscriptionId: "a".repeat(32) }),
+      (): Promise<unknown> =>
+        adapter.cancelNativeSubscription({ subscriptionId: "a".repeat(32), idempotencyKey: "c" }),
+    ]) {
+      await expect(invoke()).rejects.toMatchObject({
+        code: "invalid_request",
+        message: expect.stringContaining("hosts must retain both") as string,
+      });
+    }
+    await expect(
+      adapter.retrieveNativeSubscription({ subscriptionId: "", savedPaymentMethodToken: MUT }),
+    ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringContaining("subscriptionId") as string });
+  });
+
+  it("surfaces the gateway's unknown-subscription and token-mismatch rejections on retrieve", async () => {
+    const { adapter } = makeSubPair();
+    // Unknown subscriptionId — PSP_032 rides the ERROR envelope.
+    await expect(
+      adapter.retrieveNativeSubscription({ subscriptionId: "f".repeat(32), savedPaymentMethodToken: MUT }),
+    ).rejects.toMatchObject({ code: "invalid_request", retryable: false });
+    // Existing subscription, wrong token — PSP_030: the pair is a composite key.
+    const created = await adapter.createNativeSubscription(createInput());
+    await expect(
+      adapter.retrieveNativeSubscription({
+        subscriptionId: created.id,
+        savedPaymentMethodToken: "0".repeat(32),
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request", retryable: false });
+  });
+
+  it("derives completed from a finite schedule that ran all installments — and never from an open-ended one", async () => {
+    const { adapter, fake } = makeSubPair();
+    const finite = await adapter.createNativeSubscription(
+      createInput({ interval: undefined, schedule: "FREQ=MONTHLY;COUNT=2" }),
+    );
+    expect(fake.getSubscription(finite.id)!.totalPaymentsNumber).toBe(2);
+
+    fake.getSubscription(finite.id)!.pastPaymentsNumber = 1;
+    let record = await adapter.retrieveNativeSubscription({ subscriptionId: finite.id, savedPaymentMethodToken: MUT });
+    expect(record.status).toBe("active"); // still one installment to run
+
+    fake.getSubscription(finite.id)!.pastPaymentsNumber = 2;
+    record = await adapter.retrieveNativeSubscription({ subscriptionId: finite.id, savedPaymentMethodToken: MUT });
+    expect(record.status).toBe("completed");
+
+    // Open-ended schedules report totalPaymentsNumber 0 and never complete.
+    const openEnded = await adapter.createNativeSubscription(createInput());
+    fake.getSubscription(openEnded.id)!.pastPaymentsNumber = 5;
+    record = await adapter.retrieveNativeSubscription({ subscriptionId: openEnded.id, savedPaymentMethodToken: MUT });
+    expect(record.status).toBe("active");
+  });
+
+  it("cancels via Subscription/Cancel and reads the terminated record back", async () => {
+    const { adapter, fake } = makeSubPair();
+    const created = await adapter.createNativeSubscription(createInput());
+    const canceled = await adapter.cancelNativeSubscription({
+      subscriptionId: created.id,
+      savedPaymentMethodToken: MUT,
+      idempotencyKey: "cancel-1",
+    });
+    expect(canceled.status).toBe("canceled");
+    expect(canceled.id).toBe(created.id);
+    expect(canceled.savedPaymentMethodToken).toBe(MUT);
+    expect(fake.getSubscription(created.id)!.cancelDate).not.toBeNull();
+    // The Cancel answer is a bare ResponseCodeAnswer — the record comes from
+    // the follow-up Subscription/Get.
+    expect(fake.lastOperation).toBe("Subscription/Get");
+  });
+
+  it("treats a replayed cancel as success: the already-canceled rejection re-fetches and resolves", async () => {
+    const { adapter, fake } = makeSubPair();
+    const created = await adapter.createNativeSubscription(createInput());
+    const target = { subscriptionId: created.id, savedPaymentMethodToken: MUT };
+    await adapter.cancelNativeSubscription({ ...target, idempotencyKey: "c1" });
+    // The fake rejects the second Cancel with PSP_033 (already canceled) —
+    // the verified-idempotent path must turn that into success via Get.
+    const replayed = await adapter.cancelNativeSubscription({ ...target, idempotencyKey: "c2" });
+    expect(replayed.status).toBe("canceled");
+    expect(fake.lastOperation).toBe("Subscription/Get");
+  });
+
+  it("also resolves a PSP_564 (already terminated) rejection through the re-fetch", async () => {
+    const { adapter, fake } = makeSubPair();
+    const created = await adapter.createNativeSubscription(createInput());
+    const target = { subscriptionId: created.id, savedPaymentMethodToken: MUT };
+    await adapter.cancelNativeSubscription({ ...target, idempotencyKey: "c1" });
+    fake.failNextEnvelope(
+      { errorCode: "PSP_564", errorMessage: "This recurring payment has already been terminated" },
+      "Subscription/Cancel",
+    );
+    const replayed = await adapter.cancelNativeSubscription({ ...target, idempotencyKey: "c3" });
+    expect(replayed.status).toBe("canceled");
+  });
+
+  it("does NOT swallow a cancel rejection when the subscription is still billing", async () => {
+    const { adapter, fake } = makeSubPair();
+    const created = await adapter.createNativeSubscription(createInput());
+    // An injected rejection against a LIVE subscription: the re-fetch finds
+    // it still active, so the original error must surface, not a fake success.
+    fake.failNextEnvelope(
+      { errorCode: "PSP_564", errorMessage: "This recurring payment has already been terminated" },
+      "Subscription/Cancel",
+    );
+    await expect(
+      adapter.cancelNativeSubscription({
+        subscriptionId: created.id,
+        savedPaymentMethodToken: MUT,
+        idempotencyKey: "c1",
+      }),
+    ).rejects.toMatchObject({ code: "invalid_request", retryable: false });
+    expect(fake.getSubscription(created.id)!.cancelDate).toBeNull(); // genuinely untouched
+  });
+
+  it("maps the documented ResponseCodeAnswer rejections: 32 unknown subscription, 30 token mismatch", async () => {
+    const { adapter } = makeSubPair();
+    try {
+      await adapter.cancelNativeSubscription({
+        subscriptionId: "f".repeat(32),
+        savedPaymentMethodToken: MUT,
+        idempotencyKey: "c1",
+      });
+      expect.unreachable("expected rejection");
+    } catch (err) {
+      expect(isPayFanoutError(err)).toBe(true);
+      if (isPayFanoutError(err)) {
+        expect(err.code).toBe("invalid_request");
+        expect(err.retryable).toBe(false);
+        expect((err.raw as { responseCode?: number }).responseCode).toBe(32);
+      }
+    }
+    const created = await adapter.createNativeSubscription(createInput());
+    try {
+      await adapter.cancelNativeSubscription({
+        subscriptionId: created.id,
+        savedPaymentMethodToken: "0".repeat(32),
+        idempotencyKey: "c2",
+      });
+      expect.unreachable("expected rejection");
+    } catch (err) {
+      expect(isPayFanoutError(err)).toBe(true);
+      if (isPayFanoutError(err)) {
+        expect(err.code).toBe("invalid_request");
+        expect(err.message).toMatch(/composite key/);
+        expect((err.raw as { responseCode?: number }).responseCode).toBe(30);
+      }
+    }
+  });
+
+  it("maps responseCode 99 (undefined error) to processing_error when the re-fetch shows live billing", async () => {
+    const subscription = {
+      subscriptionId: "a".repeat(32),
+      paymentMethodToken: MUT,
+      amount: 990,
+      currency: "EUR",
+      rrule: "RRULE:FREQ=MONTHLY;INTERVAL=1",
+      effectDate: "2026-07-01T00:00:00+00:00",
+      cancelDate: null,
+      pastPaymentsNumber: 1,
+      totalPaymentsNumber: 0,
+      _type: "V4/Subscription",
+    };
+    const adapter = new PayZenServerAdapter({
+      shopId: "69876357",
+      password: "testpassword_UnitOnly",
+      environment: "sandbox",
+      maxNetworkRetries: 0,
+      fetch: async (url) =>
+        new Response(
+          JSON.stringify(
+            String(url).endsWith("/Subscription/Cancel")
+              ? { status: "SUCCESS", answer: { responseCode: 99, _type: "V4/Common/ResponseCodeAnswer" } }
+              : { status: "SUCCESS", answer: subscription },
+          ),
+          { status: 200 },
+        ),
+    });
+    try {
+      await adapter.cancelNativeSubscription({
+        subscriptionId: "a".repeat(32),
+        savedPaymentMethodToken: MUT,
+        idempotencyKey: "c",
+      });
+      expect.unreachable("expected rejection");
+    } catch (err) {
+      expect(isPayFanoutError(err)).toBe(true);
+      if (isPayFanoutError(err)) {
+        expect(err.code).toBe("processing_error");
+        expect(err.retryable).toBe(false);
+        expect((err.raw as { responseCode?: number }).responseCode).toBe(99);
+      }
+    }
+  });
+
+  it("keeps reporting canceled when the confirmation read has not caught up yet", async () => {
+    // responseCode 0 confirmed the termination; a Subscription/Get snapshot
+    // without cancelDate must not resurrect the subscription.
+    const subscription = {
+      subscriptionId: "a".repeat(32),
+      paymentMethodToken: MUT,
+      amount: 990,
+      currency: "EUR",
+      rrule: "RRULE:FREQ=MONTHLY;INTERVAL=1",
+      effectDate: "2026-07-01T00:00:00+00:00",
+      cancelDate: null,
+      pastPaymentsNumber: 1,
+      totalPaymentsNumber: 0,
+      _type: "V4/Subscription",
+    };
+    const adapter = new PayZenServerAdapter({
+      shopId: "69876357",
+      password: "testpassword_UnitOnly",
+      environment: "sandbox",
+      maxNetworkRetries: 0,
+      fetch: async (url) =>
+        new Response(
+          JSON.stringify(
+            String(url).endsWith("/Subscription/Cancel")
+              ? { status: "SUCCESS", answer: { responseCode: 0, _type: "V4/Common/ResponseCodeAnswer" } }
+              : { status: "SUCCESS", answer: subscription },
+          ),
+          { status: 200 },
+        ),
+    });
+    const record = await adapter.cancelNativeSubscription({
+      subscriptionId: "a".repeat(32),
+      savedPaymentMethodToken: MUT,
+      idempotencyKey: "c",
+    });
+    expect(record.status).toBe("canceled");
+  });
+
+  it("auto-retries transport failures on cancel — verified idempotency makes replays safe", async () => {
+    // The one mutating PayZen call that KEEPS transport retries: replaying a
+    // cancel can never double-apply, and an "already terminated" rejection on
+    // the retry resolves through the re-fetch.
+    const { adapter, fake } = makeSubPair({ maxNetworkRetries: 2, sleep: async () => {} });
+    const created = await adapter.createNativeSubscription(createInput());
+    fake.failNextWith({ status: 503 });
+    const record = await adapter.cancelNativeSubscription({
+      subscriptionId: created.id,
+      savedPaymentMethodToken: MUT,
+      idempotencyKey: "c1",
+    });
+    expect(record.status).toBe("canceled");
   });
 });

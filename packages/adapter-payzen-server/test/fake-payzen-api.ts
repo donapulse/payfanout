@@ -62,6 +62,24 @@ interface FakeSession {
   body: Record<string, unknown>;
 }
 
+/** The V4/Subscription shape (Subscription/Get answer) — no status field exists. */
+export interface FakePayZenSubscription {
+  subscriptionId: string;
+  paymentMethodToken: string;
+  orderId: string | null;
+  metadata: Record<string, string> | null;
+  effectDate: string;
+  cancelDate: string | null;
+  initialAmount: number | null;
+  initialAmountNumber: number | null;
+  amount: number;
+  currency: string;
+  pastPaymentsNumber: number;
+  totalPaymentsNumber: number;
+  rrule: string;
+  description: string | null;
+}
+
 export class FakePayZenApi {
   // The OFFICIAL public DEMO store credentials from the PayZen documentation
   // (100% public, TEST-only). Using them keeps the deterministic kr-hash
@@ -77,6 +95,7 @@ export class FakePayZenApi {
   private readonly sessionsByOrder = new Map<string, FakeSession>();
   private readonly transactions = new Map<string, FakePayZenTransaction>();
   private readonly orderTransactions = new Map<string, string[]>();
+  private readonly subscriptions = new Map<string, FakePayZenSubscription>();
   private seq = 0;
   private clockSeq = 0;
   private nextTransport: { status?: number; networkError?: boolean } | undefined;
@@ -86,6 +105,7 @@ export class FakePayZenApi {
   uniquePaymentOrderCreations = 0;
   uniqueTransactionCreations = 0;
   uniqueRefundCreations = 0;
+  uniqueSubscriptionCreations = 0;
   lastRequestBody: Record<string, unknown> | undefined;
   lastOperation: string | undefined;
 
@@ -154,6 +174,12 @@ export class FakePayZenApi {
         return this.refund(body);
       case "Transaction/CancelOrRefund":
         return this.cancelOrRefund(body);
+      case "Charge/CreateSubscription":
+        return this.createSubscription(body);
+      case "Subscription/Get":
+        return this.subscriptionGet(body);
+      case "Subscription/Cancel":
+        return this.subscriptionCancel(body);
       default:
         return this.error(operation, {
           errorCode: "INT_901",
@@ -237,6 +263,11 @@ export class FakePayZenApi {
 
   getTransaction(uuid: string): FakePayZenTransaction | undefined {
     return this.transactions.get(uuid);
+  }
+
+  /** Direct access for state tweaks (advance pastPaymentsNumber, inspect cancelDate, …). */
+  getSubscription(subscriptionId: string): FakePayZenSubscription | undefined {
+    return this.subscriptions.get(subscriptionId);
   }
 
   // --- Endpoints -------------------------------------------------------------
@@ -487,6 +518,111 @@ export class FakePayZenApi {
     if (mode === "CANCELLATION_ONLY") return this.cancel(body);
     if (mode === "REFUND_ONLY") return this.refund(body);
     return FakePayZenApi.CANCELABLE.has(tx.detailedStatus) ? this.cancel(body) : this.refund(body);
+  }
+
+  // --- Subscriptions ---------------------------------------------------------
+
+  /**
+   * Charge/CreateSubscription — required per the request schema: amount,
+   * currency, effectDate (exactly 25 chars, +00:00 style), rrule (every
+   * documented value carries the RRULE: prefix), paymentMethodToken. Like
+   * every PayZen create, NEVER dedupes: replays mint a second live
+   * subscription (the platform has no idempotency channel).
+   */
+  private createSubscription(body: Record<string, unknown>): Response {
+    const amount = body["amount"];
+    if (typeof amount !== "number" || !Number.isInteger(amount) || amount <= 0) {
+      return this.stateError("Charge/CreateSubscription", "INT_009", "invalid amount");
+    }
+    const currency = String(body["currency"] ?? "");
+    if (!this.acceptedCurrencies.has(currency)) {
+      return this.stateError("Charge/CreateSubscription", "PSP_610", "No merchant acceptance agreement available");
+    }
+    const token = body["paymentMethodToken"];
+    if (typeof token !== "string" || token.length === 0) {
+      return this.stateError("Charge/CreateSubscription", "INT_030", "invalid paymentMethodToken");
+    }
+    const rrule = body["rrule"];
+    if (typeof rrule !== "string" || !/^RRULE:FREQ=/.test(rrule)) {
+      return this.stateError("Charge/CreateSubscription", "INT_064", "invalid rrule");
+    }
+    const effectDate = body["effectDate"];
+    if (typeof effectDate !== "string" || effectDate.length !== 25) {
+      return this.stateError("Charge/CreateSubscription", "INT_069", "invalid effectDate");
+    }
+    const sub: FakePayZenSubscription = {
+      subscriptionId: this.nextUuid(),
+      paymentMethodToken: token,
+      orderId: typeof body["orderId"] === "string" ? (body["orderId"] as string) : null,
+      metadata: (body["metadata"] as Record<string, string> | undefined) ?? null,
+      effectDate,
+      cancelDate: null,
+      initialAmount: (body["initialAmount"] as number | undefined) ?? null,
+      initialAmountNumber: (body["initialAmountNumber"] as number | undefined) ?? null,
+      amount,
+      currency,
+      pastPaymentsNumber: 0,
+      // A finite rrule (COUNT) yields a total; open-ended schedules report 0.
+      totalPaymentsNumber: Number(/(?:;|:)COUNT=(\d+)/.exec(rrule)?.[1] ?? 0),
+      rrule,
+      description: typeof body["description"] === "string" ? (body["description"] as string) : null,
+    };
+    this.subscriptions.set(sub.subscriptionId, sub);
+    this.uniqueSubscriptionCreations++;
+    return this.success("Charge/CreateSubscription", {
+      subscriptionId: sub.subscriptionId,
+      rrule: sub.rrule,
+      amount: sub.amount,
+      currency: sub.currency,
+      effectDate: sub.effectDate,
+      initialAmount: sub.initialAmount,
+      initialAmountNumber: sub.initialAmountNumber,
+      _type: "V4/SubscriptionCreated",
+    });
+  }
+
+  /**
+   * Subscription/Get — keyed by subscriptionId + paymentMethodToken (both
+   * required; the pair is a composite key). Errors ride the ERROR envelope:
+   * PSP_032 unknown subscription, PSP_030 token mismatch. A cancelled
+   * subscription still reads fine, with cancelDate set.
+   */
+  private subscriptionGet(body: Record<string, unknown>): Response {
+    const sub = this.subscriptions.get(String(body["subscriptionId"] ?? ""));
+    if (!sub) {
+      return this.stateError("Subscription/Get", "PSP_032", "subscriptionId attribute not found");
+    }
+    if (String(body["paymentMethodToken"] ?? "") !== sub.paymentMethodToken) {
+      return this.stateError("Subscription/Get", "PSP_030", "Token not found");
+    }
+    return this.success("Subscription/Get", { ...sub, shopId: this.shopId, _type: "V4/Subscription" });
+  }
+
+  /**
+   * Subscription/Cancel — answers a Common/ResponseCodeAnswer INSIDE a
+   * SUCCESS envelope: 0 terminated, 30 token not found, 32 subscription not
+   * found (the playground's documented code table). Cancelling an
+   * already-cancelled subscription rejects via the ERROR envelope (PSP_033,
+   * the registry's "recurring payment already canceled" code) so the
+   * adapter's verify-then-succeed re-fetch path gets exercised.
+   */
+  private subscriptionCancel(body: Record<string, unknown>): Response {
+    const sub = this.subscriptions.get(String(body["subscriptionId"] ?? ""));
+    if (!sub) {
+      return this.success("Subscription/Cancel", { responseCode: 32, _type: "V4/Common/ResponseCodeAnswer" });
+    }
+    if (String(body["paymentMethodToken"] ?? "") !== sub.paymentMethodToken) {
+      return this.success("Subscription/Cancel", { responseCode: 30, _type: "V4/Common/ResponseCodeAnswer" });
+    }
+    if (sub.cancelDate !== null) {
+      return this.stateError(
+        "Subscription/Cancel",
+        "PSP_033",
+        "The rrule attribute is invalid or recurring payment already canceled",
+      );
+    }
+    sub.cancelDate = typeof body["terminationDate"] === "string" ? (body["terminationDate"] as string) : this.nextDate();
+    return this.success("Subscription/Cancel", { responseCode: 0, _type: "V4/Common/ResponseCodeAnswer" });
   }
 
   // --- Envelope plumbing ------------------------------------------------------

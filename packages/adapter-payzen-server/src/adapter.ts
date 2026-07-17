@@ -11,8 +11,13 @@ import {
   utf8ToBase64,
   withTransportRetries,
   type AdapterCapabilities,
+  type CancelNativeSubscriptionInput,
+  type CreateNativeSubscriptionInput,
   type CreatePaymentSessionInput,
   type MinorUnitAmount,
+  type NativeSubscriptionInterval,
+  type NativeSubscriptionRecord,
+  type NativeSubscriptionStatus,
   type PaymentInfo,
   type PaymentMethodCapability,
   type PaymentMethodDetails,
@@ -21,6 +26,7 @@ import {
   type RefundInfo,
   type RefundRequest,
   type RefundResult,
+  type RetrieveNativeSubscriptionInput,
   type ServerPaymentAdapter,
   type UnifiedErrorCode,
   type UnifiedPaymentStatus,
@@ -88,6 +94,12 @@ export interface PayZenServerAdapterConfig {
   fetch?: typeof fetch;
   /** Injected backoff sleep for retry tests; defaults to real setTimeout. */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Injected clock for tests (epoch milliseconds, default Date.now). Feeds
+   * the default subscription effectDate and the pending-vs-active status
+   * derivation of native subscriptions.
+   */
+  now?: () => number;
 }
 
 /** PayZen response envelope — the outcome lives HERE, the HTTP status is always 200. */
@@ -140,6 +152,40 @@ export interface PayZenOrderLike {
   orderStatus?: string;
   orderDetails?: { orderId?: string | null };
   transactions?: PayZenTransactionLike[];
+}
+
+/** Structural subset of the Charge/CreateSubscription answer (V4/SubscriptionCreated). */
+export interface PayZenSubscriptionCreatedLike {
+  subscriptionId?: string;
+  rrule?: string;
+  amount?: number;
+  currency?: string;
+  effectDate?: string;
+  initialAmount?: number | null;
+  initialAmountNumber?: number | null;
+}
+
+/**
+ * Structural subset of the Subscription/Get answer (V4/Subscription). The
+ * object carries NO status field — the unified status is derived (see
+ * derivePayZenSubscriptionStatus).
+ */
+export interface PayZenSubscriptionLike {
+  subscriptionId?: string;
+  shopId?: string;
+  paymentMethodToken?: string | null;
+  orderId?: string | null;
+  metadata?: Record<string, string> | null;
+  effectDate?: string;
+  cancelDate?: string | null;
+  initialAmount?: number | null;
+  initialAmountNumber?: number | null;
+  amount?: number;
+  currency?: string;
+  pastPaymentsNumber?: number;
+  totalPaymentsNumber?: number;
+  rrule?: string;
+  description?: string | null;
 }
 
 /**
@@ -316,6 +362,13 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       supportsSessionUpdate: false,
       supportsEventPolling: false, // IPN only — no events API exists
       supportsListing: false, // Order/Get is per-order; no cross-order query exists
+      // PayZen HAS a native subscription engine (Charge/CreateSubscription;
+      // the gateway schedules, charges, and retries each installment itself)
+      // but NO list/search API: Subscription/Get and Subscription/Cancel are
+      // keyed by subscriptionId + paymentMethodToken. list stays false
+      // honestly, and hosts MUST retain BOTH identifiers per subscription —
+      // they form a composite key that cannot be rediscovered via the API.
+      nativeSubscriptions: { list: false, retrieve: true, create: true, cancel: true },
       requiresServerCompletion: false, // confirm-on-client: the krypton form creates the transaction
       paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };
@@ -534,6 +587,262 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       ...(tx.creationDate ? { createdAt: tx.creationDate } : {}),
       raw: tx,
     };
+  }
+
+  /**
+   * Creates a PSP-native subscription via Charge/CreateSubscription: the
+   * gateway itself schedules, charges, and retries every installment against
+   * the vaulted `savedPaymentMethodToken` (a PayZen paymentMethodToken; for
+   * SEPA direct debits the mandate reference, which PayZen requires to start
+   * >= 14 days out). Installment outcomes arrive as ordinary transaction
+   * IPNs on the existing webhook path — enable the Back Office rule
+   * "Notification URL when creating a recurring payment".
+   *
+   * Cadence: `interval`/`intervalCount` synthesize an RFC 5545 RRULE
+   * (day/week/month/year are all accepted — PayZen rejects only sub-daily
+   * periods); `schedule` passes a host RRULE through after validation and is
+   * sent in PayZen's documented `RRULE:`-prefixed form. `startAt` becomes
+   * `effectDate` (normalized to PayZen's 25-character ISO 8601 UTC shape);
+   * when omitted the adapter's clock supplies "now" because effectDate is a
+   * REQUIRED field. `merchantRefNum` rides the dedicated orderId field.
+   * `pspCustomerId` is withheld (PayZen keys subscriptions by token, not by
+   * a customer object) and `planId` is rejected — the platform has no
+   * plan/price model to bill from.
+   *
+   * Replay safety: PayZen has no idempotency channel and creation applies
+   * IMMEDIATELY (unlike a formToken, a subscription is a live billing
+   * schedule), so this call is never transport-retried and a replayed create
+   * CAN create a second active subscription. The deterministic orderId
+   * (derived from `idempotencyKey` unless `merchantRefNum` is set) and the
+   * `payfanout_key` metadata stamp make duplicates visible in the Back
+   * Office and on installment IPNs, but there is no API to look a
+   * subscription up by orderId — never blind-retry this call; reconcile
+   * first. RETAIN the returned record's id together with the token: they
+   * form the composite key every later retrieve/cancel needs.
+   */
+  async createNativeSubscription(input: CreateNativeSubscriptionInput): Promise<NativeSubscriptionRecord> {
+    if (!input.savedPaymentMethodToken) {
+      throw PayFanoutError.invalidRequest(
+        "createNativeSubscription requires savedPaymentMethodToken — PayZen bills subscriptions from a vaulted paymentMethodToken",
+      );
+    }
+    assertMinorUnitAmount(input.amount, "amount");
+    if (input.amount === 0) {
+      throw PayFanoutError.invalidRequest("createNativeSubscription requires a positive amount");
+    }
+    const currency = this.assertSupportedCurrency(input.currency);
+    if (!input.interval && !input.schedule) {
+      throw PayFanoutError.invalidRequest(
+        "createNativeSubscription requires a billing cadence — pass interval (with optional intervalCount) or schedule",
+      );
+    }
+    if (input.interval && input.schedule) {
+      throw PayFanoutError.invalidRequest(
+        "createNativeSubscription accepts interval or schedule, not both — one cadence must be authoritative",
+      );
+    }
+    if (input.intervalCount !== undefined) {
+      if (!input.interval) {
+        throw PayFanoutError.invalidRequest("createNativeSubscription intervalCount requires interval");
+      }
+      if (!Number.isInteger(input.intervalCount) || input.intervalCount < 1) {
+        throw PayFanoutError.invalidRequest("createNativeSubscription intervalCount must be a positive integer");
+      }
+    }
+    if (input.planId !== undefined) {
+      throw PayFanoutError.invalidRequest(
+        "PayZen has no plan/price model — omit planId and express the cadence via interval or schedule",
+      );
+    }
+    const rrule = input.interval
+      ? buildPayZenRrule(input.interval, input.intervalCount ?? 1)
+      : normalizePayZenSchedule(input.schedule!);
+    let effectDate: string;
+    if (input.startAt !== undefined) {
+      const startMs = Date.parse(input.startAt);
+      if (Number.isNaN(startMs)) {
+        throw PayFanoutError.invalidRequest("createNativeSubscription startAt must be an ISO 8601 instant");
+      }
+      effectDate = toPayZenEffectDate(startMs);
+    } else {
+      // effectDate is REQUIRED by Charge/CreateSubscription — "now" starts
+      // billing on the next rrule occurrence.
+      effectDate = toPayZenEffectDate(this.nowMs());
+    }
+    const orderId = input.merchantRefNum ?? (await derivePayZenOrderId(input.idempotencyKey));
+    const answer = await this.call<PayZenSubscriptionCreatedLike>(
+      "Charge/CreateSubscription",
+      {
+        amount: input.amount,
+        currency,
+        effectDate,
+        rrule,
+        paymentMethodToken: input.savedPaymentMethodToken,
+        orderId,
+        metadata: {
+          ...input.metadata,
+          payfanout_key: input.idempotencyKey,
+        },
+      },
+      {
+        retryTransport: false,
+        unknownOutcomeHint:
+          "Do not retry blindly: a replay can create a second active subscription — " +
+          "reconcile via the Back Office (orderId) first.",
+      },
+    );
+    if (typeof answer?.subscriptionId !== "string" || answer.subscriptionId.length === 0) {
+      throw new PayFanoutError({
+        code: "processing_error",
+        message: "PayZen did not return a subscriptionId.",
+        retryable: false,
+        raw: answer,
+        pspName: this.pspName,
+      });
+    }
+    // Built from the create answer plus the request facts — never a follow-up
+    // read, so a transient read failure cannot orphan a subscription that was
+    // just created (the caller MUST receive the id).
+    return this.toSubscriptionRecord(
+      {
+        subscriptionId: answer.subscriptionId,
+        rrule: answer.rrule ?? rrule,
+        amount: answer.amount ?? input.amount,
+        currency: answer.currency ?? currency,
+        effectDate: answer.effectDate ?? effectDate,
+        orderId,
+      },
+      input.savedPaymentMethodToken,
+      answer,
+    );
+  }
+
+  /**
+   * Reads a subscription via Subscription/Get. PayZen keys subscriptions by
+   * subscriptionId + paymentMethodToken (BOTH required — there is no list
+   * API to rediscover either), so `savedPaymentMethodToken` is mandatory
+   * here. The V4/Subscription answer has no status field; the unified status
+   * is derived — see derivePayZenSubscriptionStatus for the exact rule.
+   */
+  async retrieveNativeSubscription(input: RetrieveNativeSubscriptionInput): Promise<NativeSubscriptionRecord> {
+    this.assertSubscriptionKey(input.subscriptionId, input.savedPaymentMethodToken, "retrieveNativeSubscription");
+    const answer = await this.call<PayZenSubscriptionLike>("Subscription/Get", {
+      subscriptionId: input.subscriptionId,
+      paymentMethodToken: input.savedPaymentMethodToken,
+    });
+    return this.toSubscriptionRecord(answer, answer.paymentMethodToken ?? input.savedPaymentMethodToken, answer);
+  }
+
+  /**
+   * Stops PSP-side billing via Subscription/Cancel (immediate termination —
+   * installments already in flight are NOT cancelled; use cancelPayment on
+   * the individual transaction for those). The composite key rule of
+   * retrieveNativeSubscription applies: `savedPaymentMethodToken` is
+   * required.
+   *
+   * The Cancel answer is a bare Common/ResponseCodeAnswer (0 terminated,
+   * 30 token not found, 32 subscription not found, 99 undefined error), so
+   * the returned record always comes from a follow-up Subscription/Get.
+   * Verified-idempotent: on ANY rejection — nonzero responseCode or an ERROR
+   * envelope such as PSP_033/PSP_564 (already cancelled) — the adapter
+   * re-reads the subscription and resolves successfully when it is already
+   * terminated; only a subscription that is genuinely still billing
+   * surfaces the rejection. Replaying this call is therefore always safe,
+   * which is also why it is the one mutating PayZen call that keeps
+   * automatic transport retries. `idempotencyKey` has no PayZen channel to
+   * ride; replay safety comes from this verification, not from dedupe.
+   */
+  async cancelNativeSubscription(input: CancelNativeSubscriptionInput): Promise<NativeSubscriptionRecord> {
+    this.assertSubscriptionKey(input.subscriptionId, input.savedPaymentMethodToken, "cancelNativeSubscription");
+    const token = input.savedPaymentMethodToken!;
+    let failure: PayFanoutError | undefined;
+    try {
+      const answer = await this.call<{ responseCode?: number }>("Subscription/Cancel", {
+        subscriptionId: input.subscriptionId,
+        paymentMethodToken: token,
+      });
+      if (answer?.responseCode !== 0) failure = mapPayZenCancelResponseCode(answer);
+    } catch (err) {
+      if (!(err instanceof PayFanoutError)) throw err;
+      failure = err;
+    }
+    if (failure) {
+      const settled = await this.readTerminatedSubscription(input.subscriptionId, token);
+      if (settled) return settled;
+      throw failure;
+    }
+    // responseCode 0 — the gateway confirmed termination. The record comes
+    // from a fresh read; if that read fails, replaying the cancel is safe.
+    const record = await this.retrieveNativeSubscription({
+      subscriptionId: input.subscriptionId,
+      savedPaymentMethodToken: token,
+    });
+    // A read that has not caught up with the just-confirmed termination must
+    // not resurrect the subscription.
+    return record.status === "canceled" || record.status === "completed"
+      ? record
+      : { ...record, status: "canceled" };
+  }
+
+  /** The verified-idempotency probe: the record iff it is already terminated, undefined otherwise. */
+  private async readTerminatedSubscription(
+    subscriptionId: string,
+    token: string,
+  ): Promise<NativeSubscriptionRecord | undefined> {
+    try {
+      const record = await this.retrieveNativeSubscription({
+        subscriptionId,
+        savedPaymentMethodToken: token,
+      });
+      return record.status === "canceled" || record.status === "completed" ? record : undefined;
+    } catch {
+      // The original cancel rejection stays authoritative — a failed probe
+      // (e.g. subscription not found) adds nothing actionable.
+      return undefined;
+    }
+  }
+
+  /** Both halves of PayZen's composite subscription key, or a message telling hosts to retain them. */
+  private assertSubscriptionKey(
+    subscriptionId: string,
+    savedPaymentMethodToken: string | undefined,
+    operation: string,
+  ): void {
+    if (!subscriptionId) {
+      throw PayFanoutError.invalidRequest(`${operation} requires subscriptionId`);
+    }
+    if (!savedPaymentMethodToken) {
+      throw PayFanoutError.invalidRequest(
+        `${operation} requires savedPaymentMethodToken — PayZen keys subscriptions by subscriptionId + ` +
+          "paymentMethodToken, and no list API exists to rediscover them: hosts must retain both",
+      );
+    }
+  }
+
+  private toSubscriptionRecord(
+    sub: PayZenSubscriptionLike,
+    token: string | undefined,
+    raw: unknown,
+  ): NativeSubscriptionRecord {
+    const cadence = sub.rrule ? projectPayZenRrule(sub.rrule) : undefined;
+    return {
+      id: sub.subscriptionId ?? "",
+      pspName: this.pspName,
+      status: derivePayZenSubscriptionStatus(sub, this.nowMs()),
+      amount: sub.amount ?? 0,
+      // Never fabricate a currency: empty is more honest when PayZen omits it.
+      currency: (sub.currency ?? "").toUpperCase(),
+      ...(cadence ? { interval: cadence.interval, intervalCount: cadence.intervalCount } : {}),
+      // The source cadence, verbatim as PayZen reports it.
+      ...(sub.rrule ? { schedule: sub.rrule } : {}),
+      ...(token ? { savedPaymentMethodToken: token } : {}),
+      ...(sub.orderId ? { merchantRefNum: sub.orderId } : {}),
+      raw,
+    };
+  }
+
+  private nowMs(): number {
+    return (this.config.now ?? Date.now)();
   }
 
   /**
@@ -802,7 +1111,7 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
   private async call<T>(
     operation: string,
     body: Record<string, unknown>,
-    opts: { retryTransport?: boolean } = {},
+    opts: { retryTransport?: boolean; unknownOutcomeHint?: string } = {},
   ): Promise<T> {
     const retryTransport = opts.retryTransport ?? true;
     let envelope: PayZenEnvelopeLike;
@@ -818,7 +1127,7 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
         code: err.code,
         message:
           `${err.message} The outcome of ${operation} is unknown — it may have been applied. ` +
-          "Do not retry blindly: re-read the payment (amountRefunded) first.",
+          (opts.unknownOutcomeHint ?? "Do not retry blindly: re-read the payment (amountRefunded) first."),
         retryable: false,
         raw: err.raw,
         pspName: this.pspName,
@@ -894,6 +1203,171 @@ export async function derivePayZenOrderId(idempotencyKey: string): Promise<strin
   const direct = `pf-${sanitized}`;
   if (sanitized === idempotencyKey && direct.length <= 64) return direct;
   return `pf-${sanitized.slice(0, 52)}-${(await sha256Hex(idempotencyKey)).slice(0, 8)}`;
+}
+
+/**
+ * Unified interval → RFC 5545 frequency. PayZen accepts all four (its only
+ * rrule restriction is periods below one day: SECONDLY/MINUTELY/HOURLY are
+ * not taken into account).
+ */
+const RRULE_FREQ_BY_INTERVAL: Record<NativeSubscriptionInterval, string> = {
+  day: "DAILY",
+  week: "WEEKLY",
+  month: "MONTHLY",
+  year: "YEARLY",
+};
+
+const RRULE_INTERVAL_BY_FREQ: Record<string, NativeSubscriptionInterval> = {
+  DAILY: "day",
+  WEEKLY: "week",
+  MONTHLY: "month",
+  YEARLY: "year",
+};
+
+/** The frequencies PayZen documents as ignored (no period below one day). */
+const SUB_DAILY_FREQS = new Set(["SECONDLY", "MINUTELY", "HOURLY"]);
+
+/** interval/intervalCount → the wire rrule, in PayZen's documented `RRULE:`-prefixed form. */
+function buildPayZenRrule(interval: NativeSubscriptionInterval, intervalCount: number): string {
+  return `RRULE:FREQ=${RRULE_FREQ_BY_INTERVAL[interval]};INTERVAL=${String(intervalCount)}`;
+}
+
+/**
+ * Light validation + normalization of a host-supplied schedule: the RRULE
+ * value must start with FREQ= (an optional `RRULE:` prefix is tolerated) and
+ * use a frequency PayZen can honor — sub-daily frequencies are rejected here
+ * because the platform documents them as "not taken into account", which
+ * would silently rebill on a different cadence than the host asked for. The
+ * rest of the rule (BYDAY, BYMONTHDAY, COUNT, UNTIL, …) passes through
+ * verbatim; PayZen validates it (INT_064/PSP_566). Sent with the `RRULE:`
+ * prefix, the only form the platform documents.
+ */
+function normalizePayZenSchedule(schedule: string): string {
+  const value = schedule.startsWith("RRULE:") ? schedule.slice("RRULE:".length) : schedule;
+  if (!value.startsWith("FREQ=")) {
+    throw PayFanoutError.invalidRequest(
+      'schedule must be an RFC 5545 RRULE value starting with "FREQ=" (an "RRULE:" prefix is accepted)',
+      { schedule },
+    );
+  }
+  const freq = /^FREQ=([^;]*)/.exec(value)![1]!.toUpperCase();
+  if (SUB_DAILY_FREQS.has(freq)) {
+    throw PayFanoutError.invalidRequest(
+      `PayZen does not accept recurring payment periods below one day — FREQ=${freq} is not taken into account`,
+      { schedule },
+    );
+  }
+  if (RRULE_INTERVAL_BY_FREQ[freq] === undefined) {
+    throw PayFanoutError.invalidRequest(`schedule has no valid RFC 5545 frequency: FREQ=${freq}`, { schedule });
+  }
+  return `RRULE:${value}`;
+}
+
+/**
+ * The faithful day/week/month/year projection of a PayZen rrule, or
+ * undefined when none exists. Only FREQ + INTERVAL (+ COUNT, which bounds
+ * the number of installments without changing the cadence) project; any
+ * other part (BYDAY, BYMONTHDAY, BYSETPOS, UNTIL, …) shifts occurrences in
+ * ways the simple interval vocabulary cannot express, so the record then
+ * carries only `schedule`.
+ */
+export function projectPayZenRrule(
+  rrule: string,
+): { interval: NativeSubscriptionInterval; intervalCount: number } | undefined {
+  const value = rrule.startsWith("RRULE:") ? rrule.slice("RRULE:".length) : rrule;
+  // PayZen's own examples include trailing semicolons ("RRULE:FREQ=WEEKLY;INTERVAL=2;").
+  const parts = value.split(";").filter((part) => part.length > 0);
+  let interval: NativeSubscriptionInterval | undefined;
+  let intervalCount = 1;
+  for (const part of parts) {
+    const eq = part.indexOf("=");
+    if (eq <= 0) return undefined;
+    const key = part.slice(0, eq).toUpperCase();
+    const raw = part.slice(eq + 1);
+    if (key === "FREQ") {
+      interval = RRULE_INTERVAL_BY_FREQ[raw.toUpperCase()];
+      if (!interval) return undefined;
+    } else if (key === "INTERVAL") {
+      const parsed = Number(raw);
+      if (!Number.isInteger(parsed) || parsed < 1) return undefined;
+      intervalCount = parsed;
+    } else if (key !== "COUNT") {
+      return undefined;
+    }
+  }
+  return interval ? { interval, intervalCount } : undefined;
+}
+
+/** Epoch ms → PayZen's exact 25-character effectDate shape (2026-07-17T10:00:00+00:00). */
+function toPayZenEffectDate(ms: number): string {
+  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "+00:00");
+}
+
+/**
+ * The V4/Subscription object has NO status field — the unified status is
+ * derived from the facts it does carry, first match wins:
+ *
+ *   1. cancelDate set → "canceled" (Subscription/Cancel stamps it);
+ *   2. totalPaymentsNumber > 0 and pastPaymentsNumber has reached it →
+ *      "completed" (a finite rrule — COUNT/UNTIL — ran all installments;
+ *      open-ended subscriptions report totalPaymentsNumber 0 and never
+ *      complete);
+ *   3. effectDate in the future → "pending" (created, not yet billing);
+ *   4. otherwise → "active".
+ */
+export function derivePayZenSubscriptionStatus(
+  sub: Pick<PayZenSubscriptionLike, "cancelDate" | "effectDate" | "pastPaymentsNumber" | "totalPaymentsNumber">,
+  nowMs: number,
+): NativeSubscriptionStatus {
+  if (sub.cancelDate) return "canceled";
+  if (
+    typeof sub.totalPaymentsNumber === "number" &&
+    sub.totalPaymentsNumber > 0 &&
+    typeof sub.pastPaymentsNumber === "number" &&
+    sub.pastPaymentsNumber >= sub.totalPaymentsNumber
+  ) {
+    return "completed";
+  }
+  const effectMs = Date.parse(sub.effectDate ?? "");
+  if (!Number.isNaN(effectMs) && effectMs > nowMs) return "pending";
+  return "active";
+}
+
+/**
+ * Subscription/Cancel answers a Common/ResponseCodeAnswer INSIDE a SUCCESS
+ * envelope — nonzero responseCodes are rejections riding HTTP 200 + SUCCESS:
+ * 30 token not found, 32 subscription not found, 99 undefined error. Never
+ * retryable: the same key material yields the same answer.
+ */
+function mapPayZenCancelResponseCode(answer: { responseCode?: number } | undefined): PayFanoutError {
+  const responseCode = answer?.responseCode;
+  if (responseCode === 30) {
+    return new PayFanoutError({
+      code: "invalid_request",
+      message:
+        "PayZen did not find the paymentMethodToken for this subscription — subscriptionId and " +
+        "savedPaymentMethodToken form a composite key and must belong together.",
+      retryable: false,
+      raw: answer,
+      pspName: PAYZEN_PSP_NAME,
+    });
+  }
+  if (responseCode === 32) {
+    return new PayFanoutError({
+      code: "invalid_request",
+      message: "PayZen did not find the subscription — check the subscriptionId.",
+      retryable: false,
+      raw: answer,
+      pspName: PAYZEN_PSP_NAME,
+    });
+  }
+  return new PayFanoutError({
+    code: "processing_error",
+    message: getUserMessage("processing_error"),
+    retryable: false,
+    raw: answer,
+    pspName: PAYZEN_PSP_NAME,
+  });
 }
 
 const SUCCEEDED_STATUSES = new Set(["AUTHORISED", "CAPTURED", "ACCEPTED", "PRE_AUTHORISED"]);
@@ -1026,6 +1500,16 @@ const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
   PSP_541: "psp_unavailable",
   PSP_010: "invalid_request", // transaction not found
   PSP_015: "invalid_request", // too many results (Order/Get > 30 transactions)
+  // Token / subscription lookups and state rejections.
+  PSP_030: "invalid_request", // token not found
+  PSP_031: "invalid_request", // invalid token (canceled, empty, …)
+  PSP_032: "invalid_request", // subscriptionId not found
+  PSP_033: "invalid_request", // rrule invalid or recurring payment already canceled
+  PSP_563: "invalid_request", // recurring payment already exists
+  PSP_564: "invalid_request", // recurring payment already terminated
+  PSP_565: "invalid_request", // invalid recurring payment
+  PSP_566: "invalid_request", // invalid recurrence rule
+  PSP_567: "processing_error", // recurring payment creation failed (cause unstated — never retryable)
   PSP_100: "invalid_request", // REST API not enabled on the shop
   PSP_108: "session_expired", // formToken outlived its ~15 min — create a fresh session
   PSP_109: "invalid_request", // production mode not activated

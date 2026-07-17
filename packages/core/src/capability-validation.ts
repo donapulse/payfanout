@@ -72,6 +72,30 @@ export function validateAdapterCapabilities(adapter: ServerPaymentAdapter): stri
   ) {
     issues.push(`Adapter "${adapter.pspName}" claims listing but does not implement listPayments/listRefunds`);
   }
+  // Native subscriptions are per-operation honest: each declared operation
+  // must be implemented on its own — provider support is uneven (no list on
+  // some PSPs, no server-only create on others), so there is no all-or-nothing
+  // surface rule like the vault's. The whole block is required (all-false for
+  // PSPs without a native product); a pre-upgrade adapter shape gets a
+  // violation here instead of a TypeError downstream.
+  if (!caps.nativeSubscriptions) {
+    issues.push(
+      `Adapter "${adapter.pspName}" declares no nativeSubscriptions capability block (all-false is the explicit "no native product" declaration)`,
+    );
+  } else {
+    for (const [flag, method] of [
+      ["list", "listNativeSubscriptions"],
+      ["retrieve", "retrieveNativeSubscription"],
+      ["create", "createNativeSubscription"],
+      ["cancel", "cancelNativeSubscription"],
+    ] as const) {
+      if (caps.nativeSubscriptions[flag] && typeof adapter[method] !== "function") {
+        issues.push(
+          `Adapter "${adapter.pspName}" claims native-subscription ${flag} but does not implement ${method}`,
+        );
+      }
+    }
+  }
   // The saved-payment-methods flag demands the full method surface. Cards
   // still live at the PSP only — the coherence rule is about implemented
   // methods, not about storing card data (never).

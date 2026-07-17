@@ -223,6 +223,11 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       supportsSessionUpdate: false,
       supportsEventPolling: false, // no public events-list API
       supportsListing: false,
+      // Worldline Direct has no native subscription engine — recurring is
+      // credential-on-file (each charge merchant-initiated via
+      // subsequentType: "recurring"), which the vault surface plus the
+      // host-side SubscriptionManager already cover.
+      nativeSubscriptions: { list: false, retrieve: false, create: false, cancel: false },
       requiresServerCompletion: true, // tokenize-first: the client tokenizes, the server creates the payment
       paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };

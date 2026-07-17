@@ -187,9 +187,16 @@ await subs.chargeDueSubscriptions();   // renews, retries (24h/72h dunning), can
 
 Off-session charges that hit a bank's authentication demand surface as
 `authentication_required`, bring the customer back on-session; the dunning schedule
-handles the retries. PSP-native billing (Stripe Billing) is deliberately not wrapped:
-most PSPs have no equivalent, and this engine gives every vaulting-capable PSP
-(Stripe and Paysafe today) identical behavior.
+handles the retries.
+
+Providers with their own billing product are covered too: capability-gated
+`listNativeSubscriptions` / `retrieveNativeSubscription` / `createNativeSubscription` /
+`cancelNativeSubscription` passthroughs read and mutate **PSP-native** subscriptions as
+unified records — the seam for adopting a merchant's existing PSP-billed subscriptions
+into the host engine (list at the PSP, re-create locally on the same vault token, cancel
+at the PSP with verified-idempotent semantics). Support is declared per operation in
+`getCapabilities().nativeSubscriptions`; see the
+[PSP-native subscriptions guide](https://donapulse.github.io/payfanout/guide/native-subscriptions).
 
 ### Retries, the machinery behind `retryable`
 

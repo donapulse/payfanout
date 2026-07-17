@@ -7,17 +7,22 @@ import {
   utf8ToBase64,
   withTransportRetries,
   type AdapterCapabilities,
+  type CancelNativeSubscriptionInput,
   type CompletePaymentInput,
   type CreatePaymentSessionInput,
   type FetchEventsInput,
   type FetchEventsResult,
+  type ListNativeSubscriptionsInput,
+  type ListNativeSubscriptionsResult,
   type MinorUnitAmount,
+  type NativeSubscriptionRecord,
   type PaymentInfo,
   type PaymentMethodDetails,
   type PaymentSession,
   type RefundInfo,
   type RefundRequest,
   type RefundResult,
+  type RetrieveNativeSubscriptionInput,
   type ServerPaymentAdapter,
   type ShippingDetails,
   type UnifiedPaymentStatus,
@@ -28,6 +33,12 @@ import {
 import { mapPayPalError, PAYPAL_PSP_NAME } from "./error-map.js";
 import { derivePayPalRequestId } from "./request-id.js";
 import { fromPayPalValue, PAYPAL_SUPPORTED_CURRENCIES, toPayPalValue } from "./money.js";
+import {
+  paypalSubscriptionToRecord,
+  PAYPAL_SUBSCRIPTION_CANCEL_REASON,
+  type PayPalSubscriptionLike,
+  type PayPalSubscriptionsPageLike,
+} from "./subscriptions.js";
 import {
   buildWebhookVerificationBody,
   captureIdFromLinks,
@@ -217,6 +228,13 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       supportsSessionUpdate: true, // PATCH order pre-approval
       supportsEventPolling: true, // GET /v1/notifications/webhooks-events
       supportsListing: false, // Orders/Payments v2 are GET-by-id only — no list endpoints exist
+      // Subscriptions v1 passthroughs. create stays false: POST
+      // /v1/billing/subscriptions answers 201 APPROVAL_PENDING with an
+      // `approve` link the buyer must act on, and the API documents no
+      // server-only creation against a vaulted token (its only approval-free
+      // request shape takes a raw card number, which PayFanout never touches)
+      // — declaring create would fake support.
+      nativeSubscriptions: { list: true, retrieve: true, create: false, cancel: true },
       requiresServerCompletion: true, // tokenize-first: the popup approves, money moves at server capture
       paymentMethods: [{ type: "paypal", flow: "popup", supported: true }],
     };
@@ -572,6 +590,98 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     const nextHref = page?.links?.find((link) => (link.rel ?? "").toLowerCase() === "next")?.href;
     const nextCursor = nextHref ? relativeEventsPath(nextHref) : undefined;
     return { events, ...(nextCursor ? { nextCursor } : {}) };
+  }
+
+  /**
+   * Pages the merchant's Subscriptions v1 subscriptions as unified records.
+   * The cursor is the next page number (GET /v1/billing/subscriptions pages
+   * by number: page_size 1–20, default 10). List items omit the inline plan,
+   * so each item is completed by the same fields=plan detail GET retrieve
+   * uses — a page costs 1 + N requests (N ≤ 20). total_required=true rides
+   * every page so the last page is detected from total_pages; a next link or
+   * a full page are honored as fallbacks (a possibly-empty final page beats
+   * silently truncating the walk). The unfiltered list returns PayPal's own
+   * default status set — the reference does not enumerate it, and no
+   * undocumented statuses filter is guessed here.
+   */
+  async listNativeSubscriptions(input: ListNativeSubscriptionsInput = {}): Promise<ListNativeSubscriptionsResult> {
+    const page = parseSubscriptionsCursor(input.cursor);
+    const pageSize =
+      input.limit !== undefined ? Math.min(20, Math.max(1, Math.trunc(input.limit))) : undefined;
+    const params = new URLSearchParams();
+    if (pageSize !== undefined) params.set("page_size", String(pageSize));
+    params.set("page", String(page));
+    params.set("total_required", "true");
+    const body = await this.request<PayPalSubscriptionsPageLike | undefined>(
+      "GET",
+      `/v1/billing/subscriptions?${params.toString()}`,
+    );
+    const ids = (body?.subscriptions ?? [])
+      .map((item) => item.id)
+      .filter((id): id is string => typeof id === "string" && id.length > 0);
+    const subscriptions = await Promise.all(ids.map((id) => this.retrieveSubscriptionRecord(id)));
+    const next = nextSubscriptionsPage(page, ids.length, pageSize ?? 10, body);
+    return { subscriptions, ...(next !== undefined ? { nextCursor: String(next) } : {}) };
+  }
+
+  async retrieveNativeSubscription(input: RetrieveNativeSubscriptionInput): Promise<NativeSubscriptionRecord> {
+    if (!input.subscriptionId) {
+      // An empty id would route the GET to the LIST endpoint — reject before the wire.
+      throw PayFanoutError.invalidRequest("retrieveNativeSubscription requires subscriptionId");
+    }
+    return this.retrieveSubscriptionRecord(input.subscriptionId);
+  }
+
+  /**
+   * Stops PayPal-side billing, verified-idempotent. The cancel endpoint
+   * accepts only ACTIVE/SUSPENDED subscriptions (anything else answers 422
+   * SUBSCRIPTION_STATUS_INVALID). The derived PayPal-Request-Id header is
+   * forwarded best-effort even though the cancel operation declares no such
+   * parameter — replay safety rests on the state machine plus re-fetch: on
+   * any cancel rejection the subscription is re-fetched, and a terminal
+   * billing state (CANCELLED or EXPIRED — billing already stopped) resolves
+   * as success with the honest record. Non-terminal states rethrow the
+   * cancel error. The required `reason` body field is filled with a fixed
+   * factual default.
+   */
+  async cancelNativeSubscription(input: CancelNativeSubscriptionInput): Promise<NativeSubscriptionRecord> {
+    if (!input.subscriptionId) {
+      throw PayFanoutError.invalidRequest("cancelNativeSubscription requires subscriptionId");
+    }
+    try {
+      // 204 No Content on success — the record comes from the follow-up GET.
+      await this.request<undefined>(
+        "POST",
+        `/v1/billing/subscriptions/${encodeURIComponent(input.subscriptionId)}/cancel`,
+        {
+          requestId: await derivePayPalRequestId(input.idempotencyKey),
+          json: { reason: PAYPAL_SUBSCRIPTION_CANCEL_REASON },
+        },
+      );
+    } catch (err) {
+      const record = await this.subscriptionRecordOrUndefined(input.subscriptionId);
+      if (record && (record.status === "canceled" || record.status === "completed")) return record;
+      throw err;
+    }
+    return this.retrieveSubscriptionRecord(input.subscriptionId);
+  }
+
+  /** fields=plan expands the effective plan — the documented source of the recurring amount. */
+  private retrieveSubscriptionRecord(subscriptionId: string): Promise<NativeSubscriptionRecord> {
+    return this.request<PayPalSubscriptionLike>(
+      "GET",
+      `/v1/billing/subscriptions/${encodeURIComponent(subscriptionId)}?fields=plan`,
+    ).then(paypalSubscriptionToRecord);
+  }
+
+  /** Post-rejection probe for cancel — the original cancel error stays authoritative if this fails too. */
+  private async subscriptionRecordOrUndefined(subscriptionId: string): Promise<NativeSubscriptionRecord | undefined> {
+    try {
+      return await this.retrieveSubscriptionRecord(subscriptionId);
+    } catch {
+      // Unretrievable (404, outage): nothing proves billing stopped.
+      return undefined;
+    }
   }
 
   /**
@@ -1060,6 +1170,36 @@ function isNotFound(err: unknown): boolean {
 function accessTokenFrom(text: string): string | undefined {
   const token = (text ? safeJson(text) : undefined) as { access_token?: unknown } | undefined;
   return typeof token?.access_token === "string" ? token.access_token : undefined;
+}
+
+/** The subscriptions-list cursor is the next page number this adapter issued. */
+function parseSubscriptionsCursor(cursor: string | undefined): number {
+  if (cursor === undefined) return 1;
+  if (!/^[1-9]\d*$/.test(cursor)) {
+    throw PayFanoutError.invalidRequest("listNativeSubscriptions cursor was not produced by this adapter", {
+      cursor,
+    });
+  }
+  return Number(cursor);
+}
+
+/**
+ * Last-page detection ladder: total_pages (requested via total_required=true)
+ * is authoritative; a links[rel=next] entry is honored when totals are
+ * absent; a full page without either still pages on — the walk then ends on
+ * the following short/empty page instead of dropping records.
+ */
+function nextSubscriptionsPage(
+  page: number,
+  itemCount: number,
+  effectivePageSize: number,
+  body: PayPalSubscriptionsPageLike | undefined,
+): number | undefined {
+  if (typeof body?.total_pages === "number") {
+    return page < body.total_pages ? page + 1 : undefined;
+  }
+  if ((body?.links ?? []).some((link) => (link.rel ?? "").toLowerCase() === "next")) return page + 1;
+  return itemCount > 0 && itemCount >= effectivePageSize ? page + 1 : undefined;
 }
 
 function relativeEventsPath(href: string): string | undefined {

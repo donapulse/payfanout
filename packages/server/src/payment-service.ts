@@ -2,23 +2,30 @@ import {
   assertMinorUnitAmount,
   PayFanoutError,
   type AdapterCapabilities,
+  type CancelNativeSubscriptionInput,
   type ChargeSavedPaymentMethodInput,
   type CompletePaymentInput,
   type CreateCustomerInput,
+  type CreateNativeSubscriptionInput,
   type CreatePaymentSessionInput,
   type CustomerRef,
   type FetchEventsInput,
   type FetchEventsResult,
+  type ListNativeSubscriptionsInput,
+  type ListNativeSubscriptionsResult,
   type ListPaymentsInput,
   type ListPaymentsResult,
   type ListRefundsInput,
   type ListRefundsResult,
   type MinorUnitAmount,
+  type NativeSubscriptionCapabilities,
+  type NativeSubscriptionRecord,
   type PaymentInfo,
   type PaymentSession,
   type RefundInfo,
   type RefundRequest,
   type RefundResult,
+  type RetrieveNativeSubscriptionInput,
   screenSessionInput,
   type SavedPaymentMethod,
   type SavePaymentMethodInput,
@@ -53,7 +60,11 @@ export interface PaymentOperationTelemetry {
     | "savePaymentMethod"
     | "listSavedPaymentMethods"
     | "deleteSavedPaymentMethod"
-    | "chargeSavedPaymentMethod";
+    | "chargeSavedPaymentMethod"
+    | "listNativeSubscriptions"
+    | "retrieveNativeSubscription"
+    | "createNativeSubscription"
+    | "cancelNativeSubscription";
   durationMs: number;
   ok: boolean;
   /** Unified code when the call rejected. */
@@ -317,6 +328,111 @@ export class PaymentService {
       throw guardError(pspName, `"${pspName}" does not support listing refunds`);
     }
     return this.run(pspName, "listRefunds", () => adapter.listRefunds!(input));
+  }
+
+  // --- PSP-native subscriptions -----------------------------------------
+  // The PSP schedules and collects these charges itself. Contrast the
+  // host-side SubscriptionManager, where the HOST bills on vault tokens.
+  // Capability is per operation — provider support is uneven.
+
+  async listNativeSubscriptions(
+    pspName: string,
+    input?: ListNativeSubscriptionsInput,
+  ): Promise<ListNativeSubscriptionsResult> {
+    const adapter = this.nativeSubscriptionAdapter(pspName, "list", "listing");
+    return this.run(pspName, "listNativeSubscriptions", () => adapter.listNativeSubscriptions!(input));
+  }
+
+  async retrieveNativeSubscription(
+    pspName: string,
+    input: RetrieveNativeSubscriptionInput,
+  ): Promise<NativeSubscriptionRecord> {
+    const adapter = this.nativeSubscriptionAdapter(pspName, "retrieve", "retrieving");
+    return this.run(pspName, "retrieveNativeSubscription", () => adapter.retrieveNativeSubscription!(input));
+  }
+
+  /** Server-only creation against an already-vaulted instrument (token or mandate). */
+  async createNativeSubscription(
+    pspName: string,
+    input: CreateNativeSubscriptionInput,
+  ): Promise<NativeSubscriptionRecord> {
+    const adapter = this.nativeSubscriptionAdapter(pspName, "create", "creating");
+    assertMinorUnitAmount(input.amount, "amount");
+    if (input.amount === 0) {
+      throw guardError(pspName, "createNativeSubscription requires a positive amount", "invalid_request");
+    }
+    // The cadence must be unambiguous: exactly one authoritative expression.
+    if (!input.interval && !input.schedule) {
+      throw guardError(
+        pspName,
+        "createNativeSubscription requires a billing cadence — pass interval (with optional intervalCount) or schedule",
+        "invalid_request",
+      );
+    }
+    if (input.interval && input.schedule) {
+      throw guardError(
+        pspName,
+        "createNativeSubscription accepts interval or schedule, not both — one cadence must be authoritative",
+        "invalid_request",
+      );
+    }
+    if (input.intervalCount !== undefined) {
+      if (!input.interval) {
+        throw guardError(
+          pspName,
+          "createNativeSubscription intervalCount requires interval",
+          "invalid_request",
+        );
+      }
+      if (!Number.isInteger(input.intervalCount) || input.intervalCount < 1) {
+        throw guardError(
+          pspName,
+          "createNativeSubscription intervalCount must be a positive integer",
+          "invalid_request",
+        );
+      }
+    }
+    if (input.startAt !== undefined && Number.isNaN(Date.parse(input.startAt))) {
+      throw guardError(
+        pspName,
+        "createNativeSubscription startAt must be an ISO 8601 instant",
+        "invalid_request",
+      );
+    }
+    requireIdempotencyKey(input.idempotencyKey, "createNativeSubscription");
+    return this.run(pspName, "createNativeSubscription", () => adapter.createNativeSubscription!(input));
+  }
+
+  /**
+   * Stops PSP-side billing. Adapters implement this verified-idempotent: an
+   * already-terminal subscription resolves as success, so replaying a cancel
+   * (adoption flows do) can never fail on its own earlier success.
+   */
+  async cancelNativeSubscription(
+    pspName: string,
+    input: CancelNativeSubscriptionInput,
+  ): Promise<NativeSubscriptionRecord> {
+    const adapter = this.nativeSubscriptionAdapter(pspName, "cancel", "canceling");
+    requireIdempotencyKey(input.idempotencyKey, "cancelNativeSubscription");
+    return this.run(pspName, "cancelNativeSubscription", () => adapter.cancelNativeSubscription!(input));
+  }
+
+  private nativeSubscriptionAdapter(
+    pspName: string,
+    operation: keyof NativeSubscriptionCapabilities,
+    verb: string,
+  ): ServerPaymentAdapter {
+    const adapter = this.adapterFor(pspName);
+    const methods = {
+      list: adapter.listNativeSubscriptions,
+      retrieve: adapter.retrieveNativeSubscription,
+      create: adapter.createNativeSubscription,
+      cancel: adapter.cancelNativeSubscription,
+    } as const;
+    if (!adapter.getCapabilities().nativeSubscriptions[operation] || !methods[operation]) {
+      throw guardError(pspName, `"${pspName}" does not support ${verb} native subscriptions`);
+    }
+    return adapter;
   }
 
   private adapterFor(pspName: string): ServerPaymentAdapter {

@@ -887,3 +887,117 @@ dictionary, and each rail's technical-information table):
   before production (the guide says so). Google Pay also exists on the hosted page
   (GOOGLEPAY) but is deliberately not wired — it would belong to the smartForm/wallet
   story, a separate decision.
+
+## PSP-native subscriptions across the contract (2026-07-17)
+
+Supersedes the future-designs §3 ruling that PSP-native subscriptions are out of scope.
+That ruling's premise — only one shipped PSP has a native product — no longer held under
+a same-day documentation review: most shipped PSPs expose one, including Paysafe (whose
+absence was the recorded justification). The adoption flow (list a merchant's PSP-billed
+subscriptions, re-create them in the host engine on the same vault token, cancel at the
+PSP so exactly one biller remains) needs PSP-side list/retrieve/create/cancel, so the
+contract now carries them.
+
+- **Contract**: `AdapterCapabilities.nativeSubscriptions` declares each operation
+  separately (`{ list, retrieve, create, cancel }`, required block, all-false = no
+  native product) — provider support is uneven and one boolean would fake or hide it.
+  Optional `ServerPaymentAdapter` methods `listNativeSubscriptions` (limit/cursor),
+  `retrieveNativeSubscription`, `createNativeSubscription`, `cancelNativeSubscription`;
+  unified `NativeSubscriptionRecord` (minor-unit amount, status union
+  pending/trialing/active/past_due/paused/canceled/completed/unknown — unmappable states
+  normalize to `unknown`, never dropped). Create takes exactly one cadence: `interval`
+  (+`intervalCount`) or an RFC 5545 `schedule`; adapters reject what their provider
+  cannot express instead of approximating. Cancel is contractually verified-idempotent:
+  on a cancel rejection the adapter re-fetches and treats an already-terminal
+  subscription as success — the conformance suite replays a cancel and requires both
+  calls to succeed. Retrieve/cancel inputs carry an optional `savedPaymentMethodToken`
+  because PayZen keys subscriptions by id + token.
+- **Stripe** (doc-verified 2026-07-17): list GET /v1/subscriptions returns the provider
+  default (not-canceled) set; `items[].price_data` requires an existing Product id, so a
+  `planId`-less create mints a Product under `${idempotencyKey}-product` then creates
+  with inline price_data; `planId` = an existing Price id and the record reports the
+  price's own facts. Creates send `off_session: true` + `payment_behavior:
+  "error_if_incomplete"` (declines reject, no zombie incomplete subscription).
+  `startAt` = future `billing_cycle_anchor` + `proration_behavior: "none"`. Cancel is a
+  DELETE and Stripe ignores idempotency keys on DELETE — replay safety is the re-fetch.
+  Statuses: incomplete→pending, incomplete_expired→canceled, unpaid→past_due, the rest
+  1:1. `current_period_start/end` moved onto subscription items in 2025-03-31.basil; the
+  adapter reads both locations so re-pinning across basil needs no change. Open item:
+  the three-decimal multiples-of-10 rule is no longer findable on
+  docs.stripe.com/currencies — shipped validation kept for parity, sandbox re-check
+  worthwhile.
+- **Paysafe** (doc-verified 2026-07-17): the Payment Scheduler (`subscriptionsplans/v1`)
+  authenticates with the same server-to-server Basic API key ("Back Office" is where the
+  key is retrieved, not a distinct credential) — flags statically all-true; scheduler
+  enablement remains per-account provisioning. Creation is `POST
+  /plans/{planId}/subscriptions` per the official OpenAPI spec — the typical-calls page
+  shows a bare `POST /subscriptions` that the spec contradicts (no such path, no planId
+  body field); spec followed, CI-dispatch sandbox run is the arbiter. Frequency enum is
+  DAILY/MONTHLY/YEARLY (no weekly, no RRULE); plan amounts are integer minor units;
+  `numberOfCycles: 0` = infinite. `input.merchantRefNum` wins over `idempotencyKey` for
+  the refNum (single field); replayed creates recover by refNum lookup; inline plans
+  have no refNum channel so a transport-retried creation can orphan a plan (clutter,
+  never billing). Wire statuses exactly ACTIVE/CANCELLED/SUSPENDED/COMPLETED →
+  active/canceled/paused/completed. Undocumented behaviors handled defensively, pending
+  the sandbox probe: duplicate-refNum answer shape, already-CANCELLED PATCH answer,
+  `fields` default inclusion, `meta.numberOfRecords` semantics (nextCursor derives from
+  page fullness, never that field).
+- **GoCardless** (doc-verified 2026-07-17): subscriptions charge a mandate — the mandate
+  id is the `savedPaymentMethodToken`, the customer derives from it (`pspCustomerId`
+  ignored). interval_unit weekly/monthly/yearly only: interval "day", `schedule`, and
+  `planId` reject (no plan object). `merchantRefNum` → `name` (≤255, becomes each
+  payment's description); `payment_reference` never sent (restricted to own-SUN
+  accounts). Subscription currencies AUD/CAD/DKK/EUR/GBP/NZD/SEK/USD gate locally —
+  wider than the one-off GBP/EUR `supportedCurrencies`. Statuses:
+  pending_customer_approval→pending, customer_approval_denied→canceled (terminal, never
+  billed), finished→completed, rest 1:1. Cancelling stops future payment creation only —
+  already-created payments still collect unless cancelled separately (documented
+  provider warning, surfaced in JSDoc/README/guide). `currentPeriodEnd` = earliest
+  `upcoming_payments[].charge_date`; `startAt` maps to the date-only `start_date`
+  keeping the caller's stated calendar date.
+- **PayPal** (doc-verified 2026-07-17): `create: false` — Subscriptions v1 creation is
+  buyer-approval-gated (201 APPROVAL_PENDING + approve link); the only approval-free
+  shape takes a raw PAN (US/AU, non-3DS), unusable under the card-data invariant. The
+  recurring amount requires `GET {id}?fields=plan` (documented `fields` values are
+  exactly `last_failed_payment` and `plan`); list items omit the inline plan, so a list
+  page costs 1 + N requests (N ≤ page_size ≤ 20) — amount ladder: REGULAR-cycle
+  `fixed_price` × `quantity` (per-unit when the plan is quantity-supported, per the
+  pricing-plans guide; quantity parsed as a positive integer, anything else invalidates
+  the rung) → `billing_info.last_payment.amount` (already a collected total, never
+  multiplied) → amount 0 with the truth on `raw` (never invented, and one
+  un-projectable record cannot fail a list page or the adoption walk).
+  Cancel declares no PayPal-Request-Id parameter and requires a `reason` body
+  (fixed "Canceled by merchant"); replay safety is the ACTIVE/SUSPENDED-only state
+  machine + re-fetch on 422 SUBSCRIPTION_STATUS_INVALID. Statuses:
+  APPROVAL_PENDING/APPROVED→pending, SUSPENDED→paused, EXPIRED→completed (finite
+  total_cycles ran out), rest 1:1; no trial/past-due status exists. The published
+  OpenAPI spec lacks the list operation entirely; the live reference page is the
+  authority for it. Which statuses an unfiltered list returns is undocumented — no
+  `statuses` filter is guessed.
+- **PayZen** (doc-verified 2026-07-17 via the GraphQL content channel; the JSON schema
+  again lags the playground — `ResponseCodeAnswer.responseCode` enum lists only 0 while
+  the rendered Subscription/Cancel table documents 0/30/32/99): `list: false` (no list
+  API) — hosts must retain `subscriptionId` + `paymentMethodToken`, required together on
+  Subscription/Get and Subscription/Cancel (composite key). V4 subscriptions carry no
+  status field; derived: cancelDate set→canceled, else pastPaymentsNumber ≥
+  totalPaymentsNumber (>0)→completed, else future effectDate→pending, else active.
+  `interval` synthesizes `RRULE:FREQ=…;INTERVAL=n` (all four FREQ values accepted;
+  sub-daily "not taken into account" → rejected locally); `schedule` passes through
+  normalized to the RRULE:-prefixed form; simple FREQ+INTERVAL(+COUNT) rules project
+  back onto `interval`/`intervalCount`, anything with BYxxx/UNTIL stays schedule-only.
+  Charge/CreateSubscription applies immediately with no idempotency channel and no
+  lookup-by-orderId API — the create is never transport-retried, a deterministic
+  orderId + `payfanout_key` metadata stamp keep duplicates traceable, and hosts must
+  treat creation as at-most-once (documented). Cancel is the one PayZen mutating call
+  that keeps automatic transport retries: replay-safe by the verified-idempotent
+  re-fetch over both rejection channels (nonzero responseCode; PSP_033/PSP_564 errors).
+  New PSP error codes mapped: PSP_030/031/032/033/563/564/565/566/567.
+- **Worldline** (doc-verified 2026-07-17): no native engine — recurring is
+  credential-on-file, each charge merchant-initiated (`subsequentType: "recurring"`),
+  already covered by the vault surface + host-side SubscriptionManager; capability
+  all-false is the honest declaration.
+- The host-side `SubscriptionManager` is unchanged; the guide contrasts the two engines
+  and documents the adoption recipe. Sandbox smokes for the native surface ride the
+  dispatch-gated integration suites (Stripe and GoCardless full round-trips, Paysafe
+  defensive round-trip, PayPal list-only); PayZen has no repo sandbox credentials, so
+  its derivations are doc-derived pending a future sandbox pass.

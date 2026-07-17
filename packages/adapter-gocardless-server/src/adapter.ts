@@ -9,19 +9,27 @@ import {
   safeJson,
   withTransportRetries,
   type AdapterCapabilities,
+  type CancelNativeSubscriptionInput,
+  type CreateNativeSubscriptionInput,
   type CreatePaymentSessionInput,
   type FetchEventsInput,
   type FetchEventsResult,
+  type ListNativeSubscriptionsInput,
+  type ListNativeSubscriptionsResult,
   type ListPaymentsInput,
   type ListPaymentsResult,
   type ListRefundsInput,
   type ListRefundsResult,
+  type NativeSubscriptionInterval,
+  type NativeSubscriptionRecord,
+  type NativeSubscriptionStatus,
   type PaymentInfo,
   type PaymentMethodCapability,
   type PaymentSession,
   type RefundInfo,
   type RefundRequest,
   type RefundResult,
+  type RetrieveNativeSubscriptionInput,
   type ServerPaymentAdapter,
   type UnifiedErrorCode,
   type UnifiedPaymentMethodType,
@@ -138,6 +146,37 @@ export interface GoCardlessRefundLike {
   links?: { payment?: string; mandate?: string };
 }
 
+/**
+ * Wire shape of a GoCardless subscription (snake_case). `interval` is the
+ * NUMBER of interval_units between charges (unified `intervalCount`);
+ * `upcoming_payments` carries up to 10 scheduled charges with their dates.
+ */
+export interface GoCardlessSubscriptionLike {
+  id: string;
+  created_at?: string;
+  amount?: number;
+  currency?: string;
+  status?: string;
+  /** Merchant-facing name; also set as the description on each payment created. */
+  name?: string;
+  start_date?: string;
+  end_date?: string;
+  /** Number of interval_units between charge dates (defaults to 1). */
+  interval?: number;
+  /** weekly | monthly | yearly. */
+  interval_unit?: string;
+  day_of_month?: number;
+  month?: string;
+  count?: number;
+  payment_reference?: string;
+  retry_if_possible?: boolean;
+  earliest_charge_date_after_resume?: string;
+  parent_plan_paused?: boolean;
+  upcoming_payments?: Array<{ charge_date?: string; amount?: number }>;
+  metadata?: Record<string, string>;
+  links?: { mandate?: string };
+}
+
 interface GoCardlessBillingRequestFlowLike {
   id: string;
   authorisation_url?: string;
@@ -182,6 +221,28 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
 ];
 
 const SUPPORTED_ONE_OFF_CURRENCIES = new Set(["GBP", "EUR"]);
+
+/**
+ * Subscriptions charge a mandate, so they bill in every GoCardless debit
+ * currency — unlike one-off billing request payments (GBP/EUR only).
+ */
+const SUBSCRIPTION_CURRENCIES = new Set(["AUD", "CAD", "DKK", "EUR", "GBP", "NZD", "SEK", "USD"]);
+
+/**
+ * GoCardless subscriptions bill weekly, monthly, or yearly only — "day" has
+ * no faithful projection and must reject rather than approximate.
+ */
+const INTERVAL_UNIT_BY_INTERVAL: Partial<Record<NativeSubscriptionInterval, string>> = {
+  week: "weekly",
+  month: "monthly",
+  year: "yearly",
+};
+
+const INTERVAL_BY_INTERVAL_UNIT: Record<string, NativeSubscriptionInterval> = {
+  weekly: "week",
+  monthly: "month",
+  yearly: "year",
+};
 
 export class GoCardlessServerAdapter implements ServerPaymentAdapter {
   readonly pspName = GOCARDLESS_PSP_NAME;
@@ -238,6 +299,10 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       supportsSessionUpdate: false, // a billing request's payment_request cannot be amended — cancel + recreate
       supportsEventPolling: true, // GET /events — the missed-webhook recovery path
       supportsListing: true,
+      // The Subscriptions API is a full native billing engine: GoCardless
+      // creates each payment against the mandate on its own schedule. All four
+      // operations exist server-side, so all four are declared.
+      nativeSubscriptions: { list: true, retrieve: true, create: true, cancel: true },
       requiresServerCompletion: false, // the hosted flow fulfils the billing request itself
       paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };
@@ -558,6 +623,164 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
     return { refunds, ...(nextCursor ? { nextCursor } : {}) };
   }
 
+  /**
+   * Creates a subscription GoCardless itself bills (POST /subscriptions)
+   * against an existing MANDATE — `savedPaymentMethodToken` is the mandate id
+   * (`MD...`), and GoCardless derives the customer from it, so
+   * `pspCustomerId` is ignored. Cadence is weekly/monthly/yearly only:
+   * interval "day" and RRULE `schedule`s reject (`invalid_request`) instead
+   * of approximating. `merchantRefNum` rides the dedicated `name` field
+   * (max 255 chars; GoCardless also sets it as the description on each
+   * payment created) — never `payment_reference`, which is restricted to
+   * accounts with their own Service User Number. `startAt` maps to the
+   * date-only `start_date` (the instant's stated calendar date); omitted, the
+   * first charge lands on the mandate's next_possible_charge_date. `planId`
+   * rejects: GoCardless subscriptions have no plan object.
+   */
+  async createNativeSubscription(input: CreateNativeSubscriptionInput): Promise<NativeSubscriptionRecord> {
+    assertMinorUnitAmount(input.amount, "amount");
+    if (input.amount === 0) {
+      throw PayFanoutError.invalidRequest("createNativeSubscription requires a positive amount", { input });
+    }
+    const currency = normalizeCurrency(input.currency);
+    if (!SUBSCRIPTION_CURRENCIES.has(currency)) {
+      throw PayFanoutError.invalidRequest(
+        `GoCardless subscriptions support AUD, CAD, DKK, EUR, GBP, NZD, SEK and USD, got ${currency}`,
+        { currency },
+      );
+    }
+    if (!input.savedPaymentMethodToken) {
+      throw PayFanoutError.invalidRequest(
+        "createNativeSubscription requires savedPaymentMethodToken — the GoCardless mandate id the subscription charges",
+        { missing: "savedPaymentMethodToken" },
+      );
+    }
+    if (input.schedule !== undefined) {
+      throw PayFanoutError.invalidRequest(
+        "GoCardless subscriptions have no RRULE surface — express the cadence as interval week/month/year",
+        { schedule: input.schedule },
+      );
+    }
+    if (!input.interval) {
+      throw PayFanoutError.invalidRequest(
+        "createNativeSubscription requires a billing cadence — pass interval week/month/year",
+        { missing: "interval" },
+      );
+    }
+    const intervalUnit = INTERVAL_UNIT_BY_INTERVAL[input.interval];
+    if (!intervalUnit) {
+      throw PayFanoutError.invalidRequest(
+        `GoCardless subscriptions bill weekly, monthly, or yearly — interval "${input.interval}" has no faithful projection`,
+        { interval: input.interval },
+      );
+    }
+    if (
+      input.intervalCount !== undefined &&
+      (!Number.isInteger(input.intervalCount) || input.intervalCount < 1)
+    ) {
+      throw PayFanoutError.invalidRequest(
+        "createNativeSubscription intervalCount must be a positive integer",
+        { intervalCount: input.intervalCount },
+      );
+    }
+    if (input.planId !== undefined) {
+      throw PayFanoutError.invalidRequest(
+        "GoCardless subscriptions have no plan object — omit planId",
+        { planId: input.planId },
+      );
+    }
+    if (input.merchantRefNum !== undefined && input.merchantRefNum.length > 255) {
+      throw PayFanoutError.invalidRequest(
+        "merchantRefNum rides the GoCardless subscription name, which must not exceed 255 characters",
+        { length: input.merchantRefNum.length },
+      );
+    }
+    const startDate = input.startAt === undefined ? undefined : toStartDate(input.startAt);
+    const metadata = toStampedMetadata(input);
+    const subscription = await this.createWithIdempotencyReplay<GoCardlessSubscriptionLike>(
+      "subscriptions",
+      {
+        subscriptions: {
+          amount: input.amount,
+          currency,
+          interval_unit: intervalUnit,
+          ...(input.intervalCount !== undefined ? { interval: input.intervalCount } : {}),
+          ...(startDate ? { start_date: startDate } : {}),
+          ...(input.merchantRefNum ? { name: input.merchantRefNum } : {}),
+          ...(metadata ? { metadata } : {}),
+          links: { mandate: input.savedPaymentMethodToken },
+        },
+      },
+      input.idempotencyKey,
+    );
+    return this.toNativeSubscriptionRecord(subscription);
+  }
+
+  /** Pages GET /subscriptions with GoCardless cursor semantics (`after`; limit 1-500, default 50). */
+  async listNativeSubscriptions(
+    input: ListNativeSubscriptionsInput = {},
+  ): Promise<ListNativeSubscriptionsResult> {
+    const query = new URLSearchParams();
+    if (input.limit !== undefined) query.set("limit", String(clampPageSize(input.limit)));
+    if (input.cursor) query.set("after", input.cursor);
+    const page = await this.request<{
+      subscriptions?: GoCardlessSubscriptionLike[];
+      meta?: GoCardlessListMeta;
+    }>("GET", withQuery("/subscriptions", query));
+    const subscriptions = (page.subscriptions ?? []).map((s) => this.toNativeSubscriptionRecord(s));
+    const nextCursor = page.meta?.cursors?.after;
+    return { subscriptions, ...(nextCursor ? { nextCursor } : {}) };
+  }
+
+  /** GET /subscriptions/:id — the subscription id alone keys retrieval (savedPaymentMethodToken is not needed). */
+  async retrieveNativeSubscription(
+    input: RetrieveNativeSubscriptionInput,
+  ): Promise<NativeSubscriptionRecord> {
+    const subscription = await this.request<GoCardlessSubscriptionLike>(
+      "GET",
+      `/subscriptions/${encodeURIComponent(input.subscriptionId)}`,
+      { envelope: "subscriptions" },
+    );
+    return this.toNativeSubscriptionRecord(subscription);
+  }
+
+  /**
+   * POST /subscriptions/:id/actions/cancel — stops FUTURE payment creation
+   * only: payments the subscription has already created still collect unless
+   * they are cancelled separately (GoCardless documents this explicitly).
+   * GoCardless rejects the action with a cancellation_failed invalid_state
+   * error once a subscription is already cancelled or finished, so this is
+   * verified-idempotent: on any rejection the subscription is re-fetched and
+   * a terminal state resolves as success — the billing stop the caller asked
+   * for already holds. The caller's key rides the Idempotency-Key header,
+   * matching the adapter's other cancel actions.
+   */
+  async cancelNativeSubscription(input: CancelNativeSubscriptionInput): Promise<NativeSubscriptionRecord> {
+    const path = `/subscriptions/${encodeURIComponent(input.subscriptionId)}`;
+    try {
+      const subscription = await this.request<GoCardlessSubscriptionLike>(
+        "POST",
+        `${path}/actions/cancel`,
+        { body: {}, idempotencyKey: input.idempotencyKey, envelope: "subscriptions" },
+      );
+      return this.toNativeSubscriptionRecord(subscription);
+    } catch (err) {
+      // The resource state decides, never the error shape: a terminal
+      // re-fetch means billing is already stopped, whatever the action said.
+      let record: NativeSubscriptionRecord;
+      try {
+        record = this.toNativeSubscriptionRecord(
+          await this.request<GoCardlessSubscriptionLike>("GET", path, { envelope: "subscriptions" }),
+        );
+      } catch {
+        // The re-fetch failing must not mask the original rejection.
+        throw err;
+      }
+      if (record.status === "canceled" || record.status === "completed") return record;
+      throw err;
+    }
+  }
+
   async verifyWebhookSignature(rawBody: string, headers: Record<string, string>): Promise<boolean> {
     return verifyGoCardlessWebhookSignature(rawBody, headers, this.config.webhookSecret);
   }
@@ -618,6 +841,32 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       ...(extras.mandateReference ? { mandateReference: extras.mandateReference } : {}),
       createdAt: payment.created_at ?? EPOCH,
       raw: extras.billingRequest ? { billing_request: extras.billingRequest, payment } : payment,
+    };
+  }
+
+  /**
+   * Wire subscription -> unified record. GoCardless's `interval` is the count
+   * of `interval_unit`s, so it lands on `intervalCount` (default 1); an
+   * unrecognized interval_unit omits the cadence pair rather than guessing.
+   * `currentPeriodEnd` is the earliest upcoming charge_date — when the next
+   * charge is due. There is no currentPeriodStart fact to report (start_date
+   * is the FIRST charge, not the running period), and the mandate is the
+   * reusable charging handle, so it doubles as savedPaymentMethodToken.
+   */
+  private toNativeSubscriptionRecord(subscription: GoCardlessSubscriptionLike): NativeSubscriptionRecord {
+    const interval = INTERVAL_BY_INTERVAL_UNIT[subscription.interval_unit ?? ""];
+    const currentPeriodEnd = earliestUpcomingChargeDate(subscription);
+    return {
+      id: subscription.id,
+      pspName: this.pspName,
+      status: mapGoCardlessSubscriptionStatus(subscription.status),
+      amount: subscription.amount ?? 0,
+      currency: (subscription.currency ?? "").toUpperCase() || "GBP",
+      ...(interval ? { interval, intervalCount: subscription.interval ?? 1 } : {}),
+      ...(currentPeriodEnd ? { currentPeriodEnd } : {}),
+      ...(subscription.links?.mandate ? { savedPaymentMethodToken: subscription.links.mandate } : {}),
+      ...(subscription.name ? { merchantRefNum: subscription.name } : {}),
+      raw: subscription,
     };
   }
 
@@ -798,6 +1047,60 @@ function mapGoCardlessPaymentStatus(status: string | undefined): UnifiedPaymentS
   }
 }
 
+/**
+ * Documented subscription statuses: pending_customer_approval |
+ * customer_approval_denied | active | finished | cancelled | paused.
+ * customer_approval_denied is terminal — the customer refused the approval,
+ * nothing was ever billed and no payments will be created — and GoCardless
+ * groups it with the non-cancellable states (cancellation_failed), so it
+ * projects to "canceled": billing is permanently stopped. Anything
+ * undocumented stays "unknown", never guessed.
+ */
+function mapGoCardlessSubscriptionStatus(status: string | undefined): NativeSubscriptionStatus {
+  switch (status) {
+    case "pending_customer_approval":
+      return "pending";
+    case "active":
+      return "active";
+    case "paused":
+      return "paused";
+    // All scheduled payments have been created — the finite schedule ran out.
+    case "finished":
+      return "completed";
+    case "cancelled":
+    case "customer_approval_denied":
+      return "canceled";
+    default:
+      return "unknown";
+  }
+}
+
+/** Earliest of the up-to-10 upcoming charges (date-only strings sort lexically). */
+function earliestUpcomingChargeDate(subscription: GoCardlessSubscriptionLike): string | undefined {
+  let earliest: string | undefined;
+  for (const payment of subscription.upcoming_payments ?? []) {
+    if (payment.charge_date && (!earliest || payment.charge_date < earliest)) {
+      earliest = payment.charge_date;
+    }
+  }
+  return earliest;
+}
+
+/**
+ * GoCardless date fields want YYYY-MM-DD. An ISO instant keeps its STATED
+ * calendar date (no timezone math — the caller's date is the authority).
+ */
+function toStartDate(startAt: string): string {
+  const match = /^(\d{4}-\d{2}-\d{2})/.exec(startAt.trim());
+  if (!match || Number.isNaN(Date.parse(startAt.trim()))) {
+    throw PayFanoutError.invalidRequest(
+      `startAt must be an ISO 8601 date or instant, got: ${startAt}`,
+      { startAt },
+    );
+  }
+  return match[1]!;
+}
+
 function mapGoCardlessRefundStatus(status: string | undefined): RefundResult["status"] {
   switch (status) {
     case "paid":
@@ -889,13 +1192,18 @@ function idempotentConflictResourceId(err: unknown): string | undefined {
 }
 
 /**
- * GoCardless metadata allows at most 3 keys (50-char names, 500-char values).
- * payfanout_id claims a slot first so the host id round-trips; host keys fill
- * the remaining slots and overflow is withheld rather than failing the payment.
- * Stamped on the billing request AND its payment_request, so the facts survive
- * onto the payment GoCardless creates at fulfilment.
+ * GoCardless metadata allows at most 3 keys (50-char names, 500-char values)
+ * on every resource that carries it — billing requests and subscriptions
+ * alike. payfanout_id claims a slot first where the input has a host id so it
+ * round-trips; remaining keys fill the slots and overflow is withheld rather
+ * than failing the call. On sessions it is stamped on the billing request AND
+ * its payment_request, so the facts survive onto the payment GoCardless
+ * creates at fulfilment.
  */
-function toStampedMetadata(input: CreatePaymentSessionInput): Record<string, string> | undefined {
+function toStampedMetadata(input: {
+  id?: string;
+  metadata?: Record<string, string>;
+}): Record<string, string> | undefined {
   const metadata: Record<string, string> = {};
   if (input.id) metadata["payfanout_id"] = input.id;
   for (const [key, value] of Object.entries(input.metadata ?? {})) {

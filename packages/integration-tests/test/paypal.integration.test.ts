@@ -15,7 +15,7 @@
  * the business sandbox account, then set PAYPAL_NEGATIVE_TESTING=1).
  */
 import { describe, expect, it } from "vitest";
-import { isPayFanoutError } from "@payfanout/core";
+import { isPayFanoutError, NATIVE_SUBSCRIPTION_STATUSES } from "@payfanout/core";
 import { PayPalServerAdapter } from "@payfanout/adapter-paypal-server";
 
 const CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
@@ -94,6 +94,25 @@ describeIf("PayPal sandbox integration", () => {
     await expect(
       adapter.createPaymentSession({ amount: 1050, currency: "HUF", idempotencyKey: key() }),
     ).rejects.toMatchObject({ code: "invalid_request" });
+  });
+
+  // LIST-ONLY smoke: a live subscription cannot be created headlessly (the
+  // buyer must act on the approve link), and this suite must never cancel
+  // subscriptions it did not create — so the walk asserts page shape only.
+  it("lists native subscriptions as shape-valid unified records (page may be empty)", async () => {
+    const adapter = makeAdapter();
+    const page = await adapter.listNativeSubscriptions({ limit: 5 });
+    expect(Array.isArray(page.subscriptions)).toBe(true);
+    expect(page.subscriptions.length).toBeLessThanOrEqual(5);
+    for (const record of page.subscriptions) {
+      expect(record.pspName).toBe("paypal");
+      expect(record.id.length).toBeGreaterThan(0);
+      expect(NATIVE_SUBSCRIPTION_STATUSES).toContain(record.status);
+      expect(Number.isSafeInteger(record.amount)).toBe(true);
+      expect(record.amount).toBeGreaterThanOrEqual(0);
+      expect(record.currency).toMatch(/^[A-Z]{3}$/);
+    }
+    if (page.nextCursor !== undefined) expect(page.nextCursor).toMatch(/^\d+$/);
   });
 
   it("maps a nonexistent order/capture id onto invalid_request with raw preserved", async () => {

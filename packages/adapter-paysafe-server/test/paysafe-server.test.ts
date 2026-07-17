@@ -9,7 +9,7 @@ import {
   PaysafeServerAdapter,
   type PaysafeServerAdapterConfig,
 } from "../src/index.js";
-import { FakePaysafeApi } from "./fake-paysafe-api.js";
+import { FakePaysafeApi, SEEDED_MULTI_USE_TOKEN } from "./fake-paysafe-api.js";
 
 const SIGNING_KEY = "session-signing-key";
 const WEBHOOK_KEY = "webhook-hmac-key";
@@ -119,6 +119,17 @@ runServerAdapterConformanceTests(
     vault: {
       // Tokenize-first PSP: the client's single-use handle converts server-side.
       clientToken: () => `tok_single_${Math.random().toString(36).slice(2)}`,
+    },
+    nativeSubscriptions: {
+      // The Payment Scheduler bills MULTI_USE tokens only; the fake pre-vaults
+      // one so the fixture needs no customer/save round-trip of its own.
+      createInput: () => ({
+        savedPaymentMethodToken: SEEDED_MULTI_USE_TOKEN,
+        amount: 1499,
+        currency: "USD",
+        interval: "month",
+        idempotencyKey: `nsub-${Math.random().toString(36).slice(2)}`,
+      }),
     },
     money: {
       completedPayment: (adapter, input) => completedPayment(adapter, input),

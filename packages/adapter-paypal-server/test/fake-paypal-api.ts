@@ -74,6 +74,48 @@ interface WebhookFixture {
   headers: Record<string, string>;
 }
 
+/** Subscriptions v1 object as the fake stores it; GETs shape it per the `fields` query. */
+interface FakeSubscription {
+  id: string;
+  status: string;
+  status_update_time: string;
+  plan_id: string;
+  custom_id?: string;
+  quantity: string;
+  start_time: string;
+  create_time: string;
+  update_time: string;
+  plan_overridden: boolean;
+  subscriber: Record<string, unknown>;
+  billing_info: Record<string, unknown>;
+  plan: Record<string, unknown>;
+  links: Array<{ href: string; rel: string; method: string }>;
+}
+
+export interface SeedSubscriptionOptions {
+  /** APPROVAL_PENDING | APPROVED | ACTIVE | SUSPENDED | CANCELLED | EXPIRED (default ACTIVE). */
+  status?: string;
+  /** Regular-cycle fixed_price value, PayPal decimal string (default "15.00"). */
+  value?: string;
+  currency?: string;
+  /** DAY | WEEK | MONTH | YEAR (default MONTH). */
+  intervalUnit?: string;
+  intervalCount?: number;
+  /** Prepend a free TRIAL cycle (no pricing scheme) before the REGULAR one. */
+  withTrial?: boolean;
+  /** Tier-priced plan: the regular cycle carries tiers and NO fixed_price. */
+  tieredPricing?: boolean;
+  /** billing_info.last_payment amount; absent -> no payment collected yet. */
+  lastPaymentValue?: string;
+  /** Decimal-string unit count (default "1"); quantity plans price per unit. */
+  quantity?: string;
+  customId?: string;
+  email?: string;
+  /** subscriber.payment_source.card.attributes.vault.id (a vaulted card token). */
+  vaultId?: string;
+  planId?: string;
+}
+
 const SUPPORTED_CURRENCIES = new Set([
   "AUD", "BRL", "CAD", "CHF", "CNY", "CZK", "DKK", "EUR", "GBP", "HKD", "HUF", "ILS",
   "JPY", "MXN", "MYR", "NOK", "NZD", "PHP", "PLN", "RUB", "SEK", "SGD", "THB", "TWD", "USD",
@@ -86,6 +128,7 @@ export class FakePayPalApi {
   private readonly captures = new Map<string, { capture: FakeCapture; orderId: string }>();
   private readonly authorizations = new Map<string, { auth: FakeAuthorization; orderId: string; captured: number }>();
   private readonly refunds = new Map<string, FakeRefund>();
+  private readonly subscriptions = new Map<string, FakeSubscription>();
   private readonly replays = new Map<string, { status: number; body: string }>();
   private readonly tokens = new Map<string, number>();
   private readonly webhookFixtures: WebhookFixture[] = [];
@@ -102,6 +145,7 @@ export class FakePayPalApi {
 
   uniqueOrderCreations = 0;
   uniqueRefundCreations = 0;
+  uniqueSubscriptionCancels = 0;
   tokenMints = 0;
   verifyCalls = 0;
   requestCount = 0;
@@ -158,6 +202,70 @@ export class FakePayPalApi {
   /** Invalidates every issued token — the next call 401s and must re-mint. */
   revokeTokens(): void {
     this.tokens.clear();
+  }
+
+  /**
+   * Plants a Subscriptions v1 subscription (buyer-approved flows cannot run
+   * headlessly — the real API creates these APPROVAL_PENDING behind an
+   * approve link). Mirrors the documented read shapes: list items and plain
+   * GETs omit the inline `plan`; only `fields=plan` expands it.
+   */
+  seedSubscription(options: SeedSubscriptionOptions = {}): string {
+    const id = `I-FAKE${String(++this.seq).padStart(8, "0")}`;
+    const currency = options.currency ?? "USD";
+    const regularCycle = {
+      ...(options.tieredPricing
+        ? { pricing_scheme: { version: 1, pricing_model: "TIERED", tiers: [] } }
+        : { pricing_scheme: { version: 1, fixed_price: { currency_code: currency, value: options.value ?? "15.00" } } }),
+      frequency: { interval_unit: options.intervalUnit ?? "MONTH", interval_count: options.intervalCount ?? 1 },
+      tenure_type: "REGULAR",
+      sequence: options.withTrial ? 2 : 1,
+      total_cycles: 0,
+    };
+    const trialCycle = {
+      frequency: { interval_unit: "WEEK", interval_count: 1 },
+      tenure_type: "TRIAL",
+      sequence: 1,
+      total_cycles: 1,
+    };
+    const subscription: FakeSubscription = {
+      id,
+      status: options.status ?? "ACTIVE",
+      status_update_time: this.iso(),
+      plan_id: options.planId ?? "P-5ML4271244454362WXNWU5NQ",
+      ...(options.customId !== undefined ? { custom_id: options.customId } : {}),
+      quantity: options.quantity ?? "1",
+      start_time: this.iso(),
+      create_time: this.iso(),
+      update_time: this.iso(),
+      plan_overridden: false,
+      subscriber: {
+        email_address: options.email ?? "subscriber@example.com",
+        payer_id: "2J6QB8YJQSJRJ",
+        name: { given_name: "John", surname: "Doe" },
+        ...(options.vaultId
+          ? { payment_source: { card: { last_digits: "1026", brand: "VISA", attributes: { vault: { id: options.vaultId } } } } }
+          : {}),
+      },
+      billing_info: {
+        outstanding_balance: { currency_code: currency, value: "0.0" },
+        cycle_executions: [
+          { tenure_type: "REGULAR", sequence: regularCycle.sequence, cycles_completed: 1, cycles_remaining: 0, total_cycles: 0 },
+        ],
+        ...(options.lastPaymentValue !== undefined
+          ? { last_payment: { amount: { currency_code: currency, value: options.lastPaymentValue }, time: this.iso() } }
+          : {}),
+        next_billing_time: new Date(this.now() + 30 * 24 * 3600 * 1000).toISOString(),
+        failed_payments_count: 0,
+      },
+      plan: { billing_cycles: options.withTrial ? [trialCycle, regularCycle] : [regularCycle] },
+      links: [
+        { href: `${BASE}/v1/billing/subscriptions/${id}`, rel: "self", method: "GET" },
+        { href: `${BASE}/v1/billing/subscriptions/${id}/cancel`, rel: "cancel", method: "POST" },
+      ],
+    };
+    this.subscriptions.set(id, subscription);
+    return id;
   }
 
   // --- fetch impersonator ----------------------------------------------------
@@ -237,6 +345,17 @@ export class FakePayPalApi {
     if (method === "GET" && match) {
       const refund = this.refunds.get(decodeURIComponent(match[1]!));
       return refund ? json(200, refund) : notFound();
+    }
+    if (method === "GET" && path === "/v1/billing/subscriptions") {
+      return this.listSubscriptions(parsed.searchParams);
+    }
+    match = /^\/v1\/billing\/subscriptions\/([^/]+)$/.exec(path);
+    if (method === "GET" && match) {
+      return this.getSubscription(decodeURIComponent(match[1]!), parsed.searchParams);
+    }
+    match = /^\/v1\/billing\/subscriptions\/([^/]+)\/cancel$/.exec(path);
+    if (method === "POST" && match) {
+      return this.cancelSubscription(decodeURIComponent(match[1]!), body as Record<string, unknown> | undefined);
     }
     if (method === "POST" && path === "/v1/notifications/verify-webhook-signature") {
       return this.verifyWebhookSignature(rawBody ?? "");
@@ -510,6 +629,79 @@ export class FakePayPalApi {
     });
   }
 
+  /**
+   * GET /v1/billing/subscriptions — page-number pagination (page_size 1–20,
+   * default 10; page default 1); total_items/total_pages appear only with
+   * total_required=true. Items never carry the inline plan.
+   */
+  private listSubscriptions(params: URLSearchParams): Response {
+    const pageSize = Number(params.get("page_size") ?? "10");
+    const page = Number(params.get("page") ?? "1");
+    if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 20) {
+      return json(400, {
+        name: "INVALID_REQUEST",
+        message: "Request is not well-formed, syntactically incorrect, or violates schema.",
+        debug_id: debugId(),
+        details: [{ issue: "INVALID_PARAMETER_VALUE", description: "The value of a field is invalid." }],
+      });
+    }
+    const all = [...this.subscriptions.values()];
+    const slice = all.slice((page - 1) * pageSize, page * pageSize);
+    const totalPages = Math.ceil(all.length / pageSize);
+    const query = `page_size=${pageSize}&page=${page}`;
+    return json(200, {
+      subscriptions: slice.map((subscription) => publicSubscription(subscription, false)),
+      ...(params.get("total_required") === "true" ? { total_items: all.length, total_pages: totalPages } : {}),
+      links: [
+        { href: `${BASE}/v1/billing/subscriptions?${query}`, rel: "self", method: "GET" },
+        ...(page < totalPages
+          ? [{ href: `${BASE}/v1/billing/subscriptions?page_size=${pageSize}&page=${page + 1}`, rel: "next", method: "GET" }]
+          : []),
+      ],
+    });
+  }
+
+  /** GET /v1/billing/subscriptions/{id} — the inline plan appears only when fields=plan is requested. */
+  private getSubscription(id: string, params: URLSearchParams): Response {
+    const subscription = this.subscriptions.get(id);
+    if (!subscription) return notFound();
+    const fields = (params.get("fields") ?? "").split(",").map((field) => field.trim());
+    return json(200, publicSubscription(subscription, fields.includes("plan")));
+  }
+
+  /**
+   * POST /v1/billing/subscriptions/{id}/cancel — `reason` is required; only
+   * ACTIVE/SUSPENDED can cancel (anything else answers the documented 422
+   * SUBSCRIPTION_STATUS_INVALID); success is 204 No Content. The endpoint
+   * declares no PayPal-Request-Id parameter, so no replay dedupe here.
+   */
+  private cancelSubscription(id: string, body: Record<string, unknown> | undefined): Response {
+    const subscription = this.subscriptions.get(id);
+    if (!subscription) return notFound();
+    if (typeof body?.["reason"] !== "string" || body["reason"].length === 0) {
+      return json(400, {
+        name: "INVALID_REQUEST",
+        message: "Request is not well-formed, syntactically incorrect, or violates schema.",
+        debug_id: debugId(),
+        details: [{ issue: "MISSING_REQUIRED_PARAMETER", description: "A required field / parameter is missing." }],
+      });
+    }
+    if (subscription.status !== "ACTIVE" && subscription.status !== "SUSPENDED") {
+      return json(
+        422,
+        unprocessable(
+          "SUBSCRIPTION_STATUS_INVALID",
+          "Invalid subscription status for cancel action; subscription status should be active or suspended.",
+        ),
+      );
+    }
+    subscription.status = "CANCELLED";
+    subscription.status_update_time = this.iso();
+    subscription.update_time = this.iso();
+    this.uniqueSubscriptionCancels++;
+    return new Response(null, { status: 204 });
+  }
+
   // --- internals ---------------------------------------------------------------
 
   private newCapture(
@@ -576,6 +768,12 @@ function unprocessable(issue: string, description: string): unknown {
 function publicOrder(order: FakeOrder): unknown {
   const { declineCapture: _declineCapture, pendingCapture: _pendingCapture, ...visible } = order;
   return JSON.parse(JSON.stringify(visible)) as unknown;
+}
+
+/** The subscription as reads return it — the inline plan only under fields=plan. */
+function publicSubscription(subscription: FakeSubscription, includePlan: boolean): unknown {
+  const { plan, ...visible } = subscription;
+  return JSON.parse(JSON.stringify(includePlan ? { ...visible, plan } : visible)) as unknown;
 }
 
 let debugSeq = 0;

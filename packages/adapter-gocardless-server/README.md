@@ -1,8 +1,8 @@
 # @payfanout/adapter-gocardless-server
 
 Server-side GoCardless adapter for [PayFanout](https://donapulse.github.io/payfanout/):
-Billing Requests, hosted bank authorisation flows, payments, refunds, events, and
-webhooks, over the GoCardless REST API.
+Billing Requests, hosted bank authorisation flows, payments, refunds, native
+subscriptions, events, and webhooks, over the GoCardless REST API.
 
 > **Holds secrets.** This package uses your GoCardless access token. Never bundle it
 > client-side.
@@ -75,7 +75,8 @@ rather than silently dropping events — use the recipe above for GoCardless ing
 
 - **`GoCardlessServerAdapter`**, the server contract (sessions via billing requests +
   hosted flows, retrieve by billing request or payment id, cancel, full/partial refunds
-  with `total_amount_confirmation`, refund polling, event polling, payment/refund listing).
+  with `total_amount_confirmation`, refund polling, event polling, payment/refund listing,
+  and PSP-native subscriptions: create/retrieve/list/cancel over the Subscriptions API).
 - **Webhook helpers**, `verifyGoCardlessWebhookSignature` (hex HMAC-SHA256 over the raw
   bytes, constant-time, secret-rotation aware) and `parseGoCardlessWebhookEvents` (the
   batch fan-out).
@@ -96,6 +97,24 @@ rather than silently dropping events — use the recipe above for GoCardless ing
 - Saved payment methods are declared `false` in v1: GoCardless mandates are reusable
   charging handles, but bank debits cannot meet the vault contract's instantly-succeeded
   off-session charge. Mandates-as-vault is documented future work.
+- **Native subscriptions charge a mandate** — pass the mandate id (`MD...`) as
+  `savedPaymentMethodToken`; GoCardless derives the customer from it. Cadences are
+  weekly/monthly/yearly only (`interval` week/month/year): daily billing and RRULE
+  schedules reject rather than approximate, and `planId` rejects because GoCardless
+  subscriptions have no plan object. `merchantRefNum` rides the subscription `name`
+  (max 255 chars, also set as the description on each payment created); `startAt` maps
+  to the date-only `start_date`. Subscriptions bill in AUD, CAD, DKK, EUR, GBP, NZD,
+  SEK, and USD — wider than the GBP/EUR one-off constraint, because the mandate's
+  scheme carries the currency.
+- **Cancelling a subscription stops future payment creation only** — payments the
+  subscription already created still collect unless you cancel them separately
+  (GoCardless documents this explicitly; watch `payments` webhooks for them). Cancels
+  are verified-idempotent: once a subscription is `cancelled` or `finished`, GoCardless
+  rejects the action with `cancellation_failed` and the adapter re-fetches, resolving
+  the terminal state as success. Status mapping: `pending_customer_approval` → pending,
+  `active` → active, `paused` → paused, `finished` → completed, `cancelled` and
+  `customer_approval_denied` (customer refused approval — terminal, never billed) →
+  canceled.
 
 ## Documentation
 

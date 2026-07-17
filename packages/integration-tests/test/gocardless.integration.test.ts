@@ -129,6 +129,86 @@ describeIf("GoCardless sandbox real transaction lifecycle", () => {
   });
 });
 
+describeIf("GoCardless sandbox native subscriptions", () => {
+  // Subscriptions charge a MANDATE, so this block seeds one the classic way
+  // (customer -> bank account -> mandate, activated via the scenario
+  // simulator) and then drives the adapter's whole native-subscription
+  // surface against it. Only objects created here are mutated.
+  it("creates, retrieves, lists, and idempotently cancels a subscription on a seeded mandate", async () => {
+    const adapter = makeAdapter();
+    const customer = await gcPost<{ id: string }>("/customers", "customers", {
+      email: "integration@payfanout.test",
+      given_name: "Integration",
+      family_name: "Subscription",
+      address_line1: "1 Test Street",
+      city: "London",
+      postal_code: "SW1A 1AA",
+      country_code: "GB",
+    });
+    const bankAccount = await gcPost<{ id: string }>("/customer_bank_accounts", "customer_bank_accounts", {
+      account_number: "55779911",
+      branch_code: "200000",
+      account_holder_name: "INTEGRATION TEST",
+      country_code: "GB",
+      links: { customer: customer.id },
+    });
+    const mandate = await gcPost<{ id: string }>("/mandates", "mandates", {
+      scheme: "bacs",
+      links: { customer_bank_account: bankAccount.id },
+    });
+    await gcPost("/scenario_simulators/mandate_activated/actions/run", "data", {
+      links: { resource: mandate.id },
+    });
+
+    const created = await adapter.createNativeSubscription({
+      savedPaymentMethodToken: mandate.id,
+      amount: 1500,
+      currency: "GBP",
+      interval: "month",
+      merchantRefNum: "PayFanout integration subscription",
+      metadata: { payfanout_suite: "native-subscriptions" },
+      idempotencyKey: key(),
+    });
+    expect(created.id).toMatch(/^SB/);
+    // Bacs mandates need no customer approval, so the subscription activates
+    // immediately; "pending" is tolerated in case sandbox behavior shifts.
+    expect(["active", "pending"]).toContain(created.status);
+    expect(created.amount).toBe(1500);
+    expect(created.currency).toBe("GBP");
+    expect(created.interval).toBe("month");
+    expect(created.intervalCount).toBe(1);
+    expect(created.savedPaymentMethodToken).toBe(mandate.id);
+    expect(created.merchantRefNum).toBe("PayFanout integration subscription");
+    // The first charge is scheduled from the mandate's next possible charge date.
+    expect(created.currentPeriodEnd).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+
+    const retrieved = await adapter.retrieveNativeSubscription({ subscriptionId: created.id });
+    expect(retrieved.id).toBe(created.id);
+    expect(retrieved.amount).toBe(1500);
+
+    const page = await adapter.listNativeSubscriptions({ limit: 1 });
+    expect(page.subscriptions.length).toBeLessThanOrEqual(1);
+    for (const record of page.subscriptions) {
+      expect(record.pspName).toBe("gocardless");
+      expect(record.id).toMatch(/^SB/);
+      expect(Number.isSafeInteger(record.amount)).toBe(true);
+    }
+
+    const canceled = await adapter.cancelNativeSubscription({
+      subscriptionId: created.id,
+      idempotencyKey: key(),
+    });
+    expect(canceled.status).toBe("canceled");
+    // The REAL cancellation_failed path: GoCardless rejects the second action
+    // and the adapter must resolve it as success from the re-fetch.
+    const replayed = await adapter.cancelNativeSubscription({
+      subscriptionId: created.id,
+      idempotencyKey: key(),
+    });
+    expect(replayed.status).toBe("canceled");
+  });
+});
+
 describeIf("GoCardless sandbox integration", () => {
   it("creates a billing request + hosted flow and retrieves it via the session id", async () => {
     const adapter = makeAdapter();

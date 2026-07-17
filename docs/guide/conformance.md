@@ -13,6 +13,9 @@ not a hope.
 - **Stable webhook dedupe ids**, `event.id` is a durable key across retries/replays.
 - **Error normalization** with the untouched PSP error preserved on `raw`.
 - **Idempotency replay**, same key twice → same result, one side effect.
+- **Native-subscription honesty**, gated per declared operation: create/retrieve round-trip,
+  cursor paging that terminates, statuses inside the unified union, and a repeated cancel
+  that resolves as success (verified idempotency).
 
 Every shipped adapter passes the same suite; a future adapter is **done when
 it does too**.

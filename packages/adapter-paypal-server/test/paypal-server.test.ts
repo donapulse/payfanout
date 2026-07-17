@@ -291,6 +291,12 @@ runServerAdapterConformanceTests(
         };
       },
     },
+    nativeSubscriptions: {
+      // create is declared false (buyer approval is the only documented path
+      // to a live subscription), so live records are planted in the fake.
+      seedSubscriptions: async (_adapter, count) =>
+        Array.from({ length: count }, () => ({ subscriptionId: lastFake.seedSubscription() })),
+    },
   },
 );
 

@@ -84,10 +84,16 @@ What ships instead, once vaulting (above) exists:
   (maps to Stripe `off_session: true` / Paysafe stored-credential fields). PayFanout's
   job stays: normalize SCA/decline semantics for off-session charges
   (`authentication_required` → bring the customer back on-session).
-- **PSP-native subscriptions are out of scope** (Stripe Billing exists, Paysafe has no
-  equivalent — an abstraction over one PSP is not an abstraction). If a host wants
-  Stripe Billing it should use Stripe Billing directly; PayFanout's `raw` passthrough and
-  `getAdapter()` escape hatch already allow it without forking.
+- **PSP-native subscriptions are out of scope** — SUPERSEDED 2026-07-17 (see
+  decisions.md). The premise ("Paysafe has no equivalent — an abstraction over one PSP
+  is not an abstraction") no longer held: a documentation review found a native
+  subscription product on most shipped PSPs, Paysafe's Payment Scheduler included. The
+  contract now carries per-operation `nativeSubscriptions` capabilities with
+  list/retrieve/create/cancel adapter methods — the primitive under adopting
+  PSP-billed subscriptions into the host engine. The original text, kept for the
+  record: if a host wants Stripe Billing it should use Stripe Billing directly;
+  PayFanout's `raw` passthrough and `getAdapter()` escape hatch already allow it
+  without forking.
 
 ## 4. Marketplace / split payments — parked, direction documented
 

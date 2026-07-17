@@ -388,6 +388,54 @@ describeIf("Stripe sandbox integration", () => {
     expect(renewal.amount).toBe(800);
   });
 
+  it("native subscriptions: create against a vaulted card -> retrieve -> list -> cancel -> repeat cancel", async () => {
+    const adapter = makeAdapter();
+    const customer = await adapter.createCustomer({ idempotencyKey: key() });
+    // Stripe's documented test PaymentMethod tokens attach directly to customers.
+    const pm = await rawStripe().paymentMethods.attach("pm_card_visa", { customer: customer.pspCustomerId });
+
+    const created = await adapter.createNativeSubscription({
+      pspCustomerId: customer.pspCustomerId,
+      savedPaymentMethodToken: pm.id,
+      amount: 1490,
+      currency: "USD",
+      interval: "month",
+      merchantRefNum: `int-nsub-${Date.now()}`,
+      idempotencyKey: key(),
+    });
+    expect(created.id).toMatch(/^sub_/);
+    expect(created.status).toBe("active"); // the first invoice settles with the test card
+    expect(created.amount).toBe(1490);
+    expect(created.currency).toBe("USD");
+    expect(created.interval).toBe("month");
+    expect(created.savedPaymentMethodToken).toBe(pm.id);
+    expect(created.pspCustomerId).toBe(customer.pspCustomerId);
+    expect(created.planId).toMatch(/^price_/);
+    expect(Date.parse(created.currentPeriodEnd!)).toBeGreaterThan(Date.now());
+
+    const retrieved = await adapter.retrieveNativeSubscription({ subscriptionId: created.id });
+    expect(retrieved.id).toBe(created.id);
+    expect(retrieved.status).toBe("active");
+    expect(retrieved.merchantRefNum).toBe(created.merchantRefNum);
+
+    // Bounded page walk — the sandbox account holds other live subscriptions.
+    let found = false;
+    let cursor: string | undefined;
+    for (let page = 0; page < 5 && !found; page += 1) {
+      const result = await adapter.listNativeSubscriptions({ limit: 100, ...(cursor ? { cursor } : {}) });
+      found = result.subscriptions.some((s) => s.id === created.id);
+      if (!result.nextCursor) break;
+      cursor = result.nextCursor;
+    }
+    expect(found).toBe(true);
+
+    const canceled = await adapter.cancelNativeSubscription({ subscriptionId: created.id, idempotencyKey: key() });
+    expect(canceled.status).toBe("canceled");
+    // A replayed cancel resolves as success (verified idempotency), never errors.
+    const replayed = await adapter.cancelNativeSubscription({ subscriptionId: created.id, idempotencyKey: key() });
+    expect(replayed.status).toBe("canceled");
+  });
+
   it("fetchEvents recovers recent events with sane types and working cursors", async () => {
     const adapter = makeAdapter();
     const page = await adapter.fetchEvents({ since: new Date(Date.now() - 15 * 60_000), limit: 5 });

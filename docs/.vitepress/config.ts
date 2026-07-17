@@ -58,6 +58,7 @@ export default defineConfig({
             { text: 'React usage', link: '/guide/react' },
             { text: 'Webhooks', link: '/guide/webhooks' },
             { text: 'Saved cards & subscriptions', link: '/guide/recurring' },
+            { text: 'PSP-native subscriptions', link: '/guide/native-subscriptions' },
           ],
         },
         {

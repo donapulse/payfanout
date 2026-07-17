@@ -14,6 +14,7 @@ const BASE_CAPS: AdapterCapabilities = {
   supportsSessionUpdate: false,
   supportsEventPolling: false,
   supportsListing: false,
+  nativeSubscriptions: { list: false, retrieve: false, create: false, cancel: false },
   requiresServerCompletion: false,
   paymentMethods: [{ type: "card", flow: "embedded", supported: true }],
 };
@@ -51,6 +52,7 @@ describe("validateAdapterCapabilities", () => {
             supportsSessionUpdate: true,
             supportsEventPolling: true,
             supportsListing: true,
+            nativeSubscriptions: { list: true, retrieve: true, create: true, cancel: true },
             requiresServerCompletion: true,
             supportsSavedPaymentMethods: true,
           },
@@ -63,6 +65,10 @@ describe("validateAdapterCapabilities", () => {
             fetchEvents: () => {},
             listPayments: () => {},
             listRefunds: () => {},
+            listNativeSubscriptions: () => {},
+            retrieveNativeSubscription: () => {},
+            createNativeSubscription: () => {},
+            cancelNativeSubscription: () => {},
             createCustomer: () => {},
             savePaymentMethod: () => {},
             listSavedPaymentMethods: () => {},
@@ -85,6 +91,26 @@ describe("validateAdapterCapabilities", () => {
     ["session update without updatePaymentSession", { supportsSessionUpdate: true }, /session update/],
     ["event polling without fetchEvents", { supportsEventPolling: true }, /event polling/],
     ["listing without listPayments/listRefunds", { supportsListing: true }, /listPayments\/listRefunds/],
+    [
+      "native-subscription list without listNativeSubscriptions",
+      { nativeSubscriptions: { list: true, retrieve: false, create: false, cancel: false } },
+      /native-subscription list .* listNativeSubscriptions/,
+    ],
+    [
+      "native-subscription retrieve without retrieveNativeSubscription",
+      { nativeSubscriptions: { list: false, retrieve: true, create: false, cancel: false } },
+      /native-subscription retrieve .* retrieveNativeSubscription/,
+    ],
+    [
+      "native-subscription create without createNativeSubscription",
+      { nativeSubscriptions: { list: false, retrieve: false, create: true, cancel: false } },
+      /native-subscription create .* createNativeSubscription/,
+    ],
+    [
+      "native-subscription cancel without cancelNativeSubscription",
+      { nativeSubscriptions: { list: false, retrieve: false, create: false, cancel: true } },
+      /native-subscription cancel .* cancelNativeSubscription/,
+    ],
   ];
   for (const [name, caps, expected] of cases) {
     it(`flags ${name}`, () => {
@@ -117,6 +143,39 @@ describe("validateAdapterCapabilities", () => {
     );
     expect(tokenizeFirst).toHaveLength(1);
     expect(tokenizeFirst[0]).toMatch(/tokenize-first .* savePaymentMethod/);
+  });
+
+  it("flags a missing nativeSubscriptions block instead of crashing on pre-upgrade shapes", () => {
+    const issues = validateAdapterCapabilities(
+      makeAdapter({ nativeSubscriptions: undefined as unknown as AdapterCapabilities["nativeSubscriptions"] }),
+    );
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatch(/declares no nativeSubscriptions capability block/);
+  });
+
+  it("accepts per-operation native-subscription surfaces (uneven provider support)", () => {
+    // PayZen-shaped: no list API at the provider — three operations, honestly declared.
+    expect(
+      validateAdapterCapabilities(
+        makeAdapter(
+          { nativeSubscriptions: { list: false, retrieve: true, create: true, cancel: true } },
+          {
+            retrieveNativeSubscription: () => {},
+            createNativeSubscription: () => {},
+            cancelNativeSubscription: () => {},
+          },
+        ),
+      ),
+    ).toEqual([]);
+    // Each missing operation is its own violation, not one lump.
+    const issues = validateAdapterCapabilities(
+      makeAdapter({ nativeSubscriptions: { list: true, retrieve: true, create: false, cancel: true } }),
+    );
+    expect(issues).toEqual([
+      expect.stringMatching(/native-subscription list/),
+      expect.stringMatching(/native-subscription retrieve/),
+      expect.stringMatching(/native-subscription cancel/),
+    ]);
   });
 
   it("reports every violation, in rule order", () => {

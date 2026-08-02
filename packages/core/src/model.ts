@@ -105,6 +105,27 @@ export interface NativeSubscriptionCapabilities {
   cancel: boolean;
 }
 
+/**
+ * Whether a PSP's capture/cancel/refund calls answer with the real outcome or
+ * merely acknowledge the request. Push-only providers take their payment
+ * reference as a write target and report the result over webhooks alone, so
+ * their adapters report "processing" instead of a state they have not seen.
+ */
+export type ModificationOutcome = "synchronous" | "asynchronous";
+
+/**
+ * What a provider's webhook signature actually covers. "raw-bytes" signs bytes
+ * as delivered, so any re-encoding of the signed byte range (a JSON middleware,
+ * a proxy that reformats) invalidates the signature — the range can be the
+ * whole body or a string extracted from an envelope, as PayZen's kr-answer is.
+ * "field-values" signs a selected set of values extracted from the payload, so a
+ * re-encoded body still verifies and — the part that matters for security —
+ * every field OUTSIDE the signed set arrives unauthenticated: such an adapter
+ * must authenticate the delivery channel by another means and must never
+ * present an unsigned field as trusted.
+ */
+export type WebhookSignatureScope = "raw-bytes" | "field-values";
+
 export interface AdapterCapabilities {
   pspName: string;
   /**
@@ -114,8 +135,21 @@ export interface AdapterCapabilities {
    * failover cascade before an eligible PSP is tried.
    */
   supportedCurrencies?: string[];
+  /**
+   * The PSP exposes a read for a single payment (retrievePayment). False is the
+   * push-only declaration — the payment reference is a write target only, and
+   * hosts learn payment state from webhooks alone, with no retrieve round-trip
+   * to reconcile against.
+   */
+  supportsPaymentRetrieval: boolean;
   supportsRefunds: boolean;
   supportsPartialRefunds: boolean;
+  /**
+   * retrieveRefund is available, so an async refund (status "pending") can be
+   * polled to a terminal state. False means refund outcomes arrive only by
+   * webhook — requires supportsRefunds.
+   */
+  supportsRefundRetrieval: boolean;
   /** Authorize now, capture later. */
   supportsManualCapture: boolean;
   /**
@@ -123,6 +157,13 @@ export interface AdapterCapabilities {
    * own idempotency key). Single-capture PSPs settle once and release the rest.
    */
   supportsMultiCapture: boolean;
+  /**
+   * Whether capture/cancel/refund outcomes are known when the call returns.
+   * "asynchronous" providers acknowledge the request and deliver the outcome by
+   * webhook, so cancelPayment reports "processing" rather than a confirmed
+   * "canceled" — an adapter never claims a terminal state it has not confirmed.
+   */
+  modificationOutcome: ModificationOutcome;
   /** Zero/low-amount validation, no charge, no storage. */
   supportsPaymentMethodVerification: boolean;
   /**
@@ -148,6 +189,14 @@ export interface AdapterCapabilities {
    * what the provider's own billing product supports.
    */
   nativeSubscriptions: NativeSubscriptionCapabilities;
+  /**
+   * What verifyWebhookSignature can prove about a delivery — see
+   * WebhookSignatureScope. The conformance suite asserts a re-serialized body
+   * is rejected only under "raw-bytes"; a "field-values" provider signs values
+   * that survive re-encoding, so that assertion is unprovable without inventing
+   * a byte-level heuristic that would reject legitimate deliveries.
+   */
+  webhookSignatureScope: WebhookSignatureScope;
   /**
    * True if the PSP flow is client-tokenize-first and the server must finalize
    * the payment via completePayment (Paysafe: true, Stripe: false).

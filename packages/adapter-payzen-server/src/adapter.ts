@@ -351,10 +351,14 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       // adapter's CNY/KHR exclusions — exactly what createPaymentSession
       // enforces locally.
       supportedCurrencies: [...PAYZEN_CURRENCIES],
+      supportsPaymentRetrieval: true, // Transaction/Get (uuid) or Order/Get (orderId)
       supportsRefunds: true,
       supportsPartialRefunds: true,
+      // A refund IS a transaction, read back by the same Transaction/Get.
+      supportsRefundRetrieval: true,
       supportsManualCapture: true, // manualValidation:"YES" + Transaction/Validate
       supportsMultiCapture: false, // Validate releases the whole authorization once
+      modificationOutcome: "synchronous",
       supportsPaymentMethodVerification: false, // Charge/CreateToken creates a stored token — not verification-only
       supportsSavedPaymentMethods: false, // REGISTER_PAY / paymentMethodToken path is documented future work
       // formTokens are immutable and their inputs are not statelessly
@@ -369,6 +373,8 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       // honestly, and hosts MUST retain BOTH identifiers per subscription —
       // they form a composite key that cannot be rediscovered via the API.
       nativeSubscriptions: { list: false, retrieve: true, create: true, cancel: true },
+      // kr-hash = hex HMAC-SHA256 of the kr-answer string exactly as delivered.
+      webhookSignatureScope: "raw-bytes",
       requiresServerCompletion: false, // confirm-on-client: the krypton form creates the transaction
       paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };

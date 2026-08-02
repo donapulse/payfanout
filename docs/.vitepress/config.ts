@@ -71,6 +71,7 @@ export default defineConfig({
             { text: 'Set up PayPal', link: '/guide/paypal' },
             { text: 'Set up PayZen', link: '/guide/payzen' },
             { text: 'Set up Worldline', link: '/guide/worldline' },
+            { text: 'Set up Adyen', link: '/guide/adyen' },
           ],
         },
         {

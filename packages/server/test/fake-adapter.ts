@@ -62,6 +62,7 @@ export class FakeAdapter implements ServerPaymentAdapter {
   private readonly caps: AdapterCapabilities;
   private readonly webhookSecret: string;
 
+  retrievePayment?: (pspPaymentId: string) => Promise<PaymentInfo>;
   completePayment?: (input: CompletePaymentInput) => Promise<PaymentInfo>;
   capturePayment?: (id: string, amount: MinorUnitAmount | undefined, key: string) => Promise<PaymentInfo>;
   verifyPaymentMethod?: (input: VerifyPaymentMethodInput) => Promise<PaymentInfo>;
@@ -85,20 +86,33 @@ export class FakeAdapter implements ServerPaymentAdapter {
     this.webhookSecret = options.webhookSecret ?? "shh";
     this.caps = {
       pspName: this.pspName,
+      supportsPaymentRetrieval: true,
       supportsRefunds: true,
       supportsPartialRefunds: true,
+      supportsRefundRetrieval: true,
       supportsManualCapture: true,
       supportsMultiCapture: false,
+      modificationOutcome: "synchronous",
       supportsPaymentMethodVerification: true,
       supportsSavedPaymentMethods: false,
       supportsSessionUpdate: true,
       supportsEventPolling: true,
       supportsListing: true,
       nativeSubscriptions: { list: true, retrieve: true, create: true, cancel: true },
+      webhookSignatureScope: "raw-bytes",
       requiresServerCompletion: false,
       paymentMethods: [{ type: "card", flow: "embedded", supported: true }],
       ...options.capabilities,
     };
+    // Tracks its flag exactly in both directions — omitOptionalMethods cannot
+    // drop a read the capabilities still claim, or every fixture built on it
+    // would be incoherent before the case under test is reached.
+    if (this.caps.supportsPaymentRetrieval) {
+      this.retrievePayment = async (pspPaymentId) => {
+        this.calls.push({ method: "retrievePayment", args: [pspPaymentId] });
+        return makePaymentInfo({ pspName: this.pspName, pspPaymentId });
+      };
+    }
     if (!options.omitOptionalMethods) {
       if (this.caps.requiresServerCompletion) {
         this.completePayment = async (input) => {
@@ -118,7 +132,7 @@ export class FakeAdapter implements ServerPaymentAdapter {
           return makePaymentInfo({ pspName: this.pspName, amount: 0 });
         };
       }
-      if (this.caps.supportsRefunds) {
+      if (this.caps.supportsRefundRetrieval) {
         this.retrieveRefund = async (refundId) => {
           this.calls.push({ method: "retrieveRefund", args: [refundId] });
           return { refundId, status: "succeeded", amount: 1000, raw: {} };
@@ -280,11 +294,6 @@ export class FakeAdapter implements ServerPaymentAdapter {
       currency: input.currency,
       status: "requires_payment_method",
     };
-  }
-
-  async retrievePayment(pspPaymentId: string): Promise<PaymentInfo> {
-    this.calls.push({ method: "retrievePayment", args: [pspPaymentId] });
-    return makePaymentInfo({ pspName: this.pspName, pspPaymentId });
   }
 
   async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {

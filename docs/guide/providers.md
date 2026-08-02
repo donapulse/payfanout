@@ -16,6 +16,7 @@ Pick the PSP you're wiring up:
 | **PayPal** | [Set up PayPal](/guide/paypal) | `@payfanout/adapter-paypal-server` | `@payfanout/adapter-paypal` | Tokenize-first (needs a server-completion route) |
 | **PayZen (Lyra)** | [Set up PayZen](/guide/payzen) | `@payfanout/adapter-payzen-server` | `@payfanout/adapter-payzen` | Confirm-on-client |
 | **Worldline (Direct)** | [Set up Worldline](/guide/worldline) | `@payfanout/adapter-worldline-server` | `@payfanout/adapter-worldline` | Tokenize-first (needs a server-completion route) |
+| **Adyen** | [Set up Adyen](/guide/adyen) | `@payfanout/adapter-adyen-server` | `@payfanout/adapter-adyen` | Tokenize-first (needs a server-completion route) |
 
 New to the packages themselves? [Installation](/guide/installation) covers prerequisites,
 which packages to add, and the env-var mechanics first. This page and the guides below are
@@ -35,9 +36,9 @@ The guides follow the identical arc, only the credential names and a few quirks 
    `<PayFanoutProvider>`. The PSP's browser SDK loads lazily from the PSP's CDN, there is
    nothing extra to `pnpm add`.
 4. **Register the webhook endpoint.** Point the PSP at your `/webhooks/<psp>` route and
-   give the adapter the signing secret. Signature verification hashes the **exact raw
-   request bytes**, see [Webhooks](/guide/webhooks) for the raw-body requirement that
-   every framework fights you on.
+   give the adapter the signing secret. Hand the handler the **exact raw request bytes**,
+   see [Webhooks](/guide/webhooks) for the raw-body requirement that every framework
+   fights you on.
 
 ::: tip Which side do I need?
 Server-only backend? Steps 1, 2, 4. Adding the embedded card fields? Also step 3. You do

@@ -57,6 +57,7 @@ export { validateAdapterCapabilities } from "./capability-validation.js";
 export type {
   AdapterCapabilities,
   CustomerRef,
+  ModificationOutcome,
   NativeSubscriptionCapabilities,
   NativeSubscriptionInterval,
   NativeSubscriptionRecord,
@@ -76,6 +77,7 @@ export type {
   UnifiedPaymentStatus,
   UnifiedWebhookEvent,
   UnifiedWebhookEventType,
+  WebhookSignatureScope,
 } from "./model.js";
 export {
   isNativeSubscriptionStatus,

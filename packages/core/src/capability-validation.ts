@@ -2,17 +2,30 @@ import type { ServerPaymentAdapter } from "./adapters.js";
 
 /**
  * The capability coherence rule table: every flag an adapter claims must be
- * backed by the matching implemented surface. Returns one message per
- * violation, in rule order, empty when coherent. `@payfanout/server`'s
- * PaymentService rejects registration on the first violation and the
- * conformance suite asserts an empty result — both consume this single
- * implementation so the two can never drift.
+ * backed by the matching implemented surface. The two retrieval flags are
+ * checked BOTH ways — they gate conformance assertions rather than only
+ * describing the provider, so denying an implemented read would buy silence.
+ * Returns one message per violation, in rule order, empty when coherent.
+ * `@payfanout/server`'s PaymentService rejects registration on the first
+ * violation and the conformance suite asserts an empty result — both consume
+ * this single implementation so the two can never drift.
  */
 export function validateAdapterCapabilities(adapter: ServerPaymentAdapter): string[] {
   const caps = adapter.getCapabilities();
   const issues: string[] = [];
   if (caps.pspName !== adapter.pspName) {
     issues.push(`Adapter "${adapter.pspName}" reports capabilities for "${caps.pspName}"`);
+  }
+  if (caps.supportsPaymentRetrieval && typeof adapter.retrievePayment !== "function") {
+    issues.push(
+      `Adapter "${adapter.pspName}" claims payment retrieval but does not implement retrievePayment`,
+    );
+  }
+  if (!caps.supportsPaymentRetrieval && typeof adapter.retrievePayment === "function") {
+    issues.push(
+      `Adapter "${adapter.pspName}" implements retrievePayment but declares no payment retrieval — ` +
+        "the flag switches off the conformance readback assertions, so denying an implemented read buys silence",
+    );
   }
   if (caps.requiresServerCompletion && typeof adapter.completePayment !== "function") {
     issues.push(
@@ -28,10 +41,19 @@ export function validateAdapterCapabilities(adapter: ServerPaymentAdapter): stri
   if (caps.supportsPartialRefunds && !caps.supportsRefunds) {
     issues.push(`Adapter "${adapter.pspName}" claims partial refunds without refund support`);
   }
-  if (caps.supportsRefunds && typeof adapter.retrieveRefund !== "function") {
+  if (caps.supportsRefundRetrieval && !caps.supportsRefunds) {
+    issues.push(`Adapter "${adapter.pspName}" claims refund retrieval without refund support`);
+  }
+  if (caps.supportsRefundRetrieval && typeof adapter.retrieveRefund !== "function") {
     issues.push(
-      `Adapter "${adapter.pspName}" supports refunds but does not implement retrieveRefund — ` +
+      `Adapter "${adapter.pspName}" claims refund retrieval but does not implement retrieveRefund — ` +
         "pending refunds would be unpollable",
+    );
+  }
+  if (!caps.supportsRefundRetrieval && typeof adapter.retrieveRefund === "function") {
+    issues.push(
+      `Adapter "${adapter.pspName}" implements retrieveRefund but declares no refund retrieval — ` +
+        "the flag switches off the conformance refund polling, so denying an implemented read buys silence",
     );
   }
   if (caps.supportsMultiCapture && !caps.supportsManualCapture) {
@@ -95,6 +117,15 @@ export function validateAdapterCapabilities(adapter: ServerPaymentAdapter): stri
         );
       }
     }
+  }
+  // Presence rule, like nativeSubscriptions above: the scope GATES conformance
+  // assertions instead of only describing the provider, so an absent one is an
+  // opt-out nobody declared rather than a shape to fail downstream.
+  if (caps.webhookSignatureScope !== "raw-bytes" && caps.webhookSignatureScope !== "field-values") {
+    issues.push(
+      `Adapter "${adapter.pspName}" declares no webhookSignatureScope — the flag gates the ` +
+        "conformance re-serialization assertion, so an absent scope would switch it off silently",
+    );
   }
   // The saved-payment-methods flag demands the full method surface. Cards
   // still live at the PSP only — the coherence rule is about implemented

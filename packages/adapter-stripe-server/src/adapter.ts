@@ -137,10 +137,13 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
   getCapabilities(): AdapterCapabilities {
     return {
       pspName: this.pspName,
+      supportsPaymentRetrieval: true, // GET /v1/payment_intents/:id
       supportsRefunds: true,
       supportsPartialRefunds: true,
+      supportsRefundRetrieval: true, // GET /v1/refunds/:id
       supportsManualCapture: true,
       supportsMultiCapture: false, // one capture per PaymentIntent; the rest of the auth is released
+      modificationOutcome: "synchronous", // capture/cancel/refund answer with the updated object
       supportsPaymentMethodVerification: this.verificationEnabled(),
       // PSP-side vaulting: Stripe Customers + attached PaymentMethods. Cards
       // live at Stripe only; PayFanout and the host see opaque pm_… tokens.
@@ -151,6 +154,8 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       // Stripe Billing subscriptions: the PSP schedules and collects each
       // installment itself, against a vaulted PaymentMethod.
       nativeSubscriptions: { list: true, retrieve: true, create: true, cancel: true },
+      // Stripe-Signature v1 = HMAC-SHA256 over `${timestamp}.${rawBody}`.
+      webhookSignatureScope: "raw-bytes",
       requiresServerCompletion: false, // Stripe confirms on the client (§4a)
       paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };

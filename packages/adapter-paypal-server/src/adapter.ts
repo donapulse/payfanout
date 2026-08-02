@@ -217,12 +217,15 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       pspName: this.pspName,
       // Router pre-screen; money.ts revalidates locally as defense-in-depth.
       supportedCurrencies: [...PAYPAL_SUPPORTED_CURRENCIES],
+      supportsPaymentRetrieval: true, // GET /v2/checkout/orders/{id}
       supportsRefunds: true,
       supportsPartialRefunds: true,
+      supportsRefundRetrieval: true, // GET /v2/payments/refunds/{id}
       supportsManualCapture: true, // intent AUTHORIZE + authorization capture
       // final_capture=false keeps an authorization open for repeated partial
       // captures (CAPTURE-intent orders settle exactly once).
       supportsMultiCapture: true,
+      modificationOutcome: "synchronous",
       supportsPaymentMethodVerification: false, // no zero-amount check for wallet approvals
       supportsSavedPaymentMethods: false, // v3 vault (payment-tokens) is the documented future path
       supportsSessionUpdate: true, // PATCH order pre-approval
@@ -235,6 +238,10 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       // request shape takes a raw card number, which PayFanout never touches)
       // — declaring create would fake support.
       nativeSubscriptions: { list: true, retrieve: true, create: false, cancel: true },
+      // Verification is a postback, but the scope is still the delivered bytes:
+      // PayPal verifies the exact body, which is why the raw event is spliced
+      // into the postback verbatim and a re-encoded body fails at PayPal's end.
+      webhookSignatureScope: "raw-bytes",
       requiresServerCompletion: true, // tokenize-first: the popup approves, money moves at server capture
       paymentMethods: [{ type: "paypal", flow: "popup", supported: true }],
     };

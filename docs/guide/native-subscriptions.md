@@ -54,6 +54,7 @@ Provider support is uneven, so there is no single "supports subscriptions" flag 
 | PayPal | yes | yes | no | yes | creation needs buyer approval in the PayPal UI — a server-only create would fake support; a list page costs one call per returned item to resolve amounts |
 | PayZen | no | yes | yes | yes | no list API: retain `subscriptionId` **and** `paymentMethodToken`, they are a composite key |
 | Worldline | no | no | no | no | no native engine — recurring is card-on-file; use the vault + `SubscriptionManager` |
+| Adyen | no | no | no | no | the adapter carries no vault or subscription surface; use the vault + `SubscriptionManager` on another PSP |
 
 Check the flag before offering the feature in your UI; calling an undeclared operation
 rejects with `unsupported_operation`.

@@ -696,12 +696,15 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   getCapabilities(): AdapterCapabilities {
     return {
       pspName: this.pspName,
+      supportsPaymentRetrieval: true, // GET /paymenthub/v1/payments/{id}
       supportsRefunds: true,
       supportsPartialRefunds: true,
+      supportsRefundRetrieval: true, // GET /paymenthub/v1/refunds/{id}
       supportsManualCapture: true,
       // Settlements are partial-able: several captures (distinct idempotency
       // keys) can settle one authorization up to availableToSettle.
       supportsMultiCapture: true,
+      modificationOutcome: "synchronous",
       supportsPaymentMethodVerification: true,
       // Customer Vault: single-use handles convert
       // to MULTI_USE tokens under a customer; charged with storedCredential.
@@ -714,6 +717,8 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       // cancel — behind the same Basic API key as the Payments API, so no
       // extra credential gates the flags.
       nativeSubscriptions: { list: true, retrieve: true, create: true, cancel: true },
+      // base64(HMAC-SHA256(hmacKey, rawJsonBody)) over the delivered bytes.
+      webhookSignatureScope: "raw-bytes",
       requiresServerCompletion: true, // tokenize-first (§4a): the client alone cannot finalize
       paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };

@@ -286,10 +286,16 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       // One-off billing request payments are GBP/EUR only (other GoCardless
       // currencies need a mandate first) — declared so the router pre-screens.
       supportedCurrencies: [...SUPPORTED_ONE_OFF_CURRENCIES],
+      supportsPaymentRetrieval: true, // GET /payments/:id
       supportsRefunds: true,
       supportsPartialRefunds: true,
+      supportsRefundRetrieval: true, // GET /refunds/:id
       supportsManualCapture: false, // bank debits/credits have no authorize-then-capture split
       supportsMultiCapture: false,
+      // The MONEY moves on debit-scheme timing (days), but the modification
+      // calls themselves are not push-only: cancel and refund answer with the
+      // resulting resource and its real status, not a bare acknowledgement.
+      modificationOutcome: "synchronous",
       supportsPaymentMethodVerification: false, // no zero-amount verification without creating a mandate
       // GoCardless mandates ARE reusable charging handles, but bank debits
       // confirm asynchronously (days) — the vault contract's instantly
@@ -303,6 +309,9 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       // creates each payment against the mandate on its own schedule. All four
       // operations exist server-side, so all four are declared.
       nativeSubscriptions: { list: true, retrieve: true, create: true, cancel: true },
+      // Webhook-Signature = hex HMAC-SHA256 of the whole raw delivery, batch
+      // and all — verified once over the bytes, then fanned out per event.
+      webhookSignatureScope: "raw-bytes",
       requiresServerCompletion: false, // the hosted flow fulfils the billing request itself
       paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };

@@ -119,7 +119,7 @@ runServerAdapterConformanceTests(
     failingCalls: [
       {
         name: "retrievePayment on a missing id",
-        invoke: (a) => a.retrievePayment("pay_missing"),
+        invoke: (a) => a.retrievePayment!("pay_missing"),
         expectedCode: "invalid_request",
       },
       {

@@ -51,6 +51,8 @@ Two more non-negotiables baked into the design:
 | `@payfanout/adapter-payzen` | client | PayZen krypton-client embedded card fields (confirm-on-client, 3DS inline). |
 | `@payfanout/adapter-worldline-server` | server | Worldline Direct Online Payments REST v2: Hosted Tokenization, payments, captures, refunds, webhooks. **Edge-runtime compatible** (WebCrypto, no Node builtins). |
 | `@payfanout/adapter-worldline` | client | Worldline Direct Hosted Tokenization Page iframe (tokenize-first). |
+| `@payfanout/adapter-adyen-server` | server | Adyen Checkout API v72: payments, captures, cancels, refunds, standard webhooks. **Push-only** (no payment/refund read — outcomes arrive by webhook), **edge-runtime compatible** (WebCrypto, no Node builtins). |
+| `@payfanout/adapter-adyen` | client | Adyen Web Card component, hosted iframe fields (tokenize-first). |
 | `@payfanout/conformance` | tests | The contract suite every adapter, present or future, must pass. |
 
 Client packages have **zero** dependency on anything holding secrets; this is enforced
@@ -66,7 +68,8 @@ never inferred from key prefixes.
 > [GoCardless](https://donapulse.github.io/payfanout/guide/gocardless) ·
 > [PayPal](https://donapulse.github.io/payfanout/guide/paypal) ·
 > [PayZen](https://donapulse.github.io/payfanout/guide/payzen) ·
-> [Worldline](https://donapulse.github.io/payfanout/guide/worldline)
+> [Worldline](https://donapulse.github.io/payfanout/guide/worldline) ·
+> [Adyen](https://donapulse.github.io/payfanout/guide/adyen)
 > ([overview](https://donapulse.github.io/payfanout/guide/providers)). Installing a PSP we
 > don't ship yet: [adapter authoring](https://donapulse.github.io/payfanout/adapter-authoring).
 > The quick starts below are the condensed version.
@@ -203,7 +206,7 @@ at the PSP with verified-idempotent semantics). Support is declared per operatio
 Idempotency keys are mandatory on every mutating call, so transient failures are safe
 to replay. Three layers act on that: the Stripe SDK retries network failures itself
 (`maxNetworkRetries`, default 2); every REST adapter's transport (Paysafe, GoCardless,
-PayPal, PayZen, Worldline) retries timeouts/5xx/429 with backoff (`maxNetworkRetries`,
+PayPal, PayZen, Worldline, Adyen) retries timeouts/5xx/429 with backoff (`maxNetworkRetries`,
 business errors like declines are never replayed); and `withRetry(fn, policy)` from
 `@payfanout/core` wraps any call with
 exponential backoff + jitter for `PayFanoutError.retryable` rejections.
@@ -318,7 +321,7 @@ PSPs come with inverted flows, and the abstraction models both as first-class:
   creates the payment session → client mounts with `clientSecret` → `confirm()` finalizes
   (incl. inline 3DS). Done, the server never touches confirmation, and `completePayment`
   is rejected for such PSPs.
-- **Tokenize-first (Paysafe, PayPal, Worldline):** the client tokenizes first (`confirm()`
+- **Tokenize-first (Paysafe, PayPal, Worldline, Adyen):** the client tokenizes first (`confirm()`
   resolves `requires_confirmation` + `clientToken`), then the **server** finalizes via
   `completePayment`. `<PayButton>` branches automatically through your
   `onServerCompletion` callback; the UI code is identical either way.

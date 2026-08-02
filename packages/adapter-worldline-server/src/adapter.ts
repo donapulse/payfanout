@@ -211,13 +211,20 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
   getCapabilities(): AdapterCapabilities {
     return {
       pspName: this.pspName,
+      supportsPaymentRetrieval: true, // GET /v2/{merchantId}/payments/{paymentId}
       supportsRefunds: true,
       supportsPartialRefunds: true,
+      // Read through the payment's refund list — refundPayment returns the
+      // composite "{paymentId}:{refundId}" that makes that lookup possible.
+      supportsRefundRetrieval: true,
       supportsManualCapture: true, // PRE_AUTHORIZATION + POST /capture
       // A Worldline capture always finalizes (a partial capture releases the
       // remainder), and the core capturePayment(id, amount, key) contract has no
       // isFinal signal to hold an authorization open across captures.
       supportsMultiCapture: false,
+      // Capture and cancel re-read the payment before answering, so the status
+      // reported is the provider's own, never a bare acknowledgement.
+      modificationOutcome: "synchronous",
       supportsPaymentMethodVerification: false,
       supportsSavedPaymentMethods: false,
       supportsSessionUpdate: false,
@@ -228,6 +235,8 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       // subsequentType: "recurring"), which the vault surface plus the
       // host-side SubscriptionManager already cover.
       nativeSubscriptions: { list: false, retrieve: false, create: false, cancel: false },
+      // X-GCS-Signature = base64(HMAC-SHA256(webhookSecret, rawBody)).
+      webhookSignatureScope: "raw-bytes",
       requiresServerCompletion: true, // tokenize-first: the client tokenizes, the server creates the payment
       paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };

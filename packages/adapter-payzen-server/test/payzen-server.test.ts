@@ -159,7 +159,7 @@ runServerAdapterConformanceTests(
     failingCalls: [
       {
         name: "retrievePayment on an unknown transaction uuid",
-        invoke: (a) => a.retrievePayment("ffffffffffffffffffffffffffffffff"),
+        invoke: (a) => a.retrievePayment!("ffffffffffffffffffffffffffffffff"),
         expectedCode: "invalid_request",
       },
       {
@@ -213,7 +213,7 @@ runServerAdapterConformanceTests(
         name: "HTTP 503 from infrastructure in front of the gateway",
         invoke: (a) => {
           lastFake.failNextWith({ status: 503 });
-          return a.retrievePayment("ffffffffffffffffffffffffffffffff");
+          return a.retrievePayment!("ffffffffffffffffffffffffffffffff");
         },
         expectedCode: "psp_unavailable",
       },
@@ -221,7 +221,7 @@ runServerAdapterConformanceTests(
         name: "HTTP 429 from infrastructure in front of the gateway",
         invoke: (a) => {
           lastFake.failNextWith({ status: 429 });
-          return a.retrievePayment("ffffffffffffffffffffffffffffffff");
+          return a.retrievePayment!("ffffffffffffffffffffffffffffffff");
         },
         expectedCode: "rate_limited",
       },
@@ -229,7 +229,7 @@ runServerAdapterConformanceTests(
         name: "network failure reaching the gateway",
         invoke: (a) => {
           lastFake.failNextWith({ networkError: true });
-          return a.retrievePayment("ffffffffffffffffffffffffffffffff");
+          return a.retrievePayment!("ffffffffffffffffffffffffffffffff");
         },
         expectedCode: "psp_unavailable",
       },

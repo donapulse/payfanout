@@ -8,8 +8,10 @@ not a hope.
 
 - **Capability coherence**, an adapter can't claim a capability it doesn't honor.
 - **Integer-minor-unit boundaries** proven for JPY (0 decimals) and BHD (3 decimals).
-- **Raw-body webhook signatures**, including the re-serialization trap: same JSON value,
-  different bytes ⇒ the adapter must reject.
+- **Webhook signatures held to the scope each adapter declares**: an adapter signing raw
+  bytes must fail the re-serialization trap (same JSON value, different bytes ⇒ reject),
+  while one whose provider signs extracted values must verify that body and reject an
+  altered signed value instead. Both must refuse a credential-less delivery.
 - **Stable webhook dedupe ids**, `event.id` is a durable key across retries/replays.
 - **Error normalization** with the untouched PSP error preserved on `raw`.
 - **Idempotency replay**, same key twice → same result, one side effect.

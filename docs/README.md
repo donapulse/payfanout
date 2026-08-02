@@ -5,11 +5,11 @@ each other. If content ever appears in two of them, one of the two is wrong.
 
 | File | Job | Audience |
 | --- | --- | --- |
-| [adapter-authoring.md](adapter-authoring.md) | **How-to**: write a new PSP adapter that passes the conformance suite. | Engineer adding PSP #3 |
+| [adapter-authoring.md](adapter-authoring.md) | **How-to**: write a new PSP adapter that passes the conformance suite. | Engineer adding the next PSP |
 | [decisions.md](decisions.md) | **Decision log**: what was chosen, why, and which sandbox facts were verified (never re-litigate these). | Team reviewing/overriding choices |
 | [future-designs.md](future-designs.md) | **Designs for things deliberately NOT built** (vaulting, subscriptions, marketplace…) with their unblock conditions. | Whoever picks up the next big bet |
 | `public/api/` *(generated, gitignored)* | **Generated API reference** — typedoc HTML output of every package's public surface, served by VitePress at `/api/`. Rebuild with `pnpm run docs:api`; never edit or commit it. | Anyone browsing the typed API |
-| `index.md`, `guide/`, `.vitepress/` | **VitePress documentation site** — the hand-written install + usage guide, including the per-PSP setup pages (`guide/providers.md`, `guide/stripe.md`, `guide/paysafe.md`). `pnpm docs:dev` to preview, `pnpm docs:build` to build (also regenerates `public/api/`). | Anyone learning to use the library |
+| `index.md`, `guide/`, `.vitepress/` | **VitePress documentation site** — the hand-written install + usage guide, including the per-PSP setup pages, which `guide/providers.md` indexes (one `guide/<psp>.md` per shipped adapter). `pnpm docs:dev` to preview, `pnpm docs:build` to build (also regenerates `public/api/`). | Anyone learning to use the library |
 
 One more place documentation lives, on purpose:
 

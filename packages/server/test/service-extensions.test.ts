@@ -60,10 +60,37 @@ describe("PaymentService — refund lifecycle / session update / recovery passth
   it("guards retrieveRefund behind refund support", async () => {
     const noRefunds = new FakeAdapter({
       pspName: "no-ref",
-      capabilities: { supportsRefunds: false, supportsPartialRefunds: false },
+      capabilities: { supportsRefunds: false, supportsPartialRefunds: false, supportsRefundRetrieval: false },
     });
     const service = new PaymentService({ adapters: [noRefunds] });
     await expectUnsupported(service.retrieveRefund("no-ref", "re_1"), /refund retrieval/);
+  });
+
+  it("guards retrieveRefund on the refund READ, not on refund support", async () => {
+    // A PSP can move money out and still expose no way to read the refund back.
+    const writeOnlyRefunds = new FakeAdapter({
+      pspName: "no-refund-read",
+      capabilities: { supportsRefunds: true, supportsPartialRefunds: true, supportsRefundRetrieval: false },
+    });
+    const service = new PaymentService({ adapters: [writeOnlyRefunds] });
+    await expectUnsupported(service.retrieveRefund("no-refund-read", "re_1"), /refund retrieval/);
+    // Refunding itself stays open — only the read is gated.
+    const refund = await service.refundPayment("no-refund-read", {
+      pspPaymentId: "p1",
+      idempotencyKey: "k-ref",
+    });
+    expect(refund.refundId).toBe("re_1");
+  });
+
+  it("guards retrievePayment behind payment-retrieval support", async () => {
+    // A push-only PSP takes its reference as a write target only; the host
+    // follows payment state through webhooks instead of a read.
+    const pushOnly = new FakeAdapter({
+      pspName: "push-only",
+      capabilities: { supportsPaymentRetrieval: false },
+    });
+    const service = new PaymentService({ adapters: [pushOnly] });
+    await expectUnsupported(service.retrievePayment("push-only", "p1"), /payment retrieval/);
   });
 
   it("routes fetchEvents / listPayments / listRefunds and guards their capabilities", async () => {
@@ -91,6 +118,7 @@ describe("PaymentService — refund lifecycle / session update / recovery passth
       supportsPaymentMethodVerification: false,
       supportsRefunds: false,
       supportsPartialRefunds: false,
+      supportsRefundRetrieval: false,
       supportsSessionUpdate: false,
       supportsEventPolling: false,
       supportsListing: false,
@@ -100,7 +128,7 @@ describe("PaymentService — refund lifecycle / session update / recovery passth
       [{ supportsSessionUpdate: true }, /does not implement updatePaymentSession/],
       [{ supportsEventPolling: true }, /does not implement fetchEvents/],
       [{ supportsListing: true }, /does not implement listPayments/],
-      [{ supportsRefunds: true }, /does not implement retrieveRefund/],
+      [{ supportsRefunds: true, supportsRefundRetrieval: true }, /does not implement retrieveRefund/],
       [
         { nativeSubscriptions: { ...noNativeSubscriptions, list: true } },
         /does not implement listNativeSubscriptions/,

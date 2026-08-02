@@ -332,7 +332,12 @@ export interface ServerPaymentAdapter {
    */
   completePayment?(input: CompletePaymentInput): Promise<PaymentInfo>;
 
-  retrievePayment(pspPaymentId: string): Promise<PaymentInfo>;
+  /**
+   * Only present if getCapabilities().supportsPaymentRetrieval. Push-only PSPs
+   * expose no read for a single payment — their hosts follow payment state
+   * through webhook deliveries instead.
+   */
+  retrievePayment?(pspPaymentId: string): Promise<PaymentInfo>;
 
   /**
    * Only present if getCapabilities().supportsManualCapture. Capture is the
@@ -346,13 +351,21 @@ export interface ServerPaymentAdapter {
     idempotencyKey: string,
   ): Promise<PaymentInfo>;
 
+  /**
+   * Resolves "canceled" only when the PSP confirms it. Under
+   * getCapabilities().modificationOutcome "asynchronous" the PSP merely
+   * acknowledges the request and the outcome arrives by webhook, so the
+   * returned status is "processing" — never an unconfirmed terminal state.
+   */
   cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo>;
 
   refundPayment(req: RefundRequest): Promise<RefundResult>;
 
   /**
    * Poll a refund to a terminal state. Required whenever
-   * getCapabilities().supportsRefunds — refundPayment can return "pending".
+   * getCapabilities().supportsRefundRetrieval — refundPayment can return
+   * "pending". PSPs with no refund read declare the flag false and deliver the
+   * outcome by webhook instead.
    */
   retrieveRefund?(refundId: string): Promise<RefundInfo>;
 

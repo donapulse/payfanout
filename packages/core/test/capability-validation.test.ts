@@ -5,10 +5,13 @@ import type { AdapterCapabilities } from "../src/model.js";
 
 const BASE_CAPS: AdapterCapabilities = {
   pspName: "fake",
+  supportsPaymentRetrieval: true,
   supportsRefunds: false,
   supportsPartialRefunds: false,
+  supportsRefundRetrieval: false,
   supportsManualCapture: false,
   supportsMultiCapture: false,
+  modificationOutcome: "synchronous",
   supportsPaymentMethodVerification: false,
   supportsSavedPaymentMethods: false,
   supportsSessionUpdate: false,
@@ -46,6 +49,7 @@ describe("validateAdapterCapabilities", () => {
           {
             supportsRefunds: true,
             supportsPartialRefunds: true,
+            supportsRefundRetrieval: true,
             supportsManualCapture: true,
             supportsMultiCapture: true,
             supportsPaymentMethodVerification: true,
@@ -80,13 +84,42 @@ describe("validateAdapterCapabilities", () => {
     ).toEqual([]);
   });
 
-  const cases: Array<[string, Partial<AdapterCapabilities>, RegExp]> = [
+  const cases: Array<
+    [string, Partial<AdapterCapabilities>, RegExp, Partial<Record<keyof ServerPaymentAdapter, unknown>>?]
+  > = [
     ["pspName mismatch", { pspName: "other" }, /reports capabilities for "other"/],
+    [
+      "payment retrieval without retrievePayment",
+      { supportsPaymentRetrieval: true },
+      /claims payment retrieval but does not implement retrievePayment/,
+      { retrievePayment: undefined },
+    ],
+    [
+      "retrievePayment implemented while payment retrieval is denied",
+      { supportsPaymentRetrieval: false },
+      /implements retrievePayment but declares no payment retrieval/,
+    ],
     ["server completion without completePayment", { requiresServerCompletion: true }, /completePayment/],
     ["manual capture without capturePayment", { supportsManualCapture: true }, /manual capture/],
     ["verification without verifyPaymentMethod", { supportsPaymentMethodVerification: true }, /verification/],
     ["partial refunds without refunds", { supportsPartialRefunds: true }, /partial refunds without refund support/],
-    ["refunds without retrieveRefund", { supportsRefunds: true }, /retrieveRefund/],
+    [
+      "refund retrieval without refund support",
+      { supportsRefundRetrieval: true },
+      /claims refund retrieval without refund support/,
+      { retrieveRefund: () => {} },
+    ],
+    [
+      "refund retrieval without retrieveRefund",
+      { supportsRefunds: true, supportsRefundRetrieval: true },
+      /claims refund retrieval but does not implement retrieveRefund/,
+    ],
+    [
+      "retrieveRefund implemented while refund retrieval is denied",
+      { supportsRefunds: true, supportsRefundRetrieval: false },
+      /implements retrieveRefund but declares no refund retrieval/,
+      { retrieveRefund: () => {} },
+    ],
     ["multi-capture without manual capture", { supportsMultiCapture: true }, /multi-capture without manual capture/],
     ["session update without updatePaymentSession", { supportsSessionUpdate: true }, /session update/],
     ["event polling without fetchEvents", { supportsEventPolling: true }, /event polling/],
@@ -112,9 +145,9 @@ describe("validateAdapterCapabilities", () => {
       /native-subscription cancel .* cancelNativeSubscription/,
     ],
   ];
-  for (const [name, caps, expected] of cases) {
+  for (const [name, caps, expected, methods] of cases) {
     it(`flags ${name}`, () => {
-      const issues = validateAdapterCapabilities(makeAdapter(caps));
+      const issues = validateAdapterCapabilities(makeAdapter(caps, methods));
       expect(issues).toHaveLength(1);
       expect(issues[0]).toMatch(expected);
     });
@@ -143,6 +176,25 @@ describe("validateAdapterCapabilities", () => {
     );
     expect(tokenizeFirst).toHaveLength(1);
     expect(tokenizeFirst[0]).toMatch(/tokenize-first .* savePaymentMethod/);
+  });
+
+  it("accepts a push-only adapter that reads nothing back", () => {
+    // The provider takes its payment reference as a write target only and
+    // reports every outcome by webhook — coherent, not incomplete.
+    expect(
+      validateAdapterCapabilities(
+        makeAdapter(
+          {
+            supportsPaymentRetrieval: false,
+            supportsRefunds: true,
+            supportsPartialRefunds: true,
+            supportsRefundRetrieval: false,
+            modificationOutcome: "asynchronous",
+          },
+          { retrievePayment: undefined },
+        ),
+      ),
+    ).toEqual([]);
   });
 
   it("flags a missing nativeSubscriptions block instead of crashing on pre-upgrade shapes", () => {

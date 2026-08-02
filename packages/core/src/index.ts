@@ -57,6 +57,7 @@ export { validateAdapterCapabilities } from "./capability-validation.js";
 export type {
   AdapterCapabilities,
   CustomerRef,
+  ModificationOutcome,
   NativeSubscriptionCapabilities,
   NativeSubscriptionInterval,
   NativeSubscriptionRecord,

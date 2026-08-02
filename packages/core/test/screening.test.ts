@@ -3,10 +3,13 @@ import { screenSessionInput, type AdapterCapabilities, type CreatePaymentSession
 
 const caps = (overrides: Partial<AdapterCapabilities> = {}): AdapterCapabilities => ({
   pspName: "psp-x",
+  supportsPaymentRetrieval: true,
   supportsRefunds: true,
   supportsPartialRefunds: true,
+  supportsRefundRetrieval: true,
   supportsManualCapture: false,
   supportsMultiCapture: false,
+  modificationOutcome: "synchronous",
   supportsPaymentMethodVerification: false,
   supportsSavedPaymentMethods: false,
   supportsSessionUpdate: false,

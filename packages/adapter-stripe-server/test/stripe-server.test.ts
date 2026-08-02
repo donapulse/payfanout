@@ -141,7 +141,7 @@ runServerAdapterConformanceTests(
           idempotencyKey: `vault-fixture-${Math.random()}`,
         });
         lastFake.simulateClientConfirm(session.pspSessionId);
-        const info = await adapter.retrievePayment(session.pspSessionId);
+        const info = await adapter.retrievePayment!(session.pspSessionId);
         if (!info.savedPaymentMethodToken) throw new Error("save-during-checkout produced no token");
         return info.savedPaymentMethodToken;
       },
@@ -149,7 +149,7 @@ runServerAdapterConformanceTests(
     failingCalls: [
       {
         name: "retrievePayment on a missing id",
-        invoke: (a) => a.retrievePayment("pi_missing"),
+        invoke: (a) => a.retrievePayment!("pi_missing"),
         expectedCode: "invalid_request",
       },
       {

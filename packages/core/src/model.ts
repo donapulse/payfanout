@@ -105,6 +105,14 @@ export interface NativeSubscriptionCapabilities {
   cancel: boolean;
 }
 
+/**
+ * Whether a PSP's capture/cancel/refund calls answer with the real outcome or
+ * merely acknowledge the request. Push-only providers take their payment
+ * reference as a write target and report the result over webhooks alone, so
+ * their adapters report "processing" instead of a state they have not seen.
+ */
+export type ModificationOutcome = "synchronous" | "asynchronous";
+
 export interface AdapterCapabilities {
   pspName: string;
   /**
@@ -114,8 +122,21 @@ export interface AdapterCapabilities {
    * failover cascade before an eligible PSP is tried.
    */
   supportedCurrencies?: string[];
+  /**
+   * The PSP exposes a read for a single payment (retrievePayment). False is the
+   * push-only declaration — the payment reference is a write target only, and
+   * hosts learn payment state from webhooks alone, with no retrieve round-trip
+   * to reconcile against.
+   */
+  supportsPaymentRetrieval: boolean;
   supportsRefunds: boolean;
   supportsPartialRefunds: boolean;
+  /**
+   * retrieveRefund is available, so an async refund (status "pending") can be
+   * polled to a terminal state. False means refund outcomes arrive only by
+   * webhook — requires supportsRefunds.
+   */
+  supportsRefundRetrieval: boolean;
   /** Authorize now, capture later. */
   supportsManualCapture: boolean;
   /**
@@ -123,6 +144,13 @@ export interface AdapterCapabilities {
    * own idempotency key). Single-capture PSPs settle once and release the rest.
    */
   supportsMultiCapture: boolean;
+  /**
+   * Whether capture/cancel/refund outcomes are known when the call returns.
+   * "asynchronous" providers acknowledge the request and deliver the outcome by
+   * webhook, so cancelPayment reports "processing" rather than a confirmed
+   * "canceled" — an adapter never claims a terminal state it has not confirmed.
+   */
+  modificationOutcome: ModificationOutcome;
   /** Zero/low-amount validation, no charge, no storage. */
   supportsPaymentMethodVerification: boolean;
   /**

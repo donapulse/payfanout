@@ -15,6 +15,7 @@ import {
   type CreatePaymentSessionInput,
   type MinorUnitAmount,
   type NativeSubscriptionRecord,
+  type PaymentInfo,
   type PaymentSession,
   type ServerPaymentAdapter,
   type UnifiedErrorCode,
@@ -139,6 +140,24 @@ export interface ServerConformanceFixtures {
       count: number,
     ): Promise<Array<{ subscriptionId: string; savedPaymentMethodToken?: string }>>;
   };
+}
+
+/**
+ * The normalization every PaymentInfo owes its caller, whichever call produced
+ * it. Asserted on the retrieve path AND on the modification paths, because a
+ * push-only adapter never takes the retrieve path — leaving it unchecked would
+ * exempt a whole adapter class from "money is integer minor units".
+ */
+function expectNormalizedPaymentInfo(info: PaymentInfo, pspName: string): void {
+  expect(info.pspName).toBe(pspName);
+  expect(isUnifiedPaymentStatus(info.status)).toBe(true);
+  expect(Number.isSafeInteger(info.amount)).toBe(true);
+  expect(info.amount).toBeGreaterThanOrEqual(0);
+  expect(Number.isSafeInteger(info.amountRefunded)).toBe(true);
+  expect(info.amountRefunded).toBeGreaterThanOrEqual(0);
+  expect(PAYMENT_METHOD_TYPES).toContain(info.paymentMethodType);
+  expect(Number.isNaN(Date.parse(info.createdAt))).toBe(false);
+  expect(info.raw).toBeDefined();
 }
 
 export function runServerAdapterConformanceTests(
@@ -406,21 +425,17 @@ export function runServerAdapterConformanceTests(
         "retrievePayment reports the normalized money truth",
         async () => {
           const adapter = makeAdapter();
+          if (!adapter.getCapabilities().supportsPaymentRetrieval) return;
           const id = `conformance-${name}-retrieve`;
           const pspPaymentId = await fixtures.money!.completedPayment!(adapter, {
             amount: 3000,
             id,
             metadata: { conformance_key: "v1" },
           });
-          const info = await adapter.retrievePayment(pspPaymentId);
-          expect(info.pspName).toBe(adapter.pspName);
-          expect(isUnifiedPaymentStatus(info.status)).toBe(true);
+          const info = await adapter.retrievePayment!(pspPaymentId);
+          expectNormalizedPaymentInfo(info, adapter.pspName);
           expect(info.amount).toBe(3000);
-          expect(Number.isSafeInteger(info.amountRefunded)).toBe(true);
           expect(info.amountRefunded).toBe(0);
-          expect(PAYMENT_METHOD_TYPES).toContain(info.paymentMethodType);
-          expect(Number.isNaN(Date.parse(info.createdAt))).toBe(false);
-          expect(info.raw).toBeDefined();
           if (fixtures.money!.expectations?.idRoundTrip !== false) expect(info.id).toBe(id);
           if (fixtures.money!.expectations?.metadataEcho !== false) {
             expect(info.metadata).toMatchObject({ conformance_key: "v1" });
@@ -430,7 +445,8 @@ export function runServerAdapterConformanceTests(
 
       it.skipIf(!fixtures.money?.completedPayment)("refunds the full amount and reports it", async () => {
         const adapter = makeAdapter();
-        if (!adapter.getCapabilities().supportsRefunds) return;
+        const caps = adapter.getCapabilities();
+        if (!caps.supportsRefunds) return;
         const pspPaymentId = await fixtures.money!.completedPayment!(adapter, {
           amount: 2500,
           id: `conformance-${name}-refund-full`,
@@ -445,14 +461,22 @@ export function runServerAdapterConformanceTests(
         expect(refund.refundId.length).toBeGreaterThan(0);
         expect(refund.amount).toBe(2500);
         expect(refund.raw).toBeDefined();
+        // A push-only PSP has only ACKNOWLEDGED the refund here; the terminal
+        // state arrives by webhook. Exactly one shape per adapter, so a claimed
+        // "succeeded" cannot slip between the readback branches below.
+        if (caps.modificationOutcome === "asynchronous") expect(refund.status).toBe("pending");
         if (refund.status === "pending") {
-          // Async rails: the refund must be pollable to a terminal state.
-          const polled = await adapter.retrieveRefund!(refund.refundId);
-          expect(polled.refundId).toBe(refund.refundId);
-          expect(REFUND_STATUSES).toContain(polled.status);
-          expect(polled.amount).toBe(2500);
-        } else {
-          const info = await adapter.retrievePayment(pspPaymentId);
+          // Async rails: the refund must be pollable to a terminal state —
+          // unless the PSP offers no refund read at all, where the outcome
+          // reaches the host over webhooks only.
+          if (caps.supportsRefundRetrieval) {
+            const polled = await adapter.retrieveRefund!(refund.refundId);
+            expect(polled.refundId).toBe(refund.refundId);
+            expect(REFUND_STATUSES).toContain(polled.status);
+            expect(polled.amount).toBe(2500);
+          }
+        } else if (caps.supportsPaymentRetrieval) {
+          const info = await adapter.retrievePayment!(pspPaymentId);
           expect(info.amountRefunded).toBe(2500);
           expect(getRefundState(info)).toBe("full");
         }
@@ -462,7 +486,8 @@ export function runServerAdapterConformanceTests(
         "partial refunds accumulate and over-refunds reject",
         async () => {
           const adapter = makeAdapter();
-          if (!adapter.getCapabilities().supportsPartialRefunds) return;
+          const caps = adapter.getCapabilities();
+          if (!caps.supportsPartialRefunds) return;
           const pspPaymentId = await fixtures.money!.completedPayment!(adapter, {
             amount: 3000,
             id: `conformance-${name}-refund-partial`,
@@ -475,22 +500,29 @@ export function runServerAdapterConformanceTests(
           });
           expect(first.amount).toBe(1000);
           expect(first.status).not.toBe("failed");
-          if (first.status === "succeeded") {
-            const info = await adapter.retrievePayment(pspPaymentId);
+          if (caps.modificationOutcome === "asynchronous") expect(first.status).toBe("pending");
+          if (first.status === "succeeded" && caps.supportsPaymentRetrieval) {
+            const info = await adapter.retrievePayment!(pspPaymentId);
             expect(info.amountRefunded).toBe(1000);
             expect(getRefundState(info)).toBe("partial");
           }
-          // More than the remainder must reject — money out can never exceed money in.
-          try {
-            await adapter.refundPayment({
-              pspPaymentId,
-              amount: 2500,
-              idempotencyKey: `conformance-${name}-refund-over`,
-            });
-            expect.unreachable("expected over-refund rejection");
-          } catch (err) {
-            expect(isPayFanoutError(err), `expected PayFanoutError, got ${String(err)}`).toBe(true);
-            if (isPayFanoutError(err)) expect(err.raw).toBeDefined();
+          // More than the remainder must reject — money out can never exceed
+          // money in. Demanded of every adapter whose modifications answer with
+          // the real outcome, read or no read: an asynchronous provider only
+          // acknowledges the request and rejects the excess out-of-band, so the
+          // adapter has nothing honest to reject on locally.
+          if (caps.modificationOutcome === "synchronous") {
+            try {
+              await adapter.refundPayment({
+                pspPaymentId,
+                amount: 2500,
+                idempotencyKey: `conformance-${name}-refund-over`,
+              });
+              expect.unreachable("expected over-refund rejection");
+            } catch (err) {
+              expect(isPayFanoutError(err), `expected PayFanoutError, got ${String(err)}`).toBe(true);
+              if (isPayFanoutError(err)) expect(err.raw).toBeDefined();
+            }
           }
         },
       );
@@ -499,16 +531,28 @@ export function runServerAdapterConformanceTests(
         "captures an authorization and reports amountCaptured",
         async () => {
           const adapter = makeAdapter();
-          if (!adapter.getCapabilities().supportsManualCapture) return;
+          const caps = adapter.getCapabilities();
+          if (!caps.supportsManualCapture) return;
           const pspPaymentId = await fixtures.money!.authorizedPayment!(adapter, { amount: 4000 });
           const captured = await adapter.capturePayment!(
             pspPaymentId,
             4000,
             `conformance-${name}-capture`,
           );
-          expect(isUnifiedPaymentStatus(captured.status)).toBe(true);
+          expectNormalizedPaymentInfo(captured, adapter.pspName);
           expect(captured.status).not.toBe("failed");
-          expect(captured.amountCaptured).toBe(4000);
+          // The charge being captured, anchored for BOTH shapes — an
+          // asynchronous adapter reports no amountCaptured, so without this the
+          // acknowledgement path has no money value pinned to anything.
+          expect(captured.amount).toBe(4000);
+          // Push-only PSPs acknowledge the capture without settling it — the
+          // captured amount is only knowable once the webhook lands.
+          if (caps.modificationOutcome === "asynchronous") {
+            expect(captured.status).toBe("processing");
+            expect(captured.amountCaptured).toBeUndefined();
+          } else {
+            expect(captured.amountCaptured).toBe(4000);
+          }
         },
       );
 
@@ -516,11 +560,18 @@ export function runServerAdapterConformanceTests(
         "multi-capture settles partial amounts under distinct keys",
         async () => {
           const adapter = makeAdapter();
-          if (!adapter.getCapabilities().supportsMultiCapture) return;
+          const caps = adapter.getCapabilities();
+          if (!caps.supportsMultiCapture) return;
           const pspPaymentId = await fixtures.money!.authorizedPayment!(adapter, { amount: 5000 });
+          // Both partial captures must be accepted under their own keys — that
+          // much holds for every multi-capture adapter.
           await adapter.capturePayment!(pspPaymentId, 2000, `conformance-${name}-mcap-1`);
           await adapter.capturePayment!(pspPaymentId, 1500, `conformance-${name}-mcap-2`);
-          const info = await adapter.retrievePayment(pspPaymentId);
+          // The running total needs both a payment read AND settled captures: an
+          // asynchronous provider has only acknowledged these two, so demanding a
+          // total here would force the adapter to invent one.
+          if (!caps.supportsPaymentRetrieval || caps.modificationOutcome !== "synchronous") return;
+          const info = await adapter.retrievePayment!(pspPaymentId);
           expect(info.amountCaptured).toBe(3500);
         },
       );
@@ -531,8 +582,15 @@ export function runServerAdapterConformanceTests(
           const adapter = makeAdapter();
           const pspPaymentId = await fixtures.money!.cancelablePayment!(adapter);
           const info = await adapter.cancelPayment(pspPaymentId, `conformance-${name}-cancel`);
-          expect(info.pspName).toBe(adapter.pspName);
-          expect(info.status).toBe("canceled");
+          // Runs for EVERY adapter, so it is the one place a push-only PaymentInfo
+          // is normalization-checked at all.
+          expectNormalizedPaymentInfo(info, adapter.pspName);
+          // A push-only PSP has only ACKNOWLEDGED the cancel here; the terminal
+          // state arrives by webhook, so reporting "canceled" would be a claim
+          // the adapter cannot back. Exactly one shape is acceptable per adapter.
+          expect(info.status).toBe(
+            adapter.getCapabilities().modificationOutcome === "asynchronous" ? "processing" : "canceled",
+          );
         },
       );
     });
@@ -578,10 +636,7 @@ export function runServerAdapterConformanceTests(
       expect(fixtures.completePayment, "requiresServerCompletion adapters must supply completePayment fixtures").toBeDefined();
       const session = await adapter.createPaymentSession(fixtures.createSessionInput());
       const info = await adapter.completePayment!(fixtures.completePayment!.input(session));
-      expect(info.pspName).toBe(adapter.pspName);
-      expect(isUnifiedPaymentStatus(info.status)).toBe(true);
-      expect(Number.isSafeInteger(info.amount)).toBe(true);
-      expect(Number.isSafeInteger(info.amountRefunded)).toBe(true);
+      expectNormalizedPaymentInfo(info, adapter.pspName);
     });
 
     describe("webhooks operate on the raw body", () => {

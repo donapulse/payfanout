@@ -217,12 +217,15 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       pspName: this.pspName,
       // Router pre-screen; money.ts revalidates locally as defense-in-depth.
       supportedCurrencies: [...PAYPAL_SUPPORTED_CURRENCIES],
+      supportsPaymentRetrieval: true, // GET /v2/checkout/orders/{id}
       supportsRefunds: true,
       supportsPartialRefunds: true,
+      supportsRefundRetrieval: true, // GET /v2/payments/refunds/{id}
       supportsManualCapture: true, // intent AUTHORIZE + authorization capture
       // final_capture=false keeps an authorization open for repeated partial
       // captures (CAPTURE-intent orders settle exactly once).
       supportsMultiCapture: true,
+      modificationOutcome: "synchronous",
       supportsPaymentMethodVerification: false, // no zero-amount check for wallet approvals
       supportsSavedPaymentMethods: false, // v3 vault (payment-tokens) is the documented future path
       supportsSessionUpdate: true, // PATCH order pre-approval

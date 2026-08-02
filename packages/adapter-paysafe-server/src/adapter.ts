@@ -696,12 +696,15 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   getCapabilities(): AdapterCapabilities {
     return {
       pspName: this.pspName,
+      supportsPaymentRetrieval: true, // GET /paymenthub/v1/payments/{id}
       supportsRefunds: true,
       supportsPartialRefunds: true,
+      supportsRefundRetrieval: true, // GET /paymenthub/v1/refunds/{id}
       supportsManualCapture: true,
       // Settlements are partial-able: several captures (distinct idempotency
       // keys) can settle one authorization up to availableToSettle.
       supportsMultiCapture: true,
+      modificationOutcome: "synchronous",
       supportsPaymentMethodVerification: true,
       // Customer Vault: single-use handles convert
       // to MULTI_USE tokens under a customer; charged with storedCredential.

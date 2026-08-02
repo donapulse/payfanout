@@ -17,17 +17,18 @@ component code drives both confirm-on-client and tokenize-first PSPs.
 ## Installation
 
 ```bash
-pnpm add @payfanout/react \
-         @payfanout/adapter-stripe \
-         @payfanout/adapter-paysafe \
-         react react-dom
+pnpm add @payfanout/react @payfanout/adapter-<psp> react react-dom
 ```
 
-`react` (>= 18) is a peer dependency. Add only the client adapter(s) for the PSP(s) you use;
-they have no npm dependency on the PSP browser SDKs (Stripe.js / Paysafe.js load lazily via
-a `<script>` tag).
+`react` (>= 18) is a peer dependency. Add only the client adapter(s) for the PSP(s) you use —
+[Payment providers](https://donapulse.github.io/payfanout/guide/providers) lists every shipped
+adapter with its package name and set-up guide. Client adapters have no npm dependency on the
+PSP browser SDKs; each provider's SDK loads lazily via a `<script>` tag when its adapter mounts.
 
 ## Quick start
+
+Stripe and Paysafe below are examples, one per completion shape; any pair of shipped
+adapters registers exactly the same way.
 
 ```tsx
 import { PayFanoutProvider, PaymentFields, PayButton } from "@payfanout/react";
@@ -48,7 +49,7 @@ const adapters = [
   <PayButton
     onResult={(result) => …}
     onServerCompletion={(clientToken) =>
-      // Only tokenize-first PSPs (Paysafe) invoke this: POST to YOUR route,
+      // Only tokenize-first PSPs invoke this: POST to YOUR route,
       // which calls payments.completePayment(psp, { pspSessionId, clientToken, idempotencyKey }).
       postToMyApi("/api/complete", { clientToken })
     }
@@ -67,7 +68,7 @@ const adapters = [
   (the PSP's own field texts), `fieldOptions` (the SDK's full UI option surface), and
   named slots (`data-payfanout-field=…`) for split-field PSPs so you own the layout.
 - **`<PayButton>`** and **`usePay()`**, the same pay engine as a component or a hook. Both
-  branch automatically between confirm-on-client (Stripe) and tokenize-first (Paysafe, via
+  branch automatically between confirm-on-client and tokenize-first (via
   `onServerCompletion`), the UI code is identical either way.
 - **`useRedirectReturn()` / `<RedirectReturn>`**, mount on your `returnUrl` page for
   genuinely redirect methods (iDEAL, bank redirects). It probes each registered client
@@ -75,18 +76,25 @@ const adapters = [
 
 ## The two completion shapes
 
-- **Confirm-on-client (Stripe):** server creates the PaymentIntent, the client confirms
+Every PSP falls into one of two shapes, and the UI code is identical either way:
+
+- **Confirm-on-client:** the server creates the payment session, the client confirms it
   (inline 3DS). The server never touches confirmation.
-- **Tokenize-first (Paysafe):** the client tokenizes first, then your server finalizes via
-  `completePayment`. `<PayButton>` branches through `onServerCompletion` for you. Any future
-  tokenize-first PSP reuses the same path.
+- **Tokenize-first:** the client tokenizes first, then your server finalizes via
+  `completePayment`. `<PayButton>` branches through `onServerCompletion` for you.
+
+Which shape a given PSP uses is listed per adapter in
+[Payment providers](https://donapulse.github.io/payfanout/guide/providers); a PSP added later
+reuses whichever path it declares, with no change to your components.
 
 ## Where it fits
 
 `@payfanout/react` is the browser half. The server half that creates the session it
-consumes lives in [`@payfanout/server`](../server). Client adapters:
-[`@payfanout/adapter-stripe`](../adapter-stripe),
-[`@payfanout/adapter-paysafe`](../adapter-paysafe).
+consumes lives in [`@payfanout/server`](../server). Pair it with the client adapter for each
+PSP you accept — see
+[Payment providers](https://donapulse.github.io/payfanout/guide/providers) for the full list,
+or [Writing an adapter](https://donapulse.github.io/payfanout/adapter-authoring) to add one
+we don't ship yet.
 
 ## Documentation
 

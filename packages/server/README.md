@@ -17,14 +17,16 @@ PayFanout orchestrates and normalizes; your app owns the id mapping between its 
 ## Installation
 
 ```bash
-pnpm add @payfanout/server \
-         @payfanout/adapter-stripe-server \
-         @payfanout/adapter-paysafe-server
+pnpm add @payfanout/server @payfanout/adapter-<psp>-server
 ```
 
-Add only the adapter(s) for the PSP(s) you use. `@payfanout/core` comes in transitively.
+Add only the adapter(s) for the PSP(s) you use —
+[Payment providers](https://donapulse.github.io/payfanout/guide/providers) lists every shipped
+adapter with its package name and set-up guide. `@payfanout/core` comes in transitively.
 
 ## Quick start
+
+Stripe is the example below; every server adapter registers on the service the same way.
 
 ```ts
 import { PaymentService, createAdapterWebhookHandler } from "@payfanout/server";
@@ -95,15 +97,17 @@ trouble (`psp_unavailable`, `rate_limited`, `processing_error`, `retryable` erro
 
 ## Where it fits
 
-Pair `@payfanout/server` with a server adapter
-([`@payfanout/adapter-stripe-server`](../adapter-stripe-server),
-[`@payfanout/adapter-paysafe-server`](../adapter-paysafe-server)) and, on the browser,
-[`@payfanout/react`](../react). Amounts crossing the server boundary are always integer
-minor units, use the currency helpers from [`@payfanout/core`](../core).
+Pair `@payfanout/server` with a server adapter for each PSP you accept (see
+[Payment providers](https://donapulse.github.io/payfanout/guide/providers) for the full list,
+or [Writing an adapter](https://donapulse.github.io/payfanout/adapter-authoring) to add one we
+don't ship yet) and, on the browser, [`@payfanout/react`](../react). Amounts crossing the
+server boundary are always integer minor units, use the currency helpers from
+[`@payfanout/core`](../core).
 
 ## Documentation
 
 - [Server usage](https://donapulse.github.io/payfanout/guide/server)
+- [Payment providers](https://donapulse.github.io/payfanout/guide/providers), every shipped adapter
 - [Webhooks](https://donapulse.github.io/payfanout/guide/webhooks)
 - [Saved cards & subscriptions](https://donapulse.github.io/payfanout/guide/recurring)
 - [API reference](https://donapulse.github.io/payfanout/api/)

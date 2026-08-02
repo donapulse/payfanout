@@ -1,5 +1,11 @@
 # @payfanout/server
 
+## 1.3.1
+
+### Patch Changes
+
+- 824f508: Point the package READMEs at the full list of shipped adapters instead of naming two of them, so the install instructions stay accurate as further providers ship.
+
 ## 1.3.0
 
 ### Minor Changes

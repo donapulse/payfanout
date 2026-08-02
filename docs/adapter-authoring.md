@@ -13,7 +13,7 @@ document are the whole interface.
 This is the one architectural decision, everything else is mapping. Ask: *how does a
 payment reach its terminal state?* The shipped adapters cover three shapes:
 
-| | Confirm-on-client (Stripe, PayZen) | Tokenize-first (Paysafe, PayPal, Worldline) | Redirect / hosted (GoCardless) |
+| | Confirm-on-client (Stripe, PayZen) | Tokenize-first (Paysafe, PayPal, Worldline, Adyen) | Redirect / hosted (GoCardless) |
 | --- | --- | --- | --- |
 | Server session call | creates the PSP intent object | may create nothing, see "stateless sessions" | creates the PSP object + hosted URL |
 | Client `confirm()` | finalizes, returns terminal status | returns `requires_confirmation` + `clientToken` | navigates to the hosted flow |
@@ -183,15 +183,15 @@ and `PaymentService` will hold you to:
 - `verifyWebhookSignature(rawBody, headers)` must operate on the **exact raw body
   string**. Never `JSON.parse` + re-serialize before verifying, the conformance suite
   feeds you a re-serialized body (same JSON value, different bytes) and requires
-  `false` — of every `"raw-bytes"` adapter, which is the default expectation and all of
-  them today; the next bullet covers the one scope where a re-encoded body legitimately
+  `false` — of every `"raw-bytes"` adapter, which is the default expectation; the next
+  bullet covers the one scope where a re-encoded body legitimately
   still verifies. Two verification patterns are shipped precedent: local HMAC over the raw
   bytes with constant-time comparison and timestamp tolerance (Stripe, Paysafe,
   GoCardless, PayZen — use core's `constantTimeEqual`), and **postback verification**
   where the PSP's API confirms the signature (PayPal — splice the raw body into the
   postback by string concatenation, fail closed on any transport trouble).
 - **`webhookSignatureScope` — declare what the signature actually covers.**
-  `"raw-bytes"` (every shipped adapter) means the signature is computed over bytes as
+  `"raw-bytes"` (the default, and what most providers do) means the signature is computed over bytes as
   delivered — the whole body, or a string lifted out of an envelope as PayZen's
   `kr-answer` is — so any re-encoding of that signed range invalidates it, and the
   re-serialized-body assertion above applies. `"field-values"` means the provider signs a set of values *extracted*

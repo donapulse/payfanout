@@ -1,0 +1,34 @@
+{
+  "name": "@payfanout/adapter-adyen-server",
+  "version": "0.0.0",
+  "license": "MIT",
+  "description": "Server-side Adyen adapter for PayFanout (Checkout API v72: payments, captures, cancels, refunds, standard webhooks). Push-only: outcomes arrive by webhook. Holds secrets — never bundle client-side.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "sideEffects": false,
+  "dependencies": {
+    "@payfanout/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@payfanout/conformance": "workspace:*"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "publishConfig": {
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  }
+}

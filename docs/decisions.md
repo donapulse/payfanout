@@ -1097,3 +1097,129 @@ of pretending it away.
   suite against an in-memory field-value provider, so the shape is executable rather than
   theoretical until an adapter for such a PSP exists — the same pattern as the push-only
   fake. No shipped adapter changes behavior.
+
+## Adyen adapter (2026-08-02)
+
+Tokenize-first pair (`adapter-adyen` / `adapter-adyen-server`, Checkout API v72 + Adyen Web
+v6) and the first **push-only** provider PayFanout ships. New adapter packages only — no
+core/server/react/conformance changes. Platform facts and the choices they forced (all
+doc-verified against docs.adyen.com unless noted):
+
+- **Push-only is the whole shape.** The Checkout API exposes no read for a payment and none
+  for a refund, and `/captures`, `/cancels`, `/refunds`, `/reversals`, `/amountUpdates` all
+  answer `{ status: "received" }`. Capabilities therefore declare
+  `supportsPaymentRetrieval: false`, `supportsRefundRetrieval: false` and
+  `modificationOutcome: "asynchronous"`; capture and cancel resolve `"processing"`, refunds
+  `"pending"`, no `amountCaptured` is ever synthesized, and neither `retrievePayment` nor
+  `retrieveRefund` is implemented (implementing one while declaring the flag false is a
+  coherence violation). The webhook endpoint is the system of record.
+- **`pspPaymentId` is the composite `"{pspReference}:{value}:{currency}"`.** A capture needs
+  the authorisation's currency and an amountless refund needs its value; with no read and no
+  persistence the money facts must ride the reference. `cancelPayment` accepts the bare
+  reference, and the part before the first `:` is Adyen's own pspReference — what webhooks
+  report — so a host can always recover it. Bare references on capture/refund reject with
+  `invalid_request` naming the composite rather than guessing an amount.
+- **Session creation calls nothing.** Adyen's payment object only exists once `/payments`
+  runs, so `createPaymentSession` returns a signed self-contained context (amount, currency,
+  reference, captureMethod, returnUrl, metadata, receiptEmail + enforced `expiresAt`) as
+  `pspSessionId`, which is also the `clientSecret`: Adyen Web is addressed by the public
+  clientKey, so the token is what the browser needs (it reads the payload half for the
+  amount). The merchant reference defaults to `pf_<sha256(idempotencyKey)[0..32]>`, so a
+  replayed session creation converges on one Adyen payment.
+- **Idempotency** rides the `idempotency-key` header (max 64 chars, honoured on POST only,
+  keys retained ≥ 7 days). Adyen stores those keys **at company account level, not per
+  endpoint**, so the header value is `sha256Hex("{path}\n{idempotencyKey}")` — still exactly
+  64 characters and deterministic, but scoped to the call. Derived from the caller's key
+  alone it would collide across endpoints: the documented 3-D Secure flow routes `/payments`
+  and `/payments/details` through one completion handler with one key, so the second call
+  would be answered with the stored `ChallengeShopper` response and the payment would never
+  authorise; a host reusing one key for a capture and a refund hits the same wall.
+  `errorCode` 704 (a duplicate racing the still in-flight original) maps to a retryable
+  `processing_error` and the transport loop replays it; a 409 is retried only when Adyen
+  sends `transient-error: true`.
+- **`returnUrl` is required on POST /payments in v72**, alongside `merchantAccount`,
+  `amount`, `reference` and `paymentMethod`, so the adapter takes a `defaultReturnUrl`
+  config (the PayPal adapter's `returnUrl` fallback is the precedent): the session's own
+  `returnUrl` wins, the default fills in, and a session with neither is refused at creation
+  with `invalid_request` naming the field rather than sent for Adyen to reject. The fake
+  Checkout API enforces the field, so the conformance sessions prove the shape.
+- **A host id containing `:` or `\` is refused at session creation.** Adyen documents no
+  charset restriction on `reference`, but it echoes the value as `merchantReference`, one of
+  the eight signed webhook values, and no escaping rule is documented for a signed value
+  carrying the delimiter — so such an id would make every webhook for that payment fail
+  verification, permanently and silently, after the shopper has paid. For a push-only
+  provider that is total failure, so it is rejected while the host still owns the id.
+- **The CLP/CVE/IDR/ISK exclusion is enforced on captures and refunds too**, not only at
+  session creation: the composite `pspPaymentId` is documented, so a host can drive a
+  modification for a payment created elsewhere, and an excluded currency would be priced
+  100x off.
+- **Manual capture is per payment** (`additionalData.manualCapture: "true"`), not the
+  account-wide switch, which would hold every payment. Multiple partial captures are
+  disabled by default at Adyen and a single partial capture auto-cancels the remainder, so
+  `supportsMultiCapture: false`.
+- **resultCode mapping**: `Authorised` → `succeeded` (or `requires_capture` under manual
+  capture), `Cancelled` → `canceled`, `Received`/`Pending`/`AuthenticationFinished`/
+  `AuthenticationNotRequired` → `processing`, `RedirectShopper`/`IdentifyShopper`/
+  `ChallengeShopper`/`PresentToShopper`/`PartiallyAuthorised` → `requires_action`,
+  `Refused`/`Error` raise a mapped `PayFanoutError` rather than a "failed" PaymentInfo.
+  Refusal codes map 2/5/46 → `card_declined`, 6 → `expired_card`, 8/24 →
+  `invalid_card_data`, 11/38/42 → `authentication_required`, 12 → `insufficient_funds`,
+  14/20 → `fraud_suspected`, 9 (Issuer Unavailable) → `processing_error`. None is retryable:
+  replaying the same idempotency key returns the same refusal, so a fresh attempt is the
+  shopper's move, and an unrecognized code is still a decline.
+- **CLP, CVE, IDR and ISK are rejected locally** (`invalid_request`): Adyen prices them with
+  2/0/0/2 fractional digits against ISO 4217's 0/2/2/0, and Adyen documents its own table as
+  leading, so pass-through would shift the decimal point. Same shape as the PayZen CNY/KHR
+  exclusion. `supportedCurrencies` is left undeclared: the capability is an allowlist and no
+  complete, verified Adyen currency list was available, so declaring one would be a guess —
+  the cost is that the router cannot pre-screen those four.
+- **Webhook verification requires a second factor, and that is deliberate.** Adyen's HMAC-SHA256
+  covers eight colon-joined values (`pspReference:originalReference:merchantAccountCode:`
+  `merchantReference:value:currency:eventCode:success`), base64, carried inside the payload
+  at `additionalData.hmacSignature`; the Customer Area key is hex and is decoded to bytes
+  before signing (verified against Adyen's published test vector, which ships as a fixture).
+  Everything else in the payload — `additionalData`, `reason`, `paymentMethod`, `eventDate`,
+  all of which hosts read from `event.raw` — is unauthenticated, and the signature covers
+  values rather than bytes. So the adapter additionally requires the endpoint's basic
+  authentication credentials — which Adyen supports on every webhook type — to authenticate
+  the channel the unsigned remainder arrived on. That is stricter than a bare Adyen
+  integration; hosts enable basic auth in the Customer Area, and the setup guide says so.
+  Adyen strongly recommends OAuth 2.0 for standard webhooks and offers basic authentication
+  as the alternative; the adapter checks basic auth only, so an OAuth-configured endpoint
+  fails every delivery. That limitation is stated in the setup guide rather than papered
+  over — verifying a bearer token means holding an Adyen OAuth client, which no other part
+  of the adapter needs.
+  The adapter declares `webhookSignatureScope: "field-values"` and lets a re-encoded body
+  verify, which is the honest reading: an earlier draft refused bodies carrying structural
+  whitespace to satisfy the raw-bytes assertion, but "Adyen never emits structural
+  whitespace" is a guess about the wire format that no documentation supports, and a wrong
+  guess rejects every legitimate delivery. The contract now models the scope instead.
+- **No escaping rule is documented for signed values containing the `:` delimiter**, so a
+  delivery whose signed values contain `:` or `\` is refused as ambiguous rather than
+  verified under an escaping convention Adyen would not apply on its side.
+- **Event id is the pair `"{eventCode}:{pspReference}"`**: a redelivery repeats both, while
+  `pspReference` alone is shared by a payment's own events and would collide. Modification
+  events report the payment on `originalReference` and keep their own `pspReference` as
+  `refundId`. `success`/`live` are compared to the exact strings `"true"`/`"false"` (the
+  string `"false"` is truthy). `CANCELLATION` with `success: "false"` and `CANCEL_OR_REFUND`
+  map to `"unknown"` — the first says nothing about the payment, the second does not say
+  which of the two operations Adyen performed, and fabricating either would be an accounting
+  claim. `CHARGEBACK_REVERSED` → `chargeback_won` and `SECOND_CHARGEBACK` →
+  `chargeback_lost` follow Adyen's dispute documentation ("Lost", undefendable), with the
+  caveat that a reversal is not final.
+- **`PaymentInfo.createdAt` falls back to epoch** — Checkout responses carry no creation
+  timestamp and there is no read to fetch one; hosts take it from their own record or the
+  webhook `eventDate`. The constant also keeps a replayed `completePayment` byte-identical.
+- **Client**: Adyen Web v6 from `checkoutshopper-{test|live}.cdn.adyen.com/checkoutshopper/
+  sdk/{version}/` (the Drop-in guide's shorter path 404s), `window.AdyenWeb` with an async
+  `AdyenCheckout()` and component classes (`new Card(checkout, options)`). The pinned build
+  is 6.41.0 (released 2026-07-15, current at the time of writing per Adyen's Web release
+  notes, and requiring Checkout API v69 or later, which the pinned v72 satisfies); pinning
+  the 6.0.0 that opened the major would ship a checkout a year of fixes behind. The adapter
+  owns `showPayButton: false` and `onChange`, forwards everything else. 3-D Secure resolves
+  inline through an adapter-specific `handleAction(handle, action)` whose result is a second
+  clientToken (`{ details, paymentData }`) that `completePayment` sends to `/payments/details`
+  — the unified contract has no action step because most PSPs resolve challenges inside
+  `confirm()`. One challenge at a time per handle: a re-entrant `handleAction` is refused
+  with `invalid_request` instead of replacing the pending resolver, which would leave the
+  first caller's promise unsettled forever.

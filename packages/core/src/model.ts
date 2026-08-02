@@ -113,6 +113,19 @@ export interface NativeSubscriptionCapabilities {
  */
 export type ModificationOutcome = "synchronous" | "asynchronous";
 
+/**
+ * What a provider's webhook signature actually covers. "raw-bytes" signs bytes
+ * as delivered, so any re-encoding of the signed byte range (a JSON middleware,
+ * a proxy that reformats) invalidates the signature — the range can be the
+ * whole body or a string extracted from an envelope, as PayZen's kr-answer is.
+ * "field-values" signs a selected set of values extracted from the payload, so a
+ * re-encoded body still verifies and — the part that matters for security —
+ * every field OUTSIDE the signed set arrives unauthenticated: such an adapter
+ * must authenticate the delivery channel by another means and must never
+ * present an unsigned field as trusted.
+ */
+export type WebhookSignatureScope = "raw-bytes" | "field-values";
+
 export interface AdapterCapabilities {
   pspName: string;
   /**
@@ -176,6 +189,14 @@ export interface AdapterCapabilities {
    * what the provider's own billing product supports.
    */
   nativeSubscriptions: NativeSubscriptionCapabilities;
+  /**
+   * What verifyWebhookSignature can prove about a delivery — see
+   * WebhookSignatureScope. The conformance suite asserts a re-serialized body
+   * is rejected only under "raw-bytes"; a "field-values" provider signs values
+   * that survive re-encoding, so that assertion is unprovable without inventing
+   * a byte-level heuristic that would reject legitimate deliveries.
+   */
+  webhookSignatureScope: WebhookSignatureScope;
   /**
    * True if the PSP flow is client-tokenize-first and the server must finalize
    * the payment via completePayment (Paysafe: true, Stripe: false).

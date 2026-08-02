@@ -43,7 +43,13 @@ export async function POST(req: Request) {
 
 ::: warning The conformance suite enforces this
 There is a test that **fails any adapter which re-serializes a parsed body before
-verifying** (same JSON value, different bytes ⇒ must reject).
+verifying** (same JSON value, different bytes ⇒ must reject). It applies to every adapter
+declaring `webhookSignatureScope: "raw-bytes"`, which is all of them today. A provider
+that signs values *extracted* from the payload rather than its bytes declares
+`"field-values"` instead: a re-encoded body still verifies there, so the adapter
+authenticates the delivery channel by other means, and fields outside the signed set are
+never trusted. Pass the raw bytes either way, they cost nothing and every shipped adapter
+needs them.
 :::
 
 ## Ack fast, process async

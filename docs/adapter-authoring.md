@@ -183,11 +183,32 @@ and `PaymentService` will hold you to:
 - `verifyWebhookSignature(rawBody, headers)` must operate on the **exact raw body
   string**. Never `JSON.parse` + re-serialize before verifying, the conformance suite
   feeds you a re-serialized body (same JSON value, different bytes) and requires
-  `false`. Three verification patterns are shipped precedent: local HMAC over the raw
+  `false` — of every `"raw-bytes"` adapter, which is the default expectation and all of
+  them today; the next bullet covers the one scope where a re-encoded body legitimately
+  still verifies. Two verification patterns are shipped precedent: local HMAC over the raw
   bytes with constant-time comparison and timestamp tolerance (Stripe, Paysafe,
   GoCardless, PayZen — use core's `constantTimeEqual`), and **postback verification**
   where the PSP's API confirms the signature (PayPal — splice the raw body into the
   postback by string concatenation, fail closed on any transport trouble).
+- **`webhookSignatureScope` — declare what the signature actually covers.**
+  `"raw-bytes"` (every shipped adapter) means the signature is computed over bytes as
+  delivered — the whole body, or a string lifted out of an envelope as PayZen's
+  `kr-answer` is — so any re-encoding of that signed range invalidates it, and the
+  re-serialized-body assertion above applies. `"field-values"` means the provider signs a set of values *extracted*
+  from the payload — a colon-joined field list, say — so a re-encoded body still
+  verifies and the suite inverts that assertion rather than making you invent a byte-level
+  heuristic that would reject legitimate deliveries. Where verification happens is
+  irrelevant to the flag: PayPal's postback is `"raw-bytes"` because PayPal verifies the
+  exact delivered body. A `"field-values"` adapter owes its hosts two things —
+  **authenticate the delivery channel by another means** (endpoint credentials, mutual
+  TLS, an allowlist: the signature alone proves nothing about who called you), and
+  **never present an unsigned field as trusted**, because every field outside the signed
+  set arrives unauthenticated even on a delivery that verifies. Tamper coverage does not
+  lapse either way: the suite still requires a forged payload and a credential-less
+  delivery to fail, and the waiver is two-sided — declaring `"field-values"` obliges you
+  to VERIFY a re-encoded body (a byte-signer cannot borrow the exemption) and to supply
+  `webhook.tamperedSignedValueBody`, a delivery carrying one altered signed value with
+  its signature untouched, which you must reject.
 - Accept an **array** of signing secrets/HMAC keys so rotation needs no cutover, any
   active key verifying wins (core's `normalizeSecrets`).
 - `parseWebhookEvent` returns a `UnifiedWebhookEvent` with a **stable `id`** (the PSP's

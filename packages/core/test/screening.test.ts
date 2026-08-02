@@ -16,6 +16,7 @@ const caps = (overrides: Partial<AdapterCapabilities> = {}): AdapterCapabilities
   supportsEventPolling: false,
   supportsListing: false,
   nativeSubscriptions: { list: false, retrieve: false, create: false, cancel: false },
+  webhookSignatureScope: "raw-bytes",
   requiresServerCompletion: false,
   paymentMethods: [{ type: "card", flow: "embedded", supported: true }],
   ...overrides,

@@ -235,6 +235,8 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       // subsequentType: "recurring"), which the vault surface plus the
       // host-side SubscriptionManager already cover.
       nativeSubscriptions: { list: false, retrieve: false, create: false, cancel: false },
+      // X-GCS-Signature = base64(HMAC-SHA256(webhookSecret, rawBody)).
+      webhookSignatureScope: "raw-bytes",
       requiresServerCompletion: true, // tokenize-first: the client tokenizes, the server creates the payment
       paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };

@@ -373,6 +373,8 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       // honestly, and hosts MUST retain BOTH identifiers per subscription —
       // they form a composite key that cannot be rediscovered via the API.
       nativeSubscriptions: { list: false, retrieve: true, create: true, cancel: true },
+      // kr-hash = hex HMAC-SHA256 of the kr-answer string exactly as delivered.
+      webhookSignatureScope: "raw-bytes",
       requiresServerCompletion: false, // confirm-on-client: the krypton form creates the transaction
       paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };

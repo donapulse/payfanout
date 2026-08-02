@@ -99,6 +99,7 @@ export class FakeAdapter implements ServerPaymentAdapter {
       supportsEventPolling: true,
       supportsListing: true,
       nativeSubscriptions: { list: true, retrieve: true, create: true, cancel: true },
+      webhookSignatureScope: "raw-bytes",
       requiresServerCompletion: false,
       paymentMethods: [{ type: "card", flow: "embedded", supported: true }],
       ...options.capabilities,

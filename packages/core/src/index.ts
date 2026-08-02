@@ -77,6 +77,7 @@ export type {
   UnifiedPaymentStatus,
   UnifiedWebhookEvent,
   UnifiedWebhookEventType,
+  WebhookSignatureScope,
 } from "./model.js";
 export {
   isNativeSubscriptionStatus,

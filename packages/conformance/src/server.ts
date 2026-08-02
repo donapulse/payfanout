@@ -48,6 +48,15 @@ export interface ServerConformanceFixtures {
     expectedAmount?: MinorUnitAmount;
     /** A correctly SIGNED delivery of an event type the adapter does not recognize. */
     unknownEvent?: { rawBody: string; headers: Record<string, string> };
+    /**
+     * A copy of validRawBody in which one SIGNED value has been altered (an
+     * amount moved, say) while the delivered signature is left as sent.
+     * REQUIRED when the adapter declares webhookSignatureScope "field-values":
+     * such a signature survives re-encoding, so this is the forgery that proves
+     * it still covers what it claims. Declared rather than derived — only the
+     * adapter knows which values its provider signs.
+     */
+    tamperedSignedValueBody?: string;
   };
 
   /**
@@ -650,6 +659,11 @@ export function runServerAdapterConformanceTests(
         // Fails for any adapter that parses then re-serializes before verifying —
         // the exact bug express.json()-style middlewares induce.
         const adapter = makeAdapter();
+        // A field-value signature covers values, not bytes, so it verifies a
+        // re-encoded body by design. Failing it here would take a synthetic
+        // byte-level heuristic — guessing the provider's wire format — which
+        // rejects legitimate deliveries the day the provider reformats them.
+        if (adapter.getCapabilities().webhookSignatureScope !== "raw-bytes") return;
         const { validRawBody, validHeaders } = fixtures.webhook;
         const reserialized = JSON.stringify(JSON.parse(validRawBody), null, 2);
         expect(reserialized).not.toBe(validRawBody);
@@ -657,11 +671,41 @@ export function runServerAdapterConformanceTests(
       });
 
       it("rejects tampered content and missing signature headers", async () => {
+        // Unconditional: whatever the signature covers, a forged payload and a
+        // delivery carrying no credentials at all must both fail.
         const adapter = makeAdapter();
         const { validRawBody, validHeaders } = fixtures.webhook;
         const tampered = validRawBody.replace(/\d/, (d) => String((Number(d) + 1) % 10));
         await expect(adapter.verifyWebhookSignature(tampered, validHeaders)).resolves.toBe(false);
         await expect(adapter.verifyWebhookSignature(validRawBody, {})).resolves.toBe(false);
+      });
+
+      it("verifies a re-encoded body under a field-value signature", async () => {
+        // The other half of the flag: declaring "field-values" waives the
+        // re-serialization assertion, so it has to be earned. A byte-signer
+        // that declares the scope to escape that assertion fails here, which is
+        // what keeps the opt-out from being free.
+        const adapter = makeAdapter();
+        if (adapter.getCapabilities().webhookSignatureScope !== "field-values") return;
+        const { validRawBody, validHeaders } = fixtures.webhook;
+        const parsed = JSON.parse(validRawBody) as Record<string, unknown>;
+        const reordered: Record<string, unknown> = {};
+        for (const key of Object.keys(parsed).reverse()) reordered[key] = parsed[key];
+        const reencoded = JSON.stringify(reordered, null, 2);
+        expect(reencoded).not.toBe(validRawBody);
+        // The claim the flag makes: values survive re-encoding, bytes are not covered.
+        await expect(adapter.verifyWebhookSignature(reencoded, validHeaders)).resolves.toBe(true);
+      });
+
+      it("rejects a tampered SIGNED value under a field-value signature", async () => {
+        const adapter = makeAdapter();
+        if (adapter.getCapabilities().webhookSignatureScope !== "field-values") return;
+        const { validHeaders, tamperedSignedValueBody } = fixtures.webhook;
+        expect(
+          tamperedSignedValueBody,
+          "field-values adapters must supply webhook.tamperedSignedValueBody — one signed value altered, signature as delivered",
+        ).toBeDefined();
+        await expect(adapter.verifyWebhookSignature(tamperedSignedValueBody!, validHeaders)).resolves.toBe(false);
       });
 
       it("parses to a normalized event with a stable dedupe id", async () => {

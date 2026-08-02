@@ -1049,3 +1049,51 @@ modelled honestly.
   `supportsPaymentRetrieval: true`, `supportsRefundRetrieval: true` and
   `modificationOutcome: "synchronous"` — verified against their implemented endpoints and
   unchanged in behavior.
+
+## Webhook signature scope in the adapter contract (2026-08-02)
+
+The conformance suite requires a re-serialized body (same JSON value, different bytes) to
+fail signature verification — the express.json() bug, caught at the contract level. That
+requirement silently assumed every provider signs the raw payload bytes. Providers exist
+whose standard webhook signature instead covers a fixed list of values EXTRACTED from the
+payload (colon-joined, HMAC'd, the signature carried inside the body). Re-serializing
+preserves those values, so such an adapter can only fail the assertion by inventing a
+byte-level heuristic — guessing the provider's wire format, and rejecting legitimate
+deliveries the day the provider reformats one. The contract models the difference instead
+of pretending it away.
+
+- **Contract**: `AdapterCapabilities` gains a REQUIRED
+  `webhookSignatureScope: "raw-bytes" | "field-values"`. Required, not defaulted: a
+  silent `"raw-bytes"` default would let a field-value adapter inherit a guarantee it
+  cannot back, and the flag exists precisely to stop that. `validateAdapterCapabilities`
+  flags an ABSENT scope for the same reason: the flag gates an assertion, so a
+  pre-upgrade adapter shape has to surface as a registration violation instead of
+  switching that assertion off unannounced.
+- **The flag describes the SIGNATURE, not where verification runs.** PayPal verifies by
+  postback — it sends the delivery back to PayPal — and is still `"raw-bytes"`, because
+  PayPal verifies the exact delivered body, which is why the adapter splices the raw event
+  into the postback verbatim. All shipped adapters are `"raw-bytes"`: Stripe HMACs
+  `${timestamp}.${rawBody}`, Paysafe and Worldline HMAC the body to base64, GoCardless
+  HMACs the whole batched delivery to hex, PayZen HMACs the kr-answer string as received.
+- **The re-serialization assertion is INVERTED, not dropped.** Under `"field-values"` the
+  suite requires the re-encoded body to VERIFY — the claim the flag makes — so a
+  byte-signer cannot declare the scope to escape the assertion: it fails the inverse
+  instead. Tampered content and a delivery with no credentials at all must still fail for
+  EVERY adapter, whatever the signature covers, and a field-value adapter additionally
+  has to reject `webhook.tamperedSignedValueBody`, a fixture the adapter DECLARES (one
+  signed value altered, signature as delivered) because only it knows which values its
+  provider signs. The class trades one unprovable assertion for two real ones, never for
+  less coverage.
+- **What a `"field-values"` adapter owes its hosts**, documented in the authoring guide
+  and checked, where the signature rides inside the payload, by the suite's
+  credential-less case: authenticate the delivery CHANNEL by another means (endpoint
+  credentials, mutual TLS, an allowlist) — a signature over values proves nothing about
+  the caller — and never present a field outside the signed set as trusted, because it
+  arrives unauthenticated on a delivery that verifies. The check has a limit worth
+  stating: `verifyWebhookSignature(validRawBody, {})` only bites when the signature
+  travels in the body, since a scheme carrying it in a header satisfies the case from the
+  missing header alone, with no channel authentication anywhere.
+- **Proof**: `packages/conformance/test/field-value-signature-adapter.test.ts` runs the
+  suite against an in-memory field-value provider, so the shape is executable rather than
+  theoretical until an adapter for such a PSP exists — the same pattern as the push-only
+  fake. No shipped adapter changes behavior.

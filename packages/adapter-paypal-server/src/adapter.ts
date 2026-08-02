@@ -238,6 +238,10 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       // request shape takes a raw card number, which PayFanout never touches)
       // — declaring create would fake support.
       nativeSubscriptions: { list: true, retrieve: true, create: false, cancel: true },
+      // Verification is a postback, but the scope is still the delivered bytes:
+      // PayPal verifies the exact body, which is why the raw event is spliced
+      // into the postback verbatim and a re-encoded body fails at PayPal's end.
+      webhookSignatureScope: "raw-bytes",
       requiresServerCompletion: true, // tokenize-first: the popup approves, money moves at server capture
       paymentMethods: [{ type: "paypal", flow: "popup", supported: true }],
     };

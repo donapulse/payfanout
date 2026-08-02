@@ -18,6 +18,7 @@ const BASE_CAPS: AdapterCapabilities = {
   supportsEventPolling: false,
   supportsListing: false,
   nativeSubscriptions: { list: false, retrieve: false, create: false, cancel: false },
+  webhookSignatureScope: "raw-bytes",
   requiresServerCompletion: false,
   paymentMethods: [{ type: "card", flow: "embedded", supported: true }],
 };
@@ -203,6 +204,16 @@ describe("validateAdapterCapabilities", () => {
     );
     expect(issues).toHaveLength(1);
     expect(issues[0]).toMatch(/declares no nativeSubscriptions capability block/);
+  });
+
+  it("flags a missing webhookSignatureScope instead of silently dropping the assertion it gates", () => {
+    const issues = validateAdapterCapabilities(
+      makeAdapter({
+        webhookSignatureScope: undefined as unknown as AdapterCapabilities["webhookSignatureScope"],
+      }),
+    );
+    expect(issues).toHaveLength(1);
+    expect(issues[0]).toMatch(/declares no webhookSignatureScope/);
   });
 
   it("accepts per-operation native-subscription surfaces (uneven provider support)", () => {

@@ -25,9 +25,9 @@
     "@payfanout/react": "workspace:*",
     "@payfanout/server": "workspace:*",
     "express": "^5.2.1",
-    "express-rate-limit": "^8.5.2",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "express-rate-limit": "^8.6.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",

@@ -13,6 +13,16 @@ Two packages: [`@payfanout/adapter-adyen-server`](/guide/server) (holds your API
 **edge-runtime compatible**, WebCrypto only, runs on Cloudflare Workers / Next.js edge) and
 [`@payfanout/adapter-adyen`](/guide/react) (browser-safe, holds only the public client key).
 
+::: warning Validate against your own test account before going live
+Every provider-dependent fact in this adapter is verified against Adyen's current
+documentation, and the webhook signature is checked against Adyen's own published test
+vector — but the adapter has not yet been exercised against a live Adyen test account.
+Run one payment, one capture, one refund and one webhook delivery through **your** account
+before taking it to production, and check the results against §9. Account-specific
+behaviour — enabled payment methods, whether multiple partial capture is switched on, the
+exact `additionalData` your account returns — is only observable there.
+:::
+
 ::: warning Adyen API details evolve
 Endpoint hosts, Customer Area menu names, webhook event lists, and test values change over
 time and vary per account. The **field names and behavior below are exact** (read from the

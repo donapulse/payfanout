@@ -17,6 +17,8 @@
     "packages/adapter-payzen/src/index.ts",
     "packages/adapter-worldline-server/src/index.ts",
     "packages/adapter-worldline/src/index.ts",
+    "packages/adapter-adyen-server/src/index.ts",
+    "packages/adapter-adyen/src/index.ts",
     "packages/conformance/src/index.ts"
   ],
   "tsconfig": "tsconfig.json",

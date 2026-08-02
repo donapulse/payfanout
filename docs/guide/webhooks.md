@@ -44,12 +44,12 @@ export async function POST(req: Request) {
 ::: warning The conformance suite enforces this
 There is a test that **fails any adapter which re-serializes a parsed body before
 verifying** (same JSON value, different bytes ⇒ must reject). It applies to every adapter
-declaring `webhookSignatureScope: "raw-bytes"`, which is all of them today. A provider
+declaring `webhookSignatureScope: "raw-bytes"`, the default and the common case. A provider
 that signs values *extracted* from the payload rather than its bytes declares
-`"field-values"` instead: a re-encoded body still verifies there, so the adapter
-authenticates the delivery channel by other means, and fields outside the signed set are
-never trusted. Pass the raw bytes either way, they cost nothing and every shipped adapter
-needs them.
+`"field-values"` instead, and its set-up guide says so: a re-encoded body still verifies
+there, so the adapter authenticates the delivery channel by other means, and fields outside
+the signed set are never trusted. Pass the raw bytes either way, they cost nothing and the
+handlers take them regardless of scope.
 :::
 
 ## Ack fast, process async
@@ -75,8 +75,10 @@ until it sees success.
 
 **Secret rotation without cutover:** the adapters accept an *array* of signing
 secrets/HMAC keys (Worldline's as `{ keyId, secretKey }` pairs matched by the webhook's
-key id; PayPal verifies by postback, so there is nothing to rotate locally), register the
-new one, keep the old until the PSP switches, then drop it.
+key id; Adyen's as hex HMAC keys *plus* an array of `{ username, password }` endpoint
+credentials, since its signature covers extracted values and the basic-auth pair is what
+authenticates the caller; PayPal verifies by postback, so there is nothing to rotate
+locally), register the new one, keep the old until the PSP switches, then drop it.
 
 **Missed-webhook recovery:** `payments.fetchEvents("stripe", { since, cursor })` replays
 recent events as the same normalized `UnifiedWebhookEvent`s (same ids, your dedupe makes

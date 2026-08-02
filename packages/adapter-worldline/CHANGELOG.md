@@ -1,5 +1,13 @@
 # @payfanout/adapter-worldline
 
+## 0.1.2
+
+### Patch Changes
+
+- Updated dependencies [d500d7d]
+- Updated dependencies [8933b9f]
+  - @payfanout/core@4.0.0
+
 ## 0.1.1
 
 ### Patch Changes

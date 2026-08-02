@@ -1103,7 +1103,10 @@ of pretending it away.
 Tokenize-first pair (`adapter-adyen` / `adapter-adyen-server`, Checkout API v72 + Adyen Web
 v6) and the first **push-only** provider PayFanout ships. New adapter packages only — no
 core/server/react/conformance changes. Platform facts and the choices they forced (all
-doc-verified against docs.adyen.com unless noted):
+doc-verified against docs.adyen.com unless noted). **No sandbox pass yet** — there is no
+Adyen test account on this project, so every fact below rests on the documentation and on
+Adyen's published HMAC vector, not on observed traffic. The authoring checklist calls for a
+sandbox round-trip before production use, and the setup guide carries that warning:
 
 - **Push-only is the whole shape.** The Checkout API exposes no read for a payment and none
   for a refund, and `/captures`, `/cancels`, `/refunds`, `/reversals`, `/amountUpdates` all

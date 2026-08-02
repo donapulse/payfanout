@@ -1,5 +1,11 @@
 # @payfanout/react
 
+## 0.3.3
+
+### Patch Changes
+
+- 824f508: Point the package READMEs at the full list of shipped adapters instead of naming two of them, so the install instructions stay accurate as further providers ship.
+
 ## 0.3.2
 
 ### Patch Changes

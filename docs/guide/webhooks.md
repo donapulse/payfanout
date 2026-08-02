@@ -2,7 +2,8 @@
 
 This page is the **code** side of webhooks, verifying, parsing, and handling events.
 **Registering** the endpoint URL and obtaining its signing secret happens in each PSP's
-dashboard, see [Set up Stripe](/guide/stripe) and [Set up Paysafe](/guide/paysafe).
+dashboard — that step lives in the PSP's own set-up guide, indexed from
+[Payment providers](/guide/providers).
 
 Both ingress patterns are supported, the output is always one normalized
 `UnifiedWebhookEvent`, whichever PSP sent it.

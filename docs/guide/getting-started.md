@@ -39,11 +39,14 @@ app is expected to keep.
 | `@payfanout/core` | anywhere | Unified domain model, adapter contracts, currency + error + refund-state helpers. Zero dependencies, zero PSP code. |
 | `@payfanout/server` | server | `PaymentService` over an adapter registry + framework-agnostic webhook handlers. |
 | `@payfanout/react` | client | `<PayFanoutProvider>`, `usePayFanout`, `<PaymentFields>`, `<PayButton>`. |
-| `@payfanout/adapter-stripe-server` | server | Stripe Node SDK: PaymentIntents, refunds, webhook verification. **Pins an explicit `apiVersion`.** |
-| `@payfanout/adapter-stripe` | client | Stripe.js + Payment Element. |
-| `@payfanout/adapter-paysafe-server` | server | Paysafe Payments REST API. **Edge-runtime compatible** (WebCrypto, no Node builtins). |
-| `@payfanout/adapter-paysafe` | client | Paysafe.js hosted iframe fields (tokenize-first). |
+| `@payfanout/adapter-<psp>-server` | server | Holds the secret credentials and talks to the PSP's API: sessions, captures, refunds, webhook verification. |
+| `@payfanout/adapter-<psp>` | client | Holds only a browser-safe key and mounts the PSP's hosted surface. |
 | `@payfanout/conformance` | tests | The contract suite every adapter, present or future, must pass. |
+
+Adapters ship as a client/server pair per PSP, and they are the only place provider
+knowledge lives. **[Payment providers](/guide/providers) is the list**: every shipped
+adapter with its package names, completion shape, and set-up guide. Need one we don't ship?
+[Writing an adapter](/adapter-authoring) — a new PSP is a new package, nothing else changes.
 
 Client packages have **zero** dependency on anything holding secrets; this is enforced
 mechanically by `scripts/check-boundaries.mjs` (part of `pnpm run check`), not by
@@ -54,7 +57,8 @@ never inferred from key prefixes.
 
 1. **Server** creates a payment session through `PaymentService`, naming the PSP per call.
    Amounts are **always integer minor units** at this boundary.
-2. The session's `clientSecret` (Stripe) or signed context (Paysafe) goes to the browser.
+2. The session's `clientSecret` — a PSP-native secret or a signed context, depending on the
+   adapter — goes to the browser.
 3. **React** mounts `<PaymentFields>` + `<PayButton>`, the customer pays without your code
    ever touching card data.
 4. **Webhooks** arrive as one normalized `UnifiedWebhookEvent`, whichever PSP sent them.
@@ -62,6 +66,7 @@ never inferred from key prefixes.
 ## Next steps
 
 - [Installation](/guide/installation), prerequisites, which packages to add, env vars.
+- [Payment providers](/guide/providers), every shipped adapter and its set-up guide.
 - [Server usage](/guide/server), sessions, routing/failover, retries, observability.
 - [React usage](/guide/react), provider, fields, buttons, design-system customization.
 - [Webhooks](/guide/webhooks), raw-body verification, dedupe, recovery.

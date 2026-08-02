@@ -36,14 +36,16 @@ const adapters = [
 PSPs come with inverted flows, and the abstraction models both as first-class,
 **the UI code is identical either way**:
 
-- **Confirm-on-client (Stripe, PayZen):** server creates the payment session → client
-  mounts with `clientSecret` → `confirm()` finalizes (incl. inline 3DS). The server never
-  touches confirmation, and `completePayment` is rejected for such PSPs.
-- **Tokenize-first (Paysafe, PayPal, Worldline):** the client tokenizes first (`confirm()`
-  resolves `requires_confirmation` + `clientToken`), then the **server** finalizes via
+- **Confirm-on-client:** server creates the payment session → client mounts with
+  `clientSecret` → `confirm()` finalizes (incl. inline 3DS). The server never touches
+  confirmation, and `completePayment` is rejected for such PSPs.
+- **Tokenize-first:** the client tokenizes first (`confirm()` resolves
+  `requires_confirmation` + `clientToken`), then the **server** finalizes via
   `completePayment`. `<PayButton>` branches automatically.
 
-Every tokenize-first PSP reuses the same path (`requiresServerCompletion: true`).
+Which shape each adapter uses is the `requiresServerCompletion` capability flag, listed per
+PSP in [Payment providers](/guide/providers). Every tokenize-first PSP reuses the same path,
+so a PSP added later needs no change to your components.
 
 ### Built-in completion transport
 

@@ -2,10 +2,11 @@
 
 Adding a PSP means shipping one or two new packages, **no changes to
 `@payfanout/core`, `@payfanout/server`, `@payfanout/react`, or any consuming app**. You are
-done when your adapter passes `@payfanout/conformance`, the same suite the Stripe,
-Paysafe, GoCardless, PayPal, and PayZen adapters pass. This guide assumes you have never
-seen the core internals; the contracts in `@payfanout/core` plus this document are the
-whole interface.
+done when your adapter passes `@payfanout/conformance`, the same suite every shipped
+adapter passes (they are listed in
+[Payment providers](https://donapulse.github.io/payfanout/guide/providers)). This guide
+assumes you have never seen the core internals; the contracts in `@payfanout/core` plus this
+document are the whole interface.
 
 ## 0. Decide your PSP's completion shape first
 

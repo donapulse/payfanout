@@ -118,6 +118,15 @@ export function validateAdapterCapabilities(adapter: ServerPaymentAdapter): stri
       }
     }
   }
+  // Presence rule, like nativeSubscriptions above: the scope GATES conformance
+  // assertions instead of only describing the provider, so an absent one is an
+  // opt-out nobody declared rather than a shape to fail downstream.
+  if (caps.webhookSignatureScope !== "raw-bytes" && caps.webhookSignatureScope !== "field-values") {
+    issues.push(
+      `Adapter "${adapter.pspName}" declares no webhookSignatureScope — the flag gates the ` +
+        "conformance re-serialization assertion, so an absent scope would switch it off silently",
+    );
+  }
   // The saved-payment-methods flag demands the full method surface. Cards
   // still live at the PSP only — the coherence rule is about implemented
   // methods, not about storing card data (never).

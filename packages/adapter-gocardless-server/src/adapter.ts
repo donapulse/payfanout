@@ -309,6 +309,9 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       // creates each payment against the mandate on its own schedule. All four
       // operations exist server-side, so all four are declared.
       nativeSubscriptions: { list: true, retrieve: true, create: true, cancel: true },
+      // Webhook-Signature = hex HMAC-SHA256 of the whole raw delivery, batch
+      // and all — verified once over the bytes, then fanned out per event.
+      webhookSignatureScope: "raw-bytes",
       requiresServerCompletion: false, // the hosted flow fulfils the billing request itself
       paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };

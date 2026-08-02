@@ -52,6 +52,7 @@ class PushOnlyAdapter implements ServerPaymentAdapter {
       supportsEventPolling: false,
       supportsListing: false,
       nativeSubscriptions: { list: false, retrieve: false, create: false, cancel: false },
+      webhookSignatureScope: "raw-bytes", // HMAC over the delivered body
       requiresServerCompletion: false,
       paymentMethods: [{ type: "card", flow: "embedded", supported: true }],
     };

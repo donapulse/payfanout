@@ -154,6 +154,8 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       // Stripe Billing subscriptions: the PSP schedules and collects each
       // installment itself, against a vaulted PaymentMethod.
       nativeSubscriptions: { list: true, retrieve: true, create: true, cancel: true },
+      // Stripe-Signature v1 = HMAC-SHA256 over `${timestamp}.${rawBody}`.
+      webhookSignatureScope: "raw-bytes",
       requiresServerCompletion: false, // Stripe confirms on the client (§4a)
       paymentMethods: this.config.paymentMethods ?? DEFAULT_METHODS,
     };

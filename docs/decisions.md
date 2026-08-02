@@ -1001,3 +1001,79 @@ contract now carries them.
   dispatch-gated integration suites (Stripe and GoCardless full round-trips, Paysafe
   defensive round-trip, PayPal list-only); PayZen has no repo sandbox credentials, so
   its derivations are doc-derived pending a future sandbox pass.
+
+## Adyen — evaluated, adapter not built (2026-08-02)
+
+Adyen was evaluated for an adapter pair and deliberately not implemented. It is a
+**push-only** platform, and the `ServerPaymentAdapter` contract assumes a pull-capable
+one. All facts below were verified against docs.adyen.com on 2026-08-02.
+
+- **No payment read exists, in any Adyen API.** Checkout v72 has exactly three GET
+  endpoints — `/paymentLinks/{linkId}`, `/sessions/{sessionId}`, `/storedPaymentMethods`.
+  The `{paymentPspReference}` path segment appears only on POST modification endpoints
+  (`amountUpdates`, `cancels`, `captures`, `refunds`, `reversals`); v71 is identical. The
+  classic Payment API v68 is POST-only across all 13 endpoints. Management API is account
+  configuration, Transfers reads balance-platform transaction ids rather than a
+  `pspReference`, the Data protection API only erases, Disputes keys on the dispute
+  reference. `pspReference` is accepted solely as the target of a write. The required
+  `retrievePayment(pspPaymentId)` therefore has no faithful implementation.
+- **`GET /sessions/{sessionId}` is not a substitute.** It is keyed by session id rather
+  than `pspReference`, requires the client-produced `sessionResult` query parameter that a
+  server-side retrieve would not hold, and is documented as non-updating: "The status
+  included in the response doesn't get updated. Don't make the request again to check for
+  payment status updates."
+- **Every modification is an asynchronous acknowledgement.** Capture, cancel, refund and
+  reversal all answer `status: "received"`, with the outcome delivered only by webhook
+  (`CAPTURE`/`CAPTURE_FAILED`, `CANCELLATION`, `REFUND`/`REFUND_FAILED`/
+  `REFUNDED_REVERSED`). There is no refund read and no modification-list endpoint, so an
+  asynchronous result cannot be polled to a terminal state.
+- **Consequence.** `@payfanout/conformance` requires `cancelPayment` to report `"canceled"`
+  and a `"pending"` refund to be pollable via `retrieveRefund`. Satisfying those against
+  Adyen would mean reporting a terminal state the provider has not confirmed — announcing
+  money movement on the strength of an acknowledgement, which is precisely what the
+  money-path cases exist to prevent. Synthesizing a read from remembered webhook outcomes
+  is not available either: PayFanout persists nothing and holds no cross-request cache of
+  payment state. The adapter was not written rather than written dishonestly. This outcome
+  was taken autonomously from the evidence below and awaits sign-off
+  **(default, unconfirmed)**.
+
+Facts that do map cleanly, recorded so the evaluation is not repeated: Checkout API is
+`v72`, test base `https://checkout-test.adyen.com/v72`, live
+`https://{prefix}-checkout-live.adyenpayments.com/checkout/v72`; auth is the `X-API-Key`
+header; idempotency rides an `idempotency-key` header (max 64 characters, POST only,
+retained at least 7 days, in-flight replay answering error `704`); amounts are integer
+minor units as `amount: { currency, value }`. Adyen's exponent table agrees with ISO 4217
+on JPY (0) and BHD/KWD (3) but DEVIATES on CLP (2), CVE (0), IDR (0) and ISK (2), and
+documents its own table as leading — an adapter-local constraint to declare rather than
+leak, exactly as the PayZen CNY/KHR entry does, since core's `getCurrencyExponent` follows
+ISO 4217. `POST /payments` is the only call that hands the server a `pspReference`
+synchronously; the sessions flow learns it from the AUTHORISATION webhook or from a
+`sessionResult`-bearing session read, so the advanced flow is the only shape where capture
+and refund do not depend on the push channel. A single partial capture auto-cancels the
+unclaimed remainder while multiple partial capture does not, and multiple partial capture
+is disabled until Adyen enables it per account.
+
+The push side, by contrast, is fully specified and would map cleanly. Webhooks are
+HMAC-SHA256: the signature sits in `additionalData.hmacSignature`, the signed payload is
+`pspReference:originalReference:merchantAccountCode:merchantReference:value:currency:eventCode:success`
+colon-joined with empty strings for absent fields, the Customer Area key is hex-decoded to
+binary, and the digest is base64. The verification page publishes a key/payload/signature
+triple usable directly as a fixture. No escaping rule is documented for values that
+themselves contain a colon — a future implementation should reject such values rather than
+invent one. A JSON delivery carries exactly one `NotificationRequestItem` (only the legacy
+SOAP transport batched), duplicates repeat the pair `(eventCode, pspReference)` — which is
+therefore the stable event id, since `pspReference` alone is not unique across event types
+— and `success` and `live` are the strings `"true"`/`"false"`, never booleans. Acknowledgement
+is any 2xx within 10 seconds; the `[accepted]` body survives only on classic platforms.
+Card capture is SAQ A eligible: Adyen Web v6 renders the fields in Adyen-hosted iframes and
+the merchant holds no decryption key. Sandbox refusals are triggered by `holderName` or
+`additionalData.RequestedTestAcquirerResponseCode`, never by card number, and server-side
+tests can exercise the API without a browser using the documented `test_` prefix on
+encrypted card credentials (`"encryptedCardNumber": "test_5555555555554444"`) — distinct
+from the `test_`/`live_` prefix that marks a browser client key.
+
+**Unblock:** a contract revision that models push-only providers — payment retrieval
+behind a capability flag, plus an asynchronous-modification mode the conformance suite
+recognizes — applied across `core`, `conformance` and every shipped adapter in one major
+change. That is its own decision with its own sign-off, not a side effect of adding a
+provider.

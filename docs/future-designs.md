@@ -123,6 +123,16 @@ the expected seam).
   surface to keep the abstraction honest.
 - **Dispute/chargeback management:** today the library surfaces `payment.chargeback` webhooks;
   evidence submission stays in PSP dashboards. Unblock: real merchant demand.
+- **Push-only providers (Adyen):** every shipped adapter reads state back from its PSP —
+  `retrievePayment` is a required contract method, `cancelPayment` must report a confirmed
+  `"canceled"`, and an asynchronous refund must be pollable through `retrieveRefund`. Adyen
+  exposes no read for a payment, a refund, or a modification list in any of its APIs; the
+  outcome of a capture, cancel or refund arrives only by webhook. An adapter built on
+  today's contract would have to report terminal states the provider has not confirmed.
+  Unblock: model push-only providers in the contract — retrieval behind a capability flag
+  and an asynchronous-modification mode the conformance suite recognizes — as one major
+  change across core, conformance and every adapter. The provider evaluation, with the
+  endpoint inventory that establishes the constraint, is in decisions.md (2026-08-02).
 - **Niche until demanded** (unchanged): Level 2/3 card data, DCC, surcharging,
   per-adapter health checks, incremental authorization (Stripe supports it only on
   select processors; Paysafe reauth semantics unverified).

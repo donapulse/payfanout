@@ -1,6 +1,6 @@
 {
   "name": "@payfanout/adapter-adyen-server",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "license": "MIT",
   "description": "Server-side Adyen adapter for PayFanout (Checkout API v72: payments, captures, cancels, refunds, standard webhooks). Push-only: outcomes arrive by webhook. Holds secrets — never bundle client-side.",
   "type": "module",

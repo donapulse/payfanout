@@ -286,10 +286,16 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       // One-off billing request payments are GBP/EUR only (other GoCardless
       // currencies need a mandate first) — declared so the router pre-screens.
       supportedCurrencies: [...SUPPORTED_ONE_OFF_CURRENCIES],
+      supportsPaymentRetrieval: true, // GET /payments/:id
       supportsRefunds: true,
       supportsPartialRefunds: true,
+      supportsRefundRetrieval: true, // GET /refunds/:id
       supportsManualCapture: false, // bank debits/credits have no authorize-then-capture split
       supportsMultiCapture: false,
+      // The MONEY moves on debit-scheme timing (days), but the modification
+      // calls themselves are not push-only: cancel and refund answer with the
+      // resulting resource and its real status, not a bare acknowledgement.
+      modificationOutcome: "synchronous",
       supportsPaymentMethodVerification: false, // no zero-amount verification without creating a mandate
       // GoCardless mandates ARE reusable charging handles, but bank debits
       // confirm asynchronously (days) — the vault contract's instantly

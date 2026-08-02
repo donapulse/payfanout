@@ -235,9 +235,13 @@ export class PaymentService {
     return this.run(pspName, "completePayment", () => adapter.completePayment!(input));
   }
 
+  /** Push-only PSPs expose no payment read — their hosts follow webhooks instead. */
   async retrievePayment(pspName: string, pspPaymentId: string): Promise<PaymentInfo> {
     const adapter = this.adapterFor(pspName);
-    return this.run(pspName, "retrievePayment", () => adapter.retrievePayment(pspPaymentId));
+    if (!adapter.getCapabilities().supportsPaymentRetrieval || !adapter.retrievePayment) {
+      throw guardError(pspName, `"${pspName}" does not support payment retrieval`);
+    }
+    return this.run(pspName, "retrievePayment", () => adapter.retrievePayment!(pspPaymentId));
   }
 
   /** Capture is a charge — the idempotency key is required, per-capture under multi-capture. */
@@ -283,10 +287,14 @@ export class PaymentService {
     return this.run(pspName, "refundPayment", () => adapter.refundPayment(req));
   }
 
-  /** Polls a refund to a terminal state (refundPayment can return "pending"). */
+  /**
+   * Polls a refund to a terminal state (refundPayment can return "pending").
+   * Gated on the refund READ, not on refund support: a PSP can move money out
+   * and expose no way to read the refund back.
+   */
   async retrieveRefund(pspName: string, refundId: string): Promise<RefundInfo> {
     const adapter = this.adapterFor(pspName);
-    if (!adapter.getCapabilities().supportsRefunds || !adapter.retrieveRefund) {
+    if (!adapter.getCapabilities().supportsRefundRetrieval || !adapter.retrieveRefund) {
       throw guardError(pspName, `"${pspName}" does not support refund retrieval`);
     }
     return this.run(pspName, "retrieveRefund", () => adapter.retrieveRefund!(refundId));

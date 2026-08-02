@@ -60,6 +60,11 @@ PSP-native subscription passthroughs `listNativeSubscriptions`,
 each gated on its own `nativeSubscriptions` capability flag, since provider support is
 per operation.
 
+The two reads are capability-gated as well (`supportsPaymentRetrieval` /
+`supportsRefundRetrieval`): against a **push-only** provider — one that takes its payment
+reference as a write target only — `retrievePayment` and `retrieveRefund` reject with
+`unsupported_operation`, and the host follows payment state through webhooks instead.
+
 ## What's inside
 
 - **`PaymentService`**, the unified API over an adapter registry, with an optional

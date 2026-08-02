@@ -258,7 +258,7 @@ runServerAdapterConformanceTests(
         name: "PayPal 5xx outage",
         invoke: (a) => {
           lastFake.failNextWith(500, { name: "INTERNAL_SERVICE_ERROR", message: "down" }, 3);
-          return a.retrievePayment("5O190127TN000001");
+          return a.retrievePayment!("5O190127TN000001");
         },
         expectedCode: "psp_unavailable",
       },
@@ -266,7 +266,7 @@ runServerAdapterConformanceTests(
         name: "PayPal rate limiting (429)",
         invoke: (a) => {
           lastFake.failNextWith(429, { name: "RATE_LIMIT_REACHED", message: "slow down" }, 3);
-          return a.retrievePayment("5O190127TN000001");
+          return a.retrievePayment!("5O190127TN000001");
         },
         expectedCode: "rate_limited",
       },

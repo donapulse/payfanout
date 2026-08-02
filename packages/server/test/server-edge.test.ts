@@ -31,7 +31,7 @@ describe("PaymentService registration coherence", () => {
 
   it("rejects partial-refund support without refund support", () => {
     const incoherent = new FakeAdapter({
-      capabilities: { supportsRefunds: false, supportsPartialRefunds: true },
+      capabilities: { supportsRefunds: false, supportsPartialRefunds: true, supportsRefundRetrieval: false },
     });
     expect(() => new PaymentService({ adapters: [incoherent] })).toThrowError(
       /partial refunds without refund support/,

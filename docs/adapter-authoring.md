@@ -105,8 +105,26 @@ and `PaymentService` will hold you to:
   refund state via `getRefundState` — never invent a "refunded" status), and populate
   `amountCaptured`/`amountCapturable` wherever your PSP reports settlement state —
   partial and multi-capture flows are invisible without them. If you declare
-  `supportsRefunds`, you MUST implement `retrieveRefund(refundId)`; async refunds
+  `supportsRefundRetrieval`, you MUST implement `retrieveRefund(refundId)`; async refunds
   return `"pending"` and hosts poll them to a terminal state.
+- **Readback and modification shape — declare what your PSP actually gives you.**
+  `supportsPaymentRetrieval` ↔ `retrievePayment`, `supportsRefundRetrieval` ↔
+  `retrieveRefund` (which also requires `supportsRefunds`), and `modificationOutcome`
+  says whether capture/cancel/refund answer with the real result (`"synchronous"`) or
+  only acknowledge the request (`"asynchronous"`). A **push-only** provider — one that
+  accepts its payment reference as a write target, exposes no read for a payment or a
+  refund, and reports every outcome by webhook — declares both retrieval flags `false`
+  and `modificationOutcome: "asynchronous"`; its `cancelPayment` and `capturePayment`
+  resolve `"processing"`, never a terminal state the PSP has not confirmed. The
+  conformance suite gates its readback assertions on these flags, so declaring them
+  honestly is what makes the suite provable rather than aspirational — the shipped
+  adapters all read their PSP back and are `"synchronous"`. An `"asynchronous"` adapter is
+  excused from rejecting an over-refund locally (with no read it cannot know the remaining
+  balance), but it MUST still surface the provider's own rejection as a `PayFanoutError`
+  when one arrives — never fold it into a `"pending"` acknowledgement. Declaring
+  `supportsRefundRetrieval: false` while returning `"pending"` refunds leaves the refund
+  lifecycle with nothing the suite can settle, so take that combination deliberately: it
+  says the refund outcome reaches the host over webhooks and nowhere else.
 - **Receipt-grade facts:** populate `PaymentInfo.paymentMethodDetails`
   (`{ brand, last4, wallet?, expMonth?, expYear? }`, lowercase brand) once your PSP
   reports the instrument, and `mandateReference` for debit rails (SEPA/ACH/BACS), hosts
@@ -116,12 +134,18 @@ and `PaymentService` will hold you to:
   and *withhold* fields your PSP's endpoint rejects rather than failing the payment.
 - **Optional surfaces, gated by capability flags** (declare `true` only if implemented,
   `PaymentService` enforces coherence at registration via core's
-  `validateAdapterCapabilities`): `updatePaymentSession` ↔ `supportsSessionUpdate`
-  (in-place amend or re-issued signed token, callers always continue with the returned
-  session), `fetchEvents` ↔ `supportsEventPolling` (missed-webhook recovery),
-  `listPayments`/`listRefunds` ↔ `supportsListing`, and `supportsMultiCapture`
-  (requires `supportsManualCapture`; every partial capture is its own charge with its
-  own idempotency key).
+  `validateAdapterCapabilities`): `retrievePayment` ↔ `supportsPaymentRetrieval`,
+  `retrieveRefund` ↔ `supportsRefundRetrieval` (which also requires `supportsRefunds`),
+  `updatePaymentSession` ↔ `supportsSessionUpdate` (in-place amend or re-issued signed
+  token, callers always continue with the returned session), `fetchEvents` ↔
+  `supportsEventPolling` (missed-webhook recovery), `listPayments`/`listRefunds` ↔
+  `supportsListing`, and `supportsMultiCapture` (requires `supportsManualCapture`; every
+  partial capture is its own charge with its own idempotency key). The two retrieval
+  pairs are enforced in BOTH directions — implementing a read while declaring its flag
+  `false` is a violation too, because that flag switches off conformance assertions
+  rather than merely describing the provider. If a modification needs to re-read the
+  payment internally, keep that helper private: the flag is checked against the contract
+  METHOD name, not against your ability to fetch.
 - **PSP-native subscriptions — the `nativeSubscriptions` block is REQUIRED** and
   per-operation: `{ list, retrieve, create, cancel }`, each flag pairing with its
   method (`listNativeSubscriptions` ↔ `list`, `retrieveNativeSubscription` ↔
@@ -289,7 +313,7 @@ runServerAdapterConformanceTests("acme", () => { /* fresh adapter + fake */ }, {
   money: {
     completedPayment: async (adapter, { amount, id, metadata }) => { /* drive the fake to a completed payment, return pspPaymentId */ },
     authorizedPayment: async (adapter, { amount }) => { /* manual-capture PSPs: authorized, uncaptured */ },
-    cancelablePayment: async (adapter) => { /* a pre-completion payment; cancel must yield "canceled" */ },
+    cancelablePayment: async (adapter) => { /* a pre-completion payment; cancel yields "canceled", or "processing" when modificationOutcome is "asynchronous" */ },
     // Declare documented PSP limitations honestly (defaults are true):
     // expectations: { idRoundTrip: false, metadataEcho: false },
   },

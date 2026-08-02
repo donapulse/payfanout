@@ -116,7 +116,7 @@ runServerAdapterConformanceTests(
     failingCalls: [
       {
         name: "retrievePayment on a missing id",
-        invoke: (a) => a.retrievePayment("PM_missing"),
+        invoke: (a) => a.retrievePayment!("PM_missing"),
         expectedCode: "invalid_request",
       },
       {
@@ -164,7 +164,7 @@ runServerAdapterConformanceTests(
             { error: { message: "Internal server error", type: "gocardless", code: 500 } },
             Number.POSITIVE_INFINITY,
           );
-          return a.retrievePayment("PM1");
+          return a.retrievePayment!("PM1");
         },
         expectedCode: "psp_unavailable",
       },
@@ -183,7 +183,7 @@ runServerAdapterConformanceTests(
             },
             Number.POSITIVE_INFINITY,
           );
-          return a.retrievePayment("PM1");
+          return a.retrievePayment!("PM1");
         },
         expectedCode: "rate_limited",
       },

@@ -57,6 +57,17 @@ mutating call — under multi-capture, each partial capture is its own charge wi
 key. `PaymentInfo` reports `amountCaptured`/`amountCapturable` and echoes your `metadata`
 where the PSP supports it.
 
+`retrievePayment` and `retrieveRefund` are capability-gated too
+(`supportsPaymentRetrieval` / `supportsRefundRetrieval`): a **push-only** provider takes
+its payment reference as a write target only, so both reject with
+`unsupported_operation` and the host follows payment state through webhooks instead.
+Such a provider also reports `modificationOutcome: "asynchronous"` — its capture and
+cancel resolve `"processing"`, because the terminal state arrives with the webhook and
+an adapter never claims one it has not confirmed. The `PaymentInfo` such a provider does
+return carries `amountRefunded: 0` as a structural placeholder rather than a balance, so
+`getRefundState()` is not meaningful there — track refunds from the refund webhooks.
+Every provider shipped today supports both reads and answers modifications synchronously.
+
 `PaymentInfo` carries receipt-grade facts once the PSP reports them:
 `paymentMethodDetails` (`{ brand: "visa", last4: "4242", wallet? }`) and `mandateReference`
 (SEPA/ACH/BACS mandate id, quote it to the customer).

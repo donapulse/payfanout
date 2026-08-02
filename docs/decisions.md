@@ -1001,3 +1001,51 @@ contract now carries them.
   dispatch-gated integration suites (Stripe and GoCardless full round-trips, Paysafe
   defensive round-trip, PayPal list-only); PayZen has no repo sandbox credentials, so
   its derivations are doc-derived pending a future sandbox pass.
+
+## Push-only providers in the adapter contract (2026-08-02)
+
+Every shipped adapter can read its PSP back, and the contract quietly assumed it:
+`retrievePayment` was required, `cancelPayment` had to answer a confirmed `"canceled"`,
+and a `"pending"` refund had to be pollable. A provider that accepts its payment
+reference only as the target of a write — no read for a payment, none for a refund,
+every modification acknowledged with the real outcome arriving by webhook — could not be
+modelled without lying somewhere. The gates are now capability-driven so it can be
+modelled honestly.
+
+- **Contract**: `AdapterCapabilities` gains three REQUIRED fields —
+  `supportsPaymentRetrieval`, `supportsRefundRetrieval`, and
+  `modificationOutcome: "synchronous" | "asynchronous"`. Required, not optional with a
+  defaulted value: a silent default is exactly the dishonest declaration the flags exist
+  to prevent, and it would let a push-only adapter inherit a claim it cannot back.
+  `ServerPaymentAdapter.retrievePayment` becomes optional, gated by
+  `supportsPaymentRetrieval`. Both retrieval flags are checked in BOTH directions: they
+  gate conformance assertions, so an implemented read declared `false` would buy silence
+  rather than describe the provider, and is rejected as incoherent.
+- **`PaymentInfo.amountRefunded` stays required**, so a push-only acknowledgement states
+  `0` — a structural placeholder, NOT a refund balance. It stays `0` even after a refund
+  has been requested and acknowledged, because the adapter has no read to learn otherwise,
+  so core's `getRefundState()` is not meaningful on a push-only provider: refund state
+  reaches the host through the refund webhooks alone.
+- **Refund retrieval is its own flag**, no longer implied by `supportsRefunds`: a PSP can
+  move money out and still expose no refund read. `supportsRefundRetrieval` without
+  `supportsRefunds` is incoherent and rejected; the flag→method rule moves onto it.
+- **No unconfirmed terminal states.** Under `modificationOutcome: "asynchronous"`,
+  `cancelPayment` and `capturePayment` resolve `"processing"`; the conformance suite
+  asserts exactly one of `"canceled"`/`"processing"` per adapter, never "either is fine",
+  so an adapter cannot drift into claiming a state the PSP has not confirmed.
+- **Over-refund rejection is gated on `modificationOutcome`, not on the payment read.** A
+  provider with no GET but synchronous POST answers still knows its own remaining
+  refundable balance and must reject the excess. Only an asynchronous provider is excused:
+  it merely acknowledges the request and rejects out-of-band, so demanding a local
+  rejection would force adapters to invent bookkeeping PayFanout must not hold
+  (statelessness).
+- **`PaymentService.retrievePayment` and `retrieveRefund`** now guard on their own
+  retrieval capability like every other optional surface and reject with
+  `unsupported_operation`. `retrieveRefund` on `supportsRefunds` was the wrong gate:
+  refunding and reading a refund back are separate provider capabilities.
+- **Proof**: `packages/conformance/test/push-only-adapter.test.ts` runs the suite against
+  an in-memory push-only provider, so the shape is executable rather than theoretical
+  until an adapter for such a PSP exists. All shipped adapters declare
+  `supportsPaymentRetrieval: true`, `supportsRefundRetrieval: true` and
+  `modificationOutcome: "synchronous"` — verified against their implemented endpoints and
+  unchanged in behavior.

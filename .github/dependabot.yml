@@ -19,24 +19,15 @@ updates:
       # crashes the lint gate.
       - dependency-name: typescript
         update-types: ["version-update:semver-major"]
-      # The next two holds exist only to keep Node 20 in the test matrix. Both
-      # are scoped to majors, so patch and minor updates — including security
-      # ones — still open PRs as usual; a security fix that exists only in the
-      # held major is suppressed too, and the Dependabot alert is the signal
+      # Changesets CLI 3 declares engines.node "^22.11 || ^24 || >=26", which the
+      # test matrix now satisfies, but it is driven only by changesets/action v2
+      # — and moving to v2 means rewriting release.yml in the same change
+      # (renamed inputs, and npm auth moving off NPM_TOKEN to registry-url plus
+      # NODE_AUTH_TOKEN). Held until that migration lands, then dropped together
+      # with the changesets/action entry below. Scoped to majors, so patch and
+      # minor updates still open PRs as usual; a security fix that exists only in
+      # the held major is suppressed too, and the Dependabot alert is the signal
       # there.
-      #
-      # jsdom 30 declares engines.node "^22.22.2 || ^24.15.0 || >=26.0.0" and
-      # depends on undici 8, whose CacheStorage calls
-      # worker_threads.markAsUncloneable at module scope. Node 20 has no such
-      # helper, so importing jsdom throws and every jsdom-environment suite dies
-      # before it runs on the Node 20 leg. Revisit when the matrix drops Node 20.
-      - dependency-name: jsdom
-        update-types: ["version-update:semver-major"]
-      # Changesets CLI 3 declares engines.node "^22.11 || ^24 || >=26" and is
-      # only driven by changesets/action v2, which renames every workflow input
-      # and no longer handles NPM_TOKEN, so adopting it means migrating
-      # release.yml in the same change. Revisit when the matrix drops Node 20 or
-      # release.yml moves to changesets/action v2.
       - dependency-name: "@changesets/cli"
         update-types: ["version-update:semver-major"]
 

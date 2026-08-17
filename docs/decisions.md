@@ -1250,6 +1250,14 @@ sandbox round-trip before production use, and the setup guide carries that warni
   justified if a dependency's declared range excluded every patched version, as with the
   `vite`/`esbuild` case above.
 
+## Node 20 stays in the test matrix (2026-08-17) — superseded
+
+Reversed the same day by the entry below. It held `jsdom` 30 and Changesets CLI 3 back to keep
+a Node 20 leg alive, on the belief that raising the floor was consumer-visible. It is not: no
+published package declares `engines`. The one fact worth carrying forward is that
+`@changesets/cli` publishes a `maintenance-v2` dist-tag (2.31.1), so the 2.x line is upstream-
+supported rather than merely lagging — which is why its hold survives the reversal.
+
 ## The test matrix moves to Node 22 and 24 (2026-08-17)
 
 - **The matrix was testing a dead version and missing the current one.** Node 20 (Iron) is
@@ -1281,6 +1289,18 @@ sandbox round-trip before production use, and the setup guide carries that warni
   `postcss` all had patched releases inside the ranges their dependents already declared, so a
   lockfile refresh cleared them — the same reasoning as the `ip-address` entry above. This
   change is maintenance hygiene, not a security fix.
+- **What now defends the runtime floor, since the Node 20 leg was the last mechanical check
+  that shipped code stays runnable below Node 22.** `tsconfig.base.json` caps `lib` at
+  `ES2022`, so a newer built-in does not typecheck even though `@types/node` is on 26, and the
+  only Node built-in in any published source is `createHmac` / `timingSafeEqual` in
+  `packages/adapter-stripe-server/src/webhook.ts`. Exposure today is nil; the intended floor
+  for shipped code stays "runs on any maintained Node", and `lib: ES2022` is what holds it.
+- **Revisit trigger, because the previous matrix drifted for want of one.** Node 22 has been
+  *maintenance* LTS since 2025-10-21 and ends 2027-04-30; Node 24 is *active* LTS until
+  2028-04-30; Node 26 becomes LTS on 2026-10-28. Revisit then: the pair should track the two
+  supported LTS lines, which at that point means dropping 22 for 26 or running three legs.
+  Development floor: root `engines.node` is `^22.22.2 || ^24.15.0 || >=26.0.0`, set by the test
+  toolchain (`jsdom` 30), and the root manifest is private so this is not a consumer signal.
 
 ## Release tooling stays on changesets/action v1 (2026-08-17)
 
@@ -1293,11 +1313,12 @@ sandbox round-trip before production use, and the setup guide carries that warni
   check throws next. Both surface through `setFailed`, so a stray bump turns the release step
   red rather than opening a Version Packages PR that publishes nothing. There is no
   silent-mis-publish risk here.
-- **The migration is four coupled changes, which is why it is held**: the input renames — v2
+- **The migration is three coupled changes, which is why it is held**: the input renames — v2
   renames seven of its eleven inputs, `cwd` and `github-token` keeping their names, and
   `release.yml` passes exactly one of the seven, `publish` becoming `publish-script` — npm auth
-  moving off `.npmrc` to `registry-url` plus `NODE_AUTH_TOKEN` or trusted publishing, the
-  `@changesets/cli` 3 major, and the Node engine floor that comes with it. Doing any subset
+  moving off `.npmrc` to `registry-url` plus `NODE_AUTH_TOKEN` or trusted publishing, and the
+  `@changesets/cli` 3 major. The Node engine floor was a fourth until the matrix moved to 22
+  and 24, which retired it. Doing any subset
   leaves the release broken.
 - **What the hold suppresses, precisely.** `release.yml` pins the floating `@v1` ref, so
   dependabot can only ever propose a major for this action — meaning the entry silences the

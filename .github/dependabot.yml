@@ -51,7 +51,8 @@ updates:
       # dependabot can raise for the action, and per GitHub's docs it also
       # suppresses a security PR whose fix needs a major; the Dependabot alert
       # feed still surfaces those, and a v2-only advisory fix would need a manual
-      # bump. Revisit together with the @changesets/cli hold above, on the
-      # Node 20 decision.
+      # bump. The Node floor that used to block this is gone (the matrix now runs
+      # 22 and 24); what remains is the release.yml rewrite, so revisit together
+      # with the @changesets/cli hold above when that migration is done.
       - dependency-name: changesets/action
         update-types: ["version-update:semver-major"]

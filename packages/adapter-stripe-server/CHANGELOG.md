@@ -1,5 +1,11 @@
 # @payfanout/adapter-stripe-server
 
+## 2.0.1
+
+### Patch Changes
+
+- 4e6cf32: Update the Stripe Node SDK to 22.5.0.
+
 ## 2.0.0
 
 ### Major Changes

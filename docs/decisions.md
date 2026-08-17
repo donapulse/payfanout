@@ -1256,7 +1256,8 @@ Reversed the same day by the entry below. It held `jsdom` 30 and Changesets CLI 
 a Node 20 leg alive, on the belief that raising the floor was consumer-visible. It is not: no
 published package declares `engines`. The one fact worth carrying forward is that
 `@changesets/cli` publishes a `maintenance-v2` dist-tag (2.31.1), so the 2.x line is upstream-
-supported rather than merely lagging — which is why its hold survives the reversal.
+supported rather than merely lagging — which is why its hold survived that reversal. Both holds
+were then removed when the release tooling moved to v2; see the last entry in this file.
 
 ## The test matrix moves to Node 22 and 24 (2026-08-17)
 
@@ -1284,7 +1285,8 @@ supported rather than merely lagging — which is why its hold survives the reve
   `engines.node "^22.11 || ^24 || >=26"`, which the new matrix satisfies, but it is driven only
   by `changesets/action` v2, so taking it means rewriting `release.yml` — renamed inputs and npm
   authentication moving off `NPM_TOKEN`. That touches the publish path, so it is its own change
-  rather than a passenger here. Its hold stays in `.github/dependabot.yml` until then.
+  rather than a passenger here. Its hold stayed in `.github/dependabot.yml` until the migration
+  landed later the same day; see the last entry in this file.
 - **No advisory ever required any of these majors.** `js-yaml`, `undici`, `nanoid` and
   `postcss` all had patched releases inside the ranges their dependents already declared, so a
   lockfile refresh cleared them — the same reasoning as the `ip-address` entry above. This
@@ -1302,7 +1304,11 @@ supported rather than merely lagging — which is why its hold survives the reve
   Development floor: root `engines.node` is `^22.22.2 || ^24.15.0 || >=26.0.0`, set by the test
   toolchain (`jsdom` 30), and the root manifest is private so this is not a consumer signal.
 
-## Release tooling stays on changesets/action v1 (2026-08-17)
+## Release tooling stays on changesets/action v1 (2026-08-17) — superseded
+
+Reversed the same day by the entry below, once the matrix move to Node 22 and 24 retired the
+engine floor that was the last coupled blocker. The reasoning below is retained because its
+description of what v2 changes is what the migration then had to implement.
 
 - **v1 is the line built for Changesets CLI 2, which is what this repository declares**, so the
   release path is internally consistent as it stands: `release.yml` passes `publish:` and
@@ -1327,3 +1333,62 @@ supported rather than merely lagging — which is why its hold survives the reve
   job scans Actions for advisories, because `dependency-audit` walks the npm tree through
   `scripts/audit-deps.mjs` and CodeQL is configured for `javascript-typescript` only. A v2-only
   advisory fix would need a manual bump.
+
+## Release tooling moves to changesets/action v2 (2026-08-17)
+
+- **Taken because the matrix move retired the last blocker.** Changesets CLI 3 needs
+  `engines.node "^22.11 || ^24 || >=26"`, which `node: [22, 24]` satisfies, so the migration
+  reduced to the workflow rewrite. All three coupled pieces land together: CLI `^3.0.0`, the
+  `@changesets/config@4.0.0` schema, and `release.yml`. Derived from the `changesets/action`
+  CHANGELOG entries for 2.0.0 (PRs #674, #678, #680, #681, #692, #695) and the major-changes
+  list for `@changesets/cli` 3.0.0.
+- **`publish` became `publish-script`.** v2 throws on the old name rather than ignoring it, so a
+  half-done migration fails the step instead of publishing nothing.
+- **npm authentication moved out of the action.** v2 no longer writes `.npmrc` from
+  `NPM_TOKEN`, so `actions/setup-node` now sets `registry-url` and the publish step passes the
+  same secret as `NODE_AUTH_TOKEN`. Trusted publishing via OIDC is the other supported route and
+  removes the long-lived token entirely, but it needs configuration on the npm side, so it is
+  not part of this change.
+- **`GITHUB_TOKEN` was dropped as an environment variable, but not because it was dangerous.**
+  v2 ignores the variable for configuration — the `github-token` input is what it reads, and it
+  defaults to the workflow token. Its only check compares the two by *value* and fails when they
+  differ, which is aimed at a custom token smuggled in through the environment; the old
+  configuration passed the workflow token to both, so it would have been accepted. Removing it
+  keeps the step honest about where the token comes from rather than averting a failure.
+- **`push-with-git-cli: true` is deliberate.** v1 defaulted to `commitMode: "git-cli"`; v2's
+  equivalent defaults to `false`, which pushes release commits and tags through the GitHub API,
+  re-attributing them to the token owner under GitHub's GPG key and creating *lightweight* tag
+  refs. Existing tags are annotated objects tagged by `github-actions[bot]`, so keeping the Git
+  CLI preserves both attribution and tag shape.
+- **What did not change.** `create-github-releases` still defaults to `true`, so GitHub Releases
+  keep being created. `push-git-tags` is new in v2 and also defaults to `true`, so tag pushing —
+  unconditional in v1, which had no such input — is unchanged. `commit-message` and `pr-title`
+  both default to `Version Packages`, matching v1's output. `setupGitUser` is gone in v2, which
+  handles git identity itself.
+- **Three CLI 3 default changes are inert here, but only for reasons worth writing down.**
+  Private packages are no longer versioned by default — inert because every private workspace is
+  already in `ignore`. The `prettier` config option became `format` — inert because neither is
+  set. Peer-dependency bumps are now `patch` rather than `major` — inert because no workspace
+  package declares an internal peer dependency. Adding a private package or an internal peer
+  dependency would make each of these live.
+- **Verified before merge, because CLI 3 changes behaviour the gate depends on.** `changeset
+  status --since=…` still exits 1 with "Some packages have been changed but no changesets were
+  found" when a published package moves without one, so the `changesets` CI job keeps its
+  meaning — and it still exits 0 when the only changeset present is empty, so the opt-out used
+  here still satisfies it. CLI 3's "`version` exits 1 when there are no changesets" never reaches
+  the workflow: v2 reads the changeset state first and only calls `version` when non-empty
+  changesets exist. `.changeset/config.json` points `changelog` at `@changesets/cli/changelog`,
+  which CLI 3 still exports despite being ESM-only — `status` would not have proven that, since
+  only `version` loads it.
+- **One behaviour genuinely changes, and it suits this repository.** When every pending changeset
+  is empty — the deliberate opt-out used here for tooling-only changes — v2 logs "All changesets
+  are empty; not creating PR" and stops, where v1 would open a Version Packages PR that consumed
+  them and bumped nothing. Empty changesets therefore accumulate until a real one arrives, which
+  consumes the whole batch. Fewer no-op release PRs, same end state.
+- **Two things to watch, because `release.yml` is never exercised by pull-request CI.** A bad
+  bump to this action surfaces only at release time, which is why its dependabot hold was worth
+  keeping until the migration was ready. And v2 learns what to tag from a `CHANGESETS_OUTPUT`
+  file rather than by parsing publish output: if that file is ever missing, it downgrades to a
+  warning and reports nothing published, so packages could reach npm with no tags and no GitHub
+  Releases while the step stays green. Confirm tags and Releases exist after the first release
+  under v2 rather than trusting a green step.

@@ -1,7 +1,10 @@
 # Changesets release automation: on every push to main, opens/refreshes a
 # "Version Packages" PR from pending changesets; merging that PR publishes to
-# npm. Requires the NPM_TOKEN secret (and packages to be made public in
-# .changeset/config.json "access" when the org is ready).
+# npm. Requires the NPM_TOKEN secret.
+#
+# Nothing here runs on pull requests, so a change to this file — or to the
+# action it pins — is first exercised by an actual release. Treat edits
+# accordingly, and check that tags and GitHub Releases really appeared.
 name: Release
 
 on:
@@ -28,6 +31,12 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+          # changesets/action v2 no longer writes .npmrc itself; setup-node does
+          # it, and `changeset publish` reads NODE_AUTH_TOKEN from that config.
+          # NODE_AUTH_TOKEN is scoped to the publish step, so the steps before it
+          # log "Failed to replace env in config: ${NODE_AUTH_TOKEN}" and carry on
+          # with the default registry. That warning is expected, not a failure.
+          registry-url: https://registry.npmjs.org
 
       - run: pnpm install --frozen-lockfile
 
@@ -36,9 +45,14 @@ jobs:
       - run: pnpm run build
 
       - name: Create release PR or publish
-        uses: changesets/action@v1
+        uses: changesets/action@v2
         with:
-          publish: pnpm exec changeset publish
+          publish-script: pnpm exec changeset publish
+          # v2 defaults to pushing release commits and tags through the GitHub
+          # API, which would re-attribute them. v1 used the Git CLI; keep it.
+          push-with-git-cli: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # No GITHUB_TOKEN here: the github-token input already defaults to the
+          # workflow token, and v2 fails the step if the variable is set to
+          # anything different.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

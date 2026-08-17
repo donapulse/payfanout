@@ -1226,3 +1226,26 @@ sandbox round-trip before production use, and the setup guide carries that warni
   `confirm()`. One challenge at a time per handle: a re-entrant `handleAction` is refused
   with `invalid_request` instead of replacing the pending resolver, which would leave the
   first caller's promise unsettled forever.
+
+## Production audit scope: peer dependencies (2026-08-17)
+
+- **Every `peerDependencies` entry is mirrored in `devDependencies`.** pnpm auto-installs an
+  unmet peer, and `pnpm list --prod` — the tree `scripts/audit-deps.mjs` walks — reports that
+  auto-installed peer under `dependencies`. `@payfanout/conformance` declared `vitest` only as
+  a peer and carried no `devDependencies` at all, so the entire test toolchain was audited as
+  shipped code: the weekly gate reported high advisories for `undici` (via `jsdom`) and
+  `nanoid` (via `vite` → `postcss`) as production findings. `packages/react` never had the
+  problem because it always declared `react` as a peer *and* a dev dependency. Mirroring the
+  peer is the fix; the peer range itself is untouched, so nothing consumers resolve changes.
+- **The gate covers what ships, and the informational pass still covers everything else.**
+  The production step audits 73 packages instead of 234; `--all --warn-only` still reports the
+  toolchain advisories. GitHub's dependency graph classifies the same packages as
+  `development` scope, so local and upstream classification now agree. A CVE inside the test
+  toolchain warns rather than blocks — that is the intended split of the two-step job, not a
+  relaxation: the previous blocking behaviour was an artifact of the missing manifest entry.
+- **`ip-address` was the one genuine production finding** (GHSA-mwp4-54f8-5fhr plus two
+  moderates), reaching the tree through the demo server's `express-rate-limit`. That range
+  already admitted the patched releases, so refreshing the lockfile to 10.5.0 was sufficient
+  and no manifest edit or `pnpm.overrides` entry was warranted. An override would only be
+  justified if a dependency's declared range excluded every patched version, as with the
+  `vite`/`esbuild` case above.

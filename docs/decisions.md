@@ -1252,22 +1252,59 @@ sandbox round-trip before production use, and the setup guide carries that warni
 
 ## Node 20 stays in the test matrix (2026-08-17)
 
-- **Two dependency majors are held back to keep the Node 20 leg alive**, rather than dropping
-  the leg to take them. `jsdom` 30 declares `engines.node`
-  `"^22.22.2 || ^24.15.0 || >=26.0.0"` and depends on `undici` 8, whose `CacheStorage` calls
-  `worker_threads.markAsUncloneable` at module scope — a helper that does not exist on Node 20
-  and was never backported. Importing `jsdom` therefore throws outright there, so every
-  `jsdom`-environment suite dies before it runs: the Node 20 leg lost eleven test files and
-  338 covered statements, which surfaced only as a coverage-threshold failure rather than as
-  the runtime incompatibility it was. Changesets CLI 3 declares `"^22.11 || ^24 || >=26"` and
-  is driven exclusively by `changesets/action` v2, which renames every workflow input and no
-  longer writes `.npmrc` from `NPM_TOKEN`, so adopting it also means migrating `release.yml`.
-- **Neither advisory needed the major.** `js-yaml`, `undici`, `nanoid` and `postcss` all had
+- **`jsdom` is held at 29.x because 30 genuinely breaks the Node 20 leg.** `jsdom` 30 declares
+  `engines.node` `"^22.22.2 || ^24.15.0 || >=26.0.0"` and depends on `undici` 8, whose
+  `CacheStorage` calls `worker_threads.markAsUncloneable` at module scope — a helper that does
+  not exist on Node 20 and was never backported. Importing `jsdom` therefore throws outright
+  there, so every `jsdom`-environment suite dies before it runs: the Node 20 leg lost eleven
+  test files and 338 covered statements, which surfaced only as a coverage-threshold failure
+  rather than as the runtime incompatibility it was. This is a hard break, not an engine
+  warning.
+- **`@changesets/cli` is held at 2.x for a softer reason, stated precisely.** CLI 3 declares
+  `engines.node "^22.11 || ^24 || >=26"`. Nothing mechanically fails on Node 20: there is no
+  root `.npmrc`, pnpm's `engineStrict` defaults to false, and the jobs that actually run the
+  CLI are Node 22 only. The objection is that shipping a tool which disowns a leg the matrix
+  still tests is either a false claim of support or an undeclared drop of it. Adopting CLI 3
+  also forces `changesets/action` v2 — see the entry below — so it is a release-tooling
+  migration, not a version bump.
+- **No advisory needed either major.** `js-yaml`, `undici`, `nanoid` and `postcss` all had
   patched releases inside the ranges their dependents already declare, so a lockfile refresh
   cleared them — the same reasoning as the `ip-address` entry above. Reaching a patched
   version through a major bump is a coincidence of packaging, not a requirement.
-- **Both holds are recorded in `.github/dependabot.yml` scoped to majors**, so patch and minor
-  updates still flow, and both carry an explicit revisit trigger. Node 20 is past upstream
-  end-of-life, so dropping it is a legitimate future decision — but it is consumer-visible
-  (root `engines.node` is `>=18.17`) and belongs in a deliberate change that moves `engines`,
-  the CI matrix and `release.yml` together, not in a weekly dependency group.
+- **Both holds live in `.github/dependabot.yml`, scoped to majors**, so patch and minor updates
+  still flow and each carries a revisit trigger. Node 20 is past upstream end-of-life, so
+  dropping it is a legitimate future decision — but it is consumer-visible (root
+  `engines.node` is `>=18.17`, and raising it is a breaking change for every published
+  package) and belongs in a deliberate change that moves `engines`, the CI matrix and
+  `release.yml` together, not in a weekly dependency group.
+- **Upstream support, stated per package rather than in general.** `@changesets/cli` publishes
+  a `maintenance-v2` dist-tag pointing at the 2.x line, and `changesets/action` v2's own error
+  text names v1 as the supported action for CLI 2 — both are explicit upstream signals that the
+  held lines remain supported. `jsdom` 29 has no such signal: 30.x is `latest` and there is no
+  maintenance tag, so that hold is a deliberate lag rather than a supported branch, and it is
+  the one most worth revisiting.
+
+## Release tooling stays on changesets/action v1 (2026-08-17)
+
+- **v1 is the line built for Changesets CLI 2, which is what this repository declares**, so the
+  release path is internally consistent as it stands: `release.yml` passes `publish:` and
+  `NPM_TOKEN`, both of which v1 understands.
+- **v2 fails loudly, not silently — worth recording because the opposite is easy to assume.**
+  v2 validates the declared `@changesets/cli` range before it acts on any release input and
+  throws when it finds CLI 2, with an error directing CLI 2 users back to v1; the renamed-input
+  check throws next. Both surface through `setFailed`, so a stray bump turns the release step
+  red rather than opening a Version Packages PR that publishes nothing. There is no
+  silent-mis-publish risk here.
+- **The migration is four coupled changes, which is why it is held**: the input renames — v2
+  renames seven of its eleven inputs, `cwd` and `github-token` keeping their names, and
+  `release.yml` passes exactly one of the seven, `publish` becoming `publish-script` — npm auth
+  moving off `.npmrc` to `registry-url` plus `NODE_AUTH_TOKEN` or trusted publishing, the
+  `@changesets/cli` 3 major, and the Node engine floor that comes with it. Doing any subset
+  leaves the release broken.
+- **What the hold suppresses, precisely.** `release.yml` pins the floating `@v1` ref, so
+  dependabot can only ever propose a major for this action — meaning the entry silences the
+  only PR it can raise, and per GitHub's documentation it also suppresses a security PR whose
+  fix requires a major. Dependabot **alerts** are unaffected and remain the signal here: no CI
+  job scans Actions for advisories, because `dependency-audit` walks the npm tree through
+  `scripts/audit-deps.mjs` and CodeQL is configured for `javascript-typescript` only. A v2-only
+  advisory fix would need a manual bump.

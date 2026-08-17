@@ -19,6 +19,24 @@ updates:
       # crashes the lint gate.
       - dependency-name: typescript
         update-types: ["version-update:semver-major"]
+      # The next two holds exist only to keep Node 20 in the test matrix. Both
+      # are scoped to majors, so patch and minor updates — including security
+      # ones — still open PRs as usual.
+      #
+      # jsdom 30 declares engines.node "^22.22.2 || ^24.15.0 || >=26.0.0" and
+      # depends on undici 8, whose CacheStorage calls
+      # worker_threads.markAsUncloneable at module scope. Node 20 has no such
+      # helper, so importing jsdom throws and every jsdom-environment suite dies
+      # before it runs on the Node 20 leg. Revisit when the matrix drops Node 20.
+      - dependency-name: jsdom
+        update-types: ["version-update:semver-major"]
+      # Changesets CLI 3 declares engines.node "^22.11 || ^24 || >=26" and is
+      # only driven by changesets/action v2, which renames every workflow input
+      # and no longer handles NPM_TOKEN, so adopting it means migrating
+      # release.yml in the same change. Revisit when the matrix drops Node 20 or
+      # release.yml moves to changesets/action v2.
+      - dependency-name: "@changesets/cli"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: "/"

@@ -18,6 +18,9 @@
   "peerDependencies": {
     "vitest": ">=1.0.0"
   },
+  "devDependencies": {
+    "vitest": "^4.1.10"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.build.json"
   },

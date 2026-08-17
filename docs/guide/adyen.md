@@ -2,9 +2,14 @@
 
 Adyen is a **tokenize-first** PSP: the browser encrypts the card inside Adyen's hosted
 fields, then your **server** creates the payment from that encrypted blob. It is also the
-first **push-only** provider PayFanout ships: Adyen's Checkout API exposes no read for a
-payment or a refund, and every capture/cancel/refund answers `{ "status": "received" }` —
-the real outcome arrives as a webhook. The adapter declares that honestly
+first **push-only** provider PayFanout ships:
+[Adyen's Checkout API](https://docs.adyen.com/api-explorer/Checkout/72/overview) exposes no
+read for a payment or a refund — only three of its endpoints are `GET` (payment links,
+sessions, stored payment methods) and none is keyed by `pspReference` — and every
+[capture](https://docs.adyen.com/online-payments/capture),
+[cancel](https://docs.adyen.com/online-payments/cancel) and
+[refund](https://docs.adyen.com/online-payments/refund) answers `{ "status": "received" }`,
+with the real outcome arriving as a webhook. The adapter declares that honestly
 (`supportsPaymentRetrieval: false`, `supportsRefundRetrieval: false`,
 `modificationOutcome: "asynchronous"`) instead of inventing states, so **your webhook
 endpoint is not optional here** — it is the only place outcomes exist.
@@ -31,6 +36,13 @@ your own [Adyen documentation](https://docs.adyen.com) before going live.
 :::
 
 ## 1. Get your Adyen credentials
+
+Adyen keeps the server key and the browser key on the same credential record but generates
+them separately — see
+[API credentials](https://docs.adyen.com/development-resources/api-credentials) for the API
+key and
+[client-side authentication](https://docs.adyen.com/development-resources/client-side-authentication)
+for the client key and its allowed origins.
 
 From the **Adyen Customer Area** (Developers → API credentials, and Developers → Webhooks):
 
@@ -134,7 +146,8 @@ const payments = new PaymentService({ adapters: [adyen] });
 
 ::: tip Every call is idempotent
 Each request carries an `idempotency-key` derived deterministically from your
-`idempotencyKey` **and the endpoint being called** (Adyen caps the header at 64 characters,
+`idempotencyKey` **and the endpoint being called** (Adyen
+[caps the header at 64 characters](https://docs.adyen.com/development-resources/api-idempotency),
 so it travels as a SHA-256 digest). The endpoint is part of it because Adyen stores keys at
 company-account level, not per endpoint: reusing one key across `/payments` and
 `/payments/details` — which the 3-D Secure flow in §6 does — would otherwise replay the
@@ -146,7 +159,9 @@ still deduplicates at Adyen. A duplicate racing the still in-flight original (Ad
 ### Currencies the adapter refuses
 
 Adyen prices **CLP, CVE, IDR and ISK** with a different number of fractional digits than
-ISO 4217, which is PayFanout's minor-unit contract. Passing minor units straight through
+ISO 4217, which is PayFanout's minor-unit contract — and Adyen documents
+[its own table as leading](https://docs.adyen.com/development-resources/currency-codes) for
+amounts in minor units. Passing minor units straight through
 would shift the decimal point, so `createPaymentSession` rejects those four with
 `invalid_request`. Everything else follows ISO 4217; JPY (0 decimals) and BHD (3 decimals)
 round-trip normally. `capturePayment` and `refundPayment` apply the same rule to the
@@ -279,15 +294,18 @@ In **Developers → Webhooks**, add a *Standard webhook* pointing at
 `https://your-api.example/webhooks/adyen`, generate its **HMAC key**, and set **basic
 authentication** credentials. The adapter requires both:
 
-- the HMAC key authenticates the eight signed fields (`pspReference`, `originalReference`,
-  `merchantAccountCode`, `merchantReference`, amount `value` and `currency`, `eventCode`,
-  `success`);
+- the HMAC key authenticates the
+  [eight signed fields](https://docs.adyen.com/development-resources/webhooks/secure-webhooks/verify-hmac-signatures)
+  (`pspReference`, `originalReference`, `merchantAccountCode`, `merchantReference`, amount
+  `value` and `currency`, `eventCode`, `success`);
 - basic authentication authenticates the channel the *rest* of the payload arrived on —
   Adyen's HMAC does not cover it, and hosts read those fields from `event.raw`.
 
 ::: warning Basic authentication, not OAuth
-Adyen strongly recommends **OAuth 2.0** for standard webhooks and offers basic
-authentication over HTTPS as the alternative. This adapter verifies the basic-auth
+Adyen
+[strongly recommends **OAuth 2.0**](https://docs.adyen.com/development-resources/webhooks/secure-webhooks)
+for standard webhooks and supports basic authentication for all webhook types. This adapter
+verifies the basic-auth
 credentials, and only those: an endpoint configured for OAuth sends a bearer token the
 adapter cannot check, so **every delivery fails verification**
 (`verifyAdyenWebhook` reports `credential_mismatch`, or `missing_credentials` when the
@@ -310,7 +328,9 @@ app.post("/webhooks/adyen", express.raw({ type: "application/json" }), async (re
 app.use(express.json()); // AFTER the webhook route
 ```
 
-A JSON delivery carries exactly one notification item. `success` and `live` are the
+A JSON delivery
+[carries exactly one notification item](https://docs.adyen.com/development-resources/webhooks/webhook-types)
+(SOAP may carry up to six; the adapter speaks JSON). `success` and `live` are the
 **strings** `"true"`/`"false"`, never booleans — the adapter compares the exact string, and so
 should any code you write against `event.raw`. The dedupe key is the pair
 `"{eventCode}:{pspReference}"`, because one payment's `AUTHORISATION` and `CAPTURE` share a
@@ -338,24 +358,31 @@ persist every event, dedupe by `event.id`, and alert on gaps.
 
 ## 9. Test values
 
-Use Adyen's documented sandbox cards — Visa `4111 1111 1111 1111` and Mastercard
-`5555 5555 5555 4444`, both expiry `03/2030`, CVC `737`. **No card number triggers a
-refusal**: refusals are simulated with `paymentMethod.holderName` values or
-`additionalData.RequestedTestAcquirerResponseCode` from Adyen's testing page. Confirm the
-current list before relying on it.
+Use
+[Adyen's documented sandbox cards](https://docs.adyen.com/development-resources/test-cards-and-credentials/test-card-numbers)
+— Visa `4111 1111 1111 1111` and Mastercard `5555 5555 5555 4444`, both expiry `03/2030`,
+CVC `737`. **Refusals are triggered by field values, not by the card number**: put the
+trigger in `paymentMethod.holderName` or `additionalData.RequestedTestAcquirerResponseCode`,
+per
+[Adyen's testing page](https://docs.adyen.com/development-resources/testing/result-codes).
+Confirm the current list before relying on it.
 
 ## 10. Go live
 
 - [ ] Swap in the **live** API key, merchant account, HMAC key and webhook credentials.
-- [ ] Set `environment: "live"` on **both** adapters and add `liveUrlPrefix` on the server one.
+- [ ] Set `environment: "live"` on **both** adapters and add `liveUrlPrefix` on the server one
+      — Adyen issues the prefix per company account, under Developers → API URLs in the live
+      Customer Area ([live endpoints](https://docs.adyen.com/development-resources/live-endpoints)).
 - [ ] Allowlist your production origin for the **live** client key in the Customer Area.
 - [ ] Register the **live** webhook, with HMAC **and** basic authentication, and verify a test
       delivery reaches your queue.
 - [ ] Keep `ADYEN_SESSION_KEY` stable and secret in production; rotating it invalidates
       in-flight sessions.
 - [ ] Verify card fields are still Adyen's hosted iframes (SAQ-A), no raw card input.
-- [ ] Re-check endpoint paths, event codes, and refusal reason codes against the current
-      Adyen documentation.
+- [ ] Re-check endpoint paths, [event codes](https://docs.adyen.com/development-resources/webhooks/webhook-types),
+      [result codes](https://docs.adyen.com/online-payments/build-your-integration/payment-result-codes)
+      and [refusal reason codes](https://docs.adyen.com/development-resources/refusal-reasons)
+      against the current Adyen documentation.
 
 Then continue with [Server usage](/guide/server), [React usage](/guide/react), and
 [Webhooks](/guide/webhooks).

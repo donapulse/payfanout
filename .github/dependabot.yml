@@ -19,16 +19,22 @@ updates:
       # crashes the lint gate.
       - dependency-name: typescript
         update-types: ["version-update:semver-major"]
-      # jsdom 30 requires Node >= 22.22.2: it depends on undici 8, whose
-      # CacheStorage calls worker_threads.markAsUncloneable, which Node 20 does
-      # not have. Importing jsdom throws there, so every jsdom-environment suite
-      # dies before it starts on the Node 20 test leg. Revisit when the matrix
-      # drops Node 20.
+      # The next two holds exist only to keep Node 20 in the test matrix. Both
+      # are scoped to majors, so patch and minor updates — including security
+      # ones — still open PRs as usual.
+      #
+      # jsdom 30 declares engines.node "^22.22.2 || ^24.15.0 || >=26.0.0" and
+      # depends on undici 8, whose CacheStorage calls
+      # worker_threads.markAsUncloneable at module scope. Node 20 has no such
+      # helper, so importing jsdom throws and every jsdom-environment suite dies
+      # before it runs on the Node 20 leg. Revisit when the matrix drops Node 20.
       - dependency-name: jsdom
         update-types: ["version-update:semver-major"]
-      # Changesets CLI 3 requires Node >= 22.11 and is only driven by
-      # changesets/action v2, so adopting it means migrating release.yml and
-      # dropping Node 20 in the same change. Not a weekly-group bump.
+      # Changesets CLI 3 declares engines.node "^22.11 || ^24 || >=26" and is
+      # only driven by changesets/action v2, which renames every workflow input
+      # and no longer handles NPM_TOKEN, so adopting it means migrating
+      # release.yml in the same change. Revisit when the matrix drops Node 20 or
+      # release.yml moves to changesets/action v2.
       - dependency-name: "@changesets/cli"
         update-types: ["version-update:semver-major"]
 

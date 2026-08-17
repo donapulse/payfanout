@@ -1249,3 +1249,25 @@ sandbox round-trip before production use, and the setup guide carries that warni
   and no manifest edit or `pnpm.overrides` entry was warranted. An override would only be
   justified if a dependency's declared range excluded every patched version, as with the
   `vite`/`esbuild` case above.
+
+## Node 20 stays in the test matrix (2026-08-17)
+
+- **Two dependency majors are held back to keep the Node 20 leg alive**, rather than dropping
+  the leg to take them. `jsdom` 30 declares `engines.node`
+  `"^22.22.2 || ^24.15.0 || >=26.0.0"` and depends on `undici` 8, whose `CacheStorage` calls
+  `worker_threads.markAsUncloneable` at module scope — a helper that does not exist on Node 20
+  and was never backported. Importing `jsdom` therefore throws outright there, so every
+  `jsdom`-environment suite dies before it runs: the Node 20 leg lost eleven test files and
+  338 covered statements, which surfaced only as a coverage-threshold failure rather than as
+  the runtime incompatibility it was. Changesets CLI 3 declares `"^22.11 || ^24 || >=26"` and
+  is driven exclusively by `changesets/action` v2, which renames every workflow input and no
+  longer writes `.npmrc` from `NPM_TOKEN`, so adopting it also means migrating `release.yml`.
+- **Neither advisory needed the major.** `js-yaml`, `undici`, `nanoid` and `postcss` all had
+  patched releases inside the ranges their dependents already declare, so a lockfile refresh
+  cleared them — the same reasoning as the `ip-address` entry above. Reaching a patched
+  version through a major bump is a coincidence of packaging, not a requirement.
+- **Both holds are recorded in `.github/dependabot.yml` scoped to majors**, so patch and minor
+  updates still flow, and both carry an explicit revisit trigger. Node 20 is past upstream
+  end-of-life, so dropping it is a legitimate future decision — but it is consumer-visible
+  (root `engines.node` is `>=18.17`) and belongs in a deliberate change that moves `engines`,
+  the CI matrix and `release.yml` together, not in a weekly dependency group.

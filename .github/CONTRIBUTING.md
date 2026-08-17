@@ -6,7 +6,9 @@ By participating you agree to abide by our [Code of Conduct](./CODE_OF_CONDUCT.m
 
 ## Prerequisites
 
-- Node.js `>=18.17` (CI runs the test matrix on 20 and 22).
+- Node.js `^22.22.2 || ^24.15.0 || >=26.0.0` (CI runs the test matrix on 22 and 24). The
+  floor is set by the test toolchain, not by the published packages, which declare no
+  `engines` at all — see [decisions](../docs/decisions.md).
 - pnpm `10.24.0`. The simplest way to get the right version is Corepack:
 
   ```bash

@@ -1250,39 +1250,57 @@ sandbox round-trip before production use, and the setup guide carries that warni
   justified if a dependency's declared range excluded every patched version, as with the
   `vite`/`esbuild` case above.
 
-## Node 20 stays in the test matrix (2026-08-17)
+## Node 20 stays in the test matrix (2026-08-17) — superseded
 
-- **`jsdom` is held at 29.x because 30 genuinely breaks the Node 20 leg.** `jsdom` 30 declares
-  `engines.node` `"^22.22.2 || ^24.15.0 || >=26.0.0"` and depends on `undici` 8, whose
-  `CacheStorage` calls `worker_threads.markAsUncloneable` at module scope — a helper that does
-  not exist on Node 20 and was never backported. Importing `jsdom` therefore throws outright
-  there, so every `jsdom`-environment suite dies before it runs: the Node 20 leg lost eleven
-  test files and 338 covered statements, which surfaced only as a coverage-threshold failure
-  rather than as the runtime incompatibility it was. This is a hard break, not an engine
-  warning.
-- **`@changesets/cli` is held at 2.x for a softer reason, stated precisely.** CLI 3 declares
-  `engines.node "^22.11 || ^24 || >=26"`. Nothing mechanically fails on Node 20: there is no
-  root `.npmrc`, pnpm's `engineStrict` defaults to false, and the jobs that actually run the
-  CLI are Node 22 only. The objection is that shipping a tool which disowns a leg the matrix
-  still tests is either a false claim of support or an undeclared drop of it. Adopting CLI 3
-  also forces `changesets/action` v2 — see the entry below — so it is a release-tooling
-  migration, not a version bump.
-- **No advisory needed either major.** `js-yaml`, `undici`, `nanoid` and `postcss` all had
-  patched releases inside the ranges their dependents already declare, so a lockfile refresh
-  cleared them — the same reasoning as the `ip-address` entry above. Reaching a patched
-  version through a major bump is a coincidence of packaging, not a requirement.
-- **Both holds live in `.github/dependabot.yml`, scoped to majors**, so patch and minor updates
-  still flow and each carries a revisit trigger. Node 20 is past upstream end-of-life, so
-  dropping it is a legitimate future decision — but it is consumer-visible (root
-  `engines.node` is `>=18.17`, and raising it is a breaking change for every published
-  package) and belongs in a deliberate change that moves `engines`, the CI matrix and
-  `release.yml` together, not in a weekly dependency group.
-- **Upstream support, stated per package rather than in general.** `@changesets/cli` publishes
-  a `maintenance-v2` dist-tag pointing at the 2.x line, and `changesets/action` v2's own error
-  text names v1 as the supported action for CLI 2 — both are explicit upstream signals that the
-  held lines remain supported. `jsdom` 29 has no such signal: 30.x is `latest` and there is no
-  maintenance tag, so that hold is a deliberate lag rather than a supported branch, and it is
-  the one most worth revisiting.
+Reversed the same day by the entry below. It held `jsdom` 30 and Changesets CLI 3 back to keep
+a Node 20 leg alive, on the belief that raising the floor was consumer-visible. It is not: no
+published package declares `engines`. The one fact worth carrying forward is that
+`@changesets/cli` publishes a `maintenance-v2` dist-tag (2.31.1), so the 2.x line is upstream-
+supported rather than merely lagging — which is why its hold survives the reversal.
+
+## The test matrix moves to Node 22 and 24 (2026-08-17)
+
+- **The matrix was testing a dead version and missing the current one.** Node 20 (Iron) is
+  end-of-life upstream, as is Node 18; Node 22 (Jod) and Node 24 (Krypton) are both LTS, and
+  Node 24 was not exercised at all. `node: [20, 22]` therefore spent one of its two legs on a
+  runtime nobody should deploy while leaving the newest supported line unverified. It is now
+  `node: [22, 24]`.
+- **Changing the tested versions is not consumer-visible, which is the fact that makes this
+  cheap.** No published package declares `engines` — all eighteen omit it — and the only
+  `engines.node` in the repository, `>=18.17`, sits in the root manifest, which is
+  `private: true` and never published. So this moves no floor, breaks no install and needs no
+  version bump. The honest corollary: consumers on Node 18 or 20 can still install, because
+  nothing declares otherwise; what changes is that the project stops *verifying* those
+  versions. Adding `engines` to the published packages would be the opposite kind of change —
+  breaking, and a major for every package — and is deliberately not part of this.
+- **What it unblocks.** `jsdom` 30 declares `engines.node`
+  `"^22.22.2 || ^24.15.0 || >=26.0.0"` and depends on `undici` 8, whose `CacheStorage` reaches
+  `worker_threads.markAsUncloneable` at module scope — a helper absent from Node 20 and never
+  backported, so importing `jsdom` threw outright there. That cost the Node 20 leg eleven test
+  files and 338 covered statements and surfaced only as a coverage-threshold failure rather
+  than as the runtime incompatibility it was. With Node 20 gone the break cannot occur, and
+  `jsdom` 30 lands with this change.
+- **Changesets CLI 3 is unblocked by the same move but deferred deliberately.** CLI 3 declares
+  `engines.node "^22.11 || ^24 || >=26"`, which the new matrix satisfies, but it is driven only
+  by `changesets/action` v2, so taking it means rewriting `release.yml` — renamed inputs and npm
+  authentication moving off `NPM_TOKEN`. That touches the publish path, so it is its own change
+  rather than a passenger here. Its hold stays in `.github/dependabot.yml` until then.
+- **No advisory ever required any of these majors.** `js-yaml`, `undici`, `nanoid` and
+  `postcss` all had patched releases inside the ranges their dependents already declared, so a
+  lockfile refresh cleared them — the same reasoning as the `ip-address` entry above. This
+  change is maintenance hygiene, not a security fix.
+- **What now defends the runtime floor, since the Node 20 leg was the last mechanical check
+  that shipped code stays runnable below Node 22.** `tsconfig.base.json` caps `lib` at
+  `ES2022`, so a newer built-in does not typecheck even though `@types/node` is on 26, and the
+  only Node built-in in any published source is `createHmac` / `timingSafeEqual` in
+  `packages/adapter-stripe-server/src/webhook.ts`. Exposure today is nil; the intended floor
+  for shipped code stays "runs on any maintained Node", and `lib: ES2022` is what holds it.
+- **Revisit trigger, because the previous matrix drifted for want of one.** Node 22 has been
+  *maintenance* LTS since 2025-10-21 and ends 2027-04-30; Node 24 is *active* LTS until
+  2028-04-30; Node 26 becomes LTS on 2026-10-28. Revisit then: the pair should track the two
+  supported LTS lines, which at that point means dropping 22 for 26 or running three legs.
+  Development floor: root `engines.node` is `^22.22.2 || ^24.15.0 || >=26.0.0`, set by the test
+  toolchain (`jsdom` 30), and the root manifest is private so this is not a consumer signal.
 
 ## Release tooling stays on changesets/action v1 (2026-08-17)
 
@@ -1295,11 +1313,12 @@ sandbox round-trip before production use, and the setup guide carries that warni
   check throws next. Both surface through `setFailed`, so a stray bump turns the release step
   red rather than opening a Version Packages PR that publishes nothing. There is no
   silent-mis-publish risk here.
-- **The migration is four coupled changes, which is why it is held**: the input renames — v2
+- **The migration is three coupled changes, which is why it is held**: the input renames — v2
   renames seven of its eleven inputs, `cwd` and `github-token` keeping their names, and
   `release.yml` passes exactly one of the seven, `publish` becoming `publish-script` — npm auth
-  moving off `.npmrc` to `registry-url` plus `NODE_AUTH_TOKEN` or trusted publishing, the
-  `@changesets/cli` 3 major, and the Node engine floor that comes with it. Doing any subset
+  moving off `.npmrc` to `registry-url` plus `NODE_AUTH_TOKEN` or trusted publishing, and the
+  `@changesets/cli` 3 major. The Node engine floor was a fourth until the matrix moved to 22
+  and 24, which retired it. Doing any subset
   leaves the release broken.
 - **What the hold suppresses, precisely.** `release.yml` pins the floating `@v1` ref, so
   dependabot can only ever propose a major for this action — meaning the entry silences the

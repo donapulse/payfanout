@@ -21,7 +21,9 @@ updates:
         update-types: ["version-update:semver-major"]
       # The next two holds exist only to keep Node 20 in the test matrix. Both
       # are scoped to majors, so patch and minor updates — including security
-      # ones — still open PRs as usual.
+      # ones — still open PRs as usual; a security fix that exists only in the
+      # held major is suppressed too, and the Dependabot alert is the signal
+      # there.
       #
       # jsdom 30 declares engines.node "^22.22.2 || ^24.15.0 || >=26.0.0" and
       # depends on undici 8, whose CacheStorage calls
@@ -43,3 +45,22 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    ignore:
+      # changesets/action v2 is built for Changesets CLI 3; v1 is the line built
+      # for CLI 2, which is what this repo declares. v2 validates the declared
+      # CLI range before it acts on any release input and fails the step
+      # outright, with an error naming v1 as the supported action for CLI 2 — so
+      # a stray bump reddens the release run rather than mis-publishing. It also
+      # renames seven of its eleven inputs (cwd and github-token keep their
+      # names); release.yml passes one of them, publish -> publish-script. And it
+      # no longer writes .npmrc from NPM_TOKEN, so npm auth would move to
+      # registry-url plus NODE_AUTH_TOKEN. Adopting v2 therefore means taking
+      # @changesets/cli 3 and rewriting release.yml in one change. Since
+      # release.yml pins the floating @v1 ref, this entry silences the only PR
+      # dependabot can raise for the action, and per GitHub's docs it also
+      # suppresses a security PR whose fix needs a major; the Dependabot alert
+      # feed still surfaces those, and a v2-only advisory fix would need a manual
+      # bump. Revisit together with the @changesets/cli hold above, on the
+      # Node 20 decision.
+      - dependency-name: changesets/action
+        update-types: ["version-update:semver-major"]

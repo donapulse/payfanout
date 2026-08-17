@@ -19,6 +19,18 @@ updates:
       # crashes the lint gate.
       - dependency-name: typescript
         update-types: ["version-update:semver-major"]
+      # jsdom 30 requires Node >= 22.22.2: it depends on undici 8, whose
+      # CacheStorage calls worker_threads.markAsUncloneable, which Node 20 does
+      # not have. Importing jsdom throws there, so every jsdom-environment suite
+      # dies before it starts on the Node 20 test leg. Revisit when the matrix
+      # drops Node 20.
+      - dependency-name: jsdom
+        update-types: ["version-update:semver-major"]
+      # Changesets CLI 3 requires Node >= 22.11 and is only driven by
+      # changesets/action v2, so adopting it means migrating release.yml and
+      # dropping Node 20 in the same change. Not a weekly-group bump.
+      - dependency-name: "@changesets/cli"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: "/"

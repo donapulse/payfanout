@@ -36,7 +36,7 @@ jobs:
       - run: pnpm run build
 
       - name: Create release PR or publish
-        uses: changesets/action@v1
+        uses: changesets/action@v2
         with:
           publish: pnpm exec changeset publish
         env:

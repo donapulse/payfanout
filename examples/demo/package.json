@@ -32,9 +32,9 @@
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/react": "^19.2.18",
-    "@types/react-dom": "^19.2.4",
-    "@vitejs/plugin-react": "^6.0.5",
-    "tsx": "^4.23.12",
-    "vite": "^8.2.1"
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "tsx": "^4.23.13",
+    "vite": "^8.2.2"
   }
 }

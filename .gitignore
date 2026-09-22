@@ -9,6 +9,8 @@ dist/
 coverage/
 test-results/
 playwright-report/
+# Vitest 5 reporter output, attachments and failure screenshots
+.vitest/
 
 # Logs
 *.log

@@ -14,6 +14,8 @@ describe("mapStripeError", () => {
     { name: "rate limit by status", err: { statusCode: 429 }, code: "rate_limited", retryable: true },
     { name: "connection error", err: { type: "StripeConnectionError" }, code: "psp_unavailable", retryable: true },
     { name: "API 5xx", err: { type: "StripeAPIError", statusCode: 500 }, code: "psp_unavailable", retryable: true },
+    // The SDK reports a response body cut off mid-transfer this way: no status code at all.
+    { name: "API error without a status", err: { type: "StripeAPIError" }, code: "psp_unavailable", retryable: true },
     { name: "bad API key", err: { type: "StripeAuthenticationError" }, code: "invalid_request", retryable: false },
     {
       name: "insufficient funds decline",

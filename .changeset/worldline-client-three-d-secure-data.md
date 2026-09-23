@@ -1,5 +1,5 @@
 ---
-"@payfanout/adapter-worldline": minor
+"@payfanout/adapter-worldline": major
 ---
 
-`confirm()` now sends the browser data Worldline needs for 3-D Secure along with the `hostedTokenizationId`, and tokenizes the card without storing it at Worldline for later use. The new `clientToken` format is decoded by the matching `@payfanout/adapter-worldline-server` major release, so upgrade the server adapter first.
+Breaking: `confirm()` now resolves a JSON `clientToken` that carries the browser data Worldline needs for 3-D Secure along with the `hostedTokenizationId`, instead of the bare `hostedTokenizationId`. Only the matching `@payfanout/adapter-worldline-server` major release decodes it, so upgrade the server adapter first: an earlier server adapter would send the whole envelope to Worldline as the `hostedTokenizationId`. The card is also tokenized without being stored at Worldline for later use.

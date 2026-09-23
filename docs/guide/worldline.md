@@ -102,7 +102,7 @@ const payments = new PaymentService({ adapters: [worldline] });
 | `apiKeyId` / `secretApiKey` | ✅ | - | `v1HMAC` request-signing credentials. Server-only. |
 | `merchantId` | ✅ | - | The merchant id (PSPID); the `{merchantId}` path segment. |
 | `environment` | ✅ | - | Exactly `"sandbox"` or `"live"`; selects the API host. Never inferred. |
-| `defaultReturnUrl` | ✅¹ | - | Where Worldline returns the customer after a 3-D Secure challenge. ¹Required unless every session passes its own `returnUrl`: Worldline lists the return URL among the mandatory 3-D Secure properties of every card payment, so a session with neither is refused (§6). |
+| `defaultReturnUrl` | ✅¹ | - | Where Worldline returns the customer after a 3-D Secure challenge. ¹Required unless every session passes its own `returnUrl`: Worldline lists the return URL among the mandatory 3-D Secure properties of every card payment, so a session with neither is refused (§6). **Set it before upgrading** from a release that did not require a return URL: sessions that release created without their own `returnUrl` carry none, and completing them is otherwise refused. |
 | `sessionSigningKey` | ✅ | - | HMAC key for the stateless signed session. **You generate this.** Keep it stable across restarts/instances. |
 | `webhookKeys` | ✅ | - | Array of `{ keyId, secretKey }`. Pass several to rotate with no cutover. |
 | `sessionTtlSeconds` | - | `3600` | How long a signed session stays completable (1h). Enforced at completion. |
@@ -157,11 +157,12 @@ the `sdkUrl` config field to pin a version or self-host.
 
 Worldline's [3-D Secure guide](https://docs.direct.worldline-solutions.com/en/security-and-risk-management/3d-secure/implementation)
 lists the properties every card payment must send, and the Hosted Tokenization guide requires
-at least those on the payment request. Every payment the adapter creates carries the ones it
-can supply:
+at least those on the payment request. Every payment carries the ones the adapters can
+supply:
 
 | What | Sent as |
 | --- | --- |
+| Cardholder name | Collected in the Hosted Tokenization iframe's name field, which Worldline hides unless the `Tokenizer` receives `hideCardholderName: false`; keep it visible (see §5) |
 | Return URL | `cardPaymentMethodSpecificInput.returnUrl` (the field the Hosted Tokenization guide names) **and** `cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl` |
 | Authentication | `threeDSecure.skipAuthentication: false`, never the deprecated flat `cardPaymentMethodSpecificInput.skipAuthentication` |
 | Browser device data | `order.customer.device`: `locale`, `timezoneOffsetUtcMinutes`, `userAgent`, and `browserData` (`colorDepth`, `javaEnabled`, `javaScriptEnabled`, `screenHeight`, `screenWidth`), read in the browser by the client adapter's `confirm()` |
@@ -171,23 +172,40 @@ can supply:
 `defaultReturnUrl` on the adapter (§4), absolute, with a scheme such as `https://` or an app
 scheme, at most 200 characters; a session with neither, or with a URL that breaks those rules,
 is refused with `invalid_request` before anything reaches Worldline, rather than failing after
-the customer has entered a card. `sca: { exemption: "moto" }` is withheld: Worldline's
-`exemptionRequest` has no MOTO value. For Visa, Worldline also requires one customer contact
-detail; the adapter sends `order.customer.contactDetails.emailAddress` from the session's
-`receiptEmail` or `billingDetails.email`, so pass one of them.
+the customer has entered a card. An empty `returnUrl` counts as none, so `defaultReturnUrl`
+applies. For Visa, Worldline also requires one customer contact detail; the adapter sends
+`order.customer.contactDetails.emailAddress` from the session's `receiptEmail` or
+`billingDetails.email`, so pass one of them.
+
+Session creation refuses two more values with `invalid_request`, again before anything reaches
+Worldline: an `id` longer than 40 characters, since it travels as the payment's
+`order.references.merchantReference`, and a `statementDescriptor` longer than 256 characters.
+The descriptor is sent as `order.references.softDescriptor`, not the deprecated `descriptor`.
+Worldline advises at most 22 characters, as issuers start truncating beyond that, and
+currently allows a per-payment override only for the AIB and Barclays acquirers.
+
+`sca: { exemption: "moto" }` is not mapped yet. Worldline models MOTO as a transaction channel
+(`cardPaymentMethodSpecificInput.transactionChannel: "MOTO"`), not as an exemption, so such a
+payment goes out as an e-commerce payment with 3-D Secure.
 
 `confirm()` hands the server a JSON `clientToken`,
 `{"hostedTokenizationId":"…","device":{…}}`. It carries browser characteristics only, never
-card data; a value the browser does not expose is left out, and the server adapter drops any
-field outside Worldline's documented types and lengths instead of failing the payment. A bare
-`hostedTokenizationId` from an earlier client adapter is still accepted, without device data,
-so deploy the server adapter before the client adapter.
+card data; a value the browser does not expose is left out, and the server adapter keeps only
+the fields a browser can read, dropping any outside Worldline's documented types and lengths
+instead of failing the payment. A bare `hostedTokenizationId` from an earlier client adapter
+is still accepted, without device data, so deploy the server adapter before the client
+adapter.
 
-::: warning Accept header and IP address are not sent
-Worldline also lists `order.customer.device.acceptHeader` and, for Visa,
+::: warning What the adapter does not send
+Worldline also lists `order.customer.device.acceptHeader` and, for Visa and Cartes Bancaires,
 `order.customer.device.ipAddress`. Both come from the customer's HTTP request to your server,
 not from the browser, and neither `CompletePaymentInput` nor `createCompletionHandler` carries
 them to the adapter today, so the adapter cannot send them.
+
+Cartes Bancaires additionally requires
+`cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure.useCase`.
+Worldline's API contract spells that property `usecase`, so the adapter does not send it until
+a sandbox run settles the name.
 :::
 
 The adapter tokenizes with `storePermanently: false`, so no card is stored at Worldline for

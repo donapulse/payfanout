@@ -1,10 +1,10 @@
 import { PayFanoutError } from "@payfanout/core";
 
 /**
- * Browser characteristics sent as `order.customer.device` on CreatePayment,
- * under Worldline's own key names. Worldline's 3-D Secure guide lists them
- * among the mandatory properties of every card payment, and only the browser
- * can read them, so the client adapter's `confirm()` collects them next to the
+ * The part of `order.customer.device` on CreatePayment that a browser can
+ * read, under Worldline's own key names. Worldline's 3-D Secure guide lists
+ * these fields among the mandatory properties of every card payment, so the
+ * client adapter's `confirm()` collects them next to the
  * `hostedTokenizationId`. Browser characteristics only, never card data.
  */
 export interface WorldlineCustomerDevice {
@@ -58,11 +58,16 @@ const SCREEN_DIMENSION_PATTERN = /^\d{1,6}$/;
  * does not start with `{` is a bare hostedTokenizationId — what earlier client
  * adapters and hand-written callers send — and is used as-is.
  *
- * An empty token, an envelope that is not valid JSON, or one without a
- * non-empty string `hostedTokenizationId` rejects with `invalid_request`. The
- * device data is checked field by field against Worldline's API contract: a
- * field of the wrong type or beyond its limit is dropped, as is any key the
- * contract does not define, and a device with nothing left is omitted. None of
+ * An empty or blank token, an envelope that is not valid JSON, or one without
+ * a non-blank string `hostedTokenizationId` rejects with `invalid_request`.
+ *
+ * Only the device fields a browser can read are kept — `locale`,
+ * `timezoneOffsetUtcMinutes`, `userAgent` and `browserData` — each checked
+ * against Worldline's API contract: one of the wrong type or beyond its limit
+ * is dropped, and a device with nothing left is omitted. `acceptHeader` and
+ * `ipAddress` (request headers the server observes) and `deviceFingerprint`
+ * (bound to a device-fingerprinting session) are defined by Worldline but
+ * refused from the browser, as is any key Worldline does not define. None of
  * that is fatal — it is risk data from the browser, not part of the amount.
  */
 export function decodeWorldlineClientToken(clientToken: string): WorldlineClientToken {
@@ -82,7 +87,7 @@ export function decodeWorldlineClientToken(clientToken: string): WorldlineClient
     );
   }
   const hostedTokenizationId = envelope["hostedTokenizationId"];
-  if (typeof hostedTokenizationId !== "string" || hostedTokenizationId.length === 0) {
+  if (typeof hostedTokenizationId !== "string" || hostedTokenizationId.trim().length === 0) {
     throw PayFanoutError.invalidRequest("Worldline clientToken envelope carries no hostedTokenizationId", {
       hostedTokenizationId,
     });
@@ -93,6 +98,8 @@ export function decodeWorldlineClientToken(clientToken: string): WorldlineClient
 
 function sanitizeDevice(value: unknown): WorldlineCustomerDevice | undefined {
   if (!isPlainObject(value)) return undefined;
+  // Never read acceptHeader, ipAddress or deviceFingerprint here: the browser
+  // cannot vouch for request headers or for a fingerprinting session.
   const { locale, timezoneOffsetUtcMinutes, userAgent } = value;
   const browserData = sanitizeBrowserData(value["browserData"]);
   const device: WorldlineCustomerDevice = {

@@ -57,10 +57,12 @@ export interface WorldlineServerAdapterConfig {
   environment: "sandbox" | "live";
   /**
    * Where Worldline sends the customer back after a 3-D Secure challenge, used
-   * when a session carries no `returnUrl`. Worldline lists
+   * when a session carries no `returnUrl` or an empty one. Worldline lists
    * `threeDSecure.redirectionData.returnUrl` among the mandatory 3-D Secure
    * properties of every card payment, so with neither, createPaymentSession is
-   * refused before anything reaches Worldline.
+   * refused before anything reaches Worldline. Set it before upgrading from a
+   * release that did not require a return URL: sessions that release created
+   * without one are otherwise refused at completePayment.
    */
   defaultReturnUrl?: string;
   /** HMAC key for the stateless signed session context (see session-context.ts). */
@@ -260,11 +262,12 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
    * hostedTokenizationUrl (the session's clientSecret).
    *
    * Refused with invalid_request before anything reaches Worldline when the
-   * session has no return URL (neither `returnUrl` nor the adapter's
-   * `defaultReturnUrl`) or one Worldline rejects (over 200 characters, or
-   * without a protocol such as `https://` or an app scheme), when `id` is
-   * longer than the 40 characters `order.references.merchantReference`
-   * accepts, or when `statementDescriptor` is longer than the 256 characters
+   * session has no return URL (neither a non-empty `returnUrl` nor the
+   * adapter's `defaultReturnUrl`) or one Worldline rejects (over 200
+   * characters, or without a protocol such as `https://` or an app scheme),
+   * when `id` is longer than the 40 characters
+   * `order.references.merchantReference` accepts, or when
+   * `statementDescriptor` is longer than the 256 characters
    * `order.references.softDescriptor` accepts.
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
@@ -275,7 +278,8 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
         `Worldline adapter does not support one of the requested payment method types: ${input.paymentMethodTypes.join(", ")}`,
       );
     }
-    const returnUrl = input.returnUrl ?? this.config.defaultReturnUrl;
+    // || rather than ??: an empty returnUrl means none, so the default applies.
+    const returnUrl = input.returnUrl || this.config.defaultReturnUrl;
     if (!returnUrl) throw missingReturnUrl();
     assertReturnUrlFormat(returnUrl);
     assertReferenceLimits(input);
@@ -329,9 +333,13 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
    * `threeDSecure.skipAuthentication: false`, and the device data as
    * `order.customer.device`. `acceptHeader` and `ipAddress` are observed on the
    * customer's HTTP request and CompletePaymentInput carries neither, so they
-   * are not sent. `sca.challenge: "force"` requests `challengeIndicator:
-   * "challenge-required"`; `sca.exemption: "moto"` is withheld, as Worldline's
-   * `exemptionRequest` has no MOTO value.
+   * are not sent; nor is the Cartes Bancaires `useCase`, which the API
+   * contract spells `usecase`. The cardholder name is entered in the Hosted
+   * Tokenization iframe. `sca.challenge: "force"` requests
+   * `challengeIndicator: "challenge-required"`. `sca.exemption: "moto"` is not
+   * mapped yet: Worldline models MOTO as `transactionChannel: "MOTO"`, not as
+   * an exemption, so such a payment goes out as an e-commerce payment with
+   * 3-D Secure.
    *
    * A REDIRECT merchantAction (3-D Secure challenge) surfaces as
    * requires_action with the redirect URL on `raw`; the customer completes it
@@ -340,14 +348,16 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
   async completePayment(input: CompletePaymentInput): Promise<PaymentInfo> {
     const token = decodeWorldlineClientToken(input.clientToken);
     const context = await this.decodeContext(input.pspSessionId);
-    // Contexts signed before the return URL became mandatory may lack one.
-    const returnUrl = context.returnUrl ?? this.config.defaultReturnUrl;
+    // Contexts signed before the return URL became mandatory may lack one, or
+    // carry an empty one, which counts as none.
+    const returnUrl = context.returnUrl || this.config.defaultReturnUrl;
     if (!returnUrl) throw missingReturnUrl();
     const billing = mergeBillingDetails(context.billingDetails, input.billingDetails);
     const email = context.receiptEmail ?? billing?.email;
     const references: Record<string, string> = {
       ...(context.id ? { merchantReference: context.id } : {}),
-      // descriptor is deprecated; softDescriptor is the cardholder-statement text.
+      // descriptor is deprecated in favor of merchantReconciliationReference, a
+      // reconciliation field; softDescriptor is the cardholder-statement text.
       ...(context.statementDescriptor ? { softDescriptor: context.statementDescriptor } : {}),
     };
     const created = await this.request<WorldlineCreatePaymentResponse>(

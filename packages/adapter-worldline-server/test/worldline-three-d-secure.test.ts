@@ -80,6 +80,37 @@ function describeValue(value: unknown): string {
   return typeof value === "string" && value.length > 20 ? `a ${value.length}-character string` : JSON.stringify(value);
 }
 
+function urlOfLength(length: number): string {
+  const base = "https://host.example/return/";
+  return base + "r".repeat(length - base.length);
+}
+
+/** A CreatePayment body within every documented limit, as the adapter sends it. */
+function paymentBody(
+  overrides: { hostedTokenizationId?: string; order?: Record<string, unknown>; card?: Record<string, unknown> } = {},
+) {
+  return {
+    order: { amountOfMoney: { amount: 1000, currencyCode: "EUR" }, ...overrides.order },
+    hostedTokenizationId: overrides.hostedTokenizationId ?? "htp_1",
+    cardPaymentMethodSpecificInput: {
+      authorizationMode: "SALE",
+      returnUrl: RETURN_URL,
+      threeDSecure: { skipAuthentication: false, redirectionData: { returnUrl: RETURN_URL } },
+      ...overrides.card,
+    },
+  };
+}
+
+/** Sends a CreatePayment straight to the fake, bypassing the adapter's own checks. */
+async function postCreatePayment(fake: FakeWorldlineApi, body: unknown) {
+  const response = await fake.fetch(PAYMENTS_URL, {
+    method: "POST",
+    headers: { authorization: "GCS v1HMAC:api-key-id:signature", "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return { status: response.status, body: (await response.json()) as { errors?: Array<{ propertyName?: string }> } };
+}
+
 describe("decodeWorldlineClientToken", () => {
   it("decodes the confirm() envelope into the hostedTokenizationId and the device data", () => {
     expect(decodeWorldlineClientToken(envelope("htp_1", DEVICE))).toEqual({ hostedTokenizationId: "htp_1", device: DEVICE });
@@ -138,6 +169,14 @@ describe("decodeWorldlineClientToken", () => {
     }
   });
 
+  it("rejects an envelope whose hostedTokenizationId is blank, as it does a blank bare token", () => {
+    for (const blank of [" ", "   ", "\n\t "]) {
+      const error = thrownBy(() => decodeWorldlineClientToken(envelope(blank, DEVICE)));
+      expect(error).toMatchObject({ code: "invalid_request", retryable: false });
+      expect(error.raw).toEqual({ hostedTokenizationId: blank });
+    }
+  });
+
   it("ignores a device that is not an object", () => {
     for (const device of [null, "fr-BE", 42, ["fr-BE"], true]) {
       expect(decodeWorldlineClientToken(envelope("htp_1", device))).toEqual({ hostedTokenizationId: "htp_1" });
@@ -182,12 +221,14 @@ describe("decodeWorldlineClientToken", () => {
     }
   }
 
-  it("drops every key outside Worldline's device contract, including a browser-claimed acceptHeader and ipAddress", () => {
+  it("keeps only the device fields a browser can read, refusing the acceptHeader, ipAddress and deviceFingerprint Worldline defines", () => {
+    const sent = { ...DEVICE, acceptHeader: "text/html", ipAddress: "203.0.113.7", deviceFingerprint: "fp-1" };
+    expect(decodeWorldlineClientToken(envelope("htp_1", sent)).device).toEqual(DEVICE);
+  });
+
+  it("drops keys Worldline does not define, on the device and in browserData", () => {
     const sent = {
       ...DEVICE,
-      acceptHeader: "text/html",
-      ipAddress: "203.0.113.7",
-      deviceFingerprint: "fp-1",
       extra: { nested: true },
       browserData: { ...DEVICE.browserData, innerWidth: 1200, innerHeight: 800 },
     };
@@ -249,14 +290,17 @@ describe("completePayment sends Worldline's mandatory 3-D Secure data", () => {
     [undefined, undefined],
   ];
   for (const [sca, challengeIndicator] of scaCases) {
-    it(`maps sca ${JSON.stringify(sca) ?? "absent"} to ${challengeIndicator ?? "no challengeIndicator"} and never an exemption`, async () => {
+    it(`maps sca ${JSON.stringify(sca) ?? "absent"} to ${challengeIndicator ?? "no challengeIndicator"}, as an e-commerce payment with 3-D Secure`, async () => {
       const { adapter, fake } = makePair();
       await complete(adapter, sca ? { sca } : {});
-      const threeDSecure = createPaymentBody(fake).cardPaymentMethodSpecificInput.threeDSecure;
-      if (challengeIndicator) expect(threeDSecure).toHaveProperty("challengeIndicator", challengeIndicator);
-      else expect(threeDSecure).not.toHaveProperty("challengeIndicator");
-      // Worldline's exemptionRequest has no MOTO value, so the exemption is withheld.
-      expect(threeDSecure).not.toHaveProperty("exemptionRequest");
+      const card = createPaymentBody(fake).cardPaymentMethodSpecificInput;
+      if (challengeIndicator) expect(card.threeDSecure).toHaveProperty("challengeIndicator", challengeIndicator);
+      else expect(card.threeDSecure).not.toHaveProperty("challengeIndicator");
+      // Worldline models MOTO as transactionChannel "MOTO", not as an exemption, and the
+      // adapter does not map it yet: every payment keeps the default ECOMMERCE channel.
+      expect(card).not.toHaveProperty("transactionChannel");
+      expect(card.threeDSecure).not.toHaveProperty("exemptionRequest");
+      expect(card.threeDSecure).toHaveProperty("skipAuthentication", false);
     });
   }
 
@@ -265,6 +309,20 @@ describe("completePayment sends Worldline's mandatory 3-D Secure data", () => {
     const info = await complete(adapter, { id: "order-77", statementDescriptor: "SHOP ORDER 77" });
     expect(info.id).toBe("order-77");
     expect(createPaymentBody(fake).order.references).toEqual({ merchantReference: "order-77", softDescriptor: "SHOP ORDER 77" });
+  });
+
+  it("forwards the decoded hostedTokenizationId, never the envelope an earlier server adapter sent whole", async () => {
+    const forwardedWhole = await postCreatePayment(
+      new FakeWorldlineApi(),
+      paymentBody({ hostedTokenizationId: envelope("htp_1", DEVICE) }),
+    );
+    expect(forwardedWhole.status).toBe(400);
+    expect(forwardedWhole.body.errors?.[0]?.propertyName).toBe("hostedTokenizationId");
+
+    const { adapter, fake } = makePair();
+    const info = await complete(adapter, {}, envelope("htp_1", DEVICE));
+    expect(info.status).toBe("succeeded");
+    expect(createPaymentBody(fake).hostedTokenizationId).toBe("htp_1");
   });
 
   it("sends no device data for a bare hostedTokenizationId", async () => {
@@ -339,6 +397,51 @@ describe("the 3-D Secure return URL is mandatory", () => {
     });
   });
 
+  it("treats an empty returnUrl as none: defaultReturnUrl applies, and without one the session is refused as missing", async () => {
+    const fallback = makePair({ defaultReturnUrl: DEFAULT_RETURN_URL });
+    await complete(fallback.adapter, { returnUrl: "" });
+    expect(createPaymentBody(fallback.fake).cardPaymentMethodSpecificInput).toMatchObject({
+      returnUrl: DEFAULT_RETURN_URL,
+      threeDSecure: { redirectionData: { returnUrl: DEFAULT_RETURN_URL } },
+    });
+
+    const { adapter, fetchSpy } = makePair();
+    const error = await adapter
+      .createPaymentSession({ amount: 1000, currency: "EUR", returnUrl: "", idempotencyKey: "k" })
+      .then(() => undefined, (err: unknown) => err as PayFanoutError);
+    expect(error).toMatchObject({ code: "invalid_request", retryable: false });
+    expect(error?.message).toMatch(/defaultReturnUrl/);
+    expect(error?.message).not.toMatch(/protocol/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("completes a context carrying an empty returnUrl through defaultReturnUrl", async () => {
+    const context = await encodeSessionContext(
+      {
+        v: 1,
+        amount: 1000,
+        currency: "EUR",
+        captureMethod: "automatic",
+        hostedTokenizationId: "htp_old",
+        expiresAt: Date.now() + 60_000,
+        returnUrl: "",
+      },
+      SIGNING_KEY,
+    );
+    const input = { pspSessionId: context, clientToken: envelope("htp_old", DEVICE), idempotencyKey: "complete-empty" };
+
+    const withoutDefault = makePair();
+    await expect(withoutDefault.adapter.completePayment(input)).rejects.toMatchObject({ code: "invalid_request" });
+    expect(withoutDefault.fetchSpy).not.toHaveBeenCalled();
+
+    const withDefault = makePair({ defaultReturnUrl: DEFAULT_RETURN_URL });
+    expect((await withDefault.adapter.completePayment(input)).status).toBe("succeeded");
+    expect(createPaymentBody(withDefault.fake).cardPaymentMethodSpecificInput).toMatchObject({
+      returnUrl: DEFAULT_RETURN_URL,
+      threeDSecure: { redirectionData: { returnUrl: DEFAULT_RETURN_URL } },
+    });
+  });
+
   it("completes a context signed before the return URL was mandatory only through defaultReturnUrl", async () => {
     const legacyContext = await encodeSessionContext(
       { v: 1, amount: 1000, currency: "EUR", captureMethod: "automatic", hostedTokenizationId: "htp_old", expiresAt: Date.now() + 60_000 },
@@ -389,26 +492,92 @@ describe("order references follow Worldline's limits", () => {
   });
 });
 
-describe("the fake is as strict as the documented platform", () => {
-  const authorization = { authorization: "GCS v1HMAC:api-key-id:signature", "content-type": "application/json" };
+describe("the fake enforces the documented limits the adapter relies on", () => {
+  async function expectRejection(body: unknown, propertyName: string): Promise<void> {
+    const fake = new FakeWorldlineApi();
+    const response = await postCreatePayment(fake, body);
+    expect(response.status).toBe(400);
+    expect(response.body.errors?.[0]?.propertyName).toBe(propertyName);
+    expect(mapWorldlineError(400, response.body).code).toBe("invalid_request");
+    expect(fake.uniquePaymentCreations).toBe(0);
+  }
+
+  it("accepts a CreatePayment within every limit, so each rejection below comes from one property", async () => {
+    const fake = new FakeWorldlineApi();
+    expect((await postCreatePayment(fake, paymentBody())).status).toBe(201);
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
 
   it("rejects a CreatePayment without threeDSecure.redirectionData.returnUrl, even with the flat returnUrl", async () => {
-    const fake = new FakeWorldlineApi();
-    const response = await fake.fetch(PAYMENTS_URL, {
-      method: "POST",
-      headers: authorization,
-      body: JSON.stringify({
-        order: { amountOfMoney: { amount: 1000, currencyCode: "EUR" } },
-        hostedTokenizationId: "htp_1",
-        cardPaymentMethodSpecificInput: { authorizationMode: "SALE", returnUrl: RETURN_URL },
-      }),
-    });
-    expect(response.status).toBe(400);
-    const body = (await response.json()) as { errors: Array<{ propertyName?: string }> };
-    expect(body.errors[0]?.propertyName).toBe("cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl");
-    expect(mapWorldlineError(400, body).code).toBe("invalid_request");
-    expect(fake.uniquePaymentCreations).toBe(0);
+    await expectRejection(
+      paymentBody({ card: { threeDSecure: undefined } }),
+      "cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl",
+    );
   });
+
+  it("rejects a flat returnUrl over 200 characters or without a protocol, even beside a valid redirection one", async () => {
+    for (const returnUrl of [urlOfLength(201), "shop.example/return", "/checkout/return"]) {
+      await expectRejection(paymentBody({ card: { returnUrl } }), "cardPaymentMethodSpecificInput.returnUrl");
+    }
+    const fake = new FakeWorldlineApi();
+    expect((await postCreatePayment(fake, paymentBody({ card: { returnUrl: urlOfLength(200) } }))).status).toBe(201);
+  });
+
+  it("rejects a softDescriptor over 256 characters and accepts one of exactly 256", async () => {
+    await expectRejection(
+      paymentBody({ order: { references: { softDescriptor: "d".repeat(257) } } }),
+      "order.references.softDescriptor",
+    );
+    const fake = new FakeWorldlineApi();
+    const atLimit = paymentBody({ order: { references: { softDescriptor: "d".repeat(256) } } });
+    expect((await postCreatePayment(fake, atLimit)).status).toBe(201);
+  });
+
+  it("accepts every order.customer.device field at its contract limit, the ones the adapter never sends included", async () => {
+    const device = {
+      acceptHeader: "a".repeat(2048),
+      ipAddress: "i".repeat(45),
+      locale: "l".repeat(35),
+      timezoneOffsetUtcMinutes: "-12345",
+      userAgent: "u".repeat(2048),
+      deviceFingerprint: "f".repeat(1024),
+      browserData: { colorDepth: 99, javaEnabled: true, javaScriptEnabled: true, screenHeight: "999999", screenWidth: "999999" },
+    };
+    const fake = new FakeWorldlineApi();
+    expect((await postCreatePayment(fake, paymentBody({ order: { customer: { device } } }))).status).toBe(201);
+  });
+
+  it("rejects an order.customer.device that is not an object", async () => {
+    for (const device of ["fr-BE", ["fr-BE"], 42]) {
+      await expectRejection(paymentBody({ order: { customer: { device } } }), "order.customer.device");
+    }
+  });
+
+  const deviceRejections: Array<[string, unknown]> = [
+    ["acceptHeader", "a".repeat(2049)],
+    ["ipAddress", "i".repeat(46)],
+    ["locale", "l".repeat(36)],
+    ["locale", 35],
+    ["timezoneOffsetUtcMinutes", -120],
+    ["timezoneOffsetUtcMinutes", "-123456"],
+    ["userAgent", "u".repeat(2049)],
+    ["deviceFingerprint", "f".repeat(1025)],
+    ["browserData", "24-bit"],
+    ["browserData.colorDepth", 100],
+    ["browserData.colorDepth", 24.5],
+    ["browserData.colorDepth", "24"],
+    ["browserData.javaEnabled", "false"],
+    ["browserData.javaScriptEnabled", 1],
+    ["browserData.screenHeight", 1080],
+    ["browserData.screenWidth", "1234567"],
+  ];
+  for (const [field, value] of deviceRejections) {
+    it(`rejects order.customer.device.${field} = ${describeValue(value)}, off the contract's types and limits`, async () => {
+      const [parent, child] = field.split(".") as [string, string | undefined];
+      const device = child ? { [parent]: { [child]: value } } : { [parent]: value };
+      await expectRejection(paymentBody({ order: { customer: { device } } }), `order.customer.device.${field}`);
+    });
+  }
 
   it("rejects a merchantReference over 40 characters that a hand-minted context carries to it", async () => {
     const { adapter, fake, fetchSpy } = makePair();
@@ -435,11 +604,6 @@ describe("the fake is as strict as the documented platform", () => {
 
 describe("the return URL follows Worldline's length and protocol rules", () => {
   const propertyName = "cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl";
-
-  function urlOfLength(length: number): string {
-    const base = "https://host.example/return/";
-    return base + "r".repeat(length - base.length);
-  }
 
   function refusal(adapter: WorldlineServerAdapter, session: Partial<CreatePaymentSessionInput>) {
     return adapter

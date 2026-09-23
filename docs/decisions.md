@@ -462,7 +462,13 @@ docs.direct.worldline-solutions.com unless noted):
   `clientSecret` is the `hostedTokenizationUrl` the browser iframe mounts from (no client
   key). The host id round-trips via `order.references.merchantReference` only — Worldline has
   no arbitrary metadata map — so conformance `money.expectations` is
-  `{ idRoundTrip: true, metadataEcho: false }`.
+  `{ idRoundTrip: true, metadataEcho: false }`. Doc-verified 2026-09-23 (Hosted Tokenization
+  Page guide and the served `tokenizer.min.js`): the browser `Tokenizer` hides the
+  cardholder-name field unless constructed with `hideCardholderName: false`, although the name
+  is mandatory, and calls `validationCallback` with `{ valid }` whenever the form's validity
+  changes, so the client adapter defaults `hideCardholderName` to `false` (a host
+  `fieldOptions` value still wins) and owns `validationCallback` to drive `onChange`, passing
+  each result on to a host-supplied one.
 - **CreatePayment wiring (corrected in review, 2026-07-15):** `hostedTokenizationId` rides
   at the ROOT of the CreatePayment request — the platform's current domain model declares it
   there and `CardPaymentMethodSpecificInput` has no such field (the guide's "replace the

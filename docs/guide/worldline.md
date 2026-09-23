@@ -24,7 +24,7 @@ going live.
 Both key pairs come from the **Worldline Merchant Portal** (see Worldline's
 [authentication](https://docs.direct.worldline-solutions.com/en/integration/api-developer-guide/authentication)
 and [webhooks](https://docs.direct.worldline-solutions.com/en/integration/api-developer-guide/webhooks)
-guides):
+guides; Back Office and e-Portal users follow the chapters those pages link for their tool):
 
 - **API key id + secret API key:** Developer → Payment API → *Add API Key*. The screen then
   shows the pair under *API Key ID* / *Secret API Key*.
@@ -36,8 +36,10 @@ Each secret is displayed for **60 seconds only** and never again, so copy it int
 store as soon as it appears. The key ids stay visible in the portal.
 
 API key pairs **expire**: renew before the date in the *Expiration date* column under
-Developer → Payment API. Creating a new pair **revokes** the current one, which then expires
-within **four hours**, so deploy the new `apiKeyId` / `secretApiKey` inside that window.
+Developer → Payment API. Creating a new **API key** pair **revokes** the current one, which
+then expires within **four hours**, so deploy the new `apiKeyId` / `secretApiKey` inside that
+window. Webhook key pairs get no such window: generating a new pair revokes the current one
+immediately, so add the new pair to `webhookKeys` before you switch it in the portal.
 
 | Credential | What it is | Used by |
 | --- | --- | --- |

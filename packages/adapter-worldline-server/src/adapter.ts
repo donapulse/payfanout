@@ -661,9 +661,9 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       ...(hasBody ? { contentType: "application/json" } : {}),
       gcsHeaders,
     });
-    // The Date header is sent AND signed. Worldline's manual-authentication
-    // examples also send an x-gcs-date header alongside it, signed as one of the
-    // canonical x-gcs-* headers (see signing.ts).
+    // The Date header is sent AND signed and is the only timestamp: the optional
+    // x-gcs-date from Worldline's manual-authentication examples is not sent
+    // (see signing.ts).
     const headers: Record<string, string> = { authorization, date };
     if (hasBody) headers["content-type"] = "application/json";
     for (const [key, value] of Object.entries(gcsHeaders)) headers[key] = value;

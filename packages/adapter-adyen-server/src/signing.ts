@@ -10,25 +10,60 @@ const encoder = new TextEncoder();
 /** Adyen caps the `idempotency-key` header at 64 characters. */
 export const ADYEN_IDEMPOTENCY_KEY_MAX_LENGTH = 64;
 
+/** Leads every encoding, so a later derivation cannot reproduce a value this one sends. */
+const IDEMPOTENCY_KEY_DERIVATION = "adyen-idempotency-key/2";
+
 /**
- * A caller's `idempotencyKey` is arbitrary; Adyen's header takes at most 64
- * characters. A SHA-256 hex digest is exactly 64 and deterministic, so the same
- * caller key on the same endpoint always derives the same header value and a
- * replay dedupes at Adyen.
+ * The `idempotency-key` header of one Adyen request. A caller's
+ * `idempotencyKey` is arbitrary and the header takes at most 64 characters, so
+ * it travels as a SHA-256 hex digest: exactly 64 characters, deterministic, and
+ * identical on every retry of the same request, which Adyen then answers from
+ * its store instead of performing it again.
  *
- * The request path is part of the digest because Adyen stores idempotency keys
- * **at company account level**, not per endpoint: a key already consumed by
- * `/payments` would make Adyen replay that stored response for the very next
- * call, whatever endpoint it targets. One caller key legitimately drives two
- * endpoints — `/payments` then `/payments/details` when a 3-D Secure challenge
- * comes back, or a capture and then a refund — and without the path those calls
- * collide: the payment would never leave `requires_action`, and the refund would
- * answer with the capture's acknowledgement.
+ * Adyen stores idempotency keys **at company account level** and checks their
+ * uniqueness there, not per endpoint or merchant account: a value one request
+ * consumed replays that request's stored response to any other request that
+ * sends it. The digest therefore covers everything that tells two requests
+ * apart under one caller key: the merchant account (two merchant accounts of
+ * one company), the path (`/payments` then `/payments/details`, a capture then a
+ * refund) and, for `/payments/details`, the submitted `details` and
+ * `paymentData`, since each step of a multi-step action flow submits different
+ * data while a replayed step submits the same. The fields are encoded as a JSON
+ * array and the submission as canonical JSON (object keys sorted), so no two
+ * distinct inputs share an encoding.
  */
-export async function deriveAdyenIdempotencyKey(path: string, idempotencyKey: string): Promise<string> {
-  // The newline cannot appear in a path, so no pair of (path, key) inputs can
-  // produce the same digest input as another.
-  return sha256Hex(`${path}\n${idempotencyKey}`);
+export async function deriveAdyenIdempotencyKey(request: {
+  /** The merchant account the request is booked against. */
+  merchantAccount: string;
+  /** The Checkout API path without host or version, e.g. `/payments/{pspReference}/refunds`. */
+  path: string;
+  /** The caller's `idempotencyKey`. */
+  idempotencyKey: string;
+  /** `/payments/details` only: the request's `details`, as sent. */
+  details?: unknown;
+  /** `/payments/details` only: the request's `paymentData`, when it carries one. */
+  paymentData?: string;
+}): Promise<string> {
+  const { merchantAccount, path, idempotencyKey, details, paymentData } = request;
+  const submission =
+    details === undefined && paymentData === undefined
+      ? null
+      : await sha256Hex(canonicalJson({ details, paymentData }));
+  return sha256Hex(JSON.stringify([IDEMPOTENCY_KEY_DERIVATION, merchantAccount, path, idempotencyKey, submission]));
+}
+
+/** JSON with object keys sorted at every depth, so equal values always encode alike. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item ?? null)).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const members = Object.keys(record)
+      .filter((key) => record[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`);
+    return `{${members.join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 /**

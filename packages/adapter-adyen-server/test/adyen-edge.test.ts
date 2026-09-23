@@ -112,15 +112,16 @@ describe("transport edge cases", () => {
   });
 
   it("derives one idempotency header per endpoint, deterministically and within Adyen's limit", async () => {
-    const payments = await deriveAdyenIdempotencyKey("/payments", "caller-key");
+    const scope = { merchantAccount: "TestMerchant", path: "/payments", idempotencyKey: "caller-key" };
+    const payments = await deriveAdyenIdempotencyKey(scope);
     expect(payments).toMatch(/^[0-9a-f]{64}$/);
     expect(payments.length).toBeLessThanOrEqual(ADYEN_IDEMPOTENCY_KEY_MAX_LENGTH);
     // Same call, same key: Adyen replays its stored response instead of charging twice.
-    expect(await deriveAdyenIdempotencyKey("/payments", "caller-key")).toBe(payments);
+    expect(await deriveAdyenIdempotencyKey({ ...scope })).toBe(payments);
     // Adyen stores keys per company account, so a second endpoint must not
     // inherit the first one's stored response.
-    expect(await deriveAdyenIdempotencyKey("/payments/details", "caller-key")).not.toBe(payments);
-    expect(await deriveAdyenIdempotencyKey("/payments", "another-key")).not.toBe(payments);
+    expect(await deriveAdyenIdempotencyKey({ ...scope, path: "/payments/details" })).not.toBe(payments);
+    expect(await deriveAdyenIdempotencyKey({ ...scope, idempotencyKey: "another-key" })).not.toBe(payments);
   });
 
   it("rejects a hex HMAC key that is not hex", () => {

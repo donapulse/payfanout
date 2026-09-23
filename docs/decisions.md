@@ -1306,8 +1306,10 @@ Adyen's published HMAC vector, not on observed traffic. The authoring checklist 
 sandbox round-trip before production use, and the setup guide carries that warning:
 
 - **Push-only is the whole shape.** The Checkout API exposes no read for a payment and none
-  for a refund, and `/captures`, `/cancels`, `/refunds`, `/reversals`, `/amountUpdates` all
-  answer `{ status: "received" }`. Capabilities therefore declare
+  for a refund, and `/captures`, `/cancels`, `/refunds` and `/reversals` always answer
+  `{ status: "received" }`, as does `/amountUpdates` unless the request carries
+  `adjustAuthorisationData`, which makes it answer `authorised` or `refused` (the adapter
+  calls neither of the last two). Capabilities therefore declare
   `supportsPaymentRetrieval: false`, `supportsRefundRetrieval: false` and
   `modificationOutcome: "asynchronous"`; capture and cancel resolve `"processing"`, refunds
   `"pending"`, no `amountCaptured` is ever synthesized, and neither `retrievePayment` nor
@@ -1337,6 +1339,42 @@ sandbox round-trip before production use, and the setup guide carries that warni
   `errorCode` 704 (a duplicate racing the still in-flight original) maps to a retryable
   `processing_error` and the transport loop replays it; a 409 is retried only when Adyen
   sends `transient-error: true`.
+  - **Rescoped 2026-09-23**, doc-verified against the API idempotency guide, the HTTP status
+    codes and error codes pages, the capture/cancel/refund guides, the Checkout v72 release
+    note and the v72 OpenAPI contract (`github.com/Adyen/adyen-openapi`,
+    `CheckoutService-v72.json`), superseding the path-only digest above. The guide says keys
+    "are stored at a company account level" and checked for uniqueness there, so a caller key
+    shared by two merchant accounts of one company, or by two steps of one multi-step action
+    flow, replayed the first answer. The header is now `sha256Hex` of the JSON array
+    `["adyen-idempotency-key/2", merchantAccount, path, idempotencyKey, submission]`, where
+    `submission` is, on `/payments/details` only, `sha256Hex` of the canonical JSON (object
+    keys sorted) of the request's `details` and `paymentData`, and `null` elsewhere: each
+    step is its own request while a replayed step still dedupes, and the `/payments` body
+    stays out of the digest, so a completion retried under the same key dedupes whatever
+    payment-method blob it carries. Keys are valid for 7 to 14 days and "will not be checked
+    for duplication in other regions". The guide recommends random v4 UUID keys "to prevent
+    two API credentials under the same account from accessing each others responses"; the
+    digest keeps a random caller key unguessable, and the setup guide asks hosts for one. A
+    replayed key answers the first response whatever the request, so the contract's
+    required `amount` on capture and refund acknowledgements must echo the amount and
+    currency requested: a different echo is an earlier request's stored answer and rejects
+    with a non-retryable `invalid_request`; an acknowledgement without its own
+    `pspReference`, or without that `amount`, rejects with a retryable `processing_error`
+    (a replay under the same key cannot repeat the modification), and a 2xx that is not a
+    JSON object with a retryable `psp_unavailable`. The refund guide's response example
+    omits `amount` while the contract requires it and its own 201 example carries it —
+    sandbox-verify before relying on refunds. Captures and cancels on an unknown
+    `pspReference` fail by webhook (`Transaction not found`), not in the answer, so the fake
+    acknowledges them whatever the reference, and refunds alike (the refund guide lists no
+    such reason; an assumption of the fake, which the adapter handles either way).
+    Classification follows the same pages: `transient-error: true` is retryable at any
+    status (`processing_error` below 500, `psp_unavailable` from 500), `errorCode` 705 is
+    `rate_limited`, 408 ("You can retry the request") a retryable `psp_unavailable`, and 501
+    or a 5xx typed `validation`, `configuration` or `security` a non-retryable
+    `invalid_request` (the contract's generic 500 example is `905`/`configuration`, and v72
+    moved only "some validation and rate limit errors" from 500 to 422/429). A retry that
+    spans the upgrade sends a new header and is not deduplicated against the request sent
+    before it.
 - **`returnUrl` is required on POST /payments in v72**, alongside `merchantAccount`,
   `amount`, `reference` and `paymentMethod`, so the adapter takes a `defaultReturnUrl`
   config (the PayPal adapter's `returnUrl` fallback is the precedent): the session's own

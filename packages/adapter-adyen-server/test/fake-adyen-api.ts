@@ -1,28 +1,33 @@
 /**
- * In-memory Adyen Checkout API. Models the documented behavior the adapter
- * relies on:
+ * In-memory Adyen Checkout API for ONE company account. Models the documented
+ * behavior the adapter relies on:
  *   - `X-API-Key` authentication; a lever forces 401
  *   - `idempotency-key` dedupe on every POST (Adyen honors the header on POST
- *     only and retains keys for at least seven days), so the conformance
- *     idempotency proof holds: one side effect per key, the stored response
- *     replayed verbatim. The keys are stored at COMPANY ACCOUNT level, not per
- *     endpoint, so the replay map is keyed on the header alone — a key already
- *     consumed by /payments replays that response on any other endpoint
+ *     only and keeps keys for 7 to 14 days), so the conformance idempotency
+ *     proof holds: one side effect per key, the first stored response replayed
+ *     verbatim on every reuse, whatever the request. The keys are stored at
+ *     COMPANY ACCOUNT level, not per endpoint or merchant account, so the replay
+ *     map is keyed on the header alone and shared by every adapter talking to
+ *     this fake, whichever merchant account it books against
  *   - POST /payments requiring every field Adyen marks required (`merchantAccount`,
  *     `reference`, `amount`, `paymentMethod` and `returnUrl`), returning
  *     `pspReference` + `resultCode`, with an `action` for a 3-D Secure challenge
  *     and a refusal carrying `refusalReasonCode`
  *   - POST /payments/details finishing an action
  *   - captures / cancels / refunds answering `{ status: "received" }` ONLY, each
- *     with its own pspReference — the outcome exists nowhere else until the
- *     webhook lands, which is what makes Adyen push-only
+ *     with its own pspReference, captures and refunds echoing the amount sent —
+ *     for ANY payment reference: Adyen reports an unknown one in the outcome
+ *     webhook ("Transaction not found"), not in the answer. The outcome exists
+ *     nowhere else until the webhook lands, which is what makes Adyen push-only
  *
  * Validation errors carry Adyen's envelope shape (`status`, `message`,
  * `errorType`, `pspReference`) without an `errorCode`: the real codes live in
  * Adyen's error-code list and the adapter classifies by HTTP status, so pinning
  * invented codes here would assert provider behavior the fake cannot vouch for.
- * The one code that IS behavioral, 704 (a duplicate racing the in-flight
- * original), is modeled explicitly.
+ * The codes that ARE behavioral are modeled explicitly: 704 (a duplicate racing
+ * the in-flight original) by `transientConflicts`, and any documented envelope
+ * or header — 705, `transient-error`, a 5xx typed `configuration` — through
+ * `scriptedResponses`.
  */
 export interface StoredPayment {
   pspReference: string;
@@ -43,6 +48,25 @@ const REFUSAL_TRIGGER = /^REFUSED(?::(\d+))?$/;
 /** Holder name that makes the fake answer with a 3-D Secure action instead of a result. */
 const CHALLENGE_TRIGGER = "CHALLENGE";
 
+/** The `merchantRefundReason` values the Checkout API accepts on a refund. */
+const MERCHANT_REFUND_REASONS = ["FRAUD", "CUSTOMER REQUEST", "RETURN", "DUPLICATE", "OTHER"];
+
+/** An answer served as is, before routing, authentication and the idempotency store. */
+export interface ScriptedResponse {
+  status: number;
+  /** Serialized as JSON unless `rawBody` is set. */
+  body?: unknown;
+  /** Sent verbatim: a body no Adyen endpoint sends (an HTML page, nothing at all). */
+  rawBody?: string;
+  headers?: Record<string, string>;
+}
+
+export interface RecordedRequest {
+  path: string;
+  idempotencyKey: string | undefined;
+  body: Record<string, unknown> | undefined;
+}
+
 export class FakeAdyenApi {
   private readonly payments = new Map<string, StoredPayment>();
   private readonly replayByKey = new Map<string, { status: number; body: unknown }>();
@@ -51,6 +75,10 @@ export class FakeAdyenApi {
   uniqueCaptureRequests = 0;
   uniqueCancelRequests = 0;
   uniqueRefundRequests = 0;
+  /** Requests answered from the idempotency store instead of being performed. */
+  replays = 0;
+  /** Every request received, in order, scripted answers included. */
+  readonly requests: RecordedRequest[] = [];
   lastPaymentBody: Record<string, unknown> | undefined;
   lastRequestBody: Record<string, unknown> | undefined;
   lastRequestPath: string | undefined;
@@ -62,6 +90,8 @@ export class FakeAdyenApi {
   serverError = false;
   /** Answers this many 409s (transient) before serving the request. */
   transientConflicts = 0;
+  /** Served first, one per request, in order. */
+  scriptedResponses: ScriptedResponse[] = [];
 
   readonly fetch: typeof fetch = async (input, init) => {
     if (this.networkFailure) throw new TypeError("simulated network failure");
@@ -72,7 +102,15 @@ export class FakeAdyenApi {
     this.lastRequestPath = path;
     this.lastRequestBody = body;
     this.lastIdempotencyKey = headers["idempotency-key"];
+    this.requests.push({ path, idempotencyKey: headers["idempotency-key"], body });
 
+    const scripted = this.scriptedResponses.shift();
+    if (scripted) {
+      return new Response(scripted.rawBody ?? JSON.stringify(scripted.body), {
+        status: scripted.status,
+        headers: { "content-type": "application/json", ...scripted.headers },
+      });
+    }
     if (this.authFailure || !headers["x-api-key"]) {
       return json(401, { status: 401, message: "HTTP Status Response - Unauthorized", errorType: "security" });
     }
@@ -94,6 +132,7 @@ export class FakeAdyenApi {
     const key = headers["idempotency-key"];
     if (key && this.replayByKey.has(key)) {
       const replayed = this.replayByKey.get(key)!;
+      this.replays++;
       return json(replayed.status, replayed.body);
     }
 
@@ -212,13 +251,16 @@ export class FakeAdyenApi {
     operation: string,
     body: Record<string, unknown>,
   ): { status: number; body: unknown } {
-    if (!this.payments.has(pspReference)) {
-      return validationError("Original pspReference required for this operation.");
-    }
+    // No lookup of the payment: an unknown reference is acknowledged like any
+    // other, and fails in the outcome webhook.
     if (!body["merchantAccount"]) return validationError("Required field 'merchantAccount' is not provided.");
     const amount = (body["amount"] ?? {}) as { value?: number; currency?: string };
     if (operation !== "cancels" && (typeof amount.value !== "number" || !amount.currency)) {
       return validationError("Required field 'amount' is not provided.");
+    }
+    const reason = body["merchantRefundReason"];
+    if (operation === "refunds" && reason !== undefined && !MERCHANT_REFUND_REASONS.includes(String(reason))) {
+      return validationError("Field 'merchantRefundReason' is not valid.");
     }
     if (operation === "captures") this.uniqueCaptureRequests++;
     if (operation === "cancels") this.uniqueCancelRequests++;
@@ -233,6 +275,7 @@ export class FakeAdyenApi {
         // The only status a modification ever answers with.
         status: "received",
         ...(operation === "cancels" ? {} : { amount }),
+        ...(reason === undefined ? {} : { merchantRefundReason: reason }),
       },
     };
   }

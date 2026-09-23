@@ -229,9 +229,14 @@ runServerAdapterConformanceTests(
         expectedCode: "invalid_request",
       },
       {
-        name: "refundPayment on an unknown pspReference",
-        invoke: (a) =>
-          a.refundPayment({ pspPaymentId: "8836100000000042:1000:EUR", amount: 500, idempotencyKey: "k" }),
+        // Adyen acknowledges a refund on any reference and reports an unknown
+        // one by webhook, so the first call resolves; the second is answered with
+        // the first one's stored acknowledgement, which echoes another amount.
+        name: "refundPayment reusing an idempotency key for a different amount",
+        invoke: async (a) => {
+          await a.refundPayment({ pspPaymentId: "8836100000000042:1000:EUR", amount: 500, idempotencyKey: "k" });
+          return a.refundPayment({ pspPaymentId: "8836100000000042:1000:EUR", amount: 400, idempotencyKey: "k" });
+        },
         expectedCode: "invalid_request",
       },
       {
@@ -698,9 +703,11 @@ describe("AdyenServerAdapter specifics", () => {
     await expect(
       adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken: CLIENT_TOKEN, idempotencyKey: "c1" }),
     ).rejects.toMatchObject({ code: "processing_error", retryable: false });
+    // A refund replayed under the same key cannot be performed twice, so the
+    // unconfirmed acknowledgement is safe to retry.
     await expect(
       adapter.refundPayment({ pspPaymentId: "8836100000000042:1000:EUR", idempotencyKey: "r1" }),
-    ).rejects.toMatchObject({ code: "processing_error", retryable: false });
+    ).rejects.toMatchObject({ code: "processing_error", retryable: true });
   });
 
   it("rejects a host id longer than an Adyen reference and unknown payment method types", async () => {

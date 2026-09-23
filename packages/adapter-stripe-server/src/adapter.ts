@@ -1111,7 +1111,8 @@ async function loadStripeSdk(config: StripeServerAdapterConfig): Promise<StripeC
   return new StripeCtor(config.secretKey, {
     // Pinned apiVersion: never rely on the account default, which changes silently.
     apiVersion: config.apiVersion,
-    // Idempotency keys make network retries safe; the SDK backs off on its own.
+    // Retried POSTs reuse one idempotency key and the SDK backs off on its own; subscriptions.cancel
+    // (a DELETE, where keys have no effect) is made replay-safe by its re-fetch instead.
     maxNetworkRetries: config.maxNetworkRetries ?? 2,
     // Bounds each request (headers and body); unset, the SDK's own 80s default applies.
     ...(config.requestTimeoutMs !== undefined ? { timeout: config.requestTimeoutMs } : {}),

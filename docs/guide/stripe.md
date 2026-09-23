@@ -80,7 +80,8 @@ const payments = new PaymentService({ adapters: [stripe] });
 | `environment` | ✅ | - | Exactly `"sandbox"` or `"live"`. Never inferred from the `sk_test`/`sk_live` prefix. |
 | `verifyPaymentMethodStrategy` | - | `"setup_intent_detach"` | Zero-amount verification attaches a PaymentMethod, so the default **detaches it on every path** to honor no-vaulting. Set `"disabled"` to turn the capability off entirely. |
 | `webhookToleranceSeconds` | - | `300` | Replay-protection window for the webhook timestamp. |
-| `maxNetworkRetries` | - | `2` | Network-level retries inside the Stripe SDK, safe because every mutating call carries an idempotency key. |
+| `requestTimeoutMs` | - | SDK default (`80000`) | Abort a hung Stripe request, response body included; surfaces as a retryable `psp_unavailable`. Applies per attempt: a timeout before the response starts is retried within `maxNetworkRetries`. |
+| `maxNetworkRetries` | - | `2` | Network-level retries inside the Stripe SDK. Calls that create objects or move money carry the caller's idempotency key, so a retry cannot duplicate them. At `0` the SDK still replays a closed connection once. |
 
 Every mutating call takes an integer **minor-unit** `amount` and a required
 `idempotencyKey`, see [Server usage](/guide/server) for the full lifecycle.

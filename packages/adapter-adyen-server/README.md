@@ -60,10 +60,11 @@ payment or for a refund, and captures, cancels and refunds answer `{ "status": "
 not confirmed; the confirmation is the webhook.
 
 They resolve only on a real acknowledgement: one carrying the modification's own
-`pspReference` and, for a capture or refund, echoing the amount and currency requested. An
-answer without them rejects with a retryable `processing_error` (a replay under the same key
-cannot repeat the modification), and an echo of another amount rejects with `invalid_request`,
-because it is Adyen's stored answer to an earlier request that used the same idempotency key.
+`pspReference`. An answer without it rejects with a retryable `processing_error` (a replay
+under the same key cannot repeat the modification). A capture or refund acknowledgement that
+echoes another amount or currency rejects with `invalid_request`, because it is Adyen's stored
+answer to an earlier request that used the same idempotency key; one that echoes no amount is
+accepted, as Adyen's refund guide shows acknowledgements without it.
 
 Consequences worth designing around:
 

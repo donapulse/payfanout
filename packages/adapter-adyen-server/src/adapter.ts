@@ -619,7 +619,10 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
         pspName: this.pspName,
       });
     if (typeof response.pspReference !== "string" || response.pspReference === "") throw unconfirmed();
-    if (requested) {
+    // The contract requires the echo, but the refund guide's own example omits
+    // it: an absent echo is accepted, since refusing it would report a refund
+    // Adyen took as failed. Only an echo naming another amount proves reuse.
+    if (requested && response.amount !== undefined) {
       const echoed = echoedAmount(response);
       if (!echoed) throw unconfirmed();
       if (echoed.value !== requested.value || echoed.currency !== requested.currency) {

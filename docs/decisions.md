@@ -1355,15 +1355,17 @@ sandbox round-trip before production use, and the setup guide carries that warni
     for duplication in other regions". The guide recommends random v4 UUID keys "to prevent
     two API credentials under the same account from accessing each others responses"; the
     digest keeps a random caller key unguessable, and the setup guide asks hosts for one. A
-    replayed key answers the first response whatever the request, so the contract's
-    required `amount` on capture and refund acknowledgements must echo the amount and
-    currency requested: a different echo is an earlier request's stored answer and rejects
-    with a non-retryable `invalid_request`; an acknowledgement without its own
-    `pspReference`, or without that `amount`, rejects with a retryable `processing_error`
-    (a replay under the same key cannot repeat the modification), and a 2xx that is not a
-    JSON object with a retryable `psp_unavailable`. The refund guide's response example
-    omits `amount` while the contract requires it and its own 201 example carries it —
-    sandbox-verify before relying on refunds. Captures and cancels on an unknown
+    replayed key answers the first response whatever the request, so an `amount` echoed on a
+    capture or refund acknowledgement must be the amount and currency requested: a different
+    echo is an earlier request's stored answer and rejects with a non-retryable
+    `invalid_request`, and a malformed one with a retryable `processing_error`. An absent
+    echo is accepted: the contract requires `amount` and its own 201 example carries it,
+    but the refund guide's response example omits it, and refusing an acknowledgement for
+    that would report a refund Adyen accepted as failed — a host retrying under a new key
+    would then refund twice (sandbox check: whether live acknowledgements carry it). An
+    acknowledgement without its own `pspReference` rejects with a retryable
+    `processing_error` (a replay under the same key cannot repeat the modification), and a
+    2xx that is not a JSON object with a retryable `psp_unavailable`. Captures and cancels on an unknown
     `pspReference` fail by webhook (`Transaction not found`), not in the answer, so the fake
     acknowledges them whatever the reference, and refunds alike (the refund guide lists no
     such reason; an assumption of the fake, which the adapter handles either way).
@@ -1402,7 +1404,8 @@ sandbox round-trip before production use, and the setup guide carries that warni
   `Refused`/`Error` raise a mapped `PayFanoutError` rather than a "failed" PaymentInfo.
   Refusal codes map 2/5/46 → `card_declined`, 6 → `expired_card`, 8/24 →
   `invalid_card_data`, 11/38/42 → `authentication_required`, 12 → `insufficient_funds`,
-  14/20 → `fraud_suspected`, 9 (Issuer Unavailable) → `processing_error`. None is retryable:
+  14/20/31 → `fraud_suspected` (31, Issuer Suspected Fraud, since 2026-09-23), 9 (Issuer
+  Unavailable) → `processing_error`. None is retryable:
   replaying the same idempotency key returns the same refusal, so a fresh attempt is the
   shopper's move, and an unrecognized code is still a decline.
 - **CLP, CVE, IDR and ISK are rejected locally** (`invalid_request`): Adyen prices them with

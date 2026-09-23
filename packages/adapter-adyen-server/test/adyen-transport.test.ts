@@ -279,9 +279,15 @@ describe("modification acknowledgements", () => {
         expect(sent()).toBe(1);
       }
     }
-    // Captures and refunds must also echo a well-formed amount; a cancel carries none.
+    // An absent echo is accepted: Adyen's refund guide shows acknowledgements
+    // without one, and refusing them would report accepted refunds as failed.
+    {
+      const { adapter } = answering(201, JSON.stringify({ pspReference: "8836100000000077", status: "received" }));
+      await expect(calls.capture(adapter)).resolves.toMatchObject({ status: "processing" });
+      await expect(calls.refund(adapter)).resolves.toMatchObject({ status: "pending", refundId: "8836100000000077" });
+    }
+    // An echo that is present must be well formed; a cancel carries none.
     for (const body of [
-      { pspReference: "8836100000000077", status: "received" },
       { pspReference: "8836100000000077", status: "received", amount: "1000 EUR" },
       { pspReference: "8836100000000077", status: "received", amount: { value: "1000", currency: "EUR" } },
       { pspReference: "8836100000000077", status: "received", amount: { value: 10.5, currency: "EUR" } },

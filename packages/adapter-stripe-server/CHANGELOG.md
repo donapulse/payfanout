@@ -1,5 +1,12 @@
 # @payfanout/adapter-stripe-server
 
+## 2.0.3
+
+### Patch Changes
+
+- ac2f46f: `verifyCredentials()` now reports any `StripeAPIError`, including a response cut off mid-transfer or a body that is not valid JSON, as a `network` failure instead of `internal`, matching how the adapter's other calls already treat it as retryable. A brief connection drop no longer reads as a credentials problem.
+- 5211e74: Recognize two of the payment-method error codes Stripe added in API version 2026-08-26.dahlia: `expired_payment_method` now maps to `expired_card` and `incorrect_postal_code` to `invalid_card_data`, like their card-specific counterparts. The other two new codes, `authentication_failure` and `payment_method_restricted`, keep mapping to `card_declined`.
+
 ## 2.0.2
 
 ### Patch Changes

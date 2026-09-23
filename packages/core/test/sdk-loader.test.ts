@@ -196,11 +196,11 @@ describe("injectScript options", () => {
     expect(injected).toHaveLength(0);
   });
 
-  it("accepts an integrity holding a usable hash, alone or beside another token", () => {
+  it("accepts an integrity holding a usable hash, alone or beside another token, in any case", () => {
     const { injected } = stubPage();
     void injectScript(SDK_URL, "acme", { integrity: "sha384-abc" });
-    void injectScript(OTHER_URL, "acme", { integrity: "md5-abc sha512-abc" });
-    expect(injected.map((script) => script.srcSetWith?.["integrity"])).toEqual(["sha384-abc", "md5-abc sha512-abc"]);
+    void injectScript(OTHER_URL, "acme", { integrity: "md5-abc SHA512-abc" });
+    expect(injected.map((script) => script.srcSetWith?.["integrity"])).toEqual(["sha384-abc", "md5-abc SHA512-abc"]);
   });
 });
 

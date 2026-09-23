@@ -1,6 +1,7 @@
 import { PayFanoutError } from "./errors.js";
 
-const SRI_HASH = /(?:^|\s)sha(?:256|384|512)-\S/;
+// SRI's grammar is ABNF, whose literal strings are case-insensitive.
+const SRI_HASH = /(?:^|\s)sha(?:256|384|512)-\S/i;
 
 /**
  * Guards a client adapter method against SSR: PSP browser SDKs need a real

@@ -26,14 +26,28 @@ export interface AdyenCardState {
   data?: {
     /** The encrypted card blob — encryptedCardNumber, encryptedExpiryMonth/Year, encryptedSecurityCode. */
     paymentMethod?: Record<string, unknown>;
+    /** The browser characteristics Adyen's 3-D Secure 2 needs from a web page. */
+    browserInfo?: Record<string, unknown>;
+    /** `window.location.origin` of the page the fields are on. */
+    origin?: string;
+    /** Present when `billingAddressRequired` is set on the Card. */
+    billingAddress?: Record<string, unknown>;
+    /** Adyen Web's device fingerprint, as `{ clientData }`. */
+    riskData?: Record<string, unknown>;
     [key: string]: unknown;
   };
 }
 
 export interface AdyenComponentLike {
   mount(target: HTMLElement | string): unknown;
-  /** Resolves an action returned by /payments (a threeDS2 challenge runs inline). */
+  /**
+   * Resolves an action returned by /payments. The component unmounts itself and
+   * mounts the action in its place: a threeDS2 action runs inline, a redirect
+   * navigates the page away.
+   */
   handleAction?(action: Record<string, unknown>): unknown;
+  /** Shows the fields' own validation errors. */
+  showValidation?(): unknown;
   unmount?(): void;
   remove?(): void;
 }
@@ -93,6 +107,8 @@ interface AdyenHandle {
   state?: AdyenCardState;
   /** Set while handleAction waits for the component's additional details. */
   pendingDetails?: (result: ConfirmResult) => void;
+  /** Set once handleAction ran: the Card was unmounted to make room for the action. */
+  cardReplaced?: boolean;
   cleanup: () => void;
 }
 
@@ -158,6 +174,13 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
    * `options.fieldOptions` passes through untouched (the host wins), except the
    * two keys the adapter must own: `showPayButton` (the host's own button drives
    * submission) and `onChange` (the encrypted blob arrives on it).
+   *
+   * Two Card defaults differ from Adyen Web's, and `fieldOptions` still wins
+   * over both: the cardholder name is shown and required (`hasHolderName`,
+   * `holderNameRequired`), since Adyen's native 3-D Secure 2 guide lists it as
+   * required for Visa and JCB, and `onEnterKeyPressed` does nothing, since
+   * Adyen Web's default handler calls submit(), which has no `onSubmit` to call
+   * here.
    */
   async mount(container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
     assertBrowser("AdyenClientAdapter", "mount");
@@ -190,15 +213,24 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
         ...(options.locale ?? this.config.locale ? { locale: options.locale ?? this.config.locale } : {}),
         ...(session ? { amount: { value: session.amount, currency: session.currency } } : {}),
         onAdditionalDetails: (state: { data?: Record<string, unknown> }) => {
-          handle.pendingDetails?.({
+          settlePendingDetails(handle, {
             status: "requires_confirmation",
             clientToken: JSON.stringify(state?.data ?? {}),
           });
-          handle.pendingDetails = undefined;
         },
-        onError: (err: unknown) => options.onError?.(mapAdyenClientError(err)),
+        onError: (err: unknown) => {
+          const mapped = mapAdyenClientError(err);
+          // Adyen Web's 3-D Secure 2 elements report timeouts through
+          // onAdditionalDetails and call onError only when they stop, so a
+          // pending challenge will never deliver its details.
+          settlePendingDetails(handle, { status: "failed", error: mapped });
+          options.onError?.(mapped);
+        },
       });
       const component = new Card(checkout, {
+        hasHolderName: true,
+        holderNameRequired: true,
+        onEnterKeyPressed: () => undefined,
         ...(options.appearance ? { styles: options.appearance } : {}),
         ...(options.fieldOptions ?? {}),
         showPayButton: false,
@@ -220,37 +252,61 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
   }
 
   /**
-   * Tokenize-first shape: resolves requires_confirmation plus the encrypted
-   * paymentMethod blob as the clientToken. The host passes it to the server's
-   * completePayment (<PayButton> / completionEndpoint wire it automatically),
-   * which creates the Adyen payment.
+   * Tokenize-first shape: resolves requires_confirmation plus a JSON
+   * clientToken, `{ paymentMethod, browserInfo?, origin?, billingAddress?,
+   * riskData? }` — the encrypted card blob and the browser data Adyen's 3-D
+   * Secure 2 asks the page for, taken from Adyen Web's state. The host passes
+   * it to the server's completePayment (<PayButton> / completionEndpoint wire
+   * it automatically), which creates the Adyen payment.
+   *
+   * Incomplete fields resolve `failed` after asking the Card to show its own
+   * validation errors. Once handleAction ran on the handle the Card is gone —
+   * Adyen Web replaced it with the action — so confirm() resolves `failed` with
+   * invalid_request rather than resubmit card data a payment already used;
+   * remount the fields to pay again.
    */
   async confirm(handle: MountedFieldsHandle): Promise<ConfirmResult> {
     const h = asAdyenHandle(handle);
-    const paymentMethod = h.state?.data?.paymentMethod;
-    if (h.state?.isValid !== true || !paymentMethod) {
+    if (h.cardReplaced) {
+      return {
+        status: "failed",
+        error: buildError("invalid_request", {
+          reason: "handleAction replaced the Card with the action; remount the fields to pay again",
+        }),
+      };
+    }
+    const data = h.state?.data;
+    if (h.state?.isValid !== true || !data || !isPlainObject(data.paymentMethod)) {
+      try {
+        h.component.showValidation?.();
+      } catch {
+        // Showing the field errors is a courtesy; the failed result stands either way.
+      }
       return {
         status: "failed",
         error: buildError("invalid_card_data", { isValid: h.state?.isValid ?? false }),
       };
     }
-    return { status: "requires_confirmation", clientToken: JSON.stringify(paymentMethod) };
+    return { status: "requires_confirmation", clientToken: JSON.stringify(toClientTokenEnvelope(data)) };
   }
 
   /**
    * Resolves an Adyen `action` — the object completePayment surfaced on
-   * `PaymentInfo.raw` when it answered requires_action. The component runs the
-   * challenge INLINE (a threeDS2 action needs no navigation) and resolves with a
-   * fresh clientToken carrying the additional details; the host completes the
-   * payment with it exactly as it did the first token.
+   * `PaymentInfo.raw` when it answered requires_action. Adyen Web unmounts the
+   * Card and mounts the action in its node: a threeDS2 action runs INLINE and
+   * resolves with a fresh clientToken carrying the additional details, which
+   * the host completes the payment with exactly as it did the first token; a
+   * redirect action navigates the page to Adyen, so this promise never settles
+   * and the payment finishes on the return page (see adyenRedirectResultToken).
    *
    * Adapter-specific: the unified contract has no action-handling method, since
    * most PSPs resolve challenges inside confirm().
    *
    * One challenge at a time per mounted handle: the returned promise settles
-   * when Adyen reports the shopper's additional details, so a second call while
-   * one is outstanding is refused rather than replacing the pending resolver
-   * (which would strand the first caller's promise forever). A host that wants a
+   * when Adyen reports the shopper's additional details, or `failed` when Adyen
+   * Web reports an error through onError meanwhile, so a second call while one
+   * is outstanding is refused rather than replacing the pending resolver (which
+   * would strand the first caller's promise forever). A host that wants a
    * deadline on an abandoned challenge races this promise against its own timer.
    */
   async handleAction(handle: MountedFieldsHandle, action: Record<string, unknown>): Promise<ConfirmResult> {
@@ -263,11 +319,12 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
     }
     return new Promise<ConfirmResult>((resolve) => {
       h.pendingDetails = resolve;
+      // Set before the call: a build that throws may already have unmounted the Card.
+      h.cardReplaced = true;
       try {
         h.component.handleAction!(action);
       } catch (err) {
-        h.pendingDetails = undefined;
-        resolve({ status: "failed", error: mapAdyenClientError(err) });
+        settlePendingDetails(h, { status: "failed", error: mapAdyenClientError(err) });
       }
     });
   }
@@ -314,12 +371,56 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
   }
 }
 
+/**
+ * The clientToken the return page of Adyen's 3-D Secure redirect flow
+ * completes the payment with. Adyen sends the shopper back to the session's
+ * returnUrl with a `redirectResult` query parameter appended; pass its value
+ * as `URLSearchParams.get("redirectResult")` returns it (already decoded) and
+ * complete with the result like any other clientToken — the server adapter
+ * sends it to /payments/details, within the signed session's expiry.
+ */
+export function adyenRedirectResultToken(redirectResult: string): string {
+  if (typeof redirectResult !== "string" || redirectResult.length === 0) {
+    throw PayFanoutError.invalidRequest(
+      "adyenRedirectResultToken takes the redirectResult query parameter Adyen appends to the returnUrl",
+      { reason: "missing redirectResult" },
+    );
+  }
+  return JSON.stringify({ details: { redirectResult } });
+}
+
 function asAdyenHandle(handle: MountedFieldsHandle): MountedAdyenHandle {
   const h = handle as unknown as AdyenHandle;
   if (h?.pspName !== "adyen" || !h.component) {
     throw PayFanoutError.invalidRequest("Handle was not produced by AdyenClientAdapter.mount");
   }
   return h as MountedAdyenHandle;
+}
+
+/** Clears the resolver before calling it, so a callback that fires twice settles the promise once. */
+function settlePendingDetails(handle: AdyenHandle, result: ConfirmResult): void {
+  const resolve = handle.pendingDetails;
+  handle.pendingDetails = undefined;
+  resolve?.(result);
+}
+
+/**
+ * The part of Adyen Web's state the server adapter forwards to /payments. It
+ * reads nothing else, so the rest of the state (installments,
+ * storePaymentMethod, …) is not sent.
+ */
+function toClientTokenEnvelope(data: NonNullable<AdyenCardState["data"]>): Record<string, unknown> {
+  return {
+    paymentMethod: data.paymentMethod,
+    ...(isPlainObject(data.browserInfo) ? { browserInfo: data.browserInfo } : {}),
+    ...(typeof data.origin === "string" ? { origin: data.origin } : {}),
+    ...(isPlainObject(data.billingAddress) ? { billingAddress: data.billingAddress } : {}),
+    ...(isPlainObject(data.riskData) ? { riskData: data.riskData } : {}),
+  };
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**

@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isPayFanoutError, type ClientPaymentAdapter } from "@payfanout/core";
 import { runClientAdapterConformanceTests } from "@payfanout/conformance";
-import { AdyenClientAdapter, ADYEN_WEB_VERSION, type AdyenCardState } from "../src/index.js";
+import {
+  AdyenClientAdapter,
+  ADYEN_WEB_VERSION,
+  adyenRedirectResultToken,
+  type AdyenCardState,
+} from "../src/index.js";
 
 interface FakeAdyenWeb {
   AdyenWeb: unknown;
@@ -169,8 +174,7 @@ describe("AdyenClientAdapter", () => {
     const result = await adapter.confirm(handle);
     expect(result.status).toBe("requires_confirmation");
     expect(JSON.parse(result.clientToken!)).toMatchObject({
-      type: "scheme",
-      encryptedCardNumber: "test_4111111111111111",
+      paymentMethod: { type: "scheme", encryptedCardNumber: "test_4111111111111111" },
     });
   });
 
@@ -483,5 +487,130 @@ describe("AdyenClientAdapter", () => {
     const { adapter } = makeAdapter();
     expect(adapter.listPaymentMethodCapabilities()).toEqual([{ type: "card", flow: "embedded", supported: true }]);
     expect((adapter as ClientPaymentAdapter).handleRedirectReturn).toBeUndefined();
+  });
+});
+
+describe("AdyenClientAdapter 3-D Secure", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  /** The state.data fields the server adapter forwards, as Adyen Web 6.41.0 reports them. */
+  const STATE_DATA = {
+    paymentMethod: VALID_STATE.data!.paymentMethod!,
+    browserInfo: {
+      acceptHeader: "*/*",
+      javaEnabled: false,
+      colorDepth: 24,
+      language: "nl-NL",
+      screenHeight: 723,
+      screenWidth: 1536,
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      timeZoneOffset: 0,
+    },
+    origin: "https://shop.example",
+    billingAddress: { street: "Infinite Loop", houseNumberOrName: "1", postalCode: "1011DJ", city: "Amsterdam", country: "NL" },
+    riskData: { clientData: "eyJ2ZXJzaW9uIjoiMS4wLjAifQ==" },
+  };
+
+  function componentOf(handle: unknown): Record<string, unknown> {
+    return (handle as { component: Record<string, unknown> }).component;
+  }
+
+  it("confirm() resolves the envelope of Adyen Web's state the server forwards, and nothing else", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN });
+    emitChange(fake, {
+      isValid: true,
+      data: { ...STATE_DATA, installments: { value: 3 }, storePaymentMethod: true, clientStateDataIndicator: true },
+    });
+    const result = await adapter.confirm(handle);
+    expect(result.status).toBe("requires_confirmation");
+    expect(JSON.parse(result.clientToken!)).toEqual(STATE_DATA);
+
+    // A state that carries the card alone travels as the card alone.
+    emitChange(fake, VALID_STATE);
+    expect(JSON.parse((await adapter.confirm(handle)).clientToken!)).toEqual({ paymentMethod: STATE_DATA.paymentMethod });
+  });
+
+  it("confirm() asks the Card to show its validation errors when the fields are incomplete", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN });
+    const showValidation = vi.fn();
+    componentOf(handle)["showValidation"] = showValidation;
+    emitChange(fake, { isValid: false, data: {} });
+    await expect(adapter.confirm(handle)).resolves.toMatchObject({ status: "failed", error: { code: "invalid_card_data" } });
+    expect(showValidation).toHaveBeenCalledTimes(1);
+    componentOf(handle)["showValidation"] = () => {
+      throw new Error("component is not ready");
+    };
+    await expect(adapter.confirm(handle)).resolves.toMatchObject({ status: "failed" });
+  });
+
+  it("shows a required cardholder name and ignores Enter by default, and the host still wins", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN });
+    const defaults = fake.componentOptions[0]!;
+    expect(defaults).toMatchObject({ hasHolderName: true, holderNameRequired: true });
+    const submit = vi.fn();
+    const onEnter = defaults["onEnterKeyPressed"] as (activeElement: unknown, component: unknown) => unknown;
+    expect(onEnter({ blur: vi.fn() }, { submit })).toBeUndefined();
+    expect(submit).not.toHaveBeenCalled();
+
+    const onEnterKeyPressed = vi.fn();
+    const { adapter: other, fake: otherFake } = makeAdapter();
+    await other.mount(fakeContainer(), {
+      clientSecret: SESSION_TOKEN,
+      fieldOptions: { hasHolderName: false, holderNameRequired: false, onEnterKeyPressed },
+    });
+    expect(otherFake.componentOptions[0]).toMatchObject({ hasHolderName: false, holderNameRequired: false, onEnterKeyPressed });
+  });
+
+  it("refuses confirm() once handleAction has replaced the Card", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN });
+    emitChange(fake, VALID_STATE);
+    await adapter.handleAction(handle, { type: "threeDS2", subtype: "fingerprint", token: "fingerprint-token" });
+    const result = await adapter.confirm(handle);
+    expect(result).toMatchObject({ status: "failed", error: { code: "invalid_request" } });
+    expect(result.clientToken).toBeUndefined();
+  });
+
+  it("settles a pending challenge as failed when Adyen Web reports an error, then accepts the next one", async () => {
+    stubBrowser();
+    const fake = makeFakeAdyenWeb();
+    const { adapter } = makeAdapter(fake);
+    const reported: unknown[] = [];
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN, onError: (err) => reported.push(err) });
+    // A challenge that has started and not reported back yet.
+    componentOf(handle)["handleAction"] = () => undefined;
+    const pending = adapter.handleAction(handle, { type: "threeDS2", subtype: "challenge" });
+    (fake.checkoutConfigs[0]!["onError"] as (err: unknown) => void)({
+      name: "ERROR",
+      message: "No authorisationToken received. 3DS2 Challenge cannot proceed",
+    });
+    const failed = await pending;
+    expect(failed.status).toBe("failed");
+    expect(isPayFanoutError(failed.error)).toBe(true);
+    // The host's onError still hears about it, with the same error.
+    expect(reported).toEqual([failed.error]);
+
+    const next = adapter.handleAction(handle, { type: "threeDS2", subtype: "challenge" });
+    (fake.checkoutConfigs[0]!["onAdditionalDetails"] as (state: unknown) => void)({
+      data: { details: { threeDSResult: "eyJ0cmFuc1N0YXR1cyI6IlkifQ==" } },
+    });
+    await expect(next).resolves.toEqual({
+      status: "requires_confirmation",
+      clientToken: JSON.stringify({ details: { threeDSResult: "eyJ0cmFuc1N0YXR1cyI6IlkifQ==" } }),
+    });
+  });
+
+  it("builds the clientToken a 3-D Secure redirect return completes with", () => {
+    // Adyen appends the URL-encoded redirectResult to the returnUrl; URLSearchParams decodes it.
+    const redirectResult = new URLSearchParams("?shopperOrder=12xy&redirectResult=X6XtfGC3%21Y").get("redirectResult")!;
+    expect(JSON.parse(adyenRedirectResultToken(redirectResult))).toEqual({ details: { redirectResult: "X6XtfGC3!Y" } });
+    expect(() => adyenRedirectResultToken("")).toThrowError(/redirectResult/);
   });
 });

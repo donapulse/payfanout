@@ -542,8 +542,9 @@ docs.direct.worldline-solutions.com unless noted):
   `GET /v2/{merchantId}/payments/{paymentId}/refunds`. `refundPayment` therefore returns a
   composite `refundId` (`{paymentId}:{refundId}`, the suffix being Worldline's raw refund
   id, the one webhooks report) and `retrieveRefund` resolves it through the per-payment
-  list. With no documented refund-failure webhook (below), this polling path is the only
-  reliable refund-failure signal.
+  list. With no dedicated refund-failure webhook (below; since 2026-09-23 a `payment.rejected`
+  carrying 73/83 is read as one), this polling path is the refund-failure signal a host can
+  always drive itself.
 - **paymentProductId → brand** map holds only ids confirmed on the current payment-method
   pages (1 Visa, 2 Amex, 3 Mastercard, 117 Maestro, 125 JCB, 132 Diners); 114/118/128 were
   unverified and dropped 2026-07-15 — an unknown id degrades to brandless details.
@@ -561,6 +562,20 @@ docs.direct.worldline-solutions.com unless noted):
   `requires_action`. statusCode fallbacks: 9 (CAPTURED/settled) → `succeeded`,
   5 → `requires_capture`, 2 → `failed`, 46 → `requires_action`. Refunds: REFUNDED →
   `succeeded`, REJECTED/CANCELLED → `failed`, REFUND_REQUESTED/pending → `pending`.
+  Refined 2026-09-23, superseding the REJECTED_CAPTURE → `failed` and REFUND_REQUESTED →
+  `processing` readings above, from the Statuses reference's per-operation outcome tables and
+  numeric-code list. The codes naming a refused operation are decided first, by code alone,
+  whatever status string or category carries them (the contract's status enum, v2.507.0,
+  has no CANCELLATION_REJECTED, so a refused cancellation can arrive under another string):
+  63 ("The payment remains authorised") and 93 (the transaction "will remain in
+  statusOutput.statusCode=5") → `requires_capture`; 73/83 (a refused deletion or refund, the
+  payment staying at 9) → `succeeded`. Then, still before the category band: CANCELLED 61/62
+  (a cancellation still awaiting the acquirer) → `processing`, any other CANCELLED →
+  `canceled`; without a status string (the contract does not require one) 1/6 → `canceled`
+  and 61/62 → `processing`; the CANCELLATION_REJECTED and REJECTED_CAPTURE strings → `requires_capture`;
+  REFUND_REQUESTED and the REVERSED band → `succeeded`. A capture carrying 93 or a refund
+  carrying 73/83 stays out of `amountCaptured` / `amountRefunded`, and a refund maps by its
+  statusCode when that is its only signal.
 - **Manual capture (not multi-capture):** `PRE_AUTHORIZATION` authorizes, `POST /capture
   { amount?, isFinal: true }` settles — a partial capture settles that amount and RELEASES
   the uncaptured remainder (Worldline finalizes the capture, and referenced refunds are only
@@ -569,17 +584,54 @@ docs.direct.worldline-solutions.com unless noted):
   cannot be held open across several captures. `retrievePayment` sums `GET /captures` and
   `GET /refunds` (separate sub-resources) for `amountCaptured` / `amountCapturable` (0 once
   the payment is a completed sale/capture) / `amountRefunded`.
+  Since 2026-09-23 a capture that names an amount reads the payment first: the full
+  authorised amount goes out without `amount` (a full capture), and a partial amount is sent
+  only in a two-decimal currency, any other being refused with `invalid_request` before the
+  capture call, because the API contract (v2.507.0) documents CapturePayment's bare `amount`
+  "in cents, where single digit currencies are presumed to have 2 digits" (see the
+  minor-unit item below). CancelPayment answers 409 both for a request "currently being
+  processed" under the same idempotence key (idempotent-requests guide) and, per the
+  contract, for "Cancellation is not allowed because payment is closed"; after the transport
+  retries, a 409 is read against the payment. A payment reading `canceled` answers as is, and
+  one reading `processing` does when its status is CANCELLED or, without a status string, its
+  code is 61/62; a payment still cancellable
+  (`statusOutput.isCancellable`, or when that flag is absent, one reading `requires_capture`)
+  keeps the retryable `processing_error`, because the original may still land and a replay
+  under the same key answers the original's outcome; anything else rejects with a
+  non-retryable `invalid_request`. A `processing` read-back alone is never taken for a
+  pending cancellation, since CAPTURE_REQUESTED (4/91/92/99), AUTHORIZATION_REQUESTED and
+  CREATED read `processing` too. Refusals are reported where Worldline reports them:
+  `capturePayment` answers `requires_capture` only when the refusal comes back synchronously,
+  while the Statuses reference and the test-cases page document `statusCode=91` as the
+  immediate CapturePayment answer with 93 set "after a few minutes", so the refusal usually
+  surfaces through `retrievePayment` or `payment.rejected_capture`; `cancelPayment` can
+  resolve `processing` (61/62), settled by `payment.cancelled` (documented for statusCode 6)
+  or a re-read; and a refused capture can leave an automatic-capture payment at
+  `requires_capture`, a status `usePaymentStatus` does not treat as final.
 - **Webhooks:** `X-GCS-Signature` = base64(HMAC-SHA256(webhookSecret, rawBody)) over the
   EXACT raw bytes, key selected by `X-GCS-KeyId` (array of `{keyId, secretKey}` for
   rotation, any active key verifying wins). One event per delivery. The documented event
-  list (2026-07-15) is `payment.created / redirected / authorization_requested /
-  pending_approval / pending_completion / pending_capture / capture_requested / captured /
-  rejected / rejected_capture / cancelled / refunded`, `refund.refund_requested`,
-  `paymentlink.*`, and `payment.test`; the documented terminal refund signal is
-  `payment.refunded`, and there is NO documented refund-failure event — refund failure is
-  observed by polling `retrieveRefund`. Mapping: `payment.captured` → `payment.succeeded`,
-  `payment.rejected`/`rejected_capture` → `payment.failed`, `payment.cancelled` →
-  `payment.canceled`, `payment.refunded` → `payment.refunded`, pending payment states →
+  list (2026-07-15, unchanged on 2026-09-23) is `payment.created / redirected /
+  authorization_requested / pending_approval / pending_completion / pending_capture /
+  capture_requested / captured / rejected / rejected_capture / cancelled / refunded`,
+  `refund.refund_requested` and `paymentlink.*` (`payment.test` is only the type the
+  SendTestWebhooks test message carries, and it parses as `unknown`); the documented
+  terminal refund signal is `payment.refunded`. There is no dedicated refund-failure event,
+  but (corrected 2026-09-23) the Statuses reference defines REJECTED as "The
+  authorisation/refund request has been rejected by the acquirer" and lists refused
+  deletions/refunds as REJECTED 73/83, so a `payment.rejected` whose payment (or refund)
+  resource carries statusCode 73 or 83 reports a refused deletion or refund (docs-derived,
+  not yet seen in the sandbox). A refund-failure event takes its amount and currency from a
+  `refundOutput` only and omits them otherwise, since a payment's `amountOfMoney` is what was
+  paid, not what the refused refund asked back; polling `retrieveRefund` remains the other
+  refund-failure signal. Mapping: `payment.captured` → `payment.succeeded`,
+  `payment.rejected` → `payment.failed`, or `payment.refund_failed` when it carries
+  statusCode 73/83, and `payment.rejected_capture` → `unknown` (corrected 2026-09-23: it
+  reports a failed capture on a payment that stays authorised until the merchant captures
+  again or cancels, so neither `payment.failed`, which would tell hosts the money is gone, nor
+  a success type is honest; `retrievePayment` reports `requires_capture`), `payment.cancelled`
+  → `payment.canceled`, a `payment.rejected` or `payment.cancelled` carrying 63/93 →
+  `unknown` for the same reason, `payment.refunded` → `payment.refunded`, pending payment states →
   `payment.processing`. `refund.refund_requested` maps to `unknown` deliberately — it is
   recognized but non-terminal, and the unified vocabulary has no in-flight refund state;
   fabricating a terminal type would misreport it. The parser additionally TOLERATES
@@ -616,11 +668,19 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   accepts both single-event shapes (a one-element array is unwrapped) and rejects
   multi-event arrays rather than partially processing them. Confirm with the portal's
   test-webhook feature once credentials exist.
-- **Minor-unit semantics for 0/3-decimal currencies.** Amounts are documented only as an
-  integer in "the least subunit … in some cases smaller"; nothing found on 0- or 3-decimal
-  currencies. ISO 4217 minor units are forwarded per the core invariant — run one sandbox
-  payment in a 0-decimal currency (JPY) before routing such currencies here, and declare an
-  adapter-local constraint (as with the PayZen CNY/KHR decision) if the platform disagrees.
+- **Minor-unit semantics for 0/3-decimal currencies.** CONFIRMED 2026-09-23 for every
+  `amountOfMoney` field (CreatePayment, RefundPayment and CancelPayment all use it): the API
+  contract (payment.preprod.direct.worldline-solutions.com/v1/public-contract-definition.yaml,
+  v2.507.0) defines its `amount` as "Amount in the smallest currency unit" (EUR 1234 is
+  12.34, KWD 1234 is 1.234, JPY 1234 is 1234), so ISO 4217 minor units are forwarded
+  unchanged. Still AMBIGUOUS for CapturePayment, whose bare `amount` is documented "in
+  cents, where single digit currencies are presumed to have 2 digits" without saying how a
+  zero- or three-decimal currency is expressed. The adapter sidesteps it: a capture of the
+  full authorised amount is sent without `amount`, and a partial capture in a currency whose
+  exponent is not 2 is refused with `invalid_request` before any capture call. One sandbox
+  partial capture in JPY (for example 2000 of a 5000 authorisation, then reading the
+  captured amount back from `GET /captures`) would settle the unit and let the refusal be
+  lifted or replaced by a conversion.
 - **`card.expiryDate` format** is parsed as `MMYY` when building masked instrument details —
   consistent with the platform's examples but worth one sandbox observation.
 - **`PaymentInfo.createdAt`** falls back to epoch — the Worldline payment object exposes no

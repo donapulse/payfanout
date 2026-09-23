@@ -468,7 +468,10 @@ docs.direct.worldline-solutions.com unless noted):
   is mandatory, and calls `validationCallback` with `{ valid }` whenever the form's validity
   changes, so the client adapter defaults `hideCardholderName` to `false` (a host
   `fieldOptions` value still wins) and owns `validationCallback` to drive `onChange`, passing
-  each result on to a host-supplied one.
+  each result on to a host-supplied one. The same guide also asks for `integrity` (the
+  CreateHostedTokenization response's `sri`) and `crossorigin="anonymous"` on the Tokenizer
+  script tag; not applied yet, because the browser receives only the hostedTokenizationUrl and
+  core's script injection sets neither attribute.
 - **CreatePayment wiring (corrected in review, 2026-07-15):** `hostedTokenizationId` rides
   at the ROOT of the CreatePayment request — the platform's current domain model declares it
   there and `CardPaymentMethodSpecificInput` has no such field (the guide's "replace the

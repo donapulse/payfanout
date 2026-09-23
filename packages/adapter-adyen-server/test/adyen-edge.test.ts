@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { isPayFanoutError } from "@payfanout/core";
 import {
   ADYEN_IDEMPOTENCY_KEY_MAX_LENGTH,
+  adyenOnboarding,
   AdyenServerAdapter,
   decodeAdyenPaymentRef,
   decodeSessionContext,
@@ -127,6 +128,34 @@ describe("transport edge cases", () => {
     expect(() => hexToBytes("zz")).toThrowError(/hex/);
     expect(() => hexToBytes("abc")).toThrowError(/hex/);
     expect(hexToBytes("00ff")).toEqual(new Uint8Array([0, 255]));
+  });
+});
+
+describe("onboarding descriptor", () => {
+  function adapterAcceptsHmacKey(key: string): boolean {
+    try {
+      hexToBytes(key);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("validates HMAC keys exactly as the adapter does: whole bytes of hex", () => {
+    const field = adyenOnboarding.credentialFields.find((candidate) => candidate.key === "hmacKey");
+    const pattern = new RegExp(field?.format?.pattern ?? "");
+    // An odd-length key used to pass the form and then fail the constructor.
+    for (const key of [HMAC_KEY, HMAC_KEY.toLowerCase(), "00ff", "0f0", "abc", "zz", "0x00ff", "not-hex", ""]) {
+      expect(pattern.test(key), key).toBe(adapterAcceptsHmacKey(key));
+    }
+    expect(pattern.test(HMAC_KEY)).toBe(true);
+    expect(pattern.test("0f0")).toBe(false);
+  });
+
+  it("follows Adyen's recommended policy: scripts from *.adyen.com, frames and requests left to its wildcard", () => {
+    // frame-src and connect-src are a bare `*` in Adyen's guidance (issuer 3-D
+    // Secure challenges); core's convention for a documented wildcard is empty.
+    expect(adyenOnboarding.csp).toEqual({ script: ["https://*.adyen.com"], frame: [], connect: [] });
   });
 });
 

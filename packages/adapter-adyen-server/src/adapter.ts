@@ -177,12 +177,11 @@ const METADATA_MAX_VALUE_LENGTH = 80;
 /**
  * Adyen documents no charset restriction on `reference`, so this one is the
  * adapter's: Adyen echoes the value back as `merchantReference`, one of the
- * eight colon-joined values the webhook HMAC signs, and a reference containing
- * the delimiter (or a backslash) makes that signing payload ambiguous. Every
- * webhook for the payment would then fail verification, silently and
- * permanently, after the shopper has paid. For a push-only provider the webhook
- * is the only source of truth, so the constraint is enforced at session
- * creation, while the host still owns the id.
+ * eight values the webhook HMAC joins with `:` and no escaping. The verifier
+ * can split a `:` in that one field, but a payment this adapter creates never
+ * relies on it: for a push-only provider the webhook is the only source of
+ * truth, so the delimiter (and a backslash) is refused at session creation,
+ * while the host still owns the id.
  */
 const REFERENCE_FORBIDDEN_CHARACTERS = /[:\\]/;
 
@@ -354,8 +353,8 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
     if (REFERENCE_FORBIDDEN_CHARACTERS.test(reference)) {
       throw PayFanoutError.invalidRequest(
         'Adyen references must not contain ":" or "\\": the reference travels back as merchantReference, one of the ' +
-          "eight values the webhook HMAC signs, and a signed value carrying the delimiter would make every webhook " +
-          "for this payment fail verification",
+          "eight values the webhook HMAC joins with that delimiter, and the adapter keeps the references it creates " +
+          "free of it",
         { reference },
       );
     }

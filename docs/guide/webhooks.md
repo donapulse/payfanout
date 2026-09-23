@@ -62,8 +62,11 @@ until it sees success.
   Worldline can give two genuine refund events one id, so re-read its refund-type events
   before dropping one as a duplicate, as step 8 of the
   [Worldline guide](/guide/worldline#_8-register-the-webhook-endpoint) describes.
-- **Ordering is not guaranteed** by any PSP, treat events as unordered facts and reconcile
-  with `retrievePayment` when sequence matters.
+- **Ordering is not guaranteed** by any PSP, treat events as unordered facts. When sequence
+  matters, reconcile with `retrievePayment` where the adapter declares
+  `supportsPaymentRetrieval`; a push-only PSP such as Adyen has no payment read, so apply its
+  events in `occurredAt` order, as step 8 of the
+  [Adyen guide](/guide/adyen#_8-register-the-webhook-endpoint) describes.
 - **Batched deliveries (GoCardless):** the unified handlers process one event per
   delivery — a batched GoCardless webhook (up to 250 events under one signature) makes
   `parseWebhookEvent` throw instead of dropping events. Route GoCardless deliveries to
@@ -91,12 +94,18 @@ fallback stays `retrievePayment` per order.
 ## The events you'll see
 
 - **Refund outcomes are first-class:** async refunds that later fail arrive as
-  `payment.refund_failed`, never a misleading `payment.refunded`, and
-  `retrieveRefund(refundId)` polls any `"pending"` refund to its terminal state.
+  `payment.refund_failed`, never a misleading `payment.refunded`. Where the adapter declares
+  `supportsRefundRetrieval`, `retrieveRefund(refundId)` polls any `"pending"` refund to its
+  terminal state; on a push-only PSP such as Adyen the refund events are the only outcome, and
+  a `payment.refunded` there can still be followed by `payment.refund_failed`.
 - **Async rails signal progress:** SEPA/ACH-style methods emit `payment.processing`
   (underway, not final) before their terminal event days later.
-- **Disputes resolve:** `payment.chargeback` on opening, then `payment.chargeback_won` /
-  `payment.chargeback_lost` when closed.
+- **Disputes:** `payment.chargeback` when a dispute opens, then `payment.chargeback_won` or
+  `payment.chargeback_lost` when the PSP reports how it ended. Not every PSP reports both, and
+  a reported outcome is not always final: GoCardless never emits `payment.chargeback_lost`,
+  since the chargeback itself is the loss, and Adyen reports a reversed chargeback as
+  `payment.chargeback_won` although a later loss can override it. Each PSP's set-up guide
+  lists which of its events map to which type.
 
 ## Next
 

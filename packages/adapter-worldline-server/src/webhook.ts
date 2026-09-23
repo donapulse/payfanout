@@ -148,9 +148,14 @@ export async function parseWorldlineWebhookEvent(rawBody: string): Promise<Unifi
 
   const body = parsed as WorldlineWebhookBody;
   const rawType = (body.type ?? "").toLowerCase();
-  const type = mapEventType(rawType, body.payment?.statusOutput?.statusCode);
   const resource = body.payment ?? body.refund;
-  const money = resource?.paymentOutput?.amountOfMoney ?? resource?.refundOutput?.amountOfMoney;
+  const type = mapEventType(rawType, resource?.statusOutput?.statusCode);
+  // A refund failure carries the refund's money or none: a payment's
+  // amountOfMoney is what was paid, not what the refused refund asked back.
+  const money =
+    type === "payment.refund_failed"
+      ? resource?.refundOutput?.amountOfMoney
+      : (resource?.paymentOutput?.amountOfMoney ?? resource?.refundOutput?.amountOfMoney);
   const amount = money?.amount;
   const currency = money?.currencyCode;
   const isRefundResource = body.refund !== undefined || rawType.startsWith("refund.");
@@ -169,11 +174,11 @@ export async function parseWorldlineWebhookEvent(rawBody: string): Promise<Unifi
   };
 }
 
-function mapEventType(rawType: string, paymentStatusCode: number | undefined): UnifiedWebhookEventType {
+function mapEventType(rawType: string, statusCode: number | undefined): UnifiedWebhookEventType {
   // REJECTED covers "the authorisation/refund request" (Statuses reference):
   // 73/83 are a refused deletion/refund, so the funds did not return and the
   // payment stays captured — a refund failure, not a failed payment.
-  if (rawType === "payment.rejected" && (paymentStatusCode === 73 || paymentStatusCode === 83)) {
+  if (rawType === "payment.rejected" && (statusCode === 73 || statusCode === 83)) {
     return "payment.refund_failed";
   }
   const direct = EVENT_TYPE_MAP[rawType];
@@ -184,11 +189,12 @@ function mapEventType(rawType: string, paymentStatusCode: number | undefined): U
     if (rawType.includes("lost")) return "payment.chargeback_lost";
     return "payment.chargeback";
   }
-  // payment.rejected_capture is recognized but maps to "unknown": a refused
-  // capture leaves the payment authorised (the acquirer's refusal keeps it at
-  // statusCode 5), the unified vocabulary has no such state, and payment.failed
-  // would tell hosts the money is gone while an authorisation still holds it.
-  // Hosts reconcile with retrievePayment, which reports requires_capture.
+  // payment.rejected_capture is recognized but maps to "unknown": it reports a
+  // failed operation on a payment that stays authorised (statusCode 5) until
+  // the merchant acts again, capturing anew or cancelling. payment.failed would
+  // tell hosts the money is gone while the authorisation still holds it, and a
+  // success type would claim a capture that never happened. Hosts reconcile
+  // with retrievePayment, which reports requires_capture.
   // refund.refund_requested is recognized but NON-terminal: the unified
   // vocabulary has no in-flight refund state, and emitting payment.refunded
   // (funds returned) or payment.refund_failed here would fabricate a terminal

@@ -94,15 +94,26 @@ clock is an injectable `now()` seam. Every mutating call carries a signed, deter
   missed-webhook recovery falls back to `retrievePayment` per order.
 - Card vaulting, zero-amount verification, session update, and listing are out of scope for
   this version (declared `false`).
-- A capture or cancellation the acquirer refuses leaves the payment authorised:
-  `capturePayment` / `cancelPayment` report `requires_capture` and the authorisation stays in
-  `amountCapturable`, ready to capture or cancel again.
-- Cancelling a payment Worldline reports as closed (already captured, for example) rejects
-  with a non-retryable `invalid_request`; repeating a cancellation that already took effect
-  answers `canceled`.
+- A capture or cancellation the acquirer refuses leaves the payment authorised: it reads
+  `requires_capture` and the authorisation stays in `amountCapturable`, ready to capture or
+  cancel again. `capturePayment` reports the refusal only when Worldline answers it
+  synchronously; Worldline documents a capture as `CAPTURE_REQUESTED` (status code 91) first,
+  so the call usually resolves `processing` and the refusal (93) surfaces later, through
+  `retrievePayment` or the `payment.rejected_capture` webhook, which parses as `unknown`.
+- A refused capture can also leave an automatic-capture payment at `requires_capture`.
+  `usePaymentStatus` from `@payfanout/react` does not treat that status as final and keeps
+  polling, so stop it (`enabled: false`) when it arrives.
+- `cancelPayment` resolves `processing` while the acquirer has not confirmed the cancellation
+  (status codes 61/62); the `payment.cancelled` webhook, documented for status code 6, or a
+  later `retrievePayment` settles it. Cancelling a payment Worldline reports as closed
+  (already captured, for example) rejects with a non-retryable `invalid_request`, and
+  repeating a cancellation that already took effect answers `canceled`. A 409 that persists
+  while the payment is still cancellable stays a retryable `processing_error`, since an
+  original under the same key may still be in flight; retry with the same `idempotencyKey`.
 - A refund the acquirer refuses leaves the payment `succeeded`: `retrieveRefund` reports the
-  refund `failed`, it stays out of `amountRefunded`, and its `payment.rejected` webhook
-  arrives as `payment.refund_failed`.
+  refund `failed` and it stays out of `amountRefunded`. Its `payment.rejected` webhook,
+  carrying status code 73 or 83, arrives as `payment.refund_failed`; that reading follows
+  Worldline's Statuses reference and is not yet sandbox-verified.
 - Worldline documents the CapturePayment amount in cents with two assumed decimals, so a
   partial capture in a currency without two decimals (JPY, BHD, …) is refused with
   `invalid_request` and no capture request is sent. Capture the full authorised amount (it

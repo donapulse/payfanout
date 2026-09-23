@@ -98,15 +98,20 @@ describe("mapWorldlineStatus", () => {
     ["CANCELLED", 61, "PENDING_MERCHANT", "processing"],
     ["CANCELLED", 62, "PENDING_MERCHANT", "processing"],
     ["CANCELLED", 61, "UNSUCCESSFUL", "processing"],
-    // A refused cancellation (63) or capture (93) leaves the authorisation standing.
+    // A refused cancellation (63) or capture (93) leaves the authorisation standing,
+    // whatever string carries the code (the status enum has no CANCELLATION_REJECTED).
     ["CANCELLATION_REJECTED", 63, "UNSUCCESSFUL", "requires_capture"],
+    ["CANCELLED", 63, "UNSUCCESSFUL", "requires_capture"],
     ["REJECTED_CAPTURE", 93, "UNSUCCESSFUL", "requires_capture"],
     ["REJECTED", 2, "UNSUCCESSFUL", "failed"],
     ["REJECTED", 57, "UNSUCCESSFUL", "failed"],
     ["REJECTED", 59, "UNSUCCESSFUL", "failed"],
-    // A refused refund (83) or deletion (73) leaves the payment captured.
+    // A refused refund (83) or deletion (73) leaves the payment captured, even
+    // when the code arrives without the REJECTED string.
     ["REJECTED", 83, "UNSUCCESSFUL", "succeeded"],
     ["REJECTED", 73, "UNSUCCESSFUL", "succeeded"],
+    [undefined, 83, "UNSUCCESSFUL", "succeeded"],
+    [undefined, 73, "UNSUCCESSFUL", "succeeded"],
     // A captured payment with a refund in flight, in both documented bands.
     ["REFUND_REQUESTED", 81, "REVERSED", "succeeded"],
     ["REFUND_REQUESTED", 82, "REVERSED", "succeeded"],

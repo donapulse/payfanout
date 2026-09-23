@@ -114,15 +114,30 @@ than five minutes, so keep the server clock accurate. Every mutating call carrie
 deterministic `X-GCS-Idempotence-Key` derived from your `idempotencyKey`.
 :::
 
-::: tip Manual capture: refusals and partial captures
-When the acquirer refuses a capture or a cancellation, the payment stays authorised:
-`capturePayment` and `cancelPayment` report `requires_capture`, with the authorisation still
-in `amountCapturable`, so you can try again or cancel. Cancelling a payment that is already
-captured is refused with a non-retryable `invalid_request`. Worldline documents the capture amount
-"in cents", assuming two decimals, so until that unit is confirmed for other currencies a
-**partial** capture in a currency without two decimals (JPY, BHD, …) is refused with
-`invalid_request` and no capture request is sent. Capture the full authorised amount
-instead, or cancel.
+::: tip Capture and cancellation outcomes
+When the acquirer refuses a capture or a cancellation, the payment stays authorised: it reads
+`requires_capture`, with the authorisation still in `amountCapturable`, so you can capture
+again or cancel. `capturePayment` returns that refusal only when Worldline answers it
+straight away. Worldline documents a capture as `CAPTURE_REQUESTED` (status code 91) first,
+so `capturePayment` usually resolves `processing` and the refusal (93) surfaces minutes later,
+through `retrievePayment` or the `payment.rejected_capture` webhook, which parses as
+`unknown`.
+
+`cancelPayment` resolves `processing` while the acquirer has not confirmed the cancellation
+(status codes 61/62); the `payment.cancelled` webhook, documented for status code 6, or a
+later `retrievePayment` settles it: `canceled`, or `requires_capture` if the acquirer refuses.
+Cancelling a payment that is already captured is refused with a non-retryable
+`invalid_request`.
+
+An automatic-capture payment can also end at `requires_capture` when Worldline refuses its
+capture. [`usePaymentStatus`](/guide/react#async-rails-polling-to-a-terminal-state) does not
+treat `requires_capture` as final and keeps polling it, so stop the hook yourself
+(`enabled: false`) once that status arrives, then capture again or cancel from your server.
+
+Worldline documents the capture amount "in cents", assuming two decimals, so until that unit
+is confirmed for other currencies a **partial** capture in a currency without two decimals
+(JPY, BHD, …) is refused with `invalid_request` and no capture request is sent. Capture the
+full authorised amount instead, or cancel.
 :::
 
 ## 5. Wire the client adapter

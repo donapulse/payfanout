@@ -463,14 +463,21 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
         idempotencyKey,
       );
     } catch (err) {
-      // CancelPayment answers 409 both for a replay whose original is still in
-      // flight (retried away above) and for "Cancellation is not allowed because
-      // payment is closed" (API contract). A 409 that outlives the retries is
-      // read against the payment itself: a cancellation that took effect is the
-      // answer; anything else is a closed payment, which no retry will open.
+      // A 409 that outlives the retries is still one of two answers: "the
+      // request is currently being processed" (idempotent-requests guide), for
+      // an original under this key still in flight, another worker's for
+      // instance, or "Cancellation is not allowed because payment is closed"
+      // (API contract). Only the payment tells them apart. CANCELLED means a
+      // cancellation took effect or awaits the acquirer. A payment Worldline
+      // still reports cancellable may yet see the original land, and a replay
+      // under this key answers the original's outcome, so the retryable error
+      // stands. Anything else is closed, and no retry will open it.
       if (!isIdempotenceReplayInFlight(err)) throw err;
       const info = await this.retrievePayment(pspPaymentId);
-      if (info.status === "canceled" || info.status === "processing") return info;
+      const payment = info.raw as WorldlinePaymentLike; // retrievePayment carries the payment object on raw
+      const cancelled = (payment.status ?? "").toUpperCase() === "CANCELLED";
+      if (cancelled && (info.status === "canceled" || info.status === "processing")) return info;
+      if (payment.statusOutput?.isCancellable ?? info.status === "requires_capture") throw err;
       throw new PayFanoutError({
         code: "invalid_request",
         message: getUserMessage("invalid_request"),
@@ -832,16 +839,18 @@ function isFailedStatus(operation: WorldlineStatusFields): boolean {
 
 /**
  * Maps a Worldline payment onto the unified status, per Worldline's Statuses
- * reference. Codes that change what their band means are decided first: a
- * cancellation still awaiting the acquirer (CANCELLED 61/62) is `processing`; a
- * refused cancellation (63) or capture (93) leaves the payment authorised, so
- * `requires_capture`; a refused refund or deletion (REJECTED 73/83) and a refund
- * in flight (REFUND_REQUESTED) leave it captured, so `succeeded` (refund state
- * derives from amountRefunded). Any other CANCELLED is `canceled`, never read
- * as a failure. After that the primary signal is statusOutput.statusCategory
- * (Worldline's forward-compatible band — new statuses join an existing
- * category), with statusCode and the status string as fallbacks; anything
- * unrecognized is `processing`, never a fabricated terminal state.
+ * reference. The codes that name a refused operation are decided first, by
+ * code alone, whatever status string or category carries them: a refused
+ * cancellation (63) or capture (93) leaves the payment authorised, so
+ * `requires_capture`; a refused deletion or refund (73/83) leaves it captured,
+ * so `succeeded` (refund state derives from amountRefunded). Next, a
+ * cancellation still awaiting the acquirer (CANCELLED 61/62) is `processing`
+ * and any other CANCELLED is `canceled`, never read as a failure; a refund in
+ * flight (REFUND_REQUESTED) leaves the payment captured, so `succeeded`. After
+ * that the primary signal is statusOutput.statusCategory (Worldline's
+ * forward-compatible band — new statuses join an existing category), with
+ * statusCode and the status string as fallbacks; anything unrecognized is
+ * `processing`, never a fabricated terminal state.
  */
 export function mapWorldlineStatus(
   status: string | undefined,
@@ -849,14 +858,16 @@ export function mapWorldlineStatus(
   statusCategory: string | undefined,
 ): UnifiedPaymentStatus {
   const s = (status ?? "").toUpperCase();
-  if (s === "CANCELLED") return statusCode === 61 || statusCode === 62 ? "processing" : "canceled";
+  // The contract's status enum has no CANCELLATION_REJECTED, so a refused
+  // cancellation can arrive under another string; the code is what names it.
   // "The payment remains authorised" (63); after a refused capture "the global
   // status of the transaction will remain in statusOutput.statusCode=5" (93).
-  if (s === "CANCELLATION_REJECTED" || statusCode === 63) return "requires_capture";
-  if (s === "REJECTED_CAPTURE" || statusCode === 93) return "requires_capture";
-  // A refused refund keeps the payment at 9 ("Payment requested"); REJECTED
-  // otherwise is a declined authorisation.
-  if (s === "REJECTED" && (statusCode === 73 || statusCode === 83)) return "succeeded";
+  if (statusCode === 63 || statusCode === 93) return "requires_capture";
+  // A refused refund keeps the payment at 9 ("Payment requested"), and a
+  // refused deletion leaves it undeleted.
+  if (statusCode === 73 || statusCode === 83) return "succeeded";
+  if (s === "CANCELLED") return statusCode === 61 || statusCode === 62 ? "processing" : "canceled";
+  if (s === "CANCELLATION_REJECTED" || s === "REJECTED_CAPTURE") return "requires_capture";
   if (s === "REFUND_REQUESTED") return "succeeded";
 
   switch ((statusCategory ?? "").toUpperCase()) {
@@ -889,8 +900,6 @@ export function mapWorldlineStatus(
     case 72: // deletion uncertain
     case 81: // refund pending
     case 82: // refund uncertain
-    case 73: // deletion refused, still captured
-    case 83: // refund refused, still captured
       return "succeeded";
     case 5:
     case 56:

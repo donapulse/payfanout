@@ -9,9 +9,11 @@ import type { AdapterOnboardingDescriptor } from "@payfanout/core";
  * additionally tolerates a few undocumented variants, but this descriptor
  * drives host subscription lists and must not present those as provider
  * behavior. The documented terminal refund signal is `payment.refunded`; there
- * is no dedicated refund-failure event, but a refused refund arrives as
- * `payment.rejected` with status code 73/83 (parsed as `payment.refund_failed`),
- * and polling `retrieveRefund` observes it too.
+ * is no dedicated refund-failure event. Following Worldline's Statuses
+ * reference, a `payment.rejected` carrying status code 73/83 reports a refused
+ * deletion or refund and is parsed as `payment.refund_failed`; that reading is
+ * not yet sandbox-verified, and polling `retrieveRefund` observes the refusal
+ * too.
  *
  * There is no client-scope credential: the Hosted Tokenization iframe is
  * addressed entirely by the `hostedTokenizationUrl` the server session returns,

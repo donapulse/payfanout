@@ -497,13 +497,17 @@ docs.direct.worldline-solutions.com unless noted):
   `succeeded`, REJECTED/CANCELLED → `failed`, REFUND_REQUESTED/pending → `pending`.
   Refined 2026-09-23, superseding the REJECTED_CAPTURE → `failed` and REFUND_REQUESTED →
   `processing` readings above, from the Statuses reference's per-operation outcome tables and
-  numeric-code list, with these codes decided before the category band: CANCELLED 61/62 (a
-  cancellation still awaiting the acquirer) → `processing`; CANCELLATION_REJECTED 63 ("The
-  payment remains authorised") and REJECTED_CAPTURE 93 (the transaction "will remain in
-  statusOutput.statusCode=5") → `requires_capture`; REJECTED 73/83 (a refused deletion or
-  refund, the payment staying at 9), REFUND_REQUESTED and the REVERSED band → `succeeded`;
-  a capture carrying 93 or a refund carrying 73/83 stays out of `amountCaptured` /
-  `amountRefunded`, and a refund maps by its statusCode when that is its only signal.
+  numeric-code list. The codes naming a refused operation are decided first, by code alone,
+  whatever status string or category carries them (the contract's status enum, v2.507.0,
+  has no CANCELLATION_REJECTED, so a refused cancellation can arrive under another string):
+  63 ("The payment remains authorised") and 93 (the transaction "will remain in
+  statusOutput.statusCode=5") → `requires_capture`; 73/83 (a refused deletion or refund, the
+  payment staying at 9) → `succeeded`. Then, still before the category band: CANCELLED 61/62
+  (a cancellation still awaiting the acquirer) → `processing`, any other CANCELLED →
+  `canceled`; the CANCELLATION_REJECTED and REJECTED_CAPTURE strings → `requires_capture`;
+  REFUND_REQUESTED and the REVERSED band → `succeeded`. A capture carrying 93 or a refund
+  carrying 73/83 stays out of `amountCaptured` / `amountRefunded`, and a refund maps by its
+  statusCode when that is its only signal.
 - **Manual capture (not multi-capture):** `PRE_AUTHORIZATION` authorizes, `POST /capture
   { amount?, isFinal: true }` settles — a partial capture settles that amount and RELEASES
   the uncaptured remainder (Worldline finalizes the capture, and referenced refunds are only
@@ -517,11 +521,24 @@ docs.direct.worldline-solutions.com unless noted):
   only in a two-decimal currency, any other being refused with `invalid_request` before the
   capture call, because the API contract (v2.507.0) documents CapturePayment's bare `amount`
   "in cents, where single digit currencies are presumed to have 2 digits" (see the
-  minor-unit item below). CancelPayment answers 409 both for an idempotent replay still in
-  flight and, per the contract, for "Cancellation is not allowed because payment is closed";
-  after the transport retries, a 409 is read against the payment: a cancellation that took
-  effect answers `canceled` (or `processing` while pending), anything else rejects with a
-  non-retryable `invalid_request` instead of a retryable conflict.
+  minor-unit item below). CancelPayment answers 409 both for a request "currently being
+  processed" under the same idempotence key (idempotent-requests guide) and, per the
+  contract, for "Cancellation is not allowed because payment is closed"; after the transport
+  retries, a 409 is read against the payment. A payment whose `status` is CANCELLED answers
+  `canceled` (or `processing` at 61/62); a payment still cancellable
+  (`statusOutput.isCancellable`, or when that flag is absent, one reading `requires_capture`)
+  keeps the retryable `processing_error`, because the original may still land and a replay
+  under the same key answers the original's outcome; anything else rejects with a
+  non-retryable `invalid_request`. A `processing` read-back alone is never taken for a
+  pending cancellation, since CAPTURE_REQUESTED (4/91/92/99), AUTHORIZATION_REQUESTED and
+  CREATED read `processing` too. Refusals are reported where Worldline reports them:
+  `capturePayment` answers `requires_capture` only when the refusal comes back synchronously,
+  while the Statuses reference and the test-cases page document `statusCode=91` as the
+  immediate CapturePayment answer with 93 set "after a few minutes", so the refusal usually
+  surfaces through `retrievePayment` or `payment.rejected_capture`; `cancelPayment` can
+  resolve `processing` (61/62), settled by `payment.cancelled` (documented for statusCode 6)
+  or a re-read; and a refused capture can leave an automatic-capture payment at
+  `requires_capture`, a status `usePaymentStatus` does not treat as final.
 - **Webhooks:** `X-GCS-Signature` = base64(HMAC-SHA256(webhookSecret, rawBody)) over the
   EXACT raw bytes, key selected by `X-GCS-KeyId` (array of `{keyId, secretKey}` for
   rotation, any active key verifying wins). One event per delivery. The documented event
@@ -533,17 +550,18 @@ docs.direct.worldline-solutions.com unless noted):
   terminal refund signal is `payment.refunded`. There is no dedicated refund-failure event,
   but (corrected 2026-09-23) the Statuses reference defines REJECTED as "The
   authorisation/refund request has been rejected by the acquirer" and lists refused
-  deletions/refunds as REJECTED 73/83, so a `payment.rejected` whose payment carries
-  statusCode 73 or 83 reports a refused deletion or refund (docs-derived, not yet seen in the
-  sandbox);
-  polling `retrieveRefund` remains the other refund-failure signal. Mapping:
-  `payment.captured` → `payment.succeeded`, `payment.rejected` → `payment.failed`, or
-  `payment.refund_failed` when its payment carries statusCode 73/83, and
-  `payment.rejected_capture` → `unknown` (corrected 2026-09-23: a refused capture leaves the
-  authorisation standing, a state the unified vocabulary cannot express, and
-  `payment.failed` would tell hosts the money is gone; `retrievePayment` reports
-  `requires_capture`), `payment.cancelled` → `payment.canceled`, `payment.refunded` →
-  `payment.refunded`, pending payment states →
+  deletions/refunds as REJECTED 73/83, so a `payment.rejected` whose payment (or refund)
+  resource carries statusCode 73 or 83 reports a refused deletion or refund (docs-derived,
+  not yet seen in the sandbox). A refund-failure event takes its amount and currency from a
+  `refundOutput` only and omits them otherwise, since a payment's `amountOfMoney` is what was
+  paid, not what the refused refund asked back; polling `retrieveRefund` remains the other
+  refund-failure signal. Mapping: `payment.captured` → `payment.succeeded`,
+  `payment.rejected` → `payment.failed`, or `payment.refund_failed` when it carries
+  statusCode 73/83, and `payment.rejected_capture` → `unknown` (corrected 2026-09-23: it
+  reports a failed capture on a payment that stays authorised until the merchant captures
+  again or cancels, so neither `payment.failed`, which would tell hosts the money is gone, nor
+  a success type is honest; `retrievePayment` reports `requires_capture`), `payment.cancelled`
+  → `payment.canceled`, `payment.refunded` → `payment.refunded`, pending payment states →
   `payment.processing`. `refund.refund_requested` maps to `unknown` deliberately — it is
   recognized but non-terminal, and the unified vocabulary has no in-flight refund state;
   fabricating a terminal type would misreport it. The parser additionally TOLERATES

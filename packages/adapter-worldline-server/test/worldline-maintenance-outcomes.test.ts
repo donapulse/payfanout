@@ -103,6 +103,22 @@ describe("cancellation outcomes", () => {
     fake.cancelRejected = false;
     await expect(adapter.cancelPayment(id, "void-2")).resolves.toMatchObject({ status: "canceled" });
   });
+
+  it("answers a cancellation replayed under its key with the original outcome", async () => {
+    const { adapter, fake } = makePair();
+    const id = await authorize(adapter, 4000);
+    fake.cancelRejected = true;
+    await expect(adapter.cancelPayment(id, "void-1")).resolves.toMatchObject({ status: "requires_capture" });
+
+    // The acquirer would accept a cancellation now, but a replay under the same
+    // key answers the original refusal instead of cancelling anew.
+    fake.cancelRejected = false;
+    await expect(adapter.cancelPayment(id, "void-1")).resolves.toMatchObject({
+      status: "requires_capture",
+      amountCapturable: 4000,
+    });
+    await expect(adapter.cancelPayment(id, "void-2")).resolves.toMatchObject({ status: "canceled" });
+  });
 });
 
 describe("capture outcomes", () => {
@@ -138,6 +154,57 @@ describe("capture outcomes", () => {
     fake.captureRefused = false;
     const captured = await adapter.capturePayment(id, undefined, "cap-2");
     expect(captured.amountCaptured).toBe(4000);
+  });
+
+  it("reports a capture Worldline has only queued as processing, and its later refusal as requires_capture", async () => {
+    let readBack: Record<string, unknown> | undefined;
+    const { adapter } = makePair((method, path, body) =>
+      readBack && method === "GET" && /\/payments\/[^/]+$/.test(path) ? { ...body, ...readBack } : body,
+    );
+    const id = await authorize(adapter, 4000);
+    // Test cases page: right after CapturePayment "you will receive statusCode=91",
+    // and the platform moves the payment to 93 "after a few minutes".
+    readBack = { status: "CAPTURE_REQUESTED", statusOutput: { statusCode: 91, statusCategory: "PENDING_CONNECT_OR_3RD_PARTY" } };
+    await expect(adapter.capturePayment(id, undefined, "cap-1")).resolves.toMatchObject({ status: "processing" });
+
+    readBack = { status: "REJECTED_CAPTURE", statusOutput: { statusCode: 93, statusCategory: "UNSUCCESSFUL" } };
+    await expect(adapter.retrievePayment(id)).resolves.toMatchObject({
+      status: "requires_capture",
+      amountCaptured: 0,
+      amountCapturable: 4000,
+    });
+  });
+
+  it("resolves an automatic-capture completion answered with a refused capture as requires_capture, not a decline", async () => {
+    const refused = { status: "REJECTED_CAPTURE", statusOutput: { statusCode: 93, statusCategory: "UNSUCCESSFUL" } };
+    const { adapter } = makePair((method, path, body) => {
+      if (method === "POST" && path.endsWith("/payments")) {
+        return { ...body, payment: { ...(body["payment"] as Record<string, unknown>), ...refused } };
+      }
+      if (method === "GET" && /\/payments\/[^/]+$/.test(path)) return { ...body, ...refused };
+      if (method === "GET" && path.endsWith("/captures")) {
+        const captures = (body["captures"] as Array<Record<string, unknown>>).map((c) => ({
+          ...c,
+          status: "REJECTED_CAPTURE",
+          statusOutput: { statusCode: 93 },
+        }));
+        return { ...body, captures };
+      }
+      return body;
+    });
+    const session = await adapter.createPaymentSession({
+      amount: 2500,
+      currency: "EUR",
+      captureMethod: "automatic",
+      returnUrl: "https://host.example/return",
+      idempotencyKey: "sale-session",
+    });
+    const info = await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: "htp_sale",
+      idempotencyKey: "sale-complete",
+    });
+    expect(info).toMatchObject({ status: "requires_capture", amount: 2500, amountCaptured: 0, amountCapturable: 2500 });
   });
 });
 
@@ -213,13 +280,33 @@ describe("webhooks for refused operations", () => {
     for (const statusCode of [83, 73]) {
       const event = await parseWorldlineWebhookEvent(paymentEvent("payment.rejected", "REJECTED", statusCode));
       expect(event).toMatchObject({ type: "payment.refund_failed", pspPaymentId: "pay_1" });
+      // The payment's amountOfMoney is what was paid, not what the refund asked back.
+      expect(event.amount).toBeUndefined();
+      expect(event.currency).toBeUndefined();
     }
   });
 
-  it("reads any other payment.rejected as payment.failed", async () => {
+  it("takes a refused refund's code and money from a refund resource", async () => {
+    const event = await parseWorldlineWebhookEvent(
+      JSON.stringify({
+        id: "evt_refund_83",
+        created: "2026-09-23T10:00:00Z",
+        type: "payment.rejected",
+        refund: {
+          id: "ref_7",
+          refundOutput: { amountOfMoney: { amount: 1250, currencyCode: "bhd" } },
+          status: "REJECTED",
+          statusOutput: { statusCode: 83, statusCategory: "UNSUCCESSFUL" },
+        },
+      }),
+    );
+    expect(event).toMatchObject({ type: "payment.refund_failed", refundId: "ref_7", amount: 1250, currency: "BHD" });
+  });
+
+  it("reads any other payment.rejected as payment.failed, with the payment's money", async () => {
     for (const statusCode of [2, 57, 59, undefined]) {
       const event = await parseWorldlineWebhookEvent(paymentEvent("payment.rejected", "REJECTED", statusCode));
-      expect(event.type).toBe("payment.failed");
+      expect(event).toMatchObject({ type: "payment.failed", amount: 1099, currency: "EUR" });
     }
   });
 
@@ -307,14 +394,20 @@ describe("capture amounts", () => {
   });
 });
 
-describe("cancellation of a closed payment", () => {
-  /** An adapter whose transport retries run without real backoff, with every cancel POST counted. */
+describe("cancellation answered with a 409", () => {
+  /**
+   * An adapter whose transport retries run without real backoff, with every
+   * cancel POST counted. Once readBack is called, GET /payments/{id} answers
+   * those fields over the fake's payment.
+   */
   function makeCancelPair(answerConflict: (attempt: number) => boolean = () => false): {
     adapter: WorldlineServerAdapter;
     cancelPosts: () => number;
+    readBack: (fields: Record<string, unknown>) => void;
   } {
     const fake = new FakeWorldlineApi();
     let posts = 0;
+    let override: Record<string, unknown> | undefined;
     const adapter = new WorldlineServerAdapter({
       apiKeyId: "api-key-id",
       secretApiKey: "secret-api-key",
@@ -325,25 +418,106 @@ describe("cancellation of a closed payment", () => {
       sleep: async () => {},
       fetch: async (input, init) => {
         const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-        if (init?.method === "POST" && /\/cancel$/.test(new URL(url).pathname) && answerConflict(++posts)) {
+        const path = new URL(url).pathname;
+        if (init?.method === "POST" && /\/cancel$/.test(path) && answerConflict(++posts)) {
           return new Response(
             JSON.stringify({ errorId: "dup", errors: [{ code: "1409", message: "request in progress", httpStatusCode: 409 }] }),
             { status: 409 },
           );
         }
-        return fake.fetch(input, init);
+        const response = await fake.fetch(input, init);
+        if (!override || (init?.method ?? "GET") !== "GET" || !/\/payments\/[^/]+$/.test(path)) return response;
+        const payment = (await response.json()) as Record<string, unknown>;
+        return new Response(JSON.stringify({ ...payment, ...override }), {
+          status: response.status,
+          headers: { "content-type": "application/json" },
+        });
       },
     });
-    return { adapter, cancelPosts: () => posts };
+    return {
+      adapter,
+      cancelPosts: () => posts,
+      readBack: (fields) => {
+        override = fields;
+      },
+    };
   }
 
-  it("refuses a captured payment's cancellation as a non-retryable invalid_request, not a retryable conflict", async () => {
-    const { adapter } = makeCancelPair();
-    const id = await openPayment(adapter, 3000, "EUR", "automatic");
-    const failure = await adapter.cancelPayment(id, "void-closed").catch((err: unknown) => err);
+  const closed: Array<[string, "automatic" | "manual"]> = [
+    ["a sale", "automatic"],
+    ["a captured payment", "manual"],
+  ];
+  for (const [label, captureMethod] of closed) {
+    it(`refuses cancelling ${label} as a non-retryable invalid_request, not a retryable conflict`, async () => {
+      const { adapter } = makeCancelPair();
+      const id = await openPayment(adapter, 3000, "EUR", captureMethod);
+      if (captureMethod === "manual") await adapter.capturePayment(id, undefined, "cap-1");
+      const failure = await adapter.cancelPayment(id, "void-closed").catch((err: unknown) => err);
+      expect(isPayFanoutError(failure)).toBe(true);
+      expect(failure).toMatchObject({ code: "invalid_request", retryable: false, pspName: "worldline" });
+      await expect(adapter.retrievePayment(id)).resolves.toMatchObject({ status: "succeeded" });
+    });
+  }
+
+  it("keeps the retryable error while the payment is still authorised, since the original may still land", async () => {
+    const { adapter, cancelPosts } = makeCancelPair(() => true);
+    const id = await authorize(adapter, 3000);
+    const failure = await adapter.cancelPayment(id, "void-1").catch((err: unknown) => err);
     expect(isPayFanoutError(failure)).toBe(true);
-    expect(failure).toMatchObject({ code: "invalid_request", retryable: false, pspName: "worldline" });
-    await expect(adapter.retrievePayment(id)).resolves.toMatchObject({ status: "succeeded" });
+    expect(failure).toMatchObject({ code: "processing_error", retryable: true, pspName: "worldline" });
+    expect(cancelPosts()).toBe(3); // the first attempt and both transport retries
+    await expect(adapter.retrievePayment(id)).resolves.toMatchObject({ status: "requires_capture", amountCapturable: 3000 });
+  });
+
+  it("does not take a capture in flight for a pending cancellation", async () => {
+    const { adapter, readBack } = makeCancelPair(() => true);
+    const id = await authorize(adapter, 3000);
+    readBack({ status: "CAPTURE_REQUESTED", statusOutput: { statusCode: 91, statusCategory: "PENDING_CONNECT_OR_3RD_PARTY" } });
+    const failure = await adapter.cancelPayment(id, "void-1").catch((err: unknown) => err);
+    expect(isPayFanoutError(failure)).toBe(true);
+    expect(failure).toMatchObject({ code: "invalid_request", retryable: false });
+  });
+
+  it("follows Worldline's isCancellable flag when the payment carries one", async () => {
+    const { adapter, readBack } = makeCancelPair(() => true);
+    const id = await authorize(adapter, 3000);
+    readBack({
+      status: "CAPTURE_REQUESTED",
+      statusOutput: { statusCode: 91, statusCategory: "PENDING_CONNECT_OR_3RD_PARTY", isCancellable: true },
+    });
+    await expect(adapter.cancelPayment(id, "void-1")).rejects.toMatchObject({ code: "processing_error", retryable: true });
+
+    readBack({ status: "PENDING_CAPTURE", statusOutput: { statusCode: 5, statusCategory: "PENDING_MERCHANT", isCancellable: false } });
+    await expect(adapter.cancelPayment(id, "void-2")).rejects.toMatchObject({ code: "invalid_request", retryable: false });
+  });
+
+  it("answers a cancellation still awaiting the acquirer with processing", async () => {
+    const { adapter, readBack } = makeCancelPair(() => true);
+    const id = await authorize(adapter, 3000);
+    readBack({ status: "CANCELLED", statusOutput: { statusCode: 61, statusCategory: "UNSUCCESSFUL" } });
+    await expect(adapter.cancelPayment(id, "void-1")).resolves.toMatchObject({ status: "processing" });
+  });
+
+  it("does not take a refused cancellation (63) for a cancelled payment, whatever its status string", async () => {
+    const { adapter, readBack } = makeCancelPair(() => true);
+    const id = await authorize(adapter, 3000);
+    readBack({ status: "CANCELLED", statusOutput: { statusCode: 63, statusCategory: "UNSUCCESSFUL" } });
+    await expect(adapter.cancelPayment(id, "void-1")).rejects.toMatchObject({ code: "processing_error", retryable: true });
+  });
+
+  it("judges a payment read back without a status string by its code", async () => {
+    const { adapter, readBack } = makeCancelPair(() => true);
+    const id = await authorize(adapter, 3000);
+    readBack({ status: undefined, statusOutput: { statusCode: 5 } });
+    await expect(adapter.cancelPayment(id, "void-1")).rejects.toMatchObject({ code: "processing_error", retryable: true });
+  });
+
+  it("passes any other cancellation failure through untouched and unretried", async () => {
+    const { adapter, cancelPosts } = makeCancelPair();
+    const failure = await adapter.cancelPayment("pay_missing", "void-1").catch((err: unknown) => err);
+    expect(isPayFanoutError(failure)).toBe(true);
+    expect(failure).toMatchObject({ code: "invalid_request", retryable: false });
+    expect(cancelPosts()).toBe(1);
   });
 
   it("still lets a replay whose original is in flight settle on the retry", async () => {

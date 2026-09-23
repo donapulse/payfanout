@@ -90,7 +90,7 @@ export class FakeWorldlineApi {
     const captureMatch = /^\/v2\/[^/]+\/payments\/([^/]+)\/capture$/.exec(path);
     if (method === "POST" && captureMatch) return this.capture(decodeURIComponent(captureMatch[1]!), body ?? {}, idemKey);
     const cancelMatch = /^\/v2\/[^/]+\/payments\/([^/]+)\/cancel$/.exec(path);
-    if (method === "POST" && cancelMatch) return this.cancel(decodeURIComponent(cancelMatch[1]!));
+    if (method === "POST" && cancelMatch) return this.cancel(decodeURIComponent(cancelMatch[1]!), idemKey);
     const refundMatch = /^\/v2\/[^/]+\/payments\/([^/]+)\/refund$/.exec(path);
     if (method === "POST" && refundMatch) return this.refund(decodeURIComponent(refundMatch[1]!), body ?? {}, idemKey);
     const capturesMatch = /^\/v2\/[^/]+\/payments\/([^/]+)\/captures$/.exec(path);
@@ -235,16 +235,33 @@ export class FakeWorldlineApi {
     return json(201, capture);
   }
 
-  private cancel(id: string): Response {
+  /** CancelPayment outcomes by X-GCS-Idempotence-Key, answered again to a replay. */
+  private readonly cancelByIdemKey = new Map<string, { status: number; body: unknown }>();
+
+  private cancel(id: string, idemKey: string | undefined): Response {
     const payment = this.payments.get(id);
     if (!payment) return notFound();
+    // CancelPayment is idempotent: a completed request replayed under its key
+    // answers "the same outcome as the original request" (idempotent-requests
+    // guide), whatever happened to the payment since.
+    const original = idemKey ? this.cancelByIdemKey.get(idemKey) : undefined;
+    if (original) return json(original.status, original.body);
+    const outcome = this.cancelOutcome(payment);
+    if (idemKey) this.cancelByIdemKey.set(idemKey, outcome);
+    return json(outcome.status, outcome.body);
+  }
+
+  private cancelOutcome(payment: StoredPayment): { status: number; body: unknown } {
     // API contract, CancelPayment 409: "Cancellation is not allowed because payment is closed".
     const cancelled = payment.status === "CANCELLED" && payment.statusCode === 6;
     if (payment.sale || this.hasSettledCapture(payment) || cancelled) {
-      return json(409, {
-        errorId: "cxl",
-        errors: [{ code: "409", message: "Cancellation is not allowed because payment is closed", httpStatusCode: 409 }],
-      });
+      return {
+        status: 409,
+        body: {
+          errorId: "cxl",
+          errors: [{ code: "409", message: "Cancellation is not allowed because payment is closed", httpStatusCode: 409 }],
+        },
+      };
     }
     // Statuses reference, CancelPayment outcomes: CANCELLED/UNSUCCESSFUL/6 is
     // final, CANCELLED/PENDING_MERCHANT/61 awaits the acquirer, and
@@ -252,9 +269,12 @@ export class FakeWorldlineApi {
     if (this.cancelRejected) {
       // "The payment reverts to its previous state": the stored payment is left
       // as it was, so an authorisation keeps reading back PENDING_CAPTURE/5.
-      return json(200, {
-        payment: publicPayment({ ...payment, status: "CANCELLATION_REJECTED", statusCode: 63, statusCategory: "UNSUCCESSFUL" }),
-      });
+      return {
+        status: 200,
+        body: {
+          payment: publicPayment({ ...payment, status: "CANCELLATION_REJECTED", statusCode: 63, statusCategory: "UNSUCCESSFUL" }),
+        },
+      };
     }
     payment.capturableRemaining = 0;
     payment.status = "CANCELLED";
@@ -263,10 +283,13 @@ export class FakeWorldlineApi {
       // GetPayment lists 61 under CANCELLED/UNSUCCESSFUL while CancelPayment
       // answers it as PENDING_MERCHANT; each read follows its own table.
       payment.statusCode = 61;
-      return json(200, { payment: { ...publicPayment(payment), statusOutput: { statusCode: 61, statusCategory: "PENDING_MERCHANT" } } });
+      return {
+        status: 200,
+        body: { payment: { ...publicPayment(payment), statusOutput: { statusCode: 61, statusCategory: "PENDING_MERCHANT" } } },
+      };
     }
     payment.statusCode = 6;
-    return json(200, { payment: publicPayment(payment) });
+    return { status: 200, body: { payment: publicPayment(payment) } };
   }
 
   private refund(id: string, body: Record<string, unknown>, idemKey: string | undefined): Response {

@@ -1,5 +1,11 @@
 # @payfanout/adapter-stripe-server
 
+## 2.0.2
+
+### Patch Changes
+
+- d3d577a: Update the Stripe Node SDK to 22.6.2. Payment operations now fail with a retryable `psp_unavailable` error, instead of hanging, when a Stripe response is cut off or stalls past the request timeout after its headers arrive.
+
 ## 2.0.1
 
 ### Patch Changes

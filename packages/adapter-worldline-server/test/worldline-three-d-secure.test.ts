@@ -655,17 +655,16 @@ describe("the return URL follows Worldline's length and protocol rules", () => {
     }
   });
 
-  it("refuses a defaultReturnUrl that breaks either rule the same way, and never checks one a session overrides", async () => {
+  it("refuses a defaultReturnUrl that breaks either rule when the adapter is constructed", () => {
     for (const defaultReturnUrl of [urlOfLength(201), "shop.example/return"]) {
-      const { adapter, fetchSpy } = makePair({ defaultReturnUrl });
-      const error = await refusal(adapter, {});
+      let error: unknown;
+      try {
+        makePair({ defaultReturnUrl });
+      } catch (err) {
+        error = err;
+      }
       expect(error).toMatchObject({ code: "invalid_request", retryable: false });
-      expect(error?.raw).toEqual({ propertyName });
-      expect(fetchSpy).not.toHaveBeenCalled();
-
-      const overridden = makePair({ defaultReturnUrl });
-      const info = await complete(overridden.adapter, { returnUrl: RETURN_URL });
-      expect(info.status).toBe("succeeded");
+      expect((error as PayFanoutError).raw).toEqual({ propertyName });
     }
   });
 

@@ -62,7 +62,9 @@ export interface WorldlineServerAdapterConfig {
    * properties of every card payment, so with neither, createPaymentSession is
    * refused before anything reaches Worldline. Set it before upgrading from a
    * release that did not require a return URL: sessions that release created
-   * without one are otherwise refused at completePayment.
+   * without one are otherwise refused at completePayment. Like a session's own
+   * URL it must be absolute, with a protocol, and at most 200 characters; the
+   * constructor refuses one that is not.
    */
   defaultReturnUrl?: string;
   /** HMAC key for the stateless signed session context (see session-context.ts). */
@@ -211,6 +213,9 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     ) {
       throw PayFanoutError.invalidRequest("WorldlineServerAdapter config.maxNetworkRetries must be an integer >= 0");
     }
+    // A malformed default would fail every session that relies on it, so it is
+    // refused at startup rather than at checkout.
+    if (config.defaultReturnUrl) assertReturnUrlFormat(config.defaultReturnUrl);
     this.config = config;
     this.baseUrl =
       config.baseUrl ??

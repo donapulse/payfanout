@@ -195,13 +195,33 @@ export class FakeWorldlineApi {
     const amount = (body["amount"] as number | undefined) ?? payment.capturableRemaining;
     // A capture always finalizes, so a payment is capturable at most once — a sale
     // (auto-captured), an already-captured payment, or an over-capture is rejected.
-    if (payment.sale || payment.captures.length > 0 || amount <= 0 || amount > payment.capturableRemaining) {
+    // A capture the acquirer refused does not count: the authorisation stands.
+    if (payment.sale || this.hasSettledCapture(payment) || amount <= 0 || amount > payment.capturableRemaining) {
       return json(400, { errorId: "cap", errors: [{ code: "5", message: "Payment not in a capturable state", httpStatusCode: 400 }] });
+    }
+    if (this.captureRefused) {
+      // Statuses reference: the capture object carries REJECTED_CAPTURE and only
+      // a statusCode (CaptureStatusOutput has no category), GetPayment lists 93
+      // under REJECTED_CAPTURE/UNSUCCESSFUL, and the authorisation stays
+      // capturable ("you can retry the operation").
+      const refused: WorldlineCaptureLike = {
+        id: `cap_${++this.seq}`,
+        status: "REJECTED_CAPTURE",
+        statusOutput: { statusCode: 93 },
+        captureOutput: { amountOfMoney: { amount, currencyCode: payment.currencyCode } },
+      };
+      payment.captures.push(refused);
+      payment.status = "REJECTED_CAPTURE";
+      payment.statusCode = 93;
+      payment.statusCategory = "UNSUCCESSFUL";
+      if (idemKey) this.captureByIdemKey.set(idemKey, refused);
+      this.uniqueCaptureCreations++;
+      return json(201, refused);
     }
     const capture: WorldlineCaptureLike = {
       id: `cap_${++this.seq}`,
       status: "CAPTURED",
-      statusOutput: { statusCode: 9, statusCategory: "COMPLETED" },
+      statusOutput: { statusCode: 9 },
       captureOutput: { amountOfMoney: { amount, currencyCode: payment.currencyCode } },
     };
     payment.captures.push(capture);
@@ -218,14 +238,34 @@ export class FakeWorldlineApi {
   private cancel(id: string): Response {
     const payment = this.payments.get(id);
     if (!payment) return notFound();
-    if (payment.sale || payment.captures.length > 0) {
-      return json(400, { errorId: "cxl", errors: [{ code: "5", message: "Payment cannot be cancelled", httpStatusCode: 400 }] });
+    // API contract, CancelPayment 409: "Cancellation is not allowed because payment is closed".
+    const cancelled = payment.status === "CANCELLED" && payment.statusCode === 6;
+    if (payment.sale || this.hasSettledCapture(payment) || cancelled) {
+      return json(409, {
+        errorId: "cxl",
+        errors: [{ code: "409", message: "Cancellation is not allowed because payment is closed", httpStatusCode: 409 }],
+      });
     }
-    // Statuses reference: CANCELLED sits in the UNSUCCESSFUL category.
-    payment.status = "CANCELLED";
-    payment.statusCode = 61;
-    payment.statusCategory = "UNSUCCESSFUL";
+    // Statuses reference, CancelPayment outcomes: CANCELLED/UNSUCCESSFUL/6 is
+    // final, CANCELLED/PENDING_MERCHANT/61 awaits the acquirer, and
+    // CANCELLATION_REJECTED/UNSUCCESSFUL/63 leaves the payment authorised.
+    if (this.cancelRejected) {
+      // "The payment reverts to its previous state": the stored payment is left
+      // as it was, so an authorisation keeps reading back PENDING_CAPTURE/5.
+      return json(200, {
+        payment: publicPayment({ ...payment, status: "CANCELLATION_REJECTED", statusCode: 63, statusCategory: "UNSUCCESSFUL" }),
+      });
+    }
     payment.capturableRemaining = 0;
+    payment.status = "CANCELLED";
+    payment.statusCategory = "UNSUCCESSFUL";
+    if (this.cancelPending) {
+      // GetPayment lists 61 under CANCELLED/UNSUCCESSFUL while CancelPayment
+      // answers it as PENDING_MERCHANT; each read follows its own table.
+      payment.statusCode = 61;
+      return json(200, { payment: { ...publicPayment(payment), statusOutput: { statusCode: 61, statusCategory: "PENDING_MERCHANT" } } });
+    }
+    payment.statusCode = 6;
     return json(200, { payment: publicPayment(payment) });
   }
 
@@ -235,17 +275,32 @@ export class FakeWorldlineApi {
     if (idemKey && this.refundByIdemKey.has(idemKey)) return json(201, this.refundByIdemKey.get(idemKey)!);
     const money = (body["amountOfMoney"] ?? {}) as { amount?: number; currencyCode?: string };
     const amount = money.amount ?? 0;
-    const capturedTotal = payment.captures.reduce((sum, c) => sum + (c.captureOutput?.amountOfMoney?.amount ?? 0), 0);
-    const refundedTotal = payment.refunds.reduce((sum, r) => sum + (r.refundOutput?.amountOfMoney?.amount ?? 0), 0);
+    // Refused captures and refunds moved no money, so they neither fund nor use
+    // up the refundable amount (a refused refund can be retried).
+    const capturedTotal = payment.captures
+      .filter((c) => c.status !== "REJECTED_CAPTURE")
+      .reduce((sum, c) => sum + (c.captureOutput?.amountOfMoney?.amount ?? 0), 0);
+    const refundedTotal = payment.refunds
+      .filter((r) => r.status !== "REJECTED")
+      .reduce((sum, r) => sum + (r.refundOutput?.amountOfMoney?.amount ?? 0), 0);
     if (amount <= 0 || refundedTotal + amount > capturedTotal) {
       return json(400, { errorId: "rfd", errors: [{ code: "5", message: "Refund exceeds the refundable amount", httpStatusCode: 400 }] });
     }
     const refund: WorldlineRefundLike = {
       id: `ref_${++this.seq}`,
-      status: "REFUNDED",
-      statusOutput: { statusCode: 8, statusCategory: "REFUNDED" },
+      status: this.refundPending ? "REFUND_REQUESTED" : "REFUNDED",
+      statusOutput: this.refundPending
+        ? { statusCode: 81, statusCategory: "PENDING_CONNECT_OR_3RD_PARTY" }
+        : { statusCode: 8, statusCategory: "REFUNDED" },
       refundOutput: { amountOfMoney: { amount, currencyCode: money.currencyCode ?? payment.currencyCode } },
     };
+    if (this.refundPending) {
+      // Statuses reference: the payment reads back REFUND_REQUESTED/REVERSED/81
+      // until the acquirer answers (8 refunded, or 83 refused).
+      payment.status = "REFUND_REQUESTED";
+      payment.statusCode = 81;
+      payment.statusCategory = "REVERSED";
+    }
     payment.refunds.push(refund);
     if (idemKey) this.refundByIdemKey.set(idemKey, refund);
     this.uniqueRefundCreations++;
@@ -283,6 +338,39 @@ export class FakeWorldlineApi {
     };
     payment.refunds.push(stored);
     return stored;
+  }
+
+  /*
+   * Maintenance-outcome levers, all off by default. Each switches the matching
+   * operation to another outcome documented in Worldline's Statuses reference.
+   */
+  /** CancelPayment answers 61 (Author. deletion waiting): the acquirer has not confirmed the cancellation. */
+  cancelPending = false;
+  /** The acquirer refuses the cancellation (63): the payment remains authorised. */
+  cancelRejected = false;
+  /** The acquirer refuses the capture (93): the authorisation stands and can be captured again. */
+  captureRefused = false;
+  /** RefundPayment answers 81 (Refund pending); settle it with refuseRefund. */
+  refundPending = false;
+
+  /**
+   * Test helper: the acquirer refuses a pending refund (83, Refund refused).
+   * The refund turns REJECTED and GetPayment lists the payment under
+   * REJECTED/UNSUCCESSFUL/83, though the money stays captured.
+   */
+  refuseRefund(paymentId: string, refundId: string): void {
+    const payment = this.payments.get(paymentId);
+    const refund = payment?.refunds.find((r) => r.id === refundId);
+    if (!payment || !refund) throw new Error(`No refund ${refundId} on payment ${paymentId}`);
+    refund.status = "REJECTED";
+    refund.statusOutput = { statusCode: 83, statusCategory: "UNSUCCESSFUL" };
+    payment.status = "REJECTED";
+    payment.statusCode = 83;
+    payment.statusCategory = "UNSUCCESSFUL";
+  }
+
+  private hasSettledCapture(payment: StoredPayment): boolean {
+    return payment.captures.some((c) => c.status !== "REJECTED_CAPTURE");
   }
 }
 

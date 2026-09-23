@@ -94,6 +94,19 @@ clock is an injectable `now()` seam. Every mutating call carries a signed, deter
   missed-webhook recovery falls back to `retrievePayment` per order.
 - Card vaulting, zero-amount verification, session update, and listing are out of scope for
   this version (declared `false`).
+- A capture or cancellation the acquirer refuses leaves the payment authorised:
+  `capturePayment` / `cancelPayment` report `requires_capture` and the authorisation stays in
+  `amountCapturable`, ready to capture or cancel again.
+- Cancelling a payment Worldline reports as closed (already captured, for example) rejects
+  with a non-retryable `invalid_request`; repeating a cancellation that already took effect
+  answers `canceled`.
+- A refund the acquirer refuses leaves the payment `succeeded`: `retrieveRefund` reports the
+  refund `failed`, it stays out of `amountRefunded`, and its `payment.rejected` webhook
+  arrives as `payment.refund_failed`.
+- Worldline documents the CapturePayment amount in cents with two assumed decimals, so a
+  partial capture in a currency without two decimals (JPY, BHD, …) is refused with
+  `invalid_request` and no capture request is sent. Capture the full authorised amount (it
+  is sent without an amount) or cancel instead.
 
 ## Documentation
 

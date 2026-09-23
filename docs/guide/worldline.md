@@ -114,6 +114,17 @@ than five minutes, so keep the server clock accurate. Every mutating call carrie
 deterministic `X-GCS-Idempotence-Key` derived from your `idempotencyKey`.
 :::
 
+::: tip Manual capture: refusals and partial captures
+When the acquirer refuses a capture or a cancellation, the payment stays authorised:
+`capturePayment` and `cancelPayment` report `requires_capture`, with the authorisation still
+in `amountCapturable`, so you can try again or cancel. Cancelling a payment that is already
+captured is refused with a non-retryable `invalid_request`. Worldline documents the capture amount
+"in cents", assuming two decimals, so until that unit is confirmed for other currencies a
+**partial** capture in a currency without two decimals (JPY, BHD, …) is refused with
+`invalid_request` and no capture request is sent. Capture the full authorised amount
+instead, or cancel.
+:::
+
 ## 5. Wire the client adapter
 
 ```tsx

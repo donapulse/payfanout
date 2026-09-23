@@ -1,6 +1,7 @@
 import {
   assertMinorUnitAmount,
   classifyHttpFallback,
+  getCurrencyExponent,
   getUserMessage,
   isPayFanoutError,
   isTransportRetryable,
@@ -412,11 +413,12 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     idempotencyKey: string,
   ): Promise<PaymentInfo> {
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
+    const partialAmount = amount === undefined ? undefined : await this.partialCaptureAmount(pspPaymentId, amount);
     await this.request(
       "POST",
       `/v2/${this.merchantPath()}/payments/${encodeURIComponent(pspPaymentId)}/capture`,
       {
-        ...(amount !== undefined ? { amount } : {}),
+        ...(partialAmount !== undefined ? { amount: partialAmount } : {}),
         // Always finalize: a partial capture settles that amount and releases the
         // uncaptured remainder (a bare capture takes the full remaining amount).
         // Worldline only accepts referenced refunds once the capture is finalized,
@@ -428,13 +430,55 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     return this.retrievePayment(pspPaymentId);
   }
 
-  async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
-    await this.request(
-      "POST",
-      `/v2/${this.merchantPath()}/payments/${encodeURIComponent(pspPaymentId)}/cancel`,
-      {},
-      idempotencyKey,
+  /**
+   * The amount to put on CapturePayment, or undefined for a full capture. Every
+   * amountOfMoney field is in the currency's smallest unit, but the capture
+   * `amount` is documented "in cents, where single digit currencies are presumed
+   * to have 2 digits", which leaves its unit open wherever the ISO 4217 exponent
+   * is not 2. Capturing the whole authorised amount sends no amount at all, so
+   * the question never arises; a partial capture in such a currency is refused
+   * before any capture call.
+   */
+  private async partialCaptureAmount(
+    pspPaymentId: string,
+    amount: MinorUnitAmount,
+  ): Promise<MinorUnitAmount | undefined> {
+    const authorized = (await this.fetchPayment(pspPaymentId)).paymentOutput?.amountOfMoney;
+    if (amount === authorized?.amount) return undefined;
+    const currency = authorized?.currencyCode;
+    if (currency && getCurrencyExponent(currency) === 2) return amount;
+    throw PayFanoutError.invalidRequest(
+      "Worldline documents CapturePayment amounts in cents with two assumed decimals, so a partial capture in " +
+        `${currency || "an unreported currency"} is refused rather than risk capturing the wrong amount; capture in full or cancel`,
+      { pspPaymentId, amount, authorized },
     );
+  }
+
+  async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
+    try {
+      await this.request(
+        "POST",
+        `/v2/${this.merchantPath()}/payments/${encodeURIComponent(pspPaymentId)}/cancel`,
+        {},
+        idempotencyKey,
+      );
+    } catch (err) {
+      // CancelPayment answers 409 both for a replay whose original is still in
+      // flight (retried away above) and for "Cancellation is not allowed because
+      // payment is closed" (API contract). A 409 that outlives the retries is
+      // read against the payment itself: a cancellation that took effect is the
+      // answer; anything else is a closed payment, which no retry will open.
+      if (!isIdempotenceReplayInFlight(err)) throw err;
+      const info = await this.retrievePayment(pspPaymentId);
+      if (info.status === "canceled" || info.status === "processing") return info;
+      throw new PayFanoutError({
+        code: "invalid_request",
+        message: getUserMessage("invalid_request"),
+        retryable: false,
+        raw: err.raw,
+        pspName: this.pspName,
+      });
+    }
     return this.retrievePayment(pspPaymentId);
   }
 
@@ -458,7 +502,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       // composite through the per-payment list. The part after the last ":" is
       // Worldline's own refund id, the one webhooks report.
       refundId: `${req.pspPaymentId}:${refund.id}`,
-      status: mapRefundStatus(refund.status, refund.statusOutput?.statusCategory),
+      status: mapRefundStatus(refund),
       amount: refund.refundOutput?.amountOfMoney?.amount ?? amount,
       raw: refund,
     };
@@ -490,7 +534,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     }
     return {
       refundId,
-      status: mapRefundStatus(refund.status, refund.statusOutput?.statusCategory),
+      status: mapRefundStatus(refund),
       amount: refund.refundOutput?.amountOfMoney?.amount ?? 0,
       pspPaymentId,
       raw: refund,
@@ -546,7 +590,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       `/v2/${this.merchantPath()}/payments/${encodeURIComponent(pspPaymentId)}/captures`,
     );
     return (result.captures ?? [])
-      .filter((c) => !isFailedStatus(c.status, c.statusOutput?.statusCategory))
+      .filter((c) => !isFailedStatus(c))
       .reduce((sum, c) => sum + (c.captureOutput?.amountOfMoney?.amount ?? 0), 0);
   }
 
@@ -556,7 +600,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       `/v2/${this.merchantPath()}/payments/${encodeURIComponent(pspPaymentId)}/refunds`,
     );
     return (result.refunds ?? [])
-      .filter((r) => !isFailedStatus(r.status, r.statusOutput?.statusCategory))
+      .filter((r) => !isFailedStatus(r))
       .reduce((sum, r) => sum + (r.refundOutput?.amountOfMoney?.amount ?? 0), 0);
   }
 
@@ -759,18 +803,45 @@ function parseExpiry(expiryDate: string | undefined): { month?: number; year?: n
   return { ...(month >= 1 && month <= 12 ? { month } : {}), year };
 }
 
-function isFailedStatus(status: string | undefined, category: string | undefined): boolean {
-  const s = (status ?? "").toUpperCase();
-  const cat = (category ?? "").toUpperCase();
-  return cat === "UNSUCCESSFUL" || s === "REJECTED" || s === "REJECTED_CAPTURE" || s === "CANCELLED";
+/** The status fields a Worldline payment, capture or refund object may carry. */
+interface WorldlineStatusFields {
+  status?: string;
+  statusOutput?: { statusCode?: number; statusCategory?: string };
 }
 
 /**
- * Maps a Worldline payment onto the unified status. Primary signal is
- * statusOutput.statusCategory (Worldline's forward-compatible band — new
- * statuses join an existing category), with statusCode and the status string as
- * fallbacks. CANCELLED is checked first so a voided authorization is never read
- * as a failure.
+ * True for a capture or refund that moved no money, so it stays out of the
+ * captured/refunded totals. A capture's statusOutput carries only a statusCode
+ * (93 = the acquirer refused the capture); a refund's also carries a category,
+ * and 73/83 are a refused deletion/refund.
+ */
+function isFailedStatus(operation: WorldlineStatusFields): boolean {
+  const s = (operation.status ?? "").toUpperCase();
+  const cat = (operation.statusOutput?.statusCategory ?? "").toUpperCase();
+  const code = operation.statusOutput?.statusCode;
+  return (
+    cat === "UNSUCCESSFUL" ||
+    s === "REJECTED" ||
+    s === "REJECTED_CAPTURE" ||
+    s === "CANCELLED" ||
+    code === 73 ||
+    code === 83 ||
+    code === 93
+  );
+}
+
+/**
+ * Maps a Worldline payment onto the unified status, per Worldline's Statuses
+ * reference. Codes that change what their band means are decided first: a
+ * cancellation still awaiting the acquirer (CANCELLED 61/62) is `processing`; a
+ * refused cancellation (63) or capture (93) leaves the payment authorised, so
+ * `requires_capture`; a refused refund or deletion (REJECTED 73/83) and a refund
+ * in flight (REFUND_REQUESTED) leave it captured, so `succeeded` (refund state
+ * derives from amountRefunded). Any other CANCELLED is `canceled`, never read
+ * as a failure. After that the primary signal is statusOutput.statusCategory
+ * (Worldline's forward-compatible band — new statuses join an existing
+ * category), with statusCode and the status string as fallbacks; anything
+ * unrecognized is `processing`, never a fabricated terminal state.
  */
 export function mapWorldlineStatus(
   status: string | undefined,
@@ -778,11 +849,20 @@ export function mapWorldlineStatus(
   statusCategory: string | undefined,
 ): UnifiedPaymentStatus {
   const s = (status ?? "").toUpperCase();
-  if (s === "CANCELLED") return "canceled";
+  if (s === "CANCELLED") return statusCode === 61 || statusCode === 62 ? "processing" : "canceled";
+  // "The payment remains authorised" (63); after a refused capture "the global
+  // status of the transaction will remain in statusOutput.statusCode=5" (93).
+  if (s === "CANCELLATION_REJECTED" || statusCode === 63) return "requires_capture";
+  if (s === "REJECTED_CAPTURE" || statusCode === 93) return "requires_capture";
+  // A refused refund keeps the payment at 9 ("Payment requested"); REJECTED
+  // otherwise is a declined authorisation.
+  if (s === "REJECTED" && (statusCode === 73 || statusCode === 83)) return "succeeded";
+  if (s === "REFUND_REQUESTED") return "succeeded";
 
   switch ((statusCategory ?? "").toUpperCase()) {
     case "COMPLETED":
     case "REFUNDED": // the payment succeeded; refund state derives from amountRefunded
+    case "REVERSED": // refunded, or a refund in flight
       return "succeeded";
     case "PENDING_MERCHANT":
       return "requires_capture"; // authorised, awaiting a merchant capture
@@ -801,14 +881,32 @@ export function mapWorldlineStatus(
   }
 
   switch (statusCode) {
-    case 9:
-      return "succeeded"; // CAPTURED / settled
+    case 9: // CAPTURED / settled
+    case 7: // payment deleted
+    case 8: // refunded
+    case 85: // refund processed by merchant
+    case 71: // deletion pending
+    case 72: // deletion uncertain
+    case 81: // refund pending
+    case 82: // refund uncertain
+    case 73: // deletion refused, still captured
+    case 83: // refund refused, still captured
+      return "succeeded";
     case 5:
+    case 56:
       return "requires_capture"; // authorised
     case 46:
       return "requires_action"; // waiting authentication
     case 2:
+    case 57:
+    case 59:
       return "failed"; // authorisation declined
+    case 1:
+    case 6:
+      return "canceled"; // cancelled / authorisation cancelled
+    case 61:
+    case 62:
+      return "processing"; // cancellation awaiting the acquirer
     default:
       break;
   }
@@ -822,7 +920,6 @@ export function mapWorldlineStatus(
     case "REDIRECTED":
       return "requires_action";
     case "REJECTED":
-    case "REJECTED_CAPTURE":
       return "failed";
     default:
       // CAPTURE_REQUESTED / AUTHORIZATION_REQUESTED and any unknown status.
@@ -830,12 +927,16 @@ export function mapWorldlineStatus(
   }
 }
 
-function mapRefundStatus(status: string | undefined, category: string | undefined): RefundStatus {
-  const s = (status ?? "").toUpperCase();
-  const cat = (category ?? "").toUpperCase();
-  if (s === "REFUNDED" || cat === "REFUNDED" || cat === "COMPLETED") return "succeeded";
-  if (s === "REJECTED" || s === "CANCELLED" || cat === "UNSUCCESSFUL") return "failed";
-  return "pending"; // REFUND_REQUESTED / CREATED / PENDING_* — async, poll with retrieveRefund
+function mapRefundStatus(refund: WorldlineStatusFields): RefundStatus {
+  const s = (refund.status ?? "").toUpperCase();
+  const cat = (refund.statusOutput?.statusCategory ?? "").toUpperCase();
+  const code = refund.statusOutput?.statusCode;
+  if (s === "REFUNDED" || cat === "REFUNDED" || cat === "COMPLETED" || code === 7 || code === 8 || code === 85) {
+    return "succeeded";
+  }
+  if (s === "REJECTED" || s === "CANCELLED" || cat === "UNSUCCESSFUL" || code === 73 || code === 83) return "failed";
+  // REFUND_REQUESTED (71/72/81/82) / CREATED / PENDING_* — async, poll with retrieveRefund.
+  return "pending";
 }
 
 /**
@@ -883,7 +984,7 @@ export function mapWorldlineError(httpStatus: number, body: unknown): PayFanoutE
 }
 
 /** The retryable processing_error only mapWorldlineError's 409 branch produces. */
-function isIdempotenceReplayInFlight(error: unknown): boolean {
+function isIdempotenceReplayInFlight(error: unknown): error is PayFanoutError {
   return isPayFanoutError(error) && error.code === "processing_error" && error.retryable;
 }
 

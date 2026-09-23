@@ -19,10 +19,9 @@ import { bytesToBase64, hmacSha256, sha256Hex } from "@payfanout/core";
  * UTF-8 bytes, base64-encoded, and carried as
  * `Authorization: GCS v1HMAC:{apiKeyId}:{signature}`.
  *
- * Worldline also accepts an `X-GCS-Date` signed header in place of the `Date`
- * HTTP header (line 3 stays empty and `x-gcs-date` joins the canonical block) —
- * useful on edge runtimes that forbid setting the `Date` request header. The
- * documented `Date`-header form is implemented here as the default.
+ * The `Date` header is sent and signed, with the same value on line 3.
+ * Worldline's manual-authentication examples also send an `x-gcs-date` header
+ * alongside it, signed as one of the canonical `x-gcs-*` headers (item 4).
  */
 export interface V1HmacSigningInput {
   apiKeyId: string;

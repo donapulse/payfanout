@@ -21,7 +21,23 @@ going live.
 
 ## 1. Get your Worldline credentials
 
-From the **Worldline Merchant Portal** (its API / integration settings):
+Both key pairs come from the **Worldline Merchant Portal** (see Worldline's
+[authentication](https://docs.direct.worldline-solutions.com/en/integration/api-developer-guide/authentication)
+and [webhooks](https://docs.direct.worldline-solutions.com/en/integration/api-developer-guide/webhooks)
+guides):
+
+- **API key id + secret API key:** Developer → Payment API → *Add API Key*. The screen then
+  shows the pair under *API Key ID* / *Secret API Key*.
+- **Webhook key id + secret:** Developer → Webhooks → *Generate webhooks keys* shows the
+  *Webhooks ID* and its *Secret Webhook Key*; you can instead enter your own id and secret and
+  confirm.
+
+Each secret is displayed for **60 seconds only** and never again, so copy it into your secret
+store as soon as it appears. The key ids stay visible in the portal.
+
+API key pairs **expire**: renew before the date in the *Expiration date* column under
+Developer → Payment API. Creating a new pair **revokes** the current one, which then expires
+within **four hours**, so deploy the new `apiKeyId` / `secretApiKey` inside that window.
 
 | Credential | What it is | Used by |
 | --- | --- | --- |
@@ -213,14 +229,38 @@ API (`supportsEventPolling: false`), for missed-webhook recovery, reconcile with
 
 ## 9. Test cards
 
-Use your Worldline test account's documented sandbox cards and amount-based response triggers.
-Commonly available test cards include Visa `4330 2649 3634 4675`, Mastercard
-`5137 0098 0194 3438`, and Amex `3714 4963 5311 004`; **confirm the current list, decline
-triggers, and 3-D Secure test cards in your Worldline documentation** rather than assuming.
+Worldline's
+[test cases](https://docs.direct.worldline-solutions.com/en/integration/how-to-integrate/test-cases/)
+are for the sandbox only. These cards authorize successfully, through a frictionless or a
+challenge 3-D Secure flow, with any 3- or 4-digit CVV:
+
+| Brand | 3-D Secure frictionless | 3-D Secure challenge |
+| --- | --- | --- |
+| Visa | `4330 2649 3634 4675` | `4874 9706 8667 2022` |
+| Mastercard | `5137 0098 0194 3438` | `5130 2574 7453 3310` |
+| American Express | `3714 4963 5311 004` | `3797 6442 2997 381` |
+
+- **Frictionless** cards authenticate without a challenge, so the outcome comes straight back
+  from completion (§7).
+- **Challenge** cards exercise the redirect/return trip: create the session with a `returnUrl`
+  and completion returns `requires_action` with the redirect URL (§6). Once the customer is
+  back on your `returnUrl`, reconcile with `retrievePayment`.
+- **Decline:** any of these cards on a session with `amount: 1302` (€13.02),
+  `currency: "EUR"` and the default automatic capture is declined (Worldline `statusCode` 2).
+  The trigger is documented for `authorizationMode: "SALE"`, which is what the adapter sends
+  for automatic capture (`captureMethod: "manual"` sends `PRE_AUTHORIZATION`).
+
+The page also covers other brands and amount-based refund and capture outcomes; **confirm the
+current list there** rather than assuming.
 
 ## 10. Go live
 
+- [ ] Before you switch, run one **challenge-flow** test card (§9) end to end in sandbox, so
+      the return to your `returnUrl` and the `retrievePayment` reconciliation are exercised.
 - [ ] Swap in the **live** API key id + secret and the **live** merchant id.
+- [ ] Plan the live API key renewal ahead of its *Expiration date* (Developer → Payment API):
+      the old pair expires within four hours of creating a new one, so deploy the new pair
+      inside that window (§1).
 - [ ] Set `environment: "live"` on **both** adapters (host flips to the bare
       `payment.direct.worldline-solutions.com`).
 - [ ] Register the **live** webhook endpoint in the portal and use its **live** key id + secret.

@@ -443,8 +443,11 @@ docs.direct.worldline-solutions.com unless noted):
   method / Content-Type (empty for GET) / `Date` / sorted canonical `x-gcs-*` header lines /
   resource path, each `\n`-terminated (trailing `\n` after the path). The `Date` header is
   sent and signed (RFC-1123 GMT); the clock is an injectable `now()` so tests are
-  deterministic and hosts stay inside the platform's 5-minute skew. `X-GCS-Date` is noted in
-  code as the edge-runtime alternative when the `Date` header cannot be set.
+  deterministic and hosts stay inside the platform's 5-minute skew. (Corrected 2026-09-23
+  against the manual-authentication guide: `x-gcs-date` is not documented as a replacement
+  for the `Date` header — the guide's examples send it alongside `Date`, signed as a
+  canonical `x-gcs-*` header — so the code no longer presents it as an edge-runtime
+  alternative.)
 - **Idempotency** rides `X-GCS-Idempotence-Key` (max 40 ASCII). Arbitrary caller keys are
   hashed to fit: `sha256Hex(idempotencyKey).slice(0,40)` — deterministic, so replays dedupe
   at Worldline. The header is BOTH signed (in the canonical block) and sent on every mutating

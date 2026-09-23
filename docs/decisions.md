@@ -1410,15 +1410,18 @@ sandbox round-trip before production use, and the setup guide carries that warni
 - **`PaymentInfo.createdAt` falls back to epoch** — Checkout responses carry no creation
   timestamp and there is no read to fetch one; hosts take it from their own record or the
   webhook `eventDate`. The constant also keeps a replayed `completePayment` byte-identical.
-- **The onboarding CSP leaves `frame` and `connect` empty.** Doc-verified 2026-09-23: Adyen's
-  recommended policy (PCI script-security guide) allows `*.adyen.com` scripts and sets
-  `frame-src`, `connect-src`, `img-src` and `form-action` to a bare `*`; for frames the reason
-  given is that it is "not possible to list all issuer domains loading iframes for 3DS
-  authentication", and the native 3-D Secure 2 guide says a strict policy can keep challenges
-  from loading. The earlier `https://*.adyen.com` in `frame`/`connect` let the card fields load
-  but could block issuer challenges. A bare wildcard is not a host, so the descriptor follows
-  core's convention for a documented wildcard: `script` keeps `https://*.adyen.com`, `frame`
-  and `connect` are empty, and the setup guide lists every directive, including the
+- **The onboarding CSP lists `"*"` for `frame` and `connect`.** Doc-verified 2026-09-23:
+  Adyen's recommended policy (PCI script-security guide) allows `*.adyen.com` scripts and
+  sets `frame-src`, `connect-src`, `img-src` and `form-action` to a bare `*`; for frames the
+  reason given is that it is "not possible to list all issuer domains loading iframes for
+  3DS authentication", and the native 3-D Secure 2 guide says a strict policy can keep
+  challenges from loading. The descriptor follows that policy: `script` keeps
+  `https://*.adyen.com`, and `frame` and `connect` are `["*"]`. CSP3's grammar allows a bare
+  `*` as a host source (`host-part = "*" / …`), so the `string[]` fields hold it and core's
+  validator accepts it; core's `csp` JSDoc now reserves empty arrays for "no host needed"
+  (no embedded surface, as with GoCardless), and a PSP that documents a wildcard lists
+  `"*"`. The earlier `https://*.adyen.com` in `frame`/`connect` let the card fields load but
+  blocked live issuer challenges. The setup guide lists every directive, including the
   `style-src`, `img-src` and `form-action` the type cannot express (its `style-src` names the
   Adyen host for the Adyen Web stylesheet; Adyen's sample lists only Cash App there).
 - **Client**: Adyen Web v6 from `checkoutshopper-{test|live}.cdn.adyen.com/checkoutshopper/

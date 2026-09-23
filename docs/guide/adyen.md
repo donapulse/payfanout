@@ -22,9 +22,11 @@ Two packages: [`@payfanout/adapter-adyen-server`](/guide/server) (holds your API
 The provider-dependent facts in this adapter come from Adyen's documentation, not from test
 traffic. The webhook signature is checked against Adyen's own published test vector, but the
 adapter has not yet been exercised against an Adyen test account. Run one payment, one
-3-D Secure 2 challenge, one payment routed to the 3-D Secure redirect flow, one capture, one
-refund and one webhook delivery through **your** account before taking it to production, and
-check the results against [§9](#_9-test-values). Account-specific behaviour — enabled payment
+3-D Secure 2 challenge, one capture, one refund and one webhook delivery through **your**
+account before taking it to production, and check the results against
+[§9](#_9-test-values); if Adyen routes a payment to its 3-D Secure redirect flow, check the
+shopper's return to your `returnUrl` ([§6](#_6-3-d-secure)) as well. Account-specific
+behaviour — enabled payment
 methods, the capture delay, whether multiple partial capture is switched on, the exact
 `additionalData` your account returns — is only observable there.
 :::
@@ -59,15 +61,18 @@ From the **Adyen Customer Area** (Developers → API credentials, and Developers
 **Enable the Checkout encrypted cardholder data role.** Adyen requires it to accept the
 encrypted card data the card fields produce, and it is not among the roles assigned by
 default ([roles](https://docs.adyen.com/development-resources/api-credentials/roles)). Tick
-it under **Permissions** on the credential; a credential missing a required role gets Adyen
-error `010` "Not allowed"
+it under **Permissions** on the credential. Any role your company's `ws` credential has can
+be assigned there; if that credential lacks this one, the roles page says: "If you need
+roles that your ws credential doesn't have, contact our Support Team." A credential missing
+a required role gets Adyen error `010` "Not allowed"
 ([error codes](https://docs.adyen.com/development-resources/error-codes)). Live credentials
 are configured separately, so enable it there again.
 
 **Allowed origins** are set on the API credential: Adyen expects client-side requests only
 from those domains. A test credential accepts `https` origins and the local secure contexts
 `http://localhost`, `http://127.0.0.1` and `http://*.localhost`; live origins must be `https`.
-A wildcard such as `https://*.example.org` covers every subdomain.
+An origin can include a wildcard: in Adyen's example, `https://*.example.org` includes both
+`https://blue.example.org` and `https://red.example.org`.
 
 **The live URL prefix** is a hex-encoded random part followed by your company name, one per
 company account ([live endpoints](https://docs.adyen.com/development-resources/live-endpoints)).
@@ -233,9 +238,18 @@ const adyen = new AdyenClientAdapter({
 ::: tip Content-Security-Policy
 A CSP-enforcing page must allow Adyen, or the fields fail quietly. 3-D Secure 2 challenges
 are harder: they load from the card **issuer's** domains, and Adyen documents that it cannot
-list them all, so a strict policy can block the challenge
-([script security](https://docs.adyen.com/development-resources/pci-dss-compliance-guide/script-security),
-[native 3-D Secure 2](https://docs.adyen.com/online-payments/3d-secure/native-3ds2)).
+list them all, so a strict policy can block the challenge. Adyen's recommended policy is on
+its [script security](https://docs.adyen.com/development-resources/pci-dss-compliance-guide/script-security)
+page, which says it does not apply "if you are eligible for Self-Assessment Questionnaire A
+(SAQ A)", but the 3-D Secure constraint applies to any page that enforces a CSP. The
+[native 3-D Secure 2](https://docs.adyen.com/online-payments/3d-secure/native-3ds2) guide
+states it with no such condition: "A strict Content Security Policy (CSP) can prevent native
+3D Secure 2 challenges from being loaded on your website, because loading the 3D Secure 2
+interface requires adding more URLs to your CSP. Adyen does not maintain a list of all URLs."
+For a page that should not widen its CSP, Adyen points to its
+[redirect flow](https://docs.adyen.com/online-payments/3d-secure/redirect-3ds2): "You can use
+the redirect flow if you do not want to adjust your CSP."
+
 Following Adyen's recommended policy, a page running this adapter needs:
 
 ```
@@ -256,9 +270,8 @@ img-src     *
 
 Adyen's sample also allows wallet and partner hosts in `script-src`; this adapter mounts
 only the Card component, so it needs none of them. The onboarding descriptor
-(`adyenOnboarding.csp`) lists `https://*.adyen.com` under `script` and leaves `frame` and
-`connect` empty, its convention for a documented wildcard; `style-src`, `form-action` and
-`img-src` have no descriptor field.
+(`adyenOnboarding.csp`) lists `https://*.adyen.com` under `script` and `*` under `frame` and
+`connect`; `style-src`, `form-action` and `img-src` have no descriptor field.
 :::
 
 ## 6. 3-D Secure
@@ -476,6 +489,12 @@ you configured in test is configured again in the **live** Customer Area.
       [result codes](https://docs.adyen.com/online-payments/build-your-integration/payment-result-codes)
       and [refusal reason codes](https://docs.adyen.com/development-resources/refusal-reasons)
       against the current Adyen documentation.
+- [ ] Once the live account is configured, test end to end with real payment details, which
+      incur fees. Adyen's
+      [end-to-end testing](https://docs.adyen.com/online-payments/go-live-checklist#end-to-end-testing)
+      list includes a successful payment, a payment with `resultCode` **Refused** (for example
+      by entering incorrect card details), a refund and a partial refund, and a 3-D Secure
+      payment where the shopper fails to complete the challenge.
 
 Then continue with [Server usage](/guide/server), [React usage](/guide/react), and
 [Webhooks](/guide/webhooks).

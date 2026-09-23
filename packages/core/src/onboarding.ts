@@ -60,9 +60,10 @@ export interface AdapterOnboardingDescriptor {
     events?: string[];
   };
   /**
-   * CSP hosts the PSP's browser SDK touches, by directive. Empty arrays where
-   * the PSP has no embedded surface (redirect-only PSPs) or defers to a
-   * documented wildcard.
+   * CSP hosts the PSP's browser SDK touches, by directive. An empty array means
+   * the PSP needs no host for that directive (no embedded surface, as with a
+   * redirect-only PSP); a PSP whose documentation calls for a wildcard lists
+   * `"*"`, which CSP accepts as a host source.
    */
   csp: {
     script: string[];

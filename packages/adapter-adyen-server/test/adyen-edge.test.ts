@@ -132,30 +132,52 @@ describe("transport edge cases", () => {
 });
 
 describe("onboarding descriptor", () => {
+  function fieldPattern(key: string): RegExp {
+    const field = adyenOnboarding.credentialFields.find((candidate) => candidate.key === key);
+    return new RegExp(field?.format?.pattern ?? "^$");
+  }
+
   function adapterAcceptsHmacKey(key: string): boolean {
     try {
-      hexToBytes(key);
+      makeAdapter({ hmacKeys: [key] });
       return true;
     } catch {
       return false;
     }
   }
 
-  it("validates HMAC keys exactly as the adapter does: whole bytes of hex", () => {
-    const field = adyenOnboarding.credentialFields.find((candidate) => candidate.key === "hmacKey");
-    const pattern = new RegExp(field?.format?.pattern ?? "");
-    // An odd-length key used to pass the form and then fail the constructor.
-    for (const key of [HMAC_KEY, HMAC_KEY.toLowerCase(), "00ff", "0f0", "abc", "zz", "0x00ff", "not-hex", ""]) {
-      expect(pattern.test(key), key).toBe(adapterAcceptsHmacKey(key));
+  it("validates HMAC keys exactly as the adapter does: whole bytes of hex, surrounding whitespace trimmed", () => {
+    const pattern = fieldPattern("hmacKey");
+    const candidates = [
+      HMAC_KEY, HMAC_KEY.toLowerCase(), "00ff", " 00ff", "00ff\n", "\t00ff ",
+      "0f0", " 0f0 ", "abc", "zz", "0x00ff", "00 ff", "not-hex", " ", "",
+    ];
+    for (const key of candidates) {
+      expect(pattern.test(key), JSON.stringify(key)).toBe(adapterAcceptsHmacKey(key));
     }
-    expect(pattern.test(HMAC_KEY)).toBe(true);
-    expect(pattern.test("0f0")).toBe(false);
+    // hexToBytes trims, so a key pasted with a stray space or newline still works.
+    for (const key of [HMAC_KEY, " 00ff", "00ff\n"]) {
+      expect(pattern.test(key), JSON.stringify(key)).toBe(true);
+      expect(adapterAcceptsHmacKey(key), JSON.stringify(key)).toBe(true);
+    }
+    // An odd-length key used to pass the form and then fail the constructor.
+    for (const key of ["0f0", "zz"]) {
+      expect(pattern.test(key), JSON.stringify(key)).toBe(false);
+      expect(adapterAcceptsHmacKey(key), JSON.stringify(key)).toBe(false);
+    }
   });
 
-  it("follows Adyen's recommended policy: scripts from *.adyen.com, frames and requests left to its wildcard", () => {
-    // frame-src and connect-src are a bare `*` in Adyen's guidance (issuer 3-D
-    // Secure challenges); core's convention for a documented wildcard is empty.
-    expect(adyenOnboarding.csp).toEqual({ script: ["https://*.adyen.com"], frame: [], connect: [] });
+  it("takes the live URL prefix alone, not the URL built from it", () => {
+    const pattern = fieldPattern("liveUrlPrefix");
+    // Adyen's documented example prefix.
+    expect(pattern.test("1797a841fbb37ca7-AdyenDemo")).toBe(true);
+    expect(pattern.test("https://1797a841fbb37ca7-AdyenDemo-checkout-live.adyenpayments.com")).toBe(false);
+    expect(pattern.test("1797a841fbb37ca7-AdyenDemo-checkout-live.adyenpayments.com")).toBe(false);
+  });
+
+  it("follows Adyen's recommended policy: scripts from *.adyen.com, frames and requests from any host", () => {
+    // Issuer 3-D Secure challenge frames load from domains Adyen cannot list.
+    expect(adyenOnboarding.csp).toEqual({ script: ["https://*.adyen.com"], frame: ["*"], connect: ["*"] });
   });
 });
 

@@ -53,6 +53,11 @@ export interface WorldlineClientAdapterConfig {
   /** Test seams. */
   loadScript?: (url: string) => Promise<void>;
   getWorldlineGlobal?: () => WorldlineTokenizerConstructor | undefined;
+  /**
+   * Another Worldline-served Tokenizer script URL. Worldline requires the
+   * script to load from its own servers, so this never points at a self-hosted
+   * copy.
+   */
   sdkUrl?: string;
 }
 
@@ -106,8 +111,19 @@ export class WorldlineClientAdapter implements ClientPaymentAdapter {
    * Renders Worldline's Hosted Tokenization iframe (SAQ-A eligible: card data
    * never touches the host DOM) into a generated child of `container`. The
    * iframe is addressed entirely by the session's clientSecret (the
-   * hostedTokenizationUrl) — no client key is needed. Host UI options pass
-   * through untouched via MountOptions.fieldOptions.
+   * hostedTokenizationUrl) — no client key is needed.
+   *
+   * `options.fieldOptions` passes through to the Tokenizer untouched (the host
+   * wins), with one adapter default and one adapter-owned key:
+   *
+   * - `hideCardholderName` defaults to `false`. Worldline requires the
+   *   cardholder name yet hides its field unless told otherwise, and the
+   *   adapter never makes the `useCardholderName` call that would supply the
+   *   name from the host page, so the field stays visible unless the host
+   *   overrides it.
+   * - `validationCallback` is owned by the adapter: `onChange` is driven from
+   *   the Tokenizer's validity reports. A callback the host passes there still
+   *   runs, after `onChange`, with the same result.
    */
   async mount(container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
     assertBrowser("WorldlineClientAdapter", "mount");
@@ -116,12 +132,27 @@ export class WorldlineClientAdapter implements ClientPaymentAdapter {
     const child = document.createElement("div");
     child.id = `payfanout-wl-${++mountCounter}`;
     container.appendChild(child);
-    // Worldline's Tokenizer exposes no granular field-validity stream, so
-    // initialize the host's "disable Pay until complete" state once and degrade
-    // gracefully — the real decline outcome surfaces server-side at completion.
+    // Initialize the host's "disable Pay until complete" state: the Tokenizer
+    // reports validity only when it changes, and a build that never reports
+    // leaves the state here rather than breaking the mount.
     options.onChange?.({ complete: false, empty: true });
+    const fieldOptions = options.fieldOptions ?? {};
+    const hostValidationCallback = fieldOptions["validationCallback"];
     try {
-      const tokenizer = new Tokenizer(options.clientSecret, child.id, { ...(options.fieldOptions ?? {}) });
+      const tokenizer = new Tokenizer(options.clientSecret, child.id, {
+        ...fieldOptions,
+        // An explicit undefined keeps the default, so the mandatory name field
+        // never disappears by accident.
+        hideCardholderName: fieldOptions["hideCardholderName"] ?? false,
+        validationCallback: (result?: { valid?: boolean }) => {
+          // A throwing onChange must not keep the host's own callback from running.
+          try {
+            options.onChange?.({ complete: result?.valid === true });
+          } finally {
+            if (typeof hostValidationCallback === "function") hostValidationCallback(result);
+          }
+        },
+      });
       await tokenizer.initialize();
       options.onReady?.();
       const handle: WorldlineHandle = {

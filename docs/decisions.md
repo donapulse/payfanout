@@ -443,8 +443,11 @@ docs.direct.worldline-solutions.com unless noted):
   method / Content-Type (empty for GET) / `Date` / sorted canonical `x-gcs-*` header lines /
   resource path, each `\n`-terminated (trailing `\n` after the path). The `Date` header is
   sent and signed (RFC-1123 GMT); the clock is an injectable `now()` so tests are
-  deterministic and hosts stay inside the platform's 5-minute skew. `X-GCS-Date` is noted in
-  code as the edge-runtime alternative when the `Date` header cannot be set.
+  deterministic and hosts stay inside the platform's 5-minute skew. (Corrected 2026-09-23
+  against the manual-authentication guide: `x-gcs-date` is not documented as a replacement
+  for the `Date` header — the guide's examples send it alongside `Date`, signed as a
+  canonical `x-gcs-*` header — so the code no longer presents it as an edge-runtime
+  alternative.)
 - **Idempotency** rides `X-GCS-Idempotence-Key` (max 40 ASCII). Arbitrary caller keys are
   hashed to fit: `sha256Hex(idempotencyKey).slice(0,40)` — deterministic, so replays dedupe
   at Worldline. The header is BOTH signed (in the canonical block) and sent on every mutating
@@ -462,7 +465,16 @@ docs.direct.worldline-solutions.com unless noted):
   `clientSecret` is the `hostedTokenizationUrl` the browser iframe mounts from (no client
   key). The host id round-trips via `order.references.merchantReference` only — Worldline has
   no arbitrary metadata map — so conformance `money.expectations` is
-  `{ idRoundTrip: true, metadataEcho: false }`.
+  `{ idRoundTrip: true, metadataEcho: false }`. Doc-verified 2026-09-23 (Hosted Tokenization
+  Page guide and the served `tokenizer.min.js`): the browser `Tokenizer` hides the
+  cardholder-name field unless constructed with `hideCardholderName: false`, although the name
+  is mandatory, and calls `validationCallback` with `{ valid }` whenever the form's validity
+  changes, so the client adapter defaults `hideCardholderName` to `false` (a host
+  `fieldOptions` value still wins) and owns `validationCallback` to drive `onChange`, passing
+  each result on to a host-supplied one. The same guide also asks for `integrity` (the
+  CreateHostedTokenization response's `sri`) and `crossorigin="anonymous"` on the Tokenizer
+  script tag; not applied yet, because the browser receives only the hostedTokenizationUrl and
+  core's script injection sets neither attribute.
 - **CreatePayment wiring (corrected in review, 2026-07-15):** `hostedTokenizationId` rides
   at the ROOT of the CreatePayment request — the platform's current domain model declares it
   there and `CardPaymentMethodSpecificInput` has no such field (the guide's "replace the

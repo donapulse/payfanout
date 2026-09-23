@@ -34,9 +34,9 @@ import { WorldlineClientAdapter } from "@payfanout/adapter-worldline";
 const worldline = new WorldlineClientAdapter({ environment: "sandbox" });
 
 <PayFanoutProvider adapters={[worldline]} initialPsp="worldline" completionEndpoint="/api/complete">
-  {/* The Hosted Tokenization iframe emits no field-validity stream, so do not gate the Pay
-      button on `complete` for Worldline — the default <PayButton> doesn't. */}
-  <PaymentFields clientSecret={session.clientSecret} />
+  {/* onChange fires { complete: false } on mount, then { complete: true | false } each time
+      the Tokenizer reports a validity change. */}
+  <PaymentFields clientSecret={session.clientSecret} onChange={({ complete }) => setPayEnabled(complete)} />
   {/* completionEndpoint finishes the tokenize-first flow automatically — no onServerCompletion. */}
   <PayButton onResult={(result) => showOutcome(result)}>Pay</PayButton>
 </PayFanoutProvider>
@@ -71,9 +71,16 @@ const worldline = new WorldlineClientAdapter({ environment: "sandbox" });
 
 - Card data is captured **only** inside Worldline's Hosted Tokenization iframe; there is no
   raw card input, and no PAN/CVV ever touches your DOM.
-- The Hosted Tokenization `Tokenizer` does not expose a granular field-validity event stream,
-  so the adapter emits `onChange({ complete: false })` once on mount and degrades gracefully;
-  the true decline outcome surfaces server-side at `completePayment`.
+- `onChange` is driven by the Tokenizer's `validationCallback`: it fires
+  `{ complete: false, empty: true }` on mount, then `{ complete }` carrying each validity
+  report's `valid` flag. The adapter owns that callback; one passed in `fieldOptions` still
+  runs, after `onChange`, with the same result. Validity only means the form is correctly
+  filled in: the decline outcome surfaces server-side at `completePayment`.
+- The cardholder-name field is shown by default (`hideCardholderName: false`), because
+  Worldline requires the cardholder name and hides that field unless told otherwise. A
+  `hideCardholderName: true` in `fieldOptions` still wins, but then the name has to reach
+  Worldline through its `useCardholderName` call, which the adapter neither makes nor
+  exposes, so keep the field visible.
 
 ## Documentation
 

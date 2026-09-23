@@ -21,7 +21,25 @@ going live.
 
 ## 1. Get your Worldline credentials
 
-From the **Worldline Merchant Portal** (its API / integration settings):
+Both key pairs come from the **Worldline Merchant Portal** (see Worldline's
+[authentication](https://docs.direct.worldline-solutions.com/en/integration/api-developer-guide/authentication)
+and [webhooks](https://docs.direct.worldline-solutions.com/en/integration/api-developer-guide/webhooks)
+guides; Back Office and e-Portal users follow the chapters those pages link for their tool):
+
+- **API key id + secret API key:** Developer → Payment API → *Add API Key*. The screen then
+  shows the pair under *API Key ID* / *Secret API Key*.
+- **Webhook key id + secret:** Developer → Webhooks → *Generate webhooks keys* shows the
+  *Webhooks ID* and its *Secret Webhook Key*; you can instead enter your own id and secret and
+  confirm.
+
+Each secret is displayed for **60 seconds only** and never again, so copy it into your secret
+store as soon as it appears. The key ids stay visible in the portal.
+
+API key pairs **expire**: renew before the date in the *Expiration date* column under
+Developer → Payment API. Creating a new **API key** pair **revokes** the current one, which
+then expires within **four hours**, so deploy the new `apiKeyId` / `secretApiKey` inside that
+window. Webhook key pairs get no such window: generating a new pair revokes the current one
+immediately, so add the new pair to `webhookKeys` before you switch it in the portal.
 
 | Credential | What it is | Used by |
 | --- | --- | --- |
@@ -125,10 +143,9 @@ import { WorldlineClientAdapter } from "@payfanout/adapter-worldline";
 const worldline = new WorldlineClientAdapter({ environment: "sandbox" });
 
 <PayFanoutProvider adapters={[worldline]} initialPsp="worldline" completionEndpoint="/api/complete">
-  {/* Worldline's Hosted Tokenization iframe emits no field-validity stream (onChange fires
-      { complete: false } once), so do NOT gate the Pay button on `complete` for Worldline —
-      the default <PayButton> doesn't, so plain usage is fine. */}
-  <PaymentFields clientSecret={session.clientSecret} />
+  {/* The Tokenizer reports form validity: onChange fires { complete: false } on mount, then
+      { complete: true | false } each time that validity changes. */}
+  <PaymentFields clientSecret={session.clientSecret} onChange={({ complete }) => setPayEnabled(complete)} />
   {/* completionEndpoint finishes the tokenize-first flow automatically — no onServerCompletion. See §7. */}
   <PayButton onResult={(result) => showOutcome(result)}>Pay</PayButton>
 </PayFanoutProvider>
@@ -136,9 +153,17 @@ const worldline = new WorldlineClientAdapter({ environment: "sandbox" });
 
 - The client adapter takes **only** `environment` — it holds no key. The session's
   `clientSecret` is the `hostedTokenizationUrl` the iframe mounts from.
-- The Hosted Tokenization iframe does not expose a per-field validity stream, so the adapter
-  fires `onChange({ complete: false })` once on mount and degrades gracefully. The true
-  decline outcome surfaces **server-side** at completion (step 7).
+- The adapter drives `onChange` from the Tokenizer's `validationCallback`, which Worldline
+  calls whenever the form's validity changes. Validity only means the form is correctly
+  filled in: the authorization outcome still surfaces **server-side** at completion (step 7).
+- `fieldOptions` passes through to the `Tokenizer` constructor untouched (for example
+  `paymentProductUpdatedCallback`), except `validationCallback`, which the adapter owns; a
+  callback you pass there still runs, after `onChange`, with the same result.
+- The cardholder-name field is **shown by default** (`hideCardholderName: false`), because
+  Worldline requires the cardholder name and hides that field unless told otherwise.
+  `hideCardholderName: true` in `fieldOptions` still wins, but then the name has to reach
+  Worldline through its `useCardholderName` call, which the adapter neither makes nor
+  exposes, so keep the field visible.
 
 ::: tip Content-Security-Policy
 A CSP-enforcing page must allow the Worldline payment host, or the iframe fails quietly:
@@ -149,8 +174,12 @@ frame-src   https://payment.preprod.direct.worldline-solutions.com https://payme
 connect-src https://payment.preprod.direct.worldline-solutions.com https://payment.direct.worldline-solutions.com
 ```
 
-The `preprod` host is exercised only by `environment: "sandbox"`. Override the script URL with
-the `sdkUrl` config field to pin a version or self-host.
+The `preprod` host is exercised only by `environment: "sandbox"`. Worldline requires the
+Tokenizer script to load from its own servers, so never self-host it: the `sdkUrl` config
+field only points the adapter at a different Worldline-served URL. Worldline also asks for
+the script tag to carry `integrity` (the `sri` value of the CreateHostedTokenization response)
+and `crossorigin="anonymous"`; the adapter does not apply that subresource integrity check
+yet.
 :::
 
 ## 6. 3-D Secure
@@ -269,14 +298,38 @@ API (`supportsEventPolling: false`), for missed-webhook recovery, reconcile with
 
 ## 9. Test cards
 
-Use your Worldline test account's documented sandbox cards and amount-based response triggers.
-Commonly available test cards include Visa `4330 2649 3634 4675`, Mastercard
-`5137 0098 0194 3438`, and Amex `3714 4963 5311 004`; **confirm the current list, decline
-triggers, and 3-D Secure test cards in your Worldline documentation** rather than assuming.
+Worldline's
+[test cases](https://docs.direct.worldline-solutions.com/en/integration/how-to-integrate/test-cases/)
+are for the sandbox only. These cards authorize successfully, through a frictionless or a
+challenge 3-D Secure flow, with any 3- or 4-digit CVV:
+
+| Brand | 3-D Secure frictionless | 3-D Secure challenge |
+| --- | --- | --- |
+| Visa | `4330 2649 3634 4675` | `4874 9706 8667 2022` |
+| Mastercard | `5137 0098 0194 3438` | `5130 2574 7453 3310` |
+| American Express | `3714 4963 5311 004` | `3797 6442 2997 381` |
+
+- **Frictionless** cards authenticate without a challenge, so the outcome comes straight back
+  from completion (§7).
+- **Challenge** cards exercise the redirect/return trip: create the session with a `returnUrl`
+  and completion returns `requires_action` with the redirect URL (§6). Once the customer is
+  back on your `returnUrl`, reconcile with `retrievePayment`.
+- **Decline:** any of these cards on a session with `amount: 1302` (€13.02),
+  `currency: "EUR"` and the default automatic capture is declined (Worldline `statusCode` 2).
+  The trigger is documented for `authorizationMode: "SALE"`, which is what the adapter sends
+  for automatic capture (`captureMethod: "manual"` sends `PRE_AUTHORIZATION`).
+
+The page also covers other brands and amount-based refund and capture outcomes; **confirm the
+current list there** rather than assuming.
 
 ## 10. Go live
 
+- [ ] Before you switch, run one **challenge-flow** test card (§9) end to end in sandbox, so
+      the return to your `returnUrl` and the `retrievePayment` reconciliation are exercised.
 - [ ] Swap in the **live** API key id + secret and the **live** merchant id.
+- [ ] Plan the live API key renewal ahead of its *Expiration date* (Developer → Payment API):
+      the old pair expires within four hours of creating a new one, so deploy the new pair
+      inside that window (§1).
 - [ ] Set `environment: "live"` on **both** adapters (host flips to the bare
       `payment.direct.worldline-solutions.com`).
 - [ ] Register the **live** webhook endpoint in the portal and use its **live** key id + secret.

@@ -88,9 +88,9 @@ interface WorldlineMoney {
 
 interface WorldlineWebhookResource {
   id?: string;
+  operationOutput?: { id?: string };
   paymentOutput?: { amountOfMoney?: WorldlineMoney };
   refundOutput?: { amountOfMoney?: WorldlineMoney };
-  operationOutput?: { id?: string };
 }
 
 interface WorldlineWebhookBody {

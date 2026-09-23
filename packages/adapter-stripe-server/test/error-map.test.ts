@@ -63,8 +63,9 @@ describe("mapStripeError", () => {
       retryable: false,
     },
     {
-      // Unmapped for now: falls through to card_declined. Whether it should join the other
-      // adapters' authentication_required is an open decision (docs/decisions.md).
+      // Unmapped for now: falls through to card_declined. Whether it should follow the adapters
+      // that map a failed 3-D Secure to authentication_required is an open decision
+      // (docs/decisions.md).
       name: "failed authentication",
       err: { type: "StripeCardError", code: "authentication_failure", message: "…" },
       code: "card_declined",

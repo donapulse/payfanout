@@ -1402,8 +1402,10 @@ description of what v2 changes is what the migration then had to implement.
   payment method types, countries, and regions", and docs.stripe.com/error-codes gives each
   the remedy of its card-specific counterpart. The release is marked non-breaking and removes
   no codes, and docs.stripe.com/testing still lists the expired-card test card as returning
-  `expired_card`, so whether card declines now carry the new codes is undocumented. The
-  mapping only makes sure that one which does arrive lands where its counterpart does.
+  `expired_card`. Against that, the changelog says these failures "previously" used the
+  card-specific `expired_card` and region-specific `incorrect_zip`, but it never says card
+  declines changed, so which code a card decline now carries is not stated. The mapping only
+  makes sure that one which does arrive lands where its counterpart does.
 - **Server half only, and only for hosts pinned to 2026-08-26.dahlia or later.**
   `mapStripeError` sees the errors of the adapter's own calls, which carry the host's pinned
   `apiVersion`. The browser adapter follows the account's default API version through
@@ -1413,15 +1415,18 @@ description of what v2 changes is what the migration then had to implement.
   already handles `expired_card` and `incorrect_zip`; under any other type they fall through
   to that type's existing mapping. A sandbox run pinned to this version with the expired-card
   and lost-card test cards, recording `type`, `code`, `decline_code` and `message`, would
-  settle this and the next two points.
+  settle this point and the last one. Seeing `authentication_failure` needs a failed 3-D
+  Secure challenge instead, a browser step on Stripe's mock authentication page; its mapping
+  stays a sign-off decision either way.
 - **`authentication_failure` is left unmapped (default, unconfirmed).** It falls through to
-  `card_declined`. Stripe documents a new payment method as the remedy for a failed
-  authentication, but the other adapters map a failed 3-D Secure to `authentication_required`
-  (Worldline `40001134`, Adyen `11`/`38`/`42`, and the Stripe browser adapter's
-  `payment_intent_authentication_failure` and `setup_intent_authentication_failure`), and the
-  2026-07-08 contract hardening removed exactly this kind of per-PSP divergence for
-  `authentication_required`. Which way the Stripe server half should go is an open decision;
-  a unit test records the current fall-through so that a change is deliberate.
+  `card_declined`. Its docs.stripe.com/error-codes entry states no remedy; the changelog
+  presents it as the general form of `payment_intent_authentication_failure` and
+  `setup_intent_authentication_failure`, whose documented remedy is a new payment method.
+  The Stripe browser adapter maps those two codes to `authentication_required`, as Worldline
+  does `40001134` ("a failed 3-D Secure check") and Adyen `11` and `42`. Both candidates are
+  non-retryable, so retries and the router cascade are unaffected; the choice decides which
+  code and message the host shows. Which way the Stripe server half should go is an open
+  decision; a unit test records the current fall-through so that a change is deliberate.
 - **`payment_method_restricted` stays `card_declined`.** Stripe's example is a card reported
   lost or stolen; the existing `restricted_card` decline code ("it's possible it was reported
   lost or stolen") already falls through to `card_declined`, and a `lost_card` or

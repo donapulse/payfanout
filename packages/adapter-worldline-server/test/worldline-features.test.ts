@@ -242,7 +242,7 @@ describe("webhook parsing", () => {
     const event = await parseWorldlineWebhookEvent(
       JSON.stringify({ id: "e1", created: "2026-07-14T10:00:00Z", type: "payment.captured", payment: { id: "pay_9", ...money } }),
     );
-    expect(event).toMatchObject({ id: "e1", pspPaymentId: "pay_9", amount: 1099, currency: "EUR", type: "payment.succeeded" });
+    expect(event).toMatchObject({ id: "worldline:payment.captured:pay_9", pspPaymentId: "pay_9", amount: 1099, currency: "EUR", type: "payment.succeeded" });
     expect(event.occurredAt).toBe("2026-07-14T10:00:00.000Z");
   });
 
@@ -263,7 +263,7 @@ describe("webhook parsing", () => {
   });
 
   it("hashes a stable id when Worldline omits one", async () => {
-    const raw = JSON.stringify({ type: "payment.captured", payment: { id: "pay_1" } });
+    const raw = JSON.stringify({ type: "payment.captured", payment: { status: "CAPTURED" } });
     const first = await parseWorldlineWebhookEvent(raw);
     const second = await parseWorldlineWebhookEvent(raw);
     expect(first.id).toMatch(/^worldline_[0-9a-f]{64}$/);
@@ -274,7 +274,7 @@ describe("webhook parsing", () => {
     const event = await parseWorldlineWebhookEvent(
       JSON.stringify([{ id: "e9", created: "2026-07-14T10:00:00Z", type: "payment.captured", payment: { id: "pay_1", ...money } }]),
     );
-    expect(event).toMatchObject({ id: "e9", pspPaymentId: "pay_1", type: "payment.succeeded" });
+    expect(event).toMatchObject({ id: "worldline:payment.captured:pay_1", pspPaymentId: "pay_1", type: "payment.succeeded" });
   });
 
   it("throws invalid_request on a multi-event array, empty array, unparseable, or non-object payload", async () => {

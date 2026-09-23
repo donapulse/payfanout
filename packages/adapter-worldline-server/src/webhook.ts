@@ -104,6 +104,41 @@ interface WorldlineWebhookBody {
   refund?: WorldlineWebhookResource;
 }
 
+const TEST_EVENT_TYPE = "payment.test";
+
+/**
+ * Worldline documents only `payment.id` and `type` as identical across
+ * duplicate deliveries. Any other field, the envelope `id` or `operationOutput`
+ * included, may differ on a redelivery, so putting it in the key could let a
+ * duplicate past a host's dedupe store; the Adyen adapter keys on its
+ * documented pair alone for the same reason. The price is stated on the same
+ * page: "The payment.id can change after each maintenance operation following
+ * an incremental logic. However, as this is not the case in some specific
+ * scenarios, we strongly recommend not building your business operations
+ * around it." Two events of one type on one payment.id therefore share an id,
+ * which is why hosts re-read refunds on every refund-type delivery, whether or
+ * not its id was already seen. A refund resource stands in for a missing
+ * payment; half a pair falls back to the envelope id rather than merging
+ * distinct events. The envelope id also keys payment-link events (the link
+ * resource has no `id`, and its `paymentLinkId` repeats across a reusable
+ * link's payments) and test messages, which all carry the documented
+ * payment.id "9999_9".
+ */
+async function deriveEventId(body: WorldlineWebhookBody, rawType: string, rawBody: string): Promise<string> {
+  if (rawType !== "" && rawType !== TEST_EVENT_TYPE) {
+    const resourceId = nonEmptyString(body.payment?.id) ?? nonEmptyString(body.refund?.id);
+    if (resourceId !== undefined) return `worldline:${rawType}:${resourceId}`;
+  }
+  const envelopeId = nonEmptyString(body.id);
+  if (envelopeId !== undefined) return envelopeId;
+  // Nothing to key on: hash the exact raw bytes, stable across parses.
+  return `worldline_${await sha256Hex(rawBody)}`;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+
 /**
  * One event per delivery, but the envelope is ambiguous in the official
  * material: the webhooks page's example body is an ARRAY while the platform's
@@ -111,6 +146,11 @@ interface WorldlineWebhookBody {
  * accepted (a one-element array is unwrapped); a multi-event array is rejected
  * (invalid_request) rather than partially processed — silently dropping
  * trailing events is never acceptable.
+ *
+ * Event id: `worldline:<type>:<payment.id>` (or `refund.id` without a payment),
+ * the pair Worldline documents as identical across duplicates: two events of
+ * one type on one payment id share an id. `payment.test`, payment-link events
+ * and deliveries without the pair keep the envelope `id`, else a body hash.
  */
 export async function parseWorldlineWebhookEvent(rawBody: string): Promise<UnifiedWebhookEvent> {
   let parsed: unknown;
@@ -162,8 +202,7 @@ export async function parseWorldlineWebhookEvent(rawBody: string): Promise<Unifi
   const isRefundResource = body.refund !== undefined || rawType.startsWith("refund.");
 
   return {
-    // Stable dedupe key even if Worldline omits an event id: hash of the exact raw bytes.
-    id: body.id ?? `worldline_${await sha256Hex(rawBody)}`,
+    id: await deriveEventId(body, rawType, rawBody),
     pspName: "worldline",
     ...(resource?.id ? { pspPaymentId: resource.id } : {}),
     type,

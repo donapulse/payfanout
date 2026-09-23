@@ -59,6 +59,9 @@ immediately, `onEvent` must **enqueue, not process**. Paysafe retries effectivel
 until it sees success.
 
 - **Dedupe is yours:** `event.id` is a stable key; keep the seen-set in your store.
+  Worldline can give two genuine refund events one id, so re-read its refund-type events
+  before dropping one as a duplicate, as step 8 of the
+  [Worldline guide](/guide/worldline#_8-register-the-webhook-endpoint) describes.
 - **Ordering is not guaranteed** by any PSP, treat events as unordered facts and reconcile
   with `retrievePayment` when sequence matters.
 - **Batched deliveries (GoCardless):** the unified handlers process one event per

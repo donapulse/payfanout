@@ -135,6 +135,28 @@ Session creation also refuses, with `invalid_request` and before any call to Wor
   operating on the **raw request bytes** and emitting a normalized `UnifiedWebhookEvent`. One
   event per delivery; a single-event array wrapper is unwrapped, and a multi-event batch is
   rejected rather than partially processed.
+  The event `id` is `worldline:<type>:<payment id>` (the refund's id when there is no
+  payment), built only from the pair Worldline documents as identical across duplicate
+  deliveries, since any other field may differ on a redelivery and let a duplicate through.
+  Payment-link events, `payment.test` messages and deliveries without the pair keep the
+  envelope id. Worldline also warns: "The payment.id can change after each maintenance
+  operation following an incremental logic. However, as this is not the case in some specific
+  scenarios, we strongly recommend not building your business operations around it." So two
+  events of one type on one payment id share an id, and a store keyed on it drops the second.
+  On every verified refund-type delivery (`payment.refunded`, `payment.refund_failed`, and
+  `unknown` events whose lower-cased `raw.type` starts with `refund.`), whether or not its id
+  was already seen, re-read: `retrievePayment` for `amountRefunded`, `retrieveRefund` for your refunds
+  still `pending` (both reads are idempotent). Also poll `retrieveRefund` until your refunds
+  leave `pending`, reconcile captured payments with `retrievePayment` on a schedule, which
+  catches operations made outside PayFanout (Worldline recommends a back-up GetPaymentDetails
+  check), and never sum `event.amount` across refund events. Events after a maintenance
+  operation (capture, refund, possibly cancellation) can report the operation's id as
+  `pspPaymentId`. Correlation routes each cover part of them: `merchantReference`, sent only
+  when `createPaymentSession` gets an `id`, shown echoed on sale events only and unverified on
+  maintenance events; the refund id, the suffix of the composite `refundId` (below), for
+  refunds made through `refundPayment` only; and `retrievePayment` with the original
+  `pspPaymentId`. Parse no other id. Details:
+  [Set up Worldline](https://donapulse.github.io/payfanout/guide/worldline), step 8.
 - **`mapWorldlineError`**, unifies Worldline errors into `PayFanoutError` (business rejections
   are never replayed), and **`WORLDLINE_PSP_NAME`**.
 - **`buildV1HmacAuthorization`**, the request signer, exported for testing.

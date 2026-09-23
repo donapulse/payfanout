@@ -1392,3 +1392,31 @@ description of what v2 changes is what the migration then had to implement.
   warning and reports nothing published, so packages could reach npm with no tags and no GitHub
   Releases while the step stays green. Confirm tags and Releases exist after the first release
   under v2 rather than trusting a green step.
+
+## Stripe: payment-method error codes from 2026-08-26.dahlia (2026-09-23)
+
+- **`expired_payment_method` maps to `expired_card` and `incorrect_postal_code` to
+  `invalid_card_data`, both non-retryable.** Doc-verified 2026-09-23
+  (docs.stripe.com/changelog/dahlia/2026-08-26/adds-payment-method-error-codes): the new
+  codes "are similar to existing error codes, but represent failures consistently across
+  payment method types, countries, and regions", where earlier versions reported the
+  card-specific `expired_card` and the region-specific `incorrect_zip`.
+  docs.stripe.com/error-codes gives each the same remedy as its counterpart: check the
+  expiration date or postal code, or use a different payment method.
+- **Only hosts pinned to 2026-08-26.dahlia or later receive them.** `mapStripeError` sees the
+  errors of the adapter's own calls, which carry the host's pinned `apiVersion` (an injected
+  client keeps its own). The release removes no error codes, so the card-specific mappings
+  stay.
+- **The checks live in the `StripeCardError` branch only.** Neither page states which error
+  `type` the new codes arrive with, so the conservative reading extends the branch that
+  already handles `expired_card` and `incorrect_zip`; under any other type they fall through
+  to that type's existing mapping. Revisit if a sandbox run shows them on another type.
+- **`authentication_failure` and `payment_method_restricted` stay `card_declined`,
+  non-retryable.** The first is documented as a decline because authentication failed; the
+  changelog says such failures were previously reported as
+  `payment_intent_authentication_failure` or `setup_intent_authentication_failure`, whose
+  documented remedy is a new payment method — not bringing the customer back on-session,
+  which is what `authentication_required` means. The second covers "issuer or platform
+  restrictions", a generic decline; a `lost_card` or `stolen_card` decline code on the same
+  error still yields `fraud_suspected` through the existing decline-code check. Unit tests pin
+  both outcomes and the lost-card case, so neither drifts into a more specific code.

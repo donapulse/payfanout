@@ -30,6 +30,13 @@ describe("mapStripeError", () => {
       retryable: false,
     },
     {
+      // Payment-method-agnostic spelling of expired_card (2026-08-26.dahlia).
+      name: "expired payment method",
+      err: { type: "StripeCardError", code: "expired_payment_method", message: "…" },
+      code: "expired_card",
+      retryable: false,
+    },
+    {
       name: "bad CVC",
       err: { type: "StripeCardError", code: "incorrect_cvc", message: "…" },
       code: "invalid_card_data",
@@ -42,10 +49,24 @@ describe("mapStripeError", () => {
       retryable: false,
     },
     {
+      // Payment-method-agnostic spelling of incorrect_zip (2026-08-26.dahlia).
+      name: "incorrect postal code",
+      err: { type: "StripeCardError", code: "incorrect_postal_code", message: "…" },
+      code: "invalid_card_data",
+      retryable: false,
+    },
+    {
       // Resolved by bringing the customer back on-session — never by replay.
       name: "3DS required",
       err: { type: "StripeCardError", code: "authentication_required", message: "…" },
       code: "authentication_required",
+      retryable: false,
+    },
+    {
+      // A failed authentication is a decline — a new payment method, not another on-session attempt.
+      name: "failed authentication",
+      err: { type: "StripeCardError", code: "authentication_failure", message: "…" },
+      code: "card_declined",
       retryable: false,
     },
     {
@@ -57,6 +78,19 @@ describe("mapStripeError", () => {
     {
       name: "stolen card decline",
       err: { type: "StripeCardError", code: "card_declined", decline_code: "stolen_card", message: "…" },
+      code: "fraud_suspected",
+      retryable: false,
+    },
+    {
+      name: "restricted payment method",
+      err: { type: "StripeCardError", code: "payment_method_restricted", message: "…" },
+      code: "card_declined",
+      retryable: false,
+    },
+    {
+      // The decline code still decides when it names a lost or stolen card.
+      name: "restricted payment method reported lost",
+      err: { type: "StripeCardError", code: "payment_method_restricted", decline_code: "lost_card", message: "…" },
       code: "fraud_suspected",
       retryable: false,
     },

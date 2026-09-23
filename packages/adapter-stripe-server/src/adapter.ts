@@ -671,7 +671,14 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       ) {
         return { ok: false, category: "auth", message: "Authentication failed — check the Stripe secret key." };
       }
-      if (e.type === "StripeConnectionError" || e.statusCode === 429 || (e.statusCode ?? 0) >= 500) {
+      // StripeAPIError covers unlisted statuses, non-JSON bodies and, from stripe 22.6, a body
+      // severed mid-transfer; the error map already treats it as a retryable outage.
+      if (
+        e.type === "StripeConnectionError" ||
+        e.type === "StripeAPIError" ||
+        e.statusCode === 429 ||
+        (e.statusCode ?? 0) >= 500
+      ) {
         return { ok: false, category: "network", message: "Could not reach Stripe — try again." };
       }
       return { ok: false, category: "internal", message: "Could not verify Stripe credentials." };
@@ -1104,7 +1111,8 @@ async function loadStripeSdk(config: StripeServerAdapterConfig): Promise<StripeC
   return new StripeCtor(config.secretKey, {
     // Pinned apiVersion: never rely on the account default, which changes silently.
     apiVersion: config.apiVersion,
-    // Idempotency keys make network retries safe; the SDK backs off on its own.
+    // Retried POSTs reuse one idempotency key and the SDK backs off on its own; subscriptions.cancel
+    // (a DELETE, where keys have no effect) is made replay-safe by its re-fetch instead.
     maxNetworkRetries: config.maxNetworkRetries ?? 2,
     // Bounds each request (headers and body); unset, the SDK's own 80s default applies.
     ...(config.requestTimeoutMs !== undefined ? { timeout: config.requestTimeoutMs } : {}),

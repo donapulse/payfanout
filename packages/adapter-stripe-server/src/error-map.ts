@@ -16,6 +16,7 @@ const INVALID_CARD_DATA_CODES = new Set([
   "invalid_expiry_month",
   "invalid_expiry_year",
   "incorrect_zip",
+  "incorrect_postal_code",
 ]);
 
 const FRAUD_DECLINE_CODES = new Set(["fraudulent", "stolen_card", "lost_card", "merchant_blacklist"]);
@@ -50,7 +51,9 @@ function classify(e: StripeErrorLike): { code: UnifiedErrorCode; retryable: bool
     if (e.decline_code === "insufficient_funds" || e.code === "insufficient_funds") {
       return { code: "insufficient_funds", retryable: false, message: userMessage };
     }
-    if (e.code === "expired_card") return { code: "expired_card", retryable: false, message: userMessage };
+    if (e.code === "expired_card" || e.code === "expired_payment_method") {
+      return { code: "expired_card", retryable: false, message: userMessage };
+    }
     if (e.code && INVALID_CARD_DATA_CODES.has(e.code)) {
       return { code: "invalid_card_data", retryable: false, message: userMessage };
     }

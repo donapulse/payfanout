@@ -1,0 +1,5 @@
+---
+"@payfanout/adapter-worldline-server": major
+---
+
+Send the 3-D Secure data Worldline lists as mandatory on every card payment — the browser device data forwarded by `@payfanout/adapter-worldline`, `threeDSecure.skipAuthentication: false`, the return URL in both documented forms, and a `challenge-required` indicator for `sca: { challenge: "force" }` — and send the statement descriptor as `softDescriptor` instead of the deprecated `descriptor`. Breaking: a return URL is now required per session or through the new `defaultReturnUrl` option (absolute, with a scheme such as `https://` or an app scheme, at most 200 characters; an empty `returnUrl` counts as none, and a malformed `defaultReturnUrl` is refused when the adapter is constructed), so set `defaultReturnUrl` before upgrading, as sessions the previous release created without their own `returnUrl` are otherwise refused at completion. Session creation also refuses, before anything reaches Worldline, a missing or malformed return URL, an `id` longer than 40 characters (Worldline's merchant reference limit) and a `statementDescriptor` longer than 256 characters.

@@ -124,9 +124,8 @@ const worldline = new WorldlineClientAdapter({ environment: "sandbox" });
 
 <PayFanoutProvider adapters={[worldline]} initialPsp="worldline" completionEndpoint="/api/complete">
   {/* The Tokenizer reports form validity: onChange fires { complete: false } on mount, then
-      { complete: true | false } each time that validity changes, so gating the Pay button
-      on `complete` works. */}
-  <PaymentFields clientSecret={session.clientSecret} />
+      { complete: true | false } each time that validity changes. */}
+  <PaymentFields clientSecret={session.clientSecret} onChange={({ complete }) => setPayEnabled(complete)} />
   {/* completionEndpoint finishes the tokenize-first flow automatically — no onServerCompletion. See §7. */}
   <PayButton onResult={(result) => showOutcome(result)}>Pay</PayButton>
 </PayFanoutProvider>
@@ -137,10 +136,9 @@ const worldline = new WorldlineClientAdapter({ environment: "sandbox" });
 - The adapter drives `onChange` from the Tokenizer's `validationCallback`, which Worldline
   calls whenever the form's validity changes. Validity only means the form is correctly
   filled in: the authorization outcome still surfaces **server-side** at completion (step 7).
-- `fieldOptions` passes through to the `Tokenizer` constructor untouched
-  (`paymentProductUpdatedCallback`, `hideTokenFields`, …), except `validationCallback`, which
-  the adapter owns; a callback you pass there still runs, after `onChange`, with the same
-  result.
+- `fieldOptions` passes through to the `Tokenizer` constructor untouched (for example
+  `paymentProductUpdatedCallback`), except `validationCallback`, which the adapter owns; a
+  callback you pass there still runs, after `onChange`, with the same result.
 - The cardholder-name field is **shown by default** (`hideCardholderName: false`), because
   Worldline requires the cardholder name and hides that field unless told otherwise.
   `hideCardholderName: true` in `fieldOptions` still wins, but then the name has to reach
@@ -158,7 +156,10 @@ connect-src https://payment.preprod.direct.worldline-solutions.com https://payme
 
 The `preprod` host is exercised only by `environment: "sandbox"`. Worldline requires the
 Tokenizer script to load from its own servers, so never self-host it: the `sdkUrl` config
-field only points the adapter at a different Worldline-served URL.
+field only points the adapter at a different Worldline-served URL. Worldline also asks for
+the script tag to carry `integrity` (the `sri` value of the CreateHostedTokenization response)
+and `crossorigin="anonymous"`; the adapter does not apply that subresource integrity check
+yet.
 :::
 
 ## 6. 3-D Secure

@@ -48,6 +48,11 @@ export interface WorldlineClientAdapterConfig {
   /** Test seams. */
   loadScript?: (url: string) => Promise<void>;
   getWorldlineGlobal?: () => WorldlineTokenizerConstructor | undefined;
+  /**
+   * Another Worldline-served Tokenizer script URL. Worldline requires the
+   * script to load from its own servers, so this never points at a self-hosted
+   * copy.
+   */
   sdkUrl?: string;
 }
 
@@ -135,8 +140,12 @@ export class WorldlineClientAdapter implements ClientPaymentAdapter {
         // never disappears by accident.
         hideCardholderName: fieldOptions["hideCardholderName"] ?? false,
         validationCallback: (result?: { valid?: boolean }) => {
-          options.onChange?.({ complete: result?.valid === true });
-          if (typeof hostValidationCallback === "function") hostValidationCallback(result);
+          // A throwing onChange must not keep the host's own callback from running.
+          try {
+            options.onChange?.({ complete: result?.valid === true });
+          } finally {
+            if (typeof hostValidationCallback === "function") hostValidationCallback(result);
+          }
         },
       });
       await tokenizer.initialize();

@@ -35,8 +35,8 @@ const worldline = new WorldlineClientAdapter({ environment: "sandbox" });
 
 <PayFanoutProvider adapters={[worldline]} initialPsp="worldline" completionEndpoint="/api/complete">
   {/* onChange fires { complete: false } on mount, then { complete: true | false } each time
-      the Tokenizer reports a validity change, so the Pay button can be gated on `complete`. */}
-  <PaymentFields clientSecret={session.clientSecret} />
+      the Tokenizer reports a validity change. */}
+  <PaymentFields clientSecret={session.clientSecret} onChange={({ complete }) => setPayEnabled(complete)} />
   {/* completionEndpoint finishes the tokenize-first flow automatically — no onServerCompletion. */}
   <PayButton onResult={(result) => showOutcome(result)}>Pay</PayButton>
 </PayFanoutProvider>

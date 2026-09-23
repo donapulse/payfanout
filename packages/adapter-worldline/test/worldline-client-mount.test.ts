@@ -147,6 +147,24 @@ describe("WorldlineClientAdapter Tokenizer options", () => {
     expect(events).toEqual(["change:false", "change:true", "host"]);
   });
 
+  it("still calls the host's validationCallback when onChange throws", async () => {
+    stubBrowser();
+    const fake = makeFakeTokenizer();
+    const hostCallback = vi.fn();
+    let changes = 0;
+    await makeAdapter(fake).mount(fakeContainer(), {
+      clientSecret: URL_SECRET,
+      fieldOptions: { validationCallback: hostCallback },
+      onChange: () => {
+        // The first call is the mount-time initial state; the report's call throws.
+        if (++changes > 1) throw new Error("host onChange bug");
+      },
+    });
+    expect(() => fake.reportFormStatus({ valid: true })).toThrowError(/host onChange bug/);
+    expect(hostCallback).toHaveBeenCalledTimes(1);
+    expect(hostCallback).toHaveBeenCalledWith({ valid: true });
+  });
+
   it("ignores a validationCallback option that is not a function", async () => {
     stubBrowser();
     const fake = makeFakeTokenizer();

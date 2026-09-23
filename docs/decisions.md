@@ -520,6 +520,31 @@ docs.direct.worldline-solutions.com unless noted):
   and `refund.cancelled` — none are on the documented list, and the onboarding descriptor
   advertises only the documented set so hosts never subscribe to undocumented types.
 
+  Event identity, doc-verified 2026-09-23 against the webhooks guide: Worldline calls
+  duplicate deliveries a feature of its delivery architecture and states that duplicates carry
+  identical `payment.id` and `type`; it never says the envelope `id` is stable across them, so
+  deduping on the envelope could let a duplicate through. The event id is therefore
+  `worldline:{type}:{payment.id}` (type lower-cased as received; `refund.id` when the delivery
+  carries no payment), falling back to the envelope `id` when either half is missing and to
+  `worldline_{sha256(rawBody)}` after that. Each maintenance operation gets a `payment.id` of
+  its own (the guide's Status Changes table: the capture's id on `payment.capture_requested`
+  and `payment.captured`, the refund's on `refund.refund_requested` and `payment.refunded`),
+  so a capture and a later refund, or two partial refunds, never share an event id. The other
+  side: those events' `pspPaymentId` is the operation's id while CapturePayment /
+  CancelPayment / RefundPayment keep taking the initial transaction's id, and Worldline
+  advises against building on how the ids increment, so hosts correlate through
+  `merchantReference` or `retrievePayment`. Payment-link events keep the envelope id: the
+  platform's Node SDK types that resource as `PaymentLinkResponse`, which has no `id`, and its
+  `paymentLinkId` repeats across distinct events of one type (each payment on a reusable
+  link). Same page: a 2xx is expected right away; five retries follow at 10 min / 1 h / 2 h /
+  8 h / 24 h after the previous attempt, each with a `retry-count` header (0 on the first
+  attempt); "Generate webhooks keys" revokes an existing pair immediately, so a rotation
+  deploys a self-chosen pair to `webhookKeys` before confirming it in the portal. Left for a
+  sandbox pass: the table's prose says a refund's confirmation updates "the original capture
+  request" while its `payment.id` column shows the refund's own id, so two partial refunds
+  should confirm distinct ids on their `payment.refunded` events. The id format changes once
+  on upgrade, so an event delivered on both sides of it can be processed twice.
+
 Items initially flagged AMBIGUOUS/undocumented, resolved conservatively — each notes its
 current status (remaining sandbox checks run via the dispatch-only integration workflow):
 

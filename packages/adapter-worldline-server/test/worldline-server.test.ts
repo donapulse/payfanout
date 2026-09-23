@@ -104,7 +104,7 @@ runServerAdapterConformanceTests(
       validRawBody: webhookFixture.rawBody,
       validHeaders: webhookFixture.headers,
       expectedType: "payment.succeeded",
-      expectedEventId: "evt_wl_1",
+      expectedEventId: "worldline:payment.captured:pay_wl_42",
       expectedAmount: 1099,
       unknownEvent: { rawBody: unknownWebhookFixture.rawBody, headers: unknownWebhookFixture.headers },
     },

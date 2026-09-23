@@ -78,6 +78,11 @@ clock is an injectable `now()` seam. Every mutating call carries a signed, deter
   operating on the **raw request bytes** and emitting a normalized `UnifiedWebhookEvent`. One
   event per delivery; a single-event array wrapper is unwrapped, and a multi-event batch is
   rejected rather than partially processed.
+  The event `id` is `worldline:<type>:<payment id>`, the pair Worldline documents as identical
+  across duplicate deliveries, so redeliveries dedupe on `event.id`.
+  Captures and refunds get a payment id of their own at Worldline, so their events'
+  `pspPaymentId` can differ from the one `completePayment` returned: correlate through
+  `merchantReference` or `retrievePayment`, never by parsing ids.
 - **`mapWorldlineError`**, unifies Worldline errors into `PayFanoutError` (business rejections
   are never replayed), and **`WORLDLINE_PSP_NAME`**.
 - **`buildV1HmacAuthorization`**, the request signer, exported for testing.

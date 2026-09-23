@@ -233,16 +233,18 @@ export interface StripeServerAdapterConfig {
   /** Webhook timestamp tolerance in seconds (replay protection). Default 300. */
   webhookToleranceSeconds?: number;
   /**
-   * Abort a hung Stripe request after this many milliseconds (the SDK's
-   * `timeout` client option). Left unset, the SDK's own default of 80000
-   * (80s) applies. Only applies when the SDK is loaded lazily — an injected
-   * client keeps its own configuration.
+   * Abort a hung Stripe request, response body included, after this many
+   * milliseconds (the SDK's `timeout` client option). Left unset, the SDK's
+   * own default of 80000 (80s) applies. Only applies when the SDK is loaded
+   * lazily — an injected client keeps its own configuration.
    */
   requestTimeoutMs?: number;
   /**
-   * Automatic network-level retries inside the Stripe SDK (idempotency keys
-   * make them safe). Default 2. Only applies when the SDK is loaded lazily —
-   * an injected client keeps its own configuration.
+   * Automatic network-level retries inside the Stripe SDK. Default 2. Calls
+   * that create objects or move money carry the caller's idempotency key, so
+   * a retry cannot duplicate them; the SDK also retries a closed connection
+   * once, even at 0. Only applies when the SDK is loaded lazily — an
+   * injected client keeps its own configuration.
    */
   maxNetworkRetries?: number;
   /**

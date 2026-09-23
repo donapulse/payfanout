@@ -422,19 +422,27 @@ describe("AdyenServerAdapter specifics", () => {
       idempotencyKey: "c1",
     });
     expect(info.status).toBe("requires_action");
-    expect((info.raw as { action?: { type?: string } }).action?.type).toBe("threeDS2");
+    // A bare card token carries no browser data, so Adyen answers with its redirect flow.
+    expect((info.raw as { action?: { type?: string } }).action?.type).toBe("redirect");
+    expect(info.pspPaymentId).toBe("");
   });
 
   it("finishes a resolved action through /payments/details", async () => {
     const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession({ amount: 3200, currency: "EUR", idempotencyKey: "k" });
+    const challenged = await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: JSON.stringify({ ...JSON.parse(CLIENT_TOKEN), holderName: "CHALLENGE" }),
+      idempotencyKey: "c1",
+    });
+    const details = fake.detailsFor((challenged.raw as { action: Record<string, unknown> }).action);
     const info = await adapter.completePayment({
       pspSessionId: session.pspSessionId,
-      clientToken: JSON.stringify({ details: { threeDSResult: "eyJ0..." }, paymentData: "Ab02b4c0..." }),
+      clientToken: JSON.stringify({ details, paymentData: "Ab02b4c0..." }),
       idempotencyKey: "c2",
     });
     expect(fake.lastRequestPath).toMatch(/\/payments\/details$/);
-    expect(fake.lastRequestBody).toEqual({ details: { threeDSResult: "eyJ0..." }, paymentData: "Ab02b4c0..." });
+    expect(fake.lastRequestBody).toEqual({ details, paymentData: "Ab02b4c0..." });
     expect(info.status).toBe("succeeded");
     expect(info.amount).toBe(3200); // from the signed context, not the details response
   });
@@ -458,11 +466,11 @@ describe("AdyenServerAdapter specifics", () => {
     });
     expect(challenged.status).toBe("requires_action");
     const challengeKey = fake.lastIdempotencyKey;
-    const action = (challenged.raw as { action: { paymentData: string } }).action;
+    const action = (challenged.raw as { action: Record<string, unknown> }).action;
 
     const finished = await adapter.completePayment({
       pspSessionId: session.pspSessionId,
-      clientToken: JSON.stringify({ details: { threeDSResult: "eyJ0..." }, paymentData: action.paymentData }),
+      clientToken: JSON.stringify({ details: fake.detailsFor(action) }),
       idempotencyKey: "one-caller-key",
     });
     expect(finished.status).toBe("succeeded");

@@ -46,6 +46,8 @@ export interface AdyenSessionContextV1 {
   metadata?: Record<string, string>;
   /** Shopper email (`shopperEmail` on the payment). */
   receiptEmail?: string;
+  /** The session's `billingDetails.email`, sent as `shopperEmail` when there is no `receiptEmail`. */
+  billingEmail?: string;
 }
 
 export interface DecodeSessionContextOptions {

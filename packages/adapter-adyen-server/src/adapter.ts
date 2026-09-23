@@ -54,11 +54,14 @@ export interface AdyenServerAdapterConfig {
   /** Pinned Checkout API version, e.g. "v72". */
   apiVersion?: string;
   /**
-   * Where Adyen sends the shopper back from a redirect or a 3-D Secure
-   * challenge. `returnUrl` is one of the required top-level fields on
-   * POST /payments, so a session that carries none falls back to this value;
-   * with neither, session creation is refused instead of sending Adyen a
-   * request it rejects.
+   * Where Adyen sends the shopper back from a redirect, including the 3-D
+   * Secure redirect flow Adyen can choose instead of the native one.
+   * `returnUrl` is one of the required top-level fields on POST /payments, so
+   * a session that carries none falls back to this value; with neither,
+   * session creation is refused instead of sending Adyen a request it rejects.
+   * Absolute with a scheme (`https://` on the web, an app scheme such as
+   * `my-app://`), at most 1024 characters, and without `//` in the path of a
+   * web URL — a value that breaks those rules is refused at construction.
    */
   defaultReturnUrl?: string;
   /** HMAC key for the stateless signed session context (see session-context.ts). */
@@ -264,6 +267,7 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
     ) {
       throw PayFanoutError.invalidRequest("AdyenServerAdapter config.maxNetworkRetries must be an integer >= 0");
     }
+    if (config.defaultReturnUrl) assertReturnUrl(config.defaultReturnUrl, "defaultReturnUrl");
     this.config = config;
     this.baseUrl =
       config.baseUrl ??
@@ -312,6 +316,12 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
    * checkout fields are signed into the returned `pspSessionId`, which is also
    * the session's `clientSecret` — the browser reads the payload half to drive
    * Adyen Web's own copy and cannot tamper with the amount.
+   *
+   * The shopper email Adyen asks for on Visa and JCB 3-D Secure 2 payments is
+   * `receiptEmail`, or `billingDetails.email` when there is none. Refused with
+   * invalid_request, before the shopper enters a card, when the return URL is
+   * missing or malformed (see assertReturnUrl) or that email is not an address
+   * of at most 256 characters.
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertMinorUnitAmount(input.amount, "amount");
@@ -322,8 +332,15 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
         { paymentMethodTypes: input.paymentMethodTypes },
       );
     }
+    // The configured default was checked at construction.
+    if (input.returnUrl) assertReturnUrl(input.returnUrl, "returnUrl");
     const returnUrl = input.returnUrl ?? this.config.defaultReturnUrl;
     if (!returnUrl) throw this.missingReturnUrl();
+    const receiptEmail = input.receiptEmail ? assertShopperEmail(input.receiptEmail, "receiptEmail") : undefined;
+    const billingEmail =
+      !receiptEmail && input.billingDetails?.email
+        ? assertShopperEmail(input.billingDetails.email, "billingDetails.email")
+        : undefined;
     // Deterministic so a replayed session creation yields the same merchant
     // reference: paired with the caller's idempotency key on /payments, a replay
     // converges on one Adyen payment.
@@ -353,7 +370,8 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
       returnUrl,
       ...(input.id ? { id: input.id } : {}),
       ...(metadata ? { metadata } : {}),
-      ...(input.receiptEmail ? { receiptEmail: input.receiptEmail } : {}),
+      ...(receiptEmail ? { receiptEmail } : {}),
+      ...(billingEmail ? { billingEmail } : {}),
     };
     const token = await encodeSessionContext(context, this.config.sessionSigningKey);
     return {
@@ -372,24 +390,31 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
   }
 
   /**
-   * Tokenize-first completion. `clientToken` is the JSON the client adapter's
-   * confirm() produced:
+   * Tokenize-first completion. `clientToken` is the JSON the client adapter
+   * produced (see parseClientToken):
    *
-   *  - the encrypted `paymentMethod` blob from Adyen's hosted card fields, which
-   *    creates the payment (POST /payments), or
-   *  - `{ details, paymentData }` from a resolved action, which finishes it
+   *  - confirm()'s envelope — the encrypted card `paymentMethod` plus the
+   *    browser data 3-D Secure uses — or the bare `paymentMethod` earlier
+   *    client adapters send, which creates the payment (POST /payments), or
+   *  - `{ details }` from a finished action (handleAction(), or the
+   *    redirectResult of a 3-D Secure redirect return), which finishes it
    *    (POST /payments/details).
    *
-   * The signed context is the only trusted source of amount/currency/capture
-   * method. An `action` in the response surfaces as requires_action with the
-   * action preserved on `raw`; a refusal is raised as a mapped PayFanoutError
-   * rather than folded into a "failed" PaymentInfo.
+   * The signed context is the only trusted source of amount, currency,
+   * reference and capture method. A refusal is raised as a mapped
+   * PayFanoutError rather than folded into a "failed" PaymentInfo. An `action`
+   * surfaces as requires_action with Adyen's answer on `raw`; Adyen issues the
+   * pspReference only once the action is finished, so until then
+   * `pspPaymentId` is the empty string, which capturePayment and refundPayment
+   * refuse. A /payments/details answer is only reported as the session's
+   * result once it is shown to belong to the session's payment (see
+   * detailsBelongToSession).
    */
   async completePayment(input: CompletePaymentInput): Promise<PaymentInfo> {
     const submission = parseClientToken(input.clientToken);
     const context = await this.decodeContext(input.pspSessionId);
     const response =
-      "details" in submission
+      submission.kind === "details"
         ? await this.post<AdyenPaymentResponse>(
             "/payments/details",
             {
@@ -400,11 +425,14 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
           )
         : await this.post<AdyenPaymentResponse>(
             "/payments",
-            this.buildPaymentRequest(context, submission.paymentMethod),
+            this.buildPaymentRequest(context, submission),
             input.idempotencyKey,
           );
-    const pspReference = response.pspReference;
-    if (!pspReference) {
+    const resultCode = response.resultCode ?? "";
+    if (resultCode === "Refused" || resultCode === "Error") throw mapAdyenRefusal(response);
+    const verified = submission.kind === "details" ? this.detailsBelongToSession(response, context) : true;
+    if (response.action) return this.toPaymentInfo(context, response, "requires_action");
+    if (!response.pspReference) {
       throw new PayFanoutError({
         code: "processing_error",
         message: getUserMessage("processing_error"),
@@ -413,25 +441,11 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
         pspName: this.pspName,
       });
     }
-    const resultCode = response.resultCode ?? "";
-    if (resultCode === "Refused" || resultCode === "Error") throw mapAdyenRefusal(response);
-    const status = response.action ? "requires_action" : mapAdyenResultCode(resultCode, context.captureMethod);
-    return {
-      id: context.id ?? context.reference,
-      pspName: this.pspName,
-      pspPaymentId: encodeAdyenPaymentRef(pspReference, context.amount, context.currency),
-      status,
-      amount: context.amount,
-      // Refunds and captures are acknowledged, never settled, in-band: the
-      // running totals only exist once the webhooks land.
-      amountRefunded: 0,
-      ...(status === "requires_capture" ? { amountCapturable: context.amount } : {}),
-      currency: context.currency,
-      paymentMethodType: "card",
-      ...(context.metadata ? { metadata: context.metadata } : {}),
-      createdAt: UNKNOWN_CREATED_AT,
-      raw: response,
-    };
+    return this.toPaymentInfo(
+      context,
+      response,
+      verified ? mapAdyenResultCode(resultCode, context.captureMethod) : "processing",
+    );
   }
 
   /**
@@ -526,15 +540,78 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
   // --- internals ------------------------------------------------------------
 
   /**
+   * Completion correctness: /payments/details finishes whichever payment the
+   * details were issued for, so its answer can only stand for this session
+   * once it is shown to describe the session's own payment. A
+   * `merchantReference` or `amount` that differs from the signed context means
+   * the details belong to another payment: refused, not retryable, since a
+   * replay gets the same answer. When Adyen omits either, nothing ties the
+   * answer to the session, so the payment reads "processing" and the
+   * AUTHORISATION webhook settles it. True only when both are present and match.
+   */
+  private detailsBelongToSession(response: AdyenPaymentResponse, context: AdyenSessionContextV1): boolean {
+    const reference = response.merchantReference;
+    const value = response.amount?.value;
+    const currency = response.amount?.currency;
+    if (
+      (reference !== undefined && reference !== context.reference) ||
+      (value !== undefined && value !== context.amount) ||
+      (currency !== undefined && String(currency).toUpperCase() !== context.currency)
+    ) {
+      throw new PayFanoutError({
+        code: "invalid_request",
+        message: "These payment details belong to a different payment than this session.",
+        retryable: false,
+        raw: response,
+        pspName: this.pspName,
+      });
+    }
+    return reference !== undefined && value !== undefined && currency !== undefined;
+  }
+
+  private toPaymentInfo(
+    context: AdyenSessionContextV1,
+    response: AdyenPaymentResponse,
+    status: UnifiedPaymentStatus,
+  ): PaymentInfo {
+    return {
+      id: context.id ?? context.reference,
+      pspName: this.pspName,
+      // Empty rather than a placeholder while Adyen has issued no reference: a
+      // placeholder could be stored and later mistaken for Adyen's own.
+      pspPaymentId: response.pspReference
+        ? encodeAdyenPaymentRef(response.pspReference, context.amount, context.currency)
+        : "",
+      status,
+      amount: context.amount,
+      // Refunds and captures are acknowledged, never settled, in-band: the
+      // running totals only exist once the webhooks land.
+      amountRefunded: 0,
+      ...(status === "requires_capture" ? { amountCapturable: context.amount } : {}),
+      currency: context.currency,
+      paymentMethodType: "card",
+      ...(context.metadata ? { metadata: context.metadata } : {}),
+      createdAt: UNKNOWN_CREATED_AT,
+      raw: response,
+    };
+  }
+
+  /**
    * The POST /payments body. `returnUrl` is one of Adyen's required top-level
    * fields, so the session's own value is used when it has one and the adapter's
    * `defaultReturnUrl` otherwise; a context carrying neither (one signed before
    * the fallback was configured) is refused here rather than sent to be rejected.
+   *
+   * The browser contributes only the fields Adyen's 3-D Secure guides ask the
+   * page for; amount, currency, reference, merchant account and capture method
+   * come from the signed context alone. With both `browserInfo` and `origin`
+   * the payment asks for native 3-D Secure 2 with the fields Adyen's native
+   * guide lists as required on the web; with `browserInfo` alone it carries the
+   * browser data and leaves the flow to Adyen's redirect. A bare card token from
+   * an earlier client adapter keeps the body it always had. `shopperIP` is not
+   * sent: completion has no shopper IP address to send.
    */
-  private buildPaymentRequest(
-    context: AdyenSessionContextV1,
-    paymentMethod: Record<string, unknown>,
-  ): Record<string, unknown> {
+  private buildPaymentRequest(context: AdyenSessionContextV1, card: AdyenCardSubmission): Record<string, unknown> {
     const returnUrl = context.returnUrl ?? this.config.defaultReturnUrl;
     if (!returnUrl) throw this.missingReturnUrl();
     // encodeSessionContext is exported, so a context can be minted by hand or
@@ -542,17 +619,28 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
     // trusting that createPaymentSession was the only door in.
     const currency = this.assertSupportedCurrency(context.currency);
     assertMinorUnitAmount(context.amount, "amount");
+    const shopperEmail = context.receiptEmail ?? context.billingEmail;
     return {
       merchantAccount: this.config.merchantAccount,
       amount: { currency, value: context.amount },
       reference: context.reference,
-      paymentMethod,
+      paymentMethod: card.paymentMethod,
       returnUrl,
       ...(context.metadata ? { metadata: context.metadata } : {}),
-      ...(context.receiptEmail ? { shopperEmail: context.receiptEmail } : {}),
+      ...(shopperEmail ? { shopperEmail } : {}),
       // Manual capture is a per-payment flag; the alternative is enabling it
       // account-wide, which would hold EVERY payment for capture.
       ...(context.captureMethod === "manual" ? { additionalData: { manualCapture: "true" } } : {}),
+      ...(card.browserInfo ? { browserInfo: card.browserInfo } : {}),
+      ...(card.browserInfo && card.origin
+        ? {
+            channel: "Web",
+            origin: card.origin,
+            authenticationData: { threeDSRequestData: { nativeThreeDS: "preferred" } },
+          }
+        : {}),
+      ...(card.billingAddress ? { billingAddress: card.billingAddress } : {}),
+      ...(card.riskData ? { riskData: card.riskData } : {}),
     };
   }
 
@@ -829,48 +917,269 @@ function isReplayInFlight(error: unknown): boolean {
   return isPayFanoutError(error) && error.code === "processing_error" && error.retryable;
 }
 
-/** What the client adapter's confirm() produced, parsed back out of the clientToken. */
-type AdyenSubmission =
-  | { paymentMethod: Record<string, unknown> }
-  | { details: Record<string, unknown>; paymentData?: string };
+/** A card payment, from confirm()'s envelope or the bare paymentMethod earlier client adapters send. */
+interface AdyenCardSubmission {
+  kind: "card";
+  paymentMethod: Record<string, unknown>;
+  browserInfo?: AdyenBrowserInfo;
+  origin?: string;
+  billingAddress?: Record<string, string>;
+  riskData?: { clientData: string };
+}
 
+/** The details that finish an action, for POST /payments/details. */
+interface AdyenDetailsSubmission {
+  kind: "details";
+  details: Record<string, unknown>;
+  paymentData?: string;
+}
+
+type AdyenSubmission = AdyenCardSubmission | AdyenDetailsSubmission;
+
+/** Adyen's BrowserInfo: on the web, every field but javaScriptEnabled is required. */
+interface AdyenBrowserInfo {
+  acceptHeader: string;
+  colorDepth: number;
+  javaEnabled: boolean;
+  javaScriptEnabled?: boolean;
+  language: string;
+  screenHeight: number;
+  screenWidth: number;
+  timeZoneOffset: number;
+  userAgent: string;
+}
+
+/** CardDetails fields that are raw card data rather than the blob Adyen's hosted fields encrypt. */
+const UNENCRYPTED_CARD_FIELDS = ["number", "expiryMonth", "expiryYear", "cvc"] as const;
+/** Adyen's BillingAddress fields. */
+const BILLING_ADDRESS_FIELDS = ["city", "country", "houseNumberOrName", "postalCode", "stateOrProvince", "street"] as const;
+/** Adyen's limits on the fields completion fills from the browser and the session. */
+const ORIGIN_MAX_LENGTH = 80;
+const RISK_CLIENT_DATA_MAX_LENGTH = 5000;
+const RETURN_URL_MAX_LENGTH = 1024;
+const SHOPPER_EMAIL_MAX_LENGTH = 256;
+/** An RFC 3986 scheme and "://": https:// on the web, an app's own scheme (my-app://) on mobile. */
+const RETURN_URL_PATTERN = /^[a-z][a-z0-9+.-]*:\/\/\S*$/i;
+/** Plausibility, not RFC 5322: one "@", no whitespace, a dotted domain. */
+const SHOPPER_EMAIL_PATTERN = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/;
+
+/**
+ * Decodes the clientToken completePayment receives, which the browser
+ * controls. Three shapes are accepted: confirm()'s envelope
+ * `{ paymentMethod, browserInfo?, origin?, billingAddress?, riskData? }`, the
+ * bare card `paymentMethod` earlier client adapters send, and
+ * `{ details, paymentData? }` from a finished action. Only those keys are
+ * read, so nothing the browser sends reaches the amount, currency, reference,
+ * merchant account or capture method.
+ *
+ * The card must be the blob Adyen's hosted fields encrypt: a `paymentMethod`
+ * that is not "scheme", or that carries unencrypted card fields, is refused.
+ * The browser data is authentication and risk data, not part of the payment,
+ * so a field that fails its check is dropped rather than failing the payment.
+ * No error repeats the token, which can carry card data.
+ */
 function parseClientToken(clientToken: string): AdyenSubmission {
   if (!clientToken) {
     throw PayFanoutError.invalidRequest("completePayment requires the clientToken produced by confirm()", {
-      clientToken,
+      reason: "missing clientToken",
     });
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(clientToken);
-  } catch (err) {
+  } catch {
+    // JSON.parse quotes the input in its message, so its error stays out of this one.
     throw PayFanoutError.invalidRequest(
-      "Adyen clientTokens are the JSON payload confirm() produced (the encrypted paymentMethod, or { details })",
-      err,
+      "Adyen clientTokens are the JSON payloads confirm() and handleAction() produce",
+      { reason: "clientToken is not JSON" },
     );
   }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw PayFanoutError.invalidRequest("Adyen clientToken payload is not a JSON object", parsed);
+  if (!isPlainObject(parsed)) {
+    throw PayFanoutError.invalidRequest("Adyen clientToken payload is not a JSON object", {
+      reason: "clientToken is not a JSON object",
+    });
   }
-  const payload = parsed as Record<string, unknown>;
-  const details = payload["details"];
-  if (details !== undefined) {
-    if (details === null || typeof details !== "object") {
-      throw PayFanoutError.invalidRequest("Adyen clientToken `details` must be an object", payload);
+  if (parsed["details"] !== undefined) {
+    const details = parsed["details"];
+    if (!isPlainObject(details) || parsed["paymentMethod"] !== undefined) {
+      throw PayFanoutError.invalidRequest(
+        "An Adyen clientToken carries either a paymentMethod or the `details` object of an action",
+        { reason: "malformed details" },
+      );
     }
-    const paymentData = payload["paymentData"];
-    return {
-      details: details as Record<string, unknown>,
-      ...(typeof paymentData === "string" ? { paymentData } : {}),
-    };
+    const paymentData = parsed["paymentData"];
+    return { kind: "details", details, ...(typeof paymentData === "string" ? { paymentData } : {}) };
   }
-  if (typeof payload["type"] !== "string") {
+  if (parsed["paymentMethod"] === undefined) {
+    // The bare paymentMethod earlier client adapters send.
+    if (typeof parsed["type"] === "string") return { kind: "card", paymentMethod: assertCardPaymentMethod(parsed) };
     throw PayFanoutError.invalidRequest(
-      `Adyen paymentMethod payloads carry a type (cards are "${CARD_PAYMENT_METHOD_TYPE}")`,
-      payload,
+      `Adyen clientTokens carry a paymentMethod (cards are "${CARD_PAYMENT_METHOD_TYPE}") or the details of an action`,
+      { reason: "no paymentMethod or details" },
     );
   }
-  return { paymentMethod: payload };
+  const paymentMethod = assertCardPaymentMethod(parsed["paymentMethod"]);
+  const browserInfo = sanitizeBrowserInfo(parsed["browserInfo"]);
+  const origin = sanitizeOrigin(parsed["origin"]);
+  const billingAddress = sanitizeBillingAddress(parsed["billingAddress"]);
+  const riskData = sanitizeRiskData(parsed["riskData"]);
+  return {
+    kind: "card",
+    paymentMethod,
+    ...(browserInfo ? { browserInfo } : {}),
+    ...(origin ? { origin } : {}),
+    ...(billingAddress ? { billingAddress } : {}),
+    ...(riskData ? { riskData } : {}),
+  };
+}
+
+function assertCardPaymentMethod(value: unknown): Record<string, unknown> {
+  if (!isPlainObject(value) || value["type"] !== CARD_PAYMENT_METHOD_TYPE) {
+    throw PayFanoutError.invalidRequest(
+      `The Adyen adapter completes card payments, whose paymentMethod type is "${CARD_PAYMENT_METHOD_TYPE}"`,
+      { reason: "paymentMethod is not a card" },
+    );
+  }
+  // Cards are captured in Adyen's hosted fields only, which never hand out raw
+  // card data: a token carrying it was not built by them.
+  const unencrypted = UNENCRYPTED_CARD_FIELDS.filter((field) => Object.hasOwn(value, field));
+  if (unencrypted.length > 0) {
+    throw PayFanoutError.invalidRequest(
+      "Adyen card data must arrive encrypted by Adyen's hosted fields, never as raw card fields",
+      { reason: "unencrypted card fields", fields: unencrypted },
+    );
+  }
+  return value;
+}
+
+/** Rebuilt from the documented fields; one missing or of the wrong type drops the object, as the web needs all of them. */
+function sanitizeBrowserInfo(value: unknown): AdyenBrowserInfo | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const { acceptHeader, colorDepth, javaEnabled, javaScriptEnabled, language, screenHeight, screenWidth } = value;
+  const { timeZoneOffset, userAgent } = value;
+  if (
+    !isNonEmptyString(acceptHeader) ||
+    !isNonEmptyString(language) ||
+    !isNonEmptyString(userAgent) ||
+    !isInteger(colorDepth) ||
+    !isInteger(screenHeight) ||
+    !isInteger(screenWidth) ||
+    !isInteger(timeZoneOffset) ||
+    typeof javaEnabled !== "boolean"
+  ) {
+    return undefined;
+  }
+  return {
+    acceptHeader,
+    colorDepth,
+    javaEnabled,
+    ...(typeof javaScriptEnabled === "boolean" ? { javaScriptEnabled } : {}),
+    language,
+    screenHeight,
+    screenWidth,
+    timeZoneOffset,
+    userAgent,
+  };
+}
+
+/**
+ * The page's bare origin — scheme, host, optional port; no path, no trailing
+ * slash — at most 80 characters. Anything else is dropped, and with it the
+ * request for native 3-D Secure: Adyen documents that a missing or wrong
+ * origin keeps the native action from being handled, so the payment is left
+ * to Adyen's redirect flow rather than refused. The value only tells Adyen
+ * where the shopper's own page is; no money fact depends on it.
+ */
+function sanitizeOrigin(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length > ORIGIN_MAX_LENGTH || !/^https?:\/\/[^/?#\s]+$/i.test(value)) {
+    return undefined;
+  }
+  try {
+    // A value URL rewrites (upper case, a default port, credentials) is not
+    // the origin a browser reports.
+    return new URL(value).origin === value ? value : undefined;
+  } catch {
+    // Not parseable as a URL, so not an origin.
+    return undefined;
+  }
+}
+
+function sanitizeBillingAddress(value: unknown): Record<string, string> | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const address: Record<string, string> = {};
+  for (const field of BILLING_ADDRESS_FIELDS) {
+    const entry = value[field];
+    if (isNonEmptyString(entry)) address[field] = entry;
+  }
+  return Object.keys(address).length > 0 ? address : undefined;
+}
+
+/**
+ * `clientData` only — the device fingerprint Adyen Web collects. RiskData's
+ * other fields are the merchant's to set (`fraudOffset` moves the payment's
+ * fraud score), so they never come from the browser.
+ */
+function sanitizeRiskData(value: unknown): { clientData: string } | undefined {
+  if (!isPlainObject(value)) return undefined;
+  const clientData = value["clientData"];
+  return isNonEmptyString(clientData) && clientData.length <= RISK_CLIENT_DATA_MAX_LENGTH ? { clientData } : undefined;
+}
+
+/**
+ * Adyen's returnUrl rules: absolute with a scheme, at most 1024 characters,
+ * and no "//" after the domain of a web URL. Checked where the value enters —
+ * session creation, adapter construction — so a malformed one is refused
+ * before the shopper enters a card rather than by Adyen afterwards.
+ */
+function assertReturnUrl(returnUrl: string, field: "returnUrl" | "defaultReturnUrl"): void {
+  if (returnUrl.length > RETURN_URL_MAX_LENGTH) {
+    throw PayFanoutError.invalidRequest(
+      `Adyen accepts a ${field} of at most ${RETURN_URL_MAX_LENGTH} characters, got ${returnUrl.length}`,
+      { field },
+    );
+  }
+  const web = /^https?:\/\//i.test(returnUrl);
+  const webPath = web ? urlPath(returnUrl) : undefined;
+  if (!RETURN_URL_PATTERN.test(returnUrl) || (web && webPath === undefined)) {
+    throw PayFanoutError.invalidRequest(
+      `The ${field} must be absolute, with a scheme: https:// on the web, or an app scheme such as my-app://`,
+      { field },
+    );
+  }
+  if (webPath?.includes("//")) {
+    throw PayFanoutError.invalidRequest(`Adyen refuses a ${field} with "//" after the domain`, { field });
+  }
+}
+
+function urlPath(url: string): string | undefined {
+  try {
+    return new URL(url).pathname;
+  } catch {
+    // Unparseable, so not an absolute URL.
+    return undefined;
+  }
+}
+
+function assertShopperEmail(email: string, field: "receiptEmail" | "billingDetails.email"): string {
+  if (email.length > SHOPPER_EMAIL_MAX_LENGTH || !SHOPPER_EMAIL_PATTERN.test(email)) {
+    throw PayFanoutError.invalidRequest(
+      `Adyen sends ${field} as shopperEmail, which takes an email address of at most ${SHOPPER_EMAIL_MAX_LENGTH} characters`,
+      { field },
+    );
+  }
+  return email;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isInteger(value: unknown): value is number {
+  return Number.isInteger(value);
 }
 
 /** Adyen caps metadata at 20 entries, 20-character keys and 80-character values. */

@@ -315,6 +315,22 @@ describe("webhooks for refused operations", () => {
     expect(event.type).toBe("unknown");
   });
 
+  it("reads a refused cancellation or capture (63/93) as unknown under payment.rejected or payment.cancelled", async () => {
+    for (const [type, status] of [
+      ["payment.rejected", "REJECTED"],
+      ["payment.cancelled", "CANCELLED"],
+    ] as const) {
+      for (const statusCode of [63, 93]) {
+        const event = await parseWorldlineWebhookEvent(paymentEvent(type, status, statusCode));
+        expect(event.type).toBe("unknown");
+      }
+    }
+    // The ordinary codes keep their mapping.
+    await expect(parseWorldlineWebhookEvent(paymentEvent("payment.cancelled", "CANCELLED", 6))).resolves.toMatchObject({
+      type: "payment.canceled",
+    });
+  });
+
   it("verifies and parses a signed refused-refund delivery through the adapter", async () => {
     const { adapter } = makePair();
     const rawBody = paymentEvent("payment.rejected", "REJECTED", 83);
@@ -510,6 +526,19 @@ describe("cancellation answered with a 409", () => {
     const id = await authorize(adapter, 3000);
     readBack({ status: undefined, statusOutput: { statusCode: 5 } });
     await expect(adapter.cancelPayment(id, "void-1")).rejects.toMatchObject({ code: "processing_error", retryable: true });
+  });
+
+  it("takes a cancellation read back without a status string for what its code says", async () => {
+    const cases: Array<[number, string]> = [
+      [6, "canceled"],
+      [61, "processing"],
+    ];
+    for (const [statusCode, expected] of cases) {
+      const { adapter, readBack } = makeCancelPair(() => true);
+      const id = await authorize(adapter, 3000);
+      readBack({ status: undefined, statusOutput: { statusCode, statusCategory: "UNSUCCESSFUL" } });
+      await expect(adapter.cancelPayment(id, "void-1")).resolves.toMatchObject({ status: expected });
+    }
   });
 
   it("passes any other cancellation failure through untouched and unretried", async () => {

@@ -175,6 +175,12 @@ export async function parseWorldlineWebhookEvent(rawBody: string): Promise<Unifi
 }
 
 function mapEventType(rawType: string, statusCode: number | undefined): UnifiedWebhookEventType {
+  // A refused cancellation (63) or capture (93) leaves the payment authorised
+  // whatever event type carries it, as mapWorldlineStatus reads the codes, so
+  // neither payment.failed nor payment.canceled would be honest.
+  if ((rawType === "payment.rejected" || rawType === "payment.cancelled") && (statusCode === 63 || statusCode === 93)) {
+    return "unknown";
+  }
   // REJECTED covers "the authorisation/refund request" (Statuses reference):
   // 73/83 are a refused deletion/refund, so the funds did not return and the
   // payment stays captured — a refund failure, not a failed payment.

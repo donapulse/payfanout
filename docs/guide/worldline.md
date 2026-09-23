@@ -129,6 +129,13 @@ later `retrievePayment` settles it: `canceled`, or `requires_capture` if the acq
 Cancelling a payment that is already captured is refused with a non-retryable
 `invalid_request`.
 
+A refund the acquirer refuses leaves the payment `succeeded`: `retrieveRefund` reports the
+refund `failed` and it stays out of `amountRefunded`, and a payment with a refund still in
+flight also stays `succeeded`. The refused refund's `payment.rejected` webhook, carrying status
+code 73 or 83, arrives as `payment.refund_failed` (read from Worldline's Statuses reference,
+not yet sandbox-verified); it carries no amount unless the event holds a refund resource, so
+reconcile it with `retrieveRefund`.
+
 An automatic-capture payment can also end at `requires_capture` when Worldline refuses its
 capture. [`usePaymentStatus`](/guide/react#async-rails-polling-to-a-terminal-state) does not
 treat `requires_capture` as final and keeps polling it, so stop the hook yourself

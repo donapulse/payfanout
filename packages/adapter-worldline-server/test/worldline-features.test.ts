@@ -159,6 +159,11 @@ describe("mapWorldlineStatus", () => {
     ["CAPTURE_REQUESTED", undefined, undefined, "processing"],
     // genuinely unknown -> processing (never a fabricated terminal state).
     ["SOMETHING_NEW", undefined, undefined, "processing"],
+    // No status string: the cancellation codes decide before the UNSUCCESSFUL band.
+    [undefined, 1, "UNSUCCESSFUL", "canceled"],
+    [undefined, 6, "UNSUCCESSFUL", "canceled"],
+    [undefined, 61, "UNSUCCESSFUL", "processing"],
+    [undefined, 62, "UNSUCCESSFUL", "processing"],
   ];
   for (const [status, code, category, expected] of cases) {
     it(`maps ${status ?? "-"}/${code ?? "-"}/${category ?? "-"} -> ${expected}`, () => {

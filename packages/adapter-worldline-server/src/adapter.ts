@@ -467,16 +467,19 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       // request is currently being processed" (idempotent-requests guide), for
       // an original under this key still in flight, another worker's for
       // instance, or "Cancellation is not allowed because payment is closed"
-      // (API contract). Only the payment tells them apart. CANCELLED means a
-      // cancellation took effect or awaits the acquirer. A payment Worldline
-      // still reports cancellable may yet see the original land, and a replay
-      // under this key answers the original's outcome, so the retryable error
-      // stands. Anything else is closed, and no retry will open it.
+      // (API contract). Only the payment tells them apart. A payment that reads
+      // canceled, or processing while its cancellation awaits the acquirer
+      // (CANCELLED, or codes 61/62 without a status string), is the answer. A
+      // payment Worldline still reports cancellable may yet see the original
+      // land, and a replay under this key answers the original's outcome, so
+      // the retryable error stands. Anything else is closed, and no retry will
+      // open it.
       if (!isIdempotenceReplayInFlight(err)) throw err;
       const info = await this.retrievePayment(pspPaymentId);
       const payment = info.raw as WorldlinePaymentLike; // retrievePayment carries the payment object on raw
-      const cancelled = (payment.status ?? "").toUpperCase() === "CANCELLED";
-      if (cancelled && (info.status === "canceled" || info.status === "processing")) return info;
+      const code = payment.statusOutput?.statusCode;
+      const cancelling = (payment.status ?? "").toUpperCase() === "CANCELLED" || code === 61 || code === 62;
+      if (info.status === "canceled" || (info.status === "processing" && cancelling)) return info;
       if (payment.statusOutput?.isCancellable ?? info.status === "requires_capture") throw err;
       throw new PayFanoutError({
         code: "invalid_request",
@@ -867,6 +870,11 @@ export function mapWorldlineStatus(
   // refused deletion leaves it undeleted.
   if (statusCode === 73 || statusCode === 83) return "succeeded";
   if (s === "CANCELLED") return statusCode === 61 || statusCode === 62 ? "processing" : "canceled";
+  // The contract does not require the status string; without it the
+  // cancellation codes name the state before the UNSUCCESSFUL band would read a
+  // voided or voiding authorisation as a failure.
+  if (s === "" && (statusCode === 1 || statusCode === 6)) return "canceled";
+  if (s === "" && (statusCode === 61 || statusCode === 62)) return "processing";
   if (s === "CANCELLATION_REJECTED" || s === "REJECTED_CAPTURE") return "requires_capture";
   if (s === "REFUND_REQUESTED") return "succeeded";
 

@@ -213,14 +213,16 @@ and `PaymentService` will hold you to:
   active key verifying wins (core's `normalizeSecrets`).
 - `parseWebhookEvent` returns a `UnifiedWebhookEvent` with a **stable `id`** (the PSP's
   event id; if absent, hash the raw bytes). When the provider documents which fields
-  identify a duplicate delivery, build the id from those fields instead: an envelope id the
-  provider never promises to repeat can let a redelivery past the host's dedupe store.
-  Adyen documents duplicates as sharing `eventCode` and `pspReference`, and the Adyen
-  adapter's id is that pair; Worldline documents `payment.id` and `type`, and the Worldline
-  adapter keys on them (plus an operation id when the payload carries one). Map known event
-  types onto the unified vocabulary; unknown-but-valid types become `type: "unknown"`
-  (conformance proves this on a correctly signed body), only unparseable payloads throw
-  (`invalid_request`). Timestamps come from the payload, never from `Date.now()`.
+  identify a duplicate delivery, build the id from those fields alone: an envelope id, or
+  any other field the provider does not promise to repeat, can let a redelivery past the
+  host's dedupe store. Adyen documents duplicates as sharing `eventCode` and `pspReference`,
+  and the Adyen adapter's id is that pair; Worldline documents `payment.id` and `type`, and
+  the Worldline adapter keys on that pair. When that identity can merge distinct events, the
+  adapter's docs must give hosts an idempotent re-read fallback that runs regardless of
+  dedupe. Map known event types onto the unified vocabulary; unknown-but-valid types become
+  `type: "unknown"` (conformance proves this on a correctly signed body), only unparseable
+  payloads throw (`invalid_request`). Timestamps come from the payload, never from
+  `Date.now()`.
 - **Batched deliveries:** the unified contract is one event per delivery. If your PSP
   batches (GoCardless ships up to 250 events under one signature), make
   `parseWebhookEvent` THROW on batched payloads and export a PSP-specific fan-out

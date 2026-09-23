@@ -1,5 +1,6 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
+import type { UnifiedWebhookEvent } from "@payfanout/core";
 import { parseWorldlineWebhookEvent, WorldlineServerAdapter } from "../src/index.js";
 
 const WEBHOOK_KEY_ID = "wh-key-1";
@@ -36,6 +37,13 @@ async function eventId(body: unknown): Promise<string> {
   return (await parseWorldlineWebhookEvent(JSON.stringify(body))).id;
 }
 
+/** The deliveries the setup guide tells hosts to re-read refunds on. */
+function isRefundTypeDelivery(event: UnifiedWebhookEvent): boolean {
+  if (event.type === "payment.refunded" || event.type === "payment.refund_failed") return true;
+  const rawType = (event.raw as { type?: unknown }).type;
+  return event.type === "unknown" && typeof rawType === "string" && rawType.toLowerCase().startsWith("refund.");
+}
+
 describe("webhook event identity", () => {
   it("gives two deliveries of one event the same id even when their envelope ids differ", async () => {
     const first = await eventId(delivery("env-1", "payment.captured", { payment: payment("pay_1", CAPTURED) }));
@@ -61,40 +69,32 @@ describe("webhook event identity", () => {
     expect(second).toBe("worldline:payment.refunded:pay_4");
   });
 
-  it("treats a second event of one type on one payment.id as a duplicate when no operation id tells them apart", async () => {
+  it("treats a second event of one type on one payment.id as a duplicate", async () => {
     // Worldline does not guarantee a new payment.id per operation: two refunds
-    // confirmed under one payment.id share an event id, which is why hosts
-    // re-read the payment on refund events instead of counting them.
+    // confirmed under one payment.id share an event id and a store keyed on it
+    // drops the second. Hosts therefore run the refund re-read (retrievePayment,
+    // retrieveRefund) on every refund-type delivery whether or not its event.id
+    // was already seen, poll retrieveRefund until their refunds leave pending,
+    // reconcile captured payments on a schedule, and never sum event.amount.
     const first = await eventId(delivery("env-1", "payment.refunded", { payment: payment("pay_5", REFUNDED, 400) }));
     const second = await eventId(delivery("env-2", "payment.refunded", { payment: payment("pay_5", REFUNDED, 600) }));
     expect(first).toBe("worldline:payment.refunded:pay_5");
     expect(second).toBe(first);
   });
 
-  it("appends operationOutput.id, so operations reported under one payment.id get distinct ids", async () => {
-    const first = await eventId(
-      delivery("env-1", "payment.refunded", { payment: payment("pay_6", REFUNDED, 400, { operationOutput: { id: "op_1" } }) }),
+  it("gives a redelivery the same id with, without, or with a different operationOutput", async () => {
+    // Only payment.id and type are documented as identical across duplicates;
+    // any other field may differ on a redelivery, so none reaches the id.
+    const without = await eventId(delivery("env-1", "payment.refunded", { payment: payment("pay_6", REFUNDED, 400) }));
+    const withOne = await eventId(
+      delivery("env-2", "payment.refunded", { payment: payment("pay_6", REFUNDED, 400, { operationOutput: { id: "op_1" } }) }),
     );
-    const second = await eventId(
-      delivery("env-2", "payment.refunded", { payment: payment("pay_6", REFUNDED, 600, { operationOutput: { id: "op_2" } }) }),
+    const withAnother = await eventId(
+      delivery("env-3", "payment.refunded", { payment: payment("pay_6", REFUNDED, 400, { operationOutput: { id: "op_2" } }) }),
     );
-    expect(first).toBe("worldline:payment.refunded:pay_6:op_1");
-    expect(second).toBe("worldline:payment.refunded:pay_6:op_2");
-  });
-
-  it("gives a redelivery that repeats operationOutput.id the same id", async () => {
-    const resource = { payment: payment("pay_7", REFUNDED, 400, { operationOutput: { id: "op_1", amountOfMoney: { amount: 400, currencyCode: "EUR" } } }) };
-    const first = await eventId(delivery("env-1", "payment.refunded", resource));
-    const second = await eventId(delivery("env-2", "payment.refunded", resource));
-    expect(first).toBe("worldline:payment.refunded:pay_7:op_1");
-    expect(second).toBe(first);
-  });
-
-  it("ignores an operationOutput without a usable id", async () => {
-    for (const operationOutput of [{}, { id: "" }, { id: 7 }, null]) {
-      const body = delivery("env-1", "payment.refunded", { payment: payment("pay_8", REFUNDED, 400, { operationOutput }) });
-      expect(await eventId(body)).toBe("worldline:payment.refunded:pay_8");
-    }
+    expect(without).toBe("worldline:payment.refunded:pay_6");
+    expect(withOne).toBe(without);
+    expect(withAnother).toBe(without);
   });
 
   it("keys a refund-resource event on refund.id", async () => {
@@ -179,7 +179,7 @@ describe("webhook event identity", () => {
     expect(await eventId([body])).toBe(await eventId(body));
   });
 
-  it("lets a store keyed on event.id drop a redelivery and keep refunds that differ in payment or operation id", async () => {
+  it("lets a store keyed on event.id drop a redelivery while every refund-type delivery still triggers the re-read", async () => {
     const adapter = new WorldlineServerAdapter({
       apiKeyId: "api-key-id",
       secretApiKey: "secret-api-key",
@@ -194,13 +194,15 @@ describe("webhook event identity", () => {
     const deliveries = [
       delivery("env-1", "payment.captured", { payment: payment("pay_10", CAPTURED) }),
       delivery("env-2", "payment.captured", { payment: payment("pay_10", CAPTURED) }), // Worldline redelivers the capture
-      delivery("env-3", "payment.refunded", { payment: payment("pay_11", REFUNDED, 400) }),
-      delivery("env-4", "payment.refunded", { payment: payment("pay_12", REFUNDED, 600) }),
-      delivery("env-5", "payment.refunded", { payment: payment("pay_13", REFUNDED, 300, { operationOutput: { id: "op_1" } }) }),
-      delivery("env-6", "payment.refunded", { payment: payment("pay_13", REFUNDED, 200, { operationOutput: { id: "op_2" } }) }),
+      delivery("env-3", "refund.refund_requested", { refund: { id: "ref_4", ...REFUND_REQUESTED } }),
+      delivery("env-4", "payment.refunded", { payment: payment("pay_11", REFUNDED, 400) }),
+      delivery("env-5", "payment.refunded", { payment: payment("pay_12", REFUNDED, 600) }),
+      // A second refund confirmed under the same payment.id: the store drops it.
+      delivery("env-6", "payment.refunded", { payment: payment("pay_12", REFUNDED, 200) }),
     ];
     const seen = new Set<string>();
     const processed: string[] = [];
+    const rereads: string[] = [];
     for (const body of deliveries) {
       const rawBody = JSON.stringify(body);
       const headers = {
@@ -209,16 +211,18 @@ describe("webhook event identity", () => {
       };
       await expect(adapter.verifyWebhookSignature(rawBody, headers)).resolves.toBe(true);
       const event = await adapter.parseWebhookEvent(rawBody);
+      // Ahead of the dedupe check, so a merged refund still triggers its re-read.
+      if (isRefundTypeDelivery(event)) rereads.push(`${event.type}:${event.pspPaymentId}`);
       if (seen.has(event.id)) continue;
       seen.add(event.id);
-      processed.push(`${event.type}:${event.pspPaymentId}:${event.amount}`);
+      processed.push(`${event.type}:${event.pspPaymentId}`);
     }
     expect(processed).toEqual([
-      "payment.succeeded:pay_10:1099",
-      "payment.refunded:pay_11:400",
-      "payment.refunded:pay_12:600",
-      "payment.refunded:pay_13:300",
-      "payment.refunded:pay_13:200",
+      "payment.succeeded:pay_10",
+      "unknown:ref_4",
+      "payment.refunded:pay_11",
+      "payment.refunded:pay_12",
     ]);
+    expect(rereads).toEqual(["unknown:ref_4", "payment.refunded:pay_11", "payment.refunded:pay_12", "payment.refunded:pay_12"]);
   });
 });

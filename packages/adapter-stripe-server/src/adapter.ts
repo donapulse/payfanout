@@ -671,7 +671,14 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       ) {
         return { ok: false, category: "auth", message: "Authentication failed — check the Stripe secret key." };
       }
-      if (e.type === "StripeConnectionError" || e.statusCode === 429 || (e.statusCode ?? 0) >= 500) {
+      // StripeAPIError covers unlisted statuses, non-JSON bodies and, from stripe 22.6, a body
+      // severed mid-transfer; the error map already treats it as a retryable outage.
+      if (
+        e.type === "StripeConnectionError" ||
+        e.type === "StripeAPIError" ||
+        e.statusCode === 429 ||
+        (e.statusCode ?? 0) >= 500
+      ) {
         return { ok: false, category: "network", message: "Could not reach Stripe — try again." };
       }
       return { ok: false, category: "internal", message: "Could not verify Stripe credentials." };

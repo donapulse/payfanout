@@ -469,9 +469,54 @@ describe("StripeServerAdapter specifics", () => {
       if (!result.ok) expect(result.category).toBe("network");
     });
 
+    it("classifies a StripeAPIError with no status code as category 'network'", async () => {
+      const { adapter, fake } = makePair();
+      fake.failNextWith(stripeError({ type: "StripeAPIError", message: "Invalid JSON received from the Stripe API" }));
+      const result = await adapter.verifyCredentials();
+      expect(result).toEqual({
+        ok: false,
+        category: "network",
+        message: "Could not reach Stripe — try again.",
+      });
+    });
+
+    it("classifies a StripeAPIError with an unlisted status as category 'network'", async () => {
+      const { adapter, fake } = makePair();
+      // The SDK falls back to StripeAPIError for statuses it has no named error for, e.g. 409.
+      fake.failNextWith(stripeError({ type: "StripeAPIError", statusCode: 409, message: "conflict" }));
+      const result = await adapter.verifyCredentials();
+      expect(result).toEqual({
+        ok: false,
+        category: "network",
+        message: "Could not reach Stripe — try again.",
+      });
+    });
+
+    it("keeps a 401 as category 'auth' even when the error is typed StripeAPIError", async () => {
+      const { adapter, fake } = makePair();
+      fake.failNextWith(stripeError({ type: "StripeAPIError", statusCode: 401, message: "unauthorized" }));
+      const result = await adapter.verifyCredentials();
+      expect(result).toEqual({
+        ok: false,
+        category: "auth",
+        message: "Authentication failed — check the Stripe secret key.",
+      });
+    });
+
     it("classifies anything else as category 'internal' without leaking details", async () => {
       const { adapter, fake } = makePair();
       fake.failNextWith(stripeError({ type: "StripeInvalidRequestError", statusCode: 400, message: "bad param" }));
+      const result = await adapter.verifyCredentials();
+      expect(result).toEqual({
+        ok: false,
+        category: "internal",
+        message: "Could not verify Stripe credentials.",
+      });
+    });
+
+    it("classifies a non-Stripe error with no status code as category 'internal'", async () => {
+      const { adapter, fake } = makePair();
+      fake.failNextWith(new TypeError("Cannot read properties of undefined"));
       const result = await adapter.verifyCredentials();
       expect(result).toEqual({
         ok: false,

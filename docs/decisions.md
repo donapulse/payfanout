@@ -549,9 +549,9 @@ docs.direct.worldline-solutions.com unless noted):
   being processed. Hosts are told to run the refund re-read (`retrievePayment` for
   `amountRefunded`, `retrieveRefund` for the refunds they created that are still `pending`)
   on every verified refund-type delivery (`payment.refunded`, `payment.refund_failed`, and
-  `unknown` events whose `raw.type` starts with `refund.`) whether or not its `event.id` was
-  seen, both reads being idempotent; to poll `retrieveRefund` on a schedule until those
-  refunds leave `pending`; to reconcile captured payments periodically with
+  `unknown` events whose lower-cased `raw.type` starts with `refund.`) whether or not its
+  `event.id` was seen, both reads being idempotent; to poll `retrieveRefund` on a schedule
+  until those refunds leave `pending`; to reconcile captured payments periodically with
   `retrievePayment`, which also covers operations made outside PayFanout (the page itself
   recommends "a back-up mechanism in your business logic. This could be sending proactively
   a GetHostedCheckout/GetPaymentDetails request"); and never to sum `event.amount` across
@@ -576,18 +576,19 @@ docs.direct.worldline-solutions.com unless noted):
   id: the platform's Node SDK types that resource as `PaymentLinkResponse`, which has no
   `id`, and its `paymentLinkId` repeats across distinct events of one type (each payment on
   a reusable link). Same page: a 2xx is expected right away; five retries follow at 10 min /
-  1 h / 2 h / 8 h / 24 h after the previous attempt, each with a `retry-count` header (0 on
-  the first attempt); "Generate webhooks keys" revokes an existing pair immediately, without
-  saying whether at the click or at "Confirm" when you enter your own pair, and the Back
-  Office manages the same pair, so a rotation deploys a self-chosen random pair to
-  `webhookKeys` before entering it in the portal. That shrinks the verification gap to the
-  moment between the click and "Confirm" rather than closing it, and a delivery rejected in
-  that moment is retried, the first retry 10 minutes later.
+  1 h / 2 h / 8 h / 24 h, its table heading them "Retry time relative to last delivery
+  attempt", so the last lands 35 h 10 min after the first attempt, each with a `retry-count`
+  header (0 on the first attempt); "Generate webhooks keys" revokes an existing pair
+  immediately, without saying whether at the click or at "Confirm" when you enter your own
+  pair, and the Back Office manages the same pair, so a rotation deploys a self-chosen
+  random pair to `webhookKeys` before entering it in the portal. That shrinks the
+  verification gap to the moment between the click and "Confirm" rather than closing it, and
+  a delivery rejected in that moment is retried, the first retry 10 minutes later.
   `ValidateWebhookCredentials` takes as `secret` the base64 HMAC-SHA256 of an empty body
   under the webhook secret, not the secret itself (contract: "use an empty string as body
   while hashing it"). The id format changes once on upgrade, so an event delivered on both
   sides of it can be processed twice; the envelope id stays on `event.raw.id` for hosts
-  bridging the roughly 35-hour retry window.
+  bridging the retry window, told to do so for at least 36 hours.
 
 Items initially flagged AMBIGUOUS/undocumented, resolved conservatively — each notes its
 current status (remaining sandbox checks run via the dispatch-only integration workflow):

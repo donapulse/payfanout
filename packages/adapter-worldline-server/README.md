@@ -87,8 +87,8 @@ clock is an injectable `now()` seam. Every mutating call carries a signed, deter
   scenarios, we strongly recommend not building your business operations around it." So two
   events of one type on one payment id share an id, and a store keyed on it drops the second.
   On every verified refund-type delivery (`payment.refunded`, `payment.refund_failed`, and
-  `unknown` events whose `raw.type` starts with `refund.`), whether or not its id was already
-  seen, re-read: `retrievePayment` for `amountRefunded`, `retrieveRefund` for your refunds
+  `unknown` events whose lower-cased `raw.type` starts with `refund.`), whether or not its id
+  was already seen, re-read: `retrievePayment` for `amountRefunded`, `retrieveRefund` for your refunds
   still `pending` (both reads are idempotent). Also poll `retrieveRefund` until your refunds
   leave `pending`, reconcile captured payments with `retrievePayment` on a schedule, which
   catches operations made outside PayFanout (Worldline recommends a back-up GetPaymentDetails

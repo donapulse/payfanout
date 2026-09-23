@@ -201,7 +201,7 @@ the handler with the **raw body** (signature verification hashes the exact bytes
 ```ts
 import { createAdapterWebhookHandler } from "@payfanout/server";
 const worldlineHook = createAdapterWebhookHandler(worldline, {
-  onEvent: (event) => enqueue(event), // ack-fast: enqueue, dedupe by event.id; never process inline
+  onEvent: (event) => enqueue(event), // ack-fast: enqueue; run the refund re-read before deduping by event.id (below)
 });
 
 app.post("/webhooks/worldline", express.raw({ type: "application/json" }), async (req, res) => {
@@ -295,7 +295,8 @@ every other Worldline id, and the tail of `event.id`, as opaque.
 **Answer fast; Worldline retries failures.** The handler answers as soon as `onEvent`
 returns, which is why `onEvent` should only enqueue. A delivery that gets no 2xx is retried
 five times, 10 minutes, 1 hour, 2 hours, 8 hours, and 24 hours after the previous attempt,
-and every attempt carries a `retry-count` header: `0` on the first, rising with each retry.
+so the last retry comes 35 hours 10 minutes after the first attempt, and every attempt
+carries a `retry-count` header: `0` on the first, rising with each retry.
 
 **Rotating the webhook key.** In the portal, **Generate webhooks keys** creates a new pair and
 revokes the current one immediately, so deliveries fail verification until your server knows
@@ -313,8 +314,8 @@ only. Then:
    **Webhook ID** and **Webhook Secret Key**, and click **Confirm** without delay. The new
    pair has to be deployed first because the current one may already be revoked at the click.
 3. Remove the old pair once nothing it signed can still arrive: Worldline does not say
-   whether a retry is re-signed with the current key, and the retry schedule above spans
-   about 35 hours (remove it at once if the secret leaked).
+   whether a retry is re-signed with the current key, and retries run for 35 hours
+   10 minutes, so keep it for at least 36 hours (remove it at once if the secret leaked).
 
 If you let the portal generate the pair instead, add it to `webhookKeys` and deploy straight
 away; deliveries rejected in between are retried, the first after 10 minutes.

@@ -1417,12 +1417,43 @@ sandbox round-trip before production use, and the setup guide carries that warni
   notes, and requiring Checkout API v69 or later, which the pinned v72 satisfies); pinning
   the 6.0.0 that opened the major would ship a checkout a year of fixes behind. The adapter
   owns `showPayButton: false` and `onChange`, forwards everything else. 3-D Secure resolves
-  inline through an adapter-specific `handleAction(handle, action)` whose result is a second
-  clientToken (`{ details, paymentData }`) that `completePayment` sends to `/payments/details`
-  — the unified contract has no action step because most PSPs resolve challenges inside
-  `confirm()`. One challenge at a time per handle: a re-entrant `handleAction` is refused
-  with `invalid_request` instead of replacing the pending resolver, which would leave the
-  first caller's promise unsettled forever.
+  through an adapter-specific `handleAction(handle, action)` — inline when Adyen runs it
+  natively, by a redirect to Adyen otherwise — whose inline result is a second clientToken
+  (Adyen Web's `onAdditionalDetails` data, `{ details: { threeDSResult } }`) that
+  `completePayment` sends to `/payments/details` — the unified contract has no action step
+  because most PSPs resolve challenges inside `confirm()`. One challenge at a time per handle:
+  a re-entrant `handleAction` is refused with `invalid_request` instead of replacing the
+  pending resolver, which would leave the first caller's promise unsettled forever.
+  - **3-D Secure 2 completion (2026-09-23)**, doc-verified against Adyen's Checkout v72
+    OpenAPI spec, the native and redirect 3-D Secure guides and the Adyen Web 6.41.0 source;
+    still no sandbox pass. `confirm()` resolves `{ paymentMethod, browserInfo?, origin?,
+    billingAddress?, riskData? }` from Adyen Web's state. The server reads only those keys,
+    rebuilds `browserInfo` and `billingAddress` from their documented fields, keeps
+    `riskData.clientData` alone (`fraudOffset` would let the browser move its own fraud
+    score), refuses a non-`"scheme"` `paymentMethod` or unencrypted card fields without
+    echoing the token, and still completes the bare `paymentMethod` of earlier clients with
+    the old body. With `browserInfo` and a bare origin the payment requests native 3-D Secure
+    2 (`channel: "Web"`, `origin`, `nativeThreeDS: "preferred"`); an origin that is not the
+    page's bare origin of at most 80 characters is dropped rather than refused, which leaves
+    the payment to Adyen's redirect flow: Adyen documents that a wrong origin breaks the
+    native action, legitimate pages can report one (`"null"` in a sandboxed frame, a
+    hostname beyond 80 characters), and no money fact depends on it. An action answered
+    without a pspReference — Adyen's own 3-D Secure 2 web example — reads `requires_action`
+    with `pspPaymentId: ""`, which capture and refund refuse. Details finish whichever payment
+    they were issued for, so a `/payments/details` answer whose `merchantReference` or
+    `amount` differs from the signed context is refused as a non-retryable `invalid_request`
+    (the request carried another payment's details, the same class as a foreign session
+    token, and a replay answers the same); one omitting either reads `processing` until the
+    AUTHORISATION webhook, and Adyen's example details answer carries neither.
+    `returnUrl`/`defaultReturnUrl` are checked where they enter (absolute with a scheme, at
+    most 1024 characters, no `//` after the domain), `shopperEmail` falls back to
+    `billingDetails.email` and must be a plausible address of at most 256 characters, and no
+    `shopperIP` is sent because completion has none. The client shows and requires the
+    cardholder name, makes Enter a no-op (Adyen Web's default calls `submit()` without an
+    `onSubmit`), settles a pending `handleAction` as failed on `onError` (Adyen Web 6.41.0's
+    3-D Secure 2 elements report timeouts through `onAdditionalDetails` and call `onError`
+    only when they stop), refuses `confirm()` once `handleAction` replaced the Card, and
+    exports `adyenRedirectResultToken` for the redirect return page.
 
 ## Production audit scope: peer dependencies (2026-08-17)
 

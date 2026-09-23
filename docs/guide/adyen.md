@@ -203,6 +203,22 @@ const adyen = new AdyenClientAdapter({
   submission) and `onChange` (where the encrypted blob arrives). Everything else in
   `fieldOptions` passes through to Adyen untouched, and `appearance` becomes Adyen's `styles`
   object (`base`, `error`, `placeholder`, `validated`).
+- The cardholder name field is **shown and required by default** (`hasHolderName: true`,
+  `holderNameRequired: true`): Adyen's
+  [native 3-D Secure 2 guide](https://docs.adyen.com/online-payments/3d-secure/native-3ds2)
+  requires the name for Visa and JCB, and Adyen Web hides the field unless told otherwise.
+  Set both to `false` in `fieldOptions` to hide it.
+- Set `billingAddressRequired: true` in `fieldOptions` for better 3-D Secure 2 data: Adyen's
+  `/payments` reference lists the billing address as required for 3-D Secure 2 in browser
+  integrations (its 3-D Secure reference, as recommended), and the Card then includes it in
+  what the adapter forwards to your server.
+- The Card recognizes Mastercard, Visa and American Express (`['mc','visa','amex']`) unless
+  told otherwise, and the adapter does not load your account's payment-method list — pass
+  `brands` in `fieldOptions` to accept other brands
+  ([Card Component options](https://docs.adyen.com/payment-methods/cards/web-component)).
+- Pressing **Enter** in the fields does nothing by default. Adyen Web's own handler submits
+  the Card, which has no `onSubmit` to call here; pass `onEnterKeyPressed` in `fieldOptions`
+  to run your own pay action instead.
 - `sdkVersion` pins the Adyen Web build the adapter loads; override `sdkUrl` /
   `stylesheetUrl` to self-host.
 
@@ -219,43 +235,118 @@ connect-src https://*.adyen.com
 
 ## 6. 3-D Secure
 
-Pass a `returnUrl` on `createPaymentSession` (or rely on `defaultReturnUrl` — Adyen requires
-one on every payment either way). When Adyen answers with an `action`,
-`completePayment` reports `requires_action` and preserves the action on `PaymentInfo.raw`.
-A `threeDS2` action resolves **inline** — hand it back to the mounted fields and complete the
-payment with the resulting token:
+Adyen decides per payment whether 3-D Secure 2 runs **natively**, inside the mounted fields,
+or through a **redirect** to Adyen. The adapter asks for the native flow and supports both.
+
+`confirm()` resolves a JSON `clientToken` holding the `paymentMethod`, `browserInfo`,
+`origin`, `billingAddress` and `riskData` of Adyen Web's state. The server adapter reads those
+keys and nothing else — the signed session stays the only source of amount, currency,
+reference, merchant account and capture method — and refuses a `paymentMethod` that is not a
+card (`type: "scheme"`) or that carries unencrypted card fields. With `browserInfo` and the
+page's bare `origin` (scheme, host and port, no path, at most 80 characters), `/payments` carries
+what the [native 3-D Secure 2 guide](https://docs.adyen.com/online-payments/3d-secure/native-3ds2)
+requires on the web: `channel: "Web"`, `origin`, `browserInfo` and
+`authenticationData.threeDSRequestData.nativeThreeDS: "preferred"`. Any other `origin` is
+dropped and the payment left to the redirect flow, because Adyen documents that a missing or
+wrong origin breaks the native one. `shopperEmail` is the session's `receiptEmail`, or its
+`billingDetails.email` when there is none: pass one, since Adyen asks for `shopperIP` on Visa
+and JCB 3-D Secure 2 payments without an email, and the adapter has no shopper IP address to
+send.
+
+When Adyen answers with an action, `completePayment` reports `requires_action` with Adyen's
+answer on `PaymentInfo.raw` (`raw.action`). Adyen issues the `pspReference` only once the
+action is finished, so `pspPaymentId` is the empty string until then, which `capturePayment`
+and `refundPayment` refuse. Hand the action to `handleAction`: Adyen Web replaces the card
+fields with the fingerprint or challenge in the same element and resolves with a second
+`clientToken`, the `onAdditionalDetails` data `{ details: { threeDSResult } }`, which you
+complete exactly like the first; the server sends it to `/payments/details`. That answer can
+carry another action, so loop until it doesn't:
 
 ```tsx
-// Server: completePayment reported requires_action and returned the action to the browser.
-// Client: resolve it against the mounted fields, then complete again.
-const { mountedRef } = usePayFanout();
+import { createEndpointCompletion, usePayFanoutContext, type PayResult } from "@payfanout/react";
 
-async function resolveChallenge(action: Record<string, unknown>) {
-  const handle = mountedRef.current!.handle;
-  const next = await adyen.handleAction(handle, action);   // resolves the challenge in place
-  if (next.status !== "requires_confirmation") return next.error;
-  // next.clientToken carries { details, paymentData } — POST it to your completion
-  // route exactly like the first one; the server sends it to /payments/details.
-  await fetch("/api/complete", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ sessionRef: mountedRef.current!.sessionRef, clientToken: next.clientToken }),
-  });
+// Pass what <PayButton onResult> reports through finish() before showing the outcome.
+function useAdyenActions() {
+  const { mountedRef } = usePayFanoutContext();
+  return async function finish(result: PayResult): Promise<PayResult> {
+    let current = result;
+    while (current.status === "requires_action") {
+      const mounted = mountedRef.current;
+      const action = (current.info?.raw as { action?: Record<string, unknown> } | undefined)?.action;
+      if (!mounted || !action) return current;
+      // Inline for a threeDS2 action; a redirect action navigates to Adyen instead.
+      const next = await adyen.handleAction(mounted.handle, action);
+      if (next.status !== "requires_confirmation" || !next.clientToken) {
+        return { status: next.status, error: next.error };
+      }
+      try {
+        const info = await createEndpointCompletion("/api/complete", mounted.sessionRef)(next.clientToken);
+        current = { status: info.status, info };
+      } catch (error) {
+        return { status: "failed", error: error as PayResult["error"] };
+      }
+    }
+    return current;
+  };
 }
 ```
 
-`handleAction` is Adyen-specific (the unified contract has no action step, because most PSPs
-resolve challenges inside `confirm()`), and the second `completePayment` posts
-`/payments/details` instead of `/payments`. Routing both calls through one completion
-handler with one `idempotencyKey` is fine: the adapter scopes the key it sends to the
-endpoint, so the second call is not answered with the first one's stored response. One
-challenge runs at a time per mounted field set — calling `handleAction` again while one is
+`handleAction` is Adyen-specific: the unified contract has no action step, because most PSPs
+resolve challenges inside `confirm()`. One completion handler with one `idempotencyKey` is
+fine across a multi-step challenge: the adapter derives the key it sends from your key, the
+merchant account, the endpoint and, on `/payments/details`, the details themselves.
+
+A `/payments/details` answer finishes whichever payment the details were issued for, so the
+adapter reports it only once it belongs to the session. A `merchantReference` or `amount`
+that differs from the signed session is refused with `invalid_request`, not retryable. An
+answer that omits either reads `processing` rather than `succeeded` — Adyen's own example
+answer carries neither — and the `AUTHORISATION` webhook (§8) settles the payment.
+
+One challenge runs at a time per mounted field set: calling `handleAction` again while one is
 outstanding fails with `invalid_request` rather than abandoning the first caller's promise.
+Adyen Web's 3-D Secure 2 elements report timeouts through `onAdditionalDetails` and call
+`onError` only when they stop, so an error reported through `onError` meanwhile settles the
+pending promise as `failed`. Once `handleAction` has run, the card fields are gone:
+`confirm()` on that handle fails with `invalid_request`, so remount `<PaymentFields>` for
+another attempt, with a fresh `idempotencyKey` (§7).
+
+### Redirect fallback
+
+`nativeThreeDS: "preferred"` states a preference: Adyen can still choose its redirect flow,
+and does when the browser data is missing. The action is then `type: "redirect"`, and
+`handleAction` navigates the page to Adyen; its promise never settles. After authenticating,
+the shopper returns to the session's `returnUrl` with a URL-encoded `redirectResult`
+appended to your own query parameters
+([redirect 3-D Secure guide](https://docs.adyen.com/online-payments/3d-secure/redirect-3ds2/web-component)).
+Carry your order reference in that `returnUrl`; the return page turns the result into a
+`clientToken` with `adyenRedirectResultToken` and completes the payment as usual:
+
+```ts
+import { adyenRedirectResultToken } from "@payfanout/adapter-adyen";
+import { createEndpointCompletion } from "@payfanout/react";
+
+// https://your-shop.example/checkout/return?order=1234&redirectResult=…
+const params = new URLSearchParams(window.location.search);
+const redirectResult = params.get("redirectResult"); // already URL-decoded
+if (redirectResult) {
+  const sessionRef = await clientSecretForOrder(params.get("order")); // your storage: the clientSecret the fields were mounted with
+  const info = await createEndpointCompletion("/api/complete", sessionRef)(adyenRedirectResultToken(redirectResult));
+  showOutcome(info);
+}
+```
+
+The card method is embedded, so `<RedirectReturn>` does not pick this page up. The completion
+still runs against the signed session, within `sessionTtlSeconds` of `createPaymentSession`
+(one hour by default); after that it is refused with `session_expired`. Adyen goes on to
+authorise the payment once the shopper has authenticated, whether or not they return, so the
+`AUTHORISATION` webhook is where its outcome arrives either way.
 
 ## 7. The server-completion route
 
 When the client encrypts the card, the library POSTs the resulting `clientToken` (with the
-session reference) to your `completionEndpoint`, where you mount `createCompletionHandler`:
+session reference) to your `completionEndpoint`, where you mount `createCompletionHandler`;
+the 3-D Secure tokens of §6 go to the same route. Give each completion attempt of an order
+its own `idempotencyKey`, stable within that attempt:
 
 ```ts
 import { createCompletionHandler } from "@payfanout/server";
@@ -263,15 +354,22 @@ import { createCompletionHandler } from "@payfanout/server";
 // POST /api/complete
 const complete = createCompletionHandler({
   resolveSession: async (sessionRef) => {
-    const order = await db.orderByClientSecret(sessionRef); // your storage
-    return { service: payments, pspName: "adyen", pspSessionId: order.pspSessionId, idempotencyKey: `complete-${order.id}` };
+    // One record per attempt: another card on the same order gets a new session and key.
+    const attempt = await db.paymentAttemptByClientSecret(sessionRef); // your storage
+    return { service: payments, pspName: "adyen", pspSessionId: attempt.pspSessionId, idempotencyKey: `complete-${attempt.id}` };
   },
 });
 ```
 
 Under the hood it calls `completePayment`, which verifies the session signature and expiry,
-then creates the payment. Prefer to hand-write the route? Call `completePayment` directly,
-both forms are in [Server usage](/guide/server#server-completion-tokenize-first).
+then creates the payment, or finishes it through `/payments/details` for a 3-D Secure token.
+Adyen answers a key it has seen with its first answer for
+[7 to 14 days](https://docs.adyen.com/development-resources/api-idempotency), so a key
+reused after a refusal replays the refusal instead of charging the shopper's next card:
+start a new attempt, with a new session and key, when the shopper tries again. Within an
+attempt the key stays the same, so a retried POST is deduplicated at Adyen. Prefer to
+hand-write the route? Call `completePayment` directly, both forms are in
+[Server usage](/guide/server#server-completion-tokenize-first).
 
 ::: warning Store the whole `pspPaymentId`
 Adyen has no payment read, so a capture or refund cannot look the amount and currency up.

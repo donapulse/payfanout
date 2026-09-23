@@ -123,20 +123,72 @@ export class FakeWorldlineApi {
     }
     const order = (body["order"] ?? {}) as {
       amountOfMoney?: { amount?: number; currencyCode?: string };
-      references?: { merchantReference?: string };
+      references?: { merchantReference?: string; softDescriptor?: string };
+      customer?: { device?: unknown };
     };
     // hostedTokenizationId is a ROOT CreatePayment property on the real platform.
     const hostedTokenizationId = body["hostedTokenizationId"] as string | undefined;
     const card = (body["cardPaymentMethodSpecificInput"] ?? {}) as {
       authorizationMode?: string;
+      returnUrl?: string;
+      threeDSecure?: { redirectionData?: { returnUrl?: string } };
     };
     const amount = order.amountOfMoney?.amount ?? 0;
     const currencyCode = order.amountOfMoney?.currencyCode ?? "EUR";
-    if (!hostedTokenizationId) {
-      return json(400, {
-        errorId: "val",
-        errors: [{ code: "1", propertyName: "hostedTokenizationId", message: "required", httpStatusCode: 400 }],
-      });
+    const invalid = (propertyName: string, message: string): Response =>
+      json(400, { errorId: "val", errors: [{ code: "1", propertyName, message, httpStatusCode: 400 }] });
+    if (!hostedTokenizationId) return invalid("hostedTokenizationId", "required");
+    // Regression guard: the client adapter's clientToken envelope, forwarded
+    // whole as an earlier server adapter would, is not a hosted tokenization id.
+    if (hostedTokenizationId.startsWith("{")) return invalid("hostedTokenizationId", "unknown hosted tokenization");
+    // The 3-D Secure guide lists this among the properties every card payment
+    // must send, so the fake refuses a payment that omits it.
+    if (!card.threeDSecure?.redirectionData?.returnUrl) {
+      return invalid("cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl", "required");
+    }
+    // The API contract caps both return URL forms at 200 characters and rejects a URL without a protocol.
+    const returnUrls: Array<[string, string | undefined]> = [
+      ["cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl", card.threeDSecure.redirectionData.returnUrl],
+      ["cardPaymentMethodSpecificInput.returnUrl", card.returnUrl],
+    ];
+    for (const [propertyName, returnUrl] of returnUrls) {
+      if (returnUrl === undefined) continue;
+      if (returnUrl.length > 200) return invalid(propertyName, "exceeds 200 characters");
+      if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(returnUrl)) return invalid(propertyName, "must contain a protocol");
+    }
+    // The API contract caps orderReferences.merchantReference at 40 characters and softDescriptor at 256.
+    if ((order.references?.merchantReference?.length ?? 0) > 40) {
+      return invalid("order.references.merchantReference", "exceeds 40 characters");
+    }
+    if ((order.references?.softDescriptor?.length ?? 0) > 256) {
+      return invalid("order.references.softDescriptor", "exceeds 256 characters");
+    }
+    // The API contract's types and limits on customerDevice and its browserData.
+    const device = order.customer?.device;
+    if (device !== undefined) {
+      const isObject = (value: unknown): value is Record<string, unknown> =>
+        typeof value === "object" && value !== null && !Array.isArray(value);
+      const text = (maxLength: number) => (value: unknown) => typeof value === "string" && value.length <= maxLength;
+      const flag = (value: unknown) => typeof value === "boolean";
+      if (!isObject(device)) return invalid("order.customer.device", "must be an object");
+      const browserData = device["browserData"] === undefined ? {} : device["browserData"];
+      if (!isObject(browserData)) return invalid("order.customer.device.browserData", "must be an object");
+      const fields: Array<[string, unknown, (value: unknown) => boolean]> = [
+        ["acceptHeader", device["acceptHeader"], text(2048)],
+        ["ipAddress", device["ipAddress"], text(45)],
+        ["locale", device["locale"], text(35)],
+        ["timezoneOffsetUtcMinutes", device["timezoneOffsetUtcMinutes"], text(6)],
+        ["userAgent", device["userAgent"], text(2048)],
+        ["deviceFingerprint", device["deviceFingerprint"], text(1024)],
+        ["browserData.colorDepth", browserData["colorDepth"], (value) => typeof value === "number" && Number.isInteger(value) && value <= 99],
+        ["browserData.javaEnabled", browserData["javaEnabled"], flag],
+        ["browserData.javaScriptEnabled", browserData["javaScriptEnabled"], flag],
+        ["browserData.screenHeight", browserData["screenHeight"], text(6)],
+        ["browserData.screenWidth", browserData["screenWidth"], text(6)],
+      ];
+      for (const [field, value, valid] of fields) {
+        if (value !== undefined && !valid(value)) return invalid(`order.customer.device.${field}`, "outside the documented type or limit");
+      }
     }
     if (amount === DECLINE_AMOUNT) {
       // Documented decline shape: HTTP 402 with errors[] and paymentResult.

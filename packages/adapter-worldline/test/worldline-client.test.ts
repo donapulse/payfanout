@@ -80,14 +80,14 @@ describe("WorldlineClientAdapter", () => {
     });
     expect(container.children).toHaveLength(1);
     expect(ready).toBe(true);
-    expect(firstChange).toEqual({ complete: false, empty: true }); // initialize button state, degrade gracefully
+    expect(firstChange).toEqual({ complete: false, empty: true }); // the state before the first validity report
     expect(fake.initialized).toBe(1);
     const constructed = fake.constructed[0]!;
     expect(constructed.url).toBe(URL_SECRET);
     expect(constructed.containerId).toMatch(/^payfanout-wl-\d+$/);
   });
 
-  it("forwards fieldOptions to the Tokenizer config untouched", async () => {
+  it("passes a host fieldOptions value through to the Tokenizer config", async () => {
     stubBrowser();
     const { adapter, fake } = makeAdapter();
     await adapter.mount(fakeContainer(), { clientSecret: URL_SECRET, fieldOptions: { hideCardholderName: true } });
@@ -99,7 +99,7 @@ describe("WorldlineClientAdapter", () => {
     const { adapter } = makeAdapter();
     const handle = await adapter.mount(fakeContainer(), { clientSecret: URL_SECRET });
     const result = await adapter.confirm(handle);
-    expect(result).toEqual({ status: "requires_confirmation", clientToken: "htp_123" });
+    expect(result).toEqual({ status: "requires_confirmation", clientToken: '{"hostedTokenizationId":"htp_123"}' });
   });
 
   it("maps a failed/empty tokenization to a unified failure with raw preserved", async () => {

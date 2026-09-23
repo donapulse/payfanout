@@ -443,8 +443,11 @@ docs.direct.worldline-solutions.com unless noted):
   method / Content-Type (empty for GET) / `Date` / sorted canonical `x-gcs-*` header lines /
   resource path, each `\n`-terminated (trailing `\n` after the path). The `Date` header is
   sent and signed (RFC-1123 GMT); the clock is an injectable `now()` so tests are
-  deterministic and hosts stay inside the platform's 5-minute skew. `X-GCS-Date` is noted in
-  code as the edge-runtime alternative when the `Date` header cannot be set.
+  deterministic and hosts stay inside the platform's 5-minute skew. (Corrected 2026-09-23
+  against the manual-authentication guide: `x-gcs-date` is not documented as a replacement
+  for the `Date` header — the guide's examples send it alongside `Date`, signed as a
+  canonical `x-gcs-*` header — so the code no longer presents it as an edge-runtime
+  alternative.)
 - **Idempotency** rides `X-GCS-Idempotence-Key` (max 40 ASCII). Arbitrary caller keys are
   hashed to fit: `sha256Hex(idempotencyKey).slice(0,40)` — deterministic, so replays dedupe
   at Worldline. The header is BOTH signed (in the canonical block) and sent on every mutating
@@ -462,7 +465,16 @@ docs.direct.worldline-solutions.com unless noted):
   `clientSecret` is the `hostedTokenizationUrl` the browser iframe mounts from (no client
   key). The host id round-trips via `order.references.merchantReference` only — Worldline has
   no arbitrary metadata map — so conformance `money.expectations` is
-  `{ idRoundTrip: true, metadataEcho: false }`.
+  `{ idRoundTrip: true, metadataEcho: false }`. Doc-verified 2026-09-23 (Hosted Tokenization
+  Page guide and the served `tokenizer.min.js`): the browser `Tokenizer` hides the
+  cardholder-name field unless constructed with `hideCardholderName: false`, although the name
+  is mandatory, and calls `validationCallback` with `{ valid }` whenever the form's validity
+  changes, so the client adapter defaults `hideCardholderName` to `false` (a host
+  `fieldOptions` value still wins) and owns `validationCallback` to drive `onChange`, passing
+  each result on to a host-supplied one. The same guide also asks for `integrity` (the
+  CreateHostedTokenization response's `sri`) and `crossorigin="anonymous"` on the Tokenizer
+  script tag; not applied yet, because the browser receives only the hostedTokenizationUrl and
+  core's script injection sets neither attribute.
 - **CreatePayment wiring (corrected in review, 2026-07-15):** `hostedTokenizationId` rides
   at the ROOT of the CreatePayment request — the platform's current domain model declares it
   there and `CardPaymentMethodSpecificInput` has no such field (the guide's "replace the
@@ -470,6 +482,61 @@ docs.direct.worldline-solutions.com unless noted):
   Secure return URL is sent BOTH as `cardPaymentMethodSpecificInput.returnUrl` (the field
   the Hosted Tokenization guide names) and in its `threeDSecure.redirectionData.returnUrl`
   form — both are current in the models; sandbox-verify one challenge flow.
+  Extended 2026-09-23, doc-verified against the 3-D Secure implementation guide, the Hosted
+  Tokenization Page guide, the API contract (v2.507.0) and the Tokenizer script Worldline
+  serves: the 3-D Secure guide lists `threeDSecure.redirectionData.returnUrl`,
+  `threeDSecure.skipAuthentication` and the browser's `order.customer.device` data as
+  mandatory on every card CreatePayment, and the Hosted Tokenization guide requires at least
+  those. The list opens with `cardPaymentMethodSpecificInput.card.cardholderName`, which the
+  Hosted Tokenization Page collects in the iframe's name field; Worldline hides that field
+  unless the `Tokenizer` is constructed with `hideCardholderName: false` (Hosted Tokenization
+  guide, "Manage cardholder name"), so it has to stay visible. `confirm()` now returns a JSON
+  `clientToken`, `{"hostedTokenizationId","device"}`, whose `device` carries `locale`,
+  `timezoneOffsetUtcMinutes`, `userAgent` and `browserData` under the contract's names and
+  types (offset and screen size are strings; the guide's `ScreenWidth` is the contract's
+  `screenWidth`), each read guarded and left out when unavailable. Open question: `confirm()`
+  sends `javaScriptEnabled: true` even when a privacy-hardened browser withholds some of the
+  fields JavaScript reads, and whether Worldline then still requires them is undocumented
+  (the contract waives `colorDepth`, `javaEnabled`, `screenHeight`, `screenWidth` and
+  `timezoneOffsetUtcMinutes` only when `javaScriptEnabled` is `false`) — sandbox-check it. The
+  server decodes the envelope with `decodeWorldlineClientToken`, keeps only the fields a
+  browser can read, drops any off the contract's types and limits, and still accepts a bare
+  `hostedTokenizationId`: the contract also defines `acceptHeader` and `ipAddress` (taken
+  "from the HTTP Headers", so observed by the server) and `deviceFingerprint` (a session id
+  that "must match the one sent in the device fingerprint script"), and all three are refused
+  from the browser, as is any key the contract does not define. CreatePayment always sends
+  `threeDSecure.skipAuthentication: false` (the flat field is deprecated) and the return URL in
+  both forms, plus `challengeIndicator: "challenge-required"` for `sca.challenge: "force"`.
+  Worldline models MOTO as `cardPaymentMethodSpecificInput.transactionChannel` (`ECOMMERCE` by
+  default, or `MOTO`), not as an `exemptionRequest` value; the adapter does not map
+  `sca.exemption: "moto"` yet, so such a payment goes out as an e-commerce payment with
+  3-D Secure. The return URL became mandatory — the session's `returnUrl` or the new
+  `defaultReturnUrl`, refused before any call otherwise (a breaking change), as is a URL over
+  the contract's 200 characters or without a protocol (`https://`, or a custom `protocol://`
+  for mobile apps). `merchantReference` (max 40) and the statement descriptor (max 256) are
+  length-checked at session creation. The descriptor is now sent as `softDescriptor`:
+  `descriptor` is deprecated with `x-deprecated-by: merchantReconciliationReference`, and its
+  description recommends `merchantReconciliationReference` "for the same usage, and the new
+  softDescriptor on top only in case you start needing another specific value to be pushed to
+  the cardholder statement". `merchantReconciliationReference` is reconciliation data, passed
+  to the acquirer where it accepts it, while `statementDescriptor` is cardholder-statement
+  text, so `softDescriptor` stays its target (the contract advises 22 characters and
+  currently allows per-call overrides only for AIB and Barclays). The Tokenizer stores a
+  token permanently unless `submitTokenization` receives `storePermanently: false`, which
+  `confirm()` always passes (the adapter never vaults). The fake enforces the documented
+  limits the adapter relies on: it rejects a CreatePayment without the redirection return
+  URL, with either return URL over 200 characters or without a protocol, with a
+  `merchantReference` over 40 or a `softDescriptor` over 256 characters, or with an
+  `order.customer.device` field off the contract's types and limits; as a regression guard it
+  also rejects a `hostedTokenizationId` that starts with `{`, the envelope an earlier server
+  adapter would forward whole. Known gaps: `acceptHeader`, and
+  `ipAddress` (mandatory for Visa and Cartes Bancaires), are observed on the customer's HTTP
+  request, which neither `CompletePaymentInput` nor `createCompletionHandler` carries to the
+  adapter, so neither is sent; Cartes Bancaires also requires
+  `cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure.useCase`, which
+  the contract's `paymentProduct130SpecificThreeDSecure` spells `usecase`, so it is not sent
+  until a sandbox run settles the name. Sandbox-verify one challenge flow with device data
+  before production.
 - **Refund reads (corrected in review, 2026-07-15):** Direct has NO refund-by-id endpoint —
   `GET /{merchantId}/refunds/{refundId}` is Connect-era; the only read surface is
   `GET /v2/{merchantId}/payments/{paymentId}/refunds`. `refundPayment` therefore returns a

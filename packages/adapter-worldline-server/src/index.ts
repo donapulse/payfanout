@@ -24,6 +24,12 @@ export {
   type DecodeSessionContextOptions,
   type WorldlineSessionContextV1,
 } from "./session-context.js";
+export {
+  decodeWorldlineClientToken,
+  type WorldlineBrowserData,
+  type WorldlineClientToken,
+  type WorldlineCustomerDevice,
+} from "./client-token.js";
 export { worldlineOnboarding } from "./onboarding.js";
 export {
   parseWorldlineWebhookEvent,

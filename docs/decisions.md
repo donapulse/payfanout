@@ -1415,9 +1415,11 @@ description of what v2 changes is what the migration then had to implement.
   already handles `expired_card` and `incorrect_zip`; under any other type they fall through
   to that type's existing mapping. A sandbox run pinned to this version with the expired-card
   and lost-card test cards, recording `type`, `code`, `decline_code` and `message`, would
-  settle this point and the last one. Seeing `authentication_failure` needs a failed 3-D
-  Secure challenge instead, a browser step on Stripe's mock authentication page; its mapping
-  stays a sign-off decision either way.
+  show which codes those cards return on this version and, where a new code appears, its
+  `type` and `decline_code`. The integration suite pins an older version, so this needs a new
+  case, not a re-run. Seeing `authentication_failure` needs a failed 3-D Secure challenge
+  instead, a browser step on Stripe's mock authentication page; its mapping stays a sign-off
+  decision either way.
 - **`authentication_failure` is left unmapped (default, unconfirmed).** It falls through to
   `card_declined`. Its docs.stripe.com/error-codes entry states no remedy; the changelog
   presents it as the general form of `payment_intent_authentication_failure` and
@@ -1425,8 +1427,11 @@ description of what v2 changes is what the migration then had to implement.
   The Stripe browser adapter maps those two codes to `authentication_required`, as Worldline
   does `40001134` ("a failed 3-D Secure check") and Adyen `11` and `42`. Both candidates are
   non-retryable, so retries and the router cascade are unaffected; the choice decides which
-  code and message the host shows. Which way the Stripe server half should go is an open
-  decision; a unit test records the current fall-through so that a change is deliberate.
+  code and message the host shows. Stripe's 3-D Secure guide
+  (docs.stripe.com/payments/3d-secure/authentication-flow) gives both remedies after a failed
+  authentication: try a different payment method, or retry 3-D Secure by reconfirming. Which
+  way the Stripe server half should go is an open decision; a unit test records the current
+  fall-through so that a change is deliberate.
 - **`payment_method_restricted` stays `card_declined`.** Stripe's example is a card reported
   lost or stolen; the existing `restricted_card` decline code ("it's possible it was reported
   lost or stolen") already falls through to `card_declined`, and a `lost_card` or

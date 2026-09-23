@@ -16,8 +16,9 @@
  *     3-D Secure 2, a redirect action otherwise
  *   - POST /payments/details finishing the payment the details were issued for
  *     and answering with that payment's pspReference, resultCode,
- *     merchantReference and amount — details from another payment finish that
- *     other payment, as Adyen's own do
+ *     merchantReference and amount. The request names no payment (Adyen's
+ *     PaymentDetailsRequest has no reference or merchant account field), so
+ *     details from another payment finish that other payment
  *   - captures / cancels / refunds answering `{ status: "received" }` ONLY, each
  *     with its own pspReference — the outcome exists nowhere else until the
  *     webhook lands, which is what makes Adyen push-only

@@ -252,7 +252,8 @@ app.post("/api/session", async (req, res) => {
     /** "Save my card" consent — vault during checkout. */
     save?: boolean;
   };
-  const orderId = `order_${randomUUID()}`;
+  // The order id doubles as the PSP-side merchant reference; Worldline caps it at 40 characters.
+  const orderId = `order_${randomUUID().replace(/-/g, "")}`;
   try {
     // Stripe vaults during checkout (customer + savePaymentMethod on the
     // session); Paysafe vaults at completion time (see /api/complete).

@@ -54,12 +54,15 @@ export async function verifyWorldlineWebhookSignature(
  * terminal captures/refunds become success/refund outcomes; every non-terminal
  * payment state is `payment.processing`, and recognized-but-non-terminal refund
  * requests are deliberately NOT forced into a terminal refund type (see below).
+ * A rejection is only a failed payment when the payment itself was refused —
+ * mapEventType reads refused refunds, refused captures and refused
+ * cancellations (63/93) apart.
  */
 const EVENT_TYPE_MAP: Record<string, UnifiedWebhookEventType> = {
   "payment.captured": "payment.succeeded",
   "payment.refunded": "payment.refunded",
-  "payment.rejected": "payment.failed",
-  "payment.rejected_capture": "payment.failed",
+  "payment.rejected": "payment.failed", // unless its status code is a refused refund or a 63/93 (mapEventType)
+  // payment.rejected_capture is intentionally absent — see mapEventType.
   "payment.cancelled": "payment.canceled",
   "payment.redirected": "payment.requires_action",
   // Underway payment states — the terminal event follows later.
@@ -90,6 +93,7 @@ interface WorldlineWebhookResource {
   id?: string;
   paymentOutput?: { amountOfMoney?: WorldlineMoney };
   refundOutput?: { amountOfMoney?: WorldlineMoney };
+  statusOutput?: { statusCode?: number };
 }
 
 interface WorldlineWebhookBody {
@@ -100,6 +104,41 @@ interface WorldlineWebhookBody {
   refund?: WorldlineWebhookResource;
 }
 
+const TEST_EVENT_TYPE = "payment.test";
+
+/**
+ * Worldline documents only `payment.id` and `type` as identical across
+ * duplicate deliveries. Any other field, the envelope `id` or `operationOutput`
+ * included, may differ on a redelivery, so putting it in the key could let a
+ * duplicate past a host's dedupe store; the Adyen adapter keys on its
+ * documented pair alone for the same reason. The price is stated on the same
+ * page: "The payment.id can change after each maintenance operation following
+ * an incremental logic. However, as this is not the case in some specific
+ * scenarios, we strongly recommend not building your business operations
+ * around it." Two events of one type on one payment.id therefore share an id,
+ * which is why hosts re-read refunds on every refund-type delivery, whether or
+ * not its id was already seen. A refund resource stands in for a missing
+ * payment; half a pair falls back to the envelope id rather than merging
+ * distinct events. The envelope id also keys payment-link events (the link
+ * resource has no `id`, and its `paymentLinkId` repeats across a reusable
+ * link's payments) and test messages, which all carry the documented
+ * payment.id "9999_9".
+ */
+async function deriveEventId(body: WorldlineWebhookBody, rawType: string, rawBody: string): Promise<string> {
+  if (rawType !== "" && rawType !== TEST_EVENT_TYPE) {
+    const resourceId = nonEmptyString(body.payment?.id) ?? nonEmptyString(body.refund?.id);
+    if (resourceId !== undefined) return `worldline:${rawType}:${resourceId}`;
+  }
+  const envelopeId = nonEmptyString(body.id);
+  if (envelopeId !== undefined) return envelopeId;
+  // Nothing to key on: hash the exact raw bytes, stable across parses.
+  return `worldline_${await sha256Hex(rawBody)}`;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+
 /**
  * One event per delivery, but the envelope is ambiguous in the official
  * material: the webhooks page's example body is an ARRAY while the platform's
@@ -107,6 +146,11 @@ interface WorldlineWebhookBody {
  * accepted (a one-element array is unwrapped); a multi-event array is rejected
  * (invalid_request) rather than partially processed — silently dropping
  * trailing events is never acceptable.
+ *
+ * Event id: `worldline:<type>:<payment.id>` (or `refund.id` without a payment),
+ * the pair Worldline documents as identical across duplicates: two events of
+ * one type on one payment id share an id. `payment.test`, payment-link events
+ * and deliveries without the pair keep the envelope `id`, else a body hash.
  */
 export async function parseWorldlineWebhookEvent(rawBody: string): Promise<UnifiedWebhookEvent> {
   let parsed: unknown;
@@ -145,16 +189,20 @@ export async function parseWorldlineWebhookEvent(rawBody: string): Promise<Unifi
 
   const body = parsed as WorldlineWebhookBody;
   const rawType = (body.type ?? "").toLowerCase();
-  const type = mapEventType(rawType);
   const resource = body.payment ?? body.refund;
-  const money = resource?.paymentOutput?.amountOfMoney ?? resource?.refundOutput?.amountOfMoney;
+  const type = mapEventType(rawType, resource?.statusOutput?.statusCode);
+  // A refund failure carries the refund's money or none: a payment's
+  // amountOfMoney is what was paid, not what the refused refund asked back.
+  const money =
+    type === "payment.refund_failed"
+      ? resource?.refundOutput?.amountOfMoney
+      : (resource?.paymentOutput?.amountOfMoney ?? resource?.refundOutput?.amountOfMoney);
   const amount = money?.amount;
   const currency = money?.currencyCode;
   const isRefundResource = body.refund !== undefined || rawType.startsWith("refund.");
 
   return {
-    // Stable dedupe key even if Worldline omits an event id: hash of the exact raw bytes.
-    id: body.id ?? `worldline_${await sha256Hex(rawBody)}`,
+    id: await deriveEventId(body, rawType, rawBody),
     pspName: "worldline",
     ...(resource?.id ? { pspPaymentId: resource.id } : {}),
     type,
@@ -166,7 +214,19 @@ export async function parseWorldlineWebhookEvent(rawBody: string): Promise<Unifi
   };
 }
 
-function mapEventType(rawType: string): UnifiedWebhookEventType {
+function mapEventType(rawType: string, statusCode: number | undefined): UnifiedWebhookEventType {
+  // A refused cancellation (63) or capture (93) leaves the payment authorised
+  // whatever event type carries it, as mapWorldlineStatus reads the codes, so
+  // neither payment.failed nor payment.canceled would be honest.
+  if ((rawType === "payment.rejected" || rawType === "payment.cancelled") && (statusCode === 63 || statusCode === 93)) {
+    return "unknown";
+  }
+  // REJECTED covers "the authorisation/refund request" (Statuses reference):
+  // 73/83 are a refused deletion/refund, so the funds did not return and the
+  // payment stays captured — a refund failure, not a failed payment.
+  if (rawType === "payment.rejected" && (statusCode === 73 || statusCode === 83)) {
+    return "payment.refund_failed";
+  }
   const direct = EVENT_TYPE_MAP[rawType];
   if (direct) return direct;
   // Disputes surface as chargeback.* on Worldline.
@@ -175,6 +235,12 @@ function mapEventType(rawType: string): UnifiedWebhookEventType {
     if (rawType.includes("lost")) return "payment.chargeback_lost";
     return "payment.chargeback";
   }
+  // payment.rejected_capture is recognized but maps to "unknown": it reports a
+  // failed operation on a payment that stays authorised (statusCode 5) until
+  // the merchant acts again, capturing anew or cancelling. payment.failed would
+  // tell hosts the money is gone while the authorisation still holds it, and a
+  // success type would claim a capture that never happened. Hosts reconcile
+  // with retrievePayment, which reports requires_capture.
   // refund.refund_requested is recognized but NON-terminal: the unified
   // vocabulary has no in-flight refund state, and emitting payment.refunded
   // (funds returned) or payment.refund_failed here would fabricate a terminal

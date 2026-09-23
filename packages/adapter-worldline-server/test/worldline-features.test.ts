@@ -81,29 +81,94 @@ describe("mapWorldlineStatus", () => {
   const cases: Array<[string | undefined, number | undefined, string | undefined, UnifiedPaymentStatus]> = [
     ["CAPTURED", 9, "COMPLETED", "succeeded"],
     ["PENDING_CAPTURE", 5, "PENDING_MERCHANT", "requires_capture"],
+    ["PENDING_CAPTURE", 56, "PENDING_MERCHANT", "requires_capture"],
     // The PENDING_CONNECT_OR_3RD_PARTY band: only REDIRECTED is a customer action;
     // the async downstream members are processing.
     ["REDIRECTED", 46, "PENDING_CONNECT_OR_3RD_PARTY", "requires_action"],
     ["AUTHORIZATION_REQUESTED", undefined, "PENDING_CONNECT_OR_3RD_PARTY", "processing"],
+    ["AUTHORIZATION_REQUESTED", 50, "PENDING_CONNECT_OR_3RD_PARTY", "processing"],
     ["CAPTURE_REQUESTED", undefined, "PENDING_CONNECT_OR_3RD_PARTY", "processing"],
+    ["CAPTURE_REQUESTED", 91, "PENDING_CONNECT_OR_3RD_PARTY", "processing"],
     // CANCELLED sits in the UNSUCCESSFUL band but must map to canceled, not failed.
     ["CANCELLED", undefined, "UNSUCCESSFUL", "canceled"],
+    ["CANCELLED", 6, "UNSUCCESSFUL", "canceled"],
+    ["CANCELLED", 1, "UNSUCCESSFUL", "canceled"],
+    // 61/62: the cancellation still awaits the acquirer (CancelPayment answers it
+    // as PENDING_MERCHANT, GetPayment lists it under UNSUCCESSFUL).
+    ["CANCELLED", 61, "PENDING_MERCHANT", "processing"],
+    ["CANCELLED", 62, "PENDING_MERCHANT", "processing"],
+    ["CANCELLED", 61, "UNSUCCESSFUL", "processing"],
+    // A refused cancellation (63) or capture (93) leaves the authorisation standing,
+    // whatever string carries the code (the status enum has no CANCELLATION_REJECTED).
+    ["CANCELLATION_REJECTED", 63, "UNSUCCESSFUL", "requires_capture"],
+    ["CANCELLED", 63, "UNSUCCESSFUL", "requires_capture"],
+    ["REJECTED_CAPTURE", 93, "UNSUCCESSFUL", "requires_capture"],
     ["REJECTED", 2, "UNSUCCESSFUL", "failed"],
+    ["REJECTED", 57, "UNSUCCESSFUL", "failed"],
+    ["REJECTED", 59, "UNSUCCESSFUL", "failed"],
+    // A refused refund (83) or deletion (73) leaves the payment captured, even
+    // when the code arrives without the REJECTED string.
+    ["REJECTED", 83, "UNSUCCESSFUL", "succeeded"],
+    ["REJECTED", 73, "UNSUCCESSFUL", "succeeded"],
+    [undefined, 83, "UNSUCCESSFUL", "succeeded"],
+    [undefined, 73, "UNSUCCESSFUL", "succeeded"],
+    // A captured payment with a refund in flight, in both documented bands.
+    ["REFUND_REQUESTED", 81, "REVERSED", "succeeded"],
+    ["REFUND_REQUESTED", 82, "REVERSED", "succeeded"],
+    ["REFUND_REQUESTED", 81, "PENDING_CONNECT_OR_3RD_PARTY", "succeeded"],
+    ["REFUNDED", 8, "REVERSED", "succeeded"],
+    [undefined, undefined, "REVERSED", "succeeded"],
     ["CREATED", 0, "CREATED", "processing"],
     ["REFUNDED", undefined, "REFUNDED", "succeeded"],
     [undefined, undefined, "PENDING_PAYMENT", "processing"],
     // statusCode fallback when no category is present.
     [undefined, 9, undefined, "succeeded"],
     [undefined, 5, undefined, "requires_capture"],
+    [undefined, 56, undefined, "requires_capture"],
+    [undefined, 63, undefined, "requires_capture"],
+    [undefined, 93, undefined, "requires_capture"],
     [undefined, 2, undefined, "failed"],
+    [undefined, 57, undefined, "failed"],
+    [undefined, 59, undefined, "failed"],
     [undefined, 46, undefined, "requires_action"],
+    [undefined, 6, undefined, "canceled"],
+    [undefined, 1, undefined, "canceled"],
+    [undefined, 61, undefined, "processing"],
+    [undefined, 62, undefined, "processing"],
+    [undefined, 73, undefined, "succeeded"],
+    [undefined, 83, undefined, "succeeded"],
+    [undefined, 7, undefined, "succeeded"],
+    [undefined, 8, undefined, "succeeded"],
+    [undefined, 85, undefined, "succeeded"],
+    [undefined, 71, undefined, "succeeded"],
+    [undefined, 72, undefined, "succeeded"],
+    [undefined, 81, undefined, "succeeded"],
+    [undefined, 82, undefined, "succeeded"],
+    // A code with no fallback of its own stays processing.
+    [undefined, 91, undefined, "processing"],
     // status-string fallback.
-    ["REJECTED_CAPTURE", undefined, undefined, "failed"],
+    ["CAPTURED", undefined, undefined, "succeeded"],
+    ["REFUNDED", undefined, undefined, "succeeded"],
+    ["REDIRECTED", undefined, undefined, "requires_action"],
+    ["REJECTED", undefined, undefined, "failed"],
+    ["REJECTED_CAPTURE", undefined, undefined, "requires_capture"],
+    ["CANCELLATION_REJECTED", undefined, undefined, "requires_capture"],
+    ["REFUND_REQUESTED", undefined, undefined, "succeeded"],
     ["PENDING_CAPTURE", undefined, undefined, "requires_capture"],
     // CAPTURE_REQUESTED is async downstream, not a terminal success.
     ["CAPTURE_REQUESTED", undefined, undefined, "processing"],
     // genuinely unknown -> processing (never a fabricated terminal state).
     ["SOMETHING_NEW", undefined, undefined, "processing"],
+    // No status string: the cancellation codes decide before the UNSUCCESSFUL band.
+    [undefined, 1, "UNSUCCESSFUL", "canceled"],
+    [undefined, 6, "UNSUCCESSFUL", "canceled"],
+    [undefined, 61, "UNSUCCESSFUL", "processing"],
+    [undefined, 62, "UNSUCCESSFUL", "processing"],
+    // ...including under PENDING_MERCHANT, the band CancelPayment gives 61/62.
+    [undefined, 61, "PENDING_MERCHANT", "processing"],
+    // An unknown status string with no category reaches the code fallback.
+    ["SOMETHING_NEW", 6, undefined, "canceled"],
+    ["SOMETHING_NEW", 61, undefined, "processing"],
   ];
   for (const [status, code, category, expected] of cases) {
     it(`maps ${status ?? "-"}/${code ?? "-"}/${category ?? "-"} -> ${expected}`, () => {
@@ -158,7 +223,7 @@ describe("webhook parsing", () => {
     ["payment.captured", "payment.succeeded"],
     ["payment.paid", "payment.succeeded"],
     ["payment.rejected", "payment.failed"],
-    ["payment.rejected_capture", "payment.failed"],
+    ["payment.rejected_capture", "unknown"],
     ["payment.cancelled", "payment.canceled"],
     ["payment.redirected", "payment.requires_action"],
     ["payment.created", "payment.processing"],
@@ -177,7 +242,7 @@ describe("webhook parsing", () => {
     const event = await parseWorldlineWebhookEvent(
       JSON.stringify({ id: "e1", created: "2026-07-14T10:00:00Z", type: "payment.captured", payment: { id: "pay_9", ...money } }),
     );
-    expect(event).toMatchObject({ id: "e1", pspPaymentId: "pay_9", amount: 1099, currency: "EUR", type: "payment.succeeded" });
+    expect(event).toMatchObject({ id: "worldline:payment.captured:pay_9", pspPaymentId: "pay_9", amount: 1099, currency: "EUR", type: "payment.succeeded" });
     expect(event.occurredAt).toBe("2026-07-14T10:00:00.000Z");
   });
 
@@ -198,7 +263,7 @@ describe("webhook parsing", () => {
   });
 
   it("hashes a stable id when Worldline omits one", async () => {
-    const raw = JSON.stringify({ type: "payment.captured", payment: { id: "pay_1" } });
+    const raw = JSON.stringify({ type: "payment.captured", payment: { status: "CAPTURED" } });
     const first = await parseWorldlineWebhookEvent(raw);
     const second = await parseWorldlineWebhookEvent(raw);
     expect(first.id).toMatch(/^worldline_[0-9a-f]{64}$/);
@@ -209,7 +274,7 @@ describe("webhook parsing", () => {
     const event = await parseWorldlineWebhookEvent(
       JSON.stringify([{ id: "e9", created: "2026-07-14T10:00:00Z", type: "payment.captured", payment: { id: "pay_1", ...money } }]),
     );
-    expect(event).toMatchObject({ id: "e9", pspPaymentId: "pay_1", type: "payment.succeeded" });
+    expect(event).toMatchObject({ id: "worldline:payment.captured:pay_1", pspPaymentId: "pay_1", type: "payment.succeeded" });
   });
 
   it("throws invalid_request on a multi-event array, empty array, unparseable, or non-object payload", async () => {

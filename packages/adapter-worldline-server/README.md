@@ -39,6 +39,8 @@ const worldline = new WorldlineServerAdapter({
   webhookKeys: [
     { keyId: process.env.WORLDLINE_WEBHOOKS_KEY_ID!, secretKey: process.env.WORLDLINE_WEBHOOKS_SECRET_KEY! },
   ], // one key, or several during rotation — any active key verifying wins
+  // Worldline requires a 3-D Secure return URL on every card payment; sessions may override it.
+  defaultReturnUrl: "https://your-shop.example/checkout/return",
 });
 
 const payments = new PaymentService({ adapters: [worldline] });
@@ -70,6 +72,61 @@ sent and signed (RFC-1123 GMT); Worldline rejects timestamps older than five min
 clock is an injectable `now()` seam. Every mutating call carries a signed, deterministic
 `X-GCS-Idempotence-Key` derived from the caller's `idempotencyKey`.
 
+## 3-D Secure
+
+Worldline lists a set of 3-D Secure properties as mandatory on every card payment, and the
+Hosted Tokenization Page requires at least those. Every CreatePayment the adapter sends
+carries the ones it can supply:
+
+- **The return URL, in both documented forms** — `cardPaymentMethodSpecificInput.returnUrl`
+  and `cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl`. It is required:
+  pass `returnUrl` per session or set `defaultReturnUrl` once, absolute, with a scheme such as
+  `https://` or an app scheme, at most 200 characters; a session with neither, or with a URL
+  that breaks those rules, is refused with `invalid_request` before any call to Worldline. An
+  empty `returnUrl` counts as none. **Set `defaultReturnUrl` before upgrading** from a release
+  that did not require a return URL: sessions that release created without their own
+  `returnUrl` carry none, and completing them is otherwise refused.
+- **`threeDSecure.skipAuthentication: false`**, never the deprecated flat
+  `cardPaymentMethodSpecificInput.skipAuthentication`.
+- **The browser's device data** as `order.customer.device`. The client adapter's `confirm()`
+  sends it with the `hostedTokenizationId` as a JSON `clientToken`,
+  `{"hostedTokenizationId":"…","device":{…}}`, which `decodeWorldlineClientToken` reads back.
+  Only the fields a browser can read are kept — `locale`, `timezoneOffsetUtcMinutes`,
+  `userAgent` and `browserData` — and each is checked against Worldline's documented types and
+  lengths; one that fails is dropped rather than failing the payment. `acceptHeader` and
+  `ipAddress` (request headers your server observes) and `deviceFingerprint` (bound to a
+  device-fingerprinting session) are defined by Worldline but refused from the browser, as is
+  any key Worldline does not define. A bare `hostedTokenizationId` is still accepted and sends
+  no device data.
+- **`challengeIndicator: "challenge-required"`** when the session passes
+  `sca: { challenge: "force" }`.
+- **A contact detail for Visa**, which Worldline also requires: the adapter sends
+  `order.customer.contactDetails.emailAddress` from the session's `receiptEmail` or
+  `billingDetails.email`, so pass one of them.
+
+The rest of the list does not come from this adapter:
+
+- **The cardholder name** (`cardPaymentMethodSpecificInput.card.cardholderName`) is collected
+  in the Hosted Tokenization iframe's name field, which Worldline hides unless the `Tokenizer`
+  receives `hideCardholderName: false`; keep that field visible (see
+  [`@payfanout/adapter-worldline`](../adapter-worldline)).
+- **`order.customer.device.acceptHeader`** and, for Visa and Cartes Bancaires,
+  **`order.customer.device.ipAddress`** come from the customer's HTTP request to your server,
+  not from the browser, and neither `CompletePaymentInput` nor `createCompletionHandler`
+  carries them to the adapter today, so the adapter cannot send them.
+- **`cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure.useCase`**,
+  which Cartes Bancaires additionally requires, is not sent: Worldline's API contract spells
+  the property `usecase`, so the adapter leaves it out until a sandbox run settles the name.
+
+`sca: { exemption: "moto" }` is not mapped yet. Worldline models MOTO as
+`cardPaymentMethodSpecificInput.transactionChannel: "MOTO"`, not as an exemption, so such a
+payment goes out as an e-commerce payment with 3-D Secure.
+
+Session creation also refuses, with `invalid_request` and before any call to Worldline, an
+`id` longer than 40 characters (it travels as `order.references.merchantReference`) and a
+`statementDescriptor` longer than 256 characters. The descriptor is sent as
+`order.references.softDescriptor`, not the deprecated `descriptor`.
+
 ## What's inside
 
 - **`WorldlineServerAdapter`**, the full server contract (create session / complete /
@@ -78,6 +135,28 @@ clock is an injectable `now()` seam. Every mutating call carries a signed, deter
   operating on the **raw request bytes** and emitting a normalized `UnifiedWebhookEvent`. One
   event per delivery; a single-event array wrapper is unwrapped, and a multi-event batch is
   rejected rather than partially processed.
+  The event `id` is `worldline:<type>:<payment id>` (the refund's id when there is no
+  payment), built only from the pair Worldline documents as identical across duplicate
+  deliveries, since any other field may differ on a redelivery and let a duplicate through.
+  Payment-link events, `payment.test` messages and deliveries without the pair keep the
+  envelope id. Worldline also warns: "The payment.id can change after each maintenance
+  operation following an incremental logic. However, as this is not the case in some specific
+  scenarios, we strongly recommend not building your business operations around it." So two
+  events of one type on one payment id share an id, and a store keyed on it drops the second.
+  On every verified refund-type delivery (`payment.refunded`, `payment.refund_failed`, and
+  `unknown` events whose lower-cased `raw.type` starts with `refund.`), whether or not its id
+  was already seen, re-read: `retrievePayment` for `amountRefunded`, `retrieveRefund` for your refunds
+  still `pending` (both reads are idempotent). Also poll `retrieveRefund` until your refunds
+  leave `pending`, reconcile captured payments with `retrievePayment` on a schedule, which
+  catches operations made outside PayFanout (Worldline recommends a back-up GetPaymentDetails
+  check), and never sum `event.amount` across refund events. Events after a maintenance
+  operation (capture, refund, possibly cancellation) can report the operation's id as
+  `pspPaymentId`. Correlation routes each cover part of them: `merchantReference`, sent only
+  when `createPaymentSession` gets an `id`, shown echoed on sale events only and unverified on
+  maintenance events; the refund id, the suffix of the composite `refundId` (below), for
+  refunds made through `refundPayment` only; and `retrievePayment` with the original
+  `pspPaymentId`. Parse no other id. Details:
+  [Set up Worldline](https://donapulse.github.io/payfanout/guide/worldline), step 8.
 - **`mapWorldlineError`**, unifies Worldline errors into `PayFanoutError` (business rejections
   are never replayed), and **`WORLDLINE_PSP_NAME`**.
 - **`buildV1HmacAuthorization`**, the request signer, exported for testing.
@@ -94,6 +173,30 @@ clock is an injectable `now()` seam. Every mutating call carries a signed, deter
   missed-webhook recovery falls back to `retrievePayment` per order.
 - Card vaulting, zero-amount verification, session update, and listing are out of scope for
   this version (declared `false`).
+- A capture or cancellation the acquirer refuses leaves the payment authorised: it reads
+  `requires_capture` and the authorisation stays in `amountCapturable`, ready to capture or
+  cancel again. `capturePayment` reports the refusal only when Worldline answers it
+  synchronously; Worldline documents a capture as `CAPTURE_REQUESTED` (status code 91) first,
+  so the call usually resolves `processing` and the refusal (93) surfaces later, through
+  `retrievePayment` or the `payment.rejected_capture` webhook, which parses as `unknown`.
+- A refused capture can also leave an automatic-capture payment at `requires_capture`.
+  `usePaymentStatus` from `@payfanout/react` does not treat that status as final and keeps
+  polling, so stop it (`enabled: false`) when it arrives.
+- `cancelPayment` resolves `processing` while the acquirer has not confirmed the cancellation
+  (status codes 61/62); the `payment.cancelled` webhook, documented for status code 6, or a
+  later `retrievePayment` settles it. Cancelling a payment Worldline reports as closed
+  (already captured, for example) rejects with a non-retryable `invalid_request`, and
+  repeating a cancellation that already took effect answers `canceled`. A 409 that persists
+  while the payment is still cancellable stays a retryable `processing_error`, since an
+  original under the same key may still be in flight; retry with the same `idempotencyKey`.
+- A refund the acquirer refuses leaves the payment `succeeded`: `retrieveRefund` reports the
+  refund `failed` and it stays out of `amountRefunded`. Its `payment.rejected` webhook,
+  carrying status code 73 or 83, arrives as `payment.refund_failed`; that reading follows
+  Worldline's Statuses reference and is not yet sandbox-verified.
+- Worldline documents the CapturePayment amount in cents with two assumed decimals, so a
+  partial capture in a currency without two decimals (JPY, BHD, …) is refused with
+  `invalid_request` and no capture request is sent. Capture the full authorised amount (it
+  is sent without an amount) or cancel instead.
 
 ## Documentation
 

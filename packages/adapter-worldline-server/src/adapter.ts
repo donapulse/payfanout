@@ -1,6 +1,7 @@
 import {
   assertMinorUnitAmount,
   classifyHttpFallback,
+  getCurrencyExponent,
   getUserMessage,
   isPayFanoutError,
   isTransportRetryable,
@@ -28,6 +29,7 @@ import {
   type UnifiedWebhookEvent,
   type VerifyCredentialsResult,
 } from "@payfanout/core";
+import { decodeWorldlineClientToken, type WorldlineCustomerDevice } from "./client-token.js";
 import { buildV1HmacAuthorization, deriveIdempotenceKey } from "./signing.js";
 import {
   decodeSessionContext,
@@ -54,6 +56,18 @@ export interface WorldlineServerAdapterConfig {
    * live -> payment.direct.worldline-solutions.com.
    */
   environment: "sandbox" | "live";
+  /**
+   * Where Worldline sends the customer back after a 3-D Secure challenge, used
+   * when a session carries no `returnUrl` or an empty one. Worldline lists
+   * `threeDSecure.redirectionData.returnUrl` among the mandatory 3-D Secure
+   * properties of every card payment, so with neither, createPaymentSession is
+   * refused before anything reaches Worldline. Set it before upgrading from a
+   * release that did not require a return URL: sessions that release created
+   * without one are otherwise refused at completePayment. Like a session's own
+   * URL it must be absolute, with a protocol, and at most 200 characters; the
+   * constructor refuses one that is not.
+   */
+  defaultReturnUrl?: string;
   /** HMAC key for the stateless signed session context (see session-context.ts). */
   sessionSigningKey: string;
   /**
@@ -200,6 +214,9 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     ) {
       throw PayFanoutError.invalidRequest("WorldlineServerAdapter config.maxNetworkRetries must be an integer >= 0");
     }
+    // A malformed default would fail every session that relies on it, so it is
+    // refused at startup rather than at checkout.
+    if (config.defaultReturnUrl) assertReturnUrlFormat(config.defaultReturnUrl);
     this.config = config;
     this.baseUrl =
       config.baseUrl ??
@@ -244,10 +261,20 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
 
   /**
    * Creates the Hosted Tokenization session (POST /hostedtokenizations — no
-   * amount at this step) and encodes amount/currency/capture-method and the
-   * returned hostedTokenizationId into a signed, self-contained context that
-   * completePayment later verifies and trusts. The client mounts the iframe
-   * from the returned hostedTokenizationUrl (the session's clientSecret).
+   * amount at this step) and encodes amount/currency/capture-method, the return
+   * URL, the SCA preference and the returned hostedTokenizationId into a
+   * signed, self-contained context that completePayment later verifies and
+   * trusts. The client mounts the iframe from the returned
+   * hostedTokenizationUrl (the session's clientSecret).
+   *
+   * Refused with invalid_request before anything reaches Worldline when the
+   * session has no return URL (neither a non-empty `returnUrl` nor the
+   * adapter's `defaultReturnUrl`) or one Worldline rejects (over 200
+   * characters, or without a protocol such as `https://` or an app scheme),
+   * when `id` is longer than the 40 characters
+   * `order.references.merchantReference` accepts, or when
+   * `statementDescriptor` is longer than the 256 characters
+   * `order.references.softDescriptor` accepts.
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertMinorUnitAmount(input.amount, "amount");
@@ -257,6 +284,11 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
         `Worldline adapter does not support one of the requested payment method types: ${input.paymentMethodTypes.join(", ")}`,
       );
     }
+    // || rather than ??: an empty returnUrl means none, so the default applies.
+    const returnUrl = input.returnUrl || this.config.defaultReturnUrl;
+    if (!returnUrl) throw missingReturnUrl();
+    assertReturnUrlFormat(returnUrl);
+    assertReferenceLimits(input);
     // CreateHostedTokenization is not on Worldline's documented idempotent
     // operations: the key is sent (harmless) but never relied on for dedupe.
     // Tokenization is amountless — money-side safety comes from CreatePayment
@@ -274,12 +306,13 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       captureMethod: input.captureMethod ?? "automatic",
       hostedTokenizationId: tokenization.hostedTokenizationId,
       expiresAt: this.now() + this.sessionTtlMs(),
-      returnUrl: input.returnUrl,
+      returnUrl,
       id: input.id,
       billingDetails: input.billingDetails,
       statementDescriptor: input.statementDescriptor,
       receiptEmail: input.receiptEmail,
       shippingDetails: input.shippingDetails,
+      sca: input.sca,
     };
     const token = await encodeSessionContext(context, this.config.sessionSigningKey);
     return {
@@ -295,25 +328,43 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
   }
 
   /**
-   * Tokenize-first completion: create the payment from the browser's
-   * hostedTokenizationId. The signed context is the only trusted source of
-   * amount/currency/capture-method. A REDIRECT merchantAction (3-D Secure
-   * challenge) surfaces as requires_action with the redirect URL on `raw`; the
-   * customer completes it and the host reconciles with retrievePayment.
+   * Tokenize-first completion: create the payment from the clientToken
+   * confirm() produced, the hostedTokenizationId plus the browser's device data
+   * (see decodeWorldlineClientToken; a bare hostedTokenizationId is accepted
+   * too). The signed context is the only trusted source of
+   * amount/currency/capture-method.
+   *
+   * Every payment carries the mandatory 3-D Secure properties the adapter can
+   * supply: the return URL in both documented forms,
+   * `threeDSecure.skipAuthentication: false`, and the device data as
+   * `order.customer.device`. `acceptHeader` and `ipAddress` are observed on the
+   * customer's HTTP request and CompletePaymentInput carries neither, so they
+   * are not sent; nor is the Cartes Bancaires `useCase`, which the API
+   * contract spells `usecase`. The cardholder name is entered in the Hosted
+   * Tokenization iframe. `sca.challenge: "force"` requests
+   * `challengeIndicator: "challenge-required"`. `sca.exemption: "moto"` is not
+   * mapped yet: Worldline models MOTO as `transactionChannel: "MOTO"`, not as
+   * an exemption, so such a payment goes out as an e-commerce payment with
+   * 3-D Secure.
+   *
+   * A REDIRECT merchantAction (3-D Secure challenge) surfaces as
+   * requires_action with the redirect URL on `raw`; the customer completes it
+   * and the host reconciles with retrievePayment.
    */
   async completePayment(input: CompletePaymentInput): Promise<PaymentInfo> {
-    if (!input.clientToken) {
-      throw PayFanoutError.invalidRequest(
-        "completePayment requires the clientToken (hostedTokenizationId) produced by confirm()",
-        { clientToken: input.clientToken },
-      );
-    }
+    const token = decodeWorldlineClientToken(input.clientToken);
     const context = await this.decodeContext(input.pspSessionId);
+    // Contexts signed before the return URL became mandatory may lack one, or
+    // carry an empty one, which counts as none.
+    const returnUrl = context.returnUrl || this.config.defaultReturnUrl;
+    if (!returnUrl) throw missingReturnUrl();
     const billing = mergeBillingDetails(context.billingDetails, input.billingDetails);
     const email = context.receiptEmail ?? billing?.email;
     const references: Record<string, string> = {
       ...(context.id ? { merchantReference: context.id } : {}),
-      ...(context.statementDescriptor ? { descriptor: context.statementDescriptor } : {}),
+      // descriptor is deprecated in favor of merchantReconciliationReference, a
+      // reconciliation field; softDescriptor is the cardholder-statement text.
+      ...(context.statementDescriptor ? { softDescriptor: context.statementDescriptor } : {}),
     };
     const created = await this.request<WorldlineCreatePaymentResponse>(
       "POST",
@@ -322,22 +373,24 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
         order: {
           amountOfMoney: { amount: context.amount, currencyCode: context.currency },
           ...(Object.keys(references).length > 0 ? { references } : {}),
-          ...(toWorldlineCustomer(billing, email) ?? {}),
+          ...(toWorldlineCustomer(billing, email, token.device) ?? {}),
           ...(toWorldlineShipping(context.shippingDetails) ?? {}),
         },
         // hostedTokenizationId rides at the ROOT of CreatePayment — it replaces
         // the card-data source; cardPaymentMethodSpecificInput has no such field.
-        hostedTokenizationId: input.clientToken,
+        hostedTokenizationId: token.hostedTokenizationId,
         cardPaymentMethodSpecificInput: {
           authorizationMode: context.captureMethod === "manual" ? "PRE_AUTHORIZATION" : "SALE",
-          // The hosted-tokenization guide names the flattened returnUrl; the
-          // domain model also carries the threeDSecure form — send both.
-          ...(context.returnUrl
-            ? {
-                returnUrl: context.returnUrl,
-                threeDSecure: { redirectionData: { returnUrl: context.returnUrl } },
-              }
-            : {}),
+          // The Hosted Tokenization guide names the flat returnUrl; the 3-D Secure
+          // guide lists the redirectionData form as mandatory — send both.
+          returnUrl,
+          threeDSecure: {
+            // Only here: the flat cardPaymentMethodSpecificInput.skipAuthentication
+            // is deprecated in favor of this one.
+            skipAuthentication: false,
+            redirectionData: { returnUrl },
+            ...(context.sca?.challenge === "force" ? { challengeIndicator: "challenge-required" } : {}),
+          },
         },
       },
       input.idempotencyKey,
@@ -412,11 +465,12 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     idempotencyKey: string,
   ): Promise<PaymentInfo> {
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
+    const partialAmount = amount === undefined ? undefined : await this.partialCaptureAmount(pspPaymentId, amount);
     await this.request(
       "POST",
       `/v2/${this.merchantPath()}/payments/${encodeURIComponent(pspPaymentId)}/capture`,
       {
-        ...(amount !== undefined ? { amount } : {}),
+        ...(partialAmount !== undefined ? { amount: partialAmount } : {}),
         // Always finalize: a partial capture settles that amount and releases the
         // uncaptured remainder (a bare capture takes the full remaining amount).
         // Worldline only accepts referenced refunds once the capture is finalized,
@@ -428,13 +482,66 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     return this.retrievePayment(pspPaymentId);
   }
 
-  async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
-    await this.request(
-      "POST",
-      `/v2/${this.merchantPath()}/payments/${encodeURIComponent(pspPaymentId)}/cancel`,
-      {},
-      idempotencyKey,
+  /**
+   * The amount to put on CapturePayment, or undefined for a full capture. Every
+   * amountOfMoney field is in the currency's smallest unit, but the capture
+   * `amount` is documented "in cents, where single digit currencies are presumed
+   * to have 2 digits", which leaves its unit open wherever the ISO 4217 exponent
+   * is not 2. Capturing the whole authorised amount sends no amount at all, so
+   * the question never arises; a partial capture in such a currency is refused
+   * before any capture call.
+   */
+  private async partialCaptureAmount(
+    pspPaymentId: string,
+    amount: MinorUnitAmount,
+  ): Promise<MinorUnitAmount | undefined> {
+    const authorized = (await this.fetchPayment(pspPaymentId)).paymentOutput?.amountOfMoney;
+    if (amount === authorized?.amount) return undefined;
+    const currency = authorized?.currencyCode;
+    if (currency && getCurrencyExponent(currency) === 2) return amount;
+    throw PayFanoutError.invalidRequest(
+      "Worldline documents CapturePayment amounts in cents with two assumed decimals, so a partial capture in " +
+        `${currency || "an unreported currency"} is refused rather than risk capturing the wrong amount; capture in full or cancel`,
+      { pspPaymentId, amount, authorized },
     );
+  }
+
+  async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
+    try {
+      await this.request(
+        "POST",
+        `/v2/${this.merchantPath()}/payments/${encodeURIComponent(pspPaymentId)}/cancel`,
+        {},
+        idempotencyKey,
+      );
+    } catch (err) {
+      // A 409 that outlives the retries is still one of two answers: "the
+      // request is currently being processed" (idempotent-requests guide), for
+      // an original under this key still in flight, another worker's for
+      // instance, or "Cancellation is not allowed because payment is closed"
+      // (API contract). Only the payment tells them apart. A payment that reads
+      // canceled, or processing while its cancellation awaits the acquirer
+      // (CANCELLED, or codes 61/62 without a status string), is the answer. A
+      // payment Worldline still reports cancellable may yet see the original
+      // land, and a replay under this key answers the original's outcome, so
+      // the retryable error stands. Anything else is closed, and no retry will
+      // open it.
+      if (!isIdempotenceReplayInFlight(err)) throw err;
+      const info = await this.retrievePayment(pspPaymentId);
+      const payment = info.raw as WorldlinePaymentLike; // retrievePayment carries the payment object on raw
+      const code = payment.statusOutput?.statusCode;
+      const statusString = (payment.status ?? "").toUpperCase();
+      const cancelling = statusString === "CANCELLED" || (statusString === "" && (code === 61 || code === 62));
+      if (info.status === "canceled" || (info.status === "processing" && cancelling)) return info;
+      if (payment.statusOutput?.isCancellable ?? info.status === "requires_capture") throw err;
+      throw new PayFanoutError({
+        code: "invalid_request",
+        message: getUserMessage("invalid_request"),
+        retryable: false,
+        raw: err.raw,
+        pspName: this.pspName,
+      });
+    }
     return this.retrievePayment(pspPaymentId);
   }
 
@@ -458,7 +565,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       // composite through the per-payment list. The part after the last ":" is
       // Worldline's own refund id, the one webhooks report.
       refundId: `${req.pspPaymentId}:${refund.id}`,
-      status: mapRefundStatus(refund.status, refund.statusOutput?.statusCategory),
+      status: mapRefundStatus(refund),
       amount: refund.refundOutput?.amountOfMoney?.amount ?? amount,
       raw: refund,
     };
@@ -490,7 +597,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     }
     return {
       refundId,
-      status: mapRefundStatus(refund.status, refund.statusOutput?.statusCategory),
+      status: mapRefundStatus(refund),
       amount: refund.refundOutput?.amountOfMoney?.amount ?? 0,
       pspPaymentId,
       raw: refund,
@@ -546,7 +653,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       `/v2/${this.merchantPath()}/payments/${encodeURIComponent(pspPaymentId)}/captures`,
     );
     return (result.captures ?? [])
-      .filter((c) => !isFailedStatus(c.status, c.statusOutput?.statusCategory))
+      .filter((c) => !isFailedStatus(c))
       .reduce((sum, c) => sum + (c.captureOutput?.amountOfMoney?.amount ?? 0), 0);
   }
 
@@ -556,7 +663,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       `/v2/${this.merchantPath()}/payments/${encodeURIComponent(pspPaymentId)}/refunds`,
     );
     return (result.refunds ?? [])
-      .filter((r) => !isFailedStatus(r.status, r.statusOutput?.statusCategory))
+      .filter((r) => !isFailedStatus(r))
       .reduce((sum, r) => sum + (r.refundOutput?.amountOfMoney?.amount ?? 0), 0);
   }
 
@@ -661,9 +768,9 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       ...(hasBody ? { contentType: "application/json" } : {}),
       gcsHeaders,
     });
-    // The Date header is sent AND signed. A target edge runtime that forbids
-    // setting `Date` can switch to Worldline's X-GCS-Date signed header instead
-    // (see signing.ts); the documented Date-header form is used here.
+    // The Date header is sent AND signed and is the only timestamp: the optional
+    // x-gcs-date from Worldline's manual-authentication examples is not sent
+    // (see signing.ts).
     const headers: Record<string, string> = { authorization, date };
     if (hasBody) headers["content-type"] = "application/json";
     for (const [key, value] of Object.entries(gcsHeaders)) headers[key] = value;
@@ -759,18 +866,49 @@ function parseExpiry(expiryDate: string | undefined): { month?: number; year?: n
   return { ...(month >= 1 && month <= 12 ? { month } : {}), year };
 }
 
-function isFailedStatus(status: string | undefined, category: string | undefined): boolean {
-  const s = (status ?? "").toUpperCase();
-  const cat = (category ?? "").toUpperCase();
-  return cat === "UNSUCCESSFUL" || s === "REJECTED" || s === "REJECTED_CAPTURE" || s === "CANCELLED";
+/** The status fields a Worldline payment, capture or refund object may carry. */
+interface WorldlineStatusFields {
+  status?: string;
+  statusOutput?: { statusCode?: number; statusCategory?: string };
 }
 
 /**
- * Maps a Worldline payment onto the unified status. Primary signal is
- * statusOutput.statusCategory (Worldline's forward-compatible band — new
- * statuses join an existing category), with statusCode and the status string as
- * fallbacks. CANCELLED is checked first so a voided authorization is never read
- * as a failure.
+ * True for a capture or refund that moved no money, so it stays out of the
+ * captured/refunded totals. A capture's statusOutput carries only a statusCode
+ * (93 = the acquirer refused the capture); a refund's also carries a category,
+ * and 73/83 are a refused deletion/refund.
+ */
+function isFailedStatus(operation: WorldlineStatusFields): boolean {
+  const s = (operation.status ?? "").toUpperCase();
+  const cat = (operation.statusOutput?.statusCategory ?? "").toUpperCase();
+  const code = operation.statusOutput?.statusCode;
+  return (
+    cat === "UNSUCCESSFUL" ||
+    s === "REJECTED" ||
+    s === "REJECTED_CAPTURE" ||
+    s === "CANCELLED" ||
+    code === 73 ||
+    code === 83 ||
+    code === 93
+  );
+}
+
+/**
+ * Maps a Worldline payment onto the unified status, per Worldline's Statuses
+ * reference. The codes that name a refused operation are decided first, by
+ * code alone, whatever status string or category carries them: a refused
+ * cancellation (63) or capture (93) leaves the payment authorised, so
+ * `requires_capture`; a refused deletion or refund (73/83) leaves it captured,
+ * so `succeeded` (refund state derives from amountRefunded). Next, a
+ * cancellation still awaiting the acquirer (CANCELLED 61/62) is `processing`
+ * and any other CANCELLED is `canceled`, never read as a failure; without a
+ * status string (the contract does not require one) codes 1/6 are `canceled`
+ * and 61/62 `processing`; a refund in flight (REFUND_REQUESTED) leaves the
+ * payment captured, so `succeeded`. After that the primary signal is
+ * statusOutput.statusCategory (Worldline's
+ * forward-compatible band — new statuses join an existing category), with
+ * statusCode and the status string as fallbacks; anything unrecognized is
+ * `processing`, never a fabricated terminal state.
  */
 export function mapWorldlineStatus(
   status: string | undefined,
@@ -778,11 +916,27 @@ export function mapWorldlineStatus(
   statusCategory: string | undefined,
 ): UnifiedPaymentStatus {
   const s = (status ?? "").toUpperCase();
-  if (s === "CANCELLED") return "canceled";
+  // The contract's status enum has no CANCELLATION_REJECTED, so a refused
+  // cancellation can arrive under another string; the code is what names it.
+  // "The payment remains authorised" (63); after a refused capture "the global
+  // status of the transaction will remain in statusOutput.statusCode=5" (93).
+  if (statusCode === 63 || statusCode === 93) return "requires_capture";
+  // A refused refund keeps the payment at 9 ("Payment requested"), and a
+  // refused deletion leaves it undeleted.
+  if (statusCode === 73 || statusCode === 83) return "succeeded";
+  if (s === "CANCELLED") return statusCode === 61 || statusCode === 62 ? "processing" : "canceled";
+  // The contract does not require the status string; without it the
+  // cancellation codes name the state before the UNSUCCESSFUL band would read a
+  // voided or voiding authorisation as a failure.
+  if (s === "" && (statusCode === 1 || statusCode === 6)) return "canceled";
+  if (s === "" && (statusCode === 61 || statusCode === 62)) return "processing";
+  if (s === "CANCELLATION_REJECTED" || s === "REJECTED_CAPTURE") return "requires_capture";
+  if (s === "REFUND_REQUESTED") return "succeeded";
 
   switch ((statusCategory ?? "").toUpperCase()) {
     case "COMPLETED":
     case "REFUNDED": // the payment succeeded; refund state derives from amountRefunded
+    case "REVERSED": // refunded, or a refund in flight
       return "succeeded";
     case "PENDING_MERCHANT":
       return "requires_capture"; // authorised, awaiting a merchant capture
@@ -801,14 +955,30 @@ export function mapWorldlineStatus(
   }
 
   switch (statusCode) {
-    case 9:
-      return "succeeded"; // CAPTURED / settled
+    case 9: // CAPTURED / settled
+    case 7: // payment deleted
+    case 8: // refunded
+    case 85: // refund processed by merchant
+    case 71: // deletion pending
+    case 72: // deletion uncertain
+    case 81: // refund pending
+    case 82: // refund uncertain
+      return "succeeded";
     case 5:
+    case 56:
       return "requires_capture"; // authorised
     case 46:
       return "requires_action"; // waiting authentication
     case 2:
+    case 57:
+    case 59:
       return "failed"; // authorisation declined
+    case 1:
+    case 6:
+      return "canceled"; // cancelled / authorisation cancelled
+    case 61:
+    case 62:
+      return "processing"; // cancellation awaiting the acquirer
     default:
       break;
   }
@@ -822,7 +992,6 @@ export function mapWorldlineStatus(
     case "REDIRECTED":
       return "requires_action";
     case "REJECTED":
-    case "REJECTED_CAPTURE":
       return "failed";
     default:
       // CAPTURE_REQUESTED / AUTHORIZATION_REQUESTED and any unknown status.
@@ -830,12 +999,16 @@ export function mapWorldlineStatus(
   }
 }
 
-function mapRefundStatus(status: string | undefined, category: string | undefined): RefundStatus {
-  const s = (status ?? "").toUpperCase();
-  const cat = (category ?? "").toUpperCase();
-  if (s === "REFUNDED" || cat === "REFUNDED" || cat === "COMPLETED") return "succeeded";
-  if (s === "REJECTED" || s === "CANCELLED" || cat === "UNSUCCESSFUL") return "failed";
-  return "pending"; // REFUND_REQUESTED / CREATED / PENDING_* — async, poll with retrieveRefund
+function mapRefundStatus(refund: WorldlineStatusFields): RefundStatus {
+  const s = (refund.status ?? "").toUpperCase();
+  const cat = (refund.statusOutput?.statusCategory ?? "").toUpperCase();
+  const code = refund.statusOutput?.statusCode;
+  if (s === "REFUNDED" || cat === "REFUNDED" || cat === "COMPLETED" || code === 7 || code === 8 || code === 85) {
+    return "succeeded";
+  }
+  if (s === "REJECTED" || s === "CANCELLED" || cat === "UNSUCCESSFUL" || code === 73 || code === 83) return "failed";
+  // REFUND_REQUESTED (71/72/81/82) / CREATED / PENDING_* — async, poll with retrieveRefund.
+  return "pending";
 }
 
 /**
@@ -883,7 +1056,7 @@ export function mapWorldlineError(httpStatus: number, body: unknown): PayFanoutE
 }
 
 /** The retryable processing_error only mapWorldlineError's 409 branch produces. */
-function isIdempotenceReplayInFlight(error: unknown): boolean {
+function isIdempotenceReplayInFlight(error: unknown): error is PayFanoutError {
   return isPayFanoutError(error) && error.code === "processing_error" && error.retryable;
 }
 
@@ -923,6 +1096,7 @@ function pruneUndefined<T extends object>(obj: T | undefined): Partial<T> {
 function toWorldlineCustomer(
   billing: CreatePaymentSessionInput["billingDetails"],
   email: string | undefined,
+  device: WorldlineCustomerDevice | undefined,
 ): { customer: Record<string, unknown> } | undefined {
   const customer: Record<string, unknown> = {};
   const address = billing?.address;
@@ -944,7 +1118,66 @@ function toWorldlineCustomer(
     if (Object.keys(name).length > 0) customer["personalInformation"] = { name };
   }
   if (email) customer["contactDetails"] = { emailAddress: email };
+  if (device) customer["device"] = device;
   return Object.keys(customer).length > 0 ? { customer } : undefined;
+}
+
+/** Worldline's limits on the orderReferences fields the adapter fills (API contract). */
+const MERCHANT_REFERENCE_MAX_LENGTH = 40;
+const SOFT_DESCRIPTOR_MAX_LENGTH = 256;
+/** The API contract's limit on both return URL properties. */
+const RETURN_URL_MAX_LENGTH = 200;
+/** An RFC 3986 scheme followed by "://": https://, or an app's custom protocol such as myapp://. */
+const RETURN_URL_PROTOCOL = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+function missingReturnUrl(): PayFanoutError {
+  return PayFanoutError.invalidRequest(
+    "Worldline lists threeDSecure.redirectionData.returnUrl among the mandatory 3-D Secure properties of every " +
+      "card payment — pass returnUrl on createPaymentSession, or set the adapter's defaultReturnUrl",
+    { propertyName: "cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl" },
+  );
+}
+
+/**
+ * Worldline rejects a return URL longer than 200 characters or without a
+ * protocol (API contract) — refused at session creation, before the customer
+ * enters a card, rather than by CreatePayment afterwards.
+ */
+function assertReturnUrlFormat(returnUrl: string): void {
+  const diagnostic = { propertyName: "cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl" };
+  if (returnUrl.length > RETURN_URL_MAX_LENGTH) {
+    throw PayFanoutError.invalidRequest(
+      `Worldline return URLs are at most ${RETURN_URL_MAX_LENGTH} characters, got ${returnUrl.length}`,
+      diagnostic,
+    );
+  }
+  if (!RETURN_URL_PROTOCOL.test(returnUrl)) {
+    throw PayFanoutError.invalidRequest(
+      "Worldline return URLs must be absolute, with a protocol such as https:// or an app scheme like myapp://",
+      diagnostic,
+    );
+  }
+}
+
+/**
+ * Checked at session creation so an over-long value is refused before the
+ * customer enters a card, not rejected by CreatePayment afterwards.
+ */
+function assertReferenceLimits(input: CreatePaymentSessionInput): void {
+  if (input.id !== undefined && input.id.length > MERCHANT_REFERENCE_MAX_LENGTH) {
+    throw PayFanoutError.invalidRequest(
+      `Worldline merchant references are at most ${MERCHANT_REFERENCE_MAX_LENGTH} characters (the session id ` +
+        `travels as order.references.merchantReference), got ${input.id.length}`,
+      { id: input.id },
+    );
+  }
+  if (input.statementDescriptor !== undefined && input.statementDescriptor.length > SOFT_DESCRIPTOR_MAX_LENGTH) {
+    throw PayFanoutError.invalidRequest(
+      `Worldline soft descriptors are at most ${SOFT_DESCRIPTOR_MAX_LENGTH} characters (statementDescriptor ` +
+        `travels as order.references.softDescriptor), got ${input.statementDescriptor.length}`,
+      { statementDescriptor: input.statementDescriptor },
+    );
+  }
 }
 
 function toWorldlineShipping(

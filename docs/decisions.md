@@ -521,29 +521,53 @@ docs.direct.worldline-solutions.com unless noted):
   advertises only the documented set so hosts never subscribe to undocumented types.
 
   Event identity, doc-verified 2026-09-23 against the webhooks guide: Worldline calls
-  duplicate deliveries a feature of its delivery architecture and states that duplicates carry
-  identical `payment.id` and `type`; it never says the envelope `id` is stable across them, so
-  deduping on the envelope could let a duplicate through. The event id is therefore
-  `worldline:{type}:{payment.id}` (type lower-cased as received; `refund.id` when the delivery
-  carries no payment), falling back to the envelope `id` when either half is missing and to
-  `worldline_{sha256(rawBody)}` after that. Each maintenance operation gets a `payment.id` of
-  its own (the guide's Status Changes table: the capture's id on `payment.capture_requested`
-  and `payment.captured`, the refund's on `refund.refund_requested` and `payment.refunded`),
-  so a capture and a later refund, or two partial refunds, never share an event id. The other
-  side: those events' `pspPaymentId` is the operation's id while CapturePayment /
-  CancelPayment / RefundPayment keep taking the initial transaction's id, and Worldline
-  advises against building on how the ids increment, so hosts correlate through
-  `merchantReference` or `retrievePayment`. Payment-link events keep the envelope id: the
-  platform's Node SDK types that resource as `PaymentLinkResponse`, which has no `id`, and its
-  `paymentLinkId` repeats across distinct events of one type (each payment on a reusable
-  link). Same page: a 2xx is expected right away; five retries follow at 10 min / 1 h / 2 h /
-  8 h / 24 h after the previous attempt, each with a `retry-count` header (0 on the first
-  attempt); "Generate webhooks keys" revokes an existing pair immediately, so a rotation
-  deploys a self-chosen pair to `webhookKeys` before confirming it in the portal. Left for a
-  sandbox pass: the table's prose says a refund's confirmation updates "the original capture
-  request" while its `payment.id` column shows the refund's own id, so two partial refunds
-  should confirm distinct ids on their `payment.refunded` events. The id format changes once
-  on upgrade, so an event delivered on both sides of it can be processed twice.
+  duplicate deliveries "a feature of our reliable delivery architecture" and states
+  "Duplicate webhooks will have identical values for both properties payment.id and type";
+  it never says the envelope `id` is stable across them, so deduping on the envelope could
+  let a duplicate through. The event id is therefore `worldline:{type}:{payment.id}` (type
+  lower-cased as received; `refund.id` when the delivery carries no payment), with
+  `:{operationOutput.id}` appended when the payment carries one, falling back to the envelope
+  `id` when either half of the pair is missing and to `worldline_{sha256(rawBody)}` after
+  that. `payment.test` always takes the fallback: the SendTestWebhook example's `payment.id`
+  is the fixed `9999_9`. Keeping distinct events apart rests on a premise the same page
+  hedges: "The payment.id can change after each maintenance operation following an
+  incremental logic. However, as this is not the case in some specific scenarios, we
+  strongly recommend not building your business operations around it." Its Status Changes
+  table lists `payment.id2` for both `payment.capture_requested` and `payment.captured`, and
+  `payment.id3` for both `refund.refund_requested` and `payment.refunded`, while the prose of
+  the two offline rows names an earlier id: "Our platform updates the original capture
+  request payment.id1 to statusOutput.status=9 and sends a webhook for offline event
+  payment.captured" and "Our platform updates the original capture request payment.id2 to
+  statusOutput.status=8 and sends a webhook for offline event payment.refunded". A second
+  event of one type on one `payment.id` (and one operation id) is therefore treated as a
+  duplicate, and the premise that every operation reports an id of its own stays
+  (default, unconfirmed) until a sandbox run makes two partial refunds on one payment and
+  compares the two `payment.refunded` events (`payment.id`, `operationOutput`,
+  `merchantReference`). The operation-id suffix comes from the contract
+  (`paymentResponse.operationOutput`, "Object containing operation details", with its own
+  `id`), but none of the page's webhook examples shows `operationOutput`, and that a
+  duplicate repeats it is assumed (only `payment.id` and `type` are documented as
+  repeating); the same sandbox run checks both. Hosts are told to treat refund events as a
+  trigger to re-read (`retrievePayment` for `amountRefunded`, `retrieveRefund` while
+  pending), never to count them. Correlation: those events' `pspPaymentId` can be the
+  operation's id, while CapturePayment / CancelPayment / RefundPayment take "The payment.Id
+  of the initial transaction" (maintenance operations guide); `merchantReference` is sent
+  only when the session has an `id`, and the page shows it echoed only on the events of a
+  sale (`payment.created`, `payment.authorization_requested`, `payment.captured`) — none of
+  its examples is a capture-operation or refund event — so the sandbox run checks those too.
+  Payment-link events keep the envelope id: the platform's Node SDK types that resource as
+  `PaymentLinkResponse`, which has no `id`, and its `paymentLinkId` repeats across distinct
+  events of one type (each payment on a reusable link). Same page: a 2xx is expected right
+  away; five retries follow at 10 min / 1 h / 2 h / 8 h / 24 h after the previous attempt,
+  each with a `retry-count` header (0 on the first attempt); "Generate webhooks keys" revokes
+  an existing pair immediately, without saying whether at the click or at "Confirm" when you
+  enter your own pair, and the Back Office manages the same pair, so a rotation deploys a
+  self-chosen random pair to `webhookKeys` before entering it in the portal.
+  `ValidateWebhookCredentials` takes as `secret` the base64 HMAC-SHA256 of an empty body
+  under the webhook secret, not the secret itself (contract: "use an empty string as body
+  while hashing it"). The id format changes once on upgrade, so an event delivered on both
+  sides of it can be processed twice; the envelope id stays on `event.raw.id` for hosts
+  bridging the roughly 35-hour retry window.
 
 Items initially flagged AMBIGUOUS/undocumented, resolved conservatively — each notes its
 current status (remaining sandbox checks run via the dispatch-only integration workflow):

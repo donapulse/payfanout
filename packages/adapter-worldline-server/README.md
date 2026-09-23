@@ -79,10 +79,19 @@ clock is an injectable `now()` seam. Every mutating call carries a signed, deter
   event per delivery; a single-event array wrapper is unwrapped, and a multi-event batch is
   rejected rather than partially processed.
   The event `id` is `worldline:<type>:<payment id>`, the pair Worldline documents as identical
-  across duplicate deliveries, so redeliveries dedupe on `event.id`.
-  Captures and refunds get a payment id of their own at Worldline, so their events'
-  `pspPaymentId` can differ from the one `completePayment` returned: correlate through
-  `merchantReference` or `retrievePayment`, never by parsing ids.
+  across duplicate deliveries, plus `:<operation id>` when the payment carries
+  `operationOutput.id` (none of Worldline's webhook examples shows it). Payment-link events and
+  `payment.test` messages keep the envelope id. Worldline also warns: "The payment.id can
+  change after each maintenance operation following an incremental logic. However, as this is
+  not the case in some specific scenarios, we strongly recommend not building your business
+  operations around it." So a second event of one type on one payment id (and operation id)
+  is treated as a duplicate: on refund events, re-read with `retrievePayment` or
+  `retrieveRefund` instead of counting events. Events after maintenance operations such as
+  capture and refund can report the operation's id as `pspPaymentId`: correlate through the
+  refund id (the suffix of the composite `refundId`, below), `merchantReference` (sent only
+  when `createPaymentSession` gets an `id`; Worldline's examples show it echoed on sale events
+  only), or `retrievePayment`, and parse no other id. Details:
+  [Set up Worldline](https://donapulse.github.io/payfanout/guide/worldline), step 8.
 - **`mapWorldlineError`**, unifies Worldline errors into `PayFanoutError` (business rejections
   are never replayed), and **`WORLDLINE_PSP_NAME`**.
 - **`buildV1HmacAuthorization`**, the request signer, exported for testing.

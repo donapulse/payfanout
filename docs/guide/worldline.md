@@ -187,12 +187,16 @@ hand-write the route? Call `completePayment` directly, both forms are in
 
 ## 8. Register the webhook endpoint
 
-In the Merchant Portal, under **Developer > Webhooks**, add
-`https://your-api.example/webhooks/worldline` with **Add webhook endpoint**, then click
-**Generate webhooks keys**. Copy the **Webhooks ID** and the **Secret Webhook Key** into
-`WORLDLINE_WEBHOOKS_KEY_ID` / `WORLDLINE_WEBHOOKS_SECRET_KEY` right away: the portal shows the
-secret for 60 seconds only. Mount the handler with the **raw body** (signature verification
-hashes the exact bytes):
+In the Merchant Portal, under **Developer → Webhooks**, add
+`https://your-api.example/webhooks/worldline` with **Add webhook endpoint**. If the page shows
+"No keys generated", click **Generate webhooks keys** and copy the **Webhooks ID** and the
+**Secret Webhook Key** into `WORLDLINE_WEBHOOKS_KEY_ID` / `WORLDLINE_WEBHOOKS_SECRET_KEY` right
+away: the portal shows the secret for 60 seconds only. If your account already has a pair
+(the Back Office manages the same pair, and changes sync between the two), do **not** click
+**Generate webhooks keys** during setup: it creates a new pair and revokes the existing one
+immediately, which breaks whatever verifies deliveries with it today. Reuse that pair if you
+hold its secret, or replace it as described under **Rotating the webhook key** below. Mount
+the handler with the **raw body** (signature verification hashes the exact bytes):
 
 ```ts
 import { createAdapterWebhookHandler } from "@payfanout/server";
@@ -213,25 +217,55 @@ request**; a single-event array wrapper is unwrapped, and a multi-event batch is
 rather than partially processed.
 
 **Event ids follow Worldline's definition of a duplicate.** Worldline delivers some events
-more than once by design, and documents that a duplicate repeats the same `payment.id` and
-`type`; it never says the envelope `id` stays the same. So `event.id` is built from that
-pair, `worldline:<type>:<payment id>` (the refund's id when the event carries a refund and no
-payment), falling back to the envelope `id`, then to a hash of the raw body. Keep deduping on
-`event.id` as for any other PSP, and treat the value as opaque.
+more than once by design, and its webhooks guide states: "Duplicate webhooks will have
+identical values for both properties payment.id and type." It never says the envelope `id`
+stays the same. So `event.id` is built from that pair, `worldline:<type>:<payment id>` (the
+refund's id when the event carries a refund and no payment). When the payment also carries
+`operationOutput.id` (described in the API contract as "Object containing operation
+details"), it is appended: `worldline:<type>:<payment id>:<operation id>`. None of the
+platform's webhook examples shows `operationOutput`, so whether deliveries carry it is
+unverified. An event without the pair falls back to the envelope `id`, then to a hash of the
+raw body, and so do payment-link events (their resource has no `id`) and `payment.test`
+messages (each one carries the same documented `payment.id`, `9999_9`). Keep deduping on
+`event.id` as for any other PSP.
 
-**Captures and refunds report their own payment id.** Every maintenance operation gets a new
-`payment.id` at Worldline, so the webhooks that follow `capturePayment` or `refundPayment`
-(`payment.capture_requested` and `payment.captured`, `refund.refund_requested` and
-`payment.refunded`) carry that operation's id as `event.pspPaymentId`, not necessarily the one
-`completePayment` returned. That keeps two partial refunds from sharing an event id, but a
-lookup by `event.pspPaymentId` alone can miss your order. Correlate through the `id` you
-passed to `createPaymentSession` instead: the adapter sends it as
-`order.references.merchantReference`, and the event carries it back
-(`event.raw.payment.paymentOutput.references.merchantReference`, or
-`event.raw.refund.refundOutput.references.merchantReference` on a refund). Or re-read the
-payment with `retrievePayment` using the `pspPaymentId` that `completePayment` returned;
-capture, cancel, and refund keep taking that id as well. Worldline advises against building
-on how these ids change, so never parse them or the tail of `event.id`.
+**Two events can still share an id.** The same guide hedges the premise that keeps distinct
+operations apart: "The payment.id can change after each maintenance operation following an
+incremental logic. However, as this is not the case in some specific scenarios, we strongly
+recommend not building your business operations around it." Its Status Changes table gives a
+capture and a refund an id of their own, but the prose of both confirmation rows describes
+updating an earlier one ("updates the original capture request payment.id1 …
+payment.captured", "… payment.id2 … payment.refunded"). So a second event of the same type on
+the same `payment.id` (and the same operation id, when present) is treated as a duplicate:
+two partial refunds confirmed under one `payment.id`, with no operation id to tell them
+apart, reach your store as one event. Never count events. Treat `payment.refunded`, and refund events generally, as a trigger to re-read:
+`retrievePayment` for `amountRefunded`, and `retrieveRefund` while a refund you created is
+still `pending`.
+
+**Correlate events with your order.** Maintenance operations such as capture and refund
+usually get a new `payment.id` at Worldline, so the webhooks that follow `capturePayment` or
+`refundPayment` (`payment.capture_requested` and `payment.captured`, `refund.refund_requested`
+and `payment.refunded`) can carry the operation's id as `event.pspPaymentId` instead of the
+one `completePayment` returned, and a lookup by `event.pspPaymentId` alone can miss your
+order. Three routes:
+
+- **Your order id.** Pass an `id` to `createPaymentSession`; the adapter sends it as
+  `order.references.merchantReference`, and sends nothing without one. Worldline's examples
+  show it echoed at `event.raw.payment.paymentOutput.references.merchantReference`, but only
+  on the events of a sale (`payment.created`, `payment.authorization_requested`,
+  `payment.captured`); no documented example shows a capture-operation or refund event, so
+  check that your sandbox echoes it there before you rely on it.
+- **The refund id.** `refundPayment` returns the composite `refundId`
+  `{paymentId}:{refundId}`, and the part after the last `:` is the refund's own id. In the
+  `payment.id` column of the Status Changes table, that is the id `payment.refunded` carries
+  (`event.pspPaymentId`) and the one `refund.refund_requested` carries (`event.refundId`); the
+  prose quoted above names the capture's id for `payment.refunded` instead, so confirm it in
+  your sandbox too.
+- **A re-read.** `retrievePayment` with the `pspPaymentId` that `completePayment` returned;
+  `capturePayment`, `cancelPayment`, and `refundPayment` keep taking that id too.
+
+Splitting that documented composite at its last `:` is the only parsing to do: treat every
+other Worldline id, and the tail of `event.id`, as opaque.
 
 **Answer fast; Worldline retries failures.** The handler answers as soon as `onEvent`
 returns, which is why `onEvent` should only enqueue. A delivery that gets no 2xx is retried
@@ -240,19 +274,31 @@ and every attempt carries a `retry-count` header: `0` on the first, rising with 
 
 **Rotating the webhook key.** In the portal, **Generate webhooks keys** creates a new pair and
 revokes the current one immediately, so deliveries fail verification until your server knows
-the new pair. To rotate without that gap, choose the new key id and secret yourself: add
-them to `webhookKeys` next to the current pair and deploy, then enter them in the portal as
-your own pair and confirm. Remove the old pair once nothing it signed can still arrive:
-Worldline does not say whether a retry is re-signed with the current key, and the schedule
-above spans about 35 hours (remove it at once if the secret leaked). If you let the portal
-generate the pair instead, add it to `webhookKeys` and deploy straight away; deliveries
-rejected in between are retried, the first after 10 minutes.
+the new pair. To rotate without that gap, choose the new pair yourself, from a secure random
+generator: a random key id (for example `openssl rand -hex 16`) and a secret of at least 32
+random bytes (for example `openssl rand -base64 32`). Worldline documents no format rules for
+a pair you enter yourself; if the portal refuses a character, `openssl rand -hex 32` gives 32
+random bytes as hex digits only. Then:
+
+1. Add the new pair to `webhookKeys` next to the current one, and deploy.
+2. In **Developer → Webhooks**, click **Generate webhooks keys**, enter the pair as your own
+   **Webhook ID** and **Webhook Secret Key**, and click **Confirm**. Worldline does not say
+   whether the current pair is revoked at the click or at **Confirm**, which is why the new
+   pair has to be deployed first.
+3. Remove the old pair once nothing it signed can still arrive: Worldline does not say
+   whether a retry is re-signed with the current key, and the retry schedule above spans
+   about 35 hours (remove it at once if the secret leaked).
+
+If you let the portal generate the pair instead, add it to `webhookKeys` and deploy straight
+away; deliveries rejected in between are retried, the first after 10 minutes.
 
 To check the setup before real traffic arrives, Worldline's API offers
-`ValidateWebhookCredentials`, which checks the key id and secret your server holds against
-the pair on your account, and `SendTestWebhook`, which delivers a test message to your
-endpoint (a `payment.test` event, mapped to `unknown`). The adapter does not wrap either
-call.
+`ValidateWebhookCredentials` and `SendTestWebhook`; the adapter wraps neither.
+`ValidateWebhookCredentials` takes your key id and, in its `secret` field, not the secret
+itself but the signature your server would compute over an empty body,
+`base64(HMAC-SHA256(webhookSecret, ""))`; it answers `Valid` or `Invalid` for the pair on your
+account. `SendTestWebhook` delivers a test message to your endpoint: a `payment.test` event,
+mapped to `unknown` and keyed on its envelope `id` as described above.
 
 Worldline exposes no public events-polling API (`supportsEventPolling: false`), for
 missed-webhook recovery, reconcile with `retrievePayment` per order. See

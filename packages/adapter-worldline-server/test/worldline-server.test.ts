@@ -59,7 +59,7 @@ const unknownWebhookFixture = signedWebhook({
   created: "2026-07-14T10:00:01Z",
   merchantId: "mid-1",
   type: "paymentlink.created",
-  paymentLink: { id: "pl_1" },
+  paymentLink: { paymentLinkId: "pl_1" },
 });
 
 /** Tokenize-first completion of a fresh session — how every "money moved" fixture starts. */

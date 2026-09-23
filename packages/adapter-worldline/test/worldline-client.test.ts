@@ -99,7 +99,7 @@ describe("WorldlineClientAdapter", () => {
     const { adapter } = makeAdapter();
     const handle = await adapter.mount(fakeContainer(), { clientSecret: URL_SECRET });
     const result = await adapter.confirm(handle);
-    expect(result).toEqual({ status: "requires_confirmation", clientToken: "htp_123" });
+    expect(result).toEqual({ status: "requires_confirmation", clientToken: '{"hostedTokenizationId":"htp_123"}' });
   });
 
   it("maps a failed/empty tokenization to a unified failure with raw preserved", async () => {

@@ -40,17 +40,28 @@ export interface WorldlineSessionContextV1 {
   hostedTokenizationId: string;
   /** Epoch milliseconds. Tokens without it are rejected. */
   expiresAt: number;
-  /** 3-D Secure return URL (sent as both cardPaymentMethodSpecificInput.returnUrl and its threeDSecure.redirectionData form). */
+  /**
+   * 3-D Secure return URL (sent as both cardPaymentMethodSpecificInput.returnUrl and its
+   * threeDSecure.redirectionData form): the session's own, or the adapter's defaultReturnUrl.
+   * Contexts signed before it became mandatory may lack it; completePayment then falls back
+   * to defaultReturnUrl.
+   */
   returnUrl?: string;
   /** Host-app internal id (PaymentSession.id), round-tripped via order.references.merchantReference. */
   id?: string;
   /** AVS data — order.customer.billingAddress on the payment. */
   billingDetails?: CreatePaymentSessionInput["billingDetails"];
-  /** Statement text (order.references.descriptor on the payment). */
+  /** Statement text (order.references.softDescriptor on the payment). */
   statementDescriptor?: string;
   /** Customer email (order.customer.contactDetails.emailAddress on the payment). */
   receiptEmail?: string;
   shippingDetails?: ShippingDetails;
+  /**
+   * SCA preference. `challenge: "force"` becomes threeDSecure.challengeIndicator
+   * "challenge-required"; `exemption: "moto"` is withheld, as Worldline's exemptionRequest
+   * has no MOTO value.
+   */
+  sca?: CreatePaymentSessionInput["sca"];
 }
 
 export interface DecodeSessionContextOptions {

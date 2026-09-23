@@ -48,8 +48,24 @@ const worldline = new WorldlineClientAdapter({ environment: "sandbox" });
 - The session's `clientSecret` is the **`hostedTokenizationUrl`** returned by
   `createPaymentSession`; the adapter builds the `Tokenizer` from it. No client key is needed.
 - `confirm()` tokenizes the card and resolves `{ status: "requires_confirmation", clientToken }`
-  where `clientToken` is the `hostedTokenizationId`. The host passes it to the server's
-  `completePayment` — `<PayButton>` / `completionEndpoint` wire this automatically.
+  where `clientToken` carries the `hostedTokenizationId` and the browser's 3-D Secure data
+  (see below). The host passes it to the server's `completePayment` — `<PayButton>` /
+  `completionEndpoint` wire this automatically.
+
+## 3-D Secure and card storage
+
+- Worldline lists browser device data among the mandatory 3-D Secure properties of every card
+  payment, and only the browser can read it. `confirm()` collects it (language, time zone
+  offset, user agent, screen height, width and color depth, the Java and JavaScript flags)
+  and sends it with the `hostedTokenizationId` as a JSON `clientToken`:
+  `{"hostedTokenizationId":"…","device":{…}}`. Browser characteristics only, never card data;
+  a value the browser does not expose is left out rather than failing the payment.
+- `@payfanout/adapter-worldline-server` decodes the envelope and forwards the device data as
+  `order.customer.device`. Deploy the server adapter release that understands it **before**
+  this package: an earlier server adapter would send the whole envelope as the
+  `hostedTokenizationId`.
+- The card is tokenized with `storePermanently: false`, so Worldline keeps no token for later
+  payments. The adapter has no saved-card surface, so a stored token could never be used.
 
 ## Notes
 

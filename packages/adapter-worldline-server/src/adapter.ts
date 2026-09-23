@@ -28,6 +28,7 @@ import {
   type UnifiedWebhookEvent,
   type VerifyCredentialsResult,
 } from "@payfanout/core";
+import { decodeWorldlineClientToken, type WorldlineCustomerDevice } from "./client-token.js";
 import { buildV1HmacAuthorization, deriveIdempotenceKey } from "./signing.js";
 import {
   decodeSessionContext,
@@ -54,6 +55,14 @@ export interface WorldlineServerAdapterConfig {
    * live -> payment.direct.worldline-solutions.com.
    */
   environment: "sandbox" | "live";
+  /**
+   * Where Worldline sends the customer back after a 3-D Secure challenge, used
+   * when a session carries no `returnUrl`. Worldline lists
+   * `threeDSecure.redirectionData.returnUrl` among the mandatory 3-D Secure
+   * properties of every card payment, so with neither, createPaymentSession is
+   * refused before anything reaches Worldline.
+   */
+  defaultReturnUrl?: string;
   /** HMAC key for the stateless signed session context (see session-context.ts). */
   sessionSigningKey: string;
   /**
@@ -244,10 +253,19 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
 
   /**
    * Creates the Hosted Tokenization session (POST /hostedtokenizations — no
-   * amount at this step) and encodes amount/currency/capture-method and the
-   * returned hostedTokenizationId into a signed, self-contained context that
-   * completePayment later verifies and trusts. The client mounts the iframe
-   * from the returned hostedTokenizationUrl (the session's clientSecret).
+   * amount at this step) and encodes amount/currency/capture-method, the return
+   * URL, the SCA preference and the returned hostedTokenizationId into a
+   * signed, self-contained context that completePayment later verifies and
+   * trusts. The client mounts the iframe from the returned
+   * hostedTokenizationUrl (the session's clientSecret).
+   *
+   * Refused with invalid_request before anything reaches Worldline when the
+   * session has no return URL (neither `returnUrl` nor the adapter's
+   * `defaultReturnUrl`) or one Worldline rejects (over 200 characters, or
+   * without a protocol such as `https://` or an app scheme), when `id` is
+   * longer than the 40 characters `order.references.merchantReference`
+   * accepts, or when `statementDescriptor` is longer than the 256 characters
+   * `order.references.softDescriptor` accepts.
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertMinorUnitAmount(input.amount, "amount");
@@ -257,6 +275,10 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
         `Worldline adapter does not support one of the requested payment method types: ${input.paymentMethodTypes.join(", ")}`,
       );
     }
+    const returnUrl = input.returnUrl ?? this.config.defaultReturnUrl;
+    if (!returnUrl) throw missingReturnUrl();
+    assertReturnUrlFormat(returnUrl);
+    assertReferenceLimits(input);
     // CreateHostedTokenization is not on Worldline's documented idempotent
     // operations: the key is sent (harmless) but never relied on for dedupe.
     // Tokenization is amountless — money-side safety comes from CreatePayment
@@ -274,12 +296,13 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       captureMethod: input.captureMethod ?? "automatic",
       hostedTokenizationId: tokenization.hostedTokenizationId,
       expiresAt: this.now() + this.sessionTtlMs(),
-      returnUrl: input.returnUrl,
+      returnUrl,
       id: input.id,
       billingDetails: input.billingDetails,
       statementDescriptor: input.statementDescriptor,
       receiptEmail: input.receiptEmail,
       shippingDetails: input.shippingDetails,
+      sca: input.sca,
     };
     const token = await encodeSessionContext(context, this.config.sessionSigningKey);
     return {
@@ -295,25 +318,37 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
   }
 
   /**
-   * Tokenize-first completion: create the payment from the browser's
-   * hostedTokenizationId. The signed context is the only trusted source of
-   * amount/currency/capture-method. A REDIRECT merchantAction (3-D Secure
-   * challenge) surfaces as requires_action with the redirect URL on `raw`; the
-   * customer completes it and the host reconciles with retrievePayment.
+   * Tokenize-first completion: create the payment from the clientToken
+   * confirm() produced, the hostedTokenizationId plus the browser's device data
+   * (see decodeWorldlineClientToken; a bare hostedTokenizationId is accepted
+   * too). The signed context is the only trusted source of
+   * amount/currency/capture-method.
+   *
+   * Every payment carries the mandatory 3-D Secure properties the adapter can
+   * supply: the return URL in both documented forms,
+   * `threeDSecure.skipAuthentication: false`, and the device data as
+   * `order.customer.device`. `acceptHeader` and `ipAddress` are observed on the
+   * customer's HTTP request and CompletePaymentInput carries neither, so they
+   * are not sent. `sca.challenge: "force"` requests `challengeIndicator:
+   * "challenge-required"`; `sca.exemption: "moto"` is withheld, as Worldline's
+   * `exemptionRequest` has no MOTO value.
+   *
+   * A REDIRECT merchantAction (3-D Secure challenge) surfaces as
+   * requires_action with the redirect URL on `raw`; the customer completes it
+   * and the host reconciles with retrievePayment.
    */
   async completePayment(input: CompletePaymentInput): Promise<PaymentInfo> {
-    if (!input.clientToken) {
-      throw PayFanoutError.invalidRequest(
-        "completePayment requires the clientToken (hostedTokenizationId) produced by confirm()",
-        { clientToken: input.clientToken },
-      );
-    }
+    const token = decodeWorldlineClientToken(input.clientToken);
     const context = await this.decodeContext(input.pspSessionId);
+    // Contexts signed before the return URL became mandatory may lack one.
+    const returnUrl = context.returnUrl ?? this.config.defaultReturnUrl;
+    if (!returnUrl) throw missingReturnUrl();
     const billing = mergeBillingDetails(context.billingDetails, input.billingDetails);
     const email = context.receiptEmail ?? billing?.email;
     const references: Record<string, string> = {
       ...(context.id ? { merchantReference: context.id } : {}),
-      ...(context.statementDescriptor ? { descriptor: context.statementDescriptor } : {}),
+      // descriptor is deprecated; softDescriptor is the cardholder-statement text.
+      ...(context.statementDescriptor ? { softDescriptor: context.statementDescriptor } : {}),
     };
     const created = await this.request<WorldlineCreatePaymentResponse>(
       "POST",
@@ -322,22 +357,24 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
         order: {
           amountOfMoney: { amount: context.amount, currencyCode: context.currency },
           ...(Object.keys(references).length > 0 ? { references } : {}),
-          ...(toWorldlineCustomer(billing, email) ?? {}),
+          ...(toWorldlineCustomer(billing, email, token.device) ?? {}),
           ...(toWorldlineShipping(context.shippingDetails) ?? {}),
         },
         // hostedTokenizationId rides at the ROOT of CreatePayment — it replaces
         // the card-data source; cardPaymentMethodSpecificInput has no such field.
-        hostedTokenizationId: input.clientToken,
+        hostedTokenizationId: token.hostedTokenizationId,
         cardPaymentMethodSpecificInput: {
           authorizationMode: context.captureMethod === "manual" ? "PRE_AUTHORIZATION" : "SALE",
-          // The hosted-tokenization guide names the flattened returnUrl; the
-          // domain model also carries the threeDSecure form — send both.
-          ...(context.returnUrl
-            ? {
-                returnUrl: context.returnUrl,
-                threeDSecure: { redirectionData: { returnUrl: context.returnUrl } },
-              }
-            : {}),
+          // The Hosted Tokenization guide names the flat returnUrl; the 3-D Secure
+          // guide lists the redirectionData form as mandatory — send both.
+          returnUrl,
+          threeDSecure: {
+            // Only here: the flat cardPaymentMethodSpecificInput.skipAuthentication
+            // is deprecated in favor of this one.
+            skipAuthentication: false,
+            redirectionData: { returnUrl },
+            ...(context.sca?.challenge === "force" ? { challengeIndicator: "challenge-required" } : {}),
+          },
         },
       },
       input.idempotencyKey,
@@ -923,6 +960,7 @@ function pruneUndefined<T extends object>(obj: T | undefined): Partial<T> {
 function toWorldlineCustomer(
   billing: CreatePaymentSessionInput["billingDetails"],
   email: string | undefined,
+  device: WorldlineCustomerDevice | undefined,
 ): { customer: Record<string, unknown> } | undefined {
   const customer: Record<string, unknown> = {};
   const address = billing?.address;
@@ -944,7 +982,66 @@ function toWorldlineCustomer(
     if (Object.keys(name).length > 0) customer["personalInformation"] = { name };
   }
   if (email) customer["contactDetails"] = { emailAddress: email };
+  if (device) customer["device"] = device;
   return Object.keys(customer).length > 0 ? { customer } : undefined;
+}
+
+/** Worldline's limits on the orderReferences fields the adapter fills (API contract). */
+const MERCHANT_REFERENCE_MAX_LENGTH = 40;
+const SOFT_DESCRIPTOR_MAX_LENGTH = 256;
+/** The API contract's limit on both return URL properties. */
+const RETURN_URL_MAX_LENGTH = 200;
+/** An RFC 3986 scheme followed by "://": https://, or an app's custom protocol such as myapp://. */
+const RETURN_URL_PROTOCOL = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+function missingReturnUrl(): PayFanoutError {
+  return PayFanoutError.invalidRequest(
+    "Worldline lists threeDSecure.redirectionData.returnUrl among the mandatory 3-D Secure properties of every " +
+      "card payment — pass returnUrl on createPaymentSession, or set the adapter's defaultReturnUrl",
+    { propertyName: "cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl" },
+  );
+}
+
+/**
+ * Worldline rejects a return URL longer than 200 characters or without a
+ * protocol (API contract) — refused at session creation, before the customer
+ * enters a card, rather than by CreatePayment afterwards.
+ */
+function assertReturnUrlFormat(returnUrl: string): void {
+  const diagnostic = { propertyName: "cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl" };
+  if (returnUrl.length > RETURN_URL_MAX_LENGTH) {
+    throw PayFanoutError.invalidRequest(
+      `Worldline return URLs are at most ${RETURN_URL_MAX_LENGTH} characters, got ${returnUrl.length}`,
+      diagnostic,
+    );
+  }
+  if (!RETURN_URL_PROTOCOL.test(returnUrl)) {
+    throw PayFanoutError.invalidRequest(
+      "Worldline return URLs must be absolute, with a protocol such as https:// or an app scheme like myapp://",
+      diagnostic,
+    );
+  }
+}
+
+/**
+ * Checked at session creation so an over-long value is refused before the
+ * customer enters a card, not rejected by CreatePayment afterwards.
+ */
+function assertReferenceLimits(input: CreatePaymentSessionInput): void {
+  if (input.id !== undefined && input.id.length > MERCHANT_REFERENCE_MAX_LENGTH) {
+    throw PayFanoutError.invalidRequest(
+      `Worldline merchant references are at most ${MERCHANT_REFERENCE_MAX_LENGTH} characters (the session id ` +
+        `travels as order.references.merchantReference), got ${input.id.length}`,
+      { id: input.id },
+    );
+  }
+  if (input.statementDescriptor !== undefined && input.statementDescriptor.length > SOFT_DESCRIPTOR_MAX_LENGTH) {
+    throw PayFanoutError.invalidRequest(
+      `Worldline soft descriptors are at most ${SOFT_DESCRIPTOR_MAX_LENGTH} characters (statementDescriptor ` +
+        `travels as order.references.softDescriptor), got ${input.statementDescriptor.length}`,
+      { statementDescriptor: input.statementDescriptor },
+    );
+  }
 }
 
 function toWorldlineShipping(

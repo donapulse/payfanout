@@ -28,8 +28,13 @@ export interface WorldlineTokenizerResult {
 export interface WorldlineTokenizerInstanceLike {
   /** Renders the hosted tokenization iframe into the mount container. */
   initialize(): Promise<unknown>;
-  /** Tokenizes the entered card and resolves the hostedTokenizationId. */
-  submitTokenization(): Promise<WorldlineTokenizerResult>;
+  /**
+   * Tokenizes the entered card and resolves the hostedTokenizationId. The
+   * Tokenizer stores the token for later payments unless `storePermanently` is
+   * `false`; a `cardholderName` is handed to the iframe as the cardholder's
+   * name.
+   */
+  submitTokenization(options?: { storePermanently?: boolean; cardholderName?: string }): Promise<WorldlineTokenizerResult>;
   /** Tears the iframe down, where the SDK build exposes it. */
   destroy?(): void;
 }
@@ -141,16 +146,29 @@ export class WorldlineClientAdapter implements ClientPaymentAdapter {
   }
 
   /**
-   * Tokenize-first shape: resolves requires_confirmation plus the
-   * hostedTokenizationId. The host passes that clientToken to the server's
-   * completePayment (<PayButton> / completionEndpoint wire it automatically).
+   * Tokenize-first shape: resolves requires_confirmation plus a clientToken the
+   * host passes to the server's completePayment (<PayButton> /
+   * completionEndpoint wire it automatically). The clientToken is a JSON
+   * envelope, `{"hostedTokenizationId":"…","device":{…}}`: the
+   * hostedTokenizationId, plus the browser characteristics Worldline lists
+   * among the mandatory 3-D Secure properties (`order.customer.device`), which
+   * only the browser can read. A characteristic the browser does not expose is
+   * left out; `device` is absent outside a browser. The server adapter release
+   * that decodes the envelope must be deployed before this one.
+   *
+   * The card is tokenized with `storePermanently: false`: the adapter never
+   * vaults (no saved-payment-method surface), so Worldline keeps no token for
+   * later payments.
    */
   async confirm(handle: MountedFieldsHandle): Promise<ConfirmResult> {
     const h = asWorldlineHandle(handle);
     try {
-      const result = await h.tokenizer.submitTokenization();
+      const result = await h.tokenizer.submitTokenization({ storePermanently: false });
       if (result?.success && result.hostedTokenizationId) {
-        return { status: "requires_confirmation", clientToken: result.hostedTokenizationId };
+        return {
+          status: "requires_confirmation",
+          clientToken: encodeClientToken(result.hostedTokenizationId, collectDeviceData()),
+        };
       }
       return {
         status: "failed",
@@ -223,4 +241,83 @@ function mapWorldlineTokenizerError(err: unknown): UnifiedError {
     raw: err,
     pspName: "worldline",
   });
+}
+
+/**
+ * `order.customer.device` for CreatePayment, under Worldline's own key names
+ * and types (the contract types the offset and screen size as strings) so the
+ * server adapter forwards it without renaming. Browser characteristics only,
+ * never card data.
+ */
+interface WorldlineDeviceData {
+  locale?: string;
+  timezoneOffsetUtcMinutes?: string;
+  userAgent?: string;
+  browserData: {
+    colorDepth?: number;
+    javaEnabled?: boolean;
+    javaScriptEnabled: true;
+    screenHeight?: string;
+    screenWidth?: string;
+  };
+}
+
+/** The window members the collector reads, typed loosely: any of them may be missing or odd. */
+interface BrowserWindowLike {
+  navigator?: { language?: unknown; userAgent?: unknown; javaEnabled?: () => unknown };
+  screen?: { colorDepth?: unknown; height?: unknown; width?: unknown };
+}
+
+function encodeClientToken(hostedTokenizationId: string, device: WorldlineDeviceData | undefined): string {
+  return JSON.stringify(device ? { hostedTokenizationId, device } : { hostedTokenizationId });
+}
+
+/**
+ * Reads the device data at confirm() time. Every read is guarded: a missing
+ * object, a throwing getter or a non-integer number leaves that field out,
+ * because this data improves the authentication outcome but must never fail
+ * the payment. Without a navigator there is no browser to describe.
+ */
+function collectDeviceData(): WorldlineDeviceData | undefined {
+  const win = typeof window === "undefined" ? undefined : (window as unknown as BrowserWindowLike);
+  const nav = safely(() => win?.navigator);
+  if (!nav) return undefined;
+  const display = safely(() => win?.screen);
+  const locale = safely(() => nav.language);
+  const userAgent = safely(() => nav.userAgent);
+  const timezoneOffset = safely(() => new Date().getTimezoneOffset());
+  const colorDepth = safely(() => display?.colorDepth);
+  const screenHeight = safely(() => display?.height);
+  const screenWidth = safely(() => display?.width);
+  // Called on the navigator itself: detached, the method throws in browsers.
+  const javaEnabled = safely(() => nav.javaEnabled?.() === true);
+  return {
+    ...(isNonEmptyString(locale) ? { locale } : {}),
+    ...(isInteger(timezoneOffset) ? { timezoneOffsetUtcMinutes: String(timezoneOffset) } : {}),
+    ...(isNonEmptyString(userAgent) ? { userAgent } : {}),
+    browserData: {
+      ...(isInteger(colorDepth) ? { colorDepth } : {}),
+      ...(javaEnabled !== undefined ? { javaEnabled } : {}),
+      javaScriptEnabled: true,
+      ...(isInteger(screenHeight) ? { screenHeight: String(screenHeight) } : {}),
+      ...(isInteger(screenWidth) ? { screenWidth: String(screenWidth) } : {}),
+    },
+  };
+}
+
+function safely<T>(read: () => T): T | undefined {
+  try {
+    return read();
+  } catch {
+    // Privacy hardening and embedded browsers can make any of these reads throw.
+    return undefined;
+  }
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isInteger(value: unknown): value is number {
+  return Number.isInteger(value);
 }

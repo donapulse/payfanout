@@ -87,6 +87,7 @@ const worldline = new WorldlineServerAdapter({
   secretApiKey: process.env.WORLDLINE_SECRET_API_KEY!,
   merchantId: process.env.WORLDLINE_MERCHANT_ID!,
   environment: "sandbox",                                  // → payment.preprod.direct.worldline-solutions.com
+  defaultReturnUrl: "https://your-shop.example/checkout/return", // required unless every session passes returnUrl
   sessionSigningKey: process.env.WORLDLINE_SESSION_KEY!,   // YOUR HMAC secret, not a Worldline credential
   webhookKeys: [
     { keyId: process.env.WORLDLINE_WEBHOOKS_KEY_ID!, secretKey: process.env.WORLDLINE_WEBHOOKS_SECRET_KEY! },
@@ -101,6 +102,7 @@ const payments = new PaymentService({ adapters: [worldline] });
 | `apiKeyId` / `secretApiKey` | ✅ | - | `v1HMAC` request-signing credentials. Server-only. |
 | `merchantId` | ✅ | - | The merchant id (PSPID); the `{merchantId}` path segment. |
 | `environment` | ✅ | - | Exactly `"sandbox"` or `"live"`; selects the API host. Never inferred. |
+| `defaultReturnUrl` | ✅¹ | - | Where Worldline returns the customer after a 3-D Secure challenge. ¹Required unless every session passes its own `returnUrl`: Worldline lists the return URL among the mandatory 3-D Secure properties of every card payment, so a session with neither is refused (§6). |
 | `sessionSigningKey` | ✅ | - | HMAC key for the stateless signed session. **You generate this.** Keep it stable across restarts/instances. |
 | `webhookKeys` | ✅ | - | Array of `{ keyId, secretKey }`. Pass several to rotate with no cutover. |
 | `sessionTtlSeconds` | - | `3600` | How long a signed session stays completable (1h). Enforced at completion. |
@@ -153,18 +155,54 @@ the `sdkUrl` config field to pin a version or self-host.
 
 ## 6. 3-D Secure
 
-Pass a `returnUrl` on `createPaymentSession` and the adapter forwards it as
-`cardPaymentMethodSpecificInput.returnUrl` (the field the Hosted Tokenization guide names)
-and in its `threeDSecure.redirectionData.returnUrl` form — both are current. A frictionless
-authentication completes inline; a challenge comes back as `requires_action` with the
-redirect URL on `PaymentInfo.raw` (`merchantAction.redirectData.redirectURL`). After the
-customer returns, reconcile the outcome with `retrievePayment`.
+Worldline's [3-D Secure guide](https://docs.direct.worldline-solutions.com/en/security-and-risk-management/3d-secure/implementation)
+lists the properties every card payment must send, and the Hosted Tokenization guide requires
+at least those on the payment request. Every payment the adapter creates carries the ones it
+can supply:
+
+| What | Sent as |
+| --- | --- |
+| Return URL | `cardPaymentMethodSpecificInput.returnUrl` (the field the Hosted Tokenization guide names) **and** `cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl` |
+| Authentication | `threeDSecure.skipAuthentication: false`, never the deprecated flat `cardPaymentMethodSpecificInput.skipAuthentication` |
+| Browser device data | `order.customer.device`: `locale`, `timezoneOffsetUtcMinutes`, `userAgent`, and `browserData` (`colorDepth`, `javaEnabled`, `javaScriptEnabled`, `screenHeight`, `screenWidth`), read in the browser by the client adapter's `confirm()` |
+| Challenge preference | `threeDSecure.challengeIndicator: "challenge-required"` when the session passes `sca: { challenge: "force" }`; otherwise omitted, which is Worldline's `no-preference` default |
+
+**The return URL is mandatory.** Pass `returnUrl` on `createPaymentSession`, or set
+`defaultReturnUrl` on the adapter (§4), absolute, with a scheme such as `https://` or an app
+scheme, at most 200 characters; a session with neither, or with a URL that breaks those rules,
+is refused with `invalid_request` before anything reaches Worldline, rather than failing after
+the customer has entered a card. `sca: { exemption: "moto" }` is withheld: Worldline's
+`exemptionRequest` has no MOTO value. For Visa, Worldline also requires one customer contact
+detail; the adapter sends `order.customer.contactDetails.emailAddress` from the session's
+`receiptEmail` or `billingDetails.email`, so pass one of them.
+
+`confirm()` hands the server a JSON `clientToken`,
+`{"hostedTokenizationId":"…","device":{…}}`. It carries browser characteristics only, never
+card data; a value the browser does not expose is left out, and the server adapter drops any
+field outside Worldline's documented types and lengths instead of failing the payment. A bare
+`hostedTokenizationId` from an earlier client adapter is still accepted, without device data,
+so deploy the server adapter before the client adapter.
+
+::: warning Accept header and IP address are not sent
+Worldline also lists `order.customer.device.acceptHeader` and, for Visa,
+`order.customer.device.ipAddress`. Both come from the customer's HTTP request to your server,
+not from the browser, and neither `CompletePaymentInput` nor `createCompletionHandler` carries
+them to the adapter today, so the adapter cannot send them.
+:::
+
+The adapter tokenizes with `storePermanently: false`, so no card is stored at Worldline for
+later use: the adapter has no saved-card surface that could use such a token.
+
+A frictionless authentication completes inline; a challenge comes back as `requires_action`
+with the redirect URL on `PaymentInfo.raw` (`merchantAction.redirectData.redirectURL`). After
+the customer returns, reconcile the outcome with `retrievePayment`.
 
 ## 7. The server-completion route (Worldline-only)
 
 This is the step Stripe doesn't have. When the client tokenizes, the library POSTs the
-resulting `clientToken` (the `hostedTokenizationId`, with the session reference and any
-completion-time `billingDetails`) to your `completionEndpoint`, where you mount
+resulting `clientToken` (the `hostedTokenizationId` plus the browser's 3-D Secure data, see
+§6), with the session reference and any completion-time `billingDetails`, to your
+`completionEndpoint`, where you mount
 `createCompletionHandler`:
 
 ```ts

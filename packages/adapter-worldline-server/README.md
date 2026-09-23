@@ -39,6 +39,8 @@ const worldline = new WorldlineServerAdapter({
   webhookKeys: [
     { keyId: process.env.WORLDLINE_WEBHOOKS_KEY_ID!, secretKey: process.env.WORLDLINE_WEBHOOKS_SECRET_KEY! },
   ], // one key, or several during rotation — any active key verifying wins
+  // Worldline requires a 3-D Secure return URL on every card payment; sessions may override it.
+  defaultReturnUrl: "https://your-shop.example/checkout/return",
 });
 
 const payments = new PaymentService({ adapters: [worldline] });
@@ -69,6 +71,37 @@ using WebCrypto — no `node:crypto`, so the adapter stays edge-compatible. The 
 sent and signed (RFC-1123 GMT); Worldline rejects timestamps older than five minutes, so the
 clock is an injectable `now()` seam. Every mutating call carries a signed, deterministic
 `X-GCS-Idempotence-Key` derived from the caller's `idempotencyKey`.
+
+## 3-D Secure
+
+Worldline lists a set of 3-D Secure properties as mandatory on every card payment, and the
+Hosted Tokenization Page requires at least those. Every CreatePayment the adapter sends
+carries the ones it can supply:
+
+- **The return URL, in both documented forms** — `cardPaymentMethodSpecificInput.returnUrl`
+  and `cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl`. It is required:
+  pass `returnUrl` per session or set `defaultReturnUrl` once, absolute, with a scheme such as
+  `https://` or an app scheme, at most 200 characters; a session with neither, or with a URL
+  that breaks those rules, is refused with `invalid_request` before any call to Worldline.
+- **`threeDSecure.skipAuthentication: false`**, never the deprecated flat
+  `cardPaymentMethodSpecificInput.skipAuthentication`.
+- **The browser's device data** as `order.customer.device`. The client adapter's `confirm()`
+  sends it with the `hostedTokenizationId` as a JSON `clientToken`,
+  `{"hostedTokenizationId":"…","device":{…}}`, which `decodeWorldlineClientToken` reads back.
+  Each field is checked against Worldline's documented types and lengths, and one that fails,
+  or any key Worldline does not define, is dropped rather than failing the payment. A bare
+  `hostedTokenizationId` is still accepted and sends no device data.
+- **`challengeIndicator: "challenge-required"`** when the session passes
+  `sca: { challenge: "force" }`. `sca: { exemption: "moto" }` is withheld, as Worldline's
+  `exemptionRequest` has no MOTO value.
+- **A contact detail for Visa**, which Worldline also requires: the adapter sends
+  `order.customer.contactDetails.emailAddress` from the session's `receiptEmail` or
+  `billingDetails.email`, so pass one of them.
+
+`order.customer.device.acceptHeader` and, for Visa, `order.customer.device.ipAddress` are on
+the same list but are not sent. Both come from the customer's HTTP request to your server, not
+from the browser, and neither `CompletePaymentInput` nor `createCompletionHandler` carries them
+to the adapter today, so the adapter cannot send them.
 
 ## What's inside
 

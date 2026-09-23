@@ -470,6 +470,34 @@ docs.direct.worldline-solutions.com unless noted):
   Secure return URL is sent BOTH as `cardPaymentMethodSpecificInput.returnUrl` (the field
   the Hosted Tokenization guide names) and in its `threeDSecure.redirectionData.returnUrl`
   form — both are current in the models; sandbox-verify one challenge flow.
+  Extended 2026-09-23, doc-verified against the 3-D Secure implementation guide, the Hosted
+  Tokenization Page guide, the API contract (v2.507.0) and the Tokenizer script Worldline
+  serves: the 3-D Secure guide lists `threeDSecure.redirectionData.returnUrl`,
+  `threeDSecure.skipAuthentication` and the browser's `order.customer.device` data as
+  mandatory on every card CreatePayment, and the Hosted Tokenization guide requires at least
+  those. `confirm()` now returns a JSON `clientToken`, `{"hostedTokenizationId","device"}`,
+  whose `device` carries `locale`, `timezoneOffsetUtcMinutes`, `userAgent` and `browserData`
+  under the contract's names and types (offset and screen size are strings; the guide's
+  `ScreenWidth` is the contract's `screenWidth`), each read guarded and left out when
+  unavailable; the server decodes it with `decodeWorldlineClientToken`, drops any field off
+  the contract's types and limits and any key it does not define, and still accepts a bare
+  `hostedTokenizationId`. CreatePayment always sends `threeDSecure.skipAuthentication: false`
+  (the flat field is deprecated) and the return URL in both forms, plus
+  `challengeIndicator: "challenge-required"` for `sca.challenge: "force"`; `exemptionRequest`
+  has no MOTO value, so `sca.exemption: "moto"` is withheld. The return URL became mandatory
+  — the session's `returnUrl` or the new `defaultReturnUrl`, refused before any call otherwise
+  (a breaking change), as is a URL over the contract's 200 characters or without a protocol
+  (`https://`, or a custom `protocol://` for mobile apps), which the fake rejects too.
+  `merchantReference` (max 40) and the statement descriptor, now sent as
+  `softDescriptor` since `descriptor` is deprecated (max 256; the contract advises 22 and
+  currently allows per-call overrides only for AIB and Barclays), are length-checked at
+  session creation. The Tokenizer stores a token permanently unless `submitTokenization`
+  receives `storePermanently: false`, which `confirm()` always passes (the adapter never
+  vaults). The fake rejects a CreatePayment without the redirection return URL or with a
+  `merchantReference` over 40 characters. Known gap: `acceptHeader` and `ipAddress` (mandatory
+  for Visa) are observed on the customer's HTTP request, which neither `CompletePaymentInput`
+  nor `createCompletionHandler` carries to the adapter, so neither is sent. Sandbox-verify one
+  challenge flow with device data before production.
 - **Refund reads (corrected in review, 2026-07-15):** Direct has NO refund-by-id endpoint —
   `GET /{merchantId}/refunds/{refundId}` is Connect-era; the only read surface is
   `GET /v2/{merchantId}/payments/{paymentId}/refunds`. `refundPayment` therefore returns a

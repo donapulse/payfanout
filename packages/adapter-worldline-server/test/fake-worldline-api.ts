@@ -129,14 +129,29 @@ export class FakeWorldlineApi {
     const hostedTokenizationId = body["hostedTokenizationId"] as string | undefined;
     const card = (body["cardPaymentMethodSpecificInput"] ?? {}) as {
       authorizationMode?: string;
+      threeDSecure?: { redirectionData?: { returnUrl?: string } };
     };
     const amount = order.amountOfMoney?.amount ?? 0;
     const currencyCode = order.amountOfMoney?.currencyCode ?? "EUR";
-    if (!hostedTokenizationId) {
-      return json(400, {
-        errorId: "val",
-        errors: [{ code: "1", propertyName: "hostedTokenizationId", message: "required", httpStatusCode: 400 }],
-      });
+    const invalid = (propertyName: string, message: string): Response =>
+      json(400, { errorId: "val", errors: [{ code: "1", propertyName, message, httpStatusCode: 400 }] });
+    if (!hostedTokenizationId) return invalid("hostedTokenizationId", "required");
+    // The 3-D Secure guide lists this among the properties every card payment
+    // must send, so the fake refuses a payment that omits it.
+    if (!card.threeDSecure?.redirectionData?.returnUrl) {
+      return invalid("cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl", "required");
+    }
+    // The API contract caps it at 200 characters and rejects a URL without a protocol.
+    const returnUrl = card.threeDSecure.redirectionData.returnUrl;
+    if (returnUrl.length > 200) {
+      return invalid("cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl", "exceeds 200 characters");
+    }
+    if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(returnUrl)) {
+      return invalid("cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl", "must contain a protocol");
+    }
+    // The API contract caps orderReferences.merchantReference at 40 characters.
+    if ((order.references?.merchantReference?.length ?? 0) > 40) {
+      return invalid("order.references.merchantReference", "exceeds 40 characters");
     }
     if (amount === DECLINE_AMOUNT) {
       // Documented decline shape: HTTP 402 with errors[] and paymentResult.

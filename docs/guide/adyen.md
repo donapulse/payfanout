@@ -19,13 +19,14 @@ Two packages: [`@payfanout/adapter-adyen-server`](/guide/server) (holds your API
 [`@payfanout/adapter-adyen`](/guide/react) (browser-safe, holds only the public client key).
 
 ::: warning Validate against your own test account before going live
-Every provider-dependent fact in this adapter is verified against Adyen's current
-documentation, and the webhook signature is checked against Adyen's own published test
-vector — but the adapter has not yet been exercised against a live Adyen test account.
-Run one payment, one capture, one refund and one webhook delivery through **your** account
-before taking it to production, and check the results against §9. Account-specific
-behaviour — enabled payment methods, whether multiple partial capture is switched on, the
-exact `additionalData` your account returns — is only observable there.
+The provider-dependent facts in this adapter come from Adyen's documentation, not from test
+traffic. The webhook signature is checked against Adyen's own published test vector, but the
+adapter has not yet been exercised against an Adyen test account. Run one payment, one
+3-D Secure 2 challenge, one payment routed to the 3-D Secure redirect flow, one capture, one
+refund and one webhook delivery through **your** account before taking it to production, and
+check the results against [§9](#_9-test-values). Account-specific behaviour — enabled payment
+methods, the capture delay, whether multiple partial capture is switched on, the exact
+`additionalData` your account returns — is only observable there.
 :::
 
 ::: warning Adyen API details evolve
@@ -48,12 +49,35 @@ From the **Adyen Customer Area** (Developers → API credentials, and Developers
 
 | Credential | What it is | Used by |
 | --- | --- | --- |
-| **API key** | Checkout API key, sent as `X-API-Key` (server-only) | server adapter (`apiKey`) |
-| **Merchant account** | The account every request is booked against | server adapter (`merchantAccount`) |
-| **HMAC key** | Generated per webhook; a **hex** string that signs deliveries | server adapter (`hmacKeys`) |
+| **API key** | The credential's key (Server settings → Authentication → API key), sent as `X-API-Key`; server-only, copy it when you generate it | server adapter (`apiKey`) |
+| **Merchant account** | The merchant account name, as the account switcher in the Customer Area's upper-left corner shows it; case-sensitive | server adapter (`merchantAccount`) |
+| **HMAC key** | Generated under **Security** on the webhook; a **hex** string, one per webhook endpoint | server adapter (`hmacKeys`) |
 | **Webhook username + password** | Basic authentication on the webhook endpoint | server adapter (`webhookBasicAuth`) |
-| **Live URL prefix** | The account's live prefix; **live only** | server adapter (`liveUrlPrefix`) |
-| **Client key** | Public, browser-safe key; its origins are allowlisted in the Customer Area | client adapter (`clientKey`) |
+| **Live URL prefix** | Developers → API URLs → Prefix in the **live** Customer Area, for example `1797a841fbb37ca7-AdyenDemo`; **live only** | server adapter (`liveUrlPrefix`) |
+| **Client key** | Public, browser-safe key (Client settings → Authentication → Client key), `test_…` or `live_…` | client adapter (`clientKey`) |
+
+**Enable the Checkout encrypted cardholder data role.** Adyen requires it to accept the
+encrypted card data the card fields produce, and it is not among the roles assigned by
+default ([roles](https://docs.adyen.com/development-resources/api-credentials/roles)). Tick
+it under **Permissions** on the credential; a credential missing a required role gets Adyen
+error `010` "Not allowed"
+([error codes](https://docs.adyen.com/development-resources/error-codes)). Live credentials
+are configured separately, so enable it there again.
+
+**Allowed origins** are set on the API credential: Adyen expects client-side requests only
+from those domains. A test credential accepts `https` origins and the local secure contexts
+`http://localhost`, `http://127.0.0.1` and `http://*.localhost`; live origins must be `https`.
+A wildcard such as `https://*.example.org` covers every subdomain.
+
+**The live URL prefix** is a hex-encoded random part followed by your company name, one per
+company account ([live endpoints](https://docs.adyen.com/development-resources/live-endpoints)).
+Pass the prefix alone, not a URL; the adapter builds
+`https://{liveUrlPrefix}-checkout-live.adyenpayments.com/checkout/{apiVersion}` from it.
+
+**Rotating keys.** A new API key is active at once and the previous one keeps working for 24
+hours; a replaced client key also expires after 24 hours. A new HMAC key takes some time to
+propagate, so keep the previous key in `hmacKeys` next to the new one for a while
+([secure webhooks](https://docs.adyen.com/development-resources/webhooks/secure-webhooks)).
 
 Sandbox and live are **separate credential sets** and **separate hosts**; the adapter derives
 the host from `environment` (`sandbox → checkout-test.adyen.com`,
@@ -207,14 +231,34 @@ const adyen = new AdyenClientAdapter({
   `stylesheetUrl` to self-host.
 
 ::: tip Content-Security-Policy
-A CSP-enforcing page must allow Adyen, or the fields fail quietly. Adyen's own guidance is
-the wildcard, because 3-D Secure and wallet frames are served from several hosts:
+A CSP-enforcing page must allow Adyen, or the fields fail quietly. 3-D Secure 2 challenges
+are harder: they load from the card **issuer's** domains, and Adyen documents that it cannot
+list them all, so a strict policy can block the challenge
+([script security](https://docs.adyen.com/development-resources/pci-dss-compliance-guide/script-security),
+[native 3-D Secure 2](https://docs.adyen.com/online-payments/3d-secure/native-3ds2)).
+Following Adyen's recommended policy, a page running this adapter needs:
 
 ```
 script-src  https://*.adyen.com
-frame-src   https://*.adyen.com
-connect-src https://*.adyen.com
+style-src   https://*.adyen.com
+frame-src   *
+connect-src *
+form-action *
+img-src     *
 ```
+
+- **`script-src`, `style-src`**: the adapter loads Adyen Web's `adyen.js` and `adyen.css`
+  from Adyen's CDN. Adyen's sample policy lists `style-src` only for Cash App, which would
+  block the stylesheet, so allow the Adyen host there too.
+- **`frame-src`, `connect-src`, `form-action`, `img-src`**: the wildcard, as Adyen
+  recommends. For frames it gives the reason above — issuer challenge pages it cannot
+  list — and adds that its own iframes and the issuers' 3-D Secure iframes are sandboxed.
+
+Adyen's sample also allows wallet and partner hosts in `script-src`; this adapter mounts
+only the Card component, so it needs none of them. The onboarding descriptor
+(`adyenOnboarding.csp`) lists `https://*.adyen.com` under `script` and leaves `frame` and
+`connect` empty, its convention for a documented wildcard; `style-src`, `form-action` and
+`img-src` have no descriptor field.
 :::
 
 ## 6. 3-D Secure
@@ -358,27 +402,76 @@ persist every event, dedupe by `event.id`, and alert on gaps.
 
 ## 9. Test values
 
-Use
-[Adyen's documented sandbox cards](https://docs.adyen.com/development-resources/test-cards-and-credentials/test-card-numbers)
-— Visa `4111 1111 1111 1111` and Mastercard `5555 5555 5555 4444`, both expiry `03/2030`,
-CVC `737`. **Refusals are triggered by field values, not by the card number**: put the
-trigger in `paymentMethod.holderName` or `additionalData.RequestedTestAcquirerResponseCode`,
-per
-[Adyen's testing page](https://docs.adyen.com/development-resources/testing/result-codes).
-Confirm the current list before relying on it.
+[Adyen's test cards](https://docs.adyen.com/development-resources/test-cards-and-credentials/test-card-numbers)
+work on its test platform only — for example Visa `4111 1111 1111 1111` and Mastercard
+`5555 5555 5555 4444`, both expiry `03/2030`, CVC `737`.
+
+**3-D Secure 2.** Adyen's
+[3-D Secure 2 testing page](https://docs.adyen.com/development-resources/testing/3d-secure-2-authentication)
+lists the enrolled cards, among them Mastercard `5454 5454 5454 5454` and Visa
+`4917 6100 0000 0000` (`03/2030`, `737`). Its challenge scenario uses Visa
+`4212 3456 7891 0006` and its frictionless scenario Mastercard `5201 2815 0512 9736`, both
+`03/2030`, `737`. Answer a browser challenge with the password `password`; any other value
+fails the authentication. If your test account's Dynamic 3D Secure default rule is
+**Prefer Not**, set it to **Always** while testing so these cards trigger 3-D Secure.
+
+**Refusals are triggered by the cardholder name, not the card number.** Adyen reads the
+trigger from `paymentMethod.holderName` or `additionalData.RequestedTestAcquirerResponseCode`
+([testing result codes](https://docs.adyen.com/development-resources/testing/result-codes)).
+This adapter never sends the second, so type the trigger into the Card's cardholder-name
+field, with any test card above. The field is shown by default; if your
+`@payfanout/adapter-adyen` predates that, enable it with
+`fieldOptions: { hasHolderName: true }`.
+
+| Cardholder name | Adyen `refusalReason` | `completePayment` rejects with |
+| --- | --- | --- |
+| `DECLINED` | Refused | `card_declined` |
+| `CARD_EXPIRED` | Expired Card | `expired_card` |
+| `NOT_ENOUGH_BALANCE` | Not enough balance | `insufficient_funds` |
+| `CVC_DECLINED` | CVC Declined | `invalid_card_data` |
+| `ISSUER_UNAVAILABLE` | Issuer Unavailable | `processing_error` |
+
+For the failure webhooks, a payment made with the name `capture failed` gets
+`CAPTURE_FAILED` on its capture, and one made with `refund failed` gets `REFUND_FAILED` on
+its refund; Adyen notes the simulation can take up to 24 hours
+([testing payments and modifications](https://docs.adyen.com/development-resources/testing/payments-and-modifications)).
+Confirm the current values on Adyen's pages before relying on them.
 
 ## 10. Go live
 
-- [ ] Swap in the **live** API key, merchant account, HMAC key and webhook credentials.
-- [ ] Set `environment: "live"` on **both** adapters and add `liveUrlPrefix` on the server one
-      — Adyen issues the prefix per company account, under Developers → API URLs in the live
-      Customer Area ([live endpoints](https://docs.adyen.com/development-resources/live-endpoints)).
-- [ ] Allowlist your production origin for the **live** client key in the Customer Area.
-- [ ] Register the **live** webhook, with HMAC **and** basic authentication, and verify a test
-      delivery reaches your queue.
+Adyen does not copy settings from your test Customer Area to the live one
+([go-live checklist](https://docs.adyen.com/online-payments/go-live-checklist)): everything
+you configured in test is configured again in the **live** Customer Area.
+
+- [ ] Generate a **live** API key and enable the **Checkout encrypted cardholder data** role
+      on its credential ([§1](#_1-get-your-adyen-credentials)).
+- [ ] Swap in the **live** merchant account, set `environment: "live"` on **both** adapters,
+      and add `liveUrlPrefix` on the server one, from Developers → API URLs → Prefix
+      ([live endpoints](https://docs.adyen.com/development-resources/live-endpoints)).
+- [ ] Generate the **live** client key (`live_…`) and add your production origins to its
+      credential; live origins must be `https`.
+- [ ] Check that the live merchant account's **Capture delay** (Settings → Account settings →
+      General) is **immediate**, Adyen's default. The adapter sends no capture parameter for
+      `captureMethod: "automatic"`, so that setting decides when the money is taken; a
+      manual-capture payment carries `additionalData.manualCapture`, which overrides it
+      ([capture](https://docs.adyen.com/online-payments/capture)).
+- [ ] Add the card brands you accept to the live account.
+- [ ] Register the **live** webhook with HMAC **and** basic authentication. Its HMAC key is new
+      and differs from the test key, and live endpoints must be HTTPS on port 443, 8443 or
+      8843. Send a test delivery from the live Customer Area and check it reaches your queue
+      ([configure webhooks](https://docs.adyen.com/development-resources/webhooks/configure-and-manage)).
+- [ ] If you read `additionalData` from `raw`, give the live account the same additional-data
+      settings for API responses and webhooks as the test one.
+- [ ] Allow for Mastercard 3-D Secure enrollment, which can take up to 12 hours after the live
+      Customer Area is activated.
+- [ ] Complete PCI DSS **SAQ A**, the document Adyen requires for this kind of integration,
+      and have an approved scanning vendor scan the page that loads Adyen's components every
+      quarter and after significant changes
+      ([PCI DSS compliance](https://docs.adyen.com/online-payments/pci-dss-compliance),
+      [vulnerability scanning](https://docs.adyen.com/development-resources/pci-dss-compliance-guide/vulnerability-scanning-regulation)).
 - [ ] Keep `ADYEN_SESSION_KEY` stable and secret in production; rotating it invalidates
       in-flight sessions.
-- [ ] Verify card fields are still Adyen's hosted iframes (SAQ-A), no raw card input.
+- [ ] Verify card fields are still Adyen's hosted iframes (SAQ A), no raw card input.
 - [ ] Re-check endpoint paths, [event codes](https://docs.adyen.com/development-resources/webhooks/webhook-types),
       [result codes](https://docs.adyen.com/online-payments/build-your-integration/payment-result-codes)
       and [refusal reason codes](https://docs.adyen.com/development-resources/refusal-reasons)

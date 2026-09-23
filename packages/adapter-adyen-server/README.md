@@ -130,9 +130,14 @@ is one whose signed values were altered. `verifyAdyenWebhook` returns the specif
   of reaching Adyen. A host `id` containing `:` or `\` is refused too: it becomes the
   `merchantReference` Adyen signs into every webhook, and the delimiter would make those
   signatures unverifiable.
-- Manual capture is requested per payment (`additionalData.manualCapture`), so enabling it
-  account-wide is not required. Multiple partial captures are off by default at Adyen and a
-  single partial capture releases the remainder, so `supportsMultiCapture` is `false`.
+- Manual capture is requested per payment (`additionalData.manualCapture`), which overrides
+  the merchant account's capture setting, so enabling it account-wide is not required.
+  Automatic capture sends no capture parameter and follows the account's **Capture delay**
+  (Settings → Account settings in the Customer Area), so keep it at **immediate**, Adyen's
+  default: under a manual or N-day setting, a payment the adapter reports as `succeeded` is
+  not captured until you capture it or the delay runs out. Multiple partial captures are off
+  by default at Adyen and a single partial capture releases the remainder, so
+  `supportsMultiCapture` is `false`.
 - **CLP, CVE, IDR and ISK are rejected locally**: Adyen prices them with different fractional
   digits than ISO 4217 (PayFanout's minor-unit contract), so passing amounts through would
   shift the decimal point. The check runs on session creation *and* on the currency carried

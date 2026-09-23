@@ -1396,27 +1396,35 @@ description of what v2 changes is what the migration then had to implement.
 ## Stripe: payment-method error codes from 2026-08-26.dahlia (2026-09-23)
 
 - **`expired_payment_method` maps to `expired_card` and `incorrect_postal_code` to
-  `invalid_card_data`, both non-retryable.** Doc-verified 2026-09-23
+  `invalid_card_data`, both non-retryable, as a defensive mapping.** Doc-verified 2026-09-23
   (docs.stripe.com/changelog/dahlia/2026-08-26/adds-payment-method-error-codes): the new
   codes "are similar to existing error codes, but represent failures consistently across
-  payment method types, countries, and regions", where earlier versions reported the
-  card-specific `expired_card` and the region-specific `incorrect_zip`.
-  docs.stripe.com/error-codes gives each the same remedy as its counterpart: check the
-  expiration date or postal code, or use a different payment method.
-- **Only hosts pinned to 2026-08-26.dahlia or later receive them.** `mapStripeError` sees the
-  errors of the adapter's own calls, which carry the host's pinned `apiVersion` (an injected
-  client keeps its own). The release removes no error codes, so the card-specific mappings
-  stay.
+  payment method types, countries, and regions", and docs.stripe.com/error-codes gives each
+  the remedy of its card-specific counterpart. The release is marked non-breaking and removes
+  no codes, and docs.stripe.com/testing still lists the expired-card test card as returning
+  `expired_card`, so whether card declines now carry the new codes is undocumented. The
+  mapping only makes sure that one which does arrive lands where its counterpart does.
+- **Server half only, and only for hosts pinned to 2026-08-26.dahlia or later.**
+  `mapStripeError` sees the errors of the adapter's own calls, which carry the host's pinned
+  `apiVersion`. The browser adapter follows the account's default API version through
+  Stripe.js and maps none of these codes (nor `incorrect_zip`); aligning it is a follow-up.
 - **The checks live in the `StripeCardError` branch only.** Neither page states which error
   `type` the new codes arrive with, so the conservative reading extends the branch that
   already handles `expired_card` and `incorrect_zip`; under any other type they fall through
-  to that type's existing mapping. Revisit if a sandbox run shows them on another type.
-- **`authentication_failure` and `payment_method_restricted` stay `card_declined`,
-  non-retryable.** The first is documented as a decline because authentication failed; the
-  changelog says such failures were previously reported as
-  `payment_intent_authentication_failure` or `setup_intent_authentication_failure`, whose
-  documented remedy is a new payment method — not bringing the customer back on-session,
-  which is what `authentication_required` means. The second covers "issuer or platform
-  restrictions", a generic decline; a `lost_card` or `stolen_card` decline code on the same
-  error still yields `fraud_suspected` through the existing decline-code check. Unit tests pin
-  both outcomes and the lost-card case, so neither drifts into a more specific code.
+  to that type's existing mapping. A sandbox run pinned to this version with the expired-card
+  and lost-card test cards, recording `type`, `code`, `decline_code` and `message`, would
+  settle this and the next two points.
+- **`authentication_failure` is left unmapped (default, unconfirmed).** It falls through to
+  `card_declined`. Stripe documents a new payment method as the remedy for a failed
+  authentication, but the other adapters map a failed 3-D Secure to `authentication_required`
+  (Worldline `40001134`, Adyen `11`/`38`/`42`, and the Stripe browser adapter's
+  `payment_intent_authentication_failure` and `setup_intent_authentication_failure`), and the
+  2026-07-08 contract hardening removed exactly this kind of per-PSP divergence for
+  `authentication_required`. Which way the Stripe server half should go is an open decision;
+  a unit test records the current fall-through so that a change is deliberate.
+- **`payment_method_restricted` stays `card_declined`.** Stripe's example is a card reported
+  lost or stolen; the existing `restricted_card` decline code ("it's possible it was reported
+  lost or stolen") already falls through to `card_declined`, and a `lost_card` or
+  `stolen_card` decline code on the same error still yields `fraud_suspected`, whose message
+  is generic as docs.stripe.com/declines/codes asks. Whether Stripe sends a decline code
+  alongside this code is undocumented.

@@ -63,7 +63,8 @@ describe("mapStripeError", () => {
       retryable: false,
     },
     {
-      // A failed authentication is a decline — a new payment method, not another on-session attempt.
+      // Unmapped for now: falls through to card_declined. Whether it should join the other
+      // adapters' authentication_required is an open decision (docs/decisions.md).
       name: "failed authentication",
       err: { type: "StripeCardError", code: "authentication_failure", message: "…" },
       code: "card_declined",
@@ -88,7 +89,8 @@ describe("mapStripeError", () => {
       retryable: false,
     },
     {
-      // The decline code still decides when it names a lost or stolen card.
+      // Stripe does not say whether a decline code accompanies this code; when one names a
+      // lost or stolen card, it still decides.
       name: "restricted payment method reported lost",
       err: { type: "StripeCardError", code: "payment_method_restricted", decline_code: "lost_card", message: "…" },
       code: "fraud_suspected",

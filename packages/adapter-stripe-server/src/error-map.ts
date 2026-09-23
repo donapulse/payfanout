@@ -57,7 +57,6 @@ function classify(e: StripeErrorLike): { code: UnifiedErrorCode; retryable: bool
     if (e.code && INVALID_CARD_DATA_CODES.has(e.code)) {
       return { code: "invalid_card_data", retryable: false, message: userMessage };
     }
-    // Not authentication_failure: that attempt already failed, and the remedy is a new payment method.
     if (e.code === "authentication_required" || e.decline_code === "authentication_required") {
       // Resolved by bringing the customer back on-session, never by replaying the call.
       return { code: "authentication_required", retryable: false, message: userMessage };

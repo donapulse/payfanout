@@ -287,7 +287,12 @@ Implement `ClientPaymentAdapter`:
   `loadScript`/`get<Psp>Global` test seams in config.
 - `loadSdk()`: inject the PSP script lazily and idempotently (core's `injectScript` /
   `assertBrowser` helpers); guard SSR with a clear error. `<PayFanoutProvider>` never
-  calls you eagerly.
+  calls you eagerly. If the PSP publishes Subresource Integrity hashes for a
+  version-pinned SDK file, pass the hash: `injectScript(url, pspName, { integrity })`
+  sets `integrity` (and `crossorigin="anonymous"` unless you pass `crossOrigin`), a file
+  that fails the check rejects like any other load failure, and a script for the same URL
+  already on the page is reused only if it carries the same hash. Never hash a URL whose
+  content the PSP updates in place: its next release would fail the check.
 - `mount(container, options)`: render **hosted/iframe fields only** (SAQ-A), never a raw
   card input. Forward `options.appearance` to the PSP's styling hooks. Return a branded
   handle via `brandMountedFieldsHandle`, and validate handles you receive back. A

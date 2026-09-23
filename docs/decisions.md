@@ -504,7 +504,8 @@ docs.direct.worldline-solutions.com unless noted):
   statusOutput.statusCode=5") → `requires_capture`; 73/83 (a refused deletion or refund, the
   payment staying at 9) → `succeeded`. Then, still before the category band: CANCELLED 61/62
   (a cancellation still awaiting the acquirer) → `processing`, any other CANCELLED →
-  `canceled`; the CANCELLATION_REJECTED and REJECTED_CAPTURE strings → `requires_capture`;
+  `canceled`; without a status string (the contract does not require one) 1/6 → `canceled`
+  and 61/62 → `processing`; the CANCELLATION_REJECTED and REJECTED_CAPTURE strings → `requires_capture`;
   REFUND_REQUESTED and the REVERSED band → `succeeded`. A capture carrying 93 or a refund
   carrying 73/83 stays out of `amountCaptured` / `amountRefunded`, and a refund maps by its
   statusCode when that is its only signal.
@@ -524,8 +525,9 @@ docs.direct.worldline-solutions.com unless noted):
   minor-unit item below). CancelPayment answers 409 both for a request "currently being
   processed" under the same idempotence key (idempotent-requests guide) and, per the
   contract, for "Cancellation is not allowed because payment is closed"; after the transport
-  retries, a 409 is read against the payment. A payment whose `status` is CANCELLED answers
-  `canceled` (or `processing` at 61/62); a payment still cancellable
+  retries, a 409 is read against the payment. A payment reading `canceled` answers as is, and
+  one reading `processing` does when its status is CANCELLED or, without a status string, its
+  code is 61/62; a payment still cancellable
   (`statusOutput.isCancellable`, or when that flag is absent, one reading `requires_capture`)
   keeps the retryable `processing_error`, because the original may still land and a replay
   under the same key answers the original's outcome; anything else rejects with a
@@ -561,7 +563,8 @@ docs.direct.worldline-solutions.com unless noted):
   reports a failed capture on a payment that stays authorised until the merchant captures
   again or cancels, so neither `payment.failed`, which would tell hosts the money is gone, nor
   a success type is honest; `retrievePayment` reports `requires_capture`), `payment.cancelled`
-  → `payment.canceled`, `payment.refunded` → `payment.refunded`, pending payment states →
+  → `payment.canceled`, a `payment.rejected` or `payment.cancelled` carrying 63/93 →
+  `unknown` for the same reason, `payment.refunded` → `payment.refunded`, pending payment states →
   `payment.processing`. `refund.refund_requested` maps to `unknown` deliberately — it is
   recognized but non-terminal, and the unified vocabulary has no in-flight refund state;
   fabricating a terminal type would misreport it. The parser additionally TOLERATES

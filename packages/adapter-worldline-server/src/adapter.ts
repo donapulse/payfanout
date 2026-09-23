@@ -478,7 +478,8 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       const info = await this.retrievePayment(pspPaymentId);
       const payment = info.raw as WorldlinePaymentLike; // retrievePayment carries the payment object on raw
       const code = payment.statusOutput?.statusCode;
-      const cancelling = (payment.status ?? "").toUpperCase() === "CANCELLED" || code === 61 || code === 62;
+      const statusString = (payment.status ?? "").toUpperCase();
+      const cancelling = statusString === "CANCELLED" || (statusString === "" && (code === 61 || code === 62));
       if (info.status === "canceled" || (info.status === "processing" && cancelling)) return info;
       if (payment.statusOutput?.isCancellable ?? info.status === "requires_capture") throw err;
       throw new PayFanoutError({
@@ -848,9 +849,11 @@ function isFailedStatus(operation: WorldlineStatusFields): boolean {
  * `requires_capture`; a refused deletion or refund (73/83) leaves it captured,
  * so `succeeded` (refund state derives from amountRefunded). Next, a
  * cancellation still awaiting the acquirer (CANCELLED 61/62) is `processing`
- * and any other CANCELLED is `canceled`, never read as a failure; a refund in
- * flight (REFUND_REQUESTED) leaves the payment captured, so `succeeded`. After
- * that the primary signal is statusOutput.statusCategory (Worldline's
+ * and any other CANCELLED is `canceled`, never read as a failure; without a
+ * status string (the contract does not require one) codes 1/6 are `canceled`
+ * and 61/62 `processing`; a refund in flight (REFUND_REQUESTED) leaves the
+ * payment captured, so `succeeded`. After that the primary signal is
+ * statusOutput.statusCategory (Worldline's
  * forward-compatible band — new statuses join an existing category), with
  * statusCode and the status string as fallbacks; anything unrecognized is
  * `processing`, never a fabricated terminal state.

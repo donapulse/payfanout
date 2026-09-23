@@ -55,12 +55,13 @@ export async function verifyWorldlineWebhookSignature(
  * payment state is `payment.processing`, and recognized-but-non-terminal refund
  * requests are deliberately NOT forced into a terminal refund type (see below).
  * A rejection is only a failed payment when the payment itself was refused —
- * mapEventType reads refused refunds and refused captures apart.
+ * mapEventType reads refused refunds, refused captures and refused
+ * cancellations (63/93) apart.
  */
 const EVENT_TYPE_MAP: Record<string, UnifiedWebhookEventType> = {
   "payment.captured": "payment.succeeded",
   "payment.refunded": "payment.refunded",
-  "payment.rejected": "payment.failed", // unless its status code is a refused refund (mapEventType)
+  "payment.rejected": "payment.failed", // unless its status code is a refused refund or a 63/93 (mapEventType)
   // payment.rejected_capture is intentionally absent — see mapEventType.
   "payment.cancelled": "payment.canceled",
   "payment.redirected": "payment.requires_action",

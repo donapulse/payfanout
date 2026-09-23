@@ -164,6 +164,11 @@ describe("mapWorldlineStatus", () => {
     [undefined, 6, "UNSUCCESSFUL", "canceled"],
     [undefined, 61, "UNSUCCESSFUL", "processing"],
     [undefined, 62, "UNSUCCESSFUL", "processing"],
+    // ...including under PENDING_MERCHANT, the band CancelPayment gives 61/62.
+    [undefined, 61, "PENDING_MERCHANT", "processing"],
+    // An unknown status string with no category reaches the code fallback.
+    ["SOMETHING_NEW", 6, undefined, "canceled"],
+    ["SOMETHING_NEW", 61, undefined, "processing"],
   ];
   for (const [status, code, category, expected] of cases) {
     it(`maps ${status ?? "-"}/${code ?? "-"}/${category ?? "-"} -> ${expected}`, () => {

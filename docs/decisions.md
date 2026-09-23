@@ -474,7 +474,14 @@ docs.direct.worldline-solutions.com unless noted):
   each result on to a host-supplied one. The same guide also asks for `integrity` (the
   CreateHostedTokenization response's `sri`) and `crossorigin="anonymous"` on the Tokenizer
   script tag; not applied yet, because the browser receives only the hostedTokenizationUrl and
-  core's script injection sets neither attribute.
+  no channel carries the per-session `sri` to the client adapter. Updated 2026-09-23: core's
+  `injectScript` can now set both attributes (`{ integrity, crossOrigin }`). With a hash it
+  defaults `crossorigin` to `anonymous`, since the browser checks a cross-origin file only in
+  CORS mode; it reuses a `<script>` already on the page for the URL only if every such tag
+  carries the same `integrity` and a `crossorigin` attribute (the value is not compared), and
+  otherwise rejects with a non-retryable `invalid_request` without injecting, as it does for
+  an `integrity` holding no `sha256-`, `sha384-` or `sha512-` token. That is a conflict check,
+  not a trust boundary: client adapters return before injecting once the SDK global exists.
 - **CreatePayment wiring (corrected in review, 2026-07-15):** `hostedTokenizationId` rides
   at the ROOT of the CreatePayment request — the platform's current domain model declares it
   there and `CardPaymentMethodSpecificInput` has no such field (the guide's "replace the

@@ -1,5 +1,7 @@
 import { PayFanoutError } from "./errors.js";
 
+const SRI_HASH = /(?:^|\s)sha(?:256|384|512)-\S/;
+
 /**
  * Guards a client adapter method against SSR: PSP browser SDKs need a real
  * `window`/`document`. `adapterName` names the throwing class in the message
@@ -22,15 +24,25 @@ export interface InjectScriptOptions {
    * Subresource Integrity metadata, set verbatim as the tag's `integrity`
    * attribute, e.g. `"sha384-<base64 digest>"`. The browser refuses to run a
    * file that does not match, and that refusal rejects like any other load
-   * failure. A value holding no hash the browser recognizes (sha256, sha384,
-   * sha512) checks nothing, so validate hashes where they are configured.
+   * failure. A value holding no sha256, sha384 or sha512 hash (empty, or with
+   * a mistyped algorithm the browser would ignore) rejects with a
+   * non-retryable invalid_request, and nothing is injected.
+   *
+   * With it, the call also detects a conflicting `<script>` already on the
+   * page for the same URL (see {@link injectScript}). That is not a trust
+   * boundary: every shipped client adapter returns from `loadSdk()` before
+   * calling `injectScript` once the SDK global exists, so a copy the host page
+   * already loaded is used without any check.
    */
   integrity?: string;
   /**
    * The tag's `crossorigin` attribute. Defaults to `"anonymous"` when
    * `integrity` is set: the browser checks a cross-origin file only when it
    * is fetched in CORS mode, which its server must allow, and blocks one it
-   * cannot check. Without `integrity` it is set only when given.
+   * cannot check. `"use-credentials"` fails against a CDN answering
+   * `Access-Control-Allow-Origin: *`. Without `integrity` it is set only when
+   * given. With `integrity`, a tag already on the page must have the
+   * attribute to be reused; its value is not compared.
    */
   crossOrigin?: "anonymous" | "use-credentials";
 }
@@ -43,39 +55,58 @@ export interface InjectScriptOptions {
  * this only gets the script tag onto the page.
  *
  * A `<script>` already on the page for `url` is reused: the call resolves at
- * once and injects nothing. With `options.integrity`, reuse requires every
- * such tag to carry exactly the same `integrity` string; otherwise the call
- * rejects with a non-retryable invalid_request attributed to `pspName`, rather
- * than trust a copy that was never checked against that hash, and never
- * injects a second copy. `crossOrigin` plays no part in reuse.
+ * once and injects nothing, although that tag may still be loading or may
+ * have failed (a failed tag stays on the page), so callers keep confirming
+ * the SDK global. With `options.integrity` the call also detects a
+ * conflicting tag: every `<script>` for `url` must carry exactly the same
+ * `integrity` string and a `crossorigin` attribute, whatever its value, since
+ * without one a cross-origin file is fetched without CORS and cannot pass the
+ * check. A conflicting tag makes the call reject with a non-retryable
+ * invalid_request attributed to `pspName`, as does an `integrity` holding no
+ * sha256, sha384 or sha512 hash; either way nothing is injected.
+ *
+ * This is not a trust boundary: every shipped client adapter's `loadSdk()`
+ * returns before calling `injectScript` once the SDK global exists, so a copy
+ * the host page already loaded is used without any check.
  */
 export function injectScript(url: string, pspName: string, options: InjectScriptOptions = {}): Promise<void> {
   const { integrity } = options;
   const crossOrigin = options.crossOrigin ?? (integrity === undefined ? undefined : "anonymous");
   return new Promise((resolve, reject) => {
+    const refuse = (message: string) =>
+      reject(
+        new PayFanoutError({
+          code: "invalid_request",
+          message,
+          retryable: false,
+          raw: undefined,
+          pspName,
+        }),
+      );
     const selector = `script[src="${url}"]`;
-    if (integrity !== undefined) {
+    let onPage: boolean;
+    if (integrity === undefined) {
+      onPage = Boolean(document.querySelector(selector));
+    } else if (!SRI_HASH.test(integrity)) {
+      refuse(`The integrity for ${url} holds no sha256, sha384 or sha512 hash`);
+      return;
+    } else {
       const tags = Array.from(document.querySelectorAll(selector));
-      if (tags.some((tag) => tag.getAttribute("integrity") !== integrity)) {
-        reject(
-          new PayFanoutError({
-            code: "invalid_request",
-            message: `A <script> for ${url} is already on the page without the requested integrity`,
-            retryable: false,
-            raw: undefined,
-            pspName,
-          }),
+      if (tags.some((tag) => tag.getAttribute("integrity") !== integrity || tag.getAttribute("crossorigin") === null)) {
+        refuse(
+          `A conflicting <script> for ${url} is already on the page: it lacks the requested integrity or a crossorigin attribute`,
         );
         return;
       }
+      onPage = tags.length > 0;
     }
-    const existing = document.querySelector(selector);
-    if (existing) {
+    if (onPage) {
       resolve();
       return;
     }
     const script = document.createElement("script");
-    // The browser reads both when the tag is inserted; setting them later has no effect.
+    // Set before src and insertion: a browser may start fetching once src is set,
+    // and discards that fetch if crossorigin changes afterwards.
     if (integrity !== undefined) script.setAttribute("integrity", integrity);
     if (crossOrigin !== undefined) script.setAttribute("crossorigin", crossOrigin);
     script.src = url;

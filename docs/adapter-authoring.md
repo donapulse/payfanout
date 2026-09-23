@@ -287,12 +287,23 @@ Implement `ClientPaymentAdapter`:
   `loadScript`/`get<Psp>Global` test seams in config.
 - `loadSdk()`: inject the PSP script lazily and idempotently (core's `injectScript` /
   `assertBrowser` helpers); guard SSR with a clear error. `<PayFanoutProvider>` never
-  calls you eagerly. If the PSP publishes Subresource Integrity hashes for a
+  calls you eagerly. Return before calling `injectScript` once the SDK global exists, as
+  every shipped client adapter does, and confirm the global after it resolves: a script
+  already on the page for the URL is reused at once, though it may still be loading or
+  may have failed. If the PSP publishes Subresource Integrity hashes for a
   version-pinned SDK file, pass the hash: `injectScript(url, pspName, { integrity })`
-  sets `integrity` (and `crossorigin="anonymous"` unless you pass `crossOrigin`), a file
-  that fails the check rejects like any other load failure, and a script for the same URL
-  already on the page is reused only if it carries the same hash. Never hash a URL whose
-  content the PSP updates in place: its next release would fail the check.
+  sets `integrity` (and `crossorigin="anonymous"` unless you pass `crossOrigin`), and a
+  file that fails the check rejects like any other load failure. The PSP's CDN must
+  answer CORS (`Access-Control-Allow-Origin`) for the check to run; otherwise the file
+  is blocked. Pass a pinned hash only for the adapter's default pinned URL, never after
+  a host overrides the SDK URL or version, and never pin a hash for a URL whose content
+  the PSP updates in place: its next release would fail the check. A hash the PSP
+  returns at runtime for the current file (such as Worldline's `sri`) is fine. With a
+  hash, a conflicting `<script>` for the same URL, one without the same `integrity` or
+  without a `crossorigin` attribute, makes the call reject with a non-retryable
+  `invalid_request`, as does a value holding no `sha256-`, `sha384-` or `sha512-` hash.
+  That detects a conflicting tag; it is not a trust boundary, since returning early on
+  the SDK global means a copy the host page already loaded is used without any check.
 - `mount(container, options)`: render **hosted/iframe fields only** (SAQ-A), never a raw
   card input. Forward `options.appearance` to the PSP's styling hooks. Return a branded
   handle via `brandMountedFieldsHandle`, and validate handles you receive back. A

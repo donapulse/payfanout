@@ -25,13 +25,24 @@ function stubBareDocument(scriptOnPage: boolean): Record<string, unknown>[] {
 }
 
 class FakeScript {
-  src = "";
   async = false;
   onload: (() => void) | null = null;
   onerror: (() => void) | null = null;
   readonly attributes = new Map<string, string>();
+  /** Attributes as they stood when `src` was first set, from which point a browser may start fetching. */
+  srcSetWith: Record<string, string> | undefined;
   /** Attributes as they stood at insertion, which is when a browser reads them. */
   insertedWith: Record<string, string> | undefined;
+  private srcValue = "";
+
+  get src(): string {
+    return this.srcValue;
+  }
+
+  set src(value: string) {
+    this.srcValue = value;
+    this.srcSetWith ??= Object.fromEntries(this.attributes);
+  }
 
   setAttribute(name: string, value: string): void {
     this.attributes.set(name, value);
@@ -97,15 +108,23 @@ async function expectLoadFailure(loading: Promise<void>, url: string): Promise<v
   expect(error.raw).toBeUndefined();
 }
 
-async function expectReuseRefused(loading: Promise<void>): Promise<void> {
+async function expectRefused(loading: Promise<void>, message: string): Promise<void> {
   const error = await rejection(loading);
   expect(error.toJSON()).toEqual({
     name: "PayFanoutError",
     code: "invalid_request",
-    message: `A <script> for ${SDK_URL} is already on the page without the requested integrity`,
+    message,
     retryable: false,
     pspName: "acme",
   });
+  expect(error.raw).toBeUndefined();
+}
+
+function expectReuseRefused(loading: Promise<void>): Promise<void> {
+  return expectRefused(
+    loading,
+    `A conflicting <script> for ${SDK_URL} is already on the page: it lacks the requested integrity or a crossorigin attribute`,
+  );
 }
 
 describe("injectScript without options", () => {
@@ -134,10 +153,11 @@ describe("injectScript without options", () => {
 });
 
 describe("injectScript options", () => {
-  it("sets integrity and a default crossorigin of anonymous before inserting the script", async () => {
+  it("sets integrity and a default crossorigin of anonymous before setting src and inserting the script", async () => {
     const { injected } = stubPage();
     const loading = injectScript(SDK_URL, "acme", { integrity: HASH });
     expect(injected).toHaveLength(1);
+    expect(injected[0]!.srcSetWith).toEqual({ integrity: HASH, crossorigin: "anonymous" });
     expect(injected[0]!.insertedWith).toEqual({ integrity: HASH, crossorigin: "anonymous" });
     expect(injected[0]).toMatchObject({ src: SDK_URL, async: true });
     injected[0]!.onload!();
@@ -147,14 +167,14 @@ describe("injectScript options", () => {
   it("honours an explicit crossOrigin alongside integrity", () => {
     const { injected } = stubPage();
     void injectScript(SDK_URL, "acme", { integrity: HASH, crossOrigin: "use-credentials" });
-    expect(injected[0]!.insertedWith).toEqual({ integrity: HASH, crossorigin: "use-credentials" });
+    expect(injected[0]!.srcSetWith).toEqual({ integrity: HASH, crossorigin: "use-credentials" });
   });
 
   it("sets crossorigin without integrity only when asked", () => {
     const { injected } = stubPage();
     void injectScript(SDK_URL, "acme", {});
     void injectScript(OTHER_URL, "acme", { crossOrigin: "anonymous" });
-    expect(injected.map((script) => script.insertedWith)).toEqual([{}, { crossorigin: "anonymous" }]);
+    expect(injected.map((script) => script.srcSetWith)).toEqual([{}, { crossorigin: "anonymous" }]);
   });
 
   it("rejects a file that fails its integrity check exactly like any other load failure", async () => {
@@ -163,6 +183,24 @@ describe("injectScript options", () => {
     // A digest mismatch reaches the page only as the tag's error event.
     injected[0]!.onerror!();
     await expectLoadFailure(loading, SDK_URL);
+  });
+
+  it("refuses an integrity holding no sha256, sha384 or sha512 hash, and injects nothing", async () => {
+    const { injected } = stubPage();
+    for (const integrity of ["", "   ", "sha348-abc", "md5-abc"]) {
+      await expectRefused(
+        injectScript(SDK_URL, "acme", { integrity }),
+        `The integrity for ${SDK_URL} holds no sha256, sha384 or sha512 hash`,
+      );
+    }
+    expect(injected).toHaveLength(0);
+  });
+
+  it("accepts an integrity holding a usable hash, alone or beside another token", () => {
+    const { injected } = stubPage();
+    void injectScript(SDK_URL, "acme", { integrity: "sha384-abc" });
+    void injectScript(OTHER_URL, "acme", { integrity: "md5-abc sha512-abc" });
+    expect(injected.map((script) => script.srcSetWith?.["integrity"])).toEqual(["sha384-abc", "md5-abc sha512-abc"]);
   });
 });
 
@@ -174,6 +212,7 @@ describe("injectScript reuse of a script already on the page", () => {
   });
 
   it("reuses a script carrying the same integrity, even while it is still loading", async () => {
+    // Locks today's early resolution; a follow-up may change it, since a failed tag stays on the page.
     const { injected } = stubPage();
     const first = injectScript(SDK_URL, "acme", { integrity: HASH });
     await expect(injectScript(SDK_URL, "acme", { integrity: HASH })).resolves.toBeUndefined();
@@ -183,8 +222,24 @@ describe("injectScript reuse of a script already on the page", () => {
     await expect(first).resolves.toBeUndefined();
   });
 
+  it("reuses several scripts for the url that all carry the same integrity", async () => {
+    const { injected } = stubPage(
+      scriptOnPage(SDK_URL, { integrity: HASH, crossorigin: "anonymous" }),
+      scriptOnPage(SDK_URL, { integrity: HASH, crossorigin: "anonymous" }),
+    );
+    await expect(injectScript(SDK_URL, "acme", { integrity: HASH })).resolves.toBeUndefined();
+    expect(injected).toHaveLength(0);
+  });
+
   it("refuses a script for the url that carries no integrity, and injects nothing", async () => {
     const { injected } = stubPage(scriptOnPage(SDK_URL));
+    await expectReuseRefused(injectScript(SDK_URL, "acme", { integrity: HASH }));
+    expect(injected).toHaveLength(0);
+  });
+
+  it("refuses a script carrying the same integrity but no crossorigin, and injects nothing", async () => {
+    // Fetched without CORS, a cross-origin file can never have passed its integrity check.
+    const { injected } = stubPage(scriptOnPage(SDK_URL, { integrity: HASH }));
     await expectReuseRefused(injectScript(SDK_URL, "acme", { integrity: HASH }));
     expect(injected).toHaveLength(0);
   });
@@ -204,13 +259,19 @@ describe("injectScript reuse of a script already on the page", () => {
   });
 
   it("refuses when any one of several scripts for the url lacks the integrity", async () => {
-    const { injected } = stubPage(scriptOnPage(SDK_URL, { integrity: HASH }), scriptOnPage(SDK_URL));
+    const { injected } = stubPage(
+      scriptOnPage(SDK_URL, { integrity: HASH, crossorigin: "anonymous" }),
+      scriptOnPage(SDK_URL),
+    );
     await expectReuseRefused(injectScript(SDK_URL, "acme", { integrity: HASH }));
     expect(injected).toHaveLength(0);
   });
 
-  it("does not compare crossorigin when reusing", async () => {
-    const { injected } = stubPage(scriptOnPage(SDK_URL, { integrity: HASH, crossorigin: "use-credentials" }));
+  it("does not compare the crossorigin value when reusing", async () => {
+    const { injected } = stubPage(
+      scriptOnPage(SDK_URL, { integrity: HASH, crossorigin: "use-credentials" }),
+      scriptOnPage(SDK_URL, { integrity: HASH, crossorigin: "" }),
+    );
     await expect(injectScript(SDK_URL, "acme", { integrity: HASH })).resolves.toBeUndefined();
     expect(injected).toHaveLength(0);
   });

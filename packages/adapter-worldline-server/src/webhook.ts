@@ -54,12 +54,15 @@ export async function verifyWorldlineWebhookSignature(
  * terminal captures/refunds become success/refund outcomes; every non-terminal
  * payment state is `payment.processing`, and recognized-but-non-terminal refund
  * requests are deliberately NOT forced into a terminal refund type (see below).
+ * A rejection is only a failed payment when the payment itself was refused —
+ * mapEventType reads refused refunds, refused captures and refused
+ * cancellations (63/93) apart.
  */
 const EVENT_TYPE_MAP: Record<string, UnifiedWebhookEventType> = {
   "payment.captured": "payment.succeeded",
   "payment.refunded": "payment.refunded",
-  "payment.rejected": "payment.failed",
-  "payment.rejected_capture": "payment.failed",
+  "payment.rejected": "payment.failed", // unless its status code is a refused refund or a 63/93 (mapEventType)
+  // payment.rejected_capture is intentionally absent — see mapEventType.
   "payment.cancelled": "payment.canceled",
   "payment.redirected": "payment.requires_action",
   // Underway payment states — the terminal event follows later.
@@ -90,6 +93,7 @@ interface WorldlineWebhookResource {
   id?: string;
   paymentOutput?: { amountOfMoney?: WorldlineMoney };
   refundOutput?: { amountOfMoney?: WorldlineMoney };
+  statusOutput?: { statusCode?: number };
 }
 
 interface WorldlineWebhookBody {
@@ -185,9 +189,14 @@ export async function parseWorldlineWebhookEvent(rawBody: string): Promise<Unifi
 
   const body = parsed as WorldlineWebhookBody;
   const rawType = (body.type ?? "").toLowerCase();
-  const type = mapEventType(rawType);
   const resource = body.payment ?? body.refund;
-  const money = resource?.paymentOutput?.amountOfMoney ?? resource?.refundOutput?.amountOfMoney;
+  const type = mapEventType(rawType, resource?.statusOutput?.statusCode);
+  // A refund failure carries the refund's money or none: a payment's
+  // amountOfMoney is what was paid, not what the refused refund asked back.
+  const money =
+    type === "payment.refund_failed"
+      ? resource?.refundOutput?.amountOfMoney
+      : (resource?.paymentOutput?.amountOfMoney ?? resource?.refundOutput?.amountOfMoney);
   const amount = money?.amount;
   const currency = money?.currencyCode;
   const isRefundResource = body.refund !== undefined || rawType.startsWith("refund.");
@@ -205,7 +214,19 @@ export async function parseWorldlineWebhookEvent(rawBody: string): Promise<Unifi
   };
 }
 
-function mapEventType(rawType: string): UnifiedWebhookEventType {
+function mapEventType(rawType: string, statusCode: number | undefined): UnifiedWebhookEventType {
+  // A refused cancellation (63) or capture (93) leaves the payment authorised
+  // whatever event type carries it, as mapWorldlineStatus reads the codes, so
+  // neither payment.failed nor payment.canceled would be honest.
+  if ((rawType === "payment.rejected" || rawType === "payment.cancelled") && (statusCode === 63 || statusCode === 93)) {
+    return "unknown";
+  }
+  // REJECTED covers "the authorisation/refund request" (Statuses reference):
+  // 73/83 are a refused deletion/refund, so the funds did not return and the
+  // payment stays captured — a refund failure, not a failed payment.
+  if (rawType === "payment.rejected" && (statusCode === 73 || statusCode === 83)) {
+    return "payment.refund_failed";
+  }
   const direct = EVENT_TYPE_MAP[rawType];
   if (direct) return direct;
   // Disputes surface as chargeback.* on Worldline.
@@ -214,6 +235,12 @@ function mapEventType(rawType: string): UnifiedWebhookEventType {
     if (rawType.includes("lost")) return "payment.chargeback_lost";
     return "payment.chargeback";
   }
+  // payment.rejected_capture is recognized but maps to "unknown": it reports a
+  // failed operation on a payment that stays authorised (statusCode 5) until
+  // the merchant acts again, capturing anew or cancelling. payment.failed would
+  // tell hosts the money is gone while the authorisation still holds it, and a
+  // success type would claim a capture that never happened. Hosts reconcile
+  // with retrievePayment, which reports requires_capture.
   // refund.refund_requested is recognized but NON-terminal: the unified
   // vocabulary has no in-flight refund state, and emitting payment.refunded
   // (funds returned) or payment.refund_failed here would fabricate a terminal

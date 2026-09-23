@@ -26,6 +26,7 @@ function makePair(config: Partial<WorldlineServerAdapterConfig> = {}): {
     environment: "sandbox",
     sessionSigningKey: SIGNING_KEY,
     webhookKeys: [{ keyId: WEBHOOK_KEY_ID, secretKey: WEBHOOK_SECRET }],
+    defaultReturnUrl: "https://host.example/default-return",
     fetch: fake.fetch,
     ...config,
   });
@@ -346,6 +347,7 @@ describe("WorldlineServerAdapter specifics", () => {
       environment: "sandbox",
       sessionSigningKey: SIGNING_KEY,
       webhookKeys: [{ keyId: WEBHOOK_KEY_ID, secretKey: WEBHOOK_SECRET }],
+      defaultReturnUrl: "https://host.example/default-return",
       sleep: async () => {},
       fetch: async (input, init) => {
         if (conflicts > 0 && init?.method === "POST" && String(input).endsWith("/payments")) {

@@ -21,7 +21,25 @@ going live.
 
 ## 1. Get your Worldline credentials
 
-From the **Worldline Merchant Portal** (its API / integration settings):
+Both key pairs come from the **Worldline Merchant Portal** (see Worldline's
+[authentication](https://docs.direct.worldline-solutions.com/en/integration/api-developer-guide/authentication)
+and [webhooks](https://docs.direct.worldline-solutions.com/en/integration/api-developer-guide/webhooks)
+guides; Back Office and e-Portal users follow the chapters those pages link for their tool):
+
+- **API key id + secret API key:** Developer → Payment API → *Add API Key*. The screen then
+  shows the pair under *API Key ID* / *Secret API Key*.
+- **Webhook key id + secret:** Developer → Webhooks → *Generate webhooks keys* shows the
+  *Webhooks ID* and its *Secret Webhook Key*; you can instead enter your own id and secret and
+  confirm.
+
+Each secret is displayed for **60 seconds only** and never again, so copy it into your secret
+store as soon as it appears. The key ids stay visible in the portal.
+
+API key pairs **expire**: renew before the date in the *Expiration date* column under
+Developer → Payment API. Creating a new **API key** pair **revokes** the current one, which
+then expires within **four hours**, so deploy the new `apiKeyId` / `secretApiKey` inside that
+window. Webhook key pairs get no such window: generating a new pair revokes the current one
+immediately, so add the new pair to `webhookKeys` before you switch it in the portal.
 
 | Credential | What it is | Used by |
 | --- | --- | --- |
@@ -87,6 +105,7 @@ const worldline = new WorldlineServerAdapter({
   secretApiKey: process.env.WORLDLINE_SECRET_API_KEY!,
   merchantId: process.env.WORLDLINE_MERCHANT_ID!,
   environment: "sandbox",                                  // → payment.preprod.direct.worldline-solutions.com
+  defaultReturnUrl: "https://your-shop.example/checkout/return", // required unless every session passes returnUrl
   sessionSigningKey: process.env.WORLDLINE_SESSION_KEY!,   // YOUR HMAC secret, not a Worldline credential
   webhookKeys: [
     { keyId: process.env.WORLDLINE_WEBHOOKS_KEY_ID!, secretKey: process.env.WORLDLINE_WEBHOOKS_SECRET_KEY! },
@@ -101,6 +120,7 @@ const payments = new PaymentService({ adapters: [worldline] });
 | `apiKeyId` / `secretApiKey` | ✅ | - | `v1HMAC` request-signing credentials. Server-only. |
 | `merchantId` | ✅ | - | The merchant id (PSPID); the `{merchantId}` path segment. |
 | `environment` | ✅ | - | Exactly `"sandbox"` or `"live"`; selects the API host. Never inferred. |
+| `defaultReturnUrl` | ✅¹ | - | Where Worldline returns the customer after a 3-D Secure challenge; the same URL rules as a session's `returnUrl` apply (§6), checked when the adapter is constructed. ¹Required unless every session passes its own `returnUrl`: Worldline lists the return URL among the mandatory 3-D Secure properties of every card payment, so a session with neither is refused (§6). **Set it before upgrading** from a release that did not require a return URL: sessions that release created without their own `returnUrl` carry none, and completing them is otherwise refused. |
 | `sessionSigningKey` | ✅ | - | HMAC key for the stateless signed session. **You generate this.** Keep it stable across restarts/instances. |
 | `webhookKeys` | ✅ | - | Array of `{ keyId, secretKey }`. Pass several to rotate with no cutover. |
 | `sessionTtlSeconds` | - | `3600` | How long a signed session stays completable (1h). Enforced at completion. |
@@ -114,6 +134,39 @@ than five minutes, so keep the server clock accurate. Every mutating call carrie
 deterministic `X-GCS-Idempotence-Key` derived from your `idempotencyKey`.
 :::
 
+::: tip Capture and cancellation outcomes
+When the acquirer refuses a capture or a cancellation, the payment stays authorised: it reads
+`requires_capture`, with the authorisation still in `amountCapturable`, so you can capture
+again or cancel. `capturePayment` returns that refusal only when Worldline answers it
+straight away. Worldline documents a capture as `CAPTURE_REQUESTED` (status code 91) first,
+so `capturePayment` usually resolves `processing` and the refusal (93) surfaces minutes later,
+through `retrievePayment` or the `payment.rejected_capture` webhook, which parses as
+`unknown`.
+
+`cancelPayment` resolves `processing` while the acquirer has not confirmed the cancellation
+(status codes 61/62); the `payment.cancelled` webhook, documented for status code 6, or a
+later `retrievePayment` settles it: `canceled`, or `requires_capture` if the acquirer refuses.
+Cancelling a payment that is already captured is refused with a non-retryable
+`invalid_request`.
+
+A refund the acquirer refuses leaves the payment `succeeded`: `retrieveRefund` reports the
+refund `failed` and it stays out of `amountRefunded`, and a payment with a refund still in
+flight also stays `succeeded`. The refused refund's `payment.rejected` webhook, carrying status
+code 73 or 83, arrives as `payment.refund_failed` (read from Worldline's Statuses reference,
+not yet sandbox-verified); it carries no amount unless the event holds a refund resource, so
+reconcile it with `retrieveRefund`.
+
+An automatic-capture payment can also end at `requires_capture` when Worldline refuses its
+capture. [`usePaymentStatus`](/guide/react#async-rails-polling-to-a-terminal-state) does not
+treat `requires_capture` as final and keeps polling it, so stop the hook yourself
+(`enabled: false`) once that status arrives, then capture again or cancel from your server.
+
+Worldline documents the capture amount "in cents", assuming two decimals, so until that unit
+is confirmed for other currencies a **partial** capture in a currency without two decimals
+(JPY, BHD, …) is refused with `invalid_request` and no capture request is sent. Capture the
+full authorised amount instead, or cancel.
+:::
+
 ## 5. Wire the client adapter
 
 ```tsx
@@ -123,10 +176,9 @@ import { WorldlineClientAdapter } from "@payfanout/adapter-worldline";
 const worldline = new WorldlineClientAdapter({ environment: "sandbox" });
 
 <PayFanoutProvider adapters={[worldline]} initialPsp="worldline" completionEndpoint="/api/complete">
-  {/* Worldline's Hosted Tokenization iframe emits no field-validity stream (onChange fires
-      { complete: false } once), so do NOT gate the Pay button on `complete` for Worldline —
-      the default <PayButton> doesn't, so plain usage is fine. */}
-  <PaymentFields clientSecret={session.clientSecret} />
+  {/* The Tokenizer reports form validity: onChange fires { complete: false } on mount, then
+      { complete: true | false } each time that validity changes. */}
+  <PaymentFields clientSecret={session.clientSecret} onChange={({ complete }) => setPayEnabled(complete)} />
   {/* completionEndpoint finishes the tokenize-first flow automatically — no onServerCompletion. See §7. */}
   <PayButton onResult={(result) => showOutcome(result)}>Pay</PayButton>
 </PayFanoutProvider>
@@ -134,9 +186,17 @@ const worldline = new WorldlineClientAdapter({ environment: "sandbox" });
 
 - The client adapter takes **only** `environment` — it holds no key. The session's
   `clientSecret` is the `hostedTokenizationUrl` the iframe mounts from.
-- The Hosted Tokenization iframe does not expose a per-field validity stream, so the adapter
-  fires `onChange({ complete: false })` once on mount and degrades gracefully. The true
-  decline outcome surfaces **server-side** at completion (step 7).
+- The adapter drives `onChange` from the Tokenizer's `validationCallback`, which Worldline
+  calls whenever the form's validity changes. Validity only means the form is correctly
+  filled in: the authorization outcome still surfaces **server-side** at completion (step 7).
+- `fieldOptions` passes through to the `Tokenizer` constructor untouched (for example
+  `paymentProductUpdatedCallback`), except `validationCallback`, which the adapter owns; a
+  callback you pass there still runs, after `onChange`, with the same result.
+- The cardholder-name field is **shown by default** (`hideCardholderName: false`), because
+  Worldline requires the cardholder name and hides that field unless told otherwise.
+  `hideCardholderName: true` in `fieldOptions` still wins, but then the name has to reach
+  Worldline through its `useCardholderName` call, which the adapter neither makes nor
+  exposes, so keep the field visible.
 
 ::: tip Content-Security-Policy
 A CSP-enforcing page must allow the Worldline payment host, or the iframe fails quietly:
@@ -147,24 +207,82 @@ frame-src   https://payment.preprod.direct.worldline-solutions.com https://payme
 connect-src https://payment.preprod.direct.worldline-solutions.com https://payment.direct.worldline-solutions.com
 ```
 
-The `preprod` host is exercised only by `environment: "sandbox"`. Override the script URL with
-the `sdkUrl` config field to pin a version or self-host.
+The `preprod` host is exercised only by `environment: "sandbox"`. Worldline requires the
+Tokenizer script to load from its own servers, so never self-host it: the `sdkUrl` config
+field only points the adapter at a different Worldline-served URL. Worldline also asks for
+the script tag to carry `integrity` (the `sri` value of the CreateHostedTokenization response)
+and `crossorigin="anonymous"`; the adapter does not apply that subresource integrity check
+yet.
 :::
 
 ## 6. 3-D Secure
 
-Pass a `returnUrl` on `createPaymentSession` and the adapter forwards it as
-`cardPaymentMethodSpecificInput.returnUrl` (the field the Hosted Tokenization guide names)
-and in its `threeDSecure.redirectionData.returnUrl` form — both are current. A frictionless
-authentication completes inline; a challenge comes back as `requires_action` with the
-redirect URL on `PaymentInfo.raw` (`merchantAction.redirectData.redirectURL`). After the
-customer returns, reconcile the outcome with `retrievePayment`.
+Worldline's [3-D Secure guide](https://docs.direct.worldline-solutions.com/en/security-and-risk-management/3d-secure/implementation)
+lists the properties every card payment must send, and the Hosted Tokenization guide requires
+at least those on the payment request. Every payment carries the ones the adapters can
+supply:
+
+| What | Sent as |
+| --- | --- |
+| Cardholder name | Collected in the Hosted Tokenization iframe's name field, which Worldline hides unless the `Tokenizer` receives `hideCardholderName: false`; keep it visible, passing `fieldOptions: { hideCardholderName: false }` if your client adapter version does not default to it (see §5) |
+| Return URL | `cardPaymentMethodSpecificInput.returnUrl` (the field the Hosted Tokenization guide names) **and** `cardPaymentMethodSpecificInput.threeDSecure.redirectionData.returnUrl` |
+| Authentication | `threeDSecure.skipAuthentication: false`, never the deprecated flat `cardPaymentMethodSpecificInput.skipAuthentication` |
+| Browser device data | `order.customer.device`: `locale`, `timezoneOffsetUtcMinutes`, `userAgent`, and `browserData` (`colorDepth`, `javaEnabled`, `javaScriptEnabled`, `screenHeight`, `screenWidth`), read in the browser by the client adapter's `confirm()` |
+| Challenge preference | `threeDSecure.challengeIndicator: "challenge-required"` when the session passes `sca: { challenge: "force" }`; otherwise omitted, which is Worldline's `no-preference` default |
+
+**The return URL is mandatory.** Pass `returnUrl` on `createPaymentSession`, or set
+`defaultReturnUrl` on the adapter (§4), absolute, with a scheme such as `https://` or an app
+scheme, at most 200 characters; a session with neither, or with a URL that breaks those rules,
+is refused with `invalid_request` before anything reaches Worldline, rather than failing after
+the customer has entered a card. An empty `returnUrl` counts as none, so `defaultReturnUrl`
+applies. For Visa, Worldline also requires one customer contact detail; the adapter sends
+`order.customer.contactDetails.emailAddress` from the session's `receiptEmail` or
+`billingDetails.email`, so pass one of them.
+
+Session creation refuses two more values with `invalid_request`, again before anything reaches
+Worldline: an `id` longer than 40 characters, since it travels as the payment's
+`order.references.merchantReference`, and a `statementDescriptor` longer than 256 characters.
+The descriptor is sent as `order.references.softDescriptor`, not the deprecated `descriptor`.
+Worldline advises at most 22 characters, as issuers start truncating beyond that, and
+currently allows a per-payment override only for the AIB and Barclays acquirers.
+
+`sca: { exemption: "moto" }` is not mapped yet. Worldline models MOTO as a transaction channel
+(`cardPaymentMethodSpecificInput.transactionChannel: "MOTO"`), not as an exemption, so such a
+payment goes out as an e-commerce payment with 3-D Secure.
+
+`confirm()` hands the server a JSON `clientToken`,
+`{"hostedTokenizationId":"…","device":{…}}`. It carries browser characteristics only, never
+card data; a value the browser does not expose is left out, and the server adapter keeps only
+the fields a browser can read, dropping any outside Worldline's documented types and lengths
+instead of failing the payment. A bare `hostedTokenizationId` from an earlier client adapter
+is still accepted, without device data, so deploy the server adapter before the client
+adapter.
+
+::: warning What the adapter does not send
+Worldline also lists `order.customer.device.acceptHeader` and, for Visa and Cartes Bancaires,
+`order.customer.device.ipAddress`. Both come from the customer's HTTP request to your server,
+not from the browser, and neither `CompletePaymentInput` nor `createCompletionHandler` carries
+them to the adapter today, so the adapter cannot send them.
+
+Cartes Bancaires additionally requires
+`cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure.useCase`.
+Worldline's API contract spells that property `usecase`, so the adapter does not send it until
+a sandbox run settles the name.
+:::
+
+The adapter tokenizes with `storePermanently: false`, so no card is stored at Worldline for
+later use: the adapter has no saved-card surface that could use such a token.
+
+A frictionless authentication completes inline; a challenge comes back as `requires_action`
+with the redirect URL on `PaymentInfo.raw` (`merchantAction.redirectData.redirectURL`). After
+the customer returns, reconcile the outcome with `retrievePayment`.
 
 ## 7. The server-completion route (Worldline-only)
 
 This is the step Stripe doesn't have. When the client tokenizes, the library POSTs the
-resulting `clientToken` (the `hostedTokenizationId`, with the session reference and any
-completion-time `billingDetails`) to your `completionEndpoint`, where you mount
+resulting `clientToken` (the `hostedTokenizationId` plus the browser's 3-D Secure data, see
+§6), with the session reference and any completion-time `billingDetails`, to your
+`completionEndpoint`, where you mount
 `createCompletionHandler`:
 
 ```ts
@@ -334,14 +452,38 @@ missed-webhook recovery, reconcile with `retrievePayment` per order. See
 
 ## 9. Test cards
 
-Use your Worldline test account's documented sandbox cards and amount-based response triggers.
-Commonly available test cards include Visa `4330 2649 3634 4675`, Mastercard
-`5137 0098 0194 3438`, and Amex `3714 4963 5311 004`; **confirm the current list, decline
-triggers, and 3-D Secure test cards in your Worldline documentation** rather than assuming.
+Worldline's
+[test cases](https://docs.direct.worldline-solutions.com/en/integration/how-to-integrate/test-cases/)
+are for the sandbox only. These cards authorize successfully, through a frictionless or a
+challenge 3-D Secure flow, with any 3- or 4-digit CVV:
+
+| Brand | 3-D Secure frictionless | 3-D Secure challenge |
+| --- | --- | --- |
+| Visa | `4330 2649 3634 4675` | `4874 9706 8667 2022` |
+| Mastercard | `5137 0098 0194 3438` | `5130 2574 7453 3310` |
+| American Express | `3714 4963 5311 004` | `3797 6442 2997 381` |
+
+- **Frictionless** cards authenticate without a challenge, so the outcome comes straight back
+  from completion (§7).
+- **Challenge** cards exercise the redirect/return trip: create the session with a `returnUrl`
+  and completion returns `requires_action` with the redirect URL (§6). Once the customer is
+  back on your `returnUrl`, reconcile with `retrievePayment`.
+- **Decline:** any of these cards on a session with `amount: 1302` (€13.02),
+  `currency: "EUR"` and the default automatic capture is declined (Worldline `statusCode` 2).
+  The trigger is documented for `authorizationMode: "SALE"`, which is what the adapter sends
+  for automatic capture (`captureMethod: "manual"` sends `PRE_AUTHORIZATION`).
+
+The page also covers other brands and amount-based refund and capture outcomes; **confirm the
+current list there** rather than assuming.
 
 ## 10. Go live
 
+- [ ] Before you switch, run one **challenge-flow** test card (§9) end to end in sandbox, so
+      the return to your `returnUrl` and the `retrievePayment` reconciliation are exercised.
 - [ ] Swap in the **live** API key id + secret and the **live** merchant id.
+- [ ] Plan the live API key renewal ahead of its *Expiration date* (Developer → Payment API):
+      the old pair expires within four hours of creating a new one, so deploy the new pair
+      inside that window (§1).
 - [ ] Set `environment: "live"` on **both** adapters (host flips to the bare
       `payment.direct.worldline-solutions.com`).
 - [ ] Register the **live** webhook endpoint in the portal and use its **live** key id + secret.

@@ -480,6 +480,18 @@ describe("StripeServerAdapter specifics", () => {
       });
     });
 
+    it("classifies a StripeAPIError with an unlisted status as category 'network'", async () => {
+      const { adapter, fake } = makePair();
+      // The SDK falls back to StripeAPIError for statuses it has no named error for, e.g. 409.
+      fake.failNextWith(stripeError({ type: "StripeAPIError", statusCode: 409, message: "conflict" }));
+      const result = await adapter.verifyCredentials();
+      expect(result).toEqual({
+        ok: false,
+        category: "network",
+        message: "Could not reach Stripe — try again.",
+      });
+    });
+
     it("keeps a 401 as category 'auth' even when the error is typed StripeAPIError", async () => {
       const { adapter, fake } = makePair();
       fake.failNextWith(stripeError({ type: "StripeAPIError", statusCode: 401, message: "unauthorized" }));

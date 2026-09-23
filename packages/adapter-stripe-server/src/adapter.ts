@@ -671,6 +671,8 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       ) {
         return { ok: false, category: "auth", message: "Authentication failed — check the Stripe secret key." };
       }
+      // StripeAPIError covers unlisted statuses, non-JSON bodies and, from stripe 22.6, a body
+      // severed mid-transfer; the error map already treats it as a retryable outage.
       if (
         e.type === "StripeConnectionError" ||
         e.type === "StripeAPIError" ||

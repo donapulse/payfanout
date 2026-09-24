@@ -9,9 +9,17 @@ import {
 
 const OAUTH_OK = JSON.stringify({ access_token: "tok", token_type: "Bearer", expires_in: 3600 });
 
-/** An adapter over fixed GET routes that records every API request it sends. */
-function recordingAdapter(routes: Record<string, unknown>): { adapter: PayPalServerAdapter; requests: string[] } {
+/**
+ * An adapter over fixed routes that records every API request it sends. A route
+ * key is `"METHOD /path"`, or a bare path for a GET; a `null` answer is an empty 204.
+ */
+function recordingAdapter(routes: Record<string, unknown>): {
+  adapter: PayPalServerAdapter;
+  requests: string[];
+  sent: Map<string, unknown>;
+} {
   const requests: string[] = [];
+  const sent = new Map<string, unknown>();
   const adapter = new PayPalServerAdapter({
     clientId: "id",
     clientSecret: "secret",
@@ -21,16 +29,33 @@ function recordingAdapter(routes: Record<string, unknown>): { adapter: PayPalSer
       const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
       if (url.endsWith("/v1/oauth2/token")) return new Response(OAUTH_OK, { status: 200 });
       const { pathname } = new URL(url);
-      requests.push(`${init?.method ?? "GET"} ${pathname}`);
-      const body = routes[pathname];
+      const request = `${init?.method ?? "GET"} ${pathname}`;
+      requests.push(request);
+      if (typeof init?.body === "string") sent.set(request, JSON.parse(init.body));
+      const body = request in routes ? routes[request] : request.startsWith("GET ") ? routes[pathname] : undefined;
       if (body === undefined) {
         return new Response(JSON.stringify({ name: "RESOURCE_NOT_FOUND", message: "missing" }), { status: 404 });
       }
+      if (body === null) return new Response(null, { status: 204 });
       return new Response(JSON.stringify(body), { status: 200 });
     }) as typeof fetch,
   });
-  return { adapter, requests };
+  return { adapter, requests, sent };
 }
+
+const RUB_ORDER = {
+  id: "O1",
+  intent: "AUTHORIZE",
+  status: "COMPLETED",
+  purchase_units: [
+    {
+      amount: { currency_code: "RUB", value: "1500.00" },
+      payments: {
+        authorizations: [{ id: "A1", status: "CREATED", amount: { currency_code: "RUB", value: "1500.00" } }],
+      },
+    },
+  ],
+};
 
 describe("PayPal currencies", () => {
   it("accepts for new payments exactly the currencies PayPal's reference lists", () => {
@@ -81,6 +106,59 @@ describe("PayPal currencies", () => {
     // Captures and refunds of such a payment send RUB amounts as before.
     expect(toPayPalValue(150000, "RUB")).toBe("1500.00");
     expect(fromPayPalValue("1500.00", "RUB")).toBe(150000);
+  });
+
+  it("still captures part of an earlier RUB authorization, sending RUB", async () => {
+    const { adapter, sent } = recordingAdapter({
+      "/v2/checkout/orders/O1": RUB_ORDER,
+      "POST /v2/payments/authorizations/A1/capture": {
+        id: "CAP1",
+        status: "COMPLETED",
+        amount: { currency_code: "RUB", value: "700.00" },
+      },
+    });
+    await adapter.capturePayment("O1", 70000, "k-cap-rub");
+    expect(sent.get("POST /v2/payments/authorizations/A1/capture")).toEqual({
+      amount: { currency_code: "RUB", value: "700.00" },
+      final_capture: false,
+    });
+  });
+
+  it("still refunds an earlier RUB capture, sending RUB", async () => {
+    const { adapter, sent } = recordingAdapter({
+      "/v2/payments/captures/CAP1": { id: "CAP1", status: "COMPLETED", amount: { currency_code: "RUB", value: "1500.00" } },
+      "POST /v2/payments/captures/CAP1/refund": {
+        id: "R1",
+        status: "COMPLETED",
+        amount: { currency_code: "RUB", value: "500.00" },
+      },
+    });
+    await expect(
+      adapter.refundPayment({ pspPaymentId: "CAP1", amount: 50000, idempotencyKey: "k-refund-rub" }),
+    ).resolves.toMatchObject({ refundId: "R1", status: "succeeded", amount: 50000 });
+    expect(sent.get("POST /v2/payments/captures/CAP1/refund")).toEqual({
+      amount: { currency_code: "RUB", value: "500.00" },
+    });
+  });
+
+  it("still updates the amount of an earlier RUB order, however the currency is spelled", async () => {
+    for (const currency of [undefined, "rub"]) {
+      const { adapter, requests } = recordingAdapter({
+        "/v2/checkout/orders/O2": {
+          id: "O2",
+          status: "CREATED",
+          purchase_units: [{ amount: { currency_code: "RUB", value: "1500.00" } }],
+        },
+        "PATCH /v2/checkout/orders/O2": null,
+      });
+      await adapter.updatePaymentSession({
+        pspSessionId: "O2",
+        amount: 200000,
+        ...(currency ? { currency } : {}),
+        idempotencyKey: "k-up-rub",
+      });
+      expect(requests, String(currency)).toContain("PATCH /v2/checkout/orders/O2");
+    }
   });
 
   it("still reads the amount of a RUB capture webhook", async () => {

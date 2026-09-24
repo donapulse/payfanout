@@ -8,14 +8,22 @@ import {
 } from "@payfanout/core";
 
 /**
- * The currencies PayPal checkout accepts (REST currency-codes reference).
- * Everything else — including every 3-decimal ISO currency (BHD, KWD, …) —
- * is rejected locally before any API call.
+ * The currencies PayPal checkout accepts for new payments (REST currency-codes
+ * reference). A new session in anything else — including every 3-decimal ISO
+ * currency (BHD, KWD, …) — is refused locally before any API call.
  */
 export const PAYPAL_SUPPORTED_CURRENCIES: ReadonlySet<string> = new Set([
   "AUD", "BRL", "CAD", "CHF", "CNY", "CZK", "DKK", "EUR", "GBP", "HKD", "HUF", "ILS",
-  "JPY", "MXN", "MYR", "NOK", "NZD", "PHP", "PLN", "RUB", "SEK", "SGD", "THB", "TWD", "USD",
+  "JPY", "MXN", "MYR", "NOK", "NZD", "PHP", "PLN", "SEK", "SGD", "THB", "TWD", "USD",
 ]);
+
+/**
+ * Currencies the reference no longer lists but payments made earlier may carry
+ * (RUB, gone from it by 2026-09-24): their amounts still read, and still format
+ * for captures, refunds and updates of those payments, while a new session in
+ * one is refused.
+ */
+const PAYPAL_RETIRED_CURRENCIES: ReadonlySet<string> = new Set(["RUB"]);
 
 /**
  * PayPal accepts whole units only for these ("does not support decimals").
@@ -24,6 +32,7 @@ export const PAYPAL_SUPPORTED_CURRENCIES: ReadonlySet<string> = new Set([
  */
 const WHOLE_UNIT_CURRENCIES: ReadonlySet<string> = new Set(["HUF", "JPY", "TWD"]);
 
+/** A currency PayPal accepts for a new payment. */
 export function assertPayPalCurrency(currency: string): string {
   const code = normalizeCurrency(currency);
   if (!PAYPAL_SUPPORTED_CURRENCIES.has(code)) {
@@ -32,9 +41,20 @@ export function assertPayPalCurrency(currency: string): string {
   return code;
 }
 
-/** Integer minor units -> PayPal decimal string. Pure string/integer math — no floats. */
+/** A currency an existing PayPal payment can carry: a supported or a retired one. */
+function assertPayPalAmountCurrency(currency: string): string {
+  const code = normalizeCurrency(currency);
+  return PAYPAL_RETIRED_CURRENCIES.has(code) ? code : assertPayPalCurrency(code);
+}
+
+/**
+ * Integer minor units -> PayPal decimal string. Pure string/integer math — no
+ * floats. Also accepts the currencies PayPal has retired (RUB), so amounts of
+ * payments made in them earlier still convert; `PAYPAL_SUPPORTED_CURRENCIES`
+ * is what a new payment may use.
+ */
 export function toPayPalValue(minor: MinorUnitAmount, currency: string): string {
-  const code = assertPayPalCurrency(currency);
+  const code = assertPayPalAmountCurrency(currency);
   assertMinorUnitAmount(minor, "amount");
   if (!WHOLE_UNIT_CURRENCIES.has(code)) return formatMinorUnits(minor, code);
   const exponent = getCurrencyExponent(code);
@@ -52,9 +72,14 @@ export function toPayPalValue(minor: MinorUnitAmount, currency: string): string 
   return String(minor / factor);
 }
 
-/** PayPal decimal string -> integer minor units, per-currency exponent table. */
+/**
+ * PayPal decimal string -> integer minor units, per-currency exponent table.
+ * Also accepts the currencies PayPal has retired (RUB), so amounts of payments
+ * made in them earlier still read; `PAYPAL_SUPPORTED_CURRENCIES` is what a new
+ * payment may use.
+ */
 export function fromPayPalValue(value: string, currency: string): MinorUnitAmount {
-  const code = assertPayPalCurrency(currency);
+  const code = assertPayPalAmountCurrency(currency);
   const match = /^(\d+)(?:\.(\d+))?$/.exec(value.trim());
   if (!match) {
     throw PayFanoutError.invalidRequest(`Cannot parse PayPal amount "${value}" for ${code}`, { value, currency: code });

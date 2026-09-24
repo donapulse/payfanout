@@ -32,7 +32,7 @@ import {
 } from "@payfanout/core";
 import { mapPayPalError, PAYPAL_PSP_NAME, payPalErrorIssue } from "./error-map.js";
 import { derivePayPalRequestId } from "./request-id.js";
-import { fromPayPalValue, PAYPAL_SUPPORTED_CURRENCIES, toPayPalValue } from "./money.js";
+import { assertPayPalCurrency, fromPayPalValue, PAYPAL_SUPPORTED_CURRENCIES, toPayPalValue } from "./money.js";
 import {
   paypalSubscriptionToRecord,
   PAYPAL_SUBSCRIPTION_CANCEL_REASON,
@@ -251,8 +251,8 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
 
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertMinorUnitAmount(input.amount, "amount");
-    const currency = normalizeCurrency(input.currency);
-    // Validates PayPal's currency allowlist + the HUF/TWD/JPY whole-unit rule.
+    // PayPal's currency allowlist for new payments, then the HUF/TWD/JPY whole-unit rule.
+    const currency = assertPayPalCurrency(input.currency);
     const value = toPayPalValue(input.amount, currency);
     if (input.paymentMethodTypes?.some((t) => t !== "paypal")) {
       throw PayFanoutError.invalidRequest(
@@ -606,6 +606,8 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     const unit = order.purchase_units?.[0];
     const currentCurrency = (unit?.amount?.currency_code ?? "USD").toUpperCase();
     const currency = input.currency !== undefined ? normalizeCurrency(input.currency) : currentCurrency;
+    // Moving an order to another currency is a new choice: it must be one PayPal accepts now.
+    if (currency !== currentCurrency) assertPayPalCurrency(currency);
     const unitPath = "/purchase_units/@reference_id=='default'";
     const ops: Array<Record<string, unknown>> = [];
     if (input.amount !== undefined || input.currency !== undefined) {

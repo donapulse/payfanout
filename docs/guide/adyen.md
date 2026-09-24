@@ -288,10 +288,16 @@ const adyen = new AdyenClientAdapter({
   ([web best practices](https://docs.adyen.com/online-payments/web-best-practices#embed-script-and-stylesheet)).
   `adyenEnvironment` picks that value and the host, `checkoutshopper-{value}.cdn.adyen.com`:
   `test` (the default on sandbox), `live` for Europe (the default on live), or `live-us`,
-  `live-au`, `live-nea` or `live-in`. The constructor throws `invalid_request` for any other
+  `live-au`, `live-nea`, `live-in` or `live-apse`, compared case-insensitively since Adyen
+  Web lowercases the value itself. The constructor throws `invalid_request` for any other
   value, for one that contradicts `environment` (`live` or a regional value on sandbox,
-  `test` on live), and for a client key whose `test_` / `live_` prefix contradicts
-  `environment`.
+  `test` on live), and for a client key that does not start with `test_` on sandbox or
+  `live_` on live (a legacy origin key included).
+- `live-apse` (Asia Pacific and Southeast) is accepted because Adyen Web 6.45.2 types it and
+  maps it to its own API and CDN hosts, and that CDN host serves the pinned files with the
+  same hashes. Adyen's v6 integration guides and release notes do not list it (its release
+  notes last list the APSE host for 5.72.0), so confirm the value with Adyen before an APSE
+  account goes live on it.
 - Both files carry the
   [Subresource Integrity](https://docs.adyen.com/online-payments/web-best-practices#implement-subresource-integrity-hashes)
   hash Adyen publishes for 6.45.2, with `crossorigin="anonymous"`, so the browser refuses a
@@ -299,12 +305,15 @@ const adyen = new AdyenClientAdapter({
   needs. The hashes cover the adapter's default URLs for its pinned build only: setting
   `sdkVersion` turns the check off for both files, and `sdkUrl` / `stylesheetUrl`, which
   self-host one file, turn it off for that file. A `<script>` your page adds itself for the
-  default URL needs the same `integrity` and a `crossorigin` attribute: while
-  `window.AdyenWeb` is not defined yet, a conflicting tag makes the load fail with
-  `invalid_request`.
-- If the script fails to load, or loads without defining `window.AdyenWeb`, the next mount
-  loads it again, along with the stylesheet if that failed too. A stylesheet that fails to
-  load never blocks the fields from mounting.
+  default URL needs the same `integrity`, exported as `ADYEN_WEB_SCRIPT_INTEGRITY`, and a
+  `crossorigin` attribute: while `window.AdyenWeb` is not defined yet, a conflicting tag
+  makes the load fail with `invalid_request`. A stylesheet `<link>` your page adds for the
+  default URL is used as it is, so give it `ADYEN_WEB_STYLESHEET_INTEGRITY` and a
+  `crossorigin` attribute to keep the check.
+- If the script fails to load, the next mount fetches it again, with the stylesheet if that
+  failed too; if it loaded without defining `window.AdyenWeb`, the next mount checks again
+  instead of failing from a cached result. A stylesheet that fails to load never blocks the
+  fields from mounting.
 
 ::: tip Content-Security-Policy
 A CSP-enforcing page must allow Adyen, or the fields fail quietly. 3-D Secure 2 challenges
@@ -450,10 +459,10 @@ outstanding fails with `invalid_request` rather than abandoning the first caller
 Adyen Web's 3-D Secure 2 elements report timeouts through `onAdditionalDetails` and call
 `onError` only when they stop, so an error reported through `onError` meanwhile settles the
 pending promise as `failed` with `authentication_required` (or a retryable `psp_unavailable`
-when it reads as a load or network failure), and unmounting the fields settles it as `failed`
-too. Once `handleAction` has run, the card fields are gone: `confirm()` on that handle fails
-with `invalid_request`, so another attempt remounts `<PaymentFields>` on a new session with a
-new `idempotencyKey` (§7).
+when Adyen Web names it a network or script error, or its message reads as one), and
+unmounting the fields settles it as `failed` too. Once `handleAction` has run, the card
+fields are gone: `confirm()` on that handle fails with `invalid_request`, so another attempt
+remounts `<PaymentFields>` on a new session with a new `idempotencyKey` (§7).
 
 ### Redirect fallback
 
@@ -793,6 +802,10 @@ you configured in test is configured again in the **live** Customer Area.
 - [ ] Swap in the **live** merchant account, set `environment: "live"` on **both** adapters,
       and add `liveUrlPrefix` on the server one, from Developers → API URLs → Prefix
       ([live endpoints](https://docs.adyen.com/development-resources/live-endpoints)).
+- [ ] If your live endpoints are location-based, set `adyenEnvironment` on the client adapter
+      to their region, `live-us`, `live-au`, `live-nea`, `live-in` or `live-apse`
+      ([§5](#_5-wire-the-client-adapter)): it picks both the value Adyen Web gets and the CDN
+      host it loads from.
 - [ ] Generate the **live** client key (`live_…`) and add your production origins to its
       credential; live origins must be `https`.
 - [ ] Check that the live merchant account's **Capture delay** (Settings → Account settings →

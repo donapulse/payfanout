@@ -1597,8 +1597,11 @@ sandbox round-trip before production use, and the setup guide carries that warni
   blocked live issuer challenges. The setup guide lists every directive, including the
   `style-src`, `img-src` and `form-action` the type cannot express (its `style-src` names the
   Adyen host for the Adyen Web stylesheet; Adyen's sample lists only Cash App there).
-- **Client**: Adyen Web v6 from `checkoutshopper-{test|live}.cdn.adyen.com/checkoutshopper/
-  sdk/{version}/` (the Drop-in guide's shorter path 404s), `window.AdyenWeb` with an async
+- **Client**: Adyen Web v6 from `checkoutshopper-{value}.cdn.adyen.com/checkoutshopper/
+  sdk/{version}/`, `{value}` being the Adyen environment value (the Drop-in guide's shorter
+  path 404s; corrected 2026-09-24: this entry said `checkoutshopper-{test|live}`, the two
+  hosts the adapter loaded from until then, which sent every live account to the European
+  host), `window.AdyenWeb` with an async
   `AdyenCheckout()` and component classes (`new Card(checkout, options)`). The pinned build
   was 6.41.0, released 2026-07-16 per Adyen's Web release notes and its GitHub release, and
   requiring Checkout API v69 or later, which the pinned v72 satisfies (corrected 2026-09-24:
@@ -1682,16 +1685,23 @@ sandbox round-trip before production use, and the setup guide carries that warni
       `merchantReference` and `amount` (the example does not), which decides whether a
       completion reads its result or `processing` until the webhook. (4) Which `/payments`
       action answers carry a `pspReference` (the native example has none, the redirect
-      example has one).
+      example has one). (5) Whether `/payments` accepts, and 3-D Secure 2 passes with, a
+      `billingAddress` whose street, house number or city holds characters Adyen Web 6.41.0
+      stripped and 6.45.2 lets through (`?+_=!@#$%^&*(){}~<>[]\`, see the 2026-09-24 entry
+      below); the server adapter forwards them as they are. (6) `live-apse`: whether an APSE
+      live account takes that `environment` value and the `checkoutshopper-live-apse` hosts,
+      which Adyen Web maps but Adyen's v6 guides do not list; the test platform cannot show
+      it, so it takes Adyen's confirmation or an APSE live account.
   - **Adyen Web 6.45.2, Subresource Integrity and regional hosts (2026-09-24)**,
     doc-verified against Adyen's Web release notes from 6.41.1 to 6.45.2 and the matching
-    GitHub releases, the web best practices, live endpoints and client-side authentication
-    pages, the Advanced and Sessions flow guides, and the 6.41.0 and 6.45.2 source of
-    `github.com/Adyen/adyen-web`; still no sandbox pass. The pinned build moved to 6.45.2
+    GitHub releases, the 5.13.0 and 5.72.0 release notes, the web best practices, live
+    endpoints and client-side authentication pages, the Advanced and Sessions flow guides,
+    and the 6.41.0 and 6.45.2 source of `github.com/Adyen/adyen-web` with its PR #3769;
+    still no sandbox pass. The pinned build moved to 6.45.2
     (released 2026-09-21, requiring Checkout API v69 or later); 6.45.1 is marked "Do not use
     this version. A breaking bug prevents handling payment actions", and 6.45.2 reverts its
-    BaseElement and UIElement changes. Between the two tags nothing the adapter uses changed:
-    the `window.AdyenWeb` entry, the async `AdyenCheckout`, the Card's options and its
+    BaseElement and UIElement changes. Between the two tags nothing the adapter uses changed
+    shape: the `window.AdyenWeb` entry, the async `AdyenCheckout`, the Card's options and its
     `hasHolderName`/`holderNameRequired` coupling, its `state.data` (browser info, origin,
     billing address, `riskData`, `sdkData`, `checkoutAttemptId`), `onChange`, `handleAction`,
     `onAdditionalDetails`, `onEnterKeyPressed` (a handler still replaces `submit()`),
@@ -1699,26 +1709,48 @@ sandbox round-trip before production use, and the setup guide carries that warni
     submits on Enter inside a select or the dual-brand selector, 6.42.0 gives the 3-D Secure 2
     challenge iframe `allow="payment *; publickey-credentials-get *"` for passkeys, and 6.45.0
     adds a Sessions-flow review step (`onReview`, `processPayment`, `onAction`, none of which
-    the adapter sets) and refuses unsupported special characters in the street, house number
-    and city fields. The release note publishes sha384 hashes for `adyen.js` and `adyen.css`
+    the adapter sets) and moves the special-character check on the street, house number and
+    city fields from the formatter to validation. 6.41.0 stripped `?+_=!@#$%^&*(){}~<>[]\`
+    from those fields as the shopper typed (`SPECIAL_CHARS` in `utils/validator-utils.ts`);
+    6.45.2 keeps them and refuses, on blur, only emoji, regional-indicator, control and format
+    characters (PR #3769, which the 6.45.0 GitHub release links; the release note says "The
+    address fields now reject unsupported special characters"). Those characters now reach
+    `billingAddress`, and the server adapter forwards them as they are (sandbox check (5)
+    above). The release note publishes sha384 hashes for `adyen.js` and `adyen.css`
     and asks for the same hashes on test and regional URLs: verified 2026-09-24 by hashing
-    the files served from `checkoutshopper-{test, live, live-us, live-au, live-nea,
-    live-in}.cdn.adyen.com`, byte-identical and equal to the published values, each host
+    the files served from `checkoutshopper-{test, live, live-us, live-au, live-nea, live-in,
+    live-apse}.cdn.adyen.com`, byte-identical and equal to the published values, each host
     answering `Access-Control-Allow-Origin: *` without a redirect. A file carries its hash,
     with `crossorigin="anonymous"` (set on the stylesheet `<link>` before `href` and
-    insertion), only from its default URL for the pinned build: `sdkVersion` drops both
-    hashes, `sdkUrl` and `stylesheetUrl` the one for their file. The host is now
-    `checkoutshopper-{value}.cdn.adyen.com` for the Adyen environment value, where every live
-    account loaded from the European host before. The best practices page, both flow guides
-    and every v6 release note document `test`, `live`, `live-us`, `live-au`, `live-nea` and
-    `live-in`; Adyen Web 6.45.2 also maps `live-apse`, which only v5 release notes list, and
-    falls back to the European hosts for a value it does not know, so the constructor refuses
-    any value outside that list and one that contradicts `environment`. It refuses a client
-    key whose prefix contradicts `environment` as well ("The client key for your live
-    environment will start with live_"), which Adyen Web reports only once `AdyenCheckout()`
-    runs. A load that resolves without `window.AdyenWeb` is forgotten like a failed one, and
-    a `<link>` the adapter injected is removed when its load fails, so the next load fetches
-    the file again. Adyen Web errors are read by `name` first (the 6.45.2 source defines
+    insertion), only from its default URL for the pinned build: any `sdkVersion`, even one
+    naming the pinned build, drops both hashes, and `sdkUrl` and `stylesheetUrl` the one for
+    their file. Both hashes are exported, as `ADYEN_WEB_SCRIPT_INTEGRITY` and
+    `ADYEN_WEB_STYLESHEET_INTEGRITY`, for a host that adds its own tag for the default URL.
+    The host is now `checkoutshopper-{value}.cdn.adyen.com` for the Adyen environment value,
+    where every live account loaded from the European host before. The best practices page,
+    both flow guides and every v6 release note document `test`, `live`, `live-us`,
+    `live-au`, `live-nea` and `live-in`. `live-apse` is AMBIGUOUS in the docs, and accepted:
+    Adyen Web 6.45.2 types it (`environment?: 'test' | 'live' | 'live-us' | 'live-au' |
+    'live-apse' | 'live-in' | 'live-nea'` in `core/types.ts`) and maps it to its own API,
+    CDN and analytics hosts (`core/Environment/constants.ts`), its CDN host serves the pinned
+    files as above, and Adyen's release notes list it from 5.13.0 ("use the `environment`
+    **live-apse**") to the 5.72.0 host table, while no v6 guide table or v6 release note does
+    (sandbox check (6) above). Adyen Web falls back to the European hosts for a value it does
+    not know, so the constructor refuses any other value and one that contradicts
+    `environment`. It lowercases the value first, as Adyen Web does before reading it
+    (`core/core.ts`, `setOptions`: "Make environment lowercase to ensure consistency"), so
+    `LIVE-US` loads from `checkoutshopper-live-us` and Adyen Web gets `live-us`. It also
+    refuses a client key that does not start with `test_` on sandbox or `live_` on live (a
+    legacy origin key included): the client-side authentication page gives every client key
+    that prefix ("The client key for your live environment will start with live_") and makes
+    the client key the only way to authenticate from Web 4.0.0, while Adyen Web reports a
+    contradicting prefix only once `AdyenCheckout()` runs and still takes an origin key
+    (`pub.`) with a console notice. If the script fails to load, the next mount fetches it
+    again, with the stylesheet if that failed too (a `<link>` the adapter injected is removed
+    when its load fails); if it loaded without defining `window.AdyenWeb`, the next mount
+    checks again instead of failing from a cached result, and only a host `loadScript`
+    fetches anew then, since the tag already on the page is reused. Adyen Web errors are read
+    by `name` first (the 6.45.2 source defines
     `NETWORK_ERROR`, `CANCEL`, `IMPLEMENTATION_ERROR`, `API_ERROR`, `ERROR`, `SCRIPT_ERROR`
     and `SDK_ERROR`; the Sessions flow guide documents four of them): `NETWORK_ERROR` and
     `SCRIPT_ERROR` are a retryable `psp_unavailable`, `IMPLEMENTATION_ERROR` is

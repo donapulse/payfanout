@@ -71,4 +71,32 @@ describe("PayPal local limits", () => {
       events: [],
     });
   });
+
+  it("follows a next link to the events list, trailing slash included, and no other path", async () => {
+    const requested: string[] = [];
+    const nextLinks = [
+      "https://api-m.sandbox.paypal.com/v1/notifications/webhooks-events/?page_size=2&start_index=2",
+      "https://api-m.sandbox.paypal.com/v1/notifications/webhooks-events/WH-1",
+    ];
+    const fetchSpy: typeof fetch = async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/oauth2/token") {
+        return new Response(JSON.stringify({ access_token: "t", expires_in: 3600 }), { status: 200 });
+      }
+      requested.push(`${url.pathname}${url.search}`);
+      const next = nextLinks.shift();
+      return new Response(JSON.stringify({ events: [], links: next ? [{ href: next, rel: "next", method: "GET" }] : [] }), {
+        status: 200,
+      });
+    };
+    const adapter = new PayPalServerAdapter({ clientId: "id", clientSecret: "secret", environment: "sandbox", fetch: fetchSpy });
+    const first = await adapter.fetchEvents({ limit: 2 });
+    expect(first.nextCursor).toBe("/v1/notifications/webhooks-events/?page_size=2&start_index=2");
+    const second = await adapter.fetchEvents({ cursor: first.nextCursor });
+    expect(second.nextCursor).toBeUndefined();
+    expect(requested).toEqual([
+      "/v1/notifications/webhooks-events?page_size=2",
+      "/v1/notifications/webhooks-events/?page_size=2&start_index=2",
+    ]);
+  });
 });

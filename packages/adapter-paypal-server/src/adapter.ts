@@ -1423,12 +1423,14 @@ function nextSubscriptionsPage(
 
 /**
  * The path and query of an events-list link. Dot segments are resolved first,
- * so only the list itself matches, never another path reached through it.
+ * so only the list itself matches, never another path reached through it. A
+ * trailing slash is tolerated: PayPal's reference gives no example of the
+ * list's next link.
  */
 function relativeEventsPath(href: string): string | undefined {
   try {
     const url = new URL(href, "https://api-m.paypal.com");
-    return url.pathname === "/v1/notifications/webhooks-events" ? `${url.pathname}${url.search}` : undefined;
+    return /^\/v1\/notifications\/webhooks-events\/?$/.test(url.pathname) ? `${url.pathname}${url.search}` : undefined;
   } catch {
     // A malformed next link is PayPal's bug — stop paginating instead of throwing.
     return undefined;

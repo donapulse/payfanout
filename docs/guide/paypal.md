@@ -355,12 +355,17 @@ strings PayPal wants exist only inside the adapter.
 
 - Approve popups by logging in with a **personal** sandbox account
   (sandbox.paypal.com uses the same credentials).
-- **Negative testing:** enable it on the business sandbox account (Account → Settings →
-  Negative Testing), then force errors per request with the
-  `PayPal-Mock-Response: {"mock_application_codes": "INSTRUMENT_DECLINED"}` header —
-  the integration suite has an env-gated case for this. Mock errors never work in live.
-- Sandbox rate limiting kicks in around 50 requests/minute per IP; the adapter already
-  maps 429 to a retryable `rate_limited`.
+- **Negative testing** (a sandbox beta): REST calls opt in per request with the
+  `PayPal-Mock-Response: {"mock_application_codes": "INSTRUMENT_DECLINED"}` header, which
+  PayPal supports on the Orders v2 create, update, show, authorize and capture calls and on
+  the Payments v2 authorization, capture and refund calls. The account-level Negative
+  Testing setting in the sandbox dashboard is documented for PayPal's Classic APIs; turn it
+  on only if the header has no effect. The integration suite has an env-gated case for
+  this. Mock errors never work in live.
+- PayPal publishes no rate-limit policy: it may temporarily throttle traffic that looks
+  abusive, answering `429` with `RATE_LIMIT_REACHED`, which the adapter maps to a
+  retryable `rate_limited`. PayPal recommends webhooks over polling and cached OAuth
+  tokens; the adapter caches its token.
 
 ## 11. Limitations (v1)
 

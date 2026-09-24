@@ -59,9 +59,11 @@ Sandbox and live are **separate credential sets** and **separate hosts**; the ad
 the host from `environment` (`sandbox → checkout-test.adyen.com`,
 `live → {liveUrlPrefix}-checkout-live.adyenpayments.com`).
 
-Your own payment ids matter as much as the credentials: the `id` you pass to
-`createPaymentSession` becomes Adyen's `merchantReference` and is one of the values every
-webhook signature covers, so it must not contain `:` or `\` — see
+Your own payment ids have one rule too: the `id` you pass to
+`createPaymentSession` becomes Adyen's `merchantReference`, one of the values every webhook
+signature covers. Adyen joins those values unescaped and the webhook verifier accepts a `:` in
+`merchantReference`, but the adapter still keeps the references it creates free of `:` and
+`\`, so an id containing either is refused — see
 [Ids the adapter refuses](#ids-the-adapter-refuses).
 
 ::: danger One secret you generate yourself
@@ -171,12 +173,17 @@ PayFanout cannot slip a mispriced modification through either.
 ### Ids the adapter refuses
 
 The `id` you pass to `createPaymentSession` becomes Adyen's `merchantReference`, which comes
-back as one of the eight values every webhook signature covers — and Adyen documents no
-escaping rule for a signed value containing the `:` delimiter. An id like `order:1234` would
-therefore verify no webhook for that payment, ever, and for a push-only PSP that is total
-silent failure *after* the shopper has paid. So `createPaymentSession` rejects an id
-containing `:` or `\` with `invalid_request`, at integration time. Ids without those two
-characters are unrestricted, up to Adyen's 80-character reference limit.
+back as one of the eight values every webhook signature covers. Adyen joins those values with
+the `:` delimiter and escapes nothing: its
+[verification instructions](https://docs.adyen.com/development-resources/webhooks/secure-webhooks/verify-hmac-signatures)
+name no escaping rule, and its own validators join the values as they are. A `:` in
+`merchantReference` cannot change how the signed string splits, so the webhook verifier
+accepts it there and refuses it in every other signed value (§8): deliveries for payments
+created elsewhere on the same webhook endpoint verify even when their reference contains one.
+`createPaymentSession` still rejects an id containing `:` or `\` with `invalid_request`, a
+conservative choice: until the adapter has been exercised against a live Adyen test account,
+the references it creates stay clear of both characters rather than depend on the delimiter
+handling. Ids without them are unrestricted, up to Adyen's 80-character reference limit.
 
 ## 5. Wire the client adapter
 
@@ -290,9 +297,26 @@ your own record, never from that response.
 
 ## 8. Register the webhook endpoint
 
-In **Developers → Webhooks**, add a *Standard webhook* pointing at
-`https://your-api.example/webhooks/adyen`, generate its **HMAC key**, and set **basic
-authentication** credentials. The adapter requires both:
+In **Developers → Webhooks**, create a *Standard webhook* and configure it as follows
+([Adyen's configuration guide](https://docs.adyen.com/development-resources/webhooks/configure-and-manage)):
+
+| Setting | What to choose |
+| --- | --- |
+| **URL** | `https://your-api.example/webhooks/adyen` |
+| **Method** | **JSON**. The other two methods, HTTP POST and SOAP, send bodies that are not JSON, and every such delivery fails verification (`malformed_payload`). |
+| **Encryption protocol** | TLSv1.2 or TLSv1.3. |
+| **Merchant accounts** | A company-level webhook, which Adyen recommends, delivers every merchant account's events unless you include or exclude specific accounts. Include the ones this endpoint serves, or check `merchantAccountCode` (a signed value) before acting on an event. |
+| **Basic authentication** | A username and password, passed as `webhookBasicAuth`. |
+| **HMAC key** | Generate one and pass it as `hmacKeys`. |
+| **Events** | Adyen always sends the default event codes. Select **`OFFER_CLOSED`**, which is not a default, and make sure every dispute event is selected, as Adyen's dispute guide asks. `adyenOnboarding.webhook.events` lists every code the adapter maps. |
+| **Additional settings → Risk** | Enable **Include the originalReference for CHARGEBACK_REVERSED events**. Without it, `CHARGEBACK_REVERSED`, `SECOND_CHARGEBACK`, `PREARBITRATION_WON` and `PREARBITRATION_LOST` carry no `originalReference`, and the adapter falls back to their own `pspReference` as `pspPaymentId`, a reading Adyen implies but does not state (see [What each event becomes](#what-each-event-becomes)). |
+
+Adyen requires an HTTPS endpoint with TLSv1.2 or TLSv1.3, on port 443, 8443 or 8843. For test
+webhooks its requirements also list plain HTTP on port 80, 8080 or 8888: don't use it, because
+basic authentication needs HTTPS ("otherwise your basic authentication credentials can be
+compromised").
+
+The adapter requires both security settings:
 
 - the HMAC key authenticates the
   [eight signed fields](https://docs.adyen.com/development-resources/webhooks/secure-webhooks/verify-hmac-signatures)
@@ -318,7 +342,7 @@ Mount the handler with the **raw body**:
 ```ts
 import { createAdapterWebhookHandler } from "@payfanout/server";
 const adyenHook = createAdapterWebhookHandler(adyen, {
-  onEvent: (event) => enqueue(event), // ack-fast: enqueue, dedupe by event.id; never process inline
+  onEvent: (event) => enqueue(event), // ack-fast: enqueue, upsert by event.id (below); never process inline
 });
 
 app.post("/webhooks/adyen", express.raw({ type: "application/json" }), async (req, res) => {
@@ -328,33 +352,140 @@ app.post("/webhooks/adyen", express.raw({ type: "application/json" }), async (re
 app.use(express.json()); // AFTER the webhook route
 ```
 
+The handler answers `200` with an empty body once `onEvent` returns. Adyen accepts a successful (2xx) status
+[within 10 seconds](https://docs.adyen.com/development-resources/webhooks/handle-webhook-events);
+past that it marks the webhook as failing and retries, which is why `onEvent` should only
+enqueue.
+
+### What each event becomes
+
 A JSON delivery
-[carries exactly one notification item](https://docs.adyen.com/development-resources/webhooks/webhook-types)
-(SOAP may carry up to six; the adapter speaks JSON). `success` and `live` are the
-**strings** `"true"`/`"false"`, never booleans — the adapter compares the exact string, and so
-should any code you write against `event.raw`. The dedupe key is the pair
-`"{eventCode}:{pspReference}"`, because one payment's `AUTHORISATION` and `CAPTURE` share a
-reference but are different events.
+[carries exactly one notification item](https://docs.adyen.com/development-resources/webhooks/webhook-types).
+`success` and `live` are the **strings** `"true"`/`"false"`, never booleans — the adapter
+compares the exact string, and so should any code you write against `event.raw`; any other
+`success` value maps to `unknown`.
+
+| `eventCode` | `success: "true"` | `success: "false"` |
+| --- | --- | --- |
+| `AUTHORISATION` | `payment.succeeded`¹ | `payment.failed` |
+| `CAPTURE` | `payment.succeeded` | `unknown`² |
+| `CAPTURE_FAILED` | `payment.failed`³ | `payment.failed` |
+| `CANCELLATION`, `TECHNICAL_CANCEL` | `payment.canceled` | `unknown`² |
+| `EXPIRE`⁴, `OFFER_CLOSED` | `payment.canceled` | `payment.canceled` |
+| `REFUND` | `payment.refunded`⁵ | `payment.refund_failed` |
+| `REFUND_FAILED`, `REFUNDED_REVERSED` | `payment.refund_failed` | `payment.refund_failed` |
+| `NOTIFICATION_OF_CHARGEBACK`, `CHARGEBACK` | `payment.chargeback` | `payment.chargeback` |
+| `CHARGEBACK_REVERSED` | `payment.chargeback_won`⁶ | `payment.chargeback_won` |
+| `ISSUER_RESPONSE_TIMEFRAME_EXPIRED`, `PREARBITRATION_WON`, `SCHEME_ARBITRATION_WON` | `payment.chargeback_won` | `payment.chargeback_won` |
+| `SECOND_CHARGEBACK`, `PREARBITRATION_LOST`, `SCHEME_ARBITRATION_LOST`, `DISPUTE_DEFENSE_PERIOD_ENDED` | `payment.chargeback_lost` | `payment.chargeback_lost` |
+| `CANCEL_OR_REFUND`⁷ and every other code | `unknown` | `unknown` |
+
+1. Under manual capture, `AUTHORISATION` means *authorised*: the funds are held, not taken,
+   until the `CAPTURE` event. By default, automatic captures send no `CAPTURE` event.
+2. The request was refused, not the payment: Adyen's guidance is to review `reason`, fix the
+   issue and resubmit. To spot one, look for `type: "unknown"` with `raw.eventCode` `CAPTURE`,
+   `CANCELLATION` or `TECHNICAL_CANCEL` and `raw.success` `"false"`, then read `raw.reason`,
+   which the signature does not cover.
+3. Not always final: Adyen re-captures technical failures within 10 business days, and a
+   re-capture arrives as a `CAPTURE` whose `reason` is `Transaction Recaptured` or
+   `Transaction Auto-recaptured`.
+4. Adyen's [webhook reference](https://docs.adyen.com/api-explorer/Webhooks/latest/post/EXPIRE)
+   describes `EXPIRE` as "The remaining uncaptured amount expired", with the amount originally
+   authorised. The adapter declares `supportsMultiCapture: false`, and by default Adyen cancels
+   whatever a partial capture leaves over. On an account with multiple partial captures enabled
+   that remainder stays open, so a payment captured in part can later expire and read
+   `payment.canceled` although money moved: after a successful `CAPTURE`, an `EXPIRE` ends only
+   the uncaptured remainder.
+5. Not final either: `REFUND_FAILED` or `REFUNDED_REVERSED` can still follow it.
+6. Adyen documents this stage as not final: a later `payment.chargeback_lost` overrides it.
+7. A reversal states the operation Adyen performed only in
+   `additionalData["modification.action"]`, which the signature does not cover, so it is not
+   reported as a cancel or a refund. Codes Adyen adds later arrive as `unknown` too.
+
+`event.pspPaymentId` is the payment's reference: the event's `originalReference` whenever it
+carries one, and otherwise its own `pspReference` on `AUTHORISATION`, `EXPIRE` and
+`OFFER_CLOSED`. `CHARGEBACK_REVERSED`, `SECOND_CHARGEBACK`, `PREARBITRATION_WON` and
+`PREARBITRATION_LOST` carry `originalReference` only with the Risk setting above, and without
+it the adapter reports their own `pspReference`. Adyen's
+[dispute webhooks page](https://docs.adyen.com/risk-management/disputes-api/dispute-notifications)
+describes the setting as returning "the PSP reference of the payment in the
+`originalReference` field, and the PSP reference of the dispute in the `pspReference`", which
+implies the payment's reference sits in `pspReference` until you enable it, but no page states
+it. Adyen documents every `pspReference` as globally unique, so if that reading is wrong your
+lookup finds no payment rather than the wrong one: treat such a miss as a sign to enable the
+setting. Any other event without `originalReference`, such as a capture or a report
+notification (its `pspReference` is a file name), has no `pspPaymentId`. Refund events keep
+their own `pspReference` as `event.refundId`.
+
+### Duplicates and ordering
+
+Adyen [defines duplicates](https://docs.adyen.com/development-resources/webhooks/handle-webhook-events)
+as deliveries with "the same values in the `eventCode` and `pspReference` fields, while the
+`eventDate` and other fields can be different", and adds: "Your server should use the details
+from the latest webhook event." `event.id` is exactly that pair,
+`"{eventCode}:{pspReference}"`, so upsert on it instead of dropping a repeat: keep the delivery
+with the latest `occurredAt` (its `eventDate`). A `pspReference` alone does not identify an
+event: `CAPTURE` and `CAPTURE_FAILED` both carry the capture request's, `REFUND` and
+`REFUND_FAILED` the refund's, `AUTHORISATION`, `EXPIRE` and `OFFER_CLOSED` the payment's, and
+every event of one dispute the dispute's, so the `eventCode` is what keeps them apart. Two
+deliveries of one kind for one dispute are duplicates by Adyen's definition, and the upsert
+keeps the latest.
+
+Deliveries arrive in no guaranteed order, and there is no payment read to settle the
+sequence, so apply a payment's events in `occurredAt` order, as Adyen asks ("To ensure you are
+processing events in the correct chronological order, always check the timestamp"): that is
+how a later `payment.chargeback_lost` replaces an earlier `payment.chargeback_won`. Three
+rules refine that order:
+
+- **`occurredAt` is only as good as `eventDate`.** It comes from `eventDate`, which the
+  signature does not cover, so it can be relied on only because basic authentication
+  authenticates the channel it arrived on. An `occurredAt` of `1970-01-01T00:00:00.000Z` means
+  the time is unknown: the delivery's `eventDate` was missing or did not parse, and the adapter
+  reports the epoch rather than a time it made up. Don't let such an event reorder the others.
+- **A final dispute stage outranks a later date.** An outcome that Adyen's
+  [dispute flow](https://docs.adyen.com/risk-management/understanding-disputes/dispute-process-and-flow)
+  makes final is never overridden by a non-final one, whatever the dates say:
+  `SECOND_CHARGEBACK` ("This is the final stage"), `SCHEME_ARBITRATION_WON` ("The dispute is
+  closed"), `SCHEME_ARBITRATION_LOST` (Adyen follows it with that final second chargeback),
+  `DISPUTE_DEFENSE_PERIOD_ENDED` (a chargeback accepted or not defended in time, which the page
+  calls the final stage), `ISSUER_RESPONSE_TIMEFRAME_EXPIRED` (a defense the issuer accepted or
+  did not answer in time, likewise final) and `PREARBITRATION_WON` ("the final status can be
+  `Won` if the issuing bank accepts the defense in pre-arbitration"). `CHARGEBACK_REVERSED`
+  "is not final", so it never replaces any of them. `PREARBITRATION_LOST` is not on the list:
+  the page marks it lost without calling it final.
+- **`payment.chargeback_lost` is a state, not a sum.** A lost scheme arbitration arrives twice,
+  as `SCHEME_ARBITRATION_LOST` and then as the second chargeback that Adyen says "will include
+  the scheme arbitration fees on top of the dispute amount". Record the dispute as lost once,
+  and never add `event.amount` up across dispute events.
+
+### What the signature covers
 
 Adyen's signature covers **eight extracted values, not the delivered bytes**, so a body a
 middleware deserialized and re-serialized still verifies — by design, and the adapter
 declares it as `webhookSignatureScope: "field-values"`. Refusing such a body would mean
-guessing Adyen's wire format, and a wrong guess rejects every legitimate delivery. Two
+guessing Adyen's wire format, and a wrong guess rejects every legitimate delivery. Three
 consequences land on your handler:
 
 - **Basic authentication is what authenticates the caller.** A signature over values proves
   the values came from Adyen, never who posted them — hence the credential requirement above.
 - **Everything outside those eight fields arrives unauthenticated**, including everything you
   read from `event.raw`. Treat `additionalData`, `reason`, `paymentMethod` and `eventDate` as
-  untrusted input; a delivery whose signed values contain the `:` delimiter is refused
-  outright, since Adyen documents no escaping rule and the signed payload would be ambiguous.
+  untrusted input.
+- **Signed values keep the types Adyen's webhook schema gives them.** The signature covers the
+  values joined as strings, so a delivery whose signed values have another type (a boolean
+  `success`, a string amount) or lack a required one fails verification as
+  `malformed_payload` instead of being coerced; only a `null` `originalReference` or
+  `merchantReference`, the two optional values, reads as absent, since that is how Adyen's own
+  validators sign it. Adyen joins the values with `:` and escapes nothing, so a `:` in any
+  signed value except `merchantReference` fails as `ambiguous_signed_value`; in
+  `merchantReference` it cannot change how the string splits.
 
 Keep the raw body all the way to the handler anyway: it costs nothing, and it is what every
 other PSP's verification hashes.
 
 Adyen exposes no events-polling API (`supportsEventPolling: false`), and there is no
 `retrievePayment` to reconcile against, so treat the webhook queue as the system of record:
-persist every event, dedupe by `event.id`, and alert on gaps.
+persist every event, upsert by `event.id`, and alert on gaps.
 
 ## 9. Test values
 

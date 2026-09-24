@@ -3,12 +3,15 @@ import type { AdapterOnboardingDescriptor } from "@payfanout/core";
 /**
  * Declarative onboarding metadata for the PayPal adapter: the credentials a
  * host collects, the dashboard events its webhook parser consumes, and the CSP
- * hosts the browser SDK touches. It restates facts the adapter already embodies
- * — `PayPalServerAdapterConfig` (clientId/clientSecret/webhookId), the
- * `webhook.ts` event map, and PayPal's SDK/checkout origins — in a
- * machine-readable form so a host settings screen renders generically instead
- * of hard-coding PayPal specifics. The runtime companion is the adapter's
- * `verifyCredentials()` probe (a "Test connection" button).
+ * hosts the browser SDK touches (PayPal's recommendation also needs `child-src`,
+ * `img-src` with `data:`, and `'unsafe-inline'` or a nonce for scripts and
+ * styles, which the descriptor has no field for; see the setup guide). It
+ * restates facts the adapter already embodies — `PayPalServerAdapterConfig`
+ * (clientId/clientSecret/webhookId), the `webhook.ts` event map, and PayPal's
+ * SDK/checkout origins — in a machine-readable form so a host settings screen
+ * renders generically instead of hard-coding PayPal specifics. The runtime
+ * companion is the adapter's `verifyCredentials()` probe (a "Test connection"
+ * button).
  *
  * The event list MUST stay in lockstep with `webhook.ts`: every EVENT_TYPE_MAP
  * key plus CUSTOMER.DISPUTE.RESOLVED, which `mapEventType` resolves dynamically.
@@ -44,9 +47,11 @@ export const paypalOnboarding: AdapterOnboardingDescriptor = {
       "CUSTOMER.DISPUTE.RESOLVED",
     ],
   },
+  // PayPal's JS SDK CSP recommendation lists the same three host sources for
+  // script-src, frame-src and connect-src.
   csp: {
-    script: ["https://www.paypal.com", "https://*.paypal.com", "https://*.paypalobjects.com"],
-    frame: ["https://*.paypal.com"],
-    connect: ["https://*.paypal.com"],
+    script: ["https://www.paypal.com", "https://*.paypal.com", "https://*.paypalobjects.com", "https://*.venmo.com"],
+    frame: ["https://*.paypal.com", "https://*.paypalobjects.com", "https://*.venmo.com"],
+    connect: ["https://*.paypal.com", "https://*.paypalobjects.com", "https://*.venmo.com"],
   },
 };

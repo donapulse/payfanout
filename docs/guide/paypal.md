@@ -118,9 +118,26 @@ a mismatch fails late, at approval time, with an SDK error.
   what the server side then does.
 
 ::: tip Content-Security-Policy
-The SDK loads from `www.paypal.com` and opens PayPal frames. If you set a CSP, allow
-`*.paypal.com` and `*.paypalobjects.com` in `script-src`/`frame-src`/`connect-src`/`img-src`,
-and check [PayPal's CSP page](https://developer.paypal.com/sdk/js/csp/) for the current list.
+The SDK loads from `www.paypal.com` and opens PayPal frames. PayPal's
+[CSP recommendation](https://developer.paypal.com/sdk/js/v5/best-practices) for a page
+running the JS SDK is:
+
+```
+script-src  *.paypal.com *.paypalobjects.com *.venmo.com 'unsafe-inline'
+style-src   *.paypal.com *.paypalobjects.com *.venmo.com 'unsafe-inline'
+connect-src *.paypal.com *.paypalobjects.com *.venmo.com
+frame-src   *.paypal.com *.paypalobjects.com *.venmo.com
+child-src   *.paypal.com *.paypalobjects.com *.venmo.com
+img-src     *.paypal.com *.paypalobjects.com *.venmo.com data:
+```
+
+PayPal calls a nonce safer than `'unsafe-inline'`: it replaces `'unsafe-inline'` with
+`'nonce-<value>'` in `script-src` and `style-src` and puts the same value in the SDK tag's
+`nonce` and `data-csp-nonce` attributes. The adapter's script loader sets neither, so use
+the `'unsafe-inline'` policy above with the adapter as shipped. PayPal also recommends
+`Cross-Origin-Opener-Policy: same-origin-allow-popups` on a page running the SDK. The
+onboarding descriptor (`paypalOnboarding.csp`) lists these hosts under `script`, `frame`
+and `connect`; `style-src`, `child-src` and `img-src` have no descriptor field.
 :::
 
 ## 6. The two-step UX: PayPal button approves, your Pay button pays
@@ -164,9 +181,26 @@ const complete = createCompletionHandler({
 Under the hood it calls `completePayment` (which **captures**). The adapter rejects a
 `clientToken` that names a different order than the session (tamper guard), and branches on
 the order's intent: `CAPTURE` orders capture, `AUTHORIZE` orders authorize and return
-`requires_capture` for a later `capturePayment` (partial and multiple captures supported).
+`requires_capture` for a later `capturePayment` (partial and multiple captures supported,
+see [Manual capture](#manual-capture-partial-captures-and-the-rest) below).
 Prefer a hand-written route? Call `completePayment` directly — see
 [Server usage](/guide/server#server-completion-tokenize-first).
+
+### Completing an order twice
+
+A second `completePayment` for an order that is already captured or authorized (a double
+click, or a retry under a fresh idempotency key) meets PayPal's `ORDER_ALREADY_CAPTURED` or
+`ORDER_ALREADY_AUTHORIZED`. For the first, PayPal's guidance is to read the order to get the
+capture; for the second, it says the funds are authorized and ready to capture. Either way
+the adapter re-reads the order and returns the existing capture or authorization; no money
+moves twice. It does so only when the order read back is the session's own order and
+`COMPLETED` with that capture or authorization; otherwise the `invalid_request` stands. A
+re-read that fails surfaces its own error instead, so an outage reaches you as a retryable
+`psp_unavailable`.
+
+A repeated completion succeeds under any key, so `onCompleted` can run more than once for
+one payment; hosts should make it idempotent on `info.pspPaymentId` and check `info.id` and
+`info.amount` against their own record.
 
 ### Declines: `INSTRUMENT_DECLINED` recovery
 
@@ -176,32 +210,91 @@ approval **on the same order**: surface the error, the buyer clicks the PayPal b
 again and picks another funding source in the popup, and your Pay button calls the
 completion route again with the same order. No new session needed.
 
+When PayPal's refusal is not about one funding source (`PAYMENT_DENIED`,
+`PAYER_CANNOT_PAY`, `PAYER_ACCOUNT_RESTRICTED`, `PAYER_ACCOUNT_LOCKED_OR_CLOSED`,
+`MAX_NUMBER_OF_PAYMENT_ATTEMPTS_EXCEEDED`), the error is still `card_declined`, but the
+message asks for another payment method ("PayPal declined this payment — choose another
+payment method."): offer the buyer a different way to pay, not the PayPal button again.
+Both kinds share the code and differ only in `message`, which `localizeError` replaces
+outside English, so a UI that branches on the code should keep your other payment methods
+on offer next to the PayPal button after any PayPal `card_declined`.
+`TRANSACTION_BLOCKED_BY_PAYEE` (your own fraud protection settings) is `fraud_suspected`,
+and `TRANSACTION_RECEIVING_LIMIT_EXCEEDED` (your account's receiving limit) is
+`processing_error`.
+
 ### Store the capture id
 
 Once captured, `PaymentInfo.pspPaymentId` is the **capture id** (PayPal's "transaction
 ID"), not the order id — persist it. PayPal's order GET stops answering a few days after
 completion, while the capture id stays valid for refunds for 180 days.
-`retrievePayment` accepts either id (it falls back from order to capture automatically).
+`retrievePayment`, `capturePayment`, and `cancelPayment` accept either id: a capture id
+resolves to its order through the capture's `supplementary_data.related_ids.order_id`.
+After further captures `pspPaymentId` stays the first capture's id, so the id you stored
+keeps working for the next capture and for reads.
 Multi-capture payments are refunded **per capture id**: once an order carries more than
 one capture, `refundPayment` rejects the order id and requires the specific capture id.
+
+### Manual capture: partial captures and the rest
+
+`capturePayment(id, amount, key)` captures `amount` and keeps the authorization open for
+another capture while money is left; each partial capture needs its own idempotency key.
+PayPal requires partial capture of PayPal authorizations to be enabled on your PayPal
+account. Without an amount it captures **the rest**. PayPal reads a capture without an
+amount as the *full authorized amount*, so the adapter sends the uncaptured remainder
+explicitly: the authorized amount minus every capture that took money, completed or
+pending (declined and failed captures took nothing).
+
+The capture that takes the rest, with or without an explicit amount, goes out with
+`final_capture: true`, which closes the authorization: PayPal refuses any further capture
+against it (`AUTHORIZATION_ALREADY_CAPTURED`). Once earlier captures took the whole
+authorization (PayPal reports it `CAPTURED`, a capture that took money went out as the
+final one, or those captures cover the authorized amount), capturing the rest sends no
+capture and answers with the payment, under the same key or a new one. A retry you issue
+yourself of a capture of the rest whose response was lost therefore gets the payment back
+rather than an error. An authorization voided or denied before captures took it all
+(PayPal reports an expired authorization as voided) has nothing left to take: capturing the
+rest rejects with `invalid_request` before any capture call.
+
+PayPal lets captures exceed the authorized amount up to the account's overage limit (by
+default up to 115% of the authorized amount or USD 75 more, whichever is less; PSD2
+countries allow none). The adapter passes an explicit amount through for PayPal to judge
+and never adds an overage itself. Authorizations last 29 days, and captures succeed best
+within the first three days. A remainder you will not capture is left to expire;
+`cancelPayment` voids only an authorization with no capture yet.
 
 ### `amountRefunded` caveat
 
 PayPal's capture object carries no cumulative refunded total. `retrievePayment` reports
-`amountRefunded` faithfully while the order GET (with its embedded refunds list) is alive,
-and from a bare capture only the fully-`REFUNDED` case; a partially refunded old capture
-reports `0`. Keep your own refund records — PayFanout's statelessness expects the host to
-own payment bookkeeping anyway, and every `refundPayment` result carries the amounts.
+`amountRefunded` from the order's embedded refunds list while the order GET is alive, and
+from a bare capture only the fully-`REFUNDED` case; a partially refunded old capture
+reports `0`. From the list it counts `COMPLETED` refunds and `PENDING` ones (that money is
+on its way back, so it is never offered for refund again) and leaves out `FAILED` and
+`CANCELLED` refunds, which returned nothing. Keep your own refund records — PayFanout's
+statelessness expects the host to own payment bookkeeping anyway, and every
+`refundPayment` result carries the amounts.
+
+`refundPayment` does not forward `reason`. PayPal's only reason field, `note_to_payer`, is
+text the payer reads in their transaction history and in PayPal's emails, and a code such
+as `requested_by_customer` is not a message for a customer.
+
+### Payment method details
+
+`paymentMethodDetails.wallet` is `"venmo"` for an order paid with Venmo
+(`payment_source.venmo`) and `"paypal"` otherwise; a guest card payment adds the card's
+`brand` and `last4`. A bare capture, read once its order has aged out, carries no payment
+source, so `paymentMethodDetails` is left out rather than naming a wallet it cannot
+confirm.
 
 ## 8. Register the webhook endpoint
 
 In the dashboard (your app → Webhooks) add your listener URL —
-`https://your-api.example/webhooks/paypal` — subscribe at least to
-`PAYMENT.CAPTURE.*` and `CUSTOMER.DISPUTE.*`, and copy the created webhook's **ID** into
-`PAYPAL_WEBHOOK_ID`. Verification is a **postback**: the adapter POSTs the delivery
-headers plus the raw body to PayPal's `verify-webhook-signature` endpoint and trusts only
-`SUCCESS`. Without `webhookId` (or with any transmission header missing) it answers
-`false` without a network call.
+`https://your-api.example/webhooks/paypal` — subscribe it to the events the adapter maps
+(the list is `paypalOnboarding.webhook.events`; PayPal documents only `*`, every event
+type, as a wildcard), and copy the created webhook's **ID** into `PAYPAL_WEBHOOK_ID`.
+Verification is a **postback**: the adapter POSTs the delivery headers plus the raw body
+to PayPal's `verify-webhook-signature` endpoint and trusts only `SUCCESS`. Without
+`webhookId`, with any transmission header missing, or with a body that is not exactly one
+JSON object, it answers `false` without a network call.
 
 Mount the handler with the **raw body** — verification splices the exact delivered bytes
 into the postback, so a parsed-and-re-serialized body fails by design:
@@ -227,19 +320,30 @@ to 25 times over 3 days.
 :::
 
 For missed events, the adapter supports polling: `fetchEvents({ since })` pages through
-`GET /v1/notifications/webhooks-events` (~30 days of retention) and normalizes with the
-same mapper as deliveries, so dedupe by `event.id` keeps working.
+`GET /v1/notifications/webhooks-events` and normalizes with the same mapper as
+deliveries, so dedupe by `event.id` keeps working. PayPal documents no retention period
+for that list; its events dashboard searches only the last 30 days.
 
 ## 9. Currencies
 
-PayPal checkout supports 25 currencies — and **no 3-decimal ones** (BHD, KWD, TND, …
-are rejected locally with `invalid_request`):
+PayPal checkout supports the currencies of its
+[currency codes reference](https://developer.paypal.com/reference/currency-codes) — and
+**no 3-decimal ones** (BHD, KWD, TND, … are refused locally: `unsupported_operation`
+through `PaymentService`, `invalid_request` from the adapter itself):
 
 AUD, BRL, CAD, CHF, CNY, CZK, DKK, EUR, GBP, HKD, HUF, ILS, JPY, MXN, MYR, NOK, NZD,
-PHP, PLN, RUB, SEK, SGD, THB, TWD, USD.
+PHP, PLN, SEK, SGD, THB, TWD, USD.
 
-BRL, CNY, and MYR are supported for **in-country PayPal accounts only** — a business
-account registered elsewhere cannot charge them.
+RUB is no longer on that list: a new session in RUB is refused locally, while payments
+made in RUB earlier can still be retrieved, captured and refunded.
+
+BRL, CNY, and MYR are payment or settlement currencies for **in-country PayPal accounts
+only**: for an account based outside the country, PayPal converts the money into the
+account's primary currency at its conversion rate, which includes a spread or fee.
+
+A payment in a currency your PayPal account does not hold stays pending until you accept
+it in your PayPal account, unless your Payment Receiving Preferences handle it
+automatically; the adapter reports such a capture as `processing`.
 
 **Whole-unit rule:** PayPal accepts no decimals for **HUF, JPY, TWD**. JPY is 0-decimal in
 ISO anyway, but HUF and TWD are ISO 2-decimal — their minor-unit amounts must be a

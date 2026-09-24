@@ -22,11 +22,19 @@ const ISSUE_MAP: Record<string, UnifiedErrorCode> = {
   // insufficient_funds/expired_card split) — a funding failure is a decline.
   INSTRUMENT_DECLINED: "card_declined",
   REDIRECT_PAYER_FOR_ALTERNATE_FUNDING: "card_declined",
+  // Not about one funding source: re-approving the same order does not help.
+  PAYMENT_DENIED: "card_declined",
+  PAYER_CANNOT_PAY: "card_declined",
+  PAYER_ACCOUNT_RESTRICTED: "card_declined",
+  PAYER_ACCOUNT_LOCKED_OR_CLOSED: "card_declined",
+  MAX_NUMBER_OF_PAYMENT_ATTEMPTS_EXCEEDED: "card_declined",
   PAYER_ACTION_REQUIRED: "authentication_required",
   PAYEE_BLOCKED_TRANSACTION: "fraud_suspected",
+  TRANSACTION_BLOCKED_BY_PAYEE: "fraud_suspected",
   COMPLIANCE_VIOLATION: "fraud_suspected",
   TRANSACTION_REFUSED: "processing_error",
   TRANSACTION_LIMIT_EXCEEDED: "processing_error",
+  TRANSACTION_RECEIVING_LIMIT_EXCEEDED: "processing_error",
   REFUND_FAILED_INSUFFICIENT_FUNDS: "processing_error",
   // Caller/state problems — never retryable, the router must not cascade them.
   ORDER_NOT_APPROVED: "invalid_request",
@@ -43,6 +51,8 @@ const ISSUE_MAP: Record<string, UnifiedErrorCode> = {
   REFUND_TIME_LIMIT_EXCEEDED: "invalid_request",
   REFUND_NOT_ALLOWED: "invalid_request",
   PENDING_CAPTURE: "invalid_request",
+  AUTHORIZATION_ALREADY_CAPTURED: "invalid_request",
+  AUTHORIZATION_DENIED: "invalid_request",
   AUTHORIZATION_VOIDED: "invalid_request",
   AUTHORIZATION_EXPIRED: "invalid_request",
   PREVIOUSLY_CAPTURED: "invalid_request",
@@ -51,9 +61,33 @@ const ISSUE_MAP: Record<string, UnifiedErrorCode> = {
   AUTH_CAPTURE_CURRENCY_MISMATCH: "invalid_request",
 };
 
+/**
+ * Declines that are not about one funding source, so re-approving the same
+ * order in the PayPal window does not help. PayPal points PAYER_CANNOT_PAY
+ * ("Please contact the payer to find other ways to pay for this transaction.")
+ * and MAX_NUMBER_OF_PAYMENT_ATTEMPTS_EXCEEDED ("Ask the buyer to use a
+ * different payment method.") away from it, and gives no remedy for
+ * PAYMENT_DENIED or the payer-account issues, where another payment method is
+ * the conservative advice.
+ */
+const OTHER_METHOD_DECLINES: ReadonlySet<string> = new Set([
+  "PAYMENT_DENIED",
+  "PAYER_CANNOT_PAY",
+  "PAYER_ACCOUNT_RESTRICTED",
+  "PAYER_ACCOUNT_LOCKED_OR_CLOSED",
+  "MAX_NUMBER_OF_PAYMENT_ATTEMPTS_EXCEEDED",
+]);
+
+/** The first details[].issue of a PayPal error body, e.g. ORDER_ALREADY_CAPTURED. */
+export function payPalErrorIssue(body: unknown): string | undefined {
+  const details = typeof body === "object" && body !== null ? (body as PayPalErrorBody).details : undefined;
+  if (!Array.isArray(details)) return undefined;
+  return (details as Array<{ issue?: string } | null>).find((detail) => detail?.issue)?.issue;
+}
+
 export function mapPayPalError(httpStatus: number, body: unknown): PayFanoutError {
   const parsed = (typeof body === "object" && body !== null ? body : {}) as PayPalErrorBody;
-  const issue = parsed.details?.find((d) => d.issue)?.issue;
+  const issue = payPalErrorIssue(body);
   const mappedIssue = issue ? ISSUE_MAP[issue] : undefined;
   let code: UnifiedErrorCode;
   let retryable = false;
@@ -61,7 +95,9 @@ export function mapPayPalError(httpStatus: number, body: unknown): PayFanoutErro
   const fallback = classifyHttpFallback(httpStatus);
   if (mappedIssue) {
     code = mappedIssue;
-    if (code === "card_declined") {
+    if (code === "card_declined" && OTHER_METHOD_DECLINES.has(issue!)) {
+      message = "PayPal declined this payment — choose another payment method.";
+    } else if (code === "card_declined") {
       // Recovery is a fresh approval on the SAME order: the buyer picks a
       // different funding source in the PayPal window, then pay runs again.
       message = "The payment was declined — choose a different way to pay in the PayPal window and try again.";
@@ -76,7 +112,12 @@ export function mapPayPalError(httpStatus: number, body: unknown): PayFanoutErro
   } else if (fallback.code === "rate_limited" || parsed.name === "RATE_LIMIT_REACHED") {
     code = "rate_limited";
     retryable = true;
-  } else if (fallback.code === "psp_unavailable" || parsed.name === "INTERNAL_SERVICE_ERROR") {
+  } else if (
+    fallback.code === "psp_unavailable" ||
+    parsed.name === "INTERNAL_SERVER_ERROR" ||
+    parsed.name === "INTERNAL_SERVICE_ERROR"
+  ) {
+    // INTERNAL_SERVER_ERROR is PayPal's documented name; INTERNAL_SERVICE_ERROR stays accepted.
     code = "psp_unavailable";
     retryable = true;
   } else if (httpStatus === 409) {

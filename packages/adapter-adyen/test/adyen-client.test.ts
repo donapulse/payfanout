@@ -286,7 +286,7 @@ describe("AdyenClientAdapter", () => {
     expect(JSON.parse((await pending).clientToken!)).toEqual({});
   });
 
-  it("resolves an action that throws inside the SDK as a unified failure", async () => {
+  it("resolves an action that throws inside the SDK as a failed authentication", async () => {
     stubBrowser();
     const fake = makeFakeAdyenWeb();
     const { adapter } = makeAdapter(fake);
@@ -297,7 +297,7 @@ describe("AdyenClientAdapter", () => {
     };
     const result = await adapter.handleAction(handle, { type: "threeDS2" });
     expect(result.status).toBe("failed");
-    expect(result.error?.code).toBe("invalid_card_data");
+    expect(result.error).toMatchObject({ code: "authentication_required", retryable: false });
   });
 
   it("reads the SDK from window.AdyenWeb when no test seam is configured", async () => {
@@ -594,6 +594,8 @@ describe("AdyenClientAdapter 3-D Secure", () => {
     const failed = await pending;
     expect(failed.status).toBe("failed");
     expect(isPayFanoutError(failed.error)).toBe(true);
+    // The shopper's authentication failed; the card data was never in question.
+    expect(failed.error).toMatchObject({ code: "authentication_required", retryable: false });
     // The host's onError still hears about it, with the same error.
     expect(reported).toEqual([failed.error]);
 
@@ -605,6 +607,38 @@ describe("AdyenClientAdapter 3-D Secure", () => {
       status: "requires_confirmation",
       clientToken: JSON.stringify({ details: { threeDSResult: "eyJ0cmFuc1N0YXR1cyI6IlkifQ==" } }),
     });
+  });
+
+  it("keeps an SDK load failure during a challenge a retryable psp_unavailable", async () => {
+    stubBrowser();
+    const fake = makeFakeAdyenWeb();
+    const { adapter } = makeAdapter(fake);
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN });
+    componentOf(handle)["handleAction"] = () => undefined;
+    const pending = adapter.handleAction(handle, { type: "threeDS2", subtype: "challenge" });
+    (fake.checkoutConfigs[0]!["onError"] as (err: unknown) => void)({ name: "NETWORK_ERROR", message: "Network error" });
+    await expect(pending).resolves.toMatchObject({ status: "failed", error: { code: "psp_unavailable", retryable: true } });
+  });
+
+  it("settles a pending action as failed when the fields are unmounted", async () => {
+    stubBrowser();
+    const fake = makeFakeAdyenWeb();
+    const { adapter } = makeAdapter(fake);
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN });
+    componentOf(handle)["handleAction"] = () => undefined;
+    const pending = adapter.handleAction(handle, { type: "threeDS2", subtype: "challenge" });
+    adapter.unmount(handle);
+    const result = await pending;
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatchObject({ code: "authentication_required", retryable: false });
+    expect(fake.unmounted).toBe(1);
+    // Details arriving afterwards settle nothing twice.
+    (fake.checkoutConfigs[0]!["onAdditionalDetails"] as (state: unknown) => void)({
+      data: { details: { threeDSResult: "eyJ0cmFuc1N0YXR1cyI6IlkifQ==" } },
+    });
+    await expect(pending).resolves.toBe(result);
+    // With nothing pending, unmounting settles nothing.
+    expect(() => adapter.unmount(handle)).not.toThrow();
   });
 
   it("builds the clientToken a 3-D Secure redirect return completes with", () => {

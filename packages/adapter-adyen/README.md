@@ -54,8 +54,8 @@ const adyen = new AdyenClientAdapter({
   is a JSON envelope taken from Adyen Web's state: the encrypted card blob (`paymentMethod`)
   and the browser data 3-D Secure 2 uses (`browserInfo`, `origin`, `billingAddress`,
   `riskData`), nothing else. The host passes it to the server's `completePayment` —
-  `<PayButton>` / `completionEndpoint` wire this automatically. Only the matching
-  `@payfanout/adapter-adyen-server` release decodes the envelope, so upgrade the server
+  `<PayButton>` / `completionEndpoint` wire this automatically. Only the matching major
+  release of `@payfanout/adapter-adyen-server` decodes the envelope, so upgrade the server
   adapter first.
 
 ## Customization
@@ -69,13 +69,14 @@ and the validity stream arrive). `options.locale` sets the SDK's locale for that
 ## 3-D Secure
 
 A challenge comes back from the *server*: `completePayment` reports `requires_action` with
-Adyen's `action` object on `PaymentInfo.raw`, and an empty `pspPaymentId` until Adyen issues
-a `pspReference`. Hand it to `handleAction(handle, action)`: Adyen Web replaces the card
-fields with the `threeDS2` fingerprint or challenge and runs it **inline**, and the result is
-a fresh `clientToken` — the `onAdditionalDetails` data, `{ details: { threeDSResult } }` —
-which the host completes with exactly as it did the first one. That answer can carry another
-action; handle it the same way. `handleAction` is Adyen-specific — the unified contract has
-no action step, because most PSPs resolve challenges inside `confirm()`.
+Adyen's `action` object on `PaymentInfo.raw`, and an empty `pspPaymentId` when Adyen answers
+without a `pspReference` (its native 3-D Secure 2 example does). Hand it to
+`handleAction(handle, action)`: Adyen Web replaces the card fields with the `threeDS2`
+fingerprint or challenge and runs it **inline**, and the result is a fresh `clientToken` —
+the `onAdditionalDetails` data, `{ details: { threeDSResult } }` — which the host completes
+with exactly as it did the first one. That answer can carry another action; handle it the
+same way. `handleAction` is Adyen-specific — the unified contract has no action step, because
+most PSPs resolve challenges inside `confirm()`.
 
 Adyen can still choose its redirect flow. `handleAction` then navigates the page to Adyen,
 which sends the shopper back to the session's `returnUrl` with a `redirectResult` query
@@ -86,10 +87,11 @@ One challenge runs at a time per mounted field set: calling `handleAction` again
 is outstanding resolves `{ status: "failed" }` with `invalid_request` rather than replacing
 the pending resolver, which would strand the first caller's promise. The promise settles
 when Adyen reports the shopper's details, or as `failed` when Adyen Web reports an error
-through `onError` first, so race it against your own timer if you need a deadline on an
-abandoned challenge. Once `handleAction` has run, the card fields are gone: `confirm()` on
-that handle resolves `failed` with `invalid_request`, and the fields must be remounted to
-pay again.
+through `onError` first — `authentication_required`, or a retryable `psp_unavailable` when
+the error reads as a load or network failure — or when the fields are unmounted first. Race
+it against your own timer if you need a deadline on an abandoned challenge. Once
+`handleAction` has run, the card fields are gone: `confirm()` on that handle resolves
+`failed` with `invalid_request`, and the fields must be remounted to pay again.
 
 ## Notes
 

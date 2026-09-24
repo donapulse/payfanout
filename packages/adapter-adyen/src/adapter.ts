@@ -178,9 +178,10 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
    * Two Card defaults differ from Adyen Web's, and `fieldOptions` still wins
    * over both: the cardholder name is shown and required (`hasHolderName`,
    * `holderNameRequired`), since Adyen's native 3-D Secure 2 guide lists it as
-   * required for Visa and JCB, and `onEnterKeyPressed` does nothing, since
-   * Adyen Web's default handler calls submit(), which has no `onSubmit` to call
-   * here.
+   * required for Visa and JCB — `hasHolderName: false` alone hides it, and
+   * Adyen Web then drops the requirement too — and `onEnterKeyPressed` does
+   * nothing, since Adyen Web's default handler calls submit(), which has no
+   * `onSubmit` to call here.
    */
   async mount(container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
     assertBrowser("AdyenClientAdapter", "mount");
@@ -195,6 +196,11 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
     const handle: AdyenHandle = {
       pspName: "adyen",
       cleanup: () => {
+        // A pending action can no longer finish once its fields are gone.
+        settlePendingDetails(handle, {
+          status: "failed",
+          error: buildError("authentication_required", { reason: "unmounted before the action finished" }),
+        });
         try {
           handle.component?.unmount?.();
           handle.component?.remove?.();
@@ -219,7 +225,9 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
           });
         },
         onError: (err: unknown) => {
-          const mapped = mapAdyenClientError(err);
+          // An error during an action is the shopper's authentication failing,
+          // not the card data the fields validate.
+          const mapped = mapAdyenClientError(err, handle.pendingDetails ? "authentication_required" : "invalid_card_data");
           // Adyen Web's 3-D Secure 2 elements report timeouts through
           // onAdditionalDetails and call onError only when they stop, so a
           // pending challenge will never deliver its details.
@@ -304,10 +312,13 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
    *
    * One challenge at a time per mounted handle: the returned promise settles
    * when Adyen reports the shopper's additional details, or `failed` when Adyen
-   * Web reports an error through onError meanwhile, so a second call while one
-   * is outstanding is refused rather than replacing the pending resolver (which
-   * would strand the first caller's promise forever). A host that wants a
-   * deadline on an abandoned challenge races this promise against its own timer.
+   * Web reports an error through onError meanwhile or the fields are unmounted
+   * first, so a second call while one is outstanding is refused rather than
+   * replacing the pending resolver (which would strand the first caller's
+   * promise forever). An error raised while the action runs is
+   * `authentication_required`, unless it looks like an SDK load or network
+   * failure (`psp_unavailable`). A host that wants a deadline on an abandoned
+   * challenge races this promise against its own timer.
    */
   async handleAction(handle: MountedFieldsHandle, action: Record<string, unknown>): Promise<ConfirmResult> {
     const h = asAdyenHandle(handle);
@@ -324,7 +335,7 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
       try {
         h.component.handleAction!(action);
       } catch (err) {
-        settlePendingDetails(h, { status: "failed", error: mapAdyenClientError(err) });
+        settlePendingDetails(h, { status: "failed", error: mapAdyenClientError(err, "authentication_required") });
       }
     });
   }
@@ -461,14 +472,16 @@ function extractMessage(err: unknown): string {
 /**
  * Maps an Adyen Web failure onto the unified taxonomy. The browser only
  * validates and encrypts card DATA — the authorisation happens server-side at
- * completePayment — so a client-side failure is a card-data problem unless it
- * looks like an SDK/network load issue.
+ * completePayment — so a client-side failure is `fallback` (a card-data
+ * problem, or an authentication one while an action runs) unless it looks like
+ * an SDK/network load issue.
  */
-function mapAdyenClientError(err: unknown): UnifiedError {
+function mapAdyenClientError(
+  err: unknown,
+  fallback: "invalid_card_data" | "authentication_required" = "invalid_card_data",
+): UnifiedError {
   const message = extractMessage(err);
-  const code: UnifiedErrorCode = /load|network|script|timeout|unavailable/i.test(message)
-    ? "psp_unavailable"
-    : "invalid_card_data";
+  const code: UnifiedErrorCode = /load|network|script|timeout|unavailable/i.test(message) ? "psp_unavailable" : fallback;
   return buildError(code, err);
 }
 

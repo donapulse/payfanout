@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { isPayFanoutError, type CreatePaymentSessionInput } from "@payfanout/core";
-import { AdyenServerAdapter, type AdyenServerAdapterConfig } from "../src/index.js";
+import { AdyenServerAdapter, decodeAdyenPaymentRef, type AdyenServerAdapterConfig } from "../src/index.js";
 import { FakeAdyenApi } from "./fake-adyen-api.js";
 
 const HMAC_KEY = "44782DEF547AAA06C910C43932B1EB0C71FC68D9D0C057550C48EC2ACF6BA056";
@@ -39,6 +39,13 @@ const CARD = {
   holderName: "J. Smith",
 };
 const CHALLENGED_CARD = { ...CARD, holderName: "CHALLENGE" };
+/** The rest of what Adyen Web 6.41.0's Card puts in its paymentMethod (sdkData is base64 JSON). */
+const CARD_EXTRAS = {
+  brand: "visa",
+  fundingSource: "debit",
+  checkoutAttemptId: "checkout-attempt-1",
+  sdkData: "eyJzY2hlbWFWZXJzaW9uIjoxLCJjaGFubmVsIjoiV2ViIiwic2RrVmVyc2lvbiI6IjYuNDEuMCJ9",
+};
 
 /** What Adyen Web 6.41.0's collectBrowserInfo() reports. */
 const BROWSER_INFO = {
@@ -117,7 +124,7 @@ describe("Adyen native 3-D Secure 2 request", () => {
       origin: ORIGIN,
       authenticationData: { threeDSRequestData: { nativeThreeDS: "preferred" } },
       billingAddress: { ...BILLING_ADDRESS, stateOrProvince: "NH" },
-      // fraudOffset would move the payment's fraud score: the merchant's lever, never the browser's.
+      // riskData's other fields are merchant risk settings, not browser data.
       riskData: { clientData: "eyJ2ZXJzaW9uIjoiMS4wLjAifQ==" },
     });
     expect(fake.lastPaymentBody).not.toHaveProperty("shopperIP");
@@ -140,10 +147,28 @@ describe("Adyen native 3-D Secure 2 request", () => {
     await expect(adapter.capturePayment(info.pspPaymentId, 2500, "capture-1")).rejects.toMatchObject({
       code: "invalid_request",
     });
+    await expect(adapter.cancelPayment(info.pspPaymentId, "cancel-1")).rejects.toMatchObject({ code: "invalid_request" });
     await expect(adapter.refundPayment({ pspPaymentId: info.pspPaymentId, idempotencyKey: "refund-1" })).rejects.toMatchObject(
       { code: "invalid_request" },
     );
     expect(fake.lastRequestPath).toBe(sent);
+  });
+
+  it("reports the composite for an action answered with the session's own pspReference", async () => {
+    const { adapter, fake } = makePair();
+    // Adyen's v72 redirect example answers the action with a pspReference.
+    fake.actionsCarryPspReference = true;
+    const created = await session(adapter);
+    const info = await adapter.completePayment({
+      pspSessionId: created.pspSessionId,
+      clientToken: JSON.stringify(CHALLENGED_CARD),
+      idempotencyKey: "complete-1",
+    });
+    const answer = info.raw as { pspReference?: string; action?: { type?: string } };
+    expect(answer.action?.type).toBe("redirect");
+    expect(answer.pspReference).toMatch(/^\d{16}$/);
+    // Built from this session's /payments answer and the signed amount and currency.
+    expect(info).toMatchObject({ status: "requires_action", pspPaymentId: `${answer.pspReference}:2500:EUR` });
   });
 
   it("keeps the body earlier client adapters get for a bare paymentMethod token", async () => {
@@ -177,7 +202,7 @@ describe("Adyen native 3-D Secure 2 request", () => {
     }
   });
 
-  it("leaves the flow to Adyen's redirect when the origin is not the page's bare origin", async () => {
+  it("omits the native 3-D Secure request when the origin is not the page's bare origin", async () => {
     const origins: unknown[] = [
       "https://shop.example/",
       "https://shop.example/checkout",
@@ -204,6 +229,7 @@ describe("Adyen native 3-D Secure 2 request", () => {
       for (const field of ["origin", "channel", "authenticationData"]) {
         expect(fake.lastPaymentBody, label).not.toHaveProperty(field);
       }
+      // The fake's redirect answer; what Adyen answers such a request with is unverified.
       expect(actionOf(info.raw).type, label).toBe("redirect");
     }
   });
@@ -232,6 +258,84 @@ describe("Adyen native 3-D Secure 2 request", () => {
       for (const field of ["browserInfo", "origin", "channel", "authenticationData", "billingAddress", "riskData"]) {
         expect(fake.lastPaymentBody, JSON.stringify(extra)).not.toHaveProperty(field);
       }
+    }
+  });
+
+  it("forwards only the card fields Adyen Web's Card produces", async () => {
+    const produced = { ...CARD, ...CARD_EXTRAS };
+    const unlisted = {
+      storedPaymentMethodId: "8416038790273850",
+      recurringDetailReference: "8416038790273850",
+      networkPaymentReference: "MCC123456789",
+      srcScheme: "visa",
+      taxNumber: "123456",
+      threeDS2SdkVersion: "2.2.10",
+    };
+    const { holderName: _holderName, ...withoutHolderName } = CARD;
+    const { brand: _brand, ...withoutBrand } = CARD_EXTRAS;
+    const cases: Array<[Record<string, unknown>, Record<string, string>]> = [
+      [{ ...produced, ...unlisted }, produced],
+      // A listed field is forwarded only as the string the Card produces.
+      [{ ...produced, brand: 42, holderName: { first: "J." } }, { ...withoutHolderName, ...withoutBrand }],
+    ];
+    for (const [paymentMethod, expected] of cases) {
+      for (const clientToken of [envelope({}, paymentMethod), JSON.stringify(paymentMethod)]) {
+        const { adapter, fake } = makePair();
+        const created = await session(adapter);
+        await adapter.completePayment({ pspSessionId: created.pspSessionId, clientToken, idempotencyKey: "complete-1" });
+        expect(fake.lastPaymentBody?.["paymentMethod"], clientToken).toEqual(expected);
+      }
+    }
+  });
+
+  it("forwards a billing address only when it is complete and within Adyen's limits", async () => {
+    const US_ADDRESS = {
+      street: "Main Street",
+      houseNumberOrName: "1",
+      postalCode: "10001",
+      city: "New York",
+      stateOrProvince: "NY",
+      country: "US",
+    };
+    const forwarded: Array<Record<string, string>> = [
+      BILLING_ADDRESS,
+      // Adyen Web fills the fields a country does not use with "N/A".
+      { ...BILLING_ADDRESS, stateOrProvince: "N/A" },
+      US_ADDRESS,
+    ];
+    for (const billingAddress of forwarded) {
+      const { adapter, fake } = makePair();
+      const created = await session(adapter);
+      await adapter.completePayment({
+        pspSessionId: created.pspSessionId,
+        clientToken: envelope({ billingAddress: { ...billingAddress, apartment: "3" } }),
+        idempotencyKey: "complete-1",
+      });
+      expect(fake.lastPaymentBody?.["billingAddress"], JSON.stringify(billingAddress)).toEqual(billingAddress);
+    }
+    const { street: _street, ...withoutStreet } = BILLING_ADDRESS;
+    const dropped: Array<Record<string, unknown>> = [
+      { city: "Amsterdam", country: "NL" },
+      withoutStreet,
+      { ...BILLING_ADDRESS, houseNumberOrName: "" },
+      { ...BILLING_ADDRESS, postalCode: "12345678901" },
+      { ...BILLING_ADDRESS, city: "A".repeat(3001) },
+      { ...BILLING_ADDRESS, stateOrProvince: "NHAM" },
+      { ...BILLING_ADDRESS, stateOrProvince: 7 },
+      { ...BILLING_ADDRESS, country: "NLD" },
+      { ...BILLING_ADDRESS, country: "nl" },
+      { ...US_ADDRESS, postalCode: "10001-1234" },
+    ];
+    for (const billingAddress of dropped) {
+      const { adapter, fake } = makePair();
+      const created = await session(adapter);
+      await adapter.completePayment({
+        pspSessionId: created.pspSessionId,
+        clientToken: envelope({ billingAddress }),
+        idempotencyKey: "complete-1",
+      });
+      expect(fake.lastPaymentBody, JSON.stringify(billingAddress)).not.toHaveProperty("billingAddress");
+      expect(fake.lastPaymentBody, JSON.stringify(billingAddress)).toMatchObject({ browserInfo: BROWSER_INFO });
     }
   });
 
@@ -307,6 +411,7 @@ describe("Adyen native 3-D Secure 2 request", () => {
 describe("Adyen 3-D Secure completion", () => {
   it("finishes a native challenge with the details the action produced", async () => {
     const { adapter, fake } = makePair();
+    fake.detailsCarryPaymentFacts = true;
     const created = await session(adapter);
     const challenged = await adapter.completePayment({
       pspSessionId: created.pspSessionId,
@@ -322,7 +427,8 @@ describe("Adyen 3-D Secure completion", () => {
     expect(fake.lastRequestPath).toMatch(/\/payments\/details$/);
     expect(fake.lastRequestBody).toEqual({ details });
     expect(finished.status).toBe("succeeded");
-    // The pspReference arrived with the /payments/details answer, and it is a real one.
+    // The answer named the session's merchant reference and amount, so its pspReference is reported.
+    expect(finished.pspPaymentId).toBe(`${(finished.raw as { pspReference: string }).pspReference}:2500:EUR`);
     expect(finished.pspPaymentId).toMatch(/^\d{16}:2500:EUR$/);
     await expect(adapter.refundPayment({ pspPaymentId: finished.pspPaymentId, idempotencyKey: "refund-1" })).resolves.toMatchObject({
       status: "pending",
@@ -332,6 +438,7 @@ describe("Adyen 3-D Secure completion", () => {
 
   it("reports a manual-capture authorisation from /payments/details as capturable", async () => {
     const { adapter, fake } = makePair();
+    fake.detailsCarryPaymentFacts = true;
     const created = await session(adapter, { captureMethod: "manual" });
     const challenged = await adapter.completePayment({
       pspSessionId: created.pspSessionId,
@@ -350,6 +457,7 @@ describe("Adyen 3-D Secure completion", () => {
   it("answers requires_action again when /payments/details asks for a challenge after the fingerprint", async () => {
     const { adapter, fake } = makePair();
     fake.challengesAfterIdentify = 1;
+    fake.detailsCarryPaymentFacts = true;
     const created = await session(adapter);
     const identified = await adapter.completePayment({
       pspSessionId: created.pspSessionId,
@@ -371,9 +479,9 @@ describe("Adyen 3-D Secure completion", () => {
     expect(finished.status).toBe("succeeded");
   });
 
-  it("reads processing, not succeeded, when the details answer does not name the payment", async () => {
+  it("reads processing with no pspPaymentId when the details answer does not name the payment", async () => {
+    // The fake answers as Adyen's example does: a pspReference and a resultCode, nothing else.
     const { adapter, fake } = makePair();
-    fake.omitDetailsPaymentFacts = true;
     const created = await session(adapter);
     const challenged = await adapter.completePayment({
       pspSessionId: created.pspSessionId,
@@ -385,11 +493,14 @@ describe("Adyen 3-D Secure completion", () => {
       clientToken: JSON.stringify({ details: fake.detailsFor(actionOf(challenged.raw)) }),
       idempotencyKey: "complete-2",
     });
-    expect(finished.status).toBe("processing");
-    expect(finished.pspPaymentId).toMatch(/^\d{16}:2500:EUR$/);
+    expect(finished).toMatchObject({ status: "processing", pspPaymentId: "", amount: 2500, currency: "EUR" });
+    expect((finished.raw as { pspReference?: string }).pspReference).toMatch(/^\d{16}$/);
+    // Correlated by the merchant reference until the AUTHORISATION webhook reports the pspReference.
+    expect(finished.id).toBe(created.id);
 
     // Half of the facts is not enough either.
     const answers: Array<Record<string, unknown>> = [
+      { pspReference: "8836100000000042", resultCode: "Authorised" },
       { pspReference: "8836100000000042", resultCode: "Authorised", merchantReference: created.id },
       { pspReference: "8836100000000042", resultCode: "Authorised", amount: { value: 2500, currency: "EUR" } },
       { pspReference: "8836100000000042", resultCode: "Authorised", merchantReference: created.id, amount: { value: 2500 } },
@@ -400,8 +511,42 @@ describe("Adyen 3-D Secure completion", () => {
         clientToken: JSON.stringify({ details: { threeDSResult: "eyJ0cmFuc1N0YXR1cyI6IlkifQ==" } }),
         idempotencyKey: "complete-2",
       });
-      expect(info.status, JSON.stringify(answer)).toBe("processing");
+      expect(info, JSON.stringify(answer)).toMatchObject({ status: "processing", pspPaymentId: "" });
     }
+
+    // Both facts, matching: the answer is the session's, and its reference is reported.
+    const named = await answering({
+      pspReference: "8836100000000042",
+      resultCode: "Authorised",
+      merchantReference: created.id,
+      amount: { value: 2500, currency: "eur" },
+    }).completePayment({
+      pspSessionId: created.pspSessionId,
+      clientToken: JSON.stringify({ details: { threeDSResult: "eyJ0cmFuc1N0YXR1cyI6IlkifQ==" } }),
+      idempotencyKey: "complete-2",
+    });
+    expect(named).toMatchObject({ status: "succeeded", pspPaymentId: "8836100000000042:2500:EUR" });
+  });
+
+  it("reports no pspPaymentId for a details action whose answer does not name the payment", async () => {
+    const { adapter, fake } = makePair();
+    fake.challengesAfterIdentify = 1;
+    fake.actionsCarryPspReference = true;
+    const created = await session(adapter);
+    const identified = await adapter.completePayment({
+      pspSessionId: created.pspSessionId,
+      clientToken: envelope({}, CHALLENGED_CARD),
+      idempotencyKey: "complete-1",
+    });
+    // The /payments answer is this session's own, so its pspReference stands.
+    expect(identified.pspPaymentId).toMatch(/^\d{16}:2500:EUR$/);
+    const challenged = await adapter.completePayment({
+      pspSessionId: created.pspSessionId,
+      clientToken: JSON.stringify({ details: fake.detailsFor(actionOf(identified.raw)) }),
+      idempotencyKey: "complete-2",
+    });
+    expect((challenged.raw as { pspReference?: string }).pspReference).toMatch(/^\d{16}$/);
+    expect(challenged).toMatchObject({ status: "requires_action", pspPaymentId: "" });
   });
 
   it("refuses details that belong to another payment", async () => {
@@ -412,6 +557,7 @@ describe("Adyen 3-D Secure completion", () => {
     ];
     for (const other of others) {
       const { adapter, fake } = makePair();
+      fake.detailsCarryPaymentFacts = true;
       const created = await session(adapter);
       await adapter.completePayment({
         pspSessionId: created.pspSessionId,
@@ -449,9 +595,83 @@ describe("Adyen 3-D Secure completion", () => {
     ).rejects.toMatchObject({ code: "invalid_request", retryable: false });
   });
 
-  it("raises a refusal before checking whose payment it was", async () => {
+  it("refuses a /payments answer that belongs to another request", async () => {
+    // One idempotencyKey reused across two sessions: Adyen replays the first answer.
+    const { adapter, fake } = makePair();
+    const first = await session(adapter, { idempotencyKey: "session-1" });
+    const second = await session(adapter, { amount: 900, idempotencyKey: "session-2" });
+    await adapter.completePayment({ pspSessionId: first.pspSessionId, clientToken: envelope(), idempotencyKey: "one-key" });
+    const err = await rejection(
+      adapter.completePayment({ pspSessionId: second.pspSessionId, clientToken: envelope(), idempotencyKey: "one-key" }),
+    );
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false, pspName: "adyen" });
+    expect((err as { raw?: unknown }).raw).toMatchObject({ merchantReference: first.id, amount: { value: 2500 } });
+    expect(fake.uniquePaymentCreations).toBe(1);
+
+    // Any one differing fact is enough, and a refusal is no exception: it would be another request's.
+    const created = await session(adapter);
+    const answers: Array<Record<string, unknown>> = [
+      { pspReference: "8836100000000042", resultCode: "Authorised", merchantReference: "another-order" },
+      { pspReference: "8836100000000042", resultCode: "Authorised", amount: { value: 100, currency: "EUR" } },
+      { pspReference: "8836100000000042", resultCode: "Authorised", amount: { value: 2500, currency: "USD" } },
+      { pspReference: "8836100000000042", resultCode: "Refused", refusalReasonCode: "2", merchantReference: "another-order" },
+    ];
+    for (const answer of answers) {
+      await expect(
+        answering(answer).completePayment({
+          pspSessionId: created.pspSessionId,
+          clientToken: envelope(),
+          idempotencyKey: "complete-1",
+        }),
+        JSON.stringify(answer),
+      ).rejects.toMatchObject({ code: "invalid_request", retryable: false });
+    }
+    // Matching facts, or none at all as in Adyen's native 3-D Secure 2 example, stand.
+    for (const answer of [
+      { pspReference: "8836100000000042", resultCode: "Authorised", merchantReference: created.id, amount: { value: 2500, currency: "EUR" } },
+      { pspReference: "8836100000000042", resultCode: "Authorised" },
+    ]) {
+      await expect(
+        answering(answer).completePayment({ pspSessionId: created.pspSessionId, clientToken: envelope(), idempotencyKey: "complete-1" }),
+      ).resolves.toMatchObject({ status: "succeeded", pspPaymentId: "8836100000000042:2500:EUR" });
+    }
+    // An answer without a resultCode reports no outcome yet.
+    await expect(
+      answering({ pspReference: "8836100000000042" }).completePayment({
+        pspSessionId: created.pspSessionId,
+        clientToken: envelope(),
+        idempotencyKey: "complete-1",
+      }),
+    ).resolves.toMatchObject({ status: "processing", pspPaymentId: "8836100000000042:2500:EUR" });
+  });
+
+  it("refuses an empty pspPaymentId on capture, cancel and refund without calling Adyen", async () => {
+    const { adapter, fake } = makePair();
+    for (const pspPaymentId of ["", "   ", " :2500:EUR"]) {
+      await expect(adapter.capturePayment(pspPaymentId, 2500, "capture-1"), pspPaymentId).rejects.toMatchObject({
+        code: "invalid_request",
+        retryable: false,
+        raw: { pspPaymentId },
+      });
+      await expect(adapter.cancelPayment(pspPaymentId, "cancel-1"), pspPaymentId).rejects.toMatchObject({
+        code: "invalid_request",
+        retryable: false,
+      });
+      await expect(
+        adapter.refundPayment({ pspPaymentId, amount: 100, idempotencyKey: "refund-1" }),
+        pspPaymentId,
+      ).rejects.toMatchObject({ code: "invalid_request", retryable: false });
+      expect(() => decodeAdyenPaymentRef(pspPaymentId)).toThrowError(/PaymentInfo\.id/);
+    }
+    // A caller outside TypeScript can pass no string at all.
+    expect(() => decodeAdyenPaymentRef(undefined as unknown as string)).toThrowError(/PaymentInfo\.id/);
+    expect(fake.lastRequestPath).toBeUndefined();
+  });
+
+  it("raises a refusal of the submitted details before checking whose payment it was", async () => {
     const { adapter, fake } = makePair();
     fake.refuseDetailsWith = "11";
+    fake.detailsCarryPaymentFacts = true;
     const created = await session(adapter);
     const foreign = fake.seedChallengedPayment({ reference: "another-order", value: 100 });
     await expect(
@@ -465,6 +685,7 @@ describe("Adyen 3-D Secure completion", () => {
 
   it("completes a redirect return with the redirectResult the shopper came back with", async () => {
     const { adapter, fake } = makePair();
+    fake.detailsCarryPaymentFacts = true;
     const created = await session(adapter);
     const redirected = await adapter.completePayment({
       pspSessionId: created.pspSessionId,
@@ -516,6 +737,9 @@ describe("Adyen session inputs 3-D Secure depends on", () => {
       "https://",
       "https://[bad/return",
       "https://shop.example/check out",
+      "https://shop.example/checkout\treturn",
+      // Short enough as typed, past the limit once URL-encoded.
+      `https://shop.example/${"é".repeat(200)}`,
     ];
     for (const returnUrl of refused) {
       await expect(session(adapter, { returnUrl }), returnUrl).rejects.toMatchObject({
@@ -534,8 +758,28 @@ describe("Adyen session inputs 3-D Secure depends on", () => {
     }
   });
 
+  it("sends the returnUrl WHATWG-serialized, with non-ASCII characters percent-encoded", async () => {
+    const { adapter, fake } = makePair({ defaultReturnUrl: "https://bücher.example/rückkehr" });
+    const cases: Array<[Partial<CreatePaymentSessionInput>, string]> = [
+      [{ returnUrl: "https://shop.example/café?étape=retour" }, "https://shop.example/caf%C3%A9?%C3%A9tape=retour"],
+      [{ returnUrl: "HTTPS://Shop.Example:443/checkout/return" }, "https://shop.example/checkout/return"],
+      [{ returnUrl: "my-app://" }, "my-app://"],
+      [{}, "https://xn--bcher-kva.example/r%C3%BCckkehr"],
+    ];
+    for (const [input, expected] of cases) {
+      const created = await session(adapter, input);
+      await adapter.completePayment({ pspSessionId: created.pspSessionId, clientToken: envelope(), idempotencyKey: expected });
+      expect(fake.lastPaymentBody, expected).toMatchObject({ returnUrl: expected });
+    }
+  });
+
   it("refuses a malformed defaultReturnUrl when the adapter is constructed", () => {
-    for (const defaultReturnUrl of ["shop.example/return", "https://shop.example//return", `https://shop.example/${"a".repeat(1004)}`]) {
+    for (const defaultReturnUrl of [
+      "shop.example/return",
+      "https://shop.example//return",
+      `https://shop.example/${"a".repeat(1004)}`,
+      `https://shop.example/${"é".repeat(200)}`,
+    ]) {
       let thrown: unknown;
       try {
         makePair({ defaultReturnUrl });
@@ -558,30 +802,42 @@ describe("Adyen session inputs 3-D Secure depends on", () => {
       [{ receiptEmail: "", billingDetails: { email: "billing@example.test" } }, "billing@example.test"],
       // Not the address Adyen gets, so not checked.
       [{ receiptEmail: "receipt@example.test", billingDetails: { email: "not an address" } }, "receipt@example.test"],
+      // Optional billing data Adyen could not use is left out, and the session still opens.
+      [{ billingDetails: { email: "not an address" } }, undefined],
+      [{ billingDetails: { email: `${"a".repeat(245)}@example.test` } }, undefined],
+      // RFC 5322 allows a domain without a dot.
+      [{ billingDetails: { email: "jane@localhost" } }, "jane@localhost"],
       [{}, undefined],
     ];
     for (const [input, expected] of cases) {
       const { adapter, fake } = makePair();
       const created = await session(adapter, input);
       await adapter.completePayment({ pspSessionId: created.pspSessionId, clientToken: envelope(), idempotencyKey: "complete-1" });
-      if (expected) expect(fake.lastPaymentBody).toMatchObject({ shopperEmail: expected });
-      else expect(fake.lastPaymentBody).not.toHaveProperty("shopperEmail");
+      if (expected) expect(fake.lastPaymentBody, JSON.stringify(input)).toMatchObject({ shopperEmail: expected });
+      else expect(fake.lastPaymentBody, JSON.stringify(input)).not.toHaveProperty("shopperEmail");
     }
   });
 
-  it("refuses a shopper email Adyen could not use", async () => {
+  it("refuses a receiptEmail Adyen could not use", async () => {
     const { adapter } = makePair();
-    const malformed = ["not-an-email", "shopper@localhost", "shop per@example.test", "@example.test", `${"a".repeat(245)}@example.test`];
+    const malformed = [
+      "not-an-email",
+      "shop per@example.test",
+      "@example.test",
+      "shopper@",
+      "shopper@example..test",
+      "shopper@example.test.",
+      "shopper@one@example.test",
+      `${"a".repeat(245)}@example.test`,
+    ];
     for (const email of malformed) {
       await expect(session(adapter, { receiptEmail: email }), email).rejects.toMatchObject({
         code: "invalid_request",
         raw: { field: "receiptEmail" },
       });
-      await expect(session(adapter, { billingDetails: { email } }), email).rejects.toMatchObject({
-        code: "invalid_request",
-        raw: { field: "billingDetails.email" },
-      });
     }
-    await expect(session(adapter, { receiptEmail: `${"a".repeat(243)}@example.test` })).resolves.toBeDefined();
+    for (const email of [`${"a".repeat(243)}@example.test`, "jane@localhost"]) {
+      await expect(session(adapter, { receiptEmail: email }), email).resolves.toBeDefined();
+    }
   });
 });

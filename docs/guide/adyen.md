@@ -207,11 +207,15 @@ const adyen = new AdyenClientAdapter({
   `holderNameRequired: true`): Adyen's
   [native 3-D Secure 2 guide](https://docs.adyen.com/online-payments/3d-secure/native-3ds2)
   requires the name for Visa and JCB, and Adyen Web hides the field unless told otherwise.
-  Set both to `false` in `fieldOptions` to hide it.
-- Set `billingAddressRequired: true` in `fieldOptions` for better 3-D Secure 2 data: Adyen's
+  Set `hasHolderName: false` in `fieldOptions` to hide it; Adyen Web then drops the
+  requirement as well.
+- Set `billingAddressRequired: true` in `fieldOptions` for better 3-D Secure 2 data. Adyen's
   `/payments` reference lists the billing address as required for 3-D Secure 2 in browser
-  integrations (its 3-D Secure reference, as recommended), and the Card then includes it in
-  what the adapter forwards to your server.
+  integrations, and its
+  [3-D Secure API reference](https://docs.adyen.com/online-payments/3d-secure/api-reference)
+  as recommended. The Card then includes the address in its state, and the server adapter
+  forwards it when it is complete and within Adyen's limits (`street`, `houseNumberOrName`,
+  `postalCode`, `city` and `country` all present), dropping it otherwise.
 - The Card recognizes Mastercard, Visa and American Express (`['mc','visa','amex']`) unless
   told otherwise, and the adapter does not load your account's payment-method list — pass
   `brands` in `fieldOptions` to accept other brands
@@ -241,28 +245,46 @@ or through a **redirect** to Adyen. The adapter asks for the native flow and sup
 `confirm()` resolves a JSON `clientToken` holding the `paymentMethod`, `browserInfo`,
 `origin`, `billingAddress` and `riskData` of Adyen Web's state. The server adapter reads those
 keys and nothing else — the signed session stays the only source of amount, currency,
-reference, merchant account and capture method — and refuses a `paymentMethod` that is not a
-card (`type: "scheme"`) or that carries unencrypted card fields. With `browserInfo` and the
-page's bare `origin` (scheme, host and port, no path, at most 80 characters), `/payments` carries
-what the [native 3-D Secure 2 guide](https://docs.adyen.com/online-payments/3d-secure/native-3ds2)
+reference, merchant account and capture method. It refuses a `paymentMethod` that is not a
+card (`type: "scheme"`) or that carries unencrypted card fields, and forwards only the card
+fields Adyen Web's Card produces: `type`, the `encrypted…` values, `holderName`, `brand`,
+`fundingSource`, `fastlaneData`, `checkoutAttemptId` and `sdkData` (the native guide lists
+the Card's complete `paymentMethod`, `sdkData` included, as required). With `browserInfo`
+and the page's bare `origin` (scheme, host and port, no path, at most 80 characters),
+`/payments` carries what the
+[native 3-D Secure 2 guide](https://docs.adyen.com/online-payments/3d-secure/native-3ds2)
 requires on the web: `channel: "Web"`, `origin`, `browserInfo` and
 `authenticationData.threeDSRequestData.nativeThreeDS: "preferred"`. Any other `origin` is
-dropped and the payment left to the redirect flow, because Adyen documents that a missing or
-wrong origin breaks the native one. `shopperEmail` is the session's `receiptEmail`, or its
-`billingDetails.email` when there is none: pass one, since Adyen asks for `shopperIP` on Visa
-and JCB 3-D Secure 2 payments without an email, and the adapter has no shopper IP address to
-send.
+dropped, and with it `channel` and `nativeThreeDS`, because Adyen documents that a missing or
+wrong origin keeps the 3-D Secure 2 action from being handled; that the payment then takes
+the redirect flow is an unverified inference (see [Redirect fallback](#redirect-fallback)).
+
+`shopperEmail` is the session's `receiptEmail`, or its `billingDetails.email` when there is
+none; a `billingDetails.email` that is not a usable address is left out rather than failing
+the session. Pass an email, because Adyen's documentation disagrees on `shopperIP`: the
+[v72 `/payments` reference](https://docs.adyen.com/api-explorer/Checkout/72/post/payments)
+requires it for Visa and JCB 3-D Secure 2 web payments only when no `shopperEmail` is sent,
+while the [3-D Secure API reference](https://docs.adyen.com/online-payments/3d-secure/api-reference)
+and the native and redirect guides list it as required for Visa and JCB on the web. The
+adapter sends none either way — PayFanout's session and completion inputs carry no shopper
+IP address — so whether Adyen accepts such a payment with an email alone is still to be
+confirmed in a sandbox.
 
 When Adyen answers with an action, `completePayment` reports `requires_action` with Adyen's
-answer on `PaymentInfo.raw` (`raw.action`). Adyen issues the `pspReference` only once the
-action is finished, so `pspPaymentId` is the empty string until then, which `capturePayment`
-and `refundPayment` refuse. Hand the action to `handleAction`: Adyen Web replaces the card
-fields with the fingerprint or challenge in the same element and resolves with a second
-`clientToken`, the `onAdditionalDetails` data `{ details: { threeDSResult } }`, which you
-complete exactly like the first; the server sends it to `/payments/details`. That answer can
-carry another action, so loop until it doesn't:
+answer on `PaymentInfo.raw` (`raw.action`). Adyen can answer an action without a
+`pspReference` (its native 3-D Secure 2 example does), and `pspPaymentId` is then the empty
+string. That is not a reference: `capturePayment`, `cancelPayment` and `refundPayment` refuse
+an empty `pspPaymentId` with `invalid_request`, so don't store it over one, and correlate the
+attempt by `PaymentInfo.id`, the merchant reference. When the `/payments` answer does carry a
+`pspReference` (Adyen's redirect example does), `pspPaymentId` is the usual composite. Hand
+the action to `handleAction`: Adyen Web replaces the card fields with the fingerprint or
+challenge in the same element and resolves with a second `clientToken`, the
+`onAdditionalDetails` data `{ details: { threeDSResult } }`, which you complete exactly like
+the first; the server sends it to `/payments/details`. That answer can carry another action,
+so loop until it doesn't:
 
 ```tsx
+import { PayFanoutError } from "@payfanout/core";
 import { createEndpointCompletion, usePayFanoutContext, type PayResult } from "@payfanout/react";
 
 // Pass what <PayButton onResult> reports through finish() before showing the outcome.
@@ -283,7 +305,8 @@ function useAdyenActions() {
         const info = await createEndpointCompletion("/api/complete", mounted.sessionRef)(next.clientToken);
         current = { status: info.status, info };
       } catch (error) {
-        return { status: "failed", error: error as PayResult["error"] };
+        // A PayFanoutError passes through unchanged; anything else, such as a failed fetch, is wrapped.
+        return { status: "failed", error: PayFanoutError.wrap(error) };
       }
     }
     return current;
@@ -291,32 +314,43 @@ function useAdyenActions() {
 }
 ```
 
-`handleAction` is Adyen-specific: the unified contract has no action step, because most PSPs
-resolve challenges inside `confirm()`. One completion handler with one `idempotencyKey` is
-fine across a multi-step challenge: the adapter derives the key it sends from your key, the
-merchant account, the endpoint and, on `/payments/details`, the details themselves.
+`PayFanoutError` comes from `@payfanout/core`, which `@payfanout/react` depends on; add it to
+your own dependencies to import it. `handleAction` is Adyen-specific: the unified contract has
+no action step, because most PSPs resolve challenges inside `confirm()`. One completion
+handler with one `idempotencyKey` is fine across a multi-step challenge: the adapter derives
+the key it sends from your key, the merchant account, the endpoint and, on
+`/payments/details`, the details themselves.
 
-A `/payments/details` answer finishes whichever payment the details were issued for, so the
-adapter reports it only once it belongs to the session. A `merchantReference` or `amount`
-that differs from the signed session is refused with `invalid_request`, not retryable. An
-answer that omits either reads `processing` rather than `succeeded` — Adyen's own example
-answer carries neither — and the `AUTHORISATION` webhook (§8) settles the payment.
+Every answer is checked against the session it completes. A `/payments` answer naming another
+`merchantReference` or `amount` is refused with `invalid_request`, not retryable: the answer
+belongs to another request, since an `idempotencyKey` reused across sessions replays the first
+answer. A `/payments/details` answer finishes whichever payment the details were issued for,
+so one whose `merchantReference` or `amount` differs from the signed session is refused the
+same way. An answer that does not name the session's merchant reference and amount (Adyen's
+own example answer names neither) reads `processing` and carries no `pspPaymentId`; the
+`AUTHORISATION` webhook (§8), whose `merchantReference` is one of the signed values, supplies
+the reference: `encodeAdyenPaymentRef(event.pspPaymentId, event.amount, event.currency)`.
 
 One challenge runs at a time per mounted field set: calling `handleAction` again while one is
 outstanding fails with `invalid_request` rather than abandoning the first caller's promise.
 Adyen Web's 3-D Secure 2 elements report timeouts through `onAdditionalDetails` and call
 `onError` only when they stop, so an error reported through `onError` meanwhile settles the
-pending promise as `failed`. Once `handleAction` has run, the card fields are gone:
-`confirm()` on that handle fails with `invalid_request`, so remount `<PaymentFields>` for
-another attempt, with a fresh `idempotencyKey` (§7).
+pending promise as `failed` with `authentication_required` (or a retryable `psp_unavailable`
+when it reads as a load or network failure), and unmounting the fields settles it as `failed`
+too. Once `handleAction` has run, the card fields are gone: `confirm()` on that handle fails
+with `invalid_request`, so remount `<PaymentFields>` for another attempt, with a fresh
+`idempotencyKey` (§7).
 
 ### Redirect fallback
 
-`nativeThreeDS: "preferred"` states a preference: Adyen can still choose its redirect flow,
-and does when the browser data is missing. The action is then `type: "redirect"`, and
-`handleAction` navigates the page to Adyen; its promise never settles. After authenticating,
-the shopper returns to the session's `returnUrl` with a URL-encoded `redirectResult`
-appended to your own query parameters
+`nativeThreeDS: "preferred"` states a preference: Adyen can still choose its redirect flow.
+When the `clientToken` carries no usable `browserInfo` or `origin`, the adapter omits
+`nativeThreeDS` (with `channel` and `origin`) and expects the redirect flow. That is an
+inference Adyen does not document — its redirect guide lists `channel` and `origin` as
+required too — and a sandbox run is still to confirm it. The action is then
+`type: "redirect"`, and `handleAction` navigates the page to Adyen; its promise never
+settles. After authenticating, the shopper returns to the session's `returnUrl` with a
+URL-encoded `redirectResult` appended to your own query parameters
 ([redirect 3-D Secure guide](https://docs.adyen.com/online-payments/3d-secure/redirect-3ds2/web-component)).
 Carry your order reference in that `returnUrl`; the return page turns the result into a
 `clientToken` with `adyenRedirectResultToken` and completes the payment as usual:
@@ -345,8 +379,9 @@ authorise the payment once the shopper has authenticated, whether or not they re
 
 When the client encrypts the card, the library POSTs the resulting `clientToken` (with the
 session reference) to your `completionEndpoint`, where you mount `createCompletionHandler`;
-the 3-D Secure tokens of §6 go to the same route. Give each completion attempt of an order
-its own `idempotencyKey`, stable within that attempt:
+the 3-D Secure tokens of §6 go to the same route. Store a random (v4) UUID on each completion
+attempt of an order and pass it as that attempt's `idempotencyKey`. The same key serves every
+step of the attempt, because the adapter derives a distinct Adyen key per request from it:
 
 ```ts
 import { createCompletionHandler } from "@payfanout/server";
@@ -356,7 +391,8 @@ const complete = createCompletionHandler({
   resolveSession: async (sessionRef) => {
     // One record per attempt: another card on the same order gets a new session and key.
     const attempt = await db.paymentAttemptByClientSecret(sessionRef); // your storage
-    return { service: payments, pspName: "adyen", pspSessionId: attempt.pspSessionId, idempotencyKey: `complete-${attempt.id}` };
+    // attempt.idempotencyKey: crypto.randomUUID(), stored when the attempt was created.
+    return { service: payments, pspName: "adyen", pspSessionId: attempt.pspSessionId, idempotencyKey: attempt.idempotencyKey };
   },
 });
 ```

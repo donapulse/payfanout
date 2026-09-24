@@ -38,7 +38,7 @@ export interface AdyenSessionContextV1 {
   reference: string;
   /** Epoch milliseconds. Tokens without it are rejected. */
   expiresAt: number;
-  /** Where Adyen sends the shopper back from a redirect action. */
+  /** Where Adyen sends the shopper back from a redirect action, WHATWG-serialized. */
   returnUrl?: string;
   /** Host-app internal id (PaymentSession.id), also stamped into Adyen metadata. */
   id?: string;
@@ -46,7 +46,10 @@ export interface AdyenSessionContextV1 {
   metadata?: Record<string, string>;
   /** Shopper email (`shopperEmail` on the payment). */
   receiptEmail?: string;
-  /** The session's `billingDetails.email`, sent as `shopperEmail` when there is no `receiptEmail`. */
+  /**
+   * The session's `billingDetails.email`, sent as `shopperEmail` when there is
+   * no `receiptEmail`; present only when it is an address Adyen can use.
+   */
   billingEmail?: string;
 }
 

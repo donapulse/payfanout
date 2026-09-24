@@ -210,6 +210,15 @@ approval **on the same order**: surface the error, the buyer clicks the PayPal b
 again and picks another funding source in the popup, and your Pay button calls the
 completion route again with the same order. No new session needed.
 
+When PayPal refuses the payer's account rather than one funding source (`PAYMENT_DENIED`,
+`PAYER_CANNOT_PAY`, `PAYER_ACCOUNT_RESTRICTED`, `PAYER_ACCOUNT_LOCKED_OR_CLOSED`,
+`MAX_NUMBER_OF_PAYMENT_ATTEMPTS_EXCEEDED`), the error is still `card_declined`, but the
+message asks for another payment method ("PayPal declined this payment — choose another
+payment method."): offer the buyer a different way to pay, not the PayPal button again.
+`TRANSACTION_BLOCKED_BY_PAYEE` (your own fraud protection settings) is `fraud_suspected`,
+and `TRANSACTION_RECEIVING_LIMIT_EXCEEDED` (your account's receiving limit) is
+`processing_error`.
+
 ### Store the capture id
 
 Once captured, `PaymentInfo.pspPaymentId` is the **capture id** (PayPal's "transaction

@@ -106,10 +106,17 @@ describe("mapPayPalError", () => {
   const cases: Array<[number, unknown, UnifiedErrorCode, boolean]> = [
     [422, issue("INSTRUMENT_DECLINED"), "card_declined", false],
     [422, issue("REDIRECT_PAYER_FOR_ALTERNATE_FUNDING"), "card_declined", false],
+    [422, issue("PAYMENT_DENIED"), "card_declined", false],
+    [422, issue("PAYER_CANNOT_PAY"), "card_declined", false],
+    [422, issue("PAYER_ACCOUNT_RESTRICTED"), "card_declined", false],
+    [422, issue("PAYER_ACCOUNT_LOCKED_OR_CLOSED"), "card_declined", false],
+    [422, issue("MAX_NUMBER_OF_PAYMENT_ATTEMPTS_EXCEEDED"), "card_declined", false],
     [422, issue("PAYER_ACTION_REQUIRED"), "authentication_required", false],
     [422, issue("PAYEE_BLOCKED_TRANSACTION"), "fraud_suspected", false],
+    [422, issue("TRANSACTION_BLOCKED_BY_PAYEE"), "fraud_suspected", false],
     [422, issue("COMPLIANCE_VIOLATION"), "fraud_suspected", false],
     [422, issue("TRANSACTION_REFUSED"), "processing_error", false],
+    [422, issue("TRANSACTION_RECEIVING_LIMIT_EXCEEDED"), "processing_error", false],
     [422, issue("ORDER_NOT_APPROVED"), "invalid_request", false],
     [422, issue("ORDER_ALREADY_CAPTURED"), "invalid_request", false],
     [422, issue("DUPLICATE_INVOICE_ID"), "invalid_request", false],
@@ -129,6 +136,8 @@ describe("mapPayPalError", () => {
     [429, { name: "RATE_LIMIT_REACHED" }, "rate_limited", true],
     [200, { name: "RATE_LIMIT_REACHED" }, "rate_limited", true],
     [500, { name: "INTERNAL_SERVICE_ERROR" }, "psp_unavailable", true],
+    // PayPal's documented name for its 500, recognised whatever status carries it.
+    [400, { name: "INTERNAL_SERVER_ERROR" }, "psp_unavailable", true],
     [503, "<html>gateway</html>", "psp_unavailable", true],
     [409, { name: "CONFLICT" }, "processing_error", true],
     [400, { name: "INVALID_REQUEST" }, "invalid_request", false],
@@ -147,6 +156,18 @@ describe("mapPayPalError", () => {
   it("gives declines the restart-in-popup guidance", () => {
     const mapped = mapPayPalError(422, issue("INSTRUMENT_DECLINED"));
     expect(mapped.message).toMatch(/different way to pay/);
+  });
+
+  it("tells declines of the payer's account to use another payment method", () => {
+    for (const name of [
+      "PAYMENT_DENIED",
+      "PAYER_CANNOT_PAY",
+      "PAYER_ACCOUNT_RESTRICTED",
+      "PAYER_ACCOUNT_LOCKED_OR_CLOSED",
+      "MAX_NUMBER_OF_PAYMENT_ATTEMPTS_EXCEEDED",
+    ]) {
+      expect(mapPayPalError(422, issue(name)).message, name).toMatch(/another payment method/);
+    }
   });
 });
 

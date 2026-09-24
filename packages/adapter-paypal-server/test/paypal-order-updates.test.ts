@@ -23,7 +23,7 @@ async function orderUnit(adapter: PayPalServerAdapter, orderId: string): Promise
 }
 
 describe("PayPal order updates", () => {
-  it("gives an order created without shipping its name and address by replace, as PayPal's sample does", async () => {
+  it("gives an order created without shipping its name and address by replace, following PayPal's sample", async () => {
     const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession({ amount: 2000, currency: "USD", idempotencyKey: "k" });
     await adapter.updatePaymentSession({ pspSessionId: session.pspSessionId, shippingDetails: berlin, idempotencyKey: "k-up" });

@@ -647,8 +647,8 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     if (shipping) {
       // Only shipping's own attributes are patchable, never the whole object. An
       // attribute already there is replaced; a missing one is added under an
-      // existing shipping object, and replaced into an order that has none, as
-      // PayPal's own "Add Shipping Address" sample does (see decisions.md).
+      // existing shipping object, and replaced into an order that has none,
+      // following PayPal's "Add Shipping Address" sample (see docs/decisions.md).
       const current = unit?.shipping;
       for (const key of ["name", "address"] as const) {
         const value = shipping[key];

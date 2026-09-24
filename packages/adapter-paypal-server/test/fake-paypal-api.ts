@@ -455,8 +455,10 @@ export class FakePayPalApi {
     // checked first. Presence follows the error reference's rules (no add over
     // a present value, no replace or remove of a missing one), except that a
     // shipping attribute of an order with no shipping object is replaced into
-    // it, as PayPal's "Add Shipping Address" sample does, and cannot be added:
-    // JSON Patch needs the parent object to exist for an add.
+    // it, following PayPal's "Add Shipping Address" sample, and cannot be added:
+    // JSON Patch needs the parent object to exist for an add. This is one
+    // reading of conflicting PayPal pages (see docs/decisions.md), not PayPal
+    // behaviour observed in a sandbox.
     const allowed: Record<string, string[]> = {
       amount: ["replace"],
       soft_descriptor: ["replace", "remove"],

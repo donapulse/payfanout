@@ -275,10 +275,14 @@ choices they forced:
   - **AMBIGUOUS in PayPal's docs:** which operation an attribute takes. The error reference
     refuses an `add` over a present property and a `replace` of a missing one, while the
     schema describes `add` over an existing value as replacing it, and PayPal's own "Patch
-    Order - Add Shipping Address" sample adds an address with `replace`. JSON Patch also
-    needs the parent object to exist for an `add`. The adapter replaces an attribute that is
+    Order - Add Shipping Address" sample adds an address with `replace`, though the same
+    schema defines `replace` as succeeding only when "the target location must exist", as
+    RFC 6902 §4.3 does, and the sample does not say whether the order had a shipping object
+    (PayPal's `PUHF` create samples all carry an address). JSON Patch also needs the parent
+    object to exist for an `add` (RFC 6902 §4.1). The adapter replaces an attribute that is
     there, adds a missing one under an existing shipping object, and replaces into an order
-    that has no shipping object, as the sample does; the test fake models that reading.
+    that has no shipping object, following PayPal's Add Shipping Address sample; the test
+    fake models that reading, and neither operation has run against a sandbox.
     Sandbox checks to settle it: adding name and address to an order created without
     shipping, adding a `soft_descriptor` to an order without one, an `add` over an existing
     `shipping/address`, and whether an order read returns `soft_descriptor` (the refusal

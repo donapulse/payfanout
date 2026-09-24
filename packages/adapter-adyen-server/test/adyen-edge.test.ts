@@ -175,6 +175,18 @@ describe("onboarding descriptor", () => {
     expect(pattern.test("1797a841fbb37ca7-AdyenDemo-checkout-live.adyenpayments.com")).toBe(false);
   });
 
+  it("gives only patterns that compile as an HTML pattern attribute, with the v flag", () => {
+    // Browsers compile <input pattern> with the `v` flag, which rejects some
+    // character classes the flagless RegExp accepts (an unescaped `/`).
+    const patterns = adyenOnboarding.credentialFields.flatMap((field) =>
+      field.format?.pattern === undefined ? [] : [field.format.pattern],
+    );
+    expect(patterns.length).toBeGreaterThan(0);
+    for (const pattern of patterns) {
+      expect(() => new RegExp(pattern, "v"), pattern).not.toThrow();
+    }
+  });
+
   it("follows Adyen's recommended policy: scripts from *.adyen.com, frames and requests from any host", () => {
     // Issuer 3-D Secure challenge frames load from domains Adyen cannot list.
     expect(adyenOnboarding.csp).toEqual({ script: ["https://*.adyen.com"], frame: ["*"], connect: ["*"] });

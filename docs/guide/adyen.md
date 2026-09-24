@@ -26,9 +26,8 @@ adapter has not yet been exercised against an Adyen test account. Run one paymen
 account before taking it to production, and check the results against
 [§9](#_9-test-values); if Adyen routes a payment to its 3-D Secure redirect flow, check the
 shopper's return to your `returnUrl` ([§6](#_6-3-d-secure)) as well. Account-specific
-behaviour — enabled payment
-methods, the capture delay, whether multiple partial capture is switched on, the exact
-`additionalData` your account returns — is only observable there.
+behaviour — enabled payment methods, the capture delay, whether multiple partial capture is
+switched on, the exact `additionalData` your account returns — is only observable there.
 :::
 
 ::: warning Adyen API details evolve
@@ -253,9 +252,10 @@ page, which says it does not apply "if you are eligible for Self-Assessment Ques
 states it with no such condition: "A strict Content Security Policy (CSP) can prevent native
 3D Secure 2 challenges from being loaded on your website, because loading the 3D Secure 2
 interface requires adding more URLs to your CSP. Adyen does not maintain a list of all URLs."
-For a page that should not widen its CSP, Adyen points to its
-[redirect flow](https://docs.adyen.com/online-payments/3d-secure/redirect-3ds2): "You can use
-the redirect flow if you do not want to adjust your CSP."
+Adyen's own alternative is its redirect flow (the native 3-D Secure 2 guide's Limitations row:
+"You can use the redirect flow if you do not want to adjust your CSP"), but this adapter has
+no setting that selects it, so a page that keeps a strict `frame-src` or `form-action` should
+expect native challenges to fail.
 
 Following Adyen's recommended policy, a page running this adapter needs:
 
@@ -563,8 +563,7 @@ fails the authentication. If your test account's Dynamic 3D Secure default rule 
 trigger from `paymentMethod.holderName` or `additionalData.RequestedTestAcquirerResponseCode`
 ([testing result codes](https://docs.adyen.com/development-resources/testing/result-codes)).
 This adapter never sends the second, so type the trigger into the Card's cardholder-name
-field, with any test card above. The field is shown by default; if your
-`@payfanout/adapter-adyen` predates that, enable it with
+field, with any test card above. If the Card shows no cardholder-name field, enable it with
 `fieldOptions: { hasHolderName: true }`.
 
 | Cardholder name | Adyen `refusalReason` | `completePayment` rejects with |

@@ -76,7 +76,9 @@ export const adyenOnboarding: AdapterOnboardingDescriptor = {
       required: false,
       format: {
         // The prefix is one hostname label: a pasted URL or host name fails.
-        pattern: "^[^\\s/:.]+$",
+        // The slash is escaped so the pattern also compiles with the `v` flag
+        // browsers apply to an HTML pattern attribute.
+        pattern: "^[^\\s\\/:.]+$",
         hint:
           "Live URL prefix from Developers > API URLs > Prefix in the live Customer Area, " +
           "e.g. 1797a841fbb37ca7-AdyenDemo (the prefix only, not a URL) — required on live only",

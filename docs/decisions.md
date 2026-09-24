@@ -1508,8 +1508,9 @@ sandbox round-trip before production use, and the setup guide carries that warni
   `https://*.adyen.com`, and `frame` and `connect` are `["*"]`. CSP3's grammar allows a bare
   `*` as a host source (`host-part = "*" / …`), so the `string[]` fields hold it and core's
   validator accepts it; core's `csp` JSDoc now reserves empty arrays for "no host needed"
-  (no embedded surface, as with GoCardless), and a PSP that documents a wildcard lists
-  `"*"`. The earlier `https://*.adyen.com` in `frame`/`connect` let the card fields load but
+  (no embedded surface, as with GoCardless), hosts and subdomain wildcards such as PayPal's
+  `https://*.paypal.com` are listed as they are, and a PSP whose documentation allows any
+  host lists a bare `"*"`. The earlier `https://*.adyen.com` in `frame`/`connect` let the card fields load but
   blocked live issuer challenges. The setup guide lists every directive, including the
   `style-src`, `img-src` and `form-action` the type cannot express (its `style-src` names the
   Adyen host for the Adyen Web stylesheet; Adyen's sample lists only Cash App there).

@@ -719,8 +719,9 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * than this one, because total_pages ends the walk exactly when PayPal
    * returns it; a next link or a full page decide otherwise (a possibly-empty
    * final page beats silently truncating the walk). None of the documented
-   * filters (plan_ids, statuses, date ranges) is applied, so the list returns
-   * PayPal's own default status set, which the reference does not enumerate.
+   * filters (plan_ids, statuses, date ranges, filter) is applied; the
+   * reference describes the call as listing all subscriptions for the
+   * merchant account and gives statuses no default (not sandbox-verified).
    */
   async listNativeSubscriptions(input: ListNativeSubscriptionsInput = {}): Promise<ListNativeSubscriptionsResult> {
     const page = parseSubscriptionsCursor(input.cursor);

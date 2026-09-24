@@ -1293,13 +1293,14 @@ contract now carries them.
   total_cycles ran out), rest 1:1; no trial/past-due status exists. The GitHub OpenAPI
   spec lacks the list operation; the live schema
   (developer.paypal.com/api/subscriptions/v1/schema.json) documents it with `plan_ids`,
-  `statuses`, date-range filters, `page_size` (1–20) and `page`, and a collection of
-  `subscriptions` and `links` (corrected 2026-09-24: this entry said the published spec
+  `statuses`, date-range filters, `filter`, `page_size` (1–20) and `page`, and a collection
+  of `subscriptions` and `links` (corrected 2026-09-24: this entry said the published spec
   lacked the operation and that no `statuses` filter was documented). The adapter applies
-  no filter, so the list returns PayPal's default status set, which is undocumented. It
-  sends `total_required`, which the reference documents for the plans list only, because
-  totals end the walk exactly when PayPal returns them; the next link or a full page decide
-  otherwise.
+  no filter; the reference describes the call as listing all subscriptions for the
+  merchant account and gives `statuses` (ACTIVE, SUSPENDED, CANCELLED, EXPIRED) no default,
+  which no sandbox run has checked. It sends `total_required`, which the reference
+  documents for the plans list only, because totals end the walk exactly when PayPal
+  returns them; the next link or a full page decide otherwise.
 - **PayZen** (doc-verified 2026-07-17 via the GraphQL content channel; the JSON schema
   again lags the playground — `ResponseCodeAnswer.responseCode` enum lists only 0 while
   the rendered Subscription/Cancel table documents 0/30/32/99): `list: false` (no list

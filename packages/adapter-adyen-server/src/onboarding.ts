@@ -97,8 +97,12 @@ export const adyenOnboarding: AdapterOnboardingDescriptor = {
   webhook: {
     signature: "hmac-sha256-base64",
     events: [
+      // Default event codes of the Standard webhook, per Adyen's webhook types
+      // page (CAPTURE is sent for manual captures; delayed automatic capture also
+      // needs it enabled on the Webhooks settings page).
       "AUTHORISATION",
       "CANCELLATION",
+      "TECHNICAL_CANCEL",
       "CANCEL_OR_REFUND",
       "CAPTURE",
       "CAPTURE_FAILED",
@@ -106,11 +110,20 @@ export const adyenOnboarding: AdapterOnboardingDescriptor = {
       "REFUND_FAILED",
       "REFUNDED_REVERSED",
       "EXPIRE",
-      "OFFER_CLOSED",
+      "NOTIFICATION_OF_CHARGEBACK",
       "CHARGEBACK",
       "CHARGEBACK_REVERSED",
-      "NOTIFICATION_OF_CHARGEBACK",
       "SECOND_CHARGEBACK",
+      "PREARBITRATION_WON",
+      "PREARBITRATION_LOST",
+      "DISPUTE_DEFENSE_PERIOD_ENDED",
+      "ISSUER_RESPONSE_TIMEFRAME_EXPIRED",
+      // Dispute outcomes documented by Adyen's dispute webhooks page and webhook
+      // reference, which its list of default event codes does not include.
+      "SCHEME_ARBITRATION_WON",
+      "SCHEME_ARBITRATION_LOST",
+      // Not a default: select it on the Standard webhook's event list.
+      "OFFER_CLOSED",
     ],
   },
   csp: {

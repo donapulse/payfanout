@@ -9,8 +9,8 @@ import {
 
 /**
  * The currencies PayPal checkout accepts for new payments (REST currency-codes
- * reference). Everything else — including every 3-decimal ISO currency (BHD,
- * KWD, …) — is rejected locally before any API call.
+ * reference). A new session in anything else — including every 3-decimal ISO
+ * currency (BHD, KWD, …) — is refused locally before any API call.
  */
 export const PAYPAL_SUPPORTED_CURRENCIES: ReadonlySet<string> = new Set([
   "AUD", "BRL", "CAD", "CHF", "CNY", "CZK", "DKK", "EUR", "GBP", "HKD", "HUF", "ILS",
@@ -44,13 +44,15 @@ export function assertPayPalCurrency(currency: string): string {
 /** A currency an existing PayPal payment can carry: a supported or a retired one. */
 function assertPayPalAmountCurrency(currency: string): string {
   const code = normalizeCurrency(currency);
-  if (!PAYPAL_SUPPORTED_CURRENCIES.has(code) && !PAYPAL_RETIRED_CURRENCIES.has(code)) {
-    throw PayFanoutError.invalidRequest(`PayPal does not support the currency ${code}`, { currency: code });
-  }
-  return code;
+  return PAYPAL_RETIRED_CURRENCIES.has(code) ? code : assertPayPalCurrency(code);
 }
 
-/** Integer minor units -> PayPal decimal string. Pure string/integer math — no floats. */
+/**
+ * Integer minor units -> PayPal decimal string. Pure string/integer math — no
+ * floats. Also accepts the currencies PayPal has retired (RUB), so amounts of
+ * payments made in them earlier still convert; `PAYPAL_SUPPORTED_CURRENCIES`
+ * is what a new payment may use.
+ */
 export function toPayPalValue(minor: MinorUnitAmount, currency: string): string {
   const code = assertPayPalAmountCurrency(currency);
   assertMinorUnitAmount(minor, "amount");
@@ -70,7 +72,12 @@ export function toPayPalValue(minor: MinorUnitAmount, currency: string): string 
   return String(minor / factor);
 }
 
-/** PayPal decimal string -> integer minor units, per-currency exponent table. */
+/**
+ * PayPal decimal string -> integer minor units, per-currency exponent table.
+ * Also accepts the currencies PayPal has retired (RUB), so amounts of payments
+ * made in them earlier still read; `PAYPAL_SUPPORTED_CURRENCIES` is what a new
+ * payment may use.
+ */
 export function fromPayPalValue(value: string, currency: string): MinorUnitAmount {
   const code = assertPayPalAmountCurrency(currency);
   const match = /^(\d+)(?:\.(\d+))?$/.exec(value.trim());

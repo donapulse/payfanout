@@ -257,9 +257,11 @@ choices they forced:
 - **Doc-verified 2026-09-24:** PayPal's currency codes reference no longer lists RUB.
   `PAYPAL_SUPPORTED_CURRENCIES`, and so `supportedCurrencies`, holds only the listed codes,
   and a new session or a move of an order to another currency must use one of them, so the
-  router takes a RUB payment elsewhere instead of failing it at PayPal. RUB stays readable
-  and formattable for payments made in it earlier: their reads, captures and refunds keep
-  working, and PayPal decides on them.
+  router skips PayPal for a RUB payment instead of failing it there. RUB stays readable and
+  formattable for payments made in it earlier: their reads, captures, refunds and
+  same-currency updates keep working, and PayPal decides on them. Refusing those locally
+  would block refunding money already taken, and PayPal's pages do not say what happens to
+  existing RUB payments.
 - **Sandbox-verified 2026-07-07:** orders created with `payment_source.paypal`
   (always, for the experience_context) answer `PAYER_ACTION_REQUIRED` immediately —
   not `CREATED` — so a fresh session reports `requires_action`; PATCH still works in

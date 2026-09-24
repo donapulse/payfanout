@@ -2,4 +2,4 @@
 "@payfanout/adapter-paypal-server": patch
 ---
 
-The PayPal server adapter no longer offers RUB, which PayPal's currency codes reference no longer lists: `supportedCurrencies` leaves it out, so routing picks another provider for a RUB payment, and a new session in RUB, or a move of an order to RUB, is refused with `invalid_request` before calling PayPal. Payments made in RUB earlier still read, capture and refund.
+The PayPal server adapter no longer offers RUB, which PayPal's currency codes reference no longer lists. `supportedCurrencies` leaves it out, so `PaymentRouter` skips PayPal for a RUB payment and `PaymentService` refuses a RUB session for PayPal with `unsupported_operation`; the adapter itself refuses a new RUB session, or moving an order to RUB, with `invalid_request` before creating or changing the order. Payments made in RUB earlier can still be retrieved, captured and refunded.

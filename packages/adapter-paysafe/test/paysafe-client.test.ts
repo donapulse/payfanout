@@ -8,7 +8,7 @@ function sessionToken(payload: object): string {
   return `${Buffer.from(JSON.stringify(payload)).toString("base64url")}.fake-signature`;
 }
 
-const TOKEN = sessionToken({ v: 1, amount: 2500, currency: "EUR", merchantAccountId: "acct-EUR", id: "order-1" });
+const TOKEN = sessionToken({ v: 1, amount: 2500, currency: "EUR", merchantAccountId: "1001234567", id: "order-1" });
 
 function makeFakePaysafe(tokenize?: FakePaysafeJsOptions["tokenize"]) {
   return createFakePaysafeJs({ tokenize });
@@ -60,7 +60,7 @@ describe("PaysafeClientAdapter", () => {
 
   it("decodes the session payload half without needing the signing key", () => {
     const payload = decodeSessionPayload(TOKEN);
-    expect(payload).toMatchObject({ amount: 2500, currency: "EUR", merchantAccountId: "acct-EUR" });
+    expect(payload).toMatchObject({ amount: 2500, currency: "EUR", merchantAccountId: "1001234567" });
     expect(() => decodeSessionPayload("garbage")).toThrowError(/not a Paysafe session context/);
   });
 
@@ -75,10 +75,9 @@ describe("PaysafeClientAdapter", () => {
     const setup = fake.setupCalls[0]!;
     expect(setup.options["environment"]).toBe("TEST");
     expect(setup.options["currencyCode"]).toBe("EUR"); // Paysafe.js 9055s without it
-    // Not a setup option (accounts.default is), and "acct-EUR" cannot be the
-    // number that one takes.
+    // accountId is not a setup option; accounts.default is, and takes a number.
     expect(setup.options).not.toHaveProperty("accountId");
-    expect(setup.options).not.toHaveProperty("accounts");
+    expect(setup.options["accounts"]).toEqual({ default: 1001234567 });
     expect(Object.keys(setup.options["fields"] as object)).toEqual(["cardNumber", "expiryDate", "cvv"]);
   });
 
@@ -93,9 +92,20 @@ describe("PaysafeClientAdapter", () => {
       paymentType: "CARD",
       amount: 2500,
       currencyCode: "EUR",
-      accountId: "acct-EUR",
+      accountId: 1001234567,
       merchantRefNum: expect.stringMatching(/^order-1-/),
     });
+  });
+
+  it("confirm() fails as invalid_request when the account id is not the number Paysafe.js takes", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    const stringAccount = sessionToken({ v: 1, amount: 2500, currency: "EUR", merchantAccountId: "acct-EUR", id: "o2" });
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: stringAccount });
+    expect(fake.setupCalls[0]!.options).not.toHaveProperty("accounts");
+    const result = await adapter.confirm(handle);
+    expect(result).toMatchObject({ status: "failed", error: { code: "invalid_request" } });
+    expect(fake.tokenizeCalls[0]!["accountId"]).toBe("acct-EUR");
   });
 
   it("coerces a digit-only merchantAccountId to the number Paysafe.js requires, but never rounds an oversized id", async () => {
@@ -118,7 +128,10 @@ describe("PaysafeClientAdapter", () => {
       clientSecret: sessionToken({ v: 1, amount: 2500, currency: "CAD", merchantAccountId: huge }),
     });
     expect(fake.setupCalls[1]!.options).not.toHaveProperty("accounts");
-    await adapter.confirm(hugeHandle);
+    await expect(adapter.confirm(hugeHandle)).resolves.toMatchObject({
+      status: "failed",
+      error: { code: "invalid_request" },
+    });
     expect(fake.tokenizeCalls[1]!["accountId"]).toBe(huge);
   });
 

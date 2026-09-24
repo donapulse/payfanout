@@ -122,6 +122,15 @@ export function createFakePaysafeJs(options: FakePaysafeJsOptions = {}): FakePay
               };
               return Promise.reject(invalid);
             }
+            // The SDK refuses a provided accountId that is not a number.
+            const accountId = tokenizeOptions["accountId"];
+            if (accountId !== undefined && typeof accountId !== "number") {
+              const invalid: FakePaysafeJsError = {
+                ...paysafeJsError("9003", "Invalid fields: options.accountId.", "Invalid fields: options.accountId."),
+                fieldErrors: [{ field: "options.accountId", message: "Invalid accountId parameter." }],
+              };
+              return Promise.reject(invalid);
+            }
             return options.tokenize ? options.tokenize(tokenizeOptions) : Promise.resolve({ token: "SPtok_handle_1" });
           },
           areAllFieldsValid: () => {

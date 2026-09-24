@@ -86,6 +86,9 @@ describe("Paysafe.js tokenize merchantRefNum", () => {
     expect(cleaned).toMatch(new RegExp(`^order42-${UUID.source}$`));
     const [bare] = await tokenizedRefNums("[*]");
     expect(bare).toMatch(new RegExp(`^${UUID.source}$`));
+    // The rest of the documented set: ^ < and the backslash.
+    const [others] = await tokenizedRefNums(`a^b<c${String.fromCharCode(92)}d`);
+    expect(others).toMatch(new RegExp(`^abcd-${UUID.source}$`));
   });
 
   it("draws the random part from getRandomValues where randomUUID is unavailable", async () => {

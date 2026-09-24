@@ -429,8 +429,9 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * sends no capture and answers with the payment, under the same key or a
    * new one: the adapter keeps no state, so it cannot tell a retry whose
    * response was lost from a new call, and a capture without an amount would
-   * ask PayPal for the full authorized amount again. An authorization voided
-   * or denied before captures took it all rejects before any capture call.
+   * ask PayPal for the full authorized amount again. Capturing the rest of an
+   * authorization voided or denied before captures took it all rejects before
+   * any capture call.
    */
   async capturePayment(
     pspPaymentId: string,

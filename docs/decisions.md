@@ -283,21 +283,22 @@ choices they forced:
     `final_capture`, refuses a capture in another currency than the authorization's
     (`AUTH_CAPTURE_CURRENCY_MISMATCH`: "Currency of capture must be the same as currency of
     authorization"), and keeps the no-overage rule.
-  - *Nothing left to capture.* No capture request is sent when nothing is left. Once
-    earlier captures took the whole authorization (CAPTURED, a non-failed capture whose own
-    `final_capture` is `true`, or non-failed captures covering its amount), capturing the
-    rest answers with the payment, under the same key or a new one. The adapter is
-    stateless, so it cannot tell a retry whose response was lost from a new call; leaving
-    the retry to PayPal-Request-Id would mean sending a capture without an amount, which
-    PayPal reads as the full authorized amount, and zero is not allowed ("The amount must
-    be a positive number"). An authorization voided or denied before captures covered it
-    still rejects with `invalid_request` before any capture request; VOIDED is also how an
-    expired authorization reports ("voided either due to authorization reaching its 30 day
-    validity period or… manually voided"). The capture's own `final_capture` (both the
-    Payments and the Orders capture objects carry it) is read because the authorization
-    statuses are defined by amount alone (PARTIALLY_CAPTURED: "an amount that is less than
-    the amount of the original authorized payment"), so they cannot say that a final
-    capture below that amount closed the authorization.
+  - *Nothing left to capture.* Capturing the rest sends no capture request when nothing is
+    left (an explicit amount still goes to PayPal, which refuses it). Once earlier captures
+    took the whole authorization (CAPTURED, a non-failed capture whose own `final_capture`
+    is `true`, or non-failed captures covering its amount), capturing the rest answers with
+    the payment, under the same key or a new one. The adapter is stateless, so it cannot
+    tell a retry whose response was lost from a new call; leaving the retry to
+    PayPal-Request-Id would mean sending a capture without an amount, which PayPal reads as
+    the full authorized amount, and zero is not allowed ("The amount must be a positive
+    number"). An authorization voided or denied before captures covered it still rejects
+    with `invalid_request` before any capture request; VOIDED is also how an expired
+    authorization reports ("voided either due to authorization reaching its 30 day validity
+    period or… manually voided"). The capture's own `final_capture` (both the Payments and
+    the Orders capture objects carry it) is read because the authorization statuses are
+    defined by amount alone (PARTIALLY_CAPTURED: "an amount that is less than the amount of
+    the original authorized payment"), so they cannot say that a final capture below that
+    amount closed the authorization.
   - *Capture ids.* `capturePayment` and `cancelPayment` resolve a capture id, the id
     completion and every capture return, through the capture's
     `supplementary_data.related_ids.order_id`, as `retrievePayment` already did.

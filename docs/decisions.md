@@ -240,6 +240,13 @@ choices they forced:
   intent), `retrievePayment` accepts either and falls back order → capture, and
   `refundPayment` resolves order ids to their capture. Hosts are documented to
   store the capture id.
+- **Doc-verified 2026-09-24: client callbacks follow the JS SDK v5 reference.**
+  `createOrder` returns a Promise of the order id, the only form the reference's samples
+  show. Errors the buttons deliver through `onError` are non-retryable `processing_error`:
+  PayPal calls that handler a catch-all whose errors "aren't expected to be handled beyond
+  showing a generic error message or page". A mount that throws inside `paypal.Buttons()`
+  or `render()` stays a retryable `processing_error`: PayPal's docs say nothing about
+  render failures, and mounting again can succeed.
 - **Webhook verification via PayPal's postback API**
   (`POST /v1/notifications/verify-webhook-signature`), not local X.509 crypto:
   stateless, edge-clean, and PayPal does the certificate work. The raw body is

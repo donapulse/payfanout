@@ -1306,8 +1306,10 @@ Adyen's published HMAC vector, not on observed traffic. The authoring checklist 
 sandbox round-trip before production use, and the setup guide carries that warning:
 
 - **Push-only is the whole shape.** The Checkout API exposes no read for a payment and none
-  for a refund, and `/captures`, `/cancels`, `/refunds`, `/reversals`, `/amountUpdates` all
-  answer `{ status: "received" }`. Capabilities therefore declare
+  for a refund, and `/captures`, `/cancels`, `/refunds` and `/reversals` always answer
+  `{ status: "received" }`, as does `/amountUpdates` unless the request carries
+  `adjustAuthorisationData`, which makes it answer `authorised` or `refused` (the adapter
+  calls neither of the last two). Capabilities therefore declare
   `supportsPaymentRetrieval: false`, `supportsRefundRetrieval: false` and
   `modificationOutcome: "asynchronous"`; capture and cancel resolve `"processing"`, refunds
   `"pending"`, no `amountCaptured` is ever synthesized, and neither `retrievePayment` nor
@@ -1337,6 +1339,75 @@ sandbox round-trip before production use, and the setup guide carries that warni
   `errorCode` 704 (a duplicate racing the still in-flight original) maps to a retryable
   `processing_error` and the transport loop replays it; a 409 is retried only when Adyen
   sends `transient-error: true`.
+  - **Rescoped 2026-09-23**, doc-verified against the API idempotency guide, the HTTP status
+    codes and error codes pages, the capture/cancel/refund guides, the Checkout v72 release
+    note and the v72 OpenAPI contract (`github.com/Adyen/adyen-openapi`,
+    `CheckoutService-v72.json`). The guide says keys "are stored at a company account level"
+    and checked for uniqueness there, so a caller key shared by two merchant accounts of one
+    company, or by two steps of one multi-step action flow, replayed the first answer. The
+    derivation is now split by endpoint. `/payments` and `/payments/details` send the JSON
+    array `["adyen-idempotency-key/2", merchantAccount, path, idempotencyKey, submission]`
+    through `sha256Hex` (internal to the adapter), where `submission` is, on
+    `/payments/details`, `sha256Hex` of the canonical JSON (object keys sorted, JSON data
+    only) of the request's `details` and `paymentData`, and `null` on `/payments`: each step
+    is its own request while a replayed step still dedupes, and the `/payments` body stays
+    out of the digest, so a completion retried under the same key dedupes whatever
+    payment-method blob it carries.
+    Captures, cancels and refunds keep the exported `deriveAdyenIdempotencyKey` and its 0.1.0
+    output, `sha256Hex("{path}\n{idempotencyKey}")`, byte for byte: their path carries the
+    payment's pspReference, which the contract calls "globally unique", so two merchant
+    accounts never share one, and an unchanged header keeps a modification retried across
+    the upgrade deduplicated. A completion retried by a version other than the one that
+    first sent it — after an upgrade, during a rolling deploy or after a rollback — reaches
+    Adyen as a new request, and Adyen captures "automatically without a delay, immediately
+    after authorization" by default, so the changeset, the setup guide (§4) and the README
+    tell hosts to stop retrying in-flight completions before switching versions and settle
+    them from the `AUTHORISATION` webhook. Keys are valid
+    for 7 to 14 days and "will not be checked for duplication in other regions". The guide
+    recommends random v4 UUID keys "to prevent two API credentials under the same account
+    from accessing each others responses"; the digest keeps a random caller key
+    unguessable, and the setup guide asks hosts for one.
+  - **Acknowledgements, 2026-09-23.** A replayed key answers the first response whatever the
+    request, so an `amount` echoed on a capture or refund acknowledgement must be the amount
+    and currency requested (the currency compared case-insensitively). A different echo is an
+    earlier request's stored answer and rejects with a non-retryable `invalid_request` whose
+    message states what Adyen already accepted under the key and that a further one needs a
+    new key, never advising a resend; a malformed echo rejects with a retryable
+    `processing_error`. An absent or `null` echo is accepted: the contract requires `amount`
+    and its own 201 examples carry it, but the refund guide's response example omits it, and
+    refusing an acknowledgement for that would report a refund Adyen accepted as failed — a
+    host retrying under a new key would then refund twice. An acknowledgement without its own
+    `pspReference` rejects with a retryable `processing_error` (a replay under the same key
+    cannot repeat the modification), and a 2xx that is not a JSON object with a retryable
+    `psp_unavailable`. The capture and cancel guides list `Transaction not found` among the
+    failures their webhooks report, so an unknown `pspReference` is acknowledged there, not
+    rejected in the answer. Two neighbouring behaviours are assumptions, which the fake
+    models and the adapter handles either way: that a refund on an unknown reference is
+    acknowledged and fails by webhook (the refund guide's failure reasons do not list it),
+    and that a cancel after the capture fails in the `CANCELLATION` webhook (the cancel guide
+    says only "After a payment has been captured, you can no longer cancel it."). Error 906
+    ("Invalid Request: Original pspReference is invalid for this environment", cause
+    "LIVE/TEST PSP mismatch") is an error response, so a modification on an unknown reference
+    is acknowledged only within one environment.
+  - **Classification, 2026-09-23**, from the same pages: `transient-error: true` (the value
+    read case-insensitively) is retryable at any status (`processing_error` below 500,
+    `psp_unavailable` from 500), `errorCode` 705 is `rate_limited`, 408 ("You can retry the
+    request") a retryable `psp_unavailable`, and 501 or a 5xx typed `validation`,
+    `configuration` or `security` a non-retryable `invalid_request` (the contract's generic
+    500 example is `905`/`configuration`, and v72 moved only "some validation and rate limit
+    errors" from 500 to 422/429). Any other 5xx is retried, without the transient header and
+    under `transient-error: false` alike. That departs deliberately from the idempotency
+    guide's "If the API does not return a transient error header, or returns a header with a
+    value of false, do not retry the request.": the HTTP status codes page says "In the
+    following scenarios, the Adyen payments platform does not accept or store submitted
+    requests: … An internal error occurs on the Adyen payments platform.", and the retry
+    carries the same key, so it is either the first request Adyen sees or answered from its
+    store.
+  - **Sandbox checks outstanding (2026-09-23):** whether live capture and refund
+    acknowledgements carry `amount`; whether a fresh acknowledgement's echo always equals the
+    request; what Adyen answers when a key is reused with a different body; whether a refund
+    on an unknown `pspReference` is acknowledged and fails by webhook; whether a cancel after
+    the capture is acknowledged and fails in the `CANCELLATION` webhook.
 - **`returnUrl` is required on POST /payments in v72**, alongside `merchantAccount`,
   `amount`, `reference` and `paymentMethod`, so the adapter takes a `defaultReturnUrl`
   config (the PayPal adapter's `returnUrl` fallback is the precedent): the session's own
@@ -1368,7 +1439,8 @@ sandbox round-trip before production use, and the setup guide carries that warni
   `Refused`/`Error` raise a mapped `PayFanoutError` rather than a "failed" PaymentInfo.
   Refusal codes map 2/5/46 → `card_declined`, 6 → `expired_card`, 8/24 →
   `invalid_card_data`, 11/38/42 → `authentication_required`, 12 → `insufficient_funds`,
-  14/20 → `fraud_suspected`, 9 (Issuer Unavailable) → `processing_error`. None is retryable:
+  14/20/31 → `fraud_suspected` (31, Issuer Suspected Fraud, since 2026-09-23), 9 (Issuer
+  Unavailable) → `processing_error`. None is retryable:
   replaying the same idempotency key returns the same refusal, so a fresh attempt is the
   shopper's move, and an unrecognized code is still a decline.
 - **CLP, CVE, IDR and ISK are rejected locally** (`invalid_request`): Adyen prices them with

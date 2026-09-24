@@ -143,7 +143,7 @@ describe("PayPal currencies", () => {
 
   it("still updates the amount of an earlier RUB order, however the currency is spelled", async () => {
     for (const currency of [undefined, "rub"]) {
-      const { adapter, requests } = recordingAdapter({
+      const { adapter, requests, sent } = recordingAdapter({
         "/v2/checkout/orders/O2": {
           id: "O2",
           status: "CREATED",
@@ -158,6 +158,13 @@ describe("PayPal currencies", () => {
         idempotencyKey: "k-up-rub",
       });
       expect(requests, String(currency)).toContain("PATCH /v2/checkout/orders/O2");
+      expect(sent.get("PATCH /v2/checkout/orders/O2"), String(currency)).toEqual([
+        {
+          op: "replace",
+          path: "/purchase_units/@reference_id=='default'/amount",
+          value: { currency_code: "RUB", value: "2000.00" },
+        },
+      ]);
     }
   });
 

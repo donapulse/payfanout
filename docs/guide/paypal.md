@@ -316,7 +316,8 @@ for that list; its events dashboard searches only the last 30 days.
 
 PayPal checkout supports the currencies of its
 [currency codes reference](https://developer.paypal.com/reference/currency-codes) — and
-**no 3-decimal ones** (BHD, KWD, TND, … are rejected locally with `invalid_request`):
+**no 3-decimal ones** (BHD, KWD, TND, … are refused locally: `unsupported_operation`
+through `PaymentService`, `invalid_request` from the adapter itself):
 
 AUD, BRL, CAD, CHF, CNY, CZK, DKK, EUR, GBP, HKD, HUF, ILS, JPY, MXN, MYR, NOK, NZD,
 PHP, PLN, SEK, SGD, THB, TWD, USD.

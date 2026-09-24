@@ -1357,10 +1357,12 @@ sandbox round-trip before production use, and the setup guide carries that warni
     output, `sha256Hex("{path}\n{idempotencyKey}")`, byte for byte: their path carries the
     payment's pspReference, which the contract calls "globally unique", so two merchant
     accounts never share one, and an unchanged header keeps a modification retried across
-    the upgrade deduplicated. A completion first sent by 0.1.0 and retried after the upgrade
-    reaches Adyen as a new request, and Adyen captures "automatically without a delay,
-    immediately after authorization" by default, so the changeset tells hosts to stop
-    retrying those before deploying and wait for the `AUTHORISATION` webhook. Keys are valid
+    the upgrade deduplicated. A completion retried by a version other than the one that
+    first sent it — after an upgrade, during a rolling deploy or after a rollback — reaches
+    Adyen as a new request, and Adyen captures "automatically without a delay, immediately
+    after authorization" by default, so the changeset, the setup guide (§4) and the README
+    tell hosts to stop retrying in-flight completions before switching versions and settle
+    them from the `AUTHORISATION` webhook. Keys are valid
     for 7 to 14 days and "will not be checked for duplication in other regions". The guide
     recommends random v4 UUID keys "to prevent two API credentials under the same account
     from accessing each others responses"; the digest keeps a random caller key

@@ -137,6 +137,20 @@ const paysafe = new PaysafeClientAdapter({
   username/password. It can only mint single-use tokens and holds no secret authority.
 - **Currency comes from the signed session**, not from client config. It must be a currency
   your Paysafe account supports, or Paysafe.js fails to set up (error `9055`). See §11.
+- **So does the merchant account.** When `merchantAccountResolver` returns one for the
+  session, setup preselects it with Paysafe.js's `accounts.default` option, which a key
+  holding more than one account for the currency needs: without it, setup fails with error
+  `9073`. Paysafe.js takes the id as a number, so return the digits Paysafe issued; when
+  the session's account is numeric, it replaces any `fieldOptions.accounts` you pass.
+- **Each card tokenize sends a fresh `merchantRefNum`**, which Paysafe.js requires: the
+  session `id` when you set one (minus the characters Paysafe rejects in any parameter),
+  then a random suffix, 255 characters at most. A card retried after a decline gets a new
+  one, and a session created without an `id` tokenizes too. It names the single-use handle
+  only; the payment itself keeps your completion `idempotencyKey` as its `merchantRefNum`.
+- The adapter calls Paysafe.js `show()` right after setup, as Paysafe documents. Setup
+  already shows the card-only fields the adapter configures, so the call matters when your
+  options add another payment method, which would otherwise stay locked (`9100`); a card
+  error that `show()` reports fails the mount.
 - Split card fields let you own the layout via slots
   (`data-payfanout-field="cardNumber|expiryDate|cvv"`), see [React usage](/guide/react).
 

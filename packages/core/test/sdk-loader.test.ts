@@ -346,6 +346,23 @@ describe("injectScript after a failed load", () => {
     await expect(third).resolves.toBeUndefined();
   });
 
+  it("rejects each call that waited on the tag with its own error, attributed to its pspName", async () => {
+    const { injected } = stubPage();
+    const first = injectScript(SDK_URL, "acme");
+    const waiting = injectScript(SDK_URL, "acme-eu");
+    injected[0]!.onerror!();
+    await expectLoadFailure(first, SDK_URL);
+    const error = await rejection(waiting);
+    expect(error.toJSON()).toEqual({
+      name: "PayFanoutError",
+      code: "psp_unavailable",
+      message: `Failed to load ${SDK_URL}`,
+      retryable: true,
+      pspName: "acme-eu",
+    });
+    expect(error).not.toBe(await rejection(first));
+  });
+
   it("drops the failed tag before rejecting the calls that waited on it", async () => {
     // A caller retrying from its rejection handler must fetch the file again.
     const { injected } = stubPage();

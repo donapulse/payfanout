@@ -61,7 +61,11 @@ export interface StripeClientAdapterConfig {
   locale?: string;
   /** Override the capability list per account/currency instead of hardcoding. */
   paymentMethods?: PaymentMethodCapability[];
-  /** Test seams: script injection + global lookup. */
+  /**
+   * Test seams: script injection + global lookup. `loadScript` is called again by
+   * the next loadSdk() after an attempt that rejects or leaves the SDK global
+   * missing, so it must be safe to call more than once.
+   */
   loadScript?: (url: string) => Promise<void>;
   getStripeGlobal?: () => StripeJsFactory | undefined;
   sdkUrl?: string;
@@ -121,8 +125,9 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
         });
       }
     } catch (err) {
-      // Drop this attempt, if still cached, so the next loadSdk() calls the loader
-      // again: a cached rejection would fail every later mount until the page reloads.
+      // Drop this attempt, if still cached, whether it rejected or left the global
+      // missing, so the next loadSdk() calls the loader again: a cached failure
+      // would fail every later mount until the page reloads.
       if (this.sdkPromise === loading) this.sdkPromise = undefined;
       throw err;
     }

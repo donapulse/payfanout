@@ -75,18 +75,20 @@ export interface InjectScriptOptions {
  *
  * A `<script>` already on the page for `url` is reused and nothing is
  * injected. If an earlier call injected that tag and it is still loading, the
- * call waits for it: it resolves when the tag loads and rejects with the same
- * retryable psp_unavailable when it fails. Any other tag resolves the call at
- * once: one that has loaded, or one the page added itself, which the call never
- * listens to or removes, whether it is still loading or its load failed, so
- * callers keep confirming the SDK global. With `options.integrity` the call
- * also detects a conflicting tag: every `<script>` for `url` must carry exactly
- * the same `integrity` string and a `crossorigin` attribute, whatever its
- * value, since without one a cross-origin file is fetched without CORS and
- * cannot pass the check. A conflicting tag makes the call reject with a
- * non-retryable invalid_request attributed to `pspName`, as does an `integrity`
- * holding no sha256, sha384 or sha512 hash; either way nothing is injected, and
- * the call rejects at once, even while a tag for `url` is still loading.
+ * call waits for it: it resolves when the tag loads and, when the tag fails,
+ * rejects with its own retryable psp_unavailable attributed to `pspName`. There
+ * is no timeout: a tag that fires neither event keeps every call waiting on it
+ * pending. Any other tag resolves the call at once: one that has loaded, or one
+ * the page added itself, which the call never listens to or removes, whether it
+ * is still loading or its load failed, so callers keep confirming the SDK
+ * global. With `options.integrity` the call also detects a conflicting tag:
+ * every `<script>` for `url` must carry exactly the same `integrity` string and
+ * a `crossorigin` attribute, whatever its value, since without one a
+ * cross-origin file is fetched without CORS and cannot pass the check. A
+ * conflicting tag makes the call reject with a non-retryable invalid_request
+ * attributed to `pspName`, as does an `integrity` holding no sha256, sha384 or
+ * sha512 hash; either way nothing is injected, and the call rejects at once,
+ * even while a tag for `url` is still loading.
  *
  * This is not a trust boundary: every shipped client adapter's `loadSdk()`
  * returns before calling `injectScript` once the SDK global exists, so a copy

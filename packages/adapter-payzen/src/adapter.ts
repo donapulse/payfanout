@@ -111,7 +111,11 @@ export interface PayZenClientAdapterConfig {
    * the Back Office lists the contract. Overrides wholesale.
    */
   paymentMethods?: PaymentMethodCapability[];
-  /** Test seam: full asset injection (stylesheet + script) override. */
+  /**
+   * Test seam: full asset injection (stylesheet + script) override. Called again
+   * by the next loadSdk() after an attempt that rejects or leaves the KR global
+   * missing, so it must be safe to call more than once.
+   */
   loadScript?: (scriptUrl: string, cssUrl: string) => Promise<void>;
   /** Test seam: KR global lookup override. */
   getKrGlobal?: () => KrLike | undefined;
@@ -250,8 +254,9 @@ export class PayZenClientAdapter implements ClientPaymentAdapter {
         });
       }
     } catch (err) {
-      // Drop this attempt, if still cached, so the next loadSdk() calls the loader
-      // again: a cached rejection would fail every later mount until the page reloads.
+      // Drop this attempt, if still cached, whether it rejected or left the global
+      // missing, so the next loadSdk() calls the loader again: a cached failure
+      // would fail every later mount until the page reloads.
       if (this.sdkPromise === loading) this.sdkPromise = undefined;
       throw err;
     }

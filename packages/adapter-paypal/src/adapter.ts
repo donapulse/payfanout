@@ -60,6 +60,10 @@ export interface PayPalClientAdapterConfig {
   userAction?: "continue" | "pay_now";
   /** Test seams. */
   sdkBaseUrl?: string;
+  /**
+   * Test seam. Called again by the next loadSdk() after an attempt that rejects
+   * or leaves the SDK global missing, so it must be safe to call more than once.
+   */
   loadScript?: (url: string) => Promise<void>;
   getPayPalGlobal?: () => PayPalJsLike | undefined;
 }
@@ -131,8 +135,9 @@ export class PayPalClientAdapter implements ClientPaymentAdapter {
         });
       }
     } catch (err) {
-      // Drop this attempt, if still cached, so the next loadSdk() calls the loader
-      // again: a cached rejection would fail every later mount until the page reloads.
+      // Drop this attempt, if still cached, whether it rejected or left the global
+      // missing, so the next loadSdk() calls the loader again: a cached failure
+      // would fail every later mount until the page reloads.
       if (this.sdkPromise === loading) this.sdkPromise = undefined;
       throw err;
     }

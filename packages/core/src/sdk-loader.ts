@@ -1,7 +1,14 @@
 import { PayFanoutError } from "./errors.js";
 
-// SRI's grammar is ABNF, whose literal strings are case-insensitive.
-const SRI_HASH = /(?:^|\s)sha(?:256|384|512)-\S/i;
+// Lowercase only: the SRI draft lowercases algorithm names, but Chromium and
+// Firefox match them case-sensitively and skip a token they do not recognise,
+// which leaves the file unchecked. The digest is base64 or base64url, and
+// tokens split on ASCII whitespace only, as browsers split them.
+const SRI_TOKEN = /^sha(?:256|384|512)-[A-Za-z0-9+/_-]+={0,2}(?:\?.*)?$/;
+
+function holdsUsableHash(integrity: string): boolean {
+  return integrity.split(/[\t\n\f\r ]+/).some((token) => SRI_TOKEN.test(token));
+}
 
 /**
  * Guards a client adapter method against SSR: PSP browser SDKs need a real
@@ -25,9 +32,11 @@ export interface InjectScriptOptions {
    * Subresource Integrity metadata, set verbatim as the tag's `integrity`
    * attribute, e.g. `"sha384-<base64 digest>"`. The browser refuses to run a
    * file that does not match, and that refusal rejects like any other load
-   * failure. A value holding no sha256, sha384 or sha512 hash (empty, or with
-   * a mistyped algorithm the browser would ignore) rejects with a
-   * non-retryable invalid_request, and nothing is injected.
+   * failure. A value holding no well-formed sha256, sha384 or sha512 token —
+   * lowercase algorithm name, base64 digest — rejects with a non-retryable
+   * invalid_request, and nothing is injected: empty values, mistyped or
+   * uppercase algorithm names and malformed digests are all skipped by Chromium
+   * and Firefox, which would then run the file unchecked.
    *
    * With it, the call also detects a conflicting `<script>` already on the
    * page for the same URL (see {@link injectScript}). That is not a trust
@@ -88,7 +97,7 @@ export function injectScript(url: string, pspName: string, options: InjectScript
     let onPage: boolean;
     if (integrity === undefined) {
       onPage = Boolean(document.querySelector(selector));
-    } else if (!SRI_HASH.test(integrity)) {
+    } else if (!holdsUsableHash(integrity)) {
       refuse(`The integrity for ${url} holds no sha256, sha384 or sha512 hash`);
       return;
     } else {

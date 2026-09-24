@@ -480,8 +480,12 @@ docs.direct.worldline-solutions.com unless noted):
   CORS mode; it reuses a `<script>` already on the page for the URL only if every such tag
   carries the same `integrity` and a `crossorigin` attribute (the value is not compared), and
   otherwise rejects with a non-retryable `invalid_request` without injecting, as it does for
-  an `integrity` holding no `sha256-`, `sha384-` or `sha512-` token. That is a conflict check,
-  not a trust boundary: client adapters return before injecting once the SDK global exists.
+  an `integrity` holding no well-formed `sha256-`, `sha384-` or `sha512-` token. The
+  algorithm name must be lowercase: the SRI draft lowercases it, but Chromium and Firefox
+  match it case-sensitively and skip a token they do not recognise (verified 2026-09-23 in
+  headless Chromium 151, where `SHA384-…` with a wrong digest loaded and ran), and a file
+  whose every token is skipped runs unchecked. That is a conflict check, not a trust
+  boundary: client adapters return before injecting once the SDK global exists.
 - **CreatePayment wiring (corrected in review, 2026-07-15):** `hostedTokenizationId` rides
   at the ROOT of the CreatePayment request — the platform's current domain model declares it
   there and `CardPaymentMethodSpecificInput` has no such field (the guide's "replace the

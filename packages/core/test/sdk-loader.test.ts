@@ -187,7 +187,19 @@ describe("injectScript options", () => {
 
   it("refuses an integrity holding no sha256, sha384 or sha512 hash, and injects nothing", async () => {
     const { injected } = stubPage();
-    for (const integrity of ["", "   ", "sha348-abc", "md5-abc"]) {
+    // Chromium and Firefox skip every one of these, leaving the file unchecked.
+    for (const integrity of [
+      "",
+      "   ",
+      "sha348-abc",
+      "md5-abc",
+      "SHA384-abc",
+      "Sha512-abc",
+      "sha384-abc,",
+      "sha384-?",
+      " sha384-abc",
+      "md5-abc sha384-abc",
+    ]) {
       await expectRefused(
         injectScript(SDK_URL, "acme", { integrity }),
         `The integrity for ${SDK_URL} holds no sha256, sha384 or sha512 hash`,
@@ -196,11 +208,13 @@ describe("injectScript options", () => {
     expect(injected).toHaveLength(0);
   });
 
-  it("accepts an integrity holding a usable hash, alone or beside another token, in any case", () => {
+  it("accepts an integrity holding a well-formed hash, alone or beside another token", () => {
     const { injected } = stubPage();
-    void injectScript(SDK_URL, "acme", { integrity: "sha384-abc" });
-    void injectScript(OTHER_URL, "acme", { integrity: "md5-abc SHA512-abc" });
-    expect(injected.map((script) => script.srcSetWith?.["integrity"])).toEqual(["sha384-abc", "md5-abc SHA512-abc"]);
+    const values = ["sha384-abc", "md5-abc sha512-abc", "md5-abc\tsha384-ab+/_-c==", "sha256-abc?opt"];
+    for (const [index, integrity] of values.entries()) {
+      void injectScript(`https://cdn.example/sdk-${index}.js`, "acme", { integrity });
+    }
+    expect(injected.map((script) => script.srcSetWith?.["integrity"])).toEqual(values);
   });
 });
 

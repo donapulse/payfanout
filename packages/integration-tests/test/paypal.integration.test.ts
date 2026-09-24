@@ -11,8 +11,8 @@
  *
  * Capturing a real order needs a buyer approval in the popup, which a test
  * process cannot perform — the capture-path negative test below therefore
- * uses PayPal's sandbox negative-testing header; REST calls need nothing
- * more (opt in with PAYPAL_NEGATIVE_TESTING=1).
+ * uses PayPal's sandbox negative-testing header (enable Negative Testing on
+ * the business sandbox account, then set PAYPAL_NEGATIVE_TESTING=1).
  */
 import { describe, expect, it } from "vitest";
 import { isPayFanoutError, NATIVE_SUBSCRIPTION_STATUSES } from "@payfanout/core";
@@ -129,7 +129,7 @@ describeIf("PayPal sandbox integration", () => {
     }
   });
 
-  // Opt-in: forces a mock decline through PayPal's negative-testing header.
+  // Requires Negative Testing enabled on the business sandbox account.
   const itNegative = process.env.PAYPAL_NEGATIVE_TESTING ? it : it.skip;
   itNegative("negative testing: INSTRUMENT_DECLINED on capture maps to card_declined", async () => {
     // Wrap fetch to force the mock error on the capture call only.

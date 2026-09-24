@@ -355,17 +355,21 @@ strings PayPal wants exist only inside the adapter.
 
 - Approve popups by logging in with a **personal** sandbox account
   (sandbox.paypal.com uses the same credentials).
-- **Negative testing** (a sandbox beta): REST calls opt in per request with the
-  `PayPal-Mock-Response: {"mock_application_codes": "INSTRUMENT_DECLINED"}` header, which
-  PayPal supports on the Orders v2 create, update, show, authorize and capture calls and on
-  the Payments v2 authorization, capture and refund calls. The account-level Negative
-  Testing setting in the sandbox dashboard is documented for PayPal's Classic APIs; turn it
-  on only if the header has no effect. The integration suite has an env-gated case for
-  this. Mock errors never work in live.
+- **Negative testing** (a sandbox beta): turn on Negative Testing on the **business**
+  sandbox account (developer dashboard → Sandbox → Accounts → View/Edit Account → Settings),
+  then force errors per request with the
+  `PayPal-Mock-Response: {"mock_application_codes": "INSTRUMENT_DECLINED"}` header. PayPal's
+  request-headers page describes the header alone as enough for REST calls, while its
+  negative-testing overview has you turn the setting on first; doing both covers either
+  reading. The header works on the Orders v2 create, update, show, authorize and capture
+  calls, and on the Payments v2 show, capture and void authorization, show capture, refund
+  capture and show refund calls (reauthorize is not listed). The integration suite has an
+  env-gated case for this. Mock errors never work in live.
 - PayPal publishes no rate-limit policy: it may temporarily throttle traffic that looks
   abusive, answering `429` with `RATE_LIMIT_REACHED`, which the adapter maps to a
   retryable `rate_limited`. PayPal recommends webhooks over polling and cached OAuth
-  tokens; the adapter caches its token.
+  tokens. The adapter caches its token per instance, so reuse one adapter rather than
+  building one per request.
 
 ## 11. Limitations (v1)
 

@@ -169,6 +169,16 @@ do not send it again; a further capture or refund needs a new key. A duplicate r
 still in-flight original (Adyen `errorCode` 704) is retried automatically.
 :::
 
+::: warning Upgrading from 0.1.0
+`/payments` and `/payments/details` send a different `idempotency-key` than 0.1.0 did, so a
+`completePayment` retried by another version than the one that first sent it reaches Adyen as
+a new request and can charge the shopper twice — Adyen captures right after authorisation by
+default. That holds in both directions: an upgrade, a rolling deploy running both versions, or
+a rollback. Before switching versions, stop retrying in-flight completions and settle each one
+from its `AUTHORISATION` webhook. Captures, cancels and refunds send the same key as 0.1.0 and
+stay deduplicated either way.
+:::
+
 ### Currencies the adapter refuses
 
 Adyen prices **CLP, CVE, IDR and ISK** with a different number of fractional digits than

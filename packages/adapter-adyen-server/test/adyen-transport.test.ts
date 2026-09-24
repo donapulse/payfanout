@@ -97,7 +97,11 @@ describe("the idempotency-key derivations", () => {
 
   it("keeps the header 0.1.0 sent on every capture, cancel and refund", async () => {
     const path = "/payments/8836100000000001/refunds";
-    expect(await deriveAdyenIdempotencyKey(path, "caller-key")).toBe(await sha256Hex(`${path}\ncaller-key`));
+    // Pinned as a literal (SHA-256 of "/payments/8836100000000001/refunds\ncaller-key"),
+    // so a change in the hashing helper cannot move the 0.1.0 value unnoticed.
+    expect(await deriveAdyenIdempotencyKey(path, "caller-key")).toBe(
+      "ae39e1438b98b9fb8c52ee7c1c4d12d31c29784446628c69d4eb249eedb00296",
+    );
 
     const { adapter, fake } = withFake();
     const captured = await pay(adapter, "complete-1", "manual");

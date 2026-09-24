@@ -136,6 +136,12 @@ is one whose signed values were altered. `verifyAdyenWebhook` returns the specif
 
 ## Notes
 
+- **Upgrading from 0.1.0:** `/payments` and `/payments/details` send a different
+  `idempotency-key` than 0.1.0 did, so a `completePayment` retried by another version than the
+  one that first sent it reaches Adyen as a new request and can charge twice (Adyen captures
+  right after authorisation by default). That holds for an upgrade, a rolling deploy and a
+  rollback alike: before switching versions, stop retrying in-flight completions and settle
+  each from its `AUTHORISATION` webhook. Captures, cancels and refunds keep the 0.1.0 key.
 - Every call carries an `idempotency-key`, a SHA-256 digest (Adyen caps the header at 64
   characters). On `/payments` it covers the caller's `idempotencyKey`, the merchant account
   and the endpoint, and on `/payments/details` also the submitted `details` and

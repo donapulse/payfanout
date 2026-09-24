@@ -219,6 +219,9 @@ const PAYMENTS_PATH = "/payments";
 /** Finishes an action; the one endpoint whose idempotency key also covers the submitted data. */
 const PAYMENT_DETAILS_PATH = "/payments/details";
 
+/** A capture, cancel or refund of one payment: the paths that keep the 0.1.0 idempotency key. */
+const MODIFICATION_PATH = /^\/payments\/[^/]+\/(?:captures|cancels|refunds)$/;
+
 /** RefundRequest.reason -> Adyen's `merchantRefundReason`. */
 const MERCHANT_REFUND_REASONS = new Map<string, string>([
   ["duplicate", "DUPLICATE"],
@@ -745,7 +748,10 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
     if (path === PAYMENT_DETAILS_PATH) {
       return derivePaymentIdempotencyKey({ merchantAccount, path, idempotencyKey, ...detailsSubmission(body) });
     }
-    return deriveAdyenIdempotencyKey(path, idempotencyKey);
+    if (MODIFICATION_PATH.test(path)) return deriveAdyenIdempotencyKey(path, idempotencyKey);
+    // A new endpoint must choose its derivation: the 0.1.0 one is only safe on
+    // paths that carry a payment's globally unique pspReference.
+    throw new Error(`No idempotency-key derivation is defined for ${path}`);
   }
 
   private async postOnce<T>(path: string, body: unknown, idempotencyHeader: string): Promise<T> {

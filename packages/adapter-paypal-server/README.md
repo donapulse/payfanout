@@ -67,8 +67,9 @@ The adapter passes PayPal's own billing product through as unified records —
   schedule that ran its cycles), anything unrecognized → `unknown`.
 - **Listing** pages by number (`page_size` 1–20); the opaque `nextCursor` is the next page
   number. List items omit the inline plan, so each page performs one `fields=plan` detail
-  GET per item (≤ 20) on top of the list call. The unfiltered list returns PayPal's own
-  default status set — the reference does not enumerate it.
+  GET per item (≤ 20) on top of the list call. None of the documented filters (such as
+  `statuses`) is applied; the reference describes the call as listing all subscriptions
+  for the merchant account and gives `statuses` no default (not sandbox-verified).
 - **Cancel** is verified-idempotent: the endpoint accepts only ACTIVE/SUSPENDED
   subscriptions, so on any cancel rejection the adapter re-fetches and treats an
   already-terminal subscription (CANCELLED/EXPIRED) as success. The derived

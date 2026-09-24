@@ -715,11 +715,13 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * by number: page_size 1–20, default 10). List items omit the inline plan,
    * so each item is completed by the same fields=plan detail GET retrieve
    * uses — a page costs 1 + N requests (N ≤ 20). total_required=true rides
-   * every page so the last page is detected from total_pages; a next link or
-   * a full page are honored as fallbacks (a possibly-empty final page beats
-   * silently truncating the walk). The unfiltered list returns PayPal's own
-   * default status set — the reference does not enumerate it, and no
-   * undocumented statuses filter is guessed here.
+   * every page, although the reference documents it for the plans list rather
+   * than this one, because total_pages ends the walk exactly when PayPal
+   * returns it; a next link or a full page decide otherwise (a possibly-empty
+   * final page beats silently truncating the walk). None of the documented
+   * filters (plan_ids, statuses, date ranges, filter) is applied; the
+   * reference describes the call as listing all subscriptions for the
+   * merchant account and gives statuses no default (not sandbox-verified).
    */
   async listNativeSubscriptions(input: ListNativeSubscriptionsInput = {}): Promise<ListNativeSubscriptionsResult> {
     const page = parseSubscriptionsCursor(input.cursor);
@@ -1390,10 +1392,11 @@ function parseSubscriptionsCursor(cursor: string | undefined): number {
 }
 
 /**
- * Last-page detection ladder: total_pages (requested via total_required=true)
- * is authoritative; a links[rel=next] entry is honored when totals are
- * absent; a full page without either still pages on — the walk then ends on
- * the following short/empty page instead of dropping records.
+ * Last-page detection ladder: total_pages (requested via total_required=true,
+ * which this list's reference does not document) ends the walk when PayPal
+ * returns it; a links[rel=next] entry is honored when totals are absent; a
+ * full page without either still pages on — the walk then ends on the
+ * following short/empty page instead of dropping records.
  */
 function nextSubscriptionsPage(
   page: number,

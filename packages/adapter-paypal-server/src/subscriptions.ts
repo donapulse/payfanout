@@ -62,7 +62,11 @@ export interface PayPalSubscriptionLike {
   links?: Array<{ href?: string; rel?: string; method?: string }>;
 }
 
-/** GET /v1/billing/subscriptions envelope (totals appear with total_required=true). */
+/**
+ * GET /v1/billing/subscriptions envelope. The reference documents
+ * `subscriptions` and `links`; the totals are read when a
+ * total_required=true response carries them.
+ */
 export interface PayPalSubscriptionsPageLike {
   subscriptions?: PayPalSubscriptionLike[];
   total_items?: number;

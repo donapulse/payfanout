@@ -43,9 +43,17 @@ const adyen = new AdyenClientAdapter({
 </PayFanoutProvider>
 ```
 
-- `environment` selects both the CDN host and the value handed to Adyen Web
-  (`sandbox → test`, `live → live`); `adyenEnvironment` overrides the latter for regional
-  live values. Nothing is inferred.
+- `environment` selects the value handed to Adyen Web (`sandbox → test`, `live → live`), the
+  CDN host Adyen Web loads from, and the client key it takes: `test_…` on sandbox, `live_…`
+  on live. A live account served from another region sets `adyenEnvironment` to `live-us`,
+  `live-au`, `live-nea`, `live-in` or `live-apse` (compared case-insensitively), and Adyen
+  Web then loads from that region's host, `checkoutshopper-{value}.cdn.adyen.com`, as Adyen
+  requires. `live-apse` is accepted because Adyen Web types it and maps it to its own hosts,
+  which serve the pinned build, though Adyen's v6 integration guides do not list it; check
+  it with Adyen before going live on it. Nothing is inferred: the constructor throws
+  `invalid_request` for a client key that does not start with `test_` on sandbox or `live_`
+  on live (a legacy origin key included), for an `adyenEnvironment` that contradicts
+  `environment`, and for one Adyen Web does not support.
 - `countryCode` is required — Adyen Web takes it on the checkout instance.
 - The session's `clientSecret` is the server adapter's signed session token; the adapter
   reads its payload half (amount and currency) so Adyen Web shows the right figures. It
@@ -65,6 +73,11 @@ const adyen = new AdyenClientAdapter({
 host wins on conflicts, except the two keys the adapter must own: `showPayButton` (forced to
 `false`, since your `<PayButton>` drives submission) and `onChange` (where the encrypted blob
 and the validity stream arrive). `options.locale` sets the SDK's locale for that mount.
+
+`sdkVersion` loads another Adyen Web build from Adyen's CDN, and `sdkUrl` / `stylesheetUrl`
+load the script / stylesheet from your own host. The adapter carries Adyen's integrity hashes
+for its pinned build only, so an overridden file loads without an integrity check:
+`sdkVersion` turns it off for both files, `sdkUrl` and `stylesheetUrl` for their own.
 
 ## 3-D Secure
 
@@ -88,10 +101,11 @@ is outstanding resolves `{ status: "failed" }` with `invalid_request` rather tha
 the pending resolver, which would strand the first caller's promise. The promise settles
 when Adyen reports the shopper's details, or as `failed` when Adyen Web reports an error
 through `onError` first — `authentication_required`, or a retryable `psp_unavailable` when
-the error reads as a load or network failure — or when the fields are unmounted first. Race
-it against your own timer if you need a deadline on an abandoned challenge. Once
-`handleAction` has run, the card fields are gone: `confirm()` on that handle resolves
-`failed` with `invalid_request`, and the fields must be remounted to pay again.
+Adyen Web names it a network or script error, or its message reads as one — or when the
+fields are unmounted first. Race it against your own timer if you need a deadline on an
+abandoned challenge. Once `handleAction` has run, the card fields are gone: `confirm()` on
+that handle resolves `failed` with `invalid_request`, and the fields must be remounted to pay
+again.
 
 ## Notes
 
@@ -100,8 +114,19 @@ it against your own timer if you need a deadline on an abandoned challenge. Once
 - `onChange` fires once with `{ complete: false, empty: true }` on mount, then with
   `{ complete }` on every SDK validity change, so "disable Pay until complete" works out of
   the box.
-- `sdkVersion` pins the Adyen Web build; `sdkUrl` / `stylesheetUrl` let you self-host. A
-  stylesheet that fails to load never blocks the fields from mounting.
+- The adapter loads Adyen Web 6.45.2 (`ADYEN_WEB_VERSION`) with the
+  [Subresource Integrity](https://docs.adyen.com/online-payments/web-best-practices#implement-subresource-integrity-hashes)
+  hashes Adyen publishes for it and `crossorigin="anonymous"`, so the browser refuses a
+  modified script or stylesheet. A `<script>` your page adds itself for the default URL needs
+  the same `integrity`, exported as `ADYEN_WEB_SCRIPT_INTEGRITY`, and a `crossorigin`
+  attribute: while `window.AdyenWeb` is not defined yet, a conflicting tag makes `loadSdk()`
+  reject with `invalid_request`. A stylesheet `<link>` your page adds for the default URL is
+  used as it is, so give it `ADYEN_WEB_STYLESHEET_INTEGRITY` and a `crossorigin` attribute
+  to keep the check.
+- If the script fails to load, the next mount fetches it again, with the stylesheet if that
+  failed too; if it loaded without defining `window.AdyenWeb`, the next mount checks again
+  instead of failing from a cached result. A stylesheet that fails to load never blocks the
+  fields from mounting.
 
 ## Documentation
 

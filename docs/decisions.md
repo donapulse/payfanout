@@ -149,7 +149,24 @@ than enumerated options (future SDK options need no library release):
   `wallets`, …). Paysafe: per-field options under `fields` (placeholders, …) plus any
   top-level setup option. Adapters protect ONLY their functional keys (Stripe:
   clientSecret; Paysafe: environment/currencyCode/accountId/mount selectors) — the
-  host wins everywhere else.
+  host wins everywhere else. *Update 2026-09-24:* Paysafe's protected setup key is
+  `accounts` (`accounts.default`, the documented setup option for a key holding several
+  accounts in one currency), not `accountId`, which setup never read; tokenize still
+  carries `accountId`, as its reference documents. When the session's account is
+  numeric, it replaces a host's whole `fieldOptions.accounts`: tokenize's `accountId`
+  overrides the setup account and the server charges the session's account, so sibling
+  entries could never route a payment.
+- **Doc-verified 2026-09-24: Paysafe.js tokenize and show.** Tokenize requires
+  `merchantRefNum` ("A unique identifier is provided by the merchant for every transaction
+  from Paysafe JS"; the served SDK fails a missing value with 9003), so each attempt sends a
+  fresh one: the session `id` minus Paysafe's global invalid characters, cut so the whole
+  stays within 255 characters, then a random suffix (`crypto.randomUUID`, or
+  `getRandomValues` outside secure contexts). It names the single-use handle only; the
+  payment keeps the caller's `idempotencyKey`. The adapter always calls `show()` after
+  setup ("The function should be invoked immediately after the setup function"): the served
+  SDK makes it during setup only for a single payment method and answers a repeat call
+  with the first result, so the call is harmless for the card-only fields and keeps any
+  other setup from staying locked (9100).
 - **`MountOptions.locale`** — BCP-47, mapped per PSP (Paysafe underscore form).
 - **Slot convention for split-field PSPs:** `data-payfanout-field="cardNumber|
   expiryDate|cvv"` elements inside the container become the mount points — the host

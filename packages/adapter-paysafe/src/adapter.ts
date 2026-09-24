@@ -18,10 +18,16 @@ import {
  * Structural subset of Paysafe.js (hosted iframe fields). Injected in tests,
  * loaded from hosted.paysafe.com in browsers. The field-event surface is
  * optional — SDK builds without it simply never fire onChange (degrade, not
- * break).
+ * break) — and so is show(): an instance without it is used as set up.
  */
 export interface PaysafeFieldsInstanceLike {
   tokenize(options: Record<string, unknown>): Promise<{ token: string }>;
+  /**
+   * Loads the configured payment methods into their containers. Resolves with
+   * one entry per method, carrying `error` when that method failed to
+   * initialize; rejects only when none initialized.
+   */
+  show?(): Promise<Record<string, { error?: unknown } | undefined>>;
   /** True once every hosted field holds valid input. */
   areAllFieldsValid?(): boolean;
   /** Per-field validity event registration ("cardNumber" | "expiryDate" | "cvv"). */
@@ -356,6 +362,7 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
       selector: `#${selectors[name]}`, // non-negotiable: the mount point is ours
     });
 
+    const accountId = session.merchantAccountId ? toPaysafeAccountId(session.merchantAccountId) : undefined;
     try {
       const instance = await this.paysafeGlobal()!.fields.setup(this.config.apiKey, {
         // Paysafe locales use underscores ("fr_CA"); accept BCP-47 from hosts.
@@ -366,7 +373,11 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
         // Required by Paysafe.js — omitting it fails setup with error 9055
         // "Invalid currency parameter".
         currencyCode: session.currency,
-        ...(session.merchantAccountId ? { accountId: toPaysafeAccountId(session.merchantAccountId) } : {}),
+        // Without it, a key holding more than one account for the currency
+        // fails setup (9073). Setup takes only a number (9061 otherwise), so
+        // an id that cannot be one is left to tokenize's accountId, which
+        // rejects it as the configuration error it is.
+        ...(typeof accountId === "number" ? { accounts: { default: accountId } } : {}),
         fields: {
           cardNumber: fieldConfig("cardNumber", { placeholder: "Card number" }),
           expiryDate: fieldConfig("expiryDate", { placeholder: "MM/YY" }),
@@ -374,6 +385,14 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
         },
         ...(toPaysafeStyle(options.appearance) ?? {}),
       });
+      // Paysafe documents show() as the call that follows setup. The SDK makes
+      // it inside setup only when a single payment method is configured, and
+      // answers later calls from that first result, so calling it always is
+      // safe; skipping it leaves any other setup locked (9100), tokenize and
+      // the field events included.
+      const methods = await instance.show?.();
+      const cardError = methods?.["card"]?.error;
+      if (cardError) throw cardError;
       options.onReady?.();
       registerFieldStateEvents(instance, options);
       const handle: PaysafeCardHandle = {
@@ -565,7 +584,7 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
         amount: h.session.amount,
         currencyCode: h.session.currency,
         ...(h.session.merchantAccountId ? { accountId: toPaysafeAccountId(h.session.merchantAccountId) } : {}),
-        ...(h.session.id ? { merchantRefNum: h.session.id } : {}),
+        merchantRefNum: newMerchantRefNum(h.session.id),
         ...(this.config.threeDs ? { threeDs: this.config.threeDs } : {}),
       });
       if (!token) {
@@ -775,17 +794,47 @@ function toPaysafeStyle(appearance: Record<string, unknown> | undefined): { styl
 }
 
 /**
- * Paysafe.js validates `accountId` as a NUMBER — the string form produced by a
- * `merchantAccountResolver` (typed `=> string | undefined`) fails setup/tokenize with error
- * 9003 ("Invalid accountId parameter") before any card data is evaluated, even
- * though the Paysafe REST API accepts both. Coerce a digit-only id to its
- * numeric form; leave anything non-numeric, or too large to represent exactly
- * (a silently rounded id could route to the wrong merchant account), untouched.
+ * Paysafe.js validates account ids as NUMBERS — the string form produced by a
+ * `merchantAccountResolver` (typed `=> string | undefined`) fails tokenize's
+ * `accountId` with error 9003 ("Invalid accountId parameter") and setup's
+ * `accounts.default` with 9061 before any card data is evaluated, even though
+ * the Paysafe REST API accepts both. Coerce a digit-only id to its numeric
+ * form; leave anything non-numeric, or too large to represent exactly (a
+ * silently rounded id could route to the wrong merchant account), untouched.
  */
 function toPaysafeAccountId(id: string): string | number {
   if (!/^\d+$/.test(id)) return id;
   const numeric = Number(id);
   return Number.isSafeInteger(numeric) ? numeric : id;
+}
+
+/** Paysafe.js rejects a longer merchantRefNum (9003, options.merchantRefNum). */
+const MERCHANT_REF_NUM_MAX_LENGTH = 255;
+
+/** Paysafe's global invalid characters, rejected in any parameter of a Payments API request. */
+const PAYSAFE_INVALID_CHARACTERS = /[";^*<[\]\\]/g;
+
+/**
+ * Paysafe.js requires a merchantRefNum on every tokenize and Paysafe wants it
+ * unique per transaction, so each attempt gets a fresh one: a card retried
+ * after a decline is a new transaction. The host's session id, when there is
+ * one, leads as a readable prefix, cut to keep the whole within the limit.
+ */
+function newMerchantRefNum(sessionId: string | undefined): string {
+  const unique = randomReference();
+  let prefix = (sessionId ?? "")
+    .replace(PAYSAFE_INVALID_CHARACTERS, "")
+    .slice(0, MERCHANT_REF_NUM_MAX_LENGTH - unique.length - 1);
+  // Never end on the first half of a surrogate pair.
+  if (/[\uD800-\uDBFF]$/.test(prefix)) prefix = prefix.slice(0, -1);
+  return prefix ? `${prefix}-${unique}` : unique;
+}
+
+/** randomUUID exists only in secure contexts; getRandomValues in every page. */
+function randomReference(): string {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function asPaysafeHandle(handle: MountedFieldsHandle): PaysafeHandle {

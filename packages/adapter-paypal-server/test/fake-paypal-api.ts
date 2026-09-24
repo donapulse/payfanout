@@ -5,6 +5,16 @@
  * INSTRUMENT_DECLINED / ORDER_ALREADY_CAPTURED 422s, refund guards, and the
  * verify-webhook-signature postback that only accepts byte-identical raw
  * event bodies.
+ *
+ * Authorization captures follow the Payments v2 capture request: no amount
+ * means the FULL authorized amount (never the remainder), a final_capture
+ * closes the authorization (AUTHORIZATION_ALREADY_CAPTURED afterwards), a
+ * capture in another currency than the authorization's answers
+ * AUTH_CAPTURE_CURRENCY_MISMATCH, and captures summing past the authorized
+ * amount answer MAX_CAPTURE_AMOUNT_EXCEEDED. PayPal's overage limit lets
+ * captures go past the authorized amount, by default up to 115% of it or
+ * USD 75 more, whichever is less; PSD2 countries allow none, and the fake
+ * keeps that no-overage rule, so no test can lean on an overage.
  */
 
 interface FakeMoney {
@@ -126,7 +136,10 @@ const BASE = "https://api-m.sandbox.paypal.com";
 export class FakePayPalApi {
   private readonly orders = new Map<string, FakeOrder>();
   private readonly captures = new Map<string, { capture: FakeCapture; orderId: string }>();
-  private readonly authorizations = new Map<string, { auth: FakeAuthorization; orderId: string; captured: number }>();
+  private readonly authorizations = new Map<
+    string,
+    { auth: FakeAuthorization; orderId: string; captured: number; closed: boolean }
+  >();
   private readonly refunds = new Map<string, FakeRefund>();
   private readonly subscriptions = new Map<string, FakeSubscription>();
   private readonly replays = new Map<string, { status: number; body: string }>();
@@ -144,6 +157,7 @@ export class FakePayPalApi {
   tokenTtlSeconds: number;
 
   uniqueOrderCreations = 0;
+  uniqueCaptureCreations = 0;
   uniqueRefundCreations = 0;
   uniqueSubscriptionCancels = 0;
   tokenMints = 0;
@@ -468,7 +482,9 @@ export class FakePayPalApi {
       );
     }
     const unit = order.purchase_units[0]!;
-    const capture = this.newCapture(order, unit.amount, order.pendingCapture ? "PENDING" : "COMPLETED", unit.custom_id);
+    const capture = this.newCapture(order, unit.amount, order.pendingCapture ? "PENDING" : "COMPLETED", unit.custom_id, {
+      finalCapture: true,
+    });
     unit.payments = { ...(unit.payments ?? {}), captures: [...(unit.payments?.captures ?? []), capture] };
     order.status = "COMPLETED";
     return remember(201, publicOrder(order));
@@ -493,7 +509,7 @@ export class FakePayPalApi {
     };
     unit.payments = { ...(unit.payments ?? {}), authorizations: [auth] };
     order.status = "COMPLETED";
-    this.authorizations.set(auth.id, { auth, orderId: order.id, captured: 0 });
+    this.authorizations.set(auth.id, { auth, orderId: order.id, captured: 0, closed: false });
     return remember(201, publicOrder(order));
   }
 
@@ -505,20 +521,41 @@ export class FakePayPalApi {
     const entry = this.authorizations.get(authId);
     if (!entry) return notFound();
     if (entry.auth.status === "VOIDED") {
-      return json(422, unprocessable("AUTHORIZATION_VOIDED", "A voided authorization cannot be captured."));
+      return json(422, unprocessable("AUTHORIZATION_VOIDED", "A voided authorization cannot be captured or reauthorized."));
+    }
+    if (entry.closed) {
+      return json(422, unprocessable("AUTHORIZATION_ALREADY_CAPTURED", "Authorization has already been captured."));
     }
     const order = this.orders.get(entry.orderId)!;
     const unit = order.purchase_units[0]!;
     const authorized = decimalToCents(entry.auth.amount.value);
     const requestedMoney = body?.["amount"] as FakeMoney | undefined;
-    const requested = requestedMoney ? decimalToCents(requestedMoney.value) : authorized - entry.captured;
-    if (entry.captured + requested > authorized) {
-      return json(422, unprocessable("MAX_CAPTURE_AMOUNT_EXCEEDED", "Capture amount specified exceeded allowable limit."));
+    if (requestedMoney && requestedMoney.currency_code !== entry.auth.amount.currency_code) {
+      return json(
+        422,
+        unprocessable("AUTH_CAPTURE_CURRENCY_MISMATCH", "Currency of capture must be the same as currency of authorization."),
+      );
     }
+    // "If amount is not specified, the full authorized amount is captured."
+    const requested = requestedMoney ? decimalToCents(requestedMoney.value) : authorized;
+    if (entry.captured + requested > authorized) {
+      return json(
+        422,
+        unprocessable(
+          "MAX_CAPTURE_AMOUNT_EXCEEDED",
+          "Capture amount specified exceeded allowable limit. You can only capture up to the original authorization amount.",
+        ),
+      );
+    }
+    const finalCapture = body?.["final_capture"] === true;
     const amount: FakeMoney = requestedMoney ?? { ...entry.auth.amount };
-    const capture = this.newCapture(order, amount, "COMPLETED", unit.custom_id, authId);
+    const capture = this.newCapture(order, amount, order.pendingCapture ? "PENDING" : "COMPLETED", unit.custom_id, {
+      authorizationId: authId,
+      finalCapture,
+    });
     entry.captured += requested;
-    entry.auth.status = entry.captured >= authorized ? "CAPTURED" : "PARTIALLY_CAPTURED";
+    entry.closed = finalCapture;
+    entry.auth.status = finalCapture || entry.captured >= authorized ? "CAPTURED" : "PARTIALLY_CAPTURED";
     unit.payments = { ...(unit.payments ?? {}), captures: [...(unit.payments?.captures ?? []), capture] };
     return remember(201, capture);
   }
@@ -709,14 +746,15 @@ export class FakePayPalApi {
     amount: FakeMoney,
     status: string,
     customId: string | undefined,
-    authorizationId?: string,
+    options: { authorizationId?: string; finalCapture: boolean },
   ): FakeCapture {
     const captureId = `2GG279541U${String(++this.seq).padStart(6, "0")}P`;
+    const { authorizationId, finalCapture } = options;
     const capture: FakeCapture = {
       id: captureId,
       status,
       amount: { ...amount },
-      final_capture: authorizationId === undefined,
+      final_capture: finalCapture,
       ...(customId !== undefined ? { custom_id: customId } : {}),
       seller_protection: { status: "ELIGIBLE", dispute_categories: ["ITEM_NOT_RECEIVED", "UNAUTHORIZED_TRANSACTION"] },
       supplementary_data: {
@@ -727,10 +765,14 @@ export class FakePayPalApi {
       links: [
         { href: `${BASE}/v2/payments/captures/${captureId}`, rel: "self", method: "GET" },
         { href: `${BASE}/v2/payments/captures/${captureId}/refund`, rel: "refund", method: "POST" },
-        { href: `${BASE}/v2/checkout/orders/${order.id}`, rel: "up", method: "GET" },
+        // An authorization's capture points up to the authorization, an order capture to the order.
+        authorizationId
+          ? { href: `${BASE}/v2/payments/authorizations/${authorizationId}`, rel: "up", method: "GET" }
+          : { href: `${BASE}/v2/checkout/orders/${order.id}`, rel: "up", method: "GET" },
       ],
     };
     this.captures.set(capture.id, { capture, orderId: order.id });
+    this.uniqueCaptureCreations++;
     return capture;
   }
 

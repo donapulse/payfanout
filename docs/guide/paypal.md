@@ -181,9 +181,26 @@ const complete = createCompletionHandler({
 Under the hood it calls `completePayment` (which **captures**). The adapter rejects a
 `clientToken` that names a different order than the session (tamper guard), and branches on
 the order's intent: `CAPTURE` orders capture, `AUTHORIZE` orders authorize and return
-`requires_capture` for a later `capturePayment` (partial and multiple captures supported).
+`requires_capture` for a later `capturePayment` (partial and multiple captures supported,
+see [Manual capture](#manual-capture-partial-captures-and-the-rest) below).
 Prefer a hand-written route? Call `completePayment` directly — see
 [Server usage](/guide/server#server-completion-tokenize-first).
+
+### Completing an order twice
+
+A second `completePayment` for an order that is already captured or authorized (a double
+click, or a retry under a fresh idempotency key) meets PayPal's `ORDER_ALREADY_CAPTURED` or
+`ORDER_ALREADY_AUTHORIZED`. For the first, PayPal's guidance is to read the order to get the
+capture; for the second, it says the funds are authorized and ready to capture. Either way
+the adapter re-reads the order and returns the existing capture or authorization; no money
+moves twice. It does so only when the order read back is the session's own order and
+`COMPLETED` with that capture or authorization; otherwise the `invalid_request` stands. A
+re-read that fails surfaces its own error instead, so an outage reaches you as a retryable
+`psp_unavailable`.
+
+A repeated completion succeeds under any key, so `onCompleted` can run more than once for
+one payment; hosts should make it idempotent on `info.pspPaymentId` and check `info.id` and
+`info.amount` against their own record.
 
 ### Declines: `INSTRUMENT_DECLINED` recovery
 
@@ -198,17 +215,63 @@ completion route again with the same order. No new session needed.
 Once captured, `PaymentInfo.pspPaymentId` is the **capture id** (PayPal's "transaction
 ID"), not the order id — persist it. PayPal's order GET stops answering a few days after
 completion, while the capture id stays valid for refunds for 180 days.
-`retrievePayment` accepts either id (it falls back from order to capture automatically).
+`retrievePayment`, `capturePayment`, and `cancelPayment` accept either id: a capture id
+resolves to its order through the capture's `supplementary_data.related_ids.order_id`.
+After further captures `pspPaymentId` stays the first capture's id, so the id you stored
+keeps working for the next capture and for reads.
 Multi-capture payments are refunded **per capture id**: once an order carries more than
 one capture, `refundPayment` rejects the order id and requires the specific capture id.
+
+### Manual capture: partial captures and the rest
+
+`capturePayment(id, amount, key)` captures `amount` and keeps the authorization open for
+another capture while money is left; each partial capture needs its own idempotency key.
+PayPal requires partial capture of PayPal authorizations to be enabled on your PayPal
+account. Without an amount it captures **the rest**. PayPal reads a capture without an
+amount as the *full authorized amount*, so the adapter sends the uncaptured remainder
+explicitly: the authorized amount minus every capture that took money, completed or
+pending (declined and failed captures took nothing).
+
+The capture that takes the rest, with or without an explicit amount, goes out with
+`final_capture: true`, which closes the authorization: PayPal refuses any further capture
+against it (`AUTHORIZATION_ALREADY_CAPTURED`). Once earlier captures took the whole
+authorization (PayPal reports it `CAPTURED`, a capture that took money went out as the
+final one, or those captures cover the authorized amount), capturing the rest sends no
+capture and answers with the payment, under the same key or a new one. A retry you issue
+yourself of a capture of the rest whose response was lost therefore gets the payment back
+rather than an error. An authorization voided or denied before captures took it all
+(PayPal reports an expired authorization as voided) has nothing left to take: capturing the
+rest rejects with `invalid_request` before any capture call.
+
+PayPal lets captures exceed the authorized amount up to the account's overage limit (by
+default up to 115% of the authorized amount or USD 75 more, whichever is less; PSD2
+countries allow none). The adapter passes an explicit amount through for PayPal to judge
+and never adds an overage itself. Authorizations last 29 days, and captures succeed best
+within the first three days. A remainder you will not capture is left to expire;
+`cancelPayment` voids only an authorization with no capture yet.
 
 ### `amountRefunded` caveat
 
 PayPal's capture object carries no cumulative refunded total. `retrievePayment` reports
-`amountRefunded` faithfully while the order GET (with its embedded refunds list) is alive,
-and from a bare capture only the fully-`REFUNDED` case; a partially refunded old capture
-reports `0`. Keep your own refund records — PayFanout's statelessness expects the host to
-own payment bookkeeping anyway, and every `refundPayment` result carries the amounts.
+`amountRefunded` from the order's embedded refunds list while the order GET is alive, and
+from a bare capture only the fully-`REFUNDED` case; a partially refunded old capture
+reports `0`. From the list it counts `COMPLETED` refunds and `PENDING` ones (that money is
+on its way back, so it is never offered for refund again) and leaves out `FAILED` and
+`CANCELLED` refunds, which returned nothing. Keep your own refund records — PayFanout's
+statelessness expects the host to own payment bookkeeping anyway, and every
+`refundPayment` result carries the amounts.
+
+`refundPayment` does not forward `reason`. PayPal's only reason field, `note_to_payer`, is
+text the payer reads in their transaction history and in PayPal's emails, and a code such
+as `requested_by_customer` is not a message for a customer.
+
+### Payment method details
+
+`paymentMethodDetails.wallet` is `"venmo"` for an order paid with Venmo
+(`payment_source.venmo`) and `"paypal"` otherwise; a guest card payment adds the card's
+`brand` and `last4`. A bare capture, read once its order has aged out, carries no payment
+source, so `paymentMethodDetails` is left out rather than naming a wallet it cannot
+confirm.
 
 ## 8. Register the webhook endpoint
 

@@ -417,8 +417,12 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * the authorized amount minus every capture that took money (PENDING ones
    * included, DECLINED/FAILED ones took none). A capture covering the
    * remainder is sent with final_capture: true, which closes the
-   * authorization; a smaller one keeps it open for the next capture. With
-   * nothing left, capturing the rest rejects before any capture call.
+   * authorization; a smaller one keeps it open for the next capture. Once
+   * earlier captures took the whole authorization, capturing the rest answers
+   * with the captured payment and calls nothing, so a same-key retry of the
+   * capture that took the rest, whose response was lost, still succeeds. An
+   * authorization voided or denied before captures took it all rejects before
+   * any capture call.
    */
   async capturePayment(
     pspPaymentId: string,
@@ -442,6 +446,9 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     let captureAmount = amount;
     if (captureAmount === undefined) {
       if (remainder === 0) {
+        // PayPal is not called, so no money moves; the answer matches what the
+        // capture that took the rest returned.
+        if (isFullyCaptured(authorization, held, currency)) return this.orderToPaymentInfo(order);
         throw PayFanoutError.invalidRequest(
           `Payment "${pspPaymentId}" has nothing left to capture (authorization ${authorization.id} is ${authorization.status ?? "in an unreported state"})`,
           order,
@@ -1185,6 +1192,21 @@ function capturableRemainder(
   const state = (authorization.status ?? "").toUpperCase();
   const open = state === "CREATED" || state === "PENDING" || state === "PARTIALLY_CAPTURED";
   return open ? Math.max(0, authorized - held) : 0;
+}
+
+/**
+ * Whether earlier captures took the whole authorization: PayPal closed it as
+ * CAPTURED, or the captures that took money cover its amount.
+ */
+function isFullyCaptured(
+  authorization: PayPalAuthorizationLike,
+  held: MinorUnitAmount,
+  fallbackCurrency: string,
+): boolean {
+  if (held === 0) return false;
+  if ((authorization.status ?? "").toUpperCase() === "CAPTURED") return true;
+  if (authorization.amount?.value === undefined) return false;
+  return held >= fromPayPalValue(authorization.amount.value, authorization.amount.currency_code ?? fallbackCurrency);
 }
 
 function sumPayPalAmounts(amounts: Array<PayPalMoney | undefined>, fallbackCurrency: string): number {

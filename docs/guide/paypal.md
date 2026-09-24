@@ -210,14 +210,13 @@ pending (declined and failed captures took nothing).
 
 The capture that takes the rest, with or without an explicit amount, goes out with
 `final_capture: true`, which closes the authorization: PayPal refuses any further capture
-against it (`AUTHORIZATION_ALREADY_CAPTURED`). With nothing left to take (fully captured,
-voided, or denied; PayPal reports an expired authorization as voided), capturing the rest
-rejects with `invalid_request` before any capture call. That includes a retry you issue
-yourself, under the same key, of a capture of the rest whose response was lost: the adapter
-reads the payment before capturing, so if the first attempt landed the retry answers
-`invalid_request`. Check `amountCaptured` with `retrievePayment` before treating it as a
-failure. The adapter's own transport retries resend the original request and are not
-affected.
+against it (`AUTHORIZATION_ALREADY_CAPTURED`). Once earlier captures took the whole
+authorization, capturing the rest answers with the captured payment and calls nothing, so
+a retry you issue yourself, under the same key, of a capture of the rest whose response
+was lost gets the payment back rather than an error. An authorization voided or denied
+before captures took it all (PayPal reports an expired authorization as voided) has
+nothing left to take: capturing the rest rejects with `invalid_request` before any capture
+call.
 
 PayPal lets captures exceed the authorized amount up to the account's overage limit (by
 default 115% of the order amount; local regulation, such as in PSD2 countries, allows no

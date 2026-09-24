@@ -256,20 +256,26 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
     });
   });
 
-  it("capturing the rest with nothing left rejects before any capture call", async () => {
+  it("capturing the rest once captures took it all answers with the payment, without a capture call", async () => {
     const { adapter, fake, orderId } = await authorizedPayment();
     const all = await adapter.capturePayment(orderId, undefined, "k-cap-all");
     expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "20.00" }, final_capture: true });
     expect(all.amountCaptured).toBe(2000);
 
+    // The same-key retry a host sends when that capture's response was lost.
     const before = fake.requestCount;
-    await expect(adapter.capturePayment(orderId, undefined, "k-cap-more")).rejects.toMatchObject({
-      code: "invalid_request",
-      retryable: false,
-      message: expect.stringMatching(/nothing left to capture/),
-    });
+    const retried = await adapter.capturePayment(orderId, undefined, "k-cap-all");
+    expect(retried).toEqual(all);
     expect(fake.requestCount - before).toBe(1); // the order read only
     expect(fake.uniqueCaptureCreations).toBe(1);
+
+    // After a partial capture, the rest and then another capture of the rest.
+    const partial = await authorizedPayment(makePair());
+    await partial.adapter.capturePayment(partial.orderId, 700, "k-part");
+    const rest = await partial.adapter.capturePayment(partial.orderId, undefined, "k-rest");
+    expect(rest.amountCaptured).toBe(2000);
+    await expect(partial.adapter.capturePayment(partial.orderId, undefined, "k-rest")).resolves.toEqual(rest);
+    expect(partial.fake.uniqueCaptureCreations).toBe(2);
 
     // A voided authorization — also how PayPal reports an expired one — has nothing left either.
     const voided = await authorizedPayment(makePair());

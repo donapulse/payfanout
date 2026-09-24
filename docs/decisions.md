@@ -1589,12 +1589,83 @@ sandbox round-trip before production use, and the setup guide carries that warni
   notes, and requiring Checkout API v69 or later, which the pinned v72 satisfies); pinning
   the 6.0.0 that opened the major would ship a checkout a year of fixes behind. The adapter
   owns `showPayButton: false` and `onChange`, forwards everything else. 3-D Secure resolves
-  inline through an adapter-specific `handleAction(handle, action)` whose result is a second
-  clientToken (`{ details, paymentData }`) that `completePayment` sends to `/payments/details`
-  — the unified contract has no action step because most PSPs resolve challenges inside
-  `confirm()`. One challenge at a time per handle: a re-entrant `handleAction` is refused
-  with `invalid_request` instead of replacing the pending resolver, which would leave the
-  first caller's promise unsettled forever.
+  through an adapter-specific `handleAction(handle, action)` — inline when Adyen runs it
+  natively, by a redirect to Adyen otherwise — whose inline result is a second clientToken
+  (Adyen Web's `onAdditionalDetails` data, `{ details: { threeDSResult } }`) that
+  `completePayment` sends to `/payments/details` — the unified contract has no action step
+  because most PSPs resolve challenges inside `confirm()`. One challenge at a time per handle:
+  a re-entrant `handleAction` is refused with `invalid_request` instead of replacing the
+  pending resolver, which would leave the first caller's promise unsettled forever.
+  - **3-D Secure 2 completion (2026-09-23)**, doc-verified against Adyen's Checkout v72
+    OpenAPI spec, the native and redirect 3-D Secure guides, the 3-D Secure API reference
+    and the Adyen Web 6.41.0 source; still no sandbox pass. `confirm()` resolves
+    `{ paymentMethod, browserInfo?, origin?, billingAddress?, riskData? }` from Adyen Web's
+    state. The server reads only those keys. It rebuilds `paymentMethod` from the
+    CardDetails fields Adyen Web 6.41.0's Card emits (`type`, the `encrypted…` values
+    including the Korean-card `encryptedPassword`, `holderName`, `brand`, `fundingSource`,
+    `fastlaneData`, `checkoutAttemptId`, `sdkData`; the native guide lists the Card's
+    complete paymentMethod, `sdkData` included, as required), leaving out the Card's
+    stored-card and Click to Pay values, since the adapter supports neither flow, and
+    `taxNumber`, which the v72 CardDetails schema (`additionalProperties: false`) does not
+    define. It rebuilds `browserInfo` from its documented fields; forwards `billingAddress`
+    only when complete and within the v72 limits (city, country, houseNumberOrName,
+    postalCode and street required; postalCode at most 10 characters and five digits in the
+    US, stateOrProvince at most 3 and required for the US and Canada, the others at most
+    3000); Adyen Web fills the fields a country does not use with "N/A", though its partial
+    address mode can still produce an address the adapter drops; keeps
+    `riskData.clientData` alone (riskData's other fields are merchant risk settings, not
+    browser data); refuses a non-`"scheme"` `paymentMethod` or unencrypted card fields
+    without echoing the token; and still completes the bare `paymentMethod` of earlier
+    clients. With `browserInfo` and a bare origin the payment requests native 3-D Secure 2
+    (`channel: "Web"`, `origin`, `nativeThreeDS: "preferred"`). An origin that is not the
+    page's bare origin of at most 80 characters is dropped rather than refused, and with it
+    `channel` and `nativeThreeDS`: Adyen documents that a wrong origin keeps the 3-D Secure 2
+    action from being handled, a page can report one in normal use (`"null"` in a sandboxed
+    frame, a hostname beyond 80 characters), and no money fact depends on it. That such a
+    payment then takes Adyen's redirect flow is an inference, listed below. An action
+    answered without a pspReference — Adyen's own 3-D Secure 2 web example — reads
+    `requires_action` with `pspPaymentId: ""`; the v72 redirect example answers its action
+    with one (`JLCMPCQ8HXSKGK82`), and the composite is then built from the session's own
+    `/payments` answer. `decodeAdyenPaymentRef` refuses an empty or whitespace-only
+    reference, so capture, cancel and refund send nothing for it. Details finish whichever
+    payment they were issued for, so a `/payments/details` answer whose `merchantReference`
+    or `amount` differs from the signed context is refused as a non-retryable
+    `invalid_request` (the details finished a different payment, and a retry gets the same
+    answer); one that does not name both reads `processing` with no `pspPaymentId`, and the
+    AUTHORISATION webhook, whose `merchantReference` is a signed value, supplies the
+    reference — Adyen's example details answer names neither. A `/payments` answer naming
+    another `merchantReference` or `amount` is refused the same way, before any refusal in it
+    is mapped: the request named the session's own, so the answer belongs to another request
+    (an `idempotencyKey` reused across sessions replays the first answer).
+    `returnUrl`/`defaultReturnUrl` are checked where they enter (absolute with a scheme, no
+    whitespace, at most 1024 characters once serialized, no `//` after the domain) and sent
+    WHATWG-serialized, since Adyen asks for non-ASCII characters to be URL-encoded.
+    `shopperEmail` falls back to `billingDetails.email`, which is left out rather than
+    refused when it is not a plausible address of at most 256 characters (a dotless domain
+    such as `jane@localhost` is valid RFC 5322); an invalid `receiptEmail` is still refused.
+    No `shopperIP` is sent: core's inputs carry none. The client shows and requires the
+    cardholder name (`hasHolderName: false` alone hides it, since Adyen Web 6.41.0's Card
+    turns `holderNameRequired` off without it), makes Enter a no-op (Adyen Web's default
+    calls `submit()` without an `onSubmit`), and settles a pending `handleAction` as failed
+    on unmount and on `onError` (Adyen Web 6.41.0's 3-D Secure 2 elements report timeouts
+    through `onAdditionalDetails` and call `onError` only when they stop), with
+    `authentication_required` unless the error reads as a load or network failure. It
+    refuses `confirm()` once `handleAction` replaced the Card, and exports
+    `adyenRedirectResultToken` for the redirect return page.
+    - **Sandbox checks outstanding (AMBIGUOUS in the docs, 2026-09-24):** (1) `shopperIP`:
+      the v72 `/payments` reference requires it for Visa and JCB 3-D Secure 2 web payments
+      only "if you did not include the `shopperEmail`", while the 3-D Secure API reference
+      ("required for Visa and JCB transactions for all web and mobile integrations") and the
+      native and redirect guides ("required for Visa and JCB transactions on the web") give
+      no such exemption. The adapter cannot send one, so run a Visa and a JCB 3-D Secure 2
+      web payment with `shopperEmail` and without `shopperIP`. (2) The redirect fallback:
+      that a payment without `origin`, `channel` and `nativeThreeDS` gets Adyen's redirect
+      action rather than a refusal is not documented, and the redirect guide marks `channel`
+      and `origin` as required too. (3) Whether real `/payments/details` answers name
+      `merchantReference` and `amount` (the example does not), which decides whether a
+      completion reads its result or `processing` until the webhook. (4) Which `/payments`
+      action answers carry a `pspReference` (the native example has none, the redirect
+      example has one).
 
 ## Production audit scope: peer dependencies (2026-08-17)
 

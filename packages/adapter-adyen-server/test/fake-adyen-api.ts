@@ -11,9 +11,19 @@
  *     this fake, whichever merchant account it books against
  *   - POST /payments requiring every field Adyen marks required (`merchantAccount`,
  *     `reference`, `amount`, `paymentMethod` and `returnUrl`), returning
- *     `pspReference` + `resultCode`, with an `action` for a 3-D Secure challenge
- *     and a refusal carrying `refusalReasonCode`
- *   - POST /payments/details finishing an action
+ *     `pspReference` + `resultCode`, a refusal carrying `refusalReasonCode`, or a
+ *     3-D Secure action: a threeDS2 action when the request asks for native
+ *     3-D Secure 2, a redirect action otherwise (the fake's model of a request
+ *     without those fields; Adyen does not document it). Adyen can answer an
+ *     action without a pspReference, as its native 3-D Secure 2 example does,
+ *     or with one, as its redirect example does: `actionsCarryPspReference`
+ *     switches to the second
+ *   - POST /payments/details finishing the payment the details were issued for
+ *     and answering with that payment's pspReference and resultCode, without
+ *     merchantReference and amount as in Adyen's example answer;
+ *     `detailsCarryPaymentFacts` adds both. The request names no payment
+ *     (Adyen's PaymentDetailsRequest has no reference or merchant account
+ *     field), so details from another payment finish that other payment
  *   - captures / cancels / refunds answering `{ status: "received" }` ONLY, each
  *     with its own pspReference, captures and refunds echoing the amount sent —
  *     for ANY payment reference and whatever the payment's state. Adyen's
@@ -48,13 +58,37 @@ export interface StoredPayment {
 /**
  * The fake's own decline trigger. Adyen's sandbox drives refusals from
  * `paymentMethod.holderName` values and `additionalData.RequestedTestAcquirerResponseCode`
- * on its testing page; the adapter forwards the paymentMethod blob untouched, so
- * a holder name of `REFUSED` (optionally `REFUSED:<refusalReasonCode>`) is all
- * this fake needs to exercise the mapping.
+ * on its testing page; the adapter forwards `holderName`, one of the card
+ * fields Adyen Web's Card produces, so a holder name of `REFUSED` (optionally
+ * `REFUSED:<refusalReasonCode>`) is all this fake needs to exercise the mapping.
  */
 const REFUSAL_TRIGGER = /^REFUSED(?::(\d+))?$/;
-/** Holder name that makes the fake answer with a 3-D Secure action instead of a result. */
+/**
+ * Holder name that makes the fake answer with a 3-D Secure action instead of a
+ * result: IdentifyShopper with a threeDS2 action when the request carries what
+ * Adyen's native 3-D Secure 2 guide lists for the web (`nativeThreeDS:
+ * "preferred"`, `browserInfo`, `origin`, `channel: "Web"`), RedirectShopper with
+ * a redirect action otherwise — the fake's model, not documented behaviour.
+ */
 const CHALLENGE_TRIGGER = "CHALLENGE";
+
+/** A payment waiting on the shopper to finish a 3-D Secure action. */
+interface PendingPayment {
+  id: string;
+  /** Assigned with the payment; the answer that finishes it carries the same one. */
+  pspReference: string;
+  value: number;
+  currency: string;
+  reference: string;
+  manualCapture: boolean;
+  /** ChallengeShopper answers still to give before the result. */
+  challengesLeft: number;
+  /** Advances with each action, so every step's details differ. */
+  step: number;
+}
+
+/** The id of a pending payment, as the fake encodes it into actions and the details that finish them. */
+const PENDING_REF = /(3ds-\d+-\d+)$/;
 
 /** The `merchantRefundReason` values the Checkout API accepts on a refund. */
 const MERCHANT_REFUND_REASONS = ["FRAUD", "CUSTOMER REQUEST", "RETURN", "DUPLICATE", "OTHER"];
@@ -77,8 +111,10 @@ export interface RecordedRequest {
 
 export class FakeAdyenApi {
   private readonly payments = new Map<string, StoredPayment>();
+  private readonly pending = new Map<string, PendingPayment>();
   private readonly replayByKey = new Map<string, { status: number; body: unknown }>();
   private seq = 0;
+  private pendingSeq = 0;
   uniquePaymentCreations = 0;
   uniqueCaptureRequests = 0;
   uniqueCancelRequests = 0;
@@ -98,6 +134,14 @@ export class FakeAdyenApi {
   serverError = false;
   /** Answers this many 409s (transient) before serving the request. */
   transientConflicts = 0;
+  /** /payments/details answers also carry merchantReference and amount. */
+  detailsCarryPaymentFacts = false;
+  /** Action answers carry the payment's pspReference, as Adyen's redirect example does. */
+  actionsCarryPspReference = false;
+  /** Native 3-D Secure: /payments/details answers this many ChallengeShopper actions before the result. */
+  challengesAfterIdentify = 0;
+  /** /payments/details refuses the payment with this refusalReasonCode. */
+  refuseDetailsWith: string | undefined;
   /** Served first, one per request, in order. */
   scriptedResponses: ScriptedResponse[] = [];
 
@@ -163,6 +207,37 @@ export class FakeAdyenApi {
     return stored;
   }
 
+  /**
+   * Plants a payment waiting on a 3-D Secure action and returns that action —
+   * another payment's, for proving details are checked against the session.
+   */
+  seedChallengedPayment(
+    payment: Partial<Omit<StoredPayment, "pspReference">> = {},
+    flow: "native" | "redirect" = "native",
+  ): Record<string, unknown> {
+    const pending = this.addPending({
+      pspReference: this.nextReference(),
+      value: payment.value ?? 1000,
+      currency: payment.currency ?? "EUR",
+      reference: payment.reference ?? "seeded",
+      manualCapture: payment.manualCapture ?? false,
+      challengesLeft: flow === "native" ? this.challengesAfterIdentify : 0,
+    });
+    return (flow === "native" ? identifyShopper(pending) : redirectShopper(pending)).action;
+  }
+
+  /**
+   * What the browser holds once the shopper has finished an action this fake
+   * issued: the `threeDSResult` Adyen Web reports for a threeDS2 action, the
+   * `redirectResult` Adyen appends to the returnUrl for a redirect.
+   */
+  detailsFor(action: Record<string, unknown>): Record<string, string> {
+    const source = action["type"] === "redirect" ? action["url"] : action["token"];
+    const ref = typeof source === "string" ? PENDING_REF.exec(source)?.[1] : undefined;
+    if (!ref) throw new Error("not an action this fake issued");
+    return action["type"] === "redirect" ? { redirectResult: `redirectResult-${ref}` } : { threeDSResult: `threeDSResult-${ref}` };
+  }
+
   private route(path: string, method: string, body: Record<string, unknown>): { status: number; body: unknown } {
     if (method !== "POST") return notFound(`No route ${method} ${path}`);
     if (/\/payments$/.test(path)) return this.createPayment(body);
@@ -204,22 +279,19 @@ export class FakeAdyenApi {
         },
       };
     }
-    if (holderName === CHALLENGE_TRIGGER) {
-      return {
-        status: 200,
-        body: {
-          pspReference,
-          resultCode: "ChallengeShopper",
-          action: {
-            type: "threeDS2",
-            subtype: "challenge",
-            token: "challenge-token",
-            paymentData: `paymentData-${pspReference}`,
-          },
-        },
-      };
-    }
     const manualCapture = ((body["additionalData"] ?? {}) as Record<string, string>)["manualCapture"] === "true";
+    if (holderName === CHALLENGE_TRIGGER) {
+      const native = requestsNativeThreeDS(body);
+      const pending = this.addPending({
+        pspReference,
+        value: amount.value,
+        currency: String(amount.currency),
+        reference: String(body["reference"]),
+        manualCapture,
+        challengesLeft: native ? this.challengesAfterIdentify : 0,
+      });
+      return { status: 200, body: this.actionAnswer(pending, native ? identifyShopper(pending) : redirectShopper(pending)) };
+    }
     this.payments.set(pspReference, {
       pspReference,
       value: amount.value,
@@ -240,18 +312,52 @@ export class FakeAdyenApi {
   }
 
   private submitDetails(body: Record<string, unknown>): { status: number; body: unknown } {
-    if (!body["details"]) return validationError("Required field 'details' is not provided.");
-    const pspReference = this.nextReference();
-    // A finished action answers with the authorisation's own pspReference.
+    const details = body["details"];
+    if (!details || typeof details !== "object") return validationError("Required field 'details' is not provided.");
+    const { threeDSResult, redirectResult } = details as Record<string, unknown>;
+    const submitted = typeof threeDSResult === "string" ? threeDSResult : redirectResult;
+    const ref = typeof submitted === "string" ? PENDING_REF.exec(submitted)?.[1] : undefined;
+    const pending = ref ? this.pending.get(ref.slice(0, ref.lastIndexOf("-"))) : undefined;
+    if (!pending || ref !== `${pending.id}-${pending.step}`) {
+      return validationError("The payment details do not match a payment awaiting them.");
+    }
+    const facts = this.detailsCarryPaymentFacts
+      ? { merchantReference: pending.reference, amount: { value: pending.value, currency: pending.currency } }
+      : {};
+    if (pending.challengesLeft > 0) {
+      pending.challengesLeft--;
+      pending.step++;
+      return { status: 200, body: { ...this.actionAnswer(pending, challengeShopper(pending)), ...facts } };
+    }
+    this.pending.delete(pending.id);
+    // The finished action answers with the payment's own pspReference.
+    const { pspReference } = pending;
+    if (this.refuseDetailsWith !== undefined) {
+      return {
+        status: 200,
+        body: { pspReference, resultCode: "Refused", refusalReason: "Refused", refusalReasonCode: this.refuseDetailsWith, ...facts },
+      };
+    }
     this.payments.set(pspReference, {
       pspReference,
-      value: 0,
-      currency: "EUR",
-      reference: "details",
-      manualCapture: false,
+      value: pending.value,
+      currency: pending.currency,
+      reference: pending.reference,
+      manualCapture: pending.manualCapture,
     });
     this.uniquePaymentCreations++;
-    return { status: 200, body: { pspReference, resultCode: "Authorised" } };
+    return { status: 200, body: { pspReference, resultCode: "Authorised", ...facts } };
+  }
+
+  private addPending(payment: Omit<PendingPayment, "id" | "step">): PendingPayment {
+    const pending: PendingPayment = { ...payment, id: `3ds-${++this.pendingSeq}`, step: 0 };
+    this.pending.set(pending.id, pending);
+    return pending;
+  }
+
+  /** An action answer, with the payment's pspReference under actionsCarryPspReference. */
+  private actionAnswer(pending: PendingPayment, answer: ActionAnswer): Record<string, unknown> {
+    return this.actionsCarryPspReference ? { pspReference: pending.pspReference, ...answer } : { ...answer };
   }
 
   private modify(
@@ -293,6 +399,53 @@ export class FakeAdyenApi {
   private nextReference(): string {
     return `88361${String(++this.seq).padStart(11, "0")}`;
   }
+}
+
+/** The fields Adyen's native 3-D Secure 2 guide lists as required on the web. */
+function requestsNativeThreeDS(body: Record<string, unknown>): boolean {
+  const authenticationData = (body["authenticationData"] ?? {}) as { threeDSRequestData?: { nativeThreeDS?: unknown } };
+  return (
+    authenticationData.threeDSRequestData?.nativeThreeDS === "preferred" &&
+    typeof body["browserInfo"] === "object" &&
+    body["browserInfo"] !== null &&
+    typeof body["origin"] === "string" &&
+    body["channel"] === "Web"
+  );
+}
+
+type ActionAnswer = { resultCode: string; action: Record<string, unknown> };
+
+/** The action shapes of Adyen's own examples, without the pspReference actionAnswer may add. */
+function identifyShopper(pending: PendingPayment): ActionAnswer {
+  return { resultCode: "IdentifyShopper", action: threeDS2Action(pending, "fingerprint") };
+}
+
+function challengeShopper(pending: PendingPayment): ActionAnswer {
+  return { resultCode: "ChallengeShopper", action: threeDS2Action(pending, "challenge") };
+}
+
+function redirectShopper(pending: PendingPayment): ActionAnswer {
+  return {
+    resultCode: "RedirectShopper",
+    action: {
+      paymentMethodType: "scheme",
+      url: `https://checkoutshopper-test.adyen.com/checkoutshopper/threeDS/redirect?MD=${pending.id}-${pending.step}`,
+      method: "GET",
+      type: "redirect",
+    },
+  };
+}
+
+function threeDS2Action(pending: PendingPayment, subtype: "fingerprint" | "challenge"): Record<string, unknown> {
+  const ref = `${pending.id}-${pending.step}`;
+  return {
+    paymentData: `paymentData-${ref}`,
+    paymentMethodType: "scheme",
+    authorisationToken: `authorisationToken-${ref}`,
+    subtype,
+    token: `token-${ref}`,
+    type: "threeDS2",
+  };
 }
 
 function lowercase(headers: Record<string, string>): Record<string, string> {

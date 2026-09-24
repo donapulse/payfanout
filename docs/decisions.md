@@ -249,6 +249,11 @@ choices they forced:
   detectable locally). Local crypto (CRC32 + SHA256withRSA over the cert from
   `paypal-cert-url`) stays a documented optimization path, rejected for v1 because
   WebCrypto cannot import X.509 certs without hand-rolled ASN.1.
+- **Doc-verified 2026-09-24:** the verification postback accepts only a body that is
+  exactly one JSON object (PayPal's verify request types `webhook_event` as the event
+  object and requires it posted back exactly as received); anything else answers `false`
+  with no network call. `CHECKOUT.PAYMENT-APPROVAL.REVERSED` names the order as
+  `resource.order_id` (no `resource.id`), the pre-capture canonical id.
 - **Sandbox-verified 2026-07-07:** orders created with `payment_source.paypal`
   (always, for the experience_context) answer `PAYER_ACTION_REQUIRED` immediately —
   not `CREATED` — so a fresh session reports `requires_action`; PATCH still works in

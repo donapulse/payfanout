@@ -565,8 +565,9 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * Missed-webhook recovery over GET /v1/notifications/webhooks-events: the
    * same payload shapes webhooks deliver, normalized by the same mapper, so
    * dedupe by event.id — which real PayPal events always carry — works
-   * identically for delivered and fetched events. PayPal retains roughly
-   * 30 days.
+   * identically for delivered and fetched events. PayPal documents no
+   * retention period for the list; its events dashboard searches only the
+   * last 30 days.
    */
   async fetchEvents(input: FetchEventsInput = {}): Promise<FetchEventsResult> {
     let path: string;
@@ -693,9 +694,9 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
 
   /**
    * Postback verification: PayPal itself confirms the delivery headers +
-   * exact raw bytes. Missing headers, a missing webhookId, or an empty body
-   * answer false locally without a network call; transport trouble fails
-   * closed (false), never open.
+   * exact raw bytes. Missing headers, a missing webhookId, an empty body, or a
+   * body that is not exactly one JSON object answer false locally without a
+   * network call; transport trouble fails closed (false), never open.
    */
   async verifyWebhookSignature(rawBody: string, headers: Record<string, string>): Promise<boolean> {
     const body = buildWebhookVerificationBody(rawBody, headers, this.config.webhookId);

@@ -188,8 +188,9 @@ and `PaymentService` will hold you to:
   still verifies. Two verification patterns are shipped precedent: local HMAC over the raw
   bytes with constant-time comparison and timestamp tolerance (Stripe, Paysafe,
   GoCardless, PayZen — use core's `constantTimeEqual`), and **postback verification**
-  where the PSP's API confirms the signature (PayPal — splice the raw body into the
-  postback by string concatenation, fail closed on any transport trouble).
+  where the PSP's API confirms the signature (PayPal — require the raw body to be exactly
+  one JSON object, splice it into the postback by string concatenation, fail closed on
+  any transport trouble).
 - **`webhookSignatureScope` — declare what the signature actually covers.**
   `"raw-bytes"` (the default, and what most providers do) means the signature is computed over bytes as
   delivered — the whole body, or a string lifted out of an envelope as PayZen's

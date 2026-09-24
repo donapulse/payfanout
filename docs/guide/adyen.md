@@ -144,18 +144,41 @@ const payments = new PaymentService({ adapters: [adyen] });
 | `webhookBasicAuth` | ✅ | - | `{ username, password }` as configured on the webhook. See §8. |
 | `sessionTtlSeconds` | - | `3600` | How long a signed session stays completable (1h). Enforced at completion. |
 | `requestTimeoutMs` | - | `30000` | Abort a hung Adyen connection; surfaces as a retryable `psp_unavailable`. |
-| `maxNetworkRetries` | - | `2` | Retries transport trouble (network/timeout/5xx/429) only, never business errors like refusals. |
+| `maxNetworkRetries` | - | `2` | Retries, under the same idempotency key: network failures, timeouts, HTTP 408 and 429, `errorCode` 704 and 705, 5xx errors other than 501 not typed `validation`/`configuration`/`security`, a 2xx that is not a JSON object, and any error Adyen sends with `transient-error: true` (in any letter case). The 5xx retry needs no `transient-error` header, deliberately: Adyen does not store a request an internal error stopped, and the retry carries the same key. Never a refusal or any other rejection. |
 
 ::: tip Every call is idempotent
-Each request carries an `idempotency-key` derived deterministically from your
-`idempotencyKey` **and the endpoint being called** (Adyen
-[caps the header at 64 characters](https://docs.adyen.com/development-resources/api-idempotency),
-so it travels as a SHA-256 digest). The endpoint is part of it because Adyen stores keys at
-company-account level, not per endpoint: reusing one key across `/payments` and
-`/payments/details` — which the 3-D Secure flow in §6 does — would otherwise replay the
-first answer instead of finishing the payment. Replaying the *same* call with the same key
-still deduplicates at Adyen. A duplicate racing the still in-flight original (Adyen
-`errorCode` 704) is retried automatically; a refusal never is.
+Each request carries an `idempotency-key` that is a SHA-256 digest, because Adyen
+[caps the header at 64 characters](https://docs.adyen.com/development-resources/api-idempotency)
+and checks keys for uniqueness across your whole **company account**. On `/payments` it covers
+your `idempotencyKey`, the merchant account and the endpoint, and on `/payments/details` also
+the `details` and `paymentData` submitted. On a capture, cancel or refund it covers your
+`idempotencyKey` and the endpoint, whose path carries the payment's `pspReference`, unique
+across Adyen. So two merchant accounts, a capture and a refund, or the steps of a 3-D Secure
+flow (§6) never receive each other's answers under one key, while replaying the *same* call
+with the same key is answered with Adyen's stored response instead of being performed twice.
+Adyen keeps keys for 7 to 14 days after their first use — a retry sent later can be performed
+again — and does not check them across regions: a retry sent to another location-based live
+endpoint is a new request.
+
+Use a new random (v4) UUID as the `idempotencyKey` of each operation, store it with the
+operation, and reuse it only to retry that operation — Adyen recommends random keys so that
+another API credential of your company account cannot fetch your stored responses. A key is
+bound to its first answer: a refusal is replayed for the same key, so a new attempt needs a
+new key. A capture or refund whose acknowledgement echoes a different amount or currency is
+rejected with `invalid_request`, because Adyen already accepted an earlier capture or refund
+under that key — the error names its amount and `pspReference`. If that is the one you meant,
+do not send it again; a further capture or refund needs a new key. A duplicate racing the
+still in-flight original (Adyen `errorCode` 704) is retried automatically.
+:::
+
+::: warning Upgrading from 0.1.0
+`/payments` and `/payments/details` send a different `idempotency-key` than 0.1.0 did, so a
+`completePayment` retried by another version than the one that first sent it reaches Adyen as
+a new request and can charge the shopper twice — Adyen captures right after authorisation by
+default. That holds in both directions: an upgrade, a rolling deploy running both versions, or
+a rollback. Before switching versions, stop retrying in-flight completions and settle each one
+from its `AUTHORISATION` webhook. Captures, cancels and refunds send the same key as 0.1.0 and
+stay deduplicated either way.
 :::
 
 ### Currencies the adapter refuses
@@ -293,6 +316,24 @@ record of the payment and never from a client request body — a browser that ca
 the returned `PaymentInfo` has `amount: 0` and `currency: "XXX"` (ISO 4217's "no currency"),
 because no money facts travel on a bare reference; take the figures you show a shopper from
 your own record, never from that response.
+
+The composite carries the **authorised** amount, and that is what a `refundPayment` without
+`amount` requests: once part of the payment was captured or refunded, Adyen refuses it
+(`Requested refund amount too high`, `Already partially refunded, new requested refund amount
+too high`) in a `REFUND` webhook with `success: "false"`, so pass `amount` for anything but
+the full refund of a fully captured payment. `cancelPayment` only voids an authorisation that
+has not been captured — and by default Adyen captures a payment right after authorisation,
+unless the payment or your account asks for manual or delayed capture — so refund a captured
+payment instead. Adyen documents only that a captured payment can no longer be cancelled; the
+adapter assumes such a cancel is acknowledged and fails in a `CANCELLATION` webhook
+(`success: "false"`), and rejects if Adyen refuses it in the answer instead.
+
+A capture or cancel for a `pspReference` Adyen does not know is acknowledged too, and fails
+in its webhook with `Transaction not found`, so a mistyped reference surfaces only there; a
+refund is assumed to behave alike, since Adyen's refund guide does not list that reason. This
+holds within one environment only: a reference from the other one — a test `pspReference`
+sent to live — is rejected in the answer with Adyen error 906 (`Original pspReference is
+invalid for this environment`).
 :::
 
 ## 8. Register the webhook endpoint

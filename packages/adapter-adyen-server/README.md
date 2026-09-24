@@ -111,7 +111,9 @@ altered. `verifyAdyenWebhook` returns the specific reason; `verifyWebhookSignatu
 boolean the contract asks for.
 
 Events map by the outcomes Adyen documents. A refused capture or cancel request arrives as
-`unknown`, as does `CANCEL_OR_REFUND`, which names the operation only in an unsigned field;
+`unknown` — spot it by `raw.eventCode` (`CAPTURE`, `CANCELLATION` or `TECHNICAL_CANCEL`)
+with `raw.success` `"false"`, and read `raw.reason` — as does `CANCEL_OR_REFUND`, which names
+the operation only in an unsigned field;
 dispute closures arrive as `payment.chargeback_won` / `payment.chargeback_lost`, and a
 reversed chargeback's win can be overridden by a later loss. `event.id` is the pair
 `"{eventCode}:{pspReference}"` that defines a duplicate at Adyen, whose other fields may

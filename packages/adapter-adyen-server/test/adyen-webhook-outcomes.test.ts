@@ -220,16 +220,87 @@ describe("Adyen webhook outcomes", () => {
     expect(latest?.type).toBe("payment.chargeback_lost");
   });
 
-  it("names the disputed payment only through originalReference", async () => {
-    // Without the Customer Area setting that adds originalReference to these
-    // events, pspReference is the only reference on them, and it is not
-    // documented as the payment's.
-    const { originalReference: _originalReference, ...withoutOriginal } = disputeEvent("CHARGEBACK_REVERSED");
-    const event = await parse(signed(withoutOriginal));
-    expect(event.type).toBe("payment.chargeback_won");
-    expect(event.id).toBe("CHARGEBACK_REVERSED:9915555555555555");
-    expect(event.pspPaymentId).toBeUndefined();
-    expect((event.raw as AdyenNotificationItem).pspReference).toBe("9915555555555555");
+  it("reads pspReference as the payment's on the four dispute codes whose originalReference needs a setting", async () => {
+    // "Include the originalReference for CHARGEBACK_REVERSED events" puts the
+    // payment's reference in originalReference on these codes. Adyen's wording
+    // implies pspReference carries it without the setting, which no page
+    // states; a globally unique reference read wrongly only makes a lookup miss.
+    for (const eventCode of ["CHARGEBACK_REVERSED", "SECOND_CHARGEBACK", "PREARBITRATION_WON", "PREARBITRATION_LOST"]) {
+      const { originalReference: _originalReference, ...withoutSetting } = disputeEvent(eventCode, {
+        pspReference: "9913333333333333",
+      });
+      const event = await parse(signed(withoutSetting));
+      expect(event.pspPaymentId, eventCode).toBe("9913333333333333");
+      expect(event.id, eventCode).toBe(`${eventCode}:9913333333333333`);
+      // An empty originalReference reads like an absent one.
+      await expect(parse(signed({ ...withoutSetting, originalReference: "" })), eventCode).resolves.toMatchObject({
+        pspPaymentId: "9913333333333333",
+      });
+      // With the setting on, originalReference names the payment and pspReference is the dispute's.
+      await expect(parse(signed(disputeEvent(eventCode))), eventCode).resolves.toMatchObject({
+        id: `${eventCode}:9915555555555555`,
+        pspPaymentId: "9913333333333333",
+      });
+    }
+  });
+
+  it("names no payment on any other dispute event without originalReference", async () => {
+    // The dispute webhooks page's PREARBITRATION_OPEN example carries none.
+    for (const eventCode of ["NOTIFICATION_OF_CHARGEBACK", "CHARGEBACK", "PREARBITRATION_OPEN", "SCHEME_ARBITRATION_LOST"]) {
+      const { originalReference: _originalReference, ...orphan } = disputeEvent(eventCode);
+      const event = await parse(signed(orphan));
+      expect(event.pspPaymentId, eventCode).toBeUndefined();
+      expect((event.raw as AdyenNotificationItem).pspReference, eventCode).toBe("9915555555555555");
+    }
+  });
+
+  it("reports a lost arbitration and the second chargeback that follows it as two losses", async () => {
+    // Adyen follows SCHEME_ARBITRATION_LOST with a second chargeback that adds
+    // the arbitration fees to the dispute amount.
+    const ruling = await parse(signed(disputeEvent("SCHEME_ARBITRATION_LOST")));
+    const secondChargeback = await parse(
+      signed(disputeEvent("SECOND_CHARGEBACK", { amount: { currency: "EUR", value: 1500 } })),
+    );
+    expect([ruling.type, secondChargeback.type]).toEqual(["payment.chargeback_lost", "payment.chargeback_lost"]);
+    expect(ruling.id).not.toBe(secondChargeback.id);
+    expect(secondChargeback.pspPaymentId).toBe(ruling.pspPaymentId);
+    // One loss, reported twice with different amounts: a state, not two sums.
+    expect([ruling.amount, secondChargeback.amount]).toEqual([1000, 1500]);
+  });
+
+  it("takes the payment of an expiry or a closed offer from its own pspReference", async () => {
+    // The webhook reference's EXPIRE and OFFER_CLOSED examples carry no originalReference.
+    const expired = await parse(
+      signed({
+        amount: { currency: "EUR", value: 1000 },
+        eventCode: "EXPIRE",
+        eventDate: "2024-02-09T11:19:48+01:00",
+        merchantAccountCode: "TestMerchant",
+        merchantReference: "order-1",
+        pspReference: "QFQTPCQ8HXSKGK82",
+        reason: "",
+        success: "true",
+      }),
+    );
+    // The remaining uncaptured amount lapsed; the amount is the one originally authorised.
+    expect(expired).toMatchObject({ type: "payment.canceled", pspPaymentId: "QFQTPCQ8HXSKGK82", amount: 1000 });
+    expect(expired.refundId).toBeUndefined();
+
+    const offerClosed = await parse(
+      signed({
+        additionalData: { paymentMethodVariant: "ideal" },
+        amount: { currency: "EUR", value: 1000 },
+        eventCode: "OFFER_CLOSED",
+        eventDate: "2021-01-01T01:00:00+01:00",
+        merchantAccountCode: "TestMerchant",
+        merchantReference: "order-1",
+        paymentMethod: "ideal",
+        pspReference: "QFQTPCQ8HXSKGK82",
+        reason: "",
+        success: "true",
+      }),
+    );
+    expect(offerClosed).toMatchObject({ type: "payment.canceled", pspPaymentId: "QFQTPCQ8HXSKGK82" });
   });
 
   it("keeps a reversal unknown whichever operation its unsigned action names", async () => {
@@ -317,6 +388,16 @@ describe("Adyen webhook outcomes", () => {
     });
   });
 
+  it("reports the epoch, meaning no known time, for an eventDate that does not parse", async () => {
+    // The capture guide's own CAPTURE example carries this date.
+    const item = signed({ ...capture("true"), eventDate: "2018-22T15:54:01+02:00" });
+    await expect(verify(item)).resolves.toEqual({ verified: true });
+    await expect(parse(item)).resolves.toMatchObject({
+      type: "payment.succeeded",
+      occurredAt: "1970-01-01T00:00:00.000Z",
+    });
+  });
+
   it("reports no outcome for a success value Adyen does not document", async () => {
     for (const success of ["TRUE", ""]) {
       const item = signed({ ...publishedItem, additionalData: {}, success });
@@ -360,7 +441,6 @@ describe("Adyen signed values", () => {
       ["merchantAccountCode as an array", { merchantAccountCode: ["TestMerchant"] }],
       ["merchantReference as an array", { merchantReference: ["TestPayment-1407325143704"] }],
       ["originalReference as an empty array", { originalReference: [] }],
-      ["originalReference as null", { originalReference: null }],
       ["amount.value as a string", { amount: { value: "1130", currency: "EUR" } }],
       ["amount.currency as an array", { amount: { value: 1130, currency: ["EUR"] } }],
     ];
@@ -372,6 +452,43 @@ describe("Adyen signed values", () => {
       expect(buildAdyenHmacPayload(item as AdyenNotificationItem), label).toBeUndefined();
       // Parsing reads the same way, so no path interprets a value the signature did not cover.
       await expect(parse(item), label).rejects.toMatchObject({ code: "invalid_request" });
+    }
+  });
+
+  it("reads a null originalReference or merchantReference as absent, as Adyen's validators sign it", async () => {
+    // Adyen's validators render a null value as an empty string, which is how an absent one joins.
+    const nullOriginal = { ...publishedItem, originalReference: null };
+    expect(buildAdyenHmacPayload(nullOriginal as unknown as AdyenNotificationItem)).toBe(PUBLISHED_SIGNING_STRING);
+    await expect(verify(nullOriginal)).resolves.toEqual({ verified: true });
+    await expect(parse(nullOriginal)).resolves.toMatchObject({
+      type: "payment.succeeded",
+      pspPaymentId: "7914073381342284",
+    });
+
+    const nullMerchantReference = { ...signed({ ...capture("true"), merchantReference: "" }), merchantReference: null };
+    await expect(verify(nullMerchantReference)).resolves.toEqual({ verified: true });
+    await expect(parse(nullMerchantReference)).resolves.toMatchObject({
+      type: "payment.succeeded",
+      pspPaymentId: "WNS7WQ756L2GWR82",
+    });
+  });
+
+  it("still refuses null in a value the webhook schema requires", async () => {
+    const nulled: Array<[string, Record<string, unknown>]> = [
+      ["pspReference", { pspReference: null }],
+      ["merchantAccountCode", { merchantAccountCode: null }],
+      ["eventCode", { eventCode: null }],
+      ["success", { success: null }],
+      ["amount", { amount: null }],
+      ["amount.value", { amount: { value: null, currency: "EUR" } }],
+      ["amount.currency", { amount: { value: 1130, currency: null } }],
+    ];
+    for (const [label, change] of nulled) {
+      const item: Record<string, unknown> = { ...publishedItem, ...change };
+      // Signed as a reader that turns null into "" would sign it, so only the schema check refuses it.
+      const forged = { ...item, additionalData: { hmacSignature: sign(coercedJoin(item)) } };
+      await expect(verify(forged), label).resolves.toEqual({ verified: false, reason: "malformed_payload" });
+      await expect(parse(forged), label).rejects.toMatchObject({ code: "invalid_request" });
     }
   });
 
@@ -408,6 +525,10 @@ describe("Adyen signed values", () => {
     // The capture and cancel guides' examples carry no merchantReference.
     const { merchantReference: _merchantReference, ...noMerchantReference } = capture("true");
     await expect(verify(signed(noMerchantReference))).resolves.toEqual({ verified: true });
+    // Both optional values absent: the published authorisation without its merchantReference.
+    const { merchantReference: _reference, ...neither } = base;
+    await expect(verify(signed(neither))).resolves.toEqual({ verified: true });
+    expect(buildAdyenHmacPayload(neither)).toBe("7914073381342284::TestMerchant::1130:EUR:AUTHORISATION:true");
   });
 
   it("refuses an envelope carrying anything but notification items", async () => {

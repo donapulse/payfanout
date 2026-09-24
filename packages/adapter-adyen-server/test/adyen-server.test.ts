@@ -78,7 +78,8 @@ function signed(item: AdyenNotificationItem): AdyenNotificationItem {
 /**
  * The published vector's eight signed values with its documented signature
  * rather than a recomputed one. Not the sample verbatim: its eventDate is
- * replaced and its operations list dropped, neither being signed.
+ * replaced, its operations list dropped and an empty `reason` added, none of
+ * them being signed.
  */
 const authorisationItem: AdyenNotificationItem = {
   additionalData: { hmacSignature: PUBLISHED_SIGNATURE },

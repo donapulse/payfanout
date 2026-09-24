@@ -61,7 +61,11 @@ until it sees success.
 - **Dedupe is yours:** `event.id` is a stable key; keep the seen-set in your store.
   Worldline can give two genuine refund events one id, so re-read its refund-type events
   before dropping one as a duplicate, as step 8 of the
-  [Worldline guide](/guide/worldline#_8-register-the-webhook-endpoint) describes.
+  [Worldline guide](/guide/worldline#_8-register-the-webhook-endpoint) describes. Adyen
+  duplicates can differ outside `eventCode` and `pspReference`, and Adyen asks you to use the
+  latest one, so upsert by `event.id` and keep the latest delivery's details rather than
+  dropping the repeat, as step 8 of the
+  [Adyen guide](/guide/adyen#_8-register-the-webhook-endpoint) describes.
 - **Ordering is not guaranteed** by any PSP, treat events as unordered facts. When sequence
   matters, reconcile with `retrievePayment` where the adapter declares
   `supportsPaymentRetrieval`; a push-only PSP such as Adyen has no payment read, so apply its

@@ -104,13 +104,19 @@ const SIGNED_STRING_FIELDS = [
   "success",
 ] as const;
 
+/** The two signed values that may be absent, as `hasRequiredSignedValues` explains. */
+const OPTIONAL_SIGNED_FIELDS: ReadonlySet<string> = new Set(["originalReference", "merchantReference"]);
+
 /**
  * Schema validation of the signed values, shared by verification and parsing so
  * an event is built from exactly the values the signature covered. The HMAC
  * authenticates the joined strings, not the JSON types carrying them: a boolean
  * `true` and the string "true" join alike, so a value without its documented
  * type (a string, or a safe integer for `amount.value`) makes the item
- * unreadable instead of being coerced.
+ * unreadable instead of being coerced. The one exception is `null` in one of
+ * the two optional values: Adyen's own validators sign a null value as an empty
+ * string, which is how an absent one joins, so it reads as absent. A null
+ * anywhere else is refused like any other wrong type.
  */
 function readSignedValues(item: AdyenNotificationItem): SignedValues | undefined {
   const fields = item as Record<string, unknown>;
@@ -120,7 +126,7 @@ function readSignedValues(item: AdyenNotificationItem): SignedValues | undefined
   const values: SignedValues = {};
   for (const key of SIGNED_STRING_FIELDS) {
     const field = key === "currency" ? amount["currency"] : fields[key];
-    if (field === undefined) continue;
+    if (field === undefined || (field === null && OPTIONAL_SIGNED_FIELDS.has(key))) continue;
     if (typeof field !== "string") return undefined;
     values[key] = field;
   }
@@ -191,6 +197,10 @@ function joinSignedValues(values: SignedValues): string {
  * so a ":" is refused everywhere except in `merchantReference`, where it cannot
  * change how the string splits. Returns `undefined` for an item carrying a ":"
  * elsewhere, or a signed value without its documented type.
+ *
+ * It checks types, not presence: an item missing a value Adyen's webhook schema
+ * requires still yields a string, and {@link verifyAdyenWebhook} is what refuses
+ * such an item (`malformed_payload`).
  */
 export function buildAdyenHmacPayload(item: AdyenNotificationItem): string | undefined {
   const values = readSignedValues(item);
@@ -344,13 +354,43 @@ export function mapAdyenEventType(eventCode: string, success: boolean): UnifiedW
 /** Event codes whose `pspReference` is a REFUND's reference rather than the payment's. */
 const REFUND_EVENT_CODES = new Set(["REFUND", "REFUND_FAILED", "REFUNDED_REVERSED", "CANCEL_OR_REFUND"]);
 
-/**
- * Event codes whose own `pspReference` is the payment's. Every other code names
- * the payment on `originalReference` — modifications and disputes carry their
- * own reference, and REPORT_AVAILABLE a file name — so an event without one
- * names no payment rather than a wrong one.
- */
+/** Event codes whose own `pspReference` is the payment's. */
 const PAYMENT_REFERENCE_EVENT_CODES = new Set(["AUTHORISATION", "EXPIRE", "OFFER_CLOSED"]);
+
+/**
+ * Dispute codes that carry `originalReference` only once the Customer Area
+ * setting "Include the originalReference for CHARGEBACK_REVERSED events" is
+ * enabled. Adyen says the setting puts the payment's reference in
+ * `originalReference` and the dispute's in `pspReference`, which implies that
+ * without it `pspReference` holds the payment's, but no page states it. It is
+ * read as the payment's regardless: a `pspReference` is globally unique, so a
+ * wrong reading can only make a host's lookup miss, never land on another
+ * payment, while reporting none would detach the dispute's outcome from its
+ * payment.
+ */
+const SETTING_DEPENDENT_DISPUTE_CODES = new Set([
+  "CHARGEBACK_REVERSED",
+  "SECOND_CHARGEBACK",
+  "PREARBITRATION_WON",
+  "PREARBITRATION_LOST",
+]);
+
+/**
+ * The payment an event concerns: `originalReference` when it carries one, else
+ * its own `pspReference` on the codes above. Any other event without
+ * `originalReference` names no payment rather than a wrong one: its own
+ * reference is a modification's, a dispute's or, on REPORT_AVAILABLE, a file
+ * name.
+ */
+function paymentReferenceOf(
+  eventCode: string,
+  pspReference: string,
+  originalReference: string | undefined,
+): string | undefined {
+  if (originalReference) return originalReference;
+  const ownIsPayment = PAYMENT_REFERENCE_EVENT_CODES.has(eventCode) || SETTING_DEPENDENT_DISPUTE_CODES.has(eventCode);
+  return ownIsPayment ? pspReference : undefined;
+}
 
 /**
  * One event per delivery — the unified contract. JSON deliveries carry exactly
@@ -389,12 +429,12 @@ function toUnifiedEvent(item: AdyenNotificationItem): UnifiedWebhookEvent {
   if (!eventCode || !pspReference) {
     throw invalidPayload("Adyen notification item has no eventCode/pspReference", item);
   }
-  const pspPaymentId =
-    values.originalReference || (PAYMENT_REFERENCE_EVENT_CODES.has(eventCode) ? pspReference : undefined);
+  const pspPaymentId = paymentReferenceOf(eventCode, pspReference, values.originalReference);
   return {
     // Adyen defines a duplicate as a delivery repeating eventCode and
-    // pspReference, whatever else differs, and every event of one dispute shares
-    // the dispute's pspReference, so the pair is the dedupe key.
+    // pspReference, whatever else differs. pspReference alone repeats across
+    // codes (a capture and its CAPTURE_FAILED, every event of one dispute), so
+    // the pair is the dedupe key.
     id: `${eventCode}:${pspReference}`,
     pspName: "adyen",
     // Adyen documents success as "true" or "false"; any other value states no outcome.

@@ -1349,6 +1349,10 @@ sandbox round-trip before production use, and the setup guide carries that warni
   carrying the delimiter — so such an id would make every webhook for that payment fail
   verification, permanently and silently, after the shopper has paid. For a push-only
   provider that is total failure, so it is rejected while the host still owns the id.
+  Revised 2026-09-23: Adyen's own validators join the signed values unescaped, and the
+  verifier now accepts a `:` in `merchantReference` (see the escaping entry below). The
+  refusal stays as a conservative choice, so the references the adapter creates never rely
+  on that parse.
 - **The CLP/CVE/IDR/ISK exclusion is enforced on captures and refunds too**, not only at
   session creation: the composite `pspPaymentId` is documented, so a host can drive a
   modification for a payment created elsewhere, and an excluded currency would be priced
@@ -1443,10 +1447,11 @@ sandbox round-trip before production use, and the setup guide carries that warni
   definition: duplicates "have the same values in the `eventCode` and `pspReference` fields,
   while the `eventDate` and other fields can be different. Your server should use the
   details from the latest webhook event." So hosts upsert on the id, keeping the latest
-  `eventDate`. The collision a bare `pspReference` causes is inside one dispute ("All events
-  related to a dispute have the same PSP reference"), not between a payment's events: a
-  capture, cancel or refund carries its own `pspReference`, so the collision between a
-  payment's own events that this entry described does not occur. Only refund-shaped events
+  `eventDate`. A bare `pspReference` is shared by several events, which is why the pair is the
+  id: every event of one dispute ("All events related to a dispute have the same PSP
+  reference"), `CAPTURE` and `CAPTURE_FAILED` (both carry the capture request's reference),
+  `REFUND` and `REFUND_FAILED` (the refund request's), and `AUTHORISATION`, `EXPIRE` and
+  `OFFER_CLOSED` (the payment's). Only refund-shaped events
   report their `pspReference` as `refundId`. `CANCEL_OR_REFUND` does name its operation, in
   `additionalData["modification.action"]` ("refund" or "cancel"), but outside the signed
   values, so it stays `unknown`: reporting an outcome from it would present an unsigned
@@ -1462,13 +1467,27 @@ sandbox round-trip before production use, and the setup guide carries that warni
   `PREARBITRATION_ACCEPTED`, which the dispute webhooks page lists as "Pending" and the
   dispute flow page as "Lost"; the second chargeback that follows it reports the loss either
   way. A later loss overrides a reversal's provisional win, so hosts apply a payment's
-  events in `eventDate` order. `pspPaymentId` comes from `originalReference`, and from
-  `pspReference` only on `AUTHORISATION`, `EXPIRE` and `OFFER_CLOSED`; any other event
-  without `originalReference` names no payment, since its own reference is a modification's,
-  a dispute's or, on `REPORT_AVAILABLE`, a file name. `CHARGEBACK_REVERSED`,
-  `SECOND_CHARGEBACK` and `PREARBITRATION_WON/LOST` carry `originalReference` only once
-  "Include the originalReference for CHARGEBACK_REVERSED events" is enabled, which the setup
-  guide asks for. `REFUND_NOT_CLEARED` and `SETTLED_REVERSED`, added to the Webhooks
+  events in `eventDate` order, with two limits: `eventDate` is unsigned, trusted only because
+  basic authentication authenticates the channel, and an unparseable one reads as the epoch
+  (time unknown); and a final stage (`SECOND_CHARGEBACK`, `SCHEME_ARBITRATION_WON`/`LOST`,
+  `DISPUTE_DEFENSE_PERIOD_ENDED`, `ISSUER_RESPONSE_TIMEFRAME_EXPIRED`, `PREARBITRATION_WON`)
+  is never overridden by a non-final one such as `CHARGEBACK_REVERSED`, whatever the dates. A
+  lost scheme arbitration arrives as `SCHEME_ARBITRATION_LOST` and then as a second chargeback
+  including the fees, so `chargeback_lost` is a state, never a sum.
+  `pspPaymentId` comes from `originalReference`, and from `pspReference` on `AUTHORISATION`,
+  `EXPIRE` and `OFFER_CLOSED`. On `CHARGEBACK_REVERSED`, `SECOND_CHARGEBACK` and
+  `PREARBITRATION_WON/LOST` it also comes from `pspReference` when `originalReference` is
+  absent (default, unconfirmed). The dispute webhooks page describes the Customer Area setting
+  "Include the originalReference for CHARGEBACK_REVERSED events" as returning "the PSP
+  reference of the payment in the `originalReference` field, and the PSP reference of the
+  dispute in the `pspReference`" for those four codes, which implies that without it
+  `pspReference` is the payment's. The additional-settings page says only "For
+  CHARGEBACK_REVERSED webhook events, receive the `pspReference` of the original payment." A
+  `pspReference` is globally unique, so a wrong reading only makes a host's lookup miss,
+  while reporting none would detach the dispute's outcome from its payment. Sandbox check:
+  which reference those four codes carry without the setting, which the setup guide asks
+  hosts to enable. Any other event without `originalReference` names no payment, since its
+  own reference is a modification's, a dispute's or, on `REPORT_AVAILABLE`, a file name. `REFUND_NOT_CLEARED` and `SETTLED_REVERSED`, added to the Webhooks
   contract on 2026-09-10, stay `unknown` as payout-batch adjustments. `CAPTURE_FAILED` stays
   `payment.failed` even though "Technical failures are automatically re-captured by Adyen
   within 10 business days"; the setup guide flags it as not always final.

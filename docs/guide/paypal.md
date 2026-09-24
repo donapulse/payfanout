@@ -76,12 +76,14 @@ const payments = new PaymentService({ adapters: [paypal] });
 | `webhookId` | for webhooks | - | Without it `verifyWebhookSignature` answers `false` (fails closed). |
 | `userAction` | - | `"CONTINUE"` | Popup button label. Keep `CONTINUE`: your own Pay button completes the payment. Must agree with the client adapter's `userAction`. |
 | `returnUrl` / `cancelUrl` | - | - | Fallbacks when the session input carries none; `cancelUrl` defaults to the return URL. |
-| `brandName` / `locale` | - | auto | Popup presentation; `brandName` takes 1–127 characters (checked at construction). |
+| `brandName` / `locale` | - | auto | Popup presentation; `brandName` takes at most 127 characters on one line (checked at construction; an empty one is omitted). |
 | `requestTimeoutMs` | - | `30000` | Abort a hung PayPal connection; surfaces as retryable `psp_unavailable`. |
 | `maxNetworkRetries` | - | `2` | Retries transport trouble (network/timeout/5xx/429) only — retries reuse the same `PayPal-Request-Id`, so a capture can never double-charge. Business errors never retry. |
 
 `createPaymentSession` creates a PayPal **order** (`intent: CAPTURE`, or `AUTHORIZE` for
-`captureMethod: "manual"`); `pspSessionId` and `clientSecret` are both the order id.
+`captureMethod: "manual"`); `pspSessionId` and `clientSecret` are both the order id. The
+session `id` travels as the order's `custom_id`, so it takes at most 255 characters, and
+amounts must be greater than zero; both are refused as `invalid_request` before any call.
 OAuth tokens are minted and cached inside the adapter — nothing to configure.
 
 ## 5. Wire the client adapter

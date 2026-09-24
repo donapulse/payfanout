@@ -60,7 +60,10 @@ export interface PayPalServerAdapterConfig {
    * without it (verification postbacks need it, fail closed).
    */
   webhookId?: string;
-  /** Shown instead of the business name in the PayPal window. */
+  /**
+   * Shown instead of the business name in the PayPal window. At most 127
+   * characters on one line (PayPal's `brand_name` limit); empty is omitted.
+   */
   brandName?: string;
   /** BCP-47 checkout locale (e.g. "fr-FR"); PayPal auto-detects when omitted. */
   locale?: string;
@@ -208,9 +211,12 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     ) {
       throw PayFanoutError.invalidRequest("PayPalServerAdapter config.maxNetworkRetries must be an integer >= 0");
     }
-    // experience_context.brand_name: 1–127 characters.
-    if (config.brandName !== undefined && (config.brandName.length === 0 || Array.from(config.brandName).length > 127)) {
-      throw PayFanoutError.invalidRequest("PayPalServerAdapter config.brandName must be 1–127 characters");
+    // experience_context.brand_name: at most 127 characters, pattern ^.*$ (no
+    // line breaks). An empty one is never sent, so it is not refused.
+    if (config.brandName && (Array.from(config.brandName).length > 127 || /[\n\r\u2028\u2029]/.test(config.brandName))) {
+      throw PayFanoutError.invalidRequest(
+        "PayPalServerAdapter config.brandName must be at most 127 characters on one line",
+      );
     }
     this.config = config;
     this.baseUrl =
@@ -256,9 +262,11 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
 
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertPositiveAmount(input.amount, "amount");
-    if (input.id !== undefined && Array.from(input.id).length > 255) {
+    // The id travels as custom_id (at most 255 characters); an empty one is omitted.
+    const idLength = input.id ? Array.from(input.id).length : 0;
+    if (idLength > 255) {
       throw PayFanoutError.invalidRequest(
-        `PayPal keeps the session id as custom_id, at most 255 characters; this one has ${Array.from(input.id).length}`,
+        `PayPal keeps the session id as custom_id, at most 255 characters; this one has ${idLength}`,
       );
     }
     // PayPal's currency allowlist for new payments, then the HUF/TWD/JPY whole-unit rule.
@@ -690,8 +698,10 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
   async fetchEvents(input: FetchEventsInput = {}): Promise<FetchEventsResult> {
     let path: string;
     if (input.cursor) {
-      const cursorPath = input.cursor.startsWith("//") ? undefined : relativeEventsPath(input.cursor);
-      if (!input.cursor.startsWith("/") || cursorPath === undefined) {
+      const cursorPath = input.cursor.startsWith("/v1/notifications/webhooks-events")
+        ? relativeEventsPath(input.cursor)
+        : undefined;
+      if (cursorPath === undefined) {
         throw PayFanoutError.invalidRequest("fetchEvents cursor was not produced by this adapter", {
           cursor: input.cursor,
         });

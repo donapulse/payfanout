@@ -262,6 +262,19 @@ choices they forced:
   same-currency updates keep working, and PayPal decides on them. Refusing those locally
   would block refunding money already taken, and PayPal's pages do not say what happens to
   existing RUB payments.
+- **Doc-verified 2026-09-24: local limits.** A zero amount is refused on sessions, updates,
+  captures and refunds (`CANNOT_BE_ZERO_OR_NEGATIVE`; the Payments v2 capture and refund
+  amounts "must be a positive number"), a session `id` over 255 characters (the Orders v2
+  `custom_id` limit), and a `brandName` over 127 characters or with a line break
+  (`brand_name`, pattern `^.*$`). Lengths count characters, never UTF-16 units or bytes,
+  so the adapter never refuses what PayPal accepts under any unit; an empty `id` or
+  `brandName` is still omitted rather than refused. A `fetchEvents` cursor must start with
+  the events-list path and resolve to exactly that list, a trailing slash allowed, and the
+  resolved path is what is requested. **AMBIGUOUS:** the shape of the list's `next` link
+  (the webhooks schema gives no example href), and whether `start_time` without `end_time`
+  is honoured (the reference describes them as the two ends of one range). Sandbox checks:
+  page through `GET /v1/notifications/webhooks-events?page_size=1` on an account with two
+  or more events and record the `next` href, with and without `start_time`.
 - **Order updates follow the Orders v2 patchable-attributes table (2026-09-24).** The table
   lists shipping's own attributes (`shipping.name`, `shipping.address`: replace, add), not
   the whole `shipping` object, and `soft_descriptor` with replace and remove only, so the

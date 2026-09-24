@@ -2,17 +2,35 @@ import { describe, expect, it } from "vitest";
 import { PayPalServerAdapter, type PayPalServerAdapterConfig } from "../src/index.js";
 import { FakePayPalApi } from "./fake-paypal-api.js";
 
-function makePair(config: Partial<PayPalServerAdapterConfig> = {}): { adapter: PayPalServerAdapter; fake: FakePayPalApi } {
+// One character but two UTF-16 code units: pins counting by characters.
+const ASTRAL = String.fromCodePoint(0x1f600);
+
+function makePair(config: Partial<PayPalServerAdapterConfig> = {}): {
+  adapter: PayPalServerAdapter;
+  fake: FakePayPalApi;
+  orderBodies: Array<Record<string, unknown>>;
+} {
   const fake = new FakePayPalApi();
+  const orderBodies: Array<Record<string, unknown>> = [];
   const adapter = new PayPalServerAdapter({
     clientId: fake.clientId,
     clientSecret: fake.clientSecret,
     environment: "sandbox",
-    fetch: fake.fetch,
+    fetch: async (input, init) => {
+      if (init?.method === "POST" && new URL(String(input)).pathname === "/v2/checkout/orders") {
+        orderBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
+      }
+      return fake.fetch(input, init);
+    },
     sleep: async () => {},
     ...config,
   });
-  return { adapter, fake };
+  return { adapter, fake, orderBodies };
+}
+
+function experienceContext(body: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  const source = body?.["payment_source"] as { paypal?: { experience_context?: Record<string, unknown> } } | undefined;
+  return source?.paypal?.experience_context;
 }
 
 describe("PayPal local limits", () => {
@@ -32,26 +50,51 @@ describe("PayPal local limits", () => {
     expect(fake.requestCount).toBe(before);
   });
 
-  it("refuses a session id longer than the 255-character custom_id before creating the order", async () => {
+  it("refuses a session id over the 255-character custom_id before creating the order, counting characters", async () => {
     const { adapter, fake } = makePair();
     const before = fake.requestCount;
-    await expect(
-      adapter.createPaymentSession({ amount: 2000, currency: "USD", id: "x".repeat(256), idempotencyKey: "k" }),
-    ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringMatching(/255/) });
+    for (const id of ["x".repeat(256), ASTRAL.repeat(256)]) {
+      await expect(adapter.createPaymentSession({ amount: 2000, currency: "USD", id, idempotencyKey: "k" })).rejects.toMatchObject({
+        code: "invalid_request",
+        message: expect.stringMatching(/255 characters; this one has 256/),
+      });
+    }
     expect(fake.requestCount).toBe(before);
-    const session = await adapter.createPaymentSession({
-      amount: 2000,
-      currency: "USD",
-      id: "x".repeat(255),
-      idempotencyKey: "k2",
-    });
-    expect(session.id).toBe("x".repeat(255));
+    for (const [n, id] of ["x".repeat(255), ASTRAL.repeat(255)].entries()) {
+      const session = await adapter.createPaymentSession({ amount: 2000, currency: "USD", id, idempotencyKey: `ok-${n}` });
+      expect(session.id).toBe(id);
+    }
   });
 
-  it("refuses a brand name outside 1–127 characters at construction", () => {
-    expect(() => makePair({ brandName: "" })).toThrowError(/brandName must be 1–127 characters/);
-    expect(() => makePair({ brandName: "B".repeat(128) })).toThrowError(/brandName must be 1–127 characters/);
+  it("still omits an empty or missing session id", async () => {
+    const { adapter, orderBodies } = makePair();
+    for (const id of ["", null as unknown as string, undefined]) {
+      await expect(
+        adapter.createPaymentSession({ amount: 2000, currency: "USD", id, idempotencyKey: `k-${String(id)}` }),
+      ).resolves.toMatchObject({ amount: 2000 });
+    }
+    expect(orderBodies).toHaveLength(3);
+    for (const body of orderBodies) {
+      expect((body["purchase_units"] as Array<Record<string, unknown>>)[0]).not.toHaveProperty("custom_id");
+    }
+  });
+
+  it("refuses at construction a brand name PayPal would reject; an empty one is still omitted", async () => {
+    const tooLong = /brandName must be at most 127 characters on one line/;
+    expect(() => makePair({ brandName: "B".repeat(128) })).toThrowError(tooLong);
+    expect(() => makePair({ brandName: ASTRAL.repeat(128) })).toThrowError(tooLong);
+    expect(() => makePair({ brandName: `Line one${String.fromCharCode(10)}Line two` })).toThrowError(tooLong);
     expect(() => makePair({ brandName: "B".repeat(127) })).not.toThrow();
+    expect(() => makePair({ brandName: ASTRAL.repeat(127) })).not.toThrow();
+
+    for (const brandName of ["", null as unknown as string]) {
+      const { adapter, orderBodies } = makePair({ brandName });
+      await adapter.createPaymentSession({ amount: 2000, currency: "USD", idempotencyKey: "k" });
+      expect(experienceContext(orderBodies[0])).not.toHaveProperty("brand_name");
+    }
+    const { adapter, orderBodies } = makePair({ brandName: "Jane's Gifts" });
+    await adapter.createPaymentSession({ amount: 2000, currency: "USD", idempotencyKey: "k" });
+    expect(experienceContext(orderBodies[0])).toMatchObject({ brand_name: "Jane's Gifts" });
   });
 
   it("accepts as a fetchEvents cursor only the events list itself, dot segments resolved", async () => {
@@ -98,5 +141,20 @@ describe("PayPal local limits", () => {
       "/v1/notifications/webhooks-events?page_size=2",
       "/v1/notifications/webhooks-events/?page_size=2&start_index=2",
     ]);
+  });
+
+  it("requests the resolved cursor path, never the cursor as given", async () => {
+    const sent: string[] = [];
+    const fetchSpy: typeof fetch = async (input) => {
+      const raw = String(input);
+      if (new URL(raw).pathname === "/v1/oauth2/token") {
+        return new Response(JSON.stringify({ access_token: "t", expires_in: 3600 }), { status: 200 });
+      }
+      sent.push(raw);
+      return new Response(JSON.stringify({ events: [] }), { status: 200 });
+    };
+    const adapter = new PayPalServerAdapter({ clientId: "id", clientSecret: "secret", environment: "sandbox", fetch: fetchSpy });
+    await adapter.fetchEvents({ cursor: "/v1/notifications/webhooks-events/./?page_size=2" });
+    expect(sent).toEqual(["https://api-m.sandbox.paypal.com/v1/notifications/webhooks-events/?page_size=2"]);
   });
 });

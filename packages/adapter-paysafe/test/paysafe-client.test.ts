@@ -1,12 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isPayFanoutError } from "@payfanout/core";
 import { runClientAdapterConformanceTests } from "@payfanout/conformance";
-import {
-  decodeSessionPayload,
-  PaysafeClientAdapter,
-  type PaysafeFieldsInstanceLike,
-  type PaysafeJsLike,
-} from "../src/index.js";
+import { decodeSessionPayload, PaysafeClientAdapter } from "../src/index.js";
+import { createFakePaysafeJs, type FakePaysafeJsOptions } from "./fake-paysafe-js.js";
 
 function sessionToken(payload: object): string {
   return `${Buffer.from(JSON.stringify(payload)).toString("base64url")}.fake-signature`;
@@ -14,26 +10,8 @@ function sessionToken(payload: object): string {
 
 const TOKEN = sessionToken({ v: 1, amount: 2500, currency: "EUR", merchantAccountId: "acct-EUR", id: "order-1" });
 
-function makeFakePaysafe(tokenizeImpl?: PaysafeFieldsInstanceLike["tokenize"]): PaysafeJsLike & {
-  setupCalls: Array<{ apiKey: string; options: Record<string, unknown> }>;
-  tokenizeCalls: Record<string, unknown>[];
-} {
-  const fake = {
-    setupCalls: [] as Array<{ apiKey: string; options: Record<string, unknown> }>,
-    tokenizeCalls: [] as Record<string, unknown>[],
-    fields: {
-      setup: async (apiKey: string, options: Record<string, unknown>) => {
-        fake.setupCalls.push({ apiKey, options });
-        return {
-          tokenize: async (opts: Record<string, unknown>) => {
-            fake.tokenizeCalls.push(opts);
-            return tokenizeImpl ? tokenizeImpl(opts) : { token: "SPtok_handle_1" };
-          },
-        };
-      },
-    },
-  };
-  return fake as never;
+function makeFakePaysafe(tokenize?: FakePaysafeJsOptions["tokenize"]) {
+  return createFakePaysafeJs({ tokenize });
 }
 
 function makeAdapter(fake = makeFakePaysafe()): { adapter: PaysafeClientAdapter; fake: typeof fake } {
@@ -97,7 +75,10 @@ describe("PaysafeClientAdapter", () => {
     const setup = fake.setupCalls[0]!;
     expect(setup.options["environment"]).toBe("TEST");
     expect(setup.options["currencyCode"]).toBe("EUR"); // Paysafe.js 9055s without it
-    expect(setup.options["accountId"]).toBe("acct-EUR");
+    // Not a setup option (accounts.default is), and "acct-EUR" cannot be the
+    // number that one takes.
+    expect(setup.options).not.toHaveProperty("accountId");
+    expect(setup.options).not.toHaveProperty("accounts");
     expect(Object.keys(setup.options["fields"] as object)).toEqual(["cardNumber", "expiryDate", "cvv"]);
   });
 
@@ -113,7 +94,7 @@ describe("PaysafeClientAdapter", () => {
       amount: 2500,
       currencyCode: "EUR",
       accountId: "acct-EUR",
-      merchantRefNum: "order-1",
+      merchantRefNum: expect.stringMatching(/^order-1-/),
     });
   });
 
@@ -121,18 +102,24 @@ describe("PaysafeClientAdapter", () => {
     stubBrowser();
     const { adapter, fake } = makeAdapter();
     // A real per-currency account id is numeric — Paysafe.js rejects the string
-    // form with 9003, so setup() and tokenize() must receive a number.
+    // form (setup 9061, tokenize 9003), so both must receive a number.
     const numericToken = sessionToken({ v: 1, amount: 2500, currency: "CAD", merchantAccountId: "1003178470", id: "o1" });
     const handle = await adapter.mount(fakeContainer(), { clientSecret: numericToken });
-    expect(fake.setupCalls[0]!.options["accountId"]).toBe(1003178470);
+    expect(fake.setupCalls[0]!.options["accounts"]).toEqual({ default: 1003178470 });
     await adapter.confirm(handle);
     expect(fake.tokenizeCalls[0]!["accountId"]).toBe(1003178470);
 
     // An id too large to represent exactly stays a string — silently rounding it
-    // could route the tokenize to a different merchant account.
+    // could route the tokenize to a different merchant account. Setup takes no
+    // string, so it goes without; tokenize still carries it, and Paysafe.js
+    // rejects it there as the configuration error mapped further down.
     const huge = "9".repeat(20);
-    await adapter.mount(fakeContainer(), { clientSecret: sessionToken({ v: 1, amount: 2500, currency: "CAD", merchantAccountId: huge }) });
-    expect(fake.setupCalls[1]!.options["accountId"]).toBe(huge);
+    const hugeHandle = await adapter.mount(fakeContainer(), {
+      clientSecret: sessionToken({ v: 1, amount: 2500, currency: "CAD", merchantAccountId: huge }),
+    });
+    expect(fake.setupCalls[1]!.options).not.toHaveProperty("accounts");
+    await adapter.confirm(hugeHandle);
+    expect(fake.tokenizeCalls[1]!["accountId"]).toBe(huge);
   });
 
   it("maps tokenize failures to unified errors with raw preserved", async () => {

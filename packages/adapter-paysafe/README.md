@@ -63,6 +63,16 @@ slots, any grid, rows, and labels:
 </PaymentFields>
 ```
 
+## Setup and tokenize
+
+- Setup takes the currency and, when the session names one, the merchant account
+  (Paysafe.js `accounts.default`, as a number) from the signed session, and
+  `fieldOptions` cannot override either. Paysafe.js `show()` runs right after setup, as
+  Paysafe documents.
+- Each card tokenize sends a fresh `merchantRefNum`, which Paysafe.js requires: the
+  session `id` when set, then a random suffix, 255 characters at most. A card retried
+  after a decline never reuses one.
+
 ## Content-Security-Policy
 
 On CSP-enforcing pages, allow every host Paysafe.js touches, or the hosted fields

@@ -330,10 +330,13 @@ describe("injectScript after a failed load", () => {
 
   it("never takes over a tag the page added itself", async () => {
     const pageTag = scriptOnPage(SDK_URL);
-    stubPage(pageTag);
+    pageTag.remove = vi.fn();
+    const { injected } = stubPage(pageTag);
     await expect(injectScript(SDK_URL, "acme")).resolves.toBeUndefined();
     expect(pageTag.onerror).toBeNull();
     expect(pageTag.onload).toBeNull();
+    expect(pageTag.remove).not.toHaveBeenCalled();
+    expect(injected).toHaveLength(0);
   });
 
   it("lets the file load under a new hash once the tag carrying the old one failed", async () => {

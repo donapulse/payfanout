@@ -136,7 +136,8 @@ export function injectScript(url: string, pspName: string, options: InjectScript
         }),
       );
       // A failed tag must not satisfy the next lookup, or the file would never be
-      // fetched again. Plain-object doubles in adapter test fakes have no remove().
+      // fetched again. Element doubles without remove(), like the bare objects
+      // adapter test fakes may return, must not make this handler throw.
       if (typeof script.remove === "function") script.remove();
     };
     document.head.appendChild(script);

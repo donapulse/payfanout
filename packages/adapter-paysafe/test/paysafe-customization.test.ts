@@ -141,18 +141,33 @@ describe("Paysafe field customization", () => {
     });
   });
 
-  it("non-negotiables win over fieldOptions: environment, currencyCode, accountId", async () => {
+  it("non-negotiables win over fieldOptions: environment, currencyCode, accounts", async () => {
     const { adapter, fake } = makeAdapter();
     stubBrowser();
+    const accountToken = `${Buffer.from(
+      JSON.stringify({ v: 1, amount: 2500, currency: "EUR", merchantAccountId: "1001234567" }),
+    ).toString("base64url")}.sig`;
     await adapter.mount({ appendChild: () => {} } as never, {
-      clientSecret: TOKEN,
-      fieldOptions: { environment: "LIVE", currencyCode: "USD", accountId: "attacker" },
+      clientSecret: accountToken,
+      fieldOptions: { environment: "LIVE", currencyCode: "USD", accounts: { default: 42, googlePay: 43 } },
     });
     expect(fake.setupOptions[0]).toMatchObject({
       environment: "TEST", // adapter config decides
       currencyCode: "EUR", // signed session decides
-      accountId: "acct-1",
     });
+    // The session's account decides too — the whole object, so no host entry rides along.
+    expect(fake.setupOptions[0]!["accounts"]).toEqual({ default: 1001234567 });
+  });
+
+  it("passes a host's accounts through when the session names no merchant account", async () => {
+    const { adapter, fake } = makeAdapter();
+    stubBrowser();
+    const noAccountToken = `${Buffer.from(JSON.stringify({ v: 1, amount: 2500, currency: "EUR" })).toString("base64url")}.sig`;
+    await adapter.mount({ appendChild: () => {} } as never, {
+      clientSecret: noAccountToken,
+      fieldOptions: { accounts: { default: 42 } },
+    });
+    expect(fake.setupOptions[0]!["accounts"]).toEqual({ default: 42 });
   });
 
   it("translates common appearance tokens onto the Paysafe input selector", async () => {

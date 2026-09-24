@@ -149,7 +149,10 @@ than enumerated options (future SDK options need no library release):
   `wallets`, …). Paysafe: per-field options under `fields` (placeholders, …) plus any
   top-level setup option. Adapters protect ONLY their functional keys (Stripe:
   clientSecret; Paysafe: environment/currencyCode/accountId/mount selectors) — the
-  host wins everywhere else.
+  host wins everywhere else. *Update 2026-09-24:* Paysafe's protected setup key is
+  `accounts` (`accounts.default`, the documented setup option for a key holding several
+  accounts in one currency), not `accountId`, which setup never read; tokenize still
+  carries `accountId`, as its reference documents.
 - **`MountOptions.locale`** — BCP-47, mapped per PSP (Paysafe underscore form).
 - **Slot convention for split-field PSPs:** `data-payfanout-field="cardNumber|
   expiryDate|cvv"` elements inside the container become the mount points — the host

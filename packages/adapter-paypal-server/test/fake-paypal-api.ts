@@ -8,11 +8,13 @@
  *
  * Authorization captures follow the Payments v2 capture request: no amount
  * means the FULL authorized amount (never the remainder), a final_capture
- * closes the authorization (AUTHORIZATION_ALREADY_CAPTURED afterwards), and
- * captures summing past the authorized amount answer
- * MAX_CAPTURE_AMOUNT_EXCEEDED. PayPal's default overage lets captures reach
- * 115% of the order amount; the fake keeps the no-overage rule PSD2 countries
- * require, so no test can lean on an overage.
+ * closes the authorization (AUTHORIZATION_ALREADY_CAPTURED afterwards), a
+ * capture in another currency than the authorization's answers
+ * AUTH_CAPTURE_CURRENCY_MISMATCH, and captures summing past the authorized
+ * amount answer MAX_CAPTURE_AMOUNT_EXCEEDED. PayPal's overage limit lets
+ * captures go past the authorized amount, by default up to 115% of it or
+ * USD 75 more, whichever is less; PSD2 countries allow none, and the fake
+ * keeps that no-overage rule, so no test can lean on an overage.
  */
 
 interface FakeMoney {
@@ -528,6 +530,12 @@ export class FakePayPalApi {
     const unit = order.purchase_units[0]!;
     const authorized = decimalToCents(entry.auth.amount.value);
     const requestedMoney = body?.["amount"] as FakeMoney | undefined;
+    if (requestedMoney && requestedMoney.currency_code !== entry.auth.amount.currency_code) {
+      return json(
+        422,
+        unprocessable("AUTH_CAPTURE_CURRENCY_MISMATCH", "Currency of capture must be the same as currency of authorization."),
+      );
+    }
     // "If amount is not specified, the full authorized amount is captured."
     const requested = requestedMoney ? decimalToCents(requestedMoney.value) : authorized;
     if (entry.captured + requested > authorized) {

@@ -43,6 +43,8 @@ const ISSUE_MAP: Record<string, UnifiedErrorCode> = {
   REFUND_TIME_LIMIT_EXCEEDED: "invalid_request",
   REFUND_NOT_ALLOWED: "invalid_request",
   PENDING_CAPTURE: "invalid_request",
+  AUTHORIZATION_ALREADY_CAPTURED: "invalid_request",
+  AUTHORIZATION_DENIED: "invalid_request",
   AUTHORIZATION_VOIDED: "invalid_request",
   AUTHORIZATION_EXPIRED: "invalid_request",
   PREVIOUSLY_CAPTURED: "invalid_request",
@@ -51,9 +53,16 @@ const ISSUE_MAP: Record<string, UnifiedErrorCode> = {
   AUTH_CAPTURE_CURRENCY_MISMATCH: "invalid_request",
 };
 
+/** The first details[].issue of a PayPal error body, e.g. ORDER_ALREADY_CAPTURED. */
+export function payPalErrorIssue(body: unknown): string | undefined {
+  const details = typeof body === "object" && body !== null ? (body as PayPalErrorBody).details : undefined;
+  if (!Array.isArray(details)) return undefined;
+  return (details as Array<{ issue?: string } | null>).find((detail) => detail?.issue)?.issue;
+}
+
 export function mapPayPalError(httpStatus: number, body: unknown): PayFanoutError {
   const parsed = (typeof body === "object" && body !== null ? body : {}) as PayPalErrorBody;
-  const issue = parsed.details?.find((d) => d.issue)?.issue;
+  const issue = payPalErrorIssue(body);
   const mappedIssue = issue ? ISSUE_MAP[issue] : undefined;
   let code: UnifiedErrorCode;
   let retryable = false;

@@ -383,6 +383,50 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
     expect(second.amountCaptured).toBe(1000);
   });
 
+  it("a same-key retry of a partial capture replays it, though final_capture reads the new remainder", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    await adapter.capturePayment(orderId, 500, "k-cap-a");
+    await adapter.capturePayment(orderId, 1200, "k-cap-b"); // 3.00 left
+
+    // The first capture is retried after the second landed: 5.00 now covers the 3.00 left,
+    // so the body says final_capture: true, but PayPal replays by the PayPal-Request-Id
+    // header and answers the original capture.
+    const retried = await adapter.capturePayment(orderId, 500, "k-cap-a");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "5.00" }, final_capture: true });
+    expect(fake.uniqueCaptureCreations).toBe(2);
+    expect(retried.amountCaptured).toBe(1700);
+    expect(retried.amountCapturable).toBe(300); // the replay closed nothing
+
+    const rest = await adapter.capturePayment(orderId, undefined, "k-cap-rest");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "3.00" }, final_capture: true });
+    expect(rest.amountCaptured).toBe(2000);
+  });
+
+  it("a capture in another currency than the authorization's is refused", async () => {
+    const fake = new FakePayPalApi({ webhookId: WEBHOOK_ID });
+    // Resends authorization captures in EUR, as a capture in the wrong currency would go out.
+    const inEuros: typeof fetch = (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!/\/v2\/payments\/authorizations\/[^/]+\/capture$/.test(new URL(url).pathname)) return fake.fetch(input, init);
+      return fake.fetch(input, { ...init, body: String(init?.body).replace('"currency_code":"USD"', '"currency_code":"EUR"') });
+    };
+    const adapter = new PayPalServerAdapter({
+      clientId: fake.clientId,
+      clientSecret: fake.clientSecret,
+      environment: "sandbox",
+      fetch: inEuros,
+      sleep: async () => {},
+    });
+    const { orderId } = await authorizedPayment({ adapter, fake });
+    await expect(adapter.capturePayment(orderId, 500, "k-cap")).rejects.toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      raw: { details: [{ issue: "AUTH_CAPTURE_CURRENCY_MISMATCH" }] },
+    });
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "EUR", value: "5.00" }, final_capture: false });
+    expect(fake.uniqueCaptureCreations).toBe(0);
+  });
+
   it("rejects captures beyond the authorized amount via the PSP error", async () => {
     const { adapter, orderId } = await authorizedPayment();
     await adapter.capturePayment(orderId, 1800, "k-cap-1");

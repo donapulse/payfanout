@@ -116,7 +116,14 @@ describe("mapPayPalError", () => {
     [422, issue("REFUND_AMOUNT_EXCEEDED"), "invalid_request", false],
     [422, issue("CAPTURE_FULLY_REFUNDED"), "invalid_request", false],
     [422, issue("MAX_NUMBER_OF_REFUNDS_EXCEEDED"), "invalid_request", false],
+    [422, issue("AUTHORIZATION_ALREADY_CAPTURED"), "invalid_request", false],
+    [422, issue("AUTHORIZATION_DENIED"), "invalid_request", false],
+    [422, issue("AUTH_CAPTURE_CURRENCY_MISMATCH"), "invalid_request", false],
     [422, issue("SOMETHING_BRAND_NEW"), "invalid_request", false],
+    // Malformed details never break the mapping: null entries are skipped, a non-list is ignored.
+    [422, { name: "UNPROCESSABLE_ENTITY", details: [null, { issue: "INSTRUMENT_DECLINED" }] }, "card_declined", false],
+    [422, { name: "UNPROCESSABLE_ENTITY", details: "INSTRUMENT_DECLINED" }, "invalid_request", false],
+    [500, null, "psp_unavailable", true],
     [401, { error: "invalid_client", error_description: "Client Authentication failed" }, "invalid_request", false],
     [401, { name: "INVALID_TOKEN" }, "invalid_request", false],
     [429, { name: "RATE_LIMIT_REACHED" }, "rate_limited", true],
@@ -364,6 +371,8 @@ describe("PayPal bare-capture mapping (order aged out of GET)", () => {
       paymentMethodType: "paypal",
       capturedAt: "2026-05-16T05:18:59Z",
     });
+    // A capture carries no payment source, so no wallet is claimed for it.
+    expect(info.paymentMethodDetails).toBeUndefined();
   });
 
   it("REFUNDED reports the full amount; PARTIALLY_REFUNDED honestly reports 0", async () => {
@@ -443,14 +452,20 @@ describe("PayPal bare-capture mapping (order aged out of GET)", () => {
   });
 });
 
-/** Fixed responses keyed by "METHOD /path"; records what the adapter read and posted. */
-function adapterWithExchanges(routes: Record<string, { status: number; body: unknown }>): {
+type Exchange = { status: number; body: unknown };
+
+/**
+ * Fixed responses keyed by "METHOD /path" (a list answers one entry per call,
+ * its last entry repeating); records what the adapter read and posted.
+ */
+function adapterWithExchanges(routes: Record<string, Exchange | Exchange[]>): {
   adapter: PayPalServerAdapter;
   gets: string[];
   posts: Array<{ path: string; body: unknown }>;
 } {
   const gets: string[] = [];
   const posts: Array<{ path: string; body: unknown }> = [];
+  const served = new Map<string, number>();
   const adapter = new PayPalServerAdapter({
     clientId: "id",
     clientSecret: "secret",
@@ -463,17 +478,21 @@ function adapterWithExchanges(routes: Record<string, { status: number; body: unk
       const { pathname } = new URL(url);
       if (method === "POST") posts.push({ path: pathname, body: JSON.parse(String(init?.body)) as unknown });
       else gets.push(pathname);
-      const route = routes[`${method} ${pathname}`];
+      const key = `${method} ${pathname}`;
+      const route = routes[key];
       if (!route) {
         return new Response(JSON.stringify({ name: "RESOURCE_NOT_FOUND", message: "missing" }), { status: 404 });
       }
-      return new Response(JSON.stringify(route.body), { status: route.status });
+      const call = served.get(key) ?? 0;
+      served.set(key, call + 1);
+      const exchange = Array.isArray(route) ? route[Math.min(call, route.length - 1)]! : route;
+      return new Response(JSON.stringify(exchange.body), { status: exchange.status });
     }) as typeof fetch,
   });
   return { adapter, gets, posts };
 }
 
-const authorizedOrder = (payments: object): { status: number; body: unknown } => ({
+const authorizedOrder = (payments: object): Exchange => ({
   status: 200,
   body: {
     id: "5O1",
@@ -568,6 +587,83 @@ describe("PayPal capture requests", () => {
     await expect(adapter.capturePayment("2GG1", 100, "k")).rejects.toThrowError(/names no parent order/);
     expect(posts).toHaveLength(0);
   });
+
+  it("cancelling by a capture id whose capture names no parent order points to a refund", async () => {
+    const { adapter, posts } = adapterWithExchanges({
+      "GET /v2/payments/captures/2GG1": {
+        status: 200,
+        body: { id: "2GG1", status: "COMPLETED", amount: { currency_code: "USD", value: "5.00" } },
+      },
+    });
+    await expect(adapter.cancelPayment("2GG1", "k-void")).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringMatching(/names no parent order — captured payments cannot be canceled, refund them instead/),
+    });
+    expect(posts).toHaveLength(0);
+  });
+
+  it("capturing the rest of an authorization voided before captures covered it rejects without a capture", async () => {
+    // PayPal reports an authorization that expired after a partial capture as VOIDED.
+    const { adapter, posts } = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": authorizedOrder({
+        authorizations: [{ id: "A1", status: "VOIDED", amount: { currency_code: "USD", value: "20.00" } }],
+        captures: [{ id: "c1", status: "COMPLETED", amount: { currency_code: "USD", value: "5.00" } }],
+      }),
+    });
+    await expect(adapter.capturePayment("5O1", undefined, "k-rest")).rejects.toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      message: expect.stringMatching(/nothing left to capture \(authorization A1 is VOIDED\)/),
+    });
+    expect(posts).toHaveLength(0);
+  });
+
+  it("capturing the rest once captures cover the authorization, a pending one included, answers with the payment", async () => {
+    const { adapter, posts } = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": authorizedOrder({
+        authorizations: [{ id: "A1", status: "PARTIALLY_CAPTURED", amount: { currency_code: "USD", value: "20.00" } }],
+        captures: [
+          { id: "c1", status: "COMPLETED", amount: { currency_code: "USD", value: "12.00" } },
+          { id: "c2", status: "PENDING", amount: { currency_code: "USD", value: "8.00" } },
+        ],
+      }),
+    });
+    const info = await adapter.capturePayment("5O1", undefined, "k-rest");
+    expect(info).toMatchObject({ pspPaymentId: "c1", amountCaptured: 1200, amountCapturable: 0 });
+    expect(posts).toHaveLength(0);
+  });
+
+  it("a capture that took money as the final one closes the authorization", async () => {
+    // The capture's own final_capture closes it whatever status the authorization reports.
+    const closed = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": authorizedOrder({
+        authorizations: [{ id: "A1", status: "PARTIALLY_CAPTURED", amount: { currency_code: "USD", value: "20.00" } }],
+        captures: [{ id: "c1", status: "COMPLETED", final_capture: true, amount: { currency_code: "USD", value: "12.00" } }],
+      }),
+    });
+    expect((await closed.adapter.retrievePayment("5O1")).amountCapturable).toBe(0);
+    await expect(closed.adapter.capturePayment("5O1", undefined, "k-rest")).resolves.toMatchObject({
+      amountCaptured: 1200,
+      amountCapturable: 0,
+    });
+    expect(closed.posts).toHaveLength(0);
+
+    // A declined capture took nothing, so its final_capture closed nothing either.
+    const declined = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": authorizedOrder({
+        authorizations: [{ id: "A1", status: "CREATED", amount: { currency_code: "USD", value: "20.00" } }],
+        captures: [{ id: "c1", status: "DECLINED", final_capture: true, amount: { currency_code: "USD", value: "20.00" } }],
+      }),
+      "POST /v2/payments/authorizations/A1/capture": capturedOk,
+    });
+    await declined.adapter.capturePayment("5O1", undefined, "k-rest");
+    expect(declined.posts).toEqual([
+      {
+        path: "/v2/payments/authorizations/A1/capture",
+        body: { amount: { currency_code: "USD", value: "20.00" }, final_capture: true },
+      },
+    ]);
+  });
 });
 
 describe("PayPal completion replays (ORDER_ALREADY_CAPTURED)", () => {
@@ -612,6 +708,21 @@ describe("PayPal completion replays (ORDER_ALREADY_CAPTURED)", () => {
       "POST /v2/checkout/orders/5O1/capture": alreadyCaptured,
     });
     await expect(complete(noCapture.adapter)).rejects.toMatchObject({ code: "invalid_request" });
+  });
+
+  it("surfaces a failed re-read as its own error, not the original rejection", async () => {
+    const { adapter, gets } = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": [
+        {
+          status: 200,
+          body: { id: "5O1", intent: "CAPTURE", status: "APPROVED", purchase_units: [{ reference_id: "default" }] },
+        },
+        { status: 503, body: { name: "INTERNAL_SERVICE_ERROR" } },
+      ],
+      "POST /v2/checkout/orders/5O1/capture": alreadyCaptured,
+    });
+    await expect(complete(adapter)).rejects.toMatchObject({ code: "psp_unavailable", retryable: true });
+    expect(gets).toEqual(["/v2/checkout/orders/5O1", "/v2/checkout/orders/5O1"]); // read, then the failed re-read
   });
 
   it("rethrows every other completion error without re-reading", async () => {

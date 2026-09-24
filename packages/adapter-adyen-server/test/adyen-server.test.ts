@@ -229,9 +229,10 @@ runServerAdapterConformanceTests(
         expectedCode: "invalid_request",
       },
       {
-        // Adyen acknowledges a refund on any reference and reports an unknown
-        // one by webhook, so the first call resolves; the second is answered with
-        // the first one's stored acknowledgement, which echoes another amount.
+        // The fake acknowledges a refund on any reference (assumed of Adyen,
+        // whose refund guide lists no unknown-reference failure), so the first
+        // call resolves; the second is answered with the first one's stored
+        // acknowledgement, which echoes another amount.
         name: "refundPayment reusing an idempotency key for a different amount",
         invoke: async (a) => {
           await a.refundPayment({ pspPaymentId: "8836100000000042:1000:EUR", amount: 500, idempotencyKey: "k" });

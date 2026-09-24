@@ -7,6 +7,7 @@ import {
   mapAdyenRefusal,
   type AdyenServerAdapterConfig,
 } from "../src/index.js";
+import { derivePaymentIdempotencyKey } from "../src/signing.js";
 import { FakeAdyenApi } from "./fake-adyen-api.js";
 
 /** Adyen's published webhook HMAC test key; nothing here verifies a webhook. */
@@ -91,52 +92,82 @@ async function rejection(promise: Promise<unknown>) {
   return expect.unreachable("expected a rejection");
 }
 
-describe("the idempotency-key derivation", () => {
-  const base = { merchantAccount: "TestMerchant", path: "/payments", idempotencyKey: "caller-key" };
+describe("the idempotency-key derivations", () => {
+  const base = { merchantAccount: "TestMerchant", path: "/payments", idempotencyKey: "caller-key" } as const;
 
-  it("tells requests apart by merchant account, path and caller key", async () => {
-    const header = await deriveAdyenIdempotencyKey(base);
-    expect(header).toMatch(/^[0-9a-f]{64}$/);
-    for (const other of [
-      { ...base, merchantAccount: "TestMerchantUS" },
-      { ...base, path: "/payments/8836100000000001/refunds" },
-      { ...base, idempotencyKey: "caller-key-2" },
-    ]) {
-      expect(await deriveAdyenIdempotencyKey(other)).not.toBe(header);
+  it("keeps the header 0.1.0 sent on every capture, cancel and refund", async () => {
+    const path = "/payments/8836100000000001/refunds";
+    expect(await deriveAdyenIdempotencyKey(path, "caller-key")).toBe(await sha256Hex(`${path}\ncaller-key`));
+
+    const { adapter, fake } = withFake();
+    const captured = await pay(adapter, "complete-1", "manual");
+    await adapter.capturePayment(captured.pspPaymentId, 1000, "capture-key");
+    await adapter.refundPayment({ pspPaymentId: captured.pspPaymentId, amount: 500, idempotencyKey: "refund-key" });
+    const canceled = await pay(adapter, "complete-2", "manual");
+    await adapter.cancelPayment(canceled.pspPaymentId, "cancel-key");
+
+    const keys = ["capture-key", "refund-key", "cancel-key"];
+    const modifications = fake.requests.filter((request) => /\/(captures|refunds|cancels)$/.test(request.path));
+    expect(modifications).toHaveLength(keys.length);
+    for (const [index, request] of modifications.entries()) {
+      // The fake records the versioned path; the header covers it without the version.
+      const unversioned = request.path.replace(/^\/v72/, "");
+      expect(request.idempotencyKey).toBe(await sha256Hex(`${unversioned}\n${keys[index]}`));
     }
   });
 
+  it("scopes /payments and /payments/details to the merchant account and moves both off the 0.1.0 value", async () => {
+    const header = await derivePaymentIdempotencyKey(base);
+    expect(header).toMatch(/^[0-9a-f]{64}$/);
+    for (const other of [
+      { ...base, merchantAccount: "TestMerchantUS" },
+      { ...base, path: "/payments/details" as const },
+      { ...base, idempotencyKey: "caller-key-2" },
+    ]) {
+      expect(await derivePaymentIdempotencyKey(other)).not.toBe(header);
+    }
+    // Nothing submitted alongside a /payments request reaches its header.
+    expect(await derivePaymentIdempotencyKey({ ...base, details: { threeDSResult: "one" }, paymentData: "Ab02" })).toBe(
+      header,
+    );
+    // The reason completions first sent by 0.1.0 must not be retried after the upgrade.
+    expect(header).not.toBe(await sha256Hex("/payments\ncaller-key"));
+    const details = await derivePaymentIdempotencyKey({ ...base, path: "/payments/details", details: {} });
+    expect(details).not.toBe(await sha256Hex("/payments/details\ncaller-key"));
+  });
+
   it("encodes its fields unambiguously", async () => {
-    // Joined with a separator, these two would hash the same text.
-    const first = await deriveAdyenIdempotencyKey({ merchantAccount: "M", path: "/a", idempotencyKey: "b\n/c" });
-    const second = await deriveAdyenIdempotencyKey({ merchantAccount: "M\n/a", path: "b", idempotencyKey: "/c" });
+    // Joined with a newline, these two would hash the same text.
+    const first = await derivePaymentIdempotencyKey({ ...base, merchantAccount: "M\n/payments", idempotencyKey: "x" });
+    const second = await derivePaymentIdempotencyKey({ ...base, merchantAccount: "M", idempotencyKey: "/payments\nx" });
     expect(first).not.toBe(second);
   });
 
-  it("covers the /payments/details submission, whatever order its keys arrive in", async () => {
-    const scope = { ...base, path: "/payments/details" };
+  it("covers the /payments/details submission as canonical JSON data", async () => {
+    const scope = { ...base, path: "/payments/details" } as const;
     const derive = (submission: { details?: unknown; paymentData?: string }) =>
-      deriveAdyenIdempotencyKey({ ...scope, ...submission });
-    const bare = await deriveAdyenIdempotencyKey(scope);
+      derivePaymentIdempotencyKey({ ...scope, ...submission });
     const step = await derive({ details: { threeDSResult: "one" }, paymentData: "Ab02" });
-    expect(step).not.toBe(bare);
+    expect(await derive({ details: { threeDSResult: "one" }, paymentData: "Ab02" })).toBe(step);
     expect(await derive({ details: { threeDSResult: "two" }, paymentData: "Ab02" })).not.toBe(step);
     expect(await derive({ details: { threeDSResult: "one" }, paymentData: "Cd03" })).not.toBe(step);
     expect(await derive({ details: { threeDSResult: "one" } })).not.toBe(step);
-    expect(await derive({ paymentData: "Ab02" })).not.toBe(bare);
 
-    // Canonical JSON: key order is not content, array order is, and absent
-    // values encode the way JSON.stringify writes them.
-    const nested = { a: 1, b: { d: [1, { f: true, e: null }], c: "x" }, u: undefined };
+    // Key order is not content, array order is.
+    const nested = { a: 1, b: { d: [1, { f: true, e: null }], c: "x" } };
     const reordered = { b: { c: "x", d: [1, { e: null, f: true }] }, a: 1 };
     expect(await derive({ details: nested })).toBe(await derive({ details: reordered }));
     expect(await derive({ details: { list: [1, 2] } })).not.toBe(await derive({ details: { list: [2, 1] } }));
-    expect(await derive({ details: { list: [undefined, 1] } })).toBe(await derive({ details: { list: [null, 1] } }));
-    expect(await derive({ details: { list: [() => 1] } })).toBe(await derive({ details: { list: [null] } }));
-  });
-
-  it("differs from the value the previous release sent, so a retry spanning the upgrade is a new request", async () => {
-    expect(await deriveAdyenIdempotencyKey(base)).not.toBe(await sha256Hex("/payments\ncaller-key"));
+    // null is data; what JSON.stringify drops is not: such a member is left
+    // out, and such an array item written as null.
+    expect(await derive({ details: { a: null } })).not.toBe(await derive({ details: {} }));
+    for (const dropped of [undefined, () => 1, Symbol("dropped")]) {
+      expect(await derive({ details: { a: 1, b: dropped } })).toBe(await derive({ details: { a: 1 } }));
+      expect(await derive({ details: { list: [dropped, 1] } })).toBe(await derive({ details: { list: [null, 1] } }));
+    }
+    const holey: unknown[] = new Array(2);
+    holey[1] = 1;
+    expect(await derive({ details: { list: holey } })).toBe(await derive({ details: { list: [null, 1] } }));
   });
 });
 
@@ -170,6 +201,28 @@ describe("idempotency across one company account", () => {
     expect(await adapter.refundPayment(refund)).toEqual(refunded);
     expect(fake.uniqueRefundRequests).toBe(1);
     expect(fake.replays).toBe(2);
+  });
+
+  it("keeps the /payments body out of the header, so a completion retried with a changed blob is one payment", async () => {
+    const { adapter, fake } = withFake();
+    const session = await adapter.createPaymentSession({ amount: 2500, currency: "EUR", idempotencyKey: "s" });
+    const complete = (holderName: string) =>
+      adapter.completePayment({
+        pspSessionId: session.pspSessionId,
+        clientToken: JSON.stringify({ ...JSON.parse(CLIENT_TOKEN), holderName }),
+        idempotencyKey: "complete-1",
+      });
+    const first = await complete("J. Smith");
+    // A free-text field of the paymentMethod blob changed before the retry.
+    expect(await complete("John Smith")).toEqual(first);
+    expect(fake.uniquePaymentCreations).toBe(1);
+    expect(fake.replays).toBe(1);
+    const payments = fake.requests.filter((request) => request.path.endsWith("/payments"));
+    expect(payments.map((request) => (request.body?.["paymentMethod"] as { holderName?: string }).holderName)).toEqual([
+      "J. Smith",
+      "John Smith",
+    ]);
+    expect(payments[1]!.idempotencyKey).toBe(payments[0]!.idempotencyKey);
   });
 
   it("sends each /payments/details step as its own request, and a repeated step once", async () => {
@@ -207,7 +260,9 @@ describe("idempotency across one company account", () => {
 });
 
 describe("modification acknowledgements", () => {
-  it("acknowledges modifications on a reference Adyen does not know; the failure arrives by webhook", async () => {
+  it("resolves a capture, cancel or refund on a reference the fake does not know", async () => {
+    // Adyen's capture and cancel guides report "Transaction not found" by
+    // webhook, not in the answer; that refunds behave alike is an assumption.
     const { adapter, fake } = withFake();
     await expect(adapter.refundPayment({ pspPaymentId: UNKNOWN_PAYMENT, idempotencyKey: "r" })).resolves.toMatchObject({
       status: "pending",
@@ -223,10 +278,14 @@ describe("modification acknowledgements", () => {
   it("rejects a refund whose acknowledgement echoes the amount of an earlier refund under the same key", async () => {
     const { adapter, fake } = withFake();
     const { pspPaymentId } = await pay(adapter, "complete-1");
-    await adapter.refundPayment({ pspPaymentId, amount: 500, idempotencyKey: "refund-1" });
+    const accepted = await adapter.refundPayment({ pspPaymentId, amount: 500, idempotencyKey: "refund-1" });
     const error = await rejection(adapter.refundPayment({ pspPaymentId, amount: 400, idempotencyKey: "refund-1" }));
     expect(error).toMatchObject({ code: "invalid_request", retryable: false, pspName: "adyen" });
-    expect(error.message).toMatch(/idempotencyKey was already used/);
+    // It states what Adyen holds under the key, and never advises a second refund.
+    expect(error.message).toBe(
+      `Adyen already accepted a refund of 500 EUR under this idempotencyKey (pspReference ${accepted.refundId}). ` +
+        "If that is the refund you meant, do not send it again; a further refund needs a new idempotencyKey.",
+    );
     expect(error.raw).toMatchObject({ status: "received", amount: { value: 500, currency: "EUR" } });
     // Adyen answered from its store: the second refund was never requested.
     expect(fake.uniqueRefundRequests).toBe(1);
@@ -249,6 +308,17 @@ describe("modification acknowledgements", () => {
       code: "invalid_request",
       retryable: false,
     });
+  });
+
+  it("matches an echoed currency whatever its letter case", async () => {
+    const { adapter } = answering(
+      201,
+      JSON.stringify({ pspReference: "8836100000000077", status: "received", amount: { value: 1000, currency: "eur" } }),
+    );
+    await expect(adapter.capturePayment(UNKNOWN_PAYMENT, 1000, "c")).resolves.toMatchObject({ status: "processing" });
+    await expect(
+      adapter.refundPayment({ pspPaymentId: UNKNOWN_PAYMENT, amount: 1000, idempotencyKey: "r" }),
+    ).resolves.toMatchObject({ status: "pending", refundId: "8836100000000077" });
   });
 
   it("rejects every 2xx that is not an acknowledgement, on all three calls, without a TypeError", async () => {
@@ -279,10 +349,14 @@ describe("modification acknowledgements", () => {
         expect(sent()).toBe(1);
       }
     }
-    // An absent echo is accepted: Adyen's refund guide shows acknowledgements
-    // without one, and refusing them would report accepted refunds as failed.
-    {
-      const { adapter } = answering(201, JSON.stringify({ pspReference: "8836100000000077", status: "received" }));
+    // An absent or null echo is accepted: Adyen's refund guide shows
+    // acknowledgements without one, and refusing them would report accepted
+    // refunds as failed.
+    for (const body of [
+      { pspReference: "8836100000000077", status: "received" },
+      { pspReference: "8836100000000077", status: "received", amount: null },
+    ]) {
+      const { adapter } = answering(201, JSON.stringify(body));
       await expect(calls.capture(adapter)).resolves.toMatchObject({ status: "processing" });
       await expect(calls.refund(adapter)).resolves.toMatchObject({ status: "pending", refundId: "8836100000000077" });
     }
@@ -351,6 +425,48 @@ describe("HTTP error classification", () => {
     flaky.scriptedResponses.push({ status: 500, body: { ...GENERIC_500, errorType: "internal" } });
     await expect(other.cancelPayment("8836100000000042", "k")).resolves.toMatchObject({ status: "processing" });
     expect(flaky.requests).toHaveLength(2);
+  });
+
+  it("retries a plain 5xx even under transient-error: false, deliberately", async () => {
+    // Adyen stores no request an internal error stopped, and the retry carries
+    // the same key, so it cannot perform a modification twice.
+    const internal = { ...GENERIC_500, errorType: "internal" };
+    expect(mapAdyenError(500, internal, { transient: false })).toMatchObject({ code: "psp_unavailable", retryable: true });
+
+    const { adapter, fake } = withFake();
+    fake.scriptedResponses.push({ status: 500, body: internal, headers: { "transient-error": "false" } });
+    await expect(
+      adapter.refundPayment({ pspPaymentId: UNKNOWN_PAYMENT, amount: 500, idempotencyKey: "k" }),
+    ).resolves.toMatchObject({ status: "pending" });
+    expect(fake.requests).toHaveLength(2);
+    expect(fake.requests[1]!.idempotencyKey).toBe(fake.requests[0]!.idempotencyKey);
+    expect(fake.uniqueRefundRequests).toBe(1);
+  });
+
+  it("reads the transient-error header case-insensitively, ignoring surrounding whitespace", async () => {
+    let calls = 0;
+    const adapter = makeAdapter({
+      // A bare response object: Response itself would strip the whitespace
+      // before the adapter could see it.
+      fetch: async () =>
+        (++calls === 1
+          ? {
+              ok: false,
+              status: 422,
+              headers: { get: (name: string) => (name === "transient-error" ? " TRUE " : null) },
+              text: async () => JSON.stringify(GENERIC_422),
+            }
+          : new Response(JSON.stringify({ pspReference: "8836100000000077", status: "received" }), {
+              status: 201,
+            })) as Response,
+    });
+    await expect(adapter.cancelPayment("8836100000000042", "k")).resolves.toMatchObject({ status: "processing" });
+    expect(calls).toBe(2);
+
+    const { adapter: other, fake } = withFake();
+    fake.scriptedResponses.push({ status: 422, body: GENERIC_422, headers: { "transient-error": "True" } });
+    await expect(other.cancelPayment("8836100000000042", "k")).resolves.toMatchObject({ status: "processing" });
+    expect(fake.requests).toHaveLength(2);
   });
 
   it("reads errorCode 705 as rate limiting, whatever the status", async () => {

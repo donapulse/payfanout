@@ -10,33 +10,53 @@ const encoder = new TextEncoder();
 /** Adyen caps the `idempotency-key` header at 64 characters. */
 export const ADYEN_IDEMPOTENCY_KEY_MAX_LENGTH = 64;
 
+/**
+ * The `idempotency-key` header the adapter sends on every capture, cancel and
+ * refund. A caller's `idempotencyKey` is arbitrary; Adyen's header takes at
+ * most 64 characters. A SHA-256 hex digest is exactly 64 and deterministic, so
+ * the same caller key on the same endpoint always derives the same header value
+ * and a replay dedupes at Adyen.
+ *
+ * The request path is part of the digest because Adyen stores idempotency keys
+ * **at company account level**, not per endpoint: without it, a capture and a
+ * refund under one caller key would receive each other's stored answers. A
+ * modification's path also carries the payment's pspReference, which Adyen
+ * makes globally unique, so two merchant accounts of one company never derive
+ * the same value; and it is the value 0.1.0 sent on every call, so a
+ * modification retried across the upgrade still dedupes. `/payments` and
+ * `/payments/details` carry no pspReference in their path, so the adapter
+ * derives their header differently, covering the merchant account as well.
+ */
+export async function deriveAdyenIdempotencyKey(path: string, idempotencyKey: string): Promise<string> {
+  // The newline cannot appear in a path, so no pair of (path, key) inputs can
+  // produce the same digest input as another.
+  return sha256Hex(`${path}\n${idempotencyKey}`);
+}
+
 /** Leads every encoding, so a later derivation cannot reproduce a value this one sends. */
-const IDEMPOTENCY_KEY_DERIVATION = "adyen-idempotency-key/2";
+const PAYMENT_IDEMPOTENCY_KEY_DERIVATION = "adyen-idempotency-key/2";
 
 /**
- * The `idempotency-key` header of one Adyen request. A caller's
- * `idempotencyKey` is arbitrary and the header takes at most 64 characters, so
- * it travels as a SHA-256 hex digest: exactly 64 characters, deterministic, and
- * identical on every retry of the same request, which Adyen then answers from
- * its store instead of performing it again.
+ * The `idempotency-key` header of a `/payments` or `/payments/details` request:
+ * the SHA-256 hex digest of the JSON array
+ * `["adyen-idempotency-key/2", merchantAccount, path, idempotencyKey, submission]`.
+ * Internal to the adapter; the package does not export it.
  *
- * Adyen stores idempotency keys **at company account level** and checks their
- * uniqueness there, not per endpoint or merchant account: a value one request
- * consumed replays that request's stored response to any other request that
- * sends it. The digest therefore covers everything that tells two requests
- * apart under one caller key: the merchant account (two merchant accounts of
- * one company), the path (`/payments` then `/payments/details`, a capture then a
- * refund) and, for `/payments/details`, the submitted `details` and
- * `paymentData`, since each step of a multi-step action flow submits different
- * data while a replayed step submits the same. The fields are encoded as a JSON
- * array and the submission as canonical JSON (object keys sorted), so no two
- * distinct inputs share an encoding.
+ * Neither path carries a pspReference, and Adyen checks idempotency keys across
+ * the whole company account, so the merchant account is part of the digest: two
+ * merchant accounts of one company sharing a caller key never receive each
+ * other's stored answers. `submission` is `null` on `/payments`, whose body
+ * stays out of the digest, so a completion retried under the same key dedupes
+ * whatever payment-method blob it carries. On `/payments/details` it is the
+ * SHA-256 of the canonical JSON of the submitted `details` and `paymentData`:
+ * each step of a multi-step action flow submits different data and is a request
+ * of its own, while a replayed step submits the same data and dedupes. The
+ * fields travel as a JSON array, so no two distinct inputs share an encoding.
  */
-export async function deriveAdyenIdempotencyKey(request: {
+export async function derivePaymentIdempotencyKey(request: {
   /** The merchant account the request is booked against. */
   merchantAccount: string;
-  /** The Checkout API path without host or version, e.g. `/payments/{pspReference}/refunds`. */
-  path: string;
+  path: "/payments" | "/payments/details";
   /** The caller's `idempotencyKey`. */
   idempotencyKey: string;
   /** `/payments/details` only: the request's `details`, as sent. */
@@ -45,25 +65,37 @@ export async function deriveAdyenIdempotencyKey(request: {
   paymentData?: string;
 }): Promise<string> {
   const { merchantAccount, path, idempotencyKey, details, paymentData } = request;
-  const submission =
-    details === undefined && paymentData === undefined
-      ? null
-      : await sha256Hex(canonicalJson({ details, paymentData }));
-  return sha256Hex(JSON.stringify([IDEMPOTENCY_KEY_DERIVATION, merchantAccount, path, idempotencyKey, submission]));
+  const submission = path === "/payments/details" ? await sha256Hex(canonicalJson({ details, paymentData })) : null;
+  return sha256Hex(
+    JSON.stringify([PAYMENT_IDEMPOTENCY_KEY_DERIVATION, merchantAccount, path, idempotencyKey, submission]),
+  );
 }
 
-/** JSON with object keys sorted at every depth, so equal values always encode alike. */
+/**
+ * Canonical JSON of JSON data — what `JSON.parse` returns, which is all a
+ * `/payments/details` submission is: object keys sorted at every depth, so
+ * equal values always encode alike and distinct values never share an
+ * encoding. A member whose value is `undefined`, a function or a symbol is left
+ * out, and such an array item written as `null`, as `JSON.stringify` does, so
+ * the encoding covers what the request body carries and nothing it drops.
+ */
 function canonicalJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item ?? null)).join(",")}]`;
+  if (isDroppedByJson(value)) return "null";
+  if (Array.isArray(value)) return `[${Array.from(value, (item) => canonicalJson(item)).join(",")}]`;
   if (value !== null && typeof value === "object") {
     const record = value as Record<string, unknown>;
     const members = Object.keys(record)
-      .filter((key) => record[key] !== undefined)
+      .filter((key) => !isDroppedByJson(record[key]))
       .sort()
       .map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`);
     return `{${members.join(",")}}`;
   }
-  return JSON.stringify(value) ?? "null";
+  return JSON.stringify(value);
+}
+
+/** The values `JSON.stringify` leaves out of an object and writes as `null` in an array. */
+function isDroppedByJson(value: unknown): boolean {
+  return value === undefined || typeof value === "function" || typeof value === "symbol";
 }
 
 /**

@@ -62,9 +62,11 @@ not confirmed; the confirmation is the webhook.
 They resolve only on a real acknowledgement: one carrying the modification's own
 `pspReference`. An answer without it rejects with a retryable `processing_error` (a replay
 under the same key cannot repeat the modification). A capture or refund acknowledgement that
-echoes another amount or currency rejects with `invalid_request`, because it is Adyen's stored
-answer to an earlier request that used the same idempotency key; one that echoes no amount is
-accepted, as Adyen's refund guide shows acknowledgements without it.
+echoes another amount or currency rejects with `invalid_request`: it is Adyen's stored answer
+to an earlier capture or refund under the same idempotency key, which Adyen already accepted,
+and the error names its amount and `pspReference`. If that is the one you meant, do not send
+it again; a further capture or refund needs a new key. One that echoes no amount is accepted,
+as Adyen's refund guide shows acknowledgements without it.
 
 Consequences worth designing around:
 
@@ -79,10 +81,12 @@ Consequences worth designing around:
 - **Failures arrive by webhook, not as errors.** A refund without `amount` requests the
   authorised amount the composite carries, which Adyen refuses in the `REFUND` webhook once
   part of the payment was captured or refunded, so pass `amount` for partial cases.
-  `cancelPayment` only voids an authorisation that has not been captured; a cancel after the
-  capture arrives as a failed `CANCELLATION` webhook. A capture or cancel for a
-  `pspReference` Adyen does not know is acknowledged and fails in its webhook with
-  `Transaction not found`.
+  `cancelPayment` only voids an authorisation that has not been captured; that a cancel after
+  the capture is acknowledged and fails in the `CANCELLATION` webhook is an assumption, since
+  Adyen documents only that a captured payment can no longer be cancelled. A capture or cancel
+  for a `pspReference` Adyen does not know is acknowledged and fails in its webhook with
+  `Transaction not found`, and a refund is assumed to behave alike. That holds within one
+  environment: a reference from the other one is rejected in the answer (Adyen error 906).
 - **The webhook endpoint is the system of record.** There is no events-polling API either
   (`supportsEventPolling: false`), so persist every event and dedupe by `event.id`.
 
@@ -132,18 +136,23 @@ is one whose signed values were altered. `verifyAdyenWebhook` returns the specif
 
 ## Notes
 
-- Every call carries an `idempotency-key`: the SHA-256 digest (Adyen caps the header at 64
-  characters) of the caller's `idempotencyKey`, the merchant account and the endpoint, plus
-  the submitted `details` and `paymentData` on `/payments/details`. Adyen checks keys across
-  the whole company account, so two merchant accounts, a capture and a refund, or the steps
-  of a 3-D Secure flow never receive each other's stored answers, while a replay of the same
-  call is deduplicated. Keys last 7 to 14 days and are not checked across location-based
-  endpoints. Use a random (v4) UUID per operation, as Adyen recommends, and a new one for a
-  new attempt: a refusal is replayed for its key.
+- Every call carries an `idempotency-key`, a SHA-256 digest (Adyen caps the header at 64
+  characters). On `/payments` it covers the caller's `idempotencyKey`, the merchant account
+  and the endpoint, and on `/payments/details` also the submitted `details` and
+  `paymentData`. On captures, cancels and refunds it covers the caller's key and the
+  endpoint, whose path carries the payment's `pspReference`, unique across Adyen
+  (`deriveAdyenIdempotencyKey` computes that one). Adyen checks keys across the whole company
+  account, so two merchant accounts, a capture and a refund, or the steps of a 3-D Secure
+  flow never receive each other's stored answers, while a replay of the same call is
+  deduplicated. Keys last 7 to 14 days and are not checked across location-based endpoints.
+  Use a random (v4) UUID per operation, as Adyen recommends, and a new one for a new attempt:
+  a refusal is replayed for its key.
 - The transport retries, with backoff and the same key (`maxNetworkRetries`, default 2):
   network failures, timeouts, HTTP 408 and 429, `errorCode` 704 and 705, 5xx errors not
   typed `validation`/`configuration`/`security` (those, and 501, reject as `invalid_request`),
-  a 2xx that is not a JSON object, and anything Adyen sends with `transient-error: true`.
+  a 2xx that is not a JSON object, and anything Adyen sends with `transient-error: true` (in
+  any letter case). The 5xx retry needs no `transient-error` header, deliberately: Adyen does
+  not store a request an internal error stopped, and the retry carries the same key.
 - **`returnUrl` is required on every payment.** Pass it per session, or set
   `defaultReturnUrl` once; a session with neither is refused with `invalid_request` instead
   of reaching Adyen. A host `id` containing `:` or `\` is refused too: it becomes the

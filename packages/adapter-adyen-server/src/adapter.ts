@@ -26,7 +26,7 @@ import {
   type UnifiedPaymentStatus,
   type UnifiedWebhookEvent,
 } from "@payfanout/core";
-import { deriveAdyenIdempotencyKey, hexToBytes } from "./signing.js";
+import { deriveAdyenIdempotencyKey, derivePaymentIdempotencyKey, hexToBytes } from "./signing.js";
 import { decodeSessionContext, encodeSessionContext, type AdyenSessionContextV1 } from "./session-context.js";
 import {
   parseAdyenWebhookEvent,
@@ -93,10 +93,13 @@ export interface AdyenServerAdapterConfig {
    * Automatic retries with exponential backoff, each under the same
    * `idempotency-key` (default 2): network failures, timeouts, HTTP 408 and 429,
    * `errorCode` 705 (rate limited), a duplicate racing its in-flight original
-   * (`errorCode` 704), 5xx errors unless Adyen types them `validation`,
-   * `configuration` or `security`, a 2xx whose body is not a JSON object, and
-   * any error Adyen sends with `transient-error: true`. Every other rejection
-   * surfaces on the first attempt, and a refusal is an answer, never retried.
+   * (`errorCode` 704), 5xx errors other than 501 unless Adyen types them
+   * `validation`, `configuration` or `security`, a 2xx whose body is not a JSON
+   * object, and any error Adyen sends with `transient-error: true`. The 5xx retry
+   * needs no `transient-error` header, deliberately: Adyen does not store a
+   * request an internal error stopped, and the retry carries the same key. Every
+   * other rejection surfaces on the first attempt, and a refusal is an answer,
+   * never retried.
    */
   maxNetworkRetries?: number;
   /** Account capabilities vary by contract — override instead of trusting defaults. */
@@ -210,7 +213,10 @@ const RATE_LIMITED_ERROR_CODE = "705";
  */
 const REQUEST_ERROR_TYPES = new Set(["validation", "configuration", "security"]);
 
-/** The one endpoint whose idempotency key also covers the submitted data. */
+/** Creates the payment; its idempotency key covers the merchant account but not the body. */
+const PAYMENTS_PATH = "/payments";
+
+/** Finishes an action; the one endpoint whose idempotency key also covers the submitted data. */
 const PAYMENT_DETAILS_PATH = "/payments/details";
 
 /** RefundRequest.reason -> Adyen's `merchantRefundReason`. */
@@ -468,8 +474,9 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
   /**
    * Requests a capture. Adyen answers `{ status: "received" }`, so the reported
    * status is "processing" and no amountCaptured is invented — the settled amount
-   * is knowable only from the CAPTURE webhook. The acknowledgement must echo the
-   * amount requested (see readAcknowledgement).
+   * is knowable only from the CAPTURE webhook. An acknowledgement echoing a
+   * different amount or currency is rejected, and one echoing none is accepted
+   * (see readAcknowledgement).
    */
   async capturePayment(
     pspPaymentId: string,
@@ -499,8 +506,9 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
 
   /**
    * Requests a cancel. Accepts the bare pspReference: no money facts are needed.
-   * Adyen only cancels an authorisation that has not been captured; a cancel it
-   * cannot perform fails in the CANCELLATION webhook, not here.
+   * Adyen documents only that a captured payment can no longer be cancelled; a
+   * cancel after the capture is assumed to be acknowledged and to fail in the
+   * CANCELLATION webhook, and a rejection in the answer surfaces as an error.
    */
   async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
     const ref = decodeAdyenPaymentRef(pspPaymentId);
@@ -596,14 +604,15 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
   }
 
   /**
-   * An acknowledgement carries the modification's own pspReference, and a
-   * capture's or refund's echoes the amount requested. Adyen answers a reused
-   * idempotency key with the first request's stored response, so an echo of
-   * another amount means the key was already spent on a different request of
-   * the same kind: replaying cannot change that answer, and reporting the
-   * requested amount as accepted would be false. An acknowledgement missing
-   * those fields confirms nothing either; a replay under the same key cannot
-   * repeat the modification, so that rejection is retryable.
+   * A modification resolves only on an acknowledgement carrying its own
+   * pspReference. One missing it confirms nothing, and since a replay under the
+   * same key cannot repeat the modification, that rejection is retryable.
+   * Adyen answers a reused idempotency key with the first request's stored
+   * response, so a capture or refund acknowledgement echoing a different amount
+   * or currency is the answer to an earlier request under the same key: it is
+   * rejected, since reporting the requested amount as accepted would be false.
+   * One echoing no amount is accepted, and a malformed echo confirms nothing
+   * (retryable, like a missing pspReference).
    */
   private readAcknowledgement(
     operation: "capture" | "cancel" | "refund",
@@ -620,19 +629,19 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
       });
     if (typeof response.pspReference !== "string" || response.pspReference === "") throw unconfirmed();
     // The contract requires the echo, but the refund guide's own example omits
-    // it: an absent echo is accepted, since refusing it would report a refund
-    // Adyen took as failed. Only an echo naming another amount proves reuse.
-    if (requested && response.amount !== undefined) {
+    // it: an absent or null echo is accepted, since refusing it would report a
+    // refund Adyen took as failed. Only an echo naming another amount or
+    // currency proves the key was used before.
+    if (requested && response.amount != null) {
       const echoed = echoedAmount(response);
       if (!echoed) throw unconfirmed();
       if (echoed.value !== requested.value || echoed.currency !== requested.currency) {
         throw new PayFanoutError({
           code: "invalid_request",
           message:
-            `Adyen answered with the acknowledgement of a ${operation} of ${echoed.value} ${echoed.currency}, not ` +
-            `${requested.value} ${requested.currency}: this idempotencyKey was already used for another ` +
-            `${operation} of this payment, and Adyen answers a reused key with its first response. Send the ` +
-            `${operation} under a new idempotencyKey`,
+            `Adyen already accepted a ${operation} of ${echoed.value} ${echoed.currency} under this idempotencyKey ` +
+            `(pspReference ${response.pspReference}). If that is the ${operation} you meant, do not send it ` +
+            `again; a further ${operation} needs a new idempotencyKey.`,
           retryable: false,
           raw: response,
           pspName: this.pspName,
@@ -710,16 +719,11 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
    * Transport with timeout + transient-only retries. Every Adyen call is a POST
    * whose `idempotency-key` is derived once and sent unchanged on every attempt,
    * so a replay is answered from Adyen's store and can never double-charge;
-   * rejections surface on the first attempt unless Adyen marks them transient.
-   * Resolves only with a JSON object.
+   * rejections surface on the first attempt unless mapAdyenError reads them as
+   * retryable. Resolves only with a JSON object.
    */
   private async post<T>(path: string, body: unknown, idempotencyKey: string): Promise<T> {
-    const idempotencyHeader = await deriveAdyenIdempotencyKey({
-      merchantAccount: this.config.merchantAccount,
-      path,
-      idempotencyKey,
-      ...(path === PAYMENT_DETAILS_PATH ? detailsSubmission(body) : {}),
-    });
+    const idempotencyHeader = await this.idempotencyHeader(path, body, idempotencyKey);
     return withTransportRetries(() => this.postOnce<T>(path, body, idempotencyHeader), {
       attempts: 1 + (this.config.maxNetworkRetries ?? 2),
       ...(this.config.sleep ? { sleep: this.config.sleep } : {}),
@@ -727,6 +731,21 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
       // the still in-flight original among them — may be replayed too.
       isRetryable: (err) => isTransportRetryable(err) || isTransientRejection(err),
     });
+  }
+
+  /**
+   * `/payments` and `/payments/details` carry no pspReference in their path, so
+   * their header also covers the merchant account (and, on `/payments/details`,
+   * the submitted data). Captures, cancels and refunds keep the header 0.1.0
+   * sent; signing.ts gives the reasons for both derivations.
+   */
+  private idempotencyHeader(path: string, body: unknown, idempotencyKey: string): Promise<string> {
+    const { merchantAccount } = this.config;
+    if (path === PAYMENTS_PATH) return derivePaymentIdempotencyKey({ merchantAccount, path, idempotencyKey });
+    if (path === PAYMENT_DETAILS_PATH) {
+      return derivePaymentIdempotencyKey({ merchantAccount, path, idempotencyKey, ...detailsSubmission(body) });
+    }
+    return deriveAdyenIdempotencyKey(path, idempotencyKey);
   }
 
   private async postOnce<T>(path: string, body: unknown, idempotencyHeader: string): Promise<T> {
@@ -884,7 +903,11 @@ export function mapAdyenRefusal(response: AdyenPaymentResponse): PayFanoutError 
 }
 
 export interface MapAdyenErrorOptions {
-  /** True when the response carried Adyen's `transient-error: true` header. */
+  /**
+   * True when the response carried Adyen's `transient-error` header set to
+   * `true`; the adapter reads the value case-insensitively, ignoring
+   * surrounding whitespace.
+   */
   transient?: boolean;
 }
 
@@ -902,6 +925,13 @@ export interface MapAdyenErrorOptions {
  *  - a 5xx typed `validation`, `configuration` or `security` faults the request
  *    itself: non-retryable invalid_request. Other 5xx are psp_unavailable and
  *    other 4xx (401/403 bad key, 422 validation) invalid_request.
+ *
+ * Those other 5xx stay retryable without the transient header, and under
+ * `transient-error: false`, deliberately, although Adyen's idempotency guide
+ * advises against retrying then: its HTTP status codes page says Adyen neither
+ * accepts nor stores a request an internal error stopped, and a retry carries
+ * the same key, so Adyen answers it from its store if the first attempt did
+ * get through.
  */
 export function mapAdyenError(httpStatus: number, body: unknown, options: MapAdyenErrorOptions = {}): PayFanoutError {
   const error = isJsonObject(body) ? (body as AdyenApiError) : undefined;

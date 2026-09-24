@@ -16,17 +16,25 @@
  *   - POST /payments/details finishing an action
  *   - captures / cancels / refunds answering `{ status: "received" }` ONLY, each
  *     with its own pspReference, captures and refunds echoing the amount sent —
- *     for ANY payment reference: Adyen reports an unknown one in the outcome
- *     webhook ("Transaction not found"), not in the answer. The outcome exists
- *     nowhere else until the webhook lands, which is what makes Adyen push-only
+ *     for ANY payment reference and whatever the payment's state. Adyen's
+ *     capture and cancel guides list "Transaction not found" among the failures
+ *     their webhook reports, so an unknown reference is acknowledged there; that
+ *     a refund on one is acknowledged and fails by webhook too is an assumption
+ *     (the refund guide's failure reasons do not list it), as is that a cancel
+ *     after the capture fails in the CANCELLATION webhook (the cancel guide says
+ *     only that a captured payment can no longer be cancelled). A reference from
+ *     the other environment is rejected in the answer (error 906), which this
+ *     fake does not model. The outcome exists nowhere else until the webhook
+ *     lands, which is what makes Adyen push-only
  *
  * Validation errors carry Adyen's envelope shape (`status`, `message`,
  * `errorType`, `pspReference`) without an `errorCode`: the real codes live in
- * Adyen's error-code list and the adapter classifies by HTTP status, so pinning
- * invented codes here would assert provider behavior the fake cannot vouch for.
- * The codes that ARE behavioral are modeled explicitly: 704 (a duplicate racing
- * the in-flight original) by `transientConflicts`, and any documented envelope
- * or header — 705, `transient-error`, a 5xx typed `configuration` — through
+ * Adyen's error-code list, and the adapter classifies by HTTP status, by the
+ * error type on a 5xx and by error codes 704 and 705 alone, so pinning invented
+ * codes here would assert provider behavior the fake cannot vouch for. The
+ * codes that ARE behavioral are modeled explicitly: 704 (a duplicate racing the
+ * in-flight original) by `transientConflicts`, and any documented envelope or
+ * header — 705, `transient-error`, a 5xx typed `configuration` — through
  * `scriptedResponses`.
  */
 export interface StoredPayment {
@@ -252,7 +260,8 @@ export class FakeAdyenApi {
     body: Record<string, unknown>,
   ): { status: number; body: unknown } {
     // No lookup of the payment: an unknown reference is acknowledged like any
-    // other, and fails in the outcome webhook.
+    // other and fails in the outcome webhook, as documented for captures and
+    // cancels and assumed for refunds.
     if (!body["merchantAccount"]) return validationError("Required field 'merchantAccount' is not provided.");
     const amount = (body["amount"] ?? {}) as { value?: number; currency?: string };
     if (operation !== "cancels" && (typeof amount.value !== "number" || !amount.currency)) {

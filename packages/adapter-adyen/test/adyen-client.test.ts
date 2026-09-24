@@ -1,7 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isPayFanoutError, type ClientPaymentAdapter } from "@payfanout/core";
 import { runClientAdapterConformanceTests } from "@payfanout/conformance";
-import { AdyenClientAdapter, ADYEN_WEB_VERSION, type AdyenCardState } from "../src/index.js";
+import {
+  AdyenClientAdapter,
+  ADYEN_WEB_SCRIPT_INTEGRITY,
+  ADYEN_WEB_STYLESHEET_INTEGRITY,
+  ADYEN_WEB_VERSION,
+  adyenRedirectResultToken,
+  type AdyenCardState,
+  type AdyenClientAdapterConfig,
+} from "../src/index.js";
 
 interface FakeAdyenWeb {
   AdyenWeb: unknown;
@@ -103,6 +111,11 @@ function emitChange(fake: FakeAdyenWeb, state: AdyenCardState): void {
   (fake.componentOptions[0]!["onChange"] as (s: AdyenCardState) => void)(state);
 }
 
+/** An error as Adyen Web raises it: an Error named after one of AdyenCheckoutError's types. */
+function adyenError(name: string, message: string): Error {
+  return Object.assign(new Error(message), { name });
+}
+
 runClientAdapterConformanceTests("adyen", () => makeAdapter().adapter, { expectedMethodTypes: ["card"] });
 
 describe("AdyenClientAdapter", () => {
@@ -169,8 +182,7 @@ describe("AdyenClientAdapter", () => {
     const result = await adapter.confirm(handle);
     expect(result.status).toBe("requires_confirmation");
     expect(JSON.parse(result.clientToken!)).toMatchObject({
-      type: "scheme",
-      encryptedCardNumber: "test_4111111111111111",
+      paymentMethod: { type: "scheme", encryptedCardNumber: "test_4111111111111111" },
     });
   });
 
@@ -282,7 +294,7 @@ describe("AdyenClientAdapter", () => {
     expect(JSON.parse((await pending).clientToken!)).toEqual({});
   });
 
-  it("resolves an action that throws inside the SDK as a unified failure", async () => {
+  it("resolves an action that throws inside the SDK as a failed authentication", async () => {
     stubBrowser();
     const fake = makeFakeAdyenWeb();
     const { adapter } = makeAdapter(fake);
@@ -293,7 +305,7 @@ describe("AdyenClientAdapter", () => {
     };
     const result = await adapter.handleAction(handle, { type: "threeDS2" });
     expect(result.status).toBe("failed");
-    expect(result.error?.code).toBe("invalid_card_data");
+    expect(result.error).toMatchObject({ code: "authentication_required", retryable: false });
   });
 
   it("reads the SDK from window.AdyenWeb when no test seam is configured", async () => {
@@ -351,9 +363,26 @@ describe("AdyenClientAdapter", () => {
     (links[0]!["onerror"] as () => void)();
     await expect(loading).resolves.toBeUndefined();
     expect(links[0]).toMatchObject({ rel: "stylesheet" });
+    // The failed link is taken off the page, so it cannot satisfy a later lookup.
+    expect(links[0]!["remove"]).toHaveBeenCalledTimes(1);
 
-    // A second adapter finds the link already in the document and skips it.
-    existing = links[0];
+    let loadedGlobal: unknown;
+    const styled = new AdyenClientAdapter({
+      clientKey: "test_CLIENTKEY",
+      environment: "sandbox",
+      countryCode: "NL",
+      getAdyenGlobal: () => loadedGlobal as never,
+      loadScript: async () => {
+        loadedGlobal = makeFakeAdyenWeb().AdyenWeb;
+      },
+    });
+    const styling = styled.loadSdk();
+    (links[1]!["onload"] as () => void)();
+    await expect(styling).resolves.toBeUndefined();
+    expect(links[1]!["remove"]).not.toHaveBeenCalled();
+
+    // A second adapter finds the loaded link already in the document and skips it.
+    existing = links[1];
     let secondGlobal: unknown;
     const again = new AdyenClientAdapter({
       clientKey: "test_CLIENTKEY",
@@ -365,7 +394,7 @@ describe("AdyenClientAdapter", () => {
       },
     });
     await expect(again.loadSdk()).resolves.toBeUndefined();
-    expect(links).toHaveLength(1);
+    expect(links).toHaveLength(2);
   });
 
   it("cleans up its generated container and tears the component down on unmount", async () => {
@@ -483,5 +512,653 @@ describe("AdyenClientAdapter", () => {
     const { adapter } = makeAdapter();
     expect(adapter.listPaymentMethodCapabilities()).toEqual([{ type: "card", flow: "embedded", supported: true }]);
     expect((adapter as ClientPaymentAdapter).handleRedirectReturn).toBeUndefined();
+  });
+});
+
+describe("AdyenClientAdapter 3-D Secure", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  /** The state.data fields the server adapter forwards, as Adyen Web 6.45.2 reports them. */
+  const STATE_DATA = {
+    paymentMethod: VALID_STATE.data!.paymentMethod!,
+    browserInfo: {
+      acceptHeader: "*/*",
+      javaEnabled: false,
+      colorDepth: 24,
+      language: "nl-NL",
+      screenHeight: 723,
+      screenWidth: 1536,
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      timeZoneOffset: 0,
+    },
+    origin: "https://shop.example",
+    billingAddress: { street: "Infinite Loop", houseNumberOrName: "1", postalCode: "1011DJ", city: "Amsterdam", country: "NL" },
+    riskData: { clientData: "eyJ2ZXJzaW9uIjoiMS4wLjAifQ==" },
+  };
+
+  function componentOf(handle: unknown): Record<string, unknown> {
+    return (handle as { component: Record<string, unknown> }).component;
+  }
+
+  it("confirm() resolves the envelope of Adyen Web's state the server forwards, and nothing else", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN });
+    emitChange(fake, {
+      isValid: true,
+      data: { ...STATE_DATA, installments: { value: 3 }, storePaymentMethod: true, clientStateDataIndicator: true },
+    });
+    const result = await adapter.confirm(handle);
+    expect(result.status).toBe("requires_confirmation");
+    expect(JSON.parse(result.clientToken!)).toEqual(STATE_DATA);
+
+    // A state that carries the card alone travels as the card alone.
+    emitChange(fake, VALID_STATE);
+    expect(JSON.parse((await adapter.confirm(handle)).clientToken!)).toEqual({ paymentMethod: STATE_DATA.paymentMethod });
+  });
+
+  it("confirm() asks the Card to show its validation errors when the fields are incomplete", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN });
+    const showValidation = vi.fn();
+    componentOf(handle)["showValidation"] = showValidation;
+    emitChange(fake, { isValid: false, data: {} });
+    await expect(adapter.confirm(handle)).resolves.toMatchObject({ status: "failed", error: { code: "invalid_card_data" } });
+    expect(showValidation).toHaveBeenCalledTimes(1);
+    componentOf(handle)["showValidation"] = () => {
+      throw new Error("component is not ready");
+    };
+    await expect(adapter.confirm(handle)).resolves.toMatchObject({ status: "failed" });
+  });
+
+  it("shows a required cardholder name and ignores Enter by default, and the host still wins", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN });
+    const defaults = fake.componentOptions[0]!;
+    expect(defaults).toMatchObject({ hasHolderName: true, holderNameRequired: true });
+    const submit = vi.fn();
+    const onEnter = defaults["onEnterKeyPressed"] as (activeElement: unknown, component: unknown) => unknown;
+    expect(onEnter({ blur: vi.fn() }, { submit })).toBeUndefined();
+    expect(submit).not.toHaveBeenCalled();
+
+    const onEnterKeyPressed = vi.fn();
+    const { adapter: other, fake: otherFake } = makeAdapter();
+    await other.mount(fakeContainer(), {
+      clientSecret: SESSION_TOKEN,
+      fieldOptions: { hasHolderName: false, holderNameRequired: false, onEnterKeyPressed },
+    });
+    expect(otherFake.componentOptions[0]).toMatchObject({ hasHolderName: false, holderNameRequired: false, onEnterKeyPressed });
+  });
+
+  it("refuses confirm() once handleAction has replaced the Card", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN });
+    emitChange(fake, VALID_STATE);
+    await adapter.handleAction(handle, { type: "threeDS2", subtype: "fingerprint", token: "fingerprint-token" });
+    const result = await adapter.confirm(handle);
+    expect(result).toMatchObject({ status: "failed", error: { code: "invalid_request" } });
+    expect(result.clientToken).toBeUndefined();
+  });
+
+  it("settles a pending challenge as failed when Adyen Web reports an error, then accepts the next one", async () => {
+    stubBrowser();
+    const fake = makeFakeAdyenWeb();
+    const { adapter } = makeAdapter(fake);
+    const reported: unknown[] = [];
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN, onError: (err) => reported.push(err) });
+    // A challenge that has started and not reported back yet.
+    componentOf(handle)["handleAction"] = () => undefined;
+    const pending = adapter.handleAction(handle, { type: "threeDS2", subtype: "challenge" });
+    // Adyen Web's challenge raises this as an API_ERROR when the action carries no token.
+    (fake.checkoutConfigs[0]!["onError"] as (err: unknown) => void)(
+      adyenError("API_ERROR", "No authorisationToken received. 3DS2 Challenge cannot proceed"),
+    );
+    const failed = await pending;
+    expect(failed.status).toBe("failed");
+    expect(isPayFanoutError(failed.error)).toBe(true);
+    // The shopper's authentication failed; the card data was never in question.
+    expect(failed.error).toMatchObject({ code: "authentication_required", retryable: false });
+    // The host's onError still hears about it, with the same error.
+    expect(reported).toEqual([failed.error]);
+
+    const next = adapter.handleAction(handle, { type: "threeDS2", subtype: "challenge" });
+    (fake.checkoutConfigs[0]!["onAdditionalDetails"] as (state: unknown) => void)({
+      data: { details: { threeDSResult: "eyJ0cmFuc1N0YXR1cyI6IlkifQ==" } },
+    });
+    await expect(next).resolves.toEqual({
+      status: "requires_confirmation",
+      clientToken: JSON.stringify({ details: { threeDSResult: "eyJ0cmFuc1N0YXR1cyI6IlkifQ==" } }),
+    });
+  });
+
+  it("keeps an SDK load failure during a challenge a retryable psp_unavailable", async () => {
+    stubBrowser();
+    const fake = makeFakeAdyenWeb();
+    const { adapter } = makeAdapter(fake);
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN });
+    componentOf(handle)["handleAction"] = () => undefined;
+    const pending = adapter.handleAction(handle, { type: "threeDS2", subtype: "challenge" });
+    (fake.checkoutConfigs[0]!["onError"] as (err: unknown) => void)({ name: "NETWORK_ERROR", message: "Network error" });
+    await expect(pending).resolves.toMatchObject({ status: "failed", error: { code: "psp_unavailable", retryable: true } });
+  });
+
+  it("keeps a pending challenge's error authentication_required unless Adyen Web names a network or script failure", async () => {
+    stubBrowser();
+    const fake = makeFakeAdyenWeb();
+    const { adapter } = makeAdapter(fake);
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN });
+    componentOf(handle)["handleAction"] = () => undefined;
+    const onError = fake.checkoutConfigs[0]!["onError"] as (err: unknown) => void;
+    const settleWith = async (err: unknown) => {
+      const pending = adapter.handleAction(handle, { type: "threeDS2", subtype: "challenge" });
+      onError(err);
+      return (await pending).error;
+    };
+    // The name Adyen Web 6.45.2 gives a challenge action that arrives without its token.
+    await expect(
+      settleWith(adyenError("API_ERROR", "No authorisationToken received. 3DS2 Challenge cannot proceed")),
+    ).resolves.toMatchObject({ code: "authentication_required", retryable: false });
+    await expect(
+      settleWith(
+        adyenError(
+          "IMPLEMENTATION_ERROR",
+          'It can not submit the details. The callback "onAdditionalDetails" or the Session is not setup correctly.',
+        ),
+      ),
+    ).resolves.toMatchObject({ code: "authentication_required", retryable: false });
+    await expect(
+      settleWith(adyenError("SCRIPT_ERROR", "Unable to find script container node: #payment")),
+    ).resolves.toMatchObject({ code: "psp_unavailable", retryable: true });
+    // The name decides even when the message, the API's own text, reads as nothing of the kind.
+    await expect(settleWith(adyenError("NETWORK_ERROR", "Invalid Merchant Account"))).resolves.toMatchObject({
+      code: "psp_unavailable",
+      retryable: true,
+    });
+  });
+
+  it("settles a pending action as failed when the fields are unmounted", async () => {
+    stubBrowser();
+    const fake = makeFakeAdyenWeb();
+    const { adapter } = makeAdapter(fake);
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN });
+    componentOf(handle)["handleAction"] = () => undefined;
+    const pending = adapter.handleAction(handle, { type: "threeDS2", subtype: "challenge" });
+    adapter.unmount(handle);
+    const result = await pending;
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatchObject({ code: "authentication_required", retryable: false });
+    expect(fake.unmounted).toBe(1);
+    // Details arriving afterwards settle nothing twice.
+    (fake.checkoutConfigs[0]!["onAdditionalDetails"] as (state: unknown) => void)({
+      data: { details: { threeDSResult: "eyJ0cmFuc1N0YXR1cyI6IlkifQ==" } },
+    });
+    await expect(pending).resolves.toBe(result);
+    // With nothing pending, unmounting settles nothing.
+    expect(() => adapter.unmount(handle)).not.toThrow();
+  });
+
+  it("builds the clientToken a 3-D Secure redirect return completes with", () => {
+    // Adyen appends the URL-encoded redirectResult to the returnUrl; URLSearchParams decodes it.
+    const redirectResult = new URLSearchParams("?shopperOrder=12xy&redirectResult=X6XtfGC3%21Y").get("redirectResult")!;
+    expect(JSON.parse(adyenRedirectResultToken(redirectResult))).toEqual({ details: { redirectResult: "X6XtfGC3!Y" } });
+    expect(() => adyenRedirectResultToken("")).toThrowError(/redirectResult/);
+  });
+});
+
+/** The sha384 hashes Adyen's release notes publish for Adyen Web 6.45.2's adyen.js and adyen.css. */
+const SCRIPT_INTEGRITY = "sha384-crX4Byf88JpnQfdUaDuwVOj3qlk5tmSa3rhIalmJIyo1kC49EDIcnNQ9fY5blVUV";
+const STYLESHEET_INTEGRITY = "sha384-KhV4iC2YVQosq5vzx0xN0yGDVMZA++mbd6obc2JKUszVBdXmexFTRHOXKh5DcqDF";
+
+interface FakePage {
+  /** The tags on the page, in insertion order. */
+  head: FakeTag[];
+}
+
+/**
+ * A `<script>` or `<link>` double. It records its attributes when its URL is
+ * first set and when it is inserted, the two moments a browser may start
+ * fetching.
+ */
+class FakeTag {
+  readonly tagName: string;
+  readonly attributes: Record<string, string> = {};
+  rel = "";
+  async = false;
+  onload: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  urlSetWith: Record<string, string> | undefined;
+  insertedWith: Record<string, string> | undefined;
+  readonly remove: ReturnType<typeof vi.fn>;
+  private url = "";
+
+  constructor(tagName: string, page: FakePage) {
+    this.tagName = tagName;
+    this.remove = vi.fn(() => {
+      page.head = page.head.filter((tag) => tag !== this);
+    });
+  }
+
+  setAttribute(name: string, value: string): void {
+    this.attributes[name] = value;
+  }
+
+  getAttribute(name: string): string | null {
+    return this.attributes[name] ?? null;
+  }
+
+  // HTMLLinkElement reflects these two properties onto their attributes.
+  set integrity(value: string) {
+    this.attributes["integrity"] = value;
+  }
+
+  set crossOrigin(value: string) {
+    this.attributes["crossorigin"] = value;
+  }
+
+  get src(): string {
+    return this.url;
+  }
+
+  set src(value: string) {
+    this.url = value;
+    this.urlSetWith ??= { ...this.attributes };
+  }
+
+  get href(): string {
+    return this.url;
+  }
+
+  set href(value: string) {
+    this.url = value;
+    this.urlSetWith ??= { ...this.attributes };
+  }
+}
+
+/** Stubs a page that core's injectScript and the adapter's stylesheet injection both run against. */
+function stubPage(): FakePage {
+  const page: FakePage = { head: [] };
+  const matching = (selector: string): FakeTag[] => {
+    const match = /^(script|link)\[(?:src|href)="(.*)"\]$/.exec(selector);
+    if (!match) throw new Error(`unexpected selector ${selector}`);
+    return page.head.filter((tag) => tag.tagName === match[1] && tag.src === match[2]);
+  };
+  vi.stubGlobal("window", {});
+  vi.stubGlobal("document", {
+    createElement: (tagName: string) => new FakeTag(tagName, page),
+    querySelector: (selector: string) => matching(selector)[0] ?? null,
+    querySelectorAll: (selector: string) => matching(selector),
+    head: {
+      appendChild: (tag: FakeTag) => {
+        tag.insertedWith = { ...tag.attributes };
+        page.head.push(tag);
+      },
+    },
+  });
+  return page;
+}
+
+function tagOf(page: FakePage, tagName: "script" | "link"): FakeTag {
+  const tag = page.head.find((candidate) => candidate.tagName === tagName);
+  if (!tag) throw new Error(`no <${tagName}> on the page`);
+  return tag;
+}
+
+/** An adapter on the stubbed page whose SDK global appears once `defineGlobal` runs. */
+function pageAdapter(config: Partial<AdyenClientAdapterConfig> = {}): {
+  adapter: AdyenClientAdapter;
+  defineGlobal: () => FakeAdyenWeb;
+} {
+  let global: unknown;
+  const adapter = new AdyenClientAdapter({
+    clientKey: "test_CLIENTKEY",
+    environment: "sandbox",
+    countryCode: "NL",
+    getAdyenGlobal: () => global as never,
+    ...config,
+  });
+  const defineGlobal = () => {
+    const fake = makeFakeAdyenWeb();
+    global = fake.AdyenWeb;
+    return fake;
+  };
+  return { adapter, defineGlobal };
+}
+
+function constructionError(config: AdyenClientAdapterConfig): unknown {
+  try {
+    new AdyenClientAdapter(config);
+  } catch (err) {
+    return err;
+  }
+  return undefined;
+}
+
+describe("AdyenClientAdapter loading Adyen Web", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  /** Lets every tag on the page load. */
+  function loadAll(page: FakePage): void {
+    for (const tag of page.head) tag.onload?.();
+  }
+
+  it("loads the pinned 6.45.2 build from the test CDN with the integrity hashes Adyen publishes", async () => {
+    const page = stubPage();
+    const { adapter, defineGlobal } = pageAdapter();
+    const loading = adapter.loadSdk();
+    const base = "https://checkoutshopper-test.cdn.adyen.com/checkoutshopper/sdk/6.45.2";
+    expect(ADYEN_WEB_VERSION).toBe("6.45.2");
+    // Exported for a host that adds its own tag for the default URL.
+    expect([ADYEN_WEB_SCRIPT_INTEGRITY, ADYEN_WEB_STYLESHEET_INTEGRITY]).toEqual([SCRIPT_INTEGRITY, STYLESHEET_INTEGRITY]);
+    const script = tagOf(page, "script");
+    const link = tagOf(page, "link");
+    expect(script.src).toBe(`${base}/adyen.js`);
+    expect(link.href).toBe(`${base}/adyen.css`);
+    expect(link.rel).toBe("stylesheet");
+    // Both attributes are in place before the URL is set and at insertion.
+    const scriptAttributes = { integrity: SCRIPT_INTEGRITY, crossorigin: "anonymous" };
+    const linkAttributes = { integrity: STYLESHEET_INTEGRITY, crossorigin: "anonymous" };
+    expect([script.urlSetWith, script.insertedWith]).toEqual([scriptAttributes, scriptAttributes]);
+    expect([link.urlSetWith, link.insertedWith]).toEqual([linkAttributes, linkAttributes]);
+    defineGlobal();
+    loadAll(page);
+    await expect(loading).resolves.toBeUndefined();
+  });
+
+  it("loads from the CDN host of each environment value Adyen Web supports, with the same hashes", async () => {
+    const cases = [
+      { environment: "sandbox", adyenEnvironment: undefined, value: "test" },
+      { environment: "sandbox", adyenEnvironment: "test", value: "test" },
+      { environment: "live", adyenEnvironment: undefined, value: "live" },
+      { environment: "live", adyenEnvironment: "live", value: "live" },
+      { environment: "live", adyenEnvironment: "live-us", value: "live-us" },
+      { environment: "live", adyenEnvironment: "live-au", value: "live-au" },
+      { environment: "live", adyenEnvironment: "live-nea", value: "live-nea" },
+      { environment: "live", adyenEnvironment: "live-in", value: "live-in" },
+      // Typed and mapped by Adyen Web, served by its own CDN host, absent from Adyen's v6 guides.
+      { environment: "live", adyenEnvironment: "live-apse", value: "live-apse" },
+      // Adyen Web lowercases the value itself, so the host and the value it gets are lowercase too.
+      { environment: "live", adyenEnvironment: "LIVE-US", value: "live-us" },
+      { environment: "sandbox", adyenEnvironment: "Test", value: "test" },
+    ] as const;
+    for (const { environment, adyenEnvironment, value } of cases) {
+      const page = stubPage();
+      const { adapter, defineGlobal } = pageAdapter({
+        environment,
+        clientKey: environment === "live" ? "live_CLIENTKEY" : "test_CLIENTKEY",
+        ...(adyenEnvironment ? { adyenEnvironment } : {}),
+      });
+      const loading = adapter.loadSdk();
+      const base = `https://checkoutshopper-${value}.cdn.adyen.com/checkoutshopper/sdk/${ADYEN_WEB_VERSION}`;
+      expect(tagOf(page, "script").src).toBe(`${base}/adyen.js`);
+      expect(tagOf(page, "script").attributes["integrity"]).toBe(SCRIPT_INTEGRITY);
+      expect(tagOf(page, "link").href).toBe(`${base}/adyen.css`);
+      expect(tagOf(page, "link").attributes["integrity"]).toBe(STYLESHEET_INTEGRITY);
+      const fake = defineGlobal();
+      loadAll(page);
+      await loading;
+      // Adyen Web gets the environment value the files were loaded for.
+      await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN });
+      expect(fake.checkoutConfigs[0], value).toMatchObject({ environment: value });
+    }
+  });
+
+  it("loads a file the host overrides without an integrity check, and keeps it on the other file", async () => {
+    const cdn = "https://checkoutshopper-test.cdn.adyen.com/checkoutshopper/sdk";
+    const cases = [
+      {
+        config: { sdkVersion: "6.44.0" },
+        script: `${cdn}/6.44.0/adyen.js`,
+        stylesheet: `${cdn}/6.44.0/adyen.css`,
+        scriptIntegrity: undefined,
+        stylesheetIntegrity: undefined,
+      },
+      // Any sdkVersion drops the hashes, even one naming the pinned build.
+      {
+        config: { sdkVersion: ADYEN_WEB_VERSION },
+        script: `${cdn}/${ADYEN_WEB_VERSION}/adyen.js`,
+        stylesheet: `${cdn}/${ADYEN_WEB_VERSION}/adyen.css`,
+        scriptIntegrity: undefined,
+        stylesheetIntegrity: undefined,
+      },
+      {
+        config: { sdkUrl: "https://assets.shop.example/adyen/adyen.js" },
+        script: "https://assets.shop.example/adyen/adyen.js",
+        stylesheet: `${cdn}/${ADYEN_WEB_VERSION}/adyen.css`,
+        scriptIntegrity: undefined,
+        stylesheetIntegrity: STYLESHEET_INTEGRITY,
+      },
+      {
+        config: { stylesheetUrl: "https://assets.shop.example/adyen/adyen.css" },
+        script: `${cdn}/${ADYEN_WEB_VERSION}/adyen.js`,
+        stylesheet: "https://assets.shop.example/adyen/adyen.css",
+        scriptIntegrity: SCRIPT_INTEGRITY,
+        stylesheetIntegrity: undefined,
+      },
+    ];
+    for (const { config, script, stylesheet, scriptIntegrity, stylesheetIntegrity } of cases) {
+      const page = stubPage();
+      const { adapter, defineGlobal } = pageAdapter(config);
+      const loading = adapter.loadSdk();
+      const label = JSON.stringify(config);
+      expect(tagOf(page, "script").src, label).toBe(script);
+      expect(tagOf(page, "script").attributes, label).toEqual(
+        scriptIntegrity ? { integrity: scriptIntegrity, crossorigin: "anonymous" } : {},
+      );
+      expect(tagOf(page, "link").href, label).toBe(stylesheet);
+      expect(tagOf(page, "link").attributes, label).toEqual(
+        stylesheetIntegrity ? { integrity: stylesheetIntegrity, crossorigin: "anonymous" } : {},
+      );
+      defineGlobal();
+      loadAll(page);
+      await expect(loading).resolves.toBeUndefined();
+    }
+  });
+
+  it("removes a stylesheet it injected whose load failed, so the next load fetches it again", async () => {
+    const page = stubPage();
+    let loads = 0;
+    let global: unknown;
+    const adapter = new AdyenClientAdapter({
+      clientKey: "test_CLIENTKEY",
+      environment: "sandbox",
+      countryCode: "NL",
+      getAdyenGlobal: () => global as never,
+      // The script fails with the stylesheet the first time, as it does when the network drops.
+      loadScript: async () => {
+        loads++;
+        if (loads === 1) throw new Error("Failed to load adyen.js");
+        global = makeFakeAdyenWeb().AdyenWeb;
+      },
+    });
+    const first = adapter.loadSdk();
+    const failed = tagOf(page, "link");
+    // A stylesheet failing its integrity check fires the same error event.
+    failed.onerror!();
+    await expect(first).rejects.toThrowError(/Failed to load/);
+    expect(failed.remove).toHaveBeenCalledTimes(1);
+    expect(page.head).toEqual([]);
+
+    const second = adapter.loadSdk();
+    const retried = tagOf(page, "link");
+    expect(retried).not.toBe(failed);
+    expect(retried.attributes).toEqual({ integrity: STYLESHEET_INTEGRITY, crossorigin: "anonymous" });
+    retried.onload!();
+    await expect(second).resolves.toBeUndefined();
+    expect(retried.remove).not.toHaveBeenCalled();
+    expect(page.head).toEqual([retried]);
+    expect(loads).toBe(2);
+  });
+
+  it("tolerates a stylesheet element without remove() when its load fails", async () => {
+    const links: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("document", {
+      createElement: () => {
+        const link: Record<string, unknown> = {};
+        links.push(link);
+        return link;
+      },
+      querySelector: () => null,
+      head: { appendChild: () => undefined },
+    });
+    let global: unknown;
+    const adapter = new AdyenClientAdapter({
+      clientKey: "test_CLIENTKEY",
+      environment: "sandbox",
+      countryCode: "NL",
+      getAdyenGlobal: () => global as never,
+      loadScript: async () => {
+        global = makeFakeAdyenWeb().AdyenWeb;
+      },
+    });
+    const loading = adapter.loadSdk();
+    expect(() => (links[0]!["onerror"] as () => void)()).not.toThrow();
+    await expect(loading).resolves.toBeUndefined();
+  });
+
+  it("refuses a <script> the page added for the default URL without the integrity, and injects none", async () => {
+    const page = stubPage();
+    const own = new FakeTag("script", page);
+    own.src = `https://checkoutshopper-test.cdn.adyen.com/checkoutshopper/sdk/${ADYEN_WEB_VERSION}/adyen.js`;
+    own.setAttribute("crossorigin", "anonymous");
+    page.head.push(own);
+    const { adapter } = pageAdapter();
+    const scripts = () => page.head.filter((tag) => tag.tagName === "script");
+    for (let call = 1; call <= 2; call++) {
+      const loading = adapter.loadSdk();
+      loadAll(page);
+      const err = await loading.then(
+        () => undefined,
+        (reason: unknown) => reason,
+      );
+      expect(err, `call ${call}`).toMatchObject({ code: "invalid_request", retryable: false, pspName: "adyen" });
+      expect((err as Error).message).toMatch(/conflicting <script>/);
+      expect(scripts(), `call ${call}`).toEqual([own]);
+    }
+  });
+
+  it("goes back through the loader when the script loaded but the global is missing", async () => {
+    stubBrowser();
+    let loads = 0;
+    let global: unknown;
+    const adapter = new AdyenClientAdapter({
+      clientKey: "test_CLIENTKEY",
+      environment: "sandbox",
+      countryCode: "NL",
+      getAdyenGlobal: () => global as never,
+      loadStylesheet: async () => {},
+      loadScript: async () => {
+        loads++;
+        if (loads > 1) global = makeFakeAdyenWeb().AdyenWeb;
+      },
+    });
+    // Two mounts waiting on the same load both fail, and share that one load.
+    const waiting = [adapter.loadSdk(), adapter.loadSdk()];
+    for (const call of waiting) {
+      await expect(call).rejects.toMatchObject({ code: "psp_unavailable", retryable: true });
+    }
+    expect(loads).toBe(1);
+    await expect(adapter.loadSdk()).resolves.toBeUndefined();
+    expect(loads).toBe(2);
+  });
+});
+
+describe("AdyenClientAdapter configuration checks", () => {
+  const sandbox = { clientKey: "test_CLIENTKEY", environment: "sandbox", countryCode: "NL" } as const;
+  const live = { clientKey: "live_CLIENTKEY", environment: "live", countryCode: "NL" } as const;
+
+  it("refuses a client key whose prefix contradicts the environment, without echoing the key", () => {
+    const cases: Array<[AdyenClientAdapterConfig, RegExp]> = [
+      [{ ...sandbox, clientKey: "live_CLIENTKEY" }, /is a live_ key, but config\.environment "sandbox" takes a test_ key/],
+      [{ ...live, clientKey: "test_CLIENTKEY" }, /is a test_ key, but config\.environment "live" takes a live_ key/],
+      [{ ...sandbox, clientKey: "CLIENTKEY" }, /must start with test_ for config\.environment "sandbox"/],
+      [{ ...live, clientKey: "LIVE_CLIENTKEY" }, /must start with live_ for config\.environment "live"/],
+      // A legacy origin key, which Adyen Web still recognises by its pub. prefix.
+      [{ ...live, clientKey: "pub.CLIENTKEY" }, /must start with live_ for config\.environment "live"/],
+    ];
+    for (const [config, message] of cases) {
+      const err = constructionError(config);
+      expect(err, config.clientKey).toMatchObject({ code: "invalid_request", retryable: false });
+      expect((err as Error).message).toMatch(message);
+      expect((err as Error).message).not.toContain("CLIENTKEY");
+    }
+  });
+
+  it("refuses an adyenEnvironment Adyen Web does not support", () => {
+    // Adyen Web would fall back to the European live hosts for any of these.
+    for (const adyenEnvironment of ["live-eu", "LIVE-EU", "live-apac", "production", ""]) {
+      const err = constructionError({ ...live, adyenEnvironment });
+      expect(err, adyenEnvironment).toMatchObject({ code: "invalid_request", retryable: false });
+      expect((err as Error).message).toBe(
+        `AdyenClientAdapter config.adyenEnvironment ${JSON.stringify(adyenEnvironment)} is not an environment value ` +
+          'Adyen Web supports: "test", "live", "live-us", "live-au", "live-nea", "live-in", "live-apse"',
+      );
+    }
+    // A host without type checks can hand over something that is not a string at all.
+    expect(constructionError({ ...live, adyenEnvironment: 5 as never })).toMatchObject({
+      code: "invalid_request",
+      message: "AdyenClientAdapter config.adyenEnvironment must be a string, not number",
+    });
+  });
+
+  it("refuses an adyenEnvironment that contradicts the environment", () => {
+    const cases: Array<[AdyenClientAdapterConfig, RegExp]> = [
+      [{ ...sandbox, adyenEnvironment: "live" }, /"live" contradicts config\.environment "sandbox", which takes "test"/],
+      [{ ...sandbox, adyenEnvironment: "live-us" }, /"live-us" contradicts config\.environment "sandbox"/],
+      [{ ...sandbox, adyenEnvironment: "LIVE-APSE" }, /"LIVE-APSE" contradicts config\.environment "sandbox"/],
+      [{ ...live, adyenEnvironment: "test" }, /"test" contradicts config\.environment "live", which takes "live" or a regional/],
+      [{ ...live, adyenEnvironment: "Test" }, /"Test" contradicts config\.environment "live"/],
+    ];
+    for (const [config, message] of cases) {
+      const err = constructionError(config);
+      expect(err, config.adyenEnvironment).toMatchObject({ code: "invalid_request", retryable: false });
+      expect((err as Error).message).toMatch(message);
+    }
+  });
+});
+
+describe("AdyenClientAdapter error names", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("classifies an Adyen Web error by its name before its message", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    const reported: Array<{ code: string; retryable: boolean }> = [];
+    await adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN, onError: (err) => reported.push(err) });
+    const onError = fake.checkoutConfigs[0]!["onError"] as (err: unknown) => void;
+    // In live, a NETWORK_ERROR carries the API's own message, which need not read as a network failure.
+    onError(adyenError("NETWORK_ERROR", "Invalid Merchant Account"));
+    onError(adyenError("SCRIPT_ERROR", "Unable to find script container node: #payment"));
+    onError(adyenError("IMPLEMENTATION_ERROR", 'Resources module: "environmentsUrls.cdn" is not a valid URL'));
+    // The generic ERROR says nothing by its name, so its message still decides.
+    onError(adyenError("ERROR", "secured field iframes have failed to load"));
+    onError(adyenError("ERROR", "secured fields have failed to configure"));
+    expect(reported.map(({ code, retryable }) => ({ code, retryable }))).toEqual([
+      { code: "psp_unavailable", retryable: true },
+      { code: "psp_unavailable", retryable: true },
+      { code: "invalid_request", retryable: false },
+      { code: "psp_unavailable", retryable: true },
+      { code: "invalid_card_data", retryable: false },
+    ]);
+  });
+
+  it("rejects a mount Adyen Web refuses as an implementation error with invalid_request", async () => {
+    stubBrowser();
+    const fake = makeFakeAdyenWeb();
+    fake.AdyenWeb = {
+      AdyenCheckout: async () => {
+        throw adyenError("IMPLEMENTATION_ERROR", "You must specify a countryCode when initializing checkout.");
+      },
+      Card: class {},
+    };
+    const { adapter } = makeAdapter(fake);
+    let reported: unknown;
+    await expect(
+      adapter.mount(fakeContainer(), { clientSecret: SESSION_TOKEN, onError: (err) => (reported = err) }),
+    ).rejects.toMatchObject({ code: "invalid_request", retryable: false });
+    expect(reported).toMatchObject({ code: "invalid_request" });
   });
 });

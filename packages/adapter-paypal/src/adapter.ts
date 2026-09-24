@@ -60,6 +60,10 @@ export interface PayPalClientAdapterConfig {
   userAction?: "continue" | "pay_now";
   /** Test seams. */
   sdkBaseUrl?: string;
+  /**
+   * Test seam. Called again by the next loadSdk() after an attempt that rejects
+   * or leaves the SDK global missing, so it must be safe to call more than once.
+   */
   loadScript?: (url: string) => Promise<void>;
   getPayPalGlobal?: () => PayPalJsLike | undefined;
 }
@@ -118,15 +122,24 @@ export class PayPalClientAdapter implements ClientPaymentAdapter {
     if (this.payPalGlobal()) return;
     const url = this.sdkUrl();
     this.sdkPromise ??= this.config.loadScript ? this.config.loadScript(url) : injectScript(url, this.pspName);
-    await this.sdkPromise;
-    if (!this.payPalGlobal()) {
-      throw new PayFanoutError({
-        code: "psp_unavailable",
-        message: "PayPal JS SDK loaded but the paypal global is missing",
-        retryable: true,
-        raw: undefined,
-        pspName: this.pspName,
-      });
+    const loading = this.sdkPromise;
+    try {
+      await loading;
+      if (!this.payPalGlobal()) {
+        throw new PayFanoutError({
+          code: "psp_unavailable",
+          message: "PayPal JS SDK loaded but the paypal global is missing",
+          retryable: true,
+          raw: undefined,
+          pspName: this.pspName,
+        });
+      }
+    } catch (err) {
+      // Drop this attempt, if still cached, whether it rejected or left the global
+      // missing, so the next loadSdk() calls the loader again: a cached failure
+      // would fail every later mount until the page reloads.
+      if (this.sdkPromise === loading) this.sdkPromise = undefined;
+      throw err;
     }
   }
 

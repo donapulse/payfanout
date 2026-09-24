@@ -46,7 +46,11 @@ export interface PaysafeClientAdapterConfig {
   threeDs?: Record<string, unknown>;
   /** Account capabilities vary per merchant account/currency — override the conservative default. */
   paymentMethods?: PaymentMethodCapability[];
-  /** Test seams. */
+  /**
+   * Test seams. `loadScript` is called again by the next loadSdk() after an
+   * attempt that rejects or leaves the SDK global missing, so it must be safe to
+   * call more than once.
+   */
   loadScript?: (url: string) => Promise<void>;
   getPaysafeGlobal?: () => PaysafeJsLike | undefined;
   sdkUrl?: string;
@@ -272,15 +276,24 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
     if (this.paysafeGlobal()) return;
     const url = this.config.sdkUrl ?? PAYSAFE_JS_URL;
     this.sdkPromise ??= this.config.loadScript ? this.config.loadScript(url) : injectScript(url, this.pspName);
-    await this.sdkPromise;
-    if (!this.paysafeGlobal()) {
-      throw new PayFanoutError({
-        code: "psp_unavailable",
-        message: "Paysafe.js loaded but the paysafe global is missing",
-        retryable: true,
-        raw: undefined,
-        pspName: this.pspName,
-      });
+    const loading = this.sdkPromise;
+    try {
+      await loading;
+      if (!this.paysafeGlobal()) {
+        throw new PayFanoutError({
+          code: "psp_unavailable",
+          message: "Paysafe.js loaded but the paysafe global is missing",
+          retryable: true,
+          raw: undefined,
+          pspName: this.pspName,
+        });
+      }
+    } catch (err) {
+      // Drop this attempt, if still cached, whether it rejected or left the global
+      // missing, so the next loadSdk() calls the loader again: a cached failure
+      // would fail every later mount until the page reloads.
+      if (this.sdkPromise === loading) this.sdkPromise = undefined;
+      throw err;
     }
   }
 

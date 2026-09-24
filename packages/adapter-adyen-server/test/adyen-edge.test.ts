@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { isPayFanoutError } from "@payfanout/core";
 import {
   ADYEN_IDEMPOTENCY_KEY_MAX_LENGTH,
+  adyenOnboarding,
   AdyenServerAdapter,
   decodeAdyenPaymentRef,
   decodeSessionContext,
@@ -112,21 +113,83 @@ describe("transport edge cases", () => {
   });
 
   it("derives one idempotency header per endpoint, deterministically and within Adyen's limit", async () => {
-    const payments = await deriveAdyenIdempotencyKey("/payments", "caller-key");
-    expect(payments).toMatch(/^[0-9a-f]{64}$/);
-    expect(payments.length).toBeLessThanOrEqual(ADYEN_IDEMPOTENCY_KEY_MAX_LENGTH);
-    // Same call, same key: Adyen replays its stored response instead of charging twice.
-    expect(await deriveAdyenIdempotencyKey("/payments", "caller-key")).toBe(payments);
+    const capture = await deriveAdyenIdempotencyKey("/payments/8836100000000001/captures", "caller-key");
+    expect(capture).toMatch(/^[0-9a-f]{64}$/);
+    expect(capture.length).toBeLessThanOrEqual(ADYEN_IDEMPOTENCY_KEY_MAX_LENGTH);
+    // Same call, same key: Adyen replays its stored response instead of capturing twice.
+    expect(await deriveAdyenIdempotencyKey("/payments/8836100000000001/captures", "caller-key")).toBe(capture);
     // Adyen stores keys per company account, so a second endpoint must not
     // inherit the first one's stored response.
-    expect(await deriveAdyenIdempotencyKey("/payments/details", "caller-key")).not.toBe(payments);
-    expect(await deriveAdyenIdempotencyKey("/payments", "another-key")).not.toBe(payments);
+    expect(await deriveAdyenIdempotencyKey("/payments/8836100000000001/refunds", "caller-key")).not.toBe(capture);
+    expect(await deriveAdyenIdempotencyKey("/payments/8836100000000001/captures", "another-key")).not.toBe(capture);
   });
 
   it("rejects a hex HMAC key that is not hex", () => {
     expect(() => hexToBytes("zz")).toThrowError(/hex/);
     expect(() => hexToBytes("abc")).toThrowError(/hex/);
     expect(hexToBytes("00ff")).toEqual(new Uint8Array([0, 255]));
+  });
+});
+
+describe("onboarding descriptor", () => {
+  function fieldPattern(key: string): RegExp {
+    const field = adyenOnboarding.credentialFields.find((candidate) => candidate.key === key);
+    return new RegExp(field?.format?.pattern ?? "^$");
+  }
+
+  function adapterAcceptsHmacKey(key: string): boolean {
+    try {
+      makeAdapter({ hmacKeys: [key] });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it("validates HMAC keys exactly as the adapter does: whole bytes of hex, surrounding whitespace trimmed", () => {
+    const pattern = fieldPattern("hmacKey");
+    const candidates = [
+      HMAC_KEY, HMAC_KEY.toLowerCase(), "00ff", " 00ff", "00ff\n", "\t00ff ",
+      "0f0", " 0f0 ", "abc", "zz", "0x00ff", "00 ff", "not-hex", " ", "",
+    ];
+    for (const key of candidates) {
+      expect(pattern.test(key), JSON.stringify(key)).toBe(adapterAcceptsHmacKey(key));
+    }
+    // hexToBytes trims, so a key pasted with a stray space or newline still works.
+    for (const key of [HMAC_KEY, " 00ff", "00ff\n"]) {
+      expect(pattern.test(key), JSON.stringify(key)).toBe(true);
+      expect(adapterAcceptsHmacKey(key), JSON.stringify(key)).toBe(true);
+    }
+    // An odd-length key used to pass the form and then fail the constructor.
+    for (const key of ["0f0", "zz"]) {
+      expect(pattern.test(key), JSON.stringify(key)).toBe(false);
+      expect(adapterAcceptsHmacKey(key), JSON.stringify(key)).toBe(false);
+    }
+  });
+
+  it("takes the live URL prefix alone, not the URL built from it", () => {
+    const pattern = fieldPattern("liveUrlPrefix");
+    // Adyen's documented example prefix.
+    expect(pattern.test("1797a841fbb37ca7-AdyenDemo")).toBe(true);
+    expect(pattern.test("https://1797a841fbb37ca7-AdyenDemo-checkout-live.adyenpayments.com")).toBe(false);
+    expect(pattern.test("1797a841fbb37ca7-AdyenDemo-checkout-live.adyenpayments.com")).toBe(false);
+  });
+
+  it("gives only patterns that compile as an HTML pattern attribute, with the v flag", () => {
+    // Browsers compile <input pattern> with the `v` flag, which rejects some
+    // character classes the flagless RegExp accepts (an unescaped `/`).
+    const patterns = adyenOnboarding.credentialFields.flatMap((field) =>
+      field.format?.pattern === undefined ? [] : [field.format.pattern],
+    );
+    expect(patterns.length).toBeGreaterThan(0);
+    for (const pattern of patterns) {
+      expect(() => new RegExp(pattern, "v"), pattern).not.toThrow();
+    }
+  });
+
+  it("follows Adyen's recommended policy: scripts from *.adyen.com, frames and requests from any host", () => {
+    // Issuer 3-D Secure challenge frames load from domains Adyen cannot list.
+    expect(adyenOnboarding.csp).toEqual({ script: ["https://*.adyen.com"], frame: ["*"], connect: ["*"] });
   });
 });
 

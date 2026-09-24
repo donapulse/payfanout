@@ -28,13 +28,50 @@ const PUBLISHED_SIGNING_STRING =
 const PUBLISHED_SIGNATURE = "coqCmt/IZ4E3CzPvMY8zTjQVL5hYJUiBRg8UU+iCWo0=";
 
 /** Documented sandbox test card, encrypted-credential form for server-side tests. */
-const CLIENT_TOKEN = JSON.stringify({
+const CARD = {
   type: "scheme",
   encryptedCardNumber: "test_4111111111111111",
   encryptedExpiryMonth: "test_03",
   encryptedExpiryYear: "test_2030",
   encryptedSecurityCode: "test_737",
-});
+};
+
+/**
+ * The envelope the client adapter's confirm() resolves from Adyen Web 6.41.0's
+ * Card state: the paymentMethod (with the checkoutAttemptId and sdkData every
+ * Adyen Web element adds) and the browser data. `paymentMethod` overrides card
+ * fields, such as the holder names the fake reads as triggers.
+ */
+function cardToken(paymentMethod: Record<string, string> = {}): string {
+  return JSON.stringify({
+    paymentMethod: {
+      ...CARD,
+      checkoutAttemptId: "checkout-attempt-1",
+      sdkData: "eyJzY2hlbWFWZXJzaW9uIjoxLCJjaGFubmVsIjoiV2ViIiwic2RrVmVyc2lvbiI6IjYuNDEuMCJ9",
+      ...paymentMethod,
+    },
+    browserInfo: {
+      acceptHeader: "*/*",
+      colorDepth: 24,
+      javaEnabled: false,
+      language: "en-US",
+      screenHeight: 1080,
+      screenWidth: 1920,
+      timeZoneOffset: 0,
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    },
+    origin: "https://host.example",
+    riskData: { clientData: "eyJ2ZXJzaW9uIjoiMS4wLjAifQ==" },
+  });
+}
+
+/** What the conformance suite completes with: the current client adapter's envelope. */
+const CLIENT_TOKEN = cardToken();
+
+/** The bare paymentMethod earlier client adapters send, which carries no browser data. */
+function bareCardToken(paymentMethod: Record<string, string> = {}): string {
+  return JSON.stringify({ ...CARD, ...paymentMethod });
+}
 
 function makePair(config: Partial<AdyenServerAdapterConfig> = {}): {
   adapter: AdyenServerAdapter;
@@ -75,7 +112,12 @@ function signed(item: AdyenNotificationItem): AdyenNotificationItem {
   return { ...item, additionalData: { ...item.additionalData, hmacSignature: signature } };
 }
 
-/** The published vector, verbatim, with its documented signature rather than a recomputed one. */
+/**
+ * The published vector's eight signed values with its documented signature
+ * rather than a recomputed one. Not the sample verbatim: its eventDate is
+ * replaced, its operations list dropped and an empty `reason` added, none of
+ * them being signed.
+ */
 const authorisationItem: AdyenNotificationItem = {
   additionalData: { hmacSignature: PUBLISHED_SIGNATURE },
   amount: { currency: "EUR", value: 1130 },
@@ -89,14 +131,19 @@ const authorisationItem: AdyenNotificationItem = {
   success: "true",
 };
 
-/** A real Adyen event code the adapter deliberately does not map. */
+/**
+ * A real Adyen event code the adapter deliberately does not map, shaped as
+ * Adyen documents it: the report's file name in pspReference, its download URL
+ * in reason.
+ */
 const reportAvailableItem = signed({
   amount: { currency: "EUR", value: 0 },
   eventCode: "REPORT_AVAILABLE",
   eventDate: "2026-08-02T10:05:00+02:00",
   merchantAccountCode: "TestMerchant",
-  merchantReference: "settlement_detail_report_batch_1",
-  pspReference: "8836100000000001",
+  merchantReference: "",
+  pspReference: "settlement_detail_report_batch_12.csv",
+  reason: "https://ca-test.adyen.com/reports/download/MerchantAccount/TestMerchant/settlement_detail_report_batch_12.csv",
   success: "true",
 });
 
@@ -148,8 +195,9 @@ runServerAdapterConformanceTests(
       validRawBody: envelope(authorisationItem),
       validHeaders: webhookHeaders(),
       expectedType: "payment.succeeded",
-      // pspReference alone repeats across an authorisation and its capture; the
-      // dedupe key is the pair.
+      // Adyen defines a duplicate as repeating eventCode and pspReference, and
+      // pspReference alone is shared by every event of one dispute; the dedupe
+      // key is the pair.
       expectedEventId: "AUTHORISATION:7914073381342284",
       expectedAmount: 1130,
       // The amount is one of the eight signed values; moving it while leaving the
@@ -212,7 +260,7 @@ runServerAdapterConformanceTests(
           const session = await a.createPaymentSession({ amount: 2500, currency: "EUR", idempotencyKey: "k" });
           return a.completePayment!({
             pspSessionId: session.pspSessionId,
-            clientToken: JSON.stringify({ ...JSON.parse(CLIENT_TOKEN), holderName: "REFUSED" }),
+            clientToken: cardToken({ holderName: "REFUSED" }),
             idempotencyKey: "k4",
           });
         },
@@ -229,9 +277,15 @@ runServerAdapterConformanceTests(
         expectedCode: "invalid_request",
       },
       {
-        name: "refundPayment on an unknown pspReference",
-        invoke: (a) =>
-          a.refundPayment({ pspPaymentId: "8836100000000042:1000:EUR", amount: 500, idempotencyKey: "k" }),
+        // The fake acknowledges a refund on any reference (assumed of Adyen,
+        // whose refund guide lists no unknown-reference failure), so the first
+        // call resolves; the second is answered with the first one's stored
+        // acknowledgement, which echoes another amount.
+        name: "refundPayment reusing an idempotency key for a different amount",
+        invoke: async (a) => {
+          await a.refundPayment({ pspPaymentId: "8836100000000042:1000:EUR", amount: 500, idempotencyKey: "k" });
+          return a.refundPayment({ pspPaymentId: "8836100000000042:1000:EUR", amount: 400, idempotencyKey: "k" });
+        },
         expectedCode: "invalid_request",
       },
       {
@@ -418,29 +472,39 @@ describe("AdyenServerAdapter specifics", () => {
     });
     const info = await adapter.completePayment({
       pspSessionId: session.pspSessionId,
-      clientToken: JSON.stringify({ ...JSON.parse(CLIENT_TOKEN), holderName: "CHALLENGE" }),
+      clientToken: bareCardToken({ holderName: "CHALLENGE" }),
       idempotencyKey: "c1",
     });
     expect(info.status).toBe("requires_action");
-    expect((info.raw as { action?: { type?: string } }).action?.type).toBe("threeDS2");
+    // A bare card token carries no browser data, so the fake answers with a redirect action.
+    expect((info.raw as { action?: { type?: string } }).action?.type).toBe("redirect");
+    expect(info.pspPaymentId).toBe("");
   });
 
   it("finishes a resolved action through /payments/details", async () => {
     const { adapter, fake } = makePair();
+    fake.detailsCarryPaymentFacts = true;
     const session = await adapter.createPaymentSession({ amount: 3200, currency: "EUR", idempotencyKey: "k" });
+    const challenged = await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: bareCardToken({ holderName: "CHALLENGE" }),
+      idempotencyKey: "c1",
+    });
+    const details = fake.detailsFor((challenged.raw as { action: Record<string, unknown> }).action);
     const info = await adapter.completePayment({
       pspSessionId: session.pspSessionId,
-      clientToken: JSON.stringify({ details: { threeDSResult: "eyJ0..." }, paymentData: "Ab02b4c0..." }),
+      clientToken: JSON.stringify({ details, paymentData: "Ab02b4c0..." }),
       idempotencyKey: "c2",
     });
     expect(fake.lastRequestPath).toMatch(/\/payments\/details$/);
-    expect(fake.lastRequestBody).toEqual({ details: { threeDSResult: "eyJ0..." }, paymentData: "Ab02b4c0..." });
+    expect(fake.lastRequestBody).toEqual({ details, paymentData: "Ab02b4c0..." });
     expect(info.status).toBe("succeeded");
     expect(info.amount).toBe(3200); // from the signed context, not the details response
   });
 
   it("finishes a 3-D Secure challenge when one caller key drives /payments and /payments/details", async () => {
     const { adapter, fake } = makePair();
+    fake.detailsCarryPaymentFacts = true;
     const session = await adapter.createPaymentSession({
       amount: 3200,
       currency: "EUR",
@@ -453,16 +517,16 @@ describe("AdyenServerAdapter specifics", () => {
     // would replay the challenge response and the payment would never authorise.
     const challenged = await adapter.completePayment({
       pspSessionId: session.pspSessionId,
-      clientToken: JSON.stringify({ ...JSON.parse(CLIENT_TOKEN), holderName: "CHALLENGE" }),
+      clientToken: bareCardToken({ holderName: "CHALLENGE" }),
       idempotencyKey: "one-caller-key",
     });
     expect(challenged.status).toBe("requires_action");
     const challengeKey = fake.lastIdempotencyKey;
-    const action = (challenged.raw as { action: { paymentData: string } }).action;
+    const action = (challenged.raw as { action: Record<string, unknown> }).action;
 
     const finished = await adapter.completePayment({
       pspSessionId: session.pspSessionId,
-      clientToken: JSON.stringify({ details: { threeDSResult: "eyJ0..." }, paymentData: action.paymentData }),
+      clientToken: JSON.stringify({ details: fake.detailsFor(action) }),
       idempotencyKey: "one-caller-key",
     });
     expect(finished.status).toBe("succeeded");
@@ -618,7 +682,7 @@ describe("AdyenServerAdapter specifics", () => {
       try {
         await adapter.completePayment({
           pspSessionId: session.pspSessionId,
-          clientToken: JSON.stringify({ ...JSON.parse(CLIENT_TOKEN), holderName: `REFUSED:${refusalReasonCode}` }),
+          clientToken: cardToken({ holderName: `REFUSED:${refusalReasonCode}` }),
           idempotencyKey: `c-${refusalReasonCode}`,
         });
         expect.unreachable(`expected a rejection for refusalReasonCode ${refusalReasonCode}`);
@@ -698,9 +762,11 @@ describe("AdyenServerAdapter specifics", () => {
     await expect(
       adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken: CLIENT_TOKEN, idempotencyKey: "c1" }),
     ).rejects.toMatchObject({ code: "processing_error", retryable: false });
+    // A refund replayed under the same key cannot be performed twice, so the
+    // unconfirmed acknowledgement is safe to retry.
     await expect(
       adapter.refundPayment({ pspPaymentId: "8836100000000042:1000:EUR", idempotencyKey: "r1" }),
-    ).rejects.toMatchObject({ code: "processing_error", retryable: false });
+    ).rejects.toMatchObject({ code: "processing_error", retryable: true });
   });
 
   it("rejects a host id longer than an Adyen reference and unknown payment method types", async () => {
@@ -790,11 +856,12 @@ describe("Adyen webhook verification", () => {
 
   it("refuses an item whose signed values make the signing payload ambiguous", async () => {
     const { adapter } = makePair();
-    // No escaping rule is documented for a value containing the delimiter, so a
-    // colon in the merchant reference is refused rather than signed ambiguously.
+    // Adyen joins the values unescaped, so a colon anywhere but in the merchant
+    // reference would let the joined string split into different values.
     const ambiguous: AdyenNotificationItem = {
       ...authorisationItem,
-      merchantReference: "order:1130:EUR:AUTHORISATION:true",
+      merchantAccountCode: "TestMerchant:TestPayment",
+      merchantReference: "1407325143704",
     };
     expect(buildAdyenHmacPayload(ambiguous)).toBeUndefined();
     await expect(adapter.verifyWebhookSignature(envelope(ambiguous), webhookHeaders())).resolves.toBe(false);
@@ -882,7 +949,8 @@ describe("Adyen webhook parsing", () => {
   it("maps the capture, cancellation, expiry and dispute vocabulary", async () => {
     const cases: Array<[string, string, string]> = [
       ["CAPTURE", "true", "payment.succeeded"],
-      ["CAPTURE", "false", "payment.failed"],
+      // A refused capture request is resubmittable, not a failed payment.
+      ["CAPTURE", "false", "unknown"],
       ["CAPTURE_FAILED", "true", "payment.failed"],
       ["CANCELLATION", "true", "payment.canceled"],
       // A cancel that itself failed says nothing about the payment.

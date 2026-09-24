@@ -11,7 +11,7 @@ body:
     id: provider
     attributes:
       label: Provider name
-      placeholder: "e.g. Adyen, Braintree, Mollie, Razorpay"
+      placeholder: "e.g. Braintree, Mollie, Razorpay"
     validations:
       required: true
   - type: input

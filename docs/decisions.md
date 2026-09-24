@@ -430,8 +430,10 @@ choices they forced:
 ## Open items requiring humans or infrastructure
 
 - Webhook delivery verification (both PSPs) needs a public URL/tunnel + real webhook
-  secrets; deferred by user request. Paysafe's signature **header name** is still
-  unconfirmed (adapter accepts `signature` / `x-signature` / `x-paysafe-signature`).
+  secrets; deferred by user request. *Closed 2026-09-24:* Paysafe's signature header
+  name is doc-verified as `Signature` (Payments API "Configure Webhooks" page, "Example
+  Header: Signature: …"); the adapter reads it first and still tolerates `x-signature` /
+  `x-paysafe-signature`. See "Paysafe webhook correlation and event ids (2026-09-24)".
 - Team sign-off on every *(default, unconfirmed)* item above.
 
 ## Contract hardening (2026-07-08, explicit user-approved review follow-up)
@@ -2136,3 +2138,79 @@ description of what v2 changes is what the migration then had to implement.
   `stolen_card` decline code on the same error still yields `fraud_suspected`, whose message
   is generic as docs.stripe.com/declines/codes asks. Whether Stripe sends a decline code
   alongside this code is undocumented.
+
+## Paysafe webhook correlation and event ids (2026-09-24)
+
+- **A Paysafe delivery carries no event id, and a retry is the same notification with the
+  next `attemptNumber`.** Doc-verified 2026-09-24: the SEPA and Bacs Direct Debit pages, the
+  EPS, Openbucks and SafetyPay webhook pages and the Java SDK's `WebhookEvent` model
+  (`payload`, `attemptNumber`, `type`, `resourceId`, `eventDate`, `eventName`) show no
+  top-level event id; the EPS-style envelopes carry `links[].rel` instead of `type`. The
+  Payments API reference ("Some Notes on Webhooks") says Paysafe "makes a maximum of 2
+  additional attempts (total 3 attempts)" without a 200 or 202, and "In case you have
+  received the same notification multiple times for an already processed event, we request
+  you to ignore the duplicate notification." The old fallback id, a hash of the raw body,
+  changed with every attempt, so host dedupe by `event.id` let the retries through.
+- **The event id is `paysafe_` + the SHA-256 hex of `[name, resourceId, status, time]`.**
+  The name is the normalized event name, the resource id `payload.id` (else `resourceId`),
+  the status `payload.status`, and the time `payload.statusTime`, else `payload.txnTime`,
+  else the envelope `eventDate`. `statusTime` comes first because the payment schema defines
+  it as "the date and time the resource status was last updated", while the SEPA page's
+  settlement examples give `eventDate` the payment's `txnTime` and a later `statusTime`; the
+  official PHP SDK's webhook test fixture
+  (`tests/Webhook/resources/json/valid_webhook_payload.json`) has an `eventDate` later than
+  its `txnTime`, so what `eventDate` measures is unsettled and it is used only when the
+  payload has no time. The price is merging: card and refund payloads carry no
+  `statusTime`, so one resource reporting the same event twice at one status would share an
+  id. The Paysafe guide therefore tells hosts to re-read with `retrievePayment` /
+  `retrieveRefund` whether or not the id was seen. A top-level `id` is not read: the example
+  payload on the Configure Webhooks page is the bare resource with its own id there, and
+  keying on it would merge every event of that resource. A body naming no resource hashes
+  its key-sorted JSON without `attemptNumber`. The derivation changed every Paysafe event
+  id, so a host deduping across the upgrade may process one duplicate per in-flight event;
+  the changeset says so.
+- **`pspPaymentId` names a payment only.** A bank return reports `payload.paymentId`: on the
+  SEPA and Bacs `PAYMENT_RETURN_COMPLETED` examples (`type: "PAYMENT_RETURN"`) `payload.id`
+  is the return's own id, and `paymentId` / `settlementId` carry the payment's. Refund
+  events report `refundId` and no `pspPaymentId`: the spec's `refunds` schema has no payment
+  field and the EPS refund examples name none, so hosts match `refundId` to the one
+  `refundPayment` returned. Handle, settlement and every other resource leave it unset; the
+  2026-07-15 rule stands (`SETTLEMENT_*` and `PAYMENT_HANDLE_PAYABLE` delivered `unknown`,
+  correlated by payload `merchantRefNum`). Nuance: a settle-with-auth payment's settlement
+  can share the payment's id (the SEPA and Bacs examples' `settlementId` and `SETTLEMENT_*`
+  payload ids do, as does the embedded settlement of the card delivery captured in #77),
+  but a settlement made later through `POST /payments/{paymentId}/settlements` is its own
+  resource with its own `id`, so a settlement id is never reported as a payment id even
+  where the two coincide. Dispute names (`CHARGEBACK_*`, `DISPUTE_*`) appear on no
+  Payments API page and keep reporting `payload.id`, unchanged.
+- **Event names.** `REFUND_CANCELLED` ("The refund request is cancelled.", the Webhook
+  Events page the Configure Webhooks page links as its event list) and `REFUND_ERRORED`
+  (EPS webhooks page) now map to `payment.refund_failed`, as `mapRefundStatus` already reads
+  `CANCELLED` and `ERROR`; `PAYMENT_ERRORED` (Interac e-Transfer page, "The payment has an
+  error (non http status 402 error).") maps to `payment.failed`, as the `ERROR` payment
+  status does. `PAYMENT_PENDING` stays mapped and advertised: the Pay by Bank (US), PayPal
+  and Rapid Transfer webhook pages document it. `PAYMENT_DECLINED`, `PAYMENT_EXPIRED`,
+  `PAYMENT_AUTHENTICATION_REQUIRED`, `REFUND_DECLINED` and `REFUND_ERROR` appear on no page:
+  still parsed, no longer in the onboarding descriptor, whose list now derives from the
+  parser's documented names. `REFUND_RECEIVED` / `_PENDING` / `_PROCESSING` stay `unknown`
+  (no in-flight refund type in the unified vocabulary) but carry `refundId`.
+- **The `variables` envelope is read defensively (AMBIGUOUS).** The Bacs page nests
+  `payload`, `attemptNumber`, `type` and `eventDate` under `variables`; every other page,
+  the Java SDK model and the delivery captured in #77 keep them at the top level. The parser
+  reads either and gives both forms the same id. A real Bacs delivery would settle which
+  one Paysafe sends; it needs a GBP-provisioned account and `PAYSAFE_WEBHOOK_HMAC_KEY`,
+  neither of which this project has yet.
+- **Delivery limits, corrected in the docs.** Same reference section: receipt is
+  acknowledged by "200 OK or 202 ACCEPTED", Paysafe "does not have a notification method to
+  alert you when callbacks are not reaching your endpoint URL", and "only the default HTTPS
+  port 443 is supported". The Configure Webhooks page words the retry as "retry the webhook
+  up to three times" after a 4XX or 5XX; the docs use the reference's count of three
+  attempts in all. "Retries effectively forever" is gone from the guide, the webhooks page,
+  the server README and `webhook.ts`. The server handler answers 200, which Paysafe accepts.
+- **Signature, doc-verified.** Configure Webhooks: digest = HMAC_SHA256(hmacKey, UTF-8
+  JSON body), signature = base64(digest), example header `Signature`; the official PHP
+  SDK's `SignatureVerifier` computes the same and compares with `hash_equals`. The exported
+  `verifyPaysafeWebhookSignature` now lowercases header names itself instead of relying on
+  the adapter, reads `signature` first and still tolerates `x-signature` /
+  `x-paysafe-signature`; raw-body hashing, constant-time comparison and key rotation are
+  unchanged.

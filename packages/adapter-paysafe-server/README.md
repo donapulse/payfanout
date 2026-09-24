@@ -61,8 +61,12 @@ exported for advanced use.
   captures, refunds, settlements, verification via the Verifications API, saved-card
   charging, native subscriptions).
 - **Webhook helpers**, `verifyPaysafeWebhookSignature` and `parsePaysafeWebhookEvent`,
-  operating on the **raw request bytes** and emitting a normalized `UnifiedWebhookEvent`.
-  Paysafe retries webhooks effectively forever until it sees a 2xx.
+  checking the `Signature` header against the **raw request bytes** and emitting a normalized
+  `UnifiedWebhookEvent`. Paysafe sends no event id, so `event.id` is derived from the event
+  name, resource id, status and status time, the same for every redelivery; `pspPaymentId`
+  names the returned payment on a bank return and is unset on refund events, which carry
+  `refundId`. Paysafe counts only a 200 or 202 as received and makes at most three attempts,
+  so reconcile with `retrievePayment` for anything missed.
 - **`mapPaysafeError`**, unifies Paysafe errors into `PayFanoutError` (business errors like
   declines or `3406` are never replayed), and **`PAYSAFE_PSP_NAME`**.
 

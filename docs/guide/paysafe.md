@@ -331,8 +331,8 @@ step, and the mandate reference (SEPA/Bacs) surfaces on `PaymentInfo.mandateRefe
 `completePayment` normally returns `processing`. The money truth arrives by webhook:
 `PAYMENT_COMPLETED` when the request is accepted into the banking network, and — days
 later — `PAYMENT_RETURNED_COMPLETED` (also delivered by Paysafe as
-`PAYMENT_RETURN_COMPLETED`; both map to `payment.failed`) when the bank bounces the
-debit. Bacs runs a ~10-business-day cycle. Never ship the order on `processing`.
+`PAYMENT_RETURN_COMPLETED`; both map to `payment.failed`, with `pspPaymentId` naming the
+bounced payment) when the bank bounces the debit. Bacs runs a ~10-business-day cycle. Never ship the order on `processing`.
 Settlement-lifecycle events (`SETTLEMENT_*`) carry settlement ids, not payment ids, and
 are delivered as `unknown` — correlate by payload `merchantRefNum` (your
 `idempotencyKey`) if you consume them. Paysafe documents **no refunds for Bacs**; refund
@@ -367,9 +367,10 @@ register your notification endpoint URL and its **HMAC key** in the Paysafe port
 code. PayFanout only *verifies* what Paysafe sends.
 :::
 
-Point the portal's notification endpoint at `https://your-api.example/webhooks/paysafe`,
-copy the HMAC key into `PAYSAFE_WEBHOOK_HMAC_KEY`, and mount the handler with the **raw
-body** (signature verification hashes the exact bytes):
+Point the portal's notification endpoint at `https://your-api.example/webhooks/paysafe`
+(HTTPS on the default port 443, the only port Paysafe supports), copy the HMAC key into
+`PAYSAFE_WEBHOOK_HMAC_KEY`, and mount the handler with the **raw body**: Paysafe sends a
+base64 HMAC-SHA256 of the exact bytes in the `Signature` header.
 
 ```ts
 import { createAdapterWebhookHandler } from "@payfanout/server";
@@ -384,10 +385,40 @@ app.post("/webhooks/paysafe", express.raw({ type: "application/json" }), async (
 app.use(express.json()); // AFTER the webhook route
 ```
 
-Paysafe **retries effectively forever** until it sees a 2xx, so your `onEvent` must enqueue
-and return fast. Paysafe has no public events-polling API
-(`supportsEventPolling: false`), for missed-webhook recovery, reconcile with
-`retrievePayment` per order. See [Webhooks](/guide/webhooks).
+::: warning Three attempts, then nothing
+Paysafe counts only a `200` or `202` as received. Anything else, a timeout or a `500` from a
+failing `onEvent` included, gets at most two more attempts (three in all), and Paysafe sends
+no alert when all three fail. So `onEvent` must enqueue and return fast, and a delivery that
+never landed does not come back: Paysafe has no public events-polling API
+(`supportsEventPolling: false`), so reconcile open orders with `retrievePayment` on a
+schedule. See [Webhooks](/guide/webhooks).
+:::
+
+### Event ids and correlation
+
+Paysafe sends no event id, and a redelivery is the same notification with the next
+`attemptNumber`. The adapter therefore derives `event.id` from what describes the event: its
+name, the resource id, the resource's status, and its status time (`statusTime`, else
+`txnTime`, else the envelope's `eventDate`). Every attempt of one notification gets the same
+id, so deduping by `event.id` drops the retries. Two different notifications can share an id
+as well: one resource reporting the same event twice without a new status time does, and
+card and refund payloads carry no `statusTime`. So don't let dedupe alone decide an outcome:
+re-read with `retrievePayment` for payment events and `retrieveRefund` for refund events,
+even for an id you have already seen. Both reads are idempotent.
+
+`event.pspPaymentId` names a payment, never another resource:
+
+| Paysafe event | `pspPaymentId` | Notes |
+| --- | --- | --- |
+| Payment events (`PAYMENT_COMPLETED`, `PAYMENT_FAILED`, `PAYMENT_PROCESSING`, …) | the payment (`payload.id`) | |
+| Bank returns (`PAYMENT_RETURN_COMPLETED` / `PAYMENT_RETURNED_COMPLETED`) | the **returned payment** (`payload.paymentId`), not the return's own id | `payment.failed` |
+| Refund events (`REFUND_COMPLETED`; `REFUND_FAILED`, `REFUND_CANCELLED`, `REFUND_ERRORED` as `payment.refund_failed`) | unset: the refund payload names no payment | `event.refundId` is the `refundId` that `refundPayment` returned |
+| Handle and settlement events (`PAYMENT_HANDLE_*`, `SETTLEMENT_*`) | unset | delivered as `unknown`; correlate by the payload's `merchantRefNum` on `event.raw` |
+
+Paysafe's Bacs page shows the envelope nested under `variables`, where every other page has
+it at the top level. The adapter reads both, and gives the same event the same id either way.
+The onboarding descriptor's event list (`paysafeOnboarding.webhook.events`) holds only the
+event names Paysafe documents.
 
 ## 11. Test cards & the sandbox-currency trap
 

@@ -60,7 +60,10 @@ export interface PayPalServerAdapterConfig {
    * without it (verification postbacks need it, fail closed).
    */
   webhookId?: string;
-  /** Shown instead of the business name in the PayPal window. */
+  /**
+   * Shown instead of the business name in the PayPal window. At most 127
+   * characters on one line (PayPal's `brand_name` limit); empty is omitted.
+   */
   brandName?: string;
   /** BCP-47 checkout locale (e.g. "fr-FR"); PayPal auto-detects when omitted. */
   locale?: string;
@@ -152,6 +155,7 @@ export interface PayPalOrderLike {
     custom_id?: string;
     soft_descriptor?: string;
     amount?: PayPalMoney;
+    shipping?: { name?: unknown; address?: unknown };
     payments?: {
       captures?: PayPalCaptureLike[];
       authorizations?: PayPalAuthorizationLike[];
@@ -207,6 +211,13 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     ) {
       throw PayFanoutError.invalidRequest("PayPalServerAdapter config.maxNetworkRetries must be an integer >= 0");
     }
+    // experience_context.brand_name: at most 127 characters, pattern ^.*$ (no
+    // line breaks). An empty one is never sent, so it is not refused.
+    if (config.brandName && (Array.from(config.brandName).length > 127 || /[\n\r\u2028\u2029]/.test(config.brandName))) {
+      throw PayFanoutError.invalidRequest(
+        "PayPalServerAdapter config.brandName must be at most 127 characters on one line",
+      );
+    }
     this.config = config;
     this.baseUrl =
       config.baseUrl ??
@@ -250,7 +261,14 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
   }
 
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
-    assertMinorUnitAmount(input.amount, "amount");
+    assertPositiveAmount(input.amount, "amount");
+    // The id travels as custom_id (at most 255 characters); an empty one is omitted.
+    const idLength = input.id ? Array.from(input.id).length : 0;
+    if (idLength > 255) {
+      throw PayFanoutError.invalidRequest(
+        `PayPal keeps the session id as custom_id, at most 255 characters; this one has ${idLength}`,
+      );
+    }
     // PayPal's currency allowlist for new payments, then the HUF/TWD/JPY whole-unit rule.
     const currency = assertPayPalCurrency(input.currency);
     const value = toPayPalValue(input.amount, currency);
@@ -438,7 +456,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     amount: MinorUnitAmount | undefined,
     idempotencyKey: string,
   ): Promise<PaymentInfo> {
-    if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
+    if (amount !== undefined) assertPositiveAmount(amount, "capture amount");
     const order = await this.resolveOrder(pspPaymentId);
     const unit = order.purchase_units?.[0];
     const authorization = unit?.payments?.authorizations?.[0];
@@ -549,7 +567,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * message for the payer.
    */
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
-    if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
+    if (req.amount !== undefined) assertPositiveAmount(req.amount, "refund amount");
     const target = await this.resolveCapture(req.pspPaymentId);
     const refund = await this.request<PayPalRefundLike>(
       "POST",
@@ -595,10 +613,16 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * PATCH-amends a CREATED/APPROVED order in place (same order id, so the
    * mounted PayPal button keeps working). COMPLETED orders reject with
    * invalid_request. Currency changes require an explicit amount — the old
-   * minor amount is not silently reinterpreted in the new currency.
+   * minor amount is not silently reinterpreted in the new currency. The PATCH
+   * applies whole or not at all, and touches only attributes PayPal's patch
+   * table lists: shipping's name and address, and a statement descriptor the
+   * order already has. A name left out of an update keeps the order's
+   * current one (the table has no remove for it). Adding a descriptor to an
+   * order created without one is refused before any PATCH: pass
+   * statementDescriptor when creating the session.
    */
   async updatePaymentSession(input: UpdatePaymentSessionInput): Promise<PaymentSession> {
-    if (input.amount !== undefined) assertMinorUnitAmount(input.amount, "amount");
+    if (input.amount !== undefined) assertPositiveAmount(input.amount, "amount");
     const order = await this.request<PayPalOrderLike>(
       "GET",
       `/v2/checkout/orders/${encodeURIComponent(input.pspSessionId)}`,
@@ -627,11 +651,28 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     }
     const softDescriptor = toSoftDescriptor(input.statementDescriptor);
     if (softDescriptor) {
-      ops.push({ op: unit?.soft_descriptor ? "replace" : "add", path: `${unitPath}/soft_descriptor`, value: softDescriptor });
+      // PayPal's patchable-attributes table allows replace and remove, not add.
+      if (!unit?.soft_descriptor) {
+        throw PayFanoutError.invalidRequest(
+          "PayPal can replace an order's statement descriptor but not add one — pass statementDescriptor when creating the session",
+          { pspSessionId: input.pspSessionId },
+        );
+      }
+      ops.push({ op: "replace", path: `${unitPath}/soft_descriptor`, value: softDescriptor });
     }
     const shipping = toPayPalShipping(input.shippingDetails);
     if (shipping) {
-      ops.push({ op: "add", path: `${unitPath}/shipping`, value: shipping });
+      // Only shipping's own attributes are patchable, never the whole object. An
+      // attribute already there is replaced; a missing one is added under an
+      // existing shipping object, and replaced into an order that has none,
+      // following PayPal's "Add Shipping Address" sample (see docs/decisions.md).
+      const current = unit?.shipping;
+      for (const key of ["name", "address"] as const) {
+        const value = shipping[key];
+        if (value === undefined) continue;
+        const op = current === undefined || current[key] !== undefined ? "replace" : "add";
+        ops.push({ op, path: `${unitPath}/shipping/${key}`, value });
+      }
     }
     if (ops.length > 0) {
       // PATCH answers 204 No Content — the refreshed order needs its own GET.
@@ -657,12 +698,15 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
   async fetchEvents(input: FetchEventsInput = {}): Promise<FetchEventsResult> {
     let path: string;
     if (input.cursor) {
-      if (!input.cursor.startsWith("/v1/notifications/webhooks-events")) {
+      const cursorPath = input.cursor.startsWith("/v1/notifications/webhooks-events")
+        ? relativeEventsPath(input.cursor)
+        : undefined;
+      if (cursorPath === undefined) {
         throw PayFanoutError.invalidRequest("fetchEvents cursor was not produced by this adapter", {
           cursor: input.cursor,
         });
       }
-      path = input.cursor;
+      path = cursorPath;
     } else {
       const params = new URLSearchParams();
       // The webhooks-events list documents no page_size maximum (its OpenAPI
@@ -691,11 +735,13 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * by number: page_size 1–20, default 10). List items omit the inline plan,
    * so each item is completed by the same fields=plan detail GET retrieve
    * uses — a page costs 1 + N requests (N ≤ 20). total_required=true rides
-   * every page so the last page is detected from total_pages; a next link or
-   * a full page are honored as fallbacks (a possibly-empty final page beats
-   * silently truncating the walk). The unfiltered list returns PayPal's own
-   * default status set — the reference does not enumerate it, and no
-   * undocumented statuses filter is guessed here.
+   * every page, although the reference documents it for the plans list rather
+   * than this one, because total_pages ends the walk exactly when PayPal
+   * returns it; a next link or a full page decide otherwise (a possibly-empty
+   * final page beats silently truncating the walk). None of the documented
+   * filters (plan_ids, statuses, date ranges, filter) is applied; the
+   * reference describes the call as listing all subscriptions for the
+   * merchant account and gives statuses no default (not sandbox-verified).
    */
   async listNativeSubscriptions(input: ListNativeSubscriptionsInput = {}): Promise<ListNativeSubscriptionsResult> {
     const page = parseSubscriptionsCursor(input.cursor);
@@ -1316,14 +1362,14 @@ function mapRefundStatus(status: string | undefined): RefundResult["status"] {
 }
 
 /**
- * Card statements truncate the soft descriptor at 22 characters — anything
- * longer is withheld rather than failing the payment (checkout-field rule:
- * validate locally, withhold what the PSP would reject).
+ * PayPal accepts a longer soft_descriptor but truncates anything beyond 22
+ * characters, the length its responses carry, so the adapter cuts it the same
+ * way instead of dropping it.
  */
 function toSoftDescriptor(statementDescriptor: string | undefined): string | undefined {
   const trimmed = statementDescriptor?.trim();
-  if (!trimmed || trimmed.length > 22) return undefined;
-  return trimmed;
+  if (!trimmed) return undefined;
+  return Array.from(trimmed).slice(0, 22).join("").trimEnd();
 }
 
 /** PayPal requires country_code on any provided address — withhold rather than 400. */
@@ -1366,10 +1412,11 @@ function parseSubscriptionsCursor(cursor: string | undefined): number {
 }
 
 /**
- * Last-page detection ladder: total_pages (requested via total_required=true)
- * is authoritative; a links[rel=next] entry is honored when totals are
- * absent; a full page without either still pages on — the walk then ends on
- * the following short/empty page instead of dropping records.
+ * Last-page detection ladder: total_pages (requested via total_required=true,
+ * which this list's reference does not document) ends the walk when PayPal
+ * returns it; a links[rel=next] entry is honored when totals are absent; a
+ * full page without either still pages on — the walk then ends on the
+ * following short/empty page instead of dropping records.
  */
 function nextSubscriptionsPage(
   page: number,
@@ -1384,13 +1431,31 @@ function nextSubscriptionsPage(
   return itemCount > 0 && itemCount >= effectivePageSize ? page + 1 : undefined;
 }
 
+/**
+ * The path and query of an events-list link. Dot segments are resolved first,
+ * so only the list itself matches, never another path reached through it. A
+ * trailing slash is tolerated: PayPal's reference gives no example of the
+ * list's next link.
+ */
 function relativeEventsPath(href: string): string | undefined {
   try {
     const url = new URL(href, "https://api-m.paypal.com");
-    return url.pathname.startsWith("/v1/notifications/webhooks-events") ? `${url.pathname}${url.search}` : undefined;
+    return /^\/v1\/notifications\/webhooks-events\/?$/.test(url.pathname) ? `${url.pathname}${url.search}` : undefined;
   } catch {
     // A malformed next link is PayPal's bug — stop paginating instead of throwing.
     return undefined;
+  }
+}
+
+/**
+ * PayPal refuses a zero amount on orders, captures and refunds
+ * (CANNOT_BE_ZERO_OR_NEGATIVE: "Must be greater than zero."), so one is
+ * refused before any request.
+ */
+function assertPositiveAmount(amount: unknown, context: string): asserts amount is MinorUnitAmount {
+  assertMinorUnitAmount(amount, context);
+  if (amount === 0) {
+    throw PayFanoutError.invalidRequest(`${context} must be greater than zero: PayPal refuses a zero amount`);
   }
 }
 

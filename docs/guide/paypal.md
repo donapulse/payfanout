@@ -76,12 +76,14 @@ const payments = new PaymentService({ adapters: [paypal] });
 | `webhookId` | for webhooks | - | Without it `verifyWebhookSignature` answers `false` (fails closed). |
 | `userAction` | - | `"CONTINUE"` | Popup button label. Keep `CONTINUE`: your own Pay button completes the payment. Must agree with the client adapter's `userAction`. |
 | `returnUrl` / `cancelUrl` | - | - | Fallbacks when the session input carries none; `cancelUrl` defaults to the return URL. |
-| `brandName` / `locale` | - | auto | Popup presentation. |
+| `brandName` / `locale` | - | auto | Popup presentation; `brandName` takes at most 127 characters on one line (checked at construction; an empty one is omitted). |
 | `requestTimeoutMs` | - | `30000` | Abort a hung PayPal connection; surfaces as retryable `psp_unavailable`. |
 | `maxNetworkRetries` | - | `2` | Retries transport trouble (network/timeout/5xx/429) only — retries reuse the same `PayPal-Request-Id`, so a capture can never double-charge. Business errors never retry. |
 
 `createPaymentSession` creates a PayPal **order** (`intent: CAPTURE`, or `AUTHORIZE` for
-`captureMethod: "manual"`); `pspSessionId` and `clientSecret` are both the order id.
+`captureMethod: "manual"`); `pspSessionId` and `clientSecret` are both the order id. The
+session `id` travels as the order's `custom_id`, so it takes at most 255 characters, and
+amounts must be greater than zero; both are refused as `invalid_request` before any call.
 OAuth tokens are minted and cached inside the adapter — nothing to configure.
 
 ## 5. Wire the client adapter
@@ -110,6 +112,11 @@ a mismatch fails late, at approval time, with an SDK error.
   (`layout`/`color`/`shape`/`label`/`height`) and `fundingSource`; `appearance` is the
   `style` fallback. The adapter owns only `createOrder`/`onApprove`/`onCancel`/`onError`
   (they are the integration itself).
+- A button render that fails, and anything the buttons deliver through `onError`, surface
+  as `processing_error` with the SDK's error on `raw`. The `onError` ones are **not
+  retryable**: PayPal's [JS SDK reference](https://developer.paypal.com/sdk/js/v5/reference#onerror)
+  documents that callback as a catch-all with nothing to handle beyond a generic error
+  message or page. A failed render is retryable, since mounting again can succeed.
 - `locale` is a load-time SDK param — set it on the adapter config, not per mount.
 - `userAction` is the client half of the server's `userAction`: `"continue"` (default)
   loads the SDK with `commit=false`, so the popup's final button says **Continue** and
@@ -355,12 +362,22 @@ strings PayPal wants exist only inside the adapter.
 
 - Approve popups by logging in with a **personal** sandbox account
   (sandbox.paypal.com uses the same credentials).
-- **Negative testing:** enable it on the business sandbox account (Account → Settings →
-  Negative Testing), then force errors per request with the
-  `PayPal-Mock-Response: {"mock_application_codes": "INSTRUMENT_DECLINED"}` header —
-  the integration suite has an env-gated case for this. Mock errors never work in live.
-- Sandbox rate limiting kicks in around 50 requests/minute per IP; the adapter already
-  maps 429 to a retryable `rate_limited`.
+- **Negative testing** (a sandbox beta): turn on Negative Testing on the **business**
+  sandbox account your REST app belongs to (developer dashboard → Sandbox → Accounts →
+  View/Edit Account → Settings), then force errors per request with the
+  `PayPal-Mock-Response: {"mock_application_codes": "INSTRUMENT_DECLINED"}` header. PayPal's
+  [request-headers page](https://developer.paypal.com/negative-testing/request-headers)
+  describes the header alone as enough for REST calls, while its
+  [negative-testing overview](https://developer.paypal.com/negative-testing/overview) has
+  you turn the setting on first; doing both covers either reading. The header works on the Orders v2 create, update, show, authorize and capture
+  calls, and on the Payments v2 show, capture and void authorization, show capture, refund
+  capture and show refund calls (reauthorize is not listed). The integration suite has an
+  env-gated case for this. Mock errors never work in live.
+- PayPal [publishes no rate-limit policy](https://developer.paypal.com/api/rest/reference/rate-limiting):
+  it may temporarily throttle traffic that looks abusive, answering `429` with
+  `RATE_LIMIT_REACHED`, which the adapter maps to a retryable `rate_limited`. PayPal
+  recommends webhooks over polling and cached OAuth tokens. The adapter caches its token
+  per instance, so reuse one adapter rather than building one per request.
 
 ## 11. Limitations (v1)
 
@@ -371,6 +388,16 @@ strings PayPal wants exist only inside the adapter.
   PayPal's Transaction Search API is a separate product.
 - **No zero-amount verification** (`supportsPaymentMethodVerification: false`): there is
   no PayPal equivalent for wallet approvals.
+- **Order updates** (`updatePaymentSession`) patch only what PayPal's patch table lists. A
+  statement descriptor can be replaced but not added, so pass `statementDescriptor` when
+  creating the session. It is cut to 22 characters, as PayPal does, and the card statement
+  itself shows only 22 characters in total, starting with PayPal's `PAYPAL *` prefix and
+  your merchant descriptor (PayPal's example: with the merchant descriptor `Janes Gift`,
+  the descriptor `800-123-1234` shows as `PAYPAL * Janes Gift 80`). An address added by an
+  update to an order created without shipping is not locked: the order keeps PayPal's
+  default shipping preference (`GET_FROM_FILE`, the address the buyer picks on PayPal's
+  site), which is set at creation and cannot be patched; only sessions created with
+  shipping get `SET_PROVIDED_ADDRESS`.
 - `cancelPayment` voids **authorizations** only. A CAPTURE-intent order cannot be
   cancelled via the API — stop using it and it expires on its own (~3 hours in the
   CREATED state).

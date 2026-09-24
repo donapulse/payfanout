@@ -381,7 +381,7 @@ describe("PayPalServerAdapter specifics", () => {
     expect(fake.lastRequestHeaders["prefer"]).toBe("return=representation");
   });
 
-  it("withholds over-length statement descriptors and country-less shipping instead of failing", async () => {
+  it("cuts over-length statement descriptors to 22 characters and withholds country-less shipping", async () => {
     const { adapter, fake } = makePair();
     await adapter.createPaymentSession({
       amount: 100,
@@ -391,7 +391,8 @@ describe("PayPalServerAdapter specifics", () => {
       idempotencyKey: "k",
     });
     const body = fake.lastRequestBody as { purchase_units: Array<Record<string, unknown>> };
-    expect(body.purchase_units[0]).not.toHaveProperty("soft_descriptor");
+    // PayPal truncates beyond 22 characters itself; the adapter cuts it the same way.
+    expect(body.purchase_units[0]!["soft_descriptor"]).toBe("THIS DESCRIPTOR IS WAY");
     expect(body.purchase_units[0]).not.toHaveProperty("shipping");
   });
 

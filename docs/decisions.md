@@ -240,6 +240,13 @@ choices they forced:
   intent), `retrievePayment` accepts either and falls back order → capture, and
   `refundPayment` resolves order ids to their capture. Hosts are documented to
   store the capture id.
+- **Doc-verified 2026-09-24: client callbacks follow the JS SDK v5 reference.**
+  `createOrder` returns a Promise of the order id, the only form the reference's samples
+  show. Errors the buttons deliver through `onError` are non-retryable `processing_error`:
+  PayPal calls that handler a catch-all whose errors "aren't expected to be handled beyond
+  showing a generic error message or page". A mount that throws inside `paypal.Buttons()`
+  or `render()` stays a retryable `processing_error`: PayPal's docs say nothing about
+  render failures, and mounting again can succeed.
 - **Webhook verification via PayPal's postback API**
   (`POST /v1/notifications/verify-webhook-signature`), not local X.509 crypto:
   stateless, edge-clean, and PayPal does the certificate work. The raw body is
@@ -262,6 +269,44 @@ choices they forced:
   same-currency updates keep working, and PayPal decides on them. Refusing those locally
   would block refunding money already taken, and PayPal's pages do not say what happens to
   existing RUB payments.
+- **Doc-verified 2026-09-24: local limits.** A zero amount is refused on sessions, updates,
+  captures and refunds (`CANNOT_BE_ZERO_OR_NEGATIVE`; the Payments v2 capture and refund
+  amounts "must be a positive number"), a session `id` over 255 characters (the Orders v2
+  `custom_id` limit), and a `brandName` over 127 characters or with a line break
+  (`brand_name`, pattern `^.*$`). Lengths count characters, never UTF-16 units or bytes,
+  so the adapter never refuses what PayPal accepts under either of those; an empty `id` or
+  `brandName` is still omitted rather than refused. A `fetchEvents` cursor must start with
+  the events-list path and resolve to exactly that list, a trailing slash allowed, and the
+  resolved path is what is requested. **AMBIGUOUS:** the shape of the list's `next` link
+  (the webhooks schema gives no example href), and whether `start_time` without `end_time`
+  is honoured (the reference describes them as the two ends of one range). Sandbox checks:
+  page through `GET /v1/notifications/webhooks-events?page_size=1` on an account with two
+  or more events and record the `next` href, with and without `start_time`.
+- **Order updates follow the Orders v2 patchable-attributes table (2026-09-24).** The table
+  lists shipping's own attributes (`shipping.name`, `shipping.address`: replace, add), not
+  the whole `shipping` object, and `soft_descriptor` with replace and remove only, so the
+  adapter patches `shipping/name` and `shipping/address` and refuses to add a descriptor to
+  an order created without one, before the PATCH. A statement descriptor longer than 22
+  characters is cut to 22, since PayPal truncates it ("any content beyond 22 characters
+  (including spaces) will be truncated"), instead of being dropped. The PATCH applies whole
+  or not at all (RFC 5789 and RFC 6902, which PayPal's patch format follows; PayPal's pages
+  do not say so themselves), so one refused operation would take an amount change down
+  with it.
+  - **AMBIGUOUS in PayPal's docs:** which operation an attribute takes. The error reference
+    refuses an `add` over a present property and a `replace` of a missing one, while the
+    schema describes `add` over an existing value as replacing it, and PayPal's own "Patch
+    Order - Add Shipping Address" sample adds an address with `replace`, though the same
+    schema defines `replace` as succeeding only when "the target location must exist", as
+    RFC 6902 §4.3 does, and the sample does not say whether the order had a shipping object
+    (PayPal's `PUHF` create samples all carry an address). JSON Patch also needs the parent
+    object to exist for an `add` (RFC 6902 §4.1). The adapter replaces an attribute that is
+    there, adds a missing one under an existing shipping object, and replaces into an order
+    that has no shipping object, following PayPal's Add Shipping Address sample; the test
+    fake models that reading, and neither operation has run against a sandbox.
+    Sandbox checks to settle it: adding name and address to an order created without
+    shipping, adding a `soft_descriptor` to an order without one, an `add` over an existing
+    `shipping/address`, and whether an order read returns `soft_descriptor` (the refusal
+    depends on it).
 - **Sandbox-verified 2026-07-07:** orders created with `payment_source.paypal`
   (always, for the experience_context) answer `PAYER_ACTION_REQUIRED` immediately —
   not `CREATED` — so a fresh session reports `requires_action`; PATCH still works in
@@ -341,6 +386,17 @@ choices they forced:
     the adapter assumes; whether a DECLINED capture sent with `final_capture: true` leaves
     the authorization open, as the adapter also assumes; and whether an order created with
     `payment_source.paypal` and approved with Venmo reads back with `payment_source.venmo`.
+- **Negative-testing setup (AMBIGUOUS in the docs, 2026-09-24):** PayPal's request-headers
+  page says "REST API apps use a request header to invoke negative testing in the
+  sandbox. This header configures the sandbox into a negative testing state for
+  transactions that include the merchant." Its negative-testing overview lists negative
+  testing as available for "Classic PayPal API versions 2.4 and later", has the business
+  sandbox account's Negative Testing setting turned on before any test method, and adds
+  "Without this configuration, the sandbox does not raise error conditions unless the
+  error occurs through normal transaction processing." The guide and the integration
+  suite ask for both. An opt-in `PAYPAL_NEGATIVE_TESTING` run with the setting off would
+  settle which page holds; it runs locally only, since the integration workflow never
+  passes that variable.
 
 ## Versioning policy (2026-07-07, explicit user decision)
 
@@ -1265,10 +1321,17 @@ contract now carries them.
   (fixed "Canceled by merchant"); replay safety is the ACTIVE/SUSPENDED-only state
   machine + re-fetch on 422 SUBSCRIPTION_STATUS_INVALID. Statuses:
   APPROVAL_PENDING/APPROVED→pending, SUSPENDED→paused, EXPIRED→completed (finite
-  total_cycles ran out), rest 1:1; no trial/past-due status exists. The published
-  OpenAPI spec lacks the list operation entirely; the live reference page is the
-  authority for it. Which statuses an unfiltered list returns is undocumented — no
-  `statuses` filter is guessed.
+  total_cycles ran out), rest 1:1; no trial/past-due status exists. The GitHub OpenAPI
+  spec lacks the list operation; the live schema
+  (developer.paypal.com/api/subscriptions/v1/schema.json) documents it with `plan_ids`,
+  `statuses`, date-range filters, `filter`, `page_size` (1–20) and `page`, and a collection
+  of `subscriptions` and `links` (corrected 2026-09-24: this entry said the published spec
+  lacked the operation and that no `statuses` filter was documented). The adapter applies
+  no filter; the reference describes the call as listing all subscriptions for the
+  merchant account and gives `statuses` (ACTIVE, SUSPENDED, CANCELLED, EXPIRED) no default,
+  which no sandbox run has checked. It sends `total_required`, which the reference
+  documents for the plans list only, because totals end the walk exactly when PayPal
+  returns them; the next link or a full page decide otherwise.
 - **PayZen** (doc-verified 2026-07-17 via the GraphQL content channel; the JSON schema
   again lags the playground — `ResponseCodeAnswer.responseCode` enum lists only 0 while
   the rendered Subscription/Cancel table documents 0/30/32/99): `list: false` (no list

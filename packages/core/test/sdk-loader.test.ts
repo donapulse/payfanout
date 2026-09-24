@@ -318,6 +318,24 @@ describe("injectScript after a failed load", () => {
     await expect(second).resolves.toBeUndefined();
   });
 
+  it("resolves a call that reused the tag while it loaded, then drops the tag once it fails", async () => {
+    const { injected } = stubPage();
+    const first = injectScript(SDK_URL, "acme");
+    await expect(injectScript(SDK_URL, "acme")).resolves.toBeUndefined();
+    injected[0]!.onerror!();
+    await expectLoadFailure(first, SDK_URL);
+    void injectScript(SDK_URL, "acme");
+    expect(injected).toHaveLength(2);
+  });
+
+  it("never takes over a tag the page added itself", async () => {
+    const pageTag = scriptOnPage(SDK_URL);
+    stubPage(pageTag);
+    await expect(injectScript(SDK_URL, "acme")).resolves.toBeUndefined();
+    expect(pageTag.onerror).toBeNull();
+    expect(pageTag.onload).toBeNull();
+  });
+
   it("lets the file load under a new hash once the tag carrying the old one failed", async () => {
     const { injected } = stubPage();
     const first = injectScript(SDK_URL, "acme", { integrity: HASH });

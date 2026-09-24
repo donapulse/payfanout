@@ -62,15 +62,15 @@ export interface InjectScriptOptions {
  * Injects a PSP SDK `<script>` once per page (idempotent via DOM lookup) and
  * resolves on load. A load failure, including a file that fails its
  * `options.integrity` check, rejects with a retryable psp_unavailable
- * attributed to `pspName`. Adapters keep their own poll-for-global logic —
- * this only gets the script tag onto the page.
+ * attributed to `pspName` and removes the tag this call injected, so a later
+ * call fetches the file again. Adapters keep their own poll-for-global logic —
+ * this only gets the script tag onto the page; an adapter that caches the
+ * load promise must clear it when it rejects for that later call to happen.
  *
  * A `<script>` already on the page for `url` is reused: the call resolves at
- * once and injects nothing, although that tag may still be loading or may
- * have failed without this call seeing it (a tag this function injected is
- * removed when its load fails, so the next call fetches the file again; a tag
- * the page added itself is left alone), so callers keep confirming
- * the SDK global. With `options.integrity` the call also detects a
+ * once and injects nothing, even while that tag is still loading, and a tag the
+ * page added itself is reused even if its load failed, so callers keep
+ * confirming the SDK global. With `options.integrity` the call also detects a
  * conflicting tag: every `<script>` for `url` must carry exactly the same
  * `integrity` string and a `crossorigin` attribute, whatever its value, since
  * without one a cross-origin file is fetched without CORS and cannot pass the
@@ -126,9 +126,6 @@ export function injectScript(url: string, pspName: string, options: InjectScript
     script.async = true;
     script.onload = () => resolve();
     script.onerror = () => {
-      // A tag whose load failed must not stay on the page: the next call would
-      // find it and resolve at once, and the file would never be fetched again.
-      if (typeof script.remove === "function") script.remove();
       reject(
         new PayFanoutError({
           code: "psp_unavailable",
@@ -138,6 +135,9 @@ export function injectScript(url: string, pspName: string, options: InjectScript
           pspName,
         }),
       );
+      // A failed tag must not satisfy the next lookup, or the file would never be
+      // fetched again. Plain-object doubles in adapter test fakes have no remove().
+      if (typeof script.remove === "function") script.remove();
     };
     document.head.appendChild(script);
   });

@@ -290,7 +290,9 @@ Implement `ClientPaymentAdapter`:
   calls you eagerly. Return before calling `injectScript` once the SDK global exists, as
   every shipped client adapter does, and confirm the global after it resolves: a script
   already on the page for the URL is reused at once, though it may still be loading or
-  may have failed. If the PSP publishes Subresource Integrity hashes for a
+  may have failed. A tag `injectScript` added is removed when its load fails; if you cache
+  the load promise, clear it when it rejects, or one network error breaks every later
+  mount until the page reloads. If the PSP publishes Subresource Integrity hashes for a
   version-pinned SDK file, pass the hash: `injectScript(url, pspName, { integrity })`
   sets `integrity` (and `crossorigin="anonymous"` unless you pass `crossOrigin`), and a
   file that fails the check rejects like any other load failure. The PSP's CDN must

@@ -361,20 +361,21 @@ strings PayPal wants exist only inside the adapter.
 - Approve popups by logging in with a **personal** sandbox account
   (sandbox.paypal.com uses the same credentials).
 - **Negative testing** (a sandbox beta): turn on Negative Testing on the **business**
-  sandbox account (developer dashboard → Sandbox → Accounts → View/Edit Account → Settings),
-  then force errors per request with the
+  sandbox account your REST app belongs to (developer dashboard → Sandbox → Accounts →
+  View/Edit Account → Settings), then force errors per request with the
   `PayPal-Mock-Response: {"mock_application_codes": "INSTRUMENT_DECLINED"}` header. PayPal's
-  request-headers page describes the header alone as enough for REST calls, while its
-  negative-testing overview has you turn the setting on first; doing both covers either
-  reading. The header works on the Orders v2 create, update, show, authorize and capture
+  [request-headers page](https://developer.paypal.com/negative-testing/request-headers)
+  describes the header alone as enough for REST calls, while its
+  [negative-testing overview](https://developer.paypal.com/negative-testing/overview) has
+  you turn the setting on first; doing both covers either reading. The header works on the Orders v2 create, update, show, authorize and capture
   calls, and on the Payments v2 show, capture and void authorization, show capture, refund
   capture and show refund calls (reauthorize is not listed). The integration suite has an
   env-gated case for this. Mock errors never work in live.
-- PayPal publishes no rate-limit policy: it may temporarily throttle traffic that looks
-  abusive, answering `429` with `RATE_LIMIT_REACHED`, which the adapter maps to a
-  retryable `rate_limited`. PayPal recommends webhooks over polling and cached OAuth
-  tokens. The adapter caches its token per instance, so reuse one adapter rather than
-  building one per request.
+- PayPal [publishes no rate-limit policy](https://developer.paypal.com/api/rest/reference/rate-limiting):
+  it may temporarily throttle traffic that looks abusive, answering `429` with
+  `RATE_LIMIT_REACHED`, which the adapter maps to a retryable `rate_limited`. PayPal
+  recommends webhooks over polling and cached OAuth tokens. The adapter caches its token
+  per instance, so reuse one adapter rather than building one per request.
 
 ## 11. Limitations (v1)
 

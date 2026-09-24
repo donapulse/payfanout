@@ -64,38 +64,74 @@ export interface AdyenWebGlobal {
 }
 
 export interface AdyenClientAdapterConfig {
-  /** Browser-safe client key ("test_…"/"live_…"); its origins are allowlisted in the Customer Area. */
+  /**
+   * Browser-safe client key; its origins are allowlisted in the Customer Area.
+   * Adyen prefixes every client key with its environment, and the constructor
+   * refuses one whose prefix contradicts `environment`: sandbox takes a `test_`
+   * key, live a `live_` one.
+   */
   clientKey: string;
-  /** Explicit; selects the CDN host and the SDK's own environment value. */
+  /** Explicit; selects the client key prefix, the CDN host and the SDK's own environment value. */
   environment: "sandbox" | "live";
   /** ISO 3166-1 alpha-2. Adyen Web v6 requires it on the checkout instance. */
   countryCode: string;
   /** BCP-47 locale for Adyen's own field texts. MountOptions.locale wins per mount. */
   locale?: string;
   /**
-   * Overrides the environment value handed to Adyen Web — for the regional live
-   * values (e.g. a live account served from a specific region).
+   * The environment value handed to Adyen Web, which also selects the CDN host
+   * the SDK loads from (`checkoutshopper-{value}.cdn.adyen.com`): Adyen requires
+   * both to match the region of the account's live endpoints. Defaults to
+   * `"test"` on sandbox and `"live"` (Europe) on live; a live account served
+   * from another region sets `"live-us"`, `"live-au"`, `"live-nea"` or
+   * `"live-in"`. A value Adyen does not document, or one that contradicts
+   * `environment`, is refused at construction.
    */
   adyenEnvironment?: string;
   /** Account capabilities vary per contract — override the conservative default. */
   paymentMethods?: PaymentMethodCapability[];
-  /** Adyen Web version to load from the CDN. Pinned, never floating. */
+  /**
+   * Adyen Web version to load from the CDN instead of ADYEN_WEB_VERSION. Pinned,
+   * never floating. The adapter carries Adyen's integrity hashes for its own
+   * pinned build only, so with this set both files load without an integrity
+   * check.
+   */
   sdkVersion?: string;
-  /** Test seams / self-hosting. */
+  /** Self-hosting: the script URL to load instead of Adyen's CDN copy, without an integrity check. */
   sdkUrl?: string;
+  /** Self-hosting: the stylesheet URL to load instead of Adyen's CDN copy, without an integrity check. */
   stylesheetUrl?: string;
+  /** Test seam: loads the script in place of the adapter's injection, which carries the integrity check. */
   loadScript?: (url: string) => Promise<void>;
+  /** Test seam: loads the stylesheet in place of the adapter's injection, which carries the integrity check. */
   loadStylesheet?: (url: string) => Promise<void>;
+  /** Test seam: returns the SDK in place of `window.AdyenWeb`. */
   getAdyenGlobal?: () => AdyenWebGlobal | undefined;
 }
 
 /**
  * Adyen Web version the adapter loads by default. Moving it means reading
- * Adyen's release notes for the gap — the CDN path is versioned precisely so a
- * checkout never floats onto an untested SDK. This build requires Checkout API
- * v69 or later, which the server adapter's pinned version satisfies.
+ * Adyen's release notes for the gap and replacing both integrity hashes below —
+ * the CDN path is versioned precisely so a checkout never floats onto an
+ * untested SDK. This build requires Checkout API v69 or later, which the server
+ * adapter's pinned version satisfies.
  */
-export const ADYEN_WEB_VERSION = "6.41.0";
+export const ADYEN_WEB_VERSION = "6.45.2";
+
+/**
+ * The sha384 hashes Adyen publishes for ADYEN_WEB_VERSION's adyen.js and
+ * adyen.css (release notes, "Updating to this version"). Adyen asks for the
+ * same hashes on its test and regional hosts, which serve identical files.
+ */
+const ADYEN_WEB_SCRIPT_INTEGRITY = "sha384-crX4Byf88JpnQfdUaDuwVOj3qlk5tmSa3rhIalmJIyo1kC49EDIcnNQ9fY5blVUV";
+const ADYEN_WEB_STYLESHEET_INTEGRITY = "sha384-KhV4iC2YVQosq5vzx0xN0yGDVMZA++mbd6obc2JKUszVBdXmexFTRHOXKh5DcqDF";
+
+/**
+ * The `environment` values Adyen documents for Adyen Web v6, each served from
+ * its own CDN host. Adyen Web itself also accepts `live-apse`, which the v6
+ * documentation does not list, and falls back to the European live hosts for
+ * any value it does not know.
+ */
+const ADYEN_ENVIRONMENTS: readonly string[] = ["test", "live", "live-us", "live-au", "live-nea", "live-in"];
 
 const DEFAULT_METHODS: PaymentMethodCapability[] = [{ type: "card", flow: "embedded", supported: true }];
 
@@ -122,13 +158,15 @@ let mountCounter = 0;
 export class AdyenClientAdapter implements ClientPaymentAdapter {
   readonly pspName = "adyen";
   private readonly config: AdyenClientAdapterConfig;
+  /** The validated value handed to Adyen Web; it also names the CDN host. */
+  private readonly adyenEnvironment: string;
   private sdkPromise?: Promise<void>;
 
   constructor(config: AdyenClientAdapterConfig) {
     if (config.environment !== "sandbox" && config.environment !== "live") {
       throw PayFanoutError.invalidRequest('AdyenClientAdapter config.environment must be "sandbox" or "live"');
     }
-    if (!config.clientKey) {
+    if (typeof config.clientKey !== "string" || !config.clientKey) {
       throw PayFanoutError.invalidRequest("AdyenClientAdapter config.clientKey is required");
     }
     if (!config.countryCode) {
@@ -136,17 +174,56 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
         "AdyenClientAdapter config.countryCode is required (Adyen Web takes it on the checkout instance)",
       );
     }
+    const live = config.environment === "live";
+    const keyPrefix = live ? "live_" : "test_";
+    if (!config.clientKey.startsWith(keyPrefix)) {
+      const otherPrefix = live ? "test_" : "live_";
+      throw PayFanoutError.invalidRequest(
+        config.clientKey.startsWith(otherPrefix)
+          ? `AdyenClientAdapter config.clientKey is a ${otherPrefix} key, but config.environment "${config.environment}" takes a ${keyPrefix} key`
+          : `AdyenClientAdapter config.clientKey must start with ${keyPrefix} for config.environment "${config.environment}"`,
+      );
+    }
+    const adyenEnvironment = config.adyenEnvironment ?? (live ? "live" : "test");
+    if (!ADYEN_ENVIRONMENTS.includes(adyenEnvironment)) {
+      throw PayFanoutError.invalidRequest(
+        `AdyenClientAdapter config.adyenEnvironment ${JSON.stringify(adyenEnvironment)} is not a value Adyen documents: ` +
+          ADYEN_ENVIRONMENTS.map((value) => `"${value}"`).join(", "),
+      );
+    }
+    if ((adyenEnvironment === "test") === live) {
+      throw PayFanoutError.invalidRequest(
+        `AdyenClientAdapter config.adyenEnvironment "${adyenEnvironment}" contradicts config.environment ` +
+          `"${config.environment}", which takes ${live ? '"live" or a regional "live-…" value' : '"test"'}`,
+      );
+    }
     this.config = config;
+    this.adyenEnvironment = adyenEnvironment;
   }
 
+  /**
+   * Loads Adyen Web's script and stylesheet once, from the CDN host of the
+   * configured Adyen environment. Loaded from their default URLs, both files
+   * carry the Subresource Integrity hash Adyen publishes for ADYEN_WEB_VERSION;
+   * `sdkVersion` turns the check off for both, `sdkUrl` for the script and
+   * `stylesheetUrl` for the stylesheet. A failed load is not cached: the next
+   * call loads again, as it does when the script loaded without defining
+   * `window.AdyenWeb`.
+   */
   async loadSdk(): Promise<void> {
     assertBrowser("AdyenClientAdapter", "loadSdk");
     if (this.adyenGlobal()) return;
+    const pinnedBuild = this.config.sdkVersion === undefined;
     const url = this.config.sdkUrl ?? `${this.cdnBase()}/adyen.js`;
     const stylesheet = this.config.stylesheetUrl ?? `${this.cdnBase()}/adyen.css`;
-    this.sdkPromise ??= Promise.all([
-      this.config.loadScript ? this.config.loadScript(url) : injectScript(url, this.pspName),
-      this.injectStylesheet(stylesheet),
+    const scriptIntegrity = pinnedBuild && this.config.sdkUrl === undefined ? ADYEN_WEB_SCRIPT_INTEGRITY : undefined;
+    const stylesheetIntegrity =
+      pinnedBuild && this.config.stylesheetUrl === undefined ? ADYEN_WEB_STYLESHEET_INTEGRITY : undefined;
+    const loading = (this.sdkPromise ??= Promise.all([
+      this.config.loadScript
+        ? this.config.loadScript(url)
+        : injectScript(url, this.pspName, { integrity: scriptIntegrity }),
+      this.injectStylesheet(stylesheet, stylesheetIntegrity),
     ])
       .then(() => undefined)
       .catch((err: unknown) => {
@@ -154,9 +231,13 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
         // cached promise so the next loadSdk() retries the injection.
         this.sdkPromise = undefined;
         throw err;
-      });
-    await this.sdkPromise;
+      }));
+    await loading;
     if (!this.adyenGlobal()) {
+      // The load can resolve without the global: a script already on the page
+      // for the URL is reused at once, even while it is still loading or after
+      // it failed. Forget this load so the next call goes back through the loader.
+      if (this.sdkPromise === loading) this.sdkPromise = undefined;
       throw new PayFanoutError({
         code: "psp_unavailable",
         message: "Adyen Web loaded but the AdyenWeb global is missing",
@@ -214,7 +295,7 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
       const session = readSessionPayload(options.clientSecret);
       const checkout = await AdyenCheckout({
         clientKey: this.config.clientKey,
-        environment: this.adyenEnvironmentValue(),
+        environment: this.adyenEnvironment,
         countryCode: this.config.countryCode,
         ...(options.locale ?? this.config.locale ? { locale: options.locale ?? this.config.locale } : {}),
         ...(session ? { amount: { value: session.amount, currency: session.currency } } : {}),
@@ -348,16 +429,18 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
     return this.config.paymentMethods ?? DEFAULT_METHODS;
   }
 
+  /** Adyen requires the files to come from the region the environment value names. */
   private cdnBase(): string {
-    const host = this.config.environment === "live" ? "checkoutshopper-live" : "checkoutshopper-test";
-    return `https://${host}.cdn.adyen.com/checkoutshopper/sdk/${this.config.sdkVersion ?? ADYEN_WEB_VERSION}`;
+    const version = this.config.sdkVersion ?? ADYEN_WEB_VERSION;
+    return `https://checkoutshopper-${this.adyenEnvironment}.cdn.adyen.com/checkoutshopper/sdk/${version}`;
   }
 
-  private adyenEnvironmentValue(): string {
-    return this.config.adyenEnvironment ?? (this.config.environment === "live" ? "live" : "test");
-  }
-
-  private injectStylesheet(url: string): Promise<void> {
+  /**
+   * A `<link>` already on the page for the URL is reused as it is. One this
+   * injects and whose load fails is removed again, so the next load fetches
+   * the file anew.
+   */
+  private injectStylesheet(url: string, integrity: string | undefined): Promise<void> {
     if (this.config.loadStylesheet) return this.config.loadStylesheet(url);
     return new Promise<void>((resolve) => {
       if (document.querySelector(`link[href="${url}"]`)) {
@@ -366,11 +449,20 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
       }
       const link = document.createElement("link");
       link.rel = "stylesheet";
+      // Set before href and insertion, as injectScript does for the script: the
+      // browser checks a cross-origin file only when it fetches it in CORS mode.
+      if (integrity !== undefined) {
+        link.integrity = integrity;
+        link.crossOrigin = "anonymous";
+      }
       link.href = url;
-      // Styling is cosmetic: a stylesheet that fails to load must never block
-      // the fields from mounting.
       link.onload = () => resolve();
-      link.onerror = () => resolve();
+      // Styling is cosmetic: a stylesheet that fails to load, or fails its
+      // integrity check, must never block the fields from mounting.
+      link.onerror = () => {
+        resolve();
+        link.remove();
+      };
       document.head.appendChild(link);
     });
   }
@@ -458,6 +550,7 @@ function readSessionPayload(clientSecret: string): { amount: number; currency: s
 }
 
 interface AdyenClientErrorLike {
+  name?: unknown;
   message?: string;
   errorText?: string;
   error?: { message?: string };
@@ -469,19 +562,40 @@ function extractMessage(err: unknown): string {
   return e?.message ?? e?.errorText ?? e?.error?.message ?? "";
 }
 
+function extractName(err: unknown): string | undefined {
+  const name = typeof err === "object" && err !== null ? (err as AdyenClientErrorLike).name : undefined;
+  return typeof name === "string" ? name : undefined;
+}
+
 /**
  * Maps an Adyen Web failure onto the unified taxonomy. The browser only
  * validates and encrypts card DATA — the authorisation happens server-side at
  * completePayment — so a client-side failure is `fallback` (a card-data
- * problem, or an authentication one while an action runs) unless it looks like
- * an SDK/network load issue.
+ * problem, or an authentication one while an action runs) unless it is an SDK
+ * load or network failure (`psp_unavailable`).
+ *
+ * The `name` Adyen Web gives its errors decides first: `NETWORK_ERROR` (a call
+ * to Adyen failed; Adyen asks for the shopper to try again) and `SCRIPT_ERROR`
+ * (a script failed to load) are `psp_unavailable`, and `IMPLEMENTATION_ERROR`
+ * (a method or parameter Adyen Web does not support) is `invalid_request`,
+ * though still `authentication_required` while an action runs. The generic
+ * `ERROR`, the other names (`CANCEL`, `API_ERROR`, `SDK_ERROR`) and errors
+ * without one are read by their message, as a load or network failure or as
+ * `fallback`.
  */
 function mapAdyenClientError(
   err: unknown,
   fallback: "invalid_card_data" | "authentication_required" = "invalid_card_data",
 ): UnifiedError {
-  const message = extractMessage(err);
-  const code: UnifiedErrorCode = /load|network|script|timeout|unavailable/i.test(message) ? "psp_unavailable" : fallback;
+  const name = extractName(err);
+  let code: UnifiedErrorCode;
+  if (name === "NETWORK_ERROR" || name === "SCRIPT_ERROR") {
+    code = "psp_unavailable";
+  } else if (name === "IMPLEMENTATION_ERROR") {
+    code = fallback === "authentication_required" ? fallback : "invalid_request";
+  } else {
+    code = /load|network|script|timeout|unavailable/i.test(extractMessage(err)) ? "psp_unavailable" : fallback;
+  }
   return buildError(code, err);
 }
 

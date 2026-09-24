@@ -281,8 +281,30 @@ const adyen = new AdyenClientAdapter({
 - Pressing **Enter** in the fields does nothing by default. Adyen Web's own handler submits
   the Card, which has no `onSubmit` to call here; pass `onEnterKeyPressed` in `fieldOptions`
   to run your own pay action instead.
-- `sdkVersion` pins the Adyen Web build the adapter loads; override `sdkUrl` /
-  `stylesheetUrl` to self-host.
+- The adapter loads Adyen Web **6.45.2** (`ADYEN_WEB_VERSION`) from the Adyen CDN host of
+  your account's region: Adyen requires the script and stylesheet to match the region of your
+  [live endpoints](https://docs.adyen.com/development-resources/live-endpoints) and the
+  `environment` Adyen Web is given
+  ([web best practices](https://docs.adyen.com/online-payments/web-best-practices#embed-script-and-stylesheet)).
+  `adyenEnvironment` picks that value and the host, `checkoutshopper-{value}.cdn.adyen.com`:
+  `test` (the default on sandbox), `live` for Europe (the default on live), or `live-us`,
+  `live-au`, `live-nea` or `live-in`. The constructor throws `invalid_request` for any other
+  value, for one that contradicts `environment` (`live` or a regional value on sandbox,
+  `test` on live), and for a client key whose `test_` / `live_` prefix contradicts
+  `environment`.
+- Both files carry the
+  [Subresource Integrity](https://docs.adyen.com/online-payments/web-best-practices#implement-subresource-integrity-hashes)
+  hash Adyen publishes for 6.45.2, with `crossorigin="anonymous"`, so the browser refuses a
+  modified copy; every regional host serves the same files and answers CORS, which the check
+  needs. The hashes cover the adapter's default URLs for its pinned build only: setting
+  `sdkVersion` turns the check off for both files, and `sdkUrl` / `stylesheetUrl`, which
+  self-host one file, turn it off for that file. A `<script>` your page adds itself for the
+  default URL needs the same `integrity` and a `crossorigin` attribute: while
+  `window.AdyenWeb` is not defined yet, a conflicting tag makes the load fail with
+  `invalid_request`.
+- If the script fails to load, or loads without defining `window.AdyenWeb`, the next mount
+  loads it again, along with the stylesheet if that failed too. A stylesheet that fails to
+  load never blocks the fields from mounting.
 
 ::: tip Content-Security-Policy
 A CSP-enforcing page must allow Adyen, or the fields fail quietly. 3-D Secure 2 challenges

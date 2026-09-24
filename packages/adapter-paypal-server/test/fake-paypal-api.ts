@@ -427,7 +427,8 @@ export class FakePayPalApi {
           reference_id: "default",
           amount: { currency_code: currency, value },
           ...(units?.[0]?.["custom_id"] !== undefined ? { custom_id: units[0]!["custom_id"] as string } : {}),
-          ...(units?.[0]?.["soft_descriptor"] !== undefined ? { soft_descriptor: units[0]!["soft_descriptor"] as string } : {}),
+          // PayPal keeps the first 22 characters, whichever call sets the descriptor.
+          ...(units?.[0]?.["soft_descriptor"] !== undefined ? { soft_descriptor: (units[0]!["soft_descriptor"] as string).slice(0, 22) } : {}),
           ...(units?.[0]?.["shipping"] !== undefined ? { shipping: units[0]!["shipping"] } : {}),
         },
       ],
@@ -448,9 +449,14 @@ export class FakePayPalApi {
       return json(422, unprocessable("ORDER_ALREADY_COMPLETED", "The order cannot be patched after it is completed."));
     }
     const unit = order.purchase_units[0]!;
-    const shipping = (unit.shipping ?? {}) as Record<string, unknown>;
+    const shipping = unit.shipping as Record<string, unknown> | undefined;
     // PayPal's patchable-attributes table for the paths the adapter sends. The
-    // PATCH is applied as a whole or not at all, so every op is checked first.
+    // PATCH is applied as a whole or not at all (RFC 5789/6902), so every op is
+    // checked first. Presence follows the error reference's rules (no add over
+    // a present value, no replace or remove of a missing one), except that a
+    // shipping attribute of an order with no shipping object is replaced into
+    // it, as PayPal's "Add Shipping Address" sample does, and cannot be added:
+    // JSON Patch needs the parent object to exist for an add.
     const allowed: Record<string, string[]> = {
       amount: ["replace"],
       soft_descriptor: ["replace", "remove"],
@@ -465,15 +471,17 @@ export class FakePayPalApi {
       const value = op["value"];
       const attribute = path.startsWith(prefix) ? path.slice(prefix.length) : path;
       const kinds = allowed[attribute];
-      if (!kinds) return json(422, unprocessable("FIELD_NOT_PATCHABLE", "Field cannot be patched."));
+      if (!kinds) return json(400, invalidRequest("FIELD_NOT_PATCHABLE", "Field cannot be patched."));
       const shippingKey = attribute.startsWith("shipping/") ? attribute.slice("shipping/".length) : undefined;
       const present =
         attribute === "amount" ||
-        (attribute === "soft_descriptor" ? unit.soft_descriptor !== undefined : shipping[shippingKey!] !== undefined);
-      if (!kinds.includes(kind) || (kind === "add") === present) {
+        (attribute === "soft_descriptor" ? unit.soft_descriptor !== undefined : shipping?.[shippingKey!] !== undefined);
+      const intoMissingShipping = shippingKey !== undefined && shipping === undefined;
+      const honoured = intoMissingShipping ? kind === "replace" : (kind === "add") !== present;
+      if (!kinds.includes(kind) || !honoured) {
         return json(
-          422,
-          unprocessable(
+          400,
+          invalidRequest(
             "INVALID_PATCH_OPERATION",
             "The operation cannot be honored. Cannot add a property that's already present, use replace. Cannot remove a property thats not present, use add. Cannot replace a property thats not present, use add.",
           ),
@@ -822,6 +830,16 @@ function notFound(): Response {
     debug_id: debugId(),
     details: [{ issue: "INVALID_RESOURCE_ID", description: "Specified resource ID does not exist. Please check the resource ID and try again." }],
   });
+}
+
+/** PayPal's 400 envelope, under which the Orders error reference lists the patch errors. */
+function invalidRequest(issue: string, description: string): unknown {
+  return {
+    name: "INVALID_REQUEST",
+    message: "Request is not well-formed, syntactically incorrect, or violates schema.",
+    debug_id: debugId(),
+    details: [{ issue, description }],
+  };
 }
 
 function unprocessable(issue: string, description: string): unknown {

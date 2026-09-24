@@ -596,12 +596,13 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * PATCH-amends a CREATED/APPROVED order in place (same order id, so the
    * mounted PayPal button keeps working). COMPLETED orders reject with
    * invalid_request. Currency changes require an explicit amount — the old
-   * minor amount is not silently reinterpreted in the new currency. PayPal
-   * applies the whole PATCH or none of it, and patches only the attributes
-   * its table lists: shipping's name and address (added when absent, replaced
-   * when present), and a statement descriptor the order already has. Adding
-   * a descriptor to an order created without one is refused before any
-   * PATCH: pass statementDescriptor when creating the session.
+   * minor amount is not silently reinterpreted in the new currency. The PATCH
+   * applies whole or not at all, and touches only attributes PayPal's patch
+   * table lists: shipping's name and address, and a statement descriptor the
+   * order already has. A name left out of an update keeps the order's
+   * current one (the table has no remove for it). Adding a descriptor to an
+   * order created without one is refused before any PATCH: pass
+   * statementDescriptor when creating the session.
    */
   async updatePaymentSession(input: UpdatePaymentSessionInput): Promise<PaymentSession> {
     if (input.amount !== undefined) assertMinorUnitAmount(input.amount, "amount");
@@ -644,11 +645,15 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     }
     const shipping = toPayPalShipping(input.shippingDetails);
     if (shipping) {
-      // Only shipping's own attributes are patchable, never the whole object.
+      // Only shipping's own attributes are patchable, never the whole object. An
+      // attribute already there is replaced; a missing one is added under an
+      // existing shipping object, and replaced into an order that has none, as
+      // PayPal's own "Add Shipping Address" sample does (see decisions.md).
+      const current = unit?.shipping;
       for (const key of ["name", "address"] as const) {
         const value = shipping[key];
         if (value === undefined) continue;
-        const op = unit?.shipping?.[key] !== undefined ? "replace" : "add";
+        const op = current === undefined || current[key] !== undefined ? "replace" : "add";
         ops.push({ op, path: `${unitPath}/shipping/${key}`, value });
       }
     }
@@ -1334,11 +1339,6 @@ function mapRefundStatus(status: string | undefined): RefundResult["status"] {
   }
 }
 
-/**
- * Card statements truncate the soft descriptor at 22 characters — anything
- * longer is withheld rather than failing the payment (checkout-field rule:
- * validate locally, withhold what the PSP would reject).
- */
 /**
  * PayPal accepts a longer soft_descriptor but truncates anything beyond 22
  * characters, the length its responses carry, so the adapter cuts it the same

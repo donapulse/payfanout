@@ -262,14 +262,27 @@ choices they forced:
   same-currency updates keep working, and PayPal decides on them. Refusing those locally
   would block refunding money already taken, and PayPal's pages do not say what happens to
   existing RUB payments.
-- **Doc-verified 2026-09-24:** order updates follow the Orders v2 patchable-attributes table.
-  Shipping is patched through `shipping/name` and `shipping/address` (add when absent,
-  replace when present), never as a whole object, and `soft_descriptor` can be replaced or
-  removed but not added, so adding a descriptor to an order created without one is refused
-  before the PATCH; PayPal applies a PATCH whole or not at all, so one refused operation
-  would take an amount change down with it. A statement descriptor longer than 22 characters
-  is cut to 22, since PayPal truncates it ("any content beyond 22 characters (including
-  spaces) will be truncated"), instead of being dropped.
+- **Order updates follow the Orders v2 patchable-attributes table (2026-09-24).** The table
+  lists shipping's own attributes (`shipping.name`, `shipping.address`: replace, add), not
+  the whole `shipping` object, and `soft_descriptor` with replace and remove only, so the
+  adapter patches `shipping/name` and `shipping/address` and refuses to add a descriptor to
+  an order created without one, before the PATCH. A statement descriptor longer than 22
+  characters is cut to 22, since PayPal truncates it ("any content beyond 22 characters
+  (including spaces) will be truncated"), instead of being dropped. The PATCH applies whole
+  or not at all (RFC 5789 and RFC 6902, which PayPal's patch format follows; PayPal's pages
+  do not say so themselves), so one refused operation would take an amount change down
+  with it.
+  - **AMBIGUOUS in PayPal's docs:** which operation an attribute takes. The error reference
+    refuses an `add` over a present property and a `replace` of a missing one, while the
+    schema describes `add` over an existing value as replacing it, and PayPal's own "Patch
+    Order - Add Shipping Address" sample adds an address with `replace`. JSON Patch also
+    needs the parent object to exist for an `add`. The adapter replaces an attribute that is
+    there, adds a missing one under an existing shipping object, and replaces into an order
+    that has no shipping object, as the sample does; the test fake models that reading.
+    Sandbox checks to settle it: adding name and address to an order created without
+    shipping, adding a `soft_descriptor` to an order without one, an `add` over an existing
+    `shipping/address`, and whether an order read returns `soft_descriptor` (the refusal
+    depends on it).
 - **Sandbox-verified 2026-07-07:** orders created with `payment_source.paypal`
   (always, for the experience_context) answer `PAYER_ACTION_REQUIRED` immediately —
   not `CREATED` — so a fresh session reports `requires_action`; PATCH still works in

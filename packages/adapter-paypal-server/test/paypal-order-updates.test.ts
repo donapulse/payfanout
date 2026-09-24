@@ -23,19 +23,60 @@ async function orderUnit(adapter: PayPalServerAdapter, orderId: string): Promise
 }
 
 describe("PayPal order updates", () => {
-  it("adds shipping to an order created without it, name and address as their own attributes", async () => {
+  it("gives an order created without shipping its name and address by replace, as PayPal's sample does", async () => {
     const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession({ amount: 2000, currency: "USD", idempotencyKey: "k" });
     await adapter.updatePaymentSession({ pspSessionId: session.pspSessionId, shippingDetails: berlin, idempotencyKey: "k-up" });
     expect(fake.lastRequestBody).toEqual([
-      { op: "add", path: "/purchase_units/@reference_id=='default'/shipping/name", value: { full_name: "Ann" } },
+      { op: "replace", path: "/purchase_units/@reference_id=='default'/shipping/name", value: { full_name: "Ann" } },
       {
-        op: "add",
+        op: "replace",
         path: "/purchase_units/@reference_id=='default'/shipping/address",
         value: { address_line_1: "2 Way", admin_area_2: "Berlin", postal_code: "10115", country_code: "DE" },
       },
     ]);
     expect((await orderUnit(adapter, session.pspSessionId))["shipping"]).toMatchObject({ name: { full_name: "Ann" } });
+  });
+
+  it("adds a missing name under an order's existing shipping and replaces its address", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({
+      amount: 2000,
+      currency: "USD",
+      shippingDetails: { address: berlin.address },
+      idempotencyKey: "k",
+    });
+    await adapter.updatePaymentSession({ pspSessionId: session.pspSessionId, shippingDetails: paris, idempotencyKey: "k-up" });
+    const ops = fake.lastRequestBody as Array<{ op: string; path: string }>;
+    expect(ops.map((op) => `${op.op} ${op.path.split("/").slice(3).join("/")}`)).toEqual([
+      "add shipping/name",
+      "replace shipping/address",
+    ]);
+    expect((await orderUnit(adapter, session.pspSessionId))["shipping"]).toMatchObject({
+      name: { full_name: "Bea" },
+      address: { country_code: "FR" },
+    });
+  });
+
+  it("keeps the order's name when an update sends only an address", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({
+      amount: 2000,
+      currency: "USD",
+      shippingDetails: berlin,
+      idempotencyKey: "k",
+    });
+    await adapter.updatePaymentSession({
+      pspSessionId: session.pspSessionId,
+      shippingDetails: { address: paris.address },
+      idempotencyKey: "k-up",
+    });
+    const ops = fake.lastRequestBody as Array<{ op: string; path: string }>;
+    expect(ops.map((op) => `${op.op} ${op.path.split("/").slice(3).join("/")}`)).toEqual(["replace shipping/address"]);
+    expect((await orderUnit(adapter, session.pspSessionId))["shipping"]).toMatchObject({
+      name: { full_name: "Ann" },
+      address: { country_code: "FR" },
+    });
   });
 
   it("replaces the shipping of an order that already has one", async () => {

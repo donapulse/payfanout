@@ -371,6 +371,16 @@ strings PayPal wants exist only inside the adapter.
   PayPal's Transaction Search API is a separate product.
 - **No zero-amount verification** (`supportsPaymentMethodVerification: false`): there is
   no PayPal equivalent for wallet approvals.
+- **Order updates** (`updatePaymentSession`) patch only what PayPal's patch table lists. A
+  statement descriptor can be replaced but not added, so pass `statementDescriptor` when
+  creating the session. It is cut to 22 characters, as PayPal does, and the card
+  statement itself shows only 22 characters in total, starting with PayPal's `PAYPAL *`
+  prefix and your merchant descriptor (PayPal's example: the descriptor `800-123-1234`
+  shows as `PAYPAL * Janes Gift 80`). An address added by an update to an order created
+  without shipping is not locked: the order keeps PayPal's default shipping preference
+  (`GET_FROM_FILE`, the address the buyer picks on PayPal's site), which is set at
+  creation and cannot be patched; only sessions created with shipping get
+  `SET_PROVIDED_ADDRESS`.
 - `cancelPayment` voids **authorizations** only. A CAPTURE-intent order cannot be
   cancelled via the API — stop using it and it expires on its own (~3 hours in the
   CREATED state).

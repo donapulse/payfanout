@@ -49,6 +49,33 @@ Pair it on the browser with [`@payfanout/adapter-adyen`](../adapter-adyen). This
 **tokenize-first** PSP: the browser encrypts the card in Adyen's hosted fields, then your
 server finalizes the payment via `completePayment` (wire a server-completion route for it).
 
+The browser's `clientToken` also carries the data 3-D Secure 2 needs, and the payment asks
+Adyen for its native flow (`channel: "Web"`, `origin`, `browserInfo`,
+`nativeThreeDS: "preferred"`). Only the card fields Adyen Web's Card produces are forwarded,
+and a billing address only when it is complete and within Adyen's limits. When Adyen answers
+with an action, `completePayment` reports `requires_action`; the client adapter's
+`handleAction` resolves it, or Adyen's redirect does, and the resulting token goes back
+through `completePayment` to `/payments/details` — see §6 of
+[Set up Adyen](https://donapulse.github.io/payfanout/guide/adyen). Because a
+`/payments/details` call finishes whichever payment its details were issued for, its answer
+must belong to the session's payment: a different `merchantReference` or `amount` is refused
+with `invalid_request`, and an answer that does not name the session's merchant reference and
+amount reads `processing` with no `pspPaymentId`, until the `AUTHORISATION` webhook supplies
+the reference. A `/payments` answer naming another merchant reference or amount is refused
+too: it belongs to another request, since an `idempotencyKey` reused across sessions replays
+the first answer. An empty `pspPaymentId` is not a reference — capture, cancel and refund
+refuse it — so correlate such a payment by `PaymentInfo.id`, the merchant reference.
+
+The shopper email Adyen asks for on Visa and JCB 3-D Secure 2 payments is the session's
+`receiptEmail`, or its `billingDetails.email`. Both ride the signed session context, whose
+payload half the browser can read in the `clientSecret`. A `receiptEmail` that is not an
+address of at most 256 characters is refused at session creation; a `billingDetails.email`
+like that is left out. `shopperIP` is not sent, because PayFanout's inputs carry no shopper IP
+address. Adyen's v72 reference requires it for Visa and JCB 3-D Secure 2 web payments only
+when no `shopperEmail` is sent, while its 3-D Secure guides list it as required for Visa and
+JCB on the web, so pass an email; whether Adyen accepts that without an IP address is
+unverified.
+
 ## Push-only: outcomes arrive by webhook
 
 Adyen's Checkout API takes its `pspReference` as a **write target**. There is no read for a
@@ -59,7 +86,16 @@ payment or for a refund, and captures, cancels and refunds answer `{ "status": "
 `"processing"` and refunds resolve `"pending"`. Nothing reports a terminal state Adyen has
 not confirmed; the confirmation is the webhook.
 
-Two consequences worth designing around:
+They resolve only on a real acknowledgement: one carrying the modification's own
+`pspReference`. An answer without it rejects with a retryable `processing_error` (a replay
+under the same key cannot repeat the modification). A capture or refund acknowledgement that
+echoes another amount or currency rejects with `invalid_request`: it is Adyen's stored answer
+to an earlier capture or refund under the same idempotency key, which Adyen already accepted,
+and the error names its amount and `pspReference`. If that is the one you meant, do not send
+it again; a further capture or refund needs a new key. One that echoes no amount is accepted,
+as Adyen's refund guide shows acknowledgements without it.
+
+Consequences worth designing around:
 
 - **`PaymentInfo.pspPaymentId` is the composite `"{pspReference}:{value}:{currency}"`.** A
   capture or refund needs the payment's currency (and, without an explicit amount, its
@@ -69,6 +105,15 @@ Two consequences worth designing around:
   composite as server-side state: read it from your own record, never from a client request
   body. A cancel driven from a bare reference reports `amount: 0` and `currency: "XXX"`,
   since no money facts travel on one.
+- **Failures arrive by webhook, not as errors.** A refund without `amount` requests the
+  authorised amount the composite carries, which Adyen refuses in the `REFUND` webhook once
+  part of the payment was captured or refunded, so pass `amount` for partial cases.
+  `cancelPayment` only voids an authorisation that has not been captured; that a cancel after
+  the capture is acknowledged and fails in the `CANCELLATION` webhook is an assumption, since
+  Adyen documents only that a captured payment can no longer be cancelled. A capture or cancel
+  for a `pspReference` Adyen does not know is acknowledged and fails in its webhook with
+  `Transaction not found`, and a refund is assumed to behave alike. That holds within one
+  environment: a reference from the other one is rejected in the answer (Adyen error 906).
 - **The webhook endpoint is the system of record.** There is no events-polling API either
   (`supportsEventPolling: false`), so persist every event and dedupe by `event.id`.
 
@@ -79,8 +124,10 @@ amount, currency, reference, capture method and the checkout fields are HMAC-sig
 `pspSessionId` and verified at `completePayment`. The browser round-trips the token (it is
 also the session's `clientSecret`, which is how Adyen Web learns the amount) but cannot
 tamper with it, and every context carries an **expiry** (`sessionTtlSeconds`, default 1h)
-enforced at completion. `encodeSessionContext` / `decodeSessionContext` are exported for
-advanced use.
+enforced at every completion — the 3-D Secure one and a redirect return page's included.
+The `clientToken` the browser sends adds only the card and its 3-D Secure data: nothing in
+it reaches the amount, currency, reference, merchant account or capture method.
+`encodeSessionContext` / `decodeSessionContext` are exported for advanced use.
 
 ## Webhooks
 
@@ -131,23 +178,44 @@ Customer Area settings it relies on.
 - **`mapAdyenError` / `mapAdyenRefusal` / `mapAdyenResultCode`**, the taxonomy mapping —
   business rejections are never replayed, and an unrecognized refusal reason is still a
   decline.
-- **`encodeAdyenPaymentRef` / `decodeAdyenPaymentRef`**, the composite payment reference.
+- **`encodeAdyenPaymentRef` / `decodeAdyenPaymentRef`**, the composite payment reference;
+  `decodeAdyenPaymentRef` refuses an empty one.
 
 ## Notes
 
-- Every call carries an `idempotency-key` derived deterministically from the caller's
-  `idempotencyKey` **and the endpoint** (Adyen caps it at 64 characters, so it travels as a
-  SHA-256 digest). Adyen stores keys at company-account level rather than per endpoint, so
-  one caller key spanning `/payments` and `/payments/details` — the 3-D Secure flow — or a
-  capture and a refund would otherwise be answered with the first call's stored response.
-  The transport retries timeouts/5xx/429 with backoff (`maxNetworkRetries`, default 2) and
-  replays a duplicate racing the in-flight original (`errorCode` 704).
+- **Upgrading from 0.1.0:** `/payments` and `/payments/details` send a different
+  `idempotency-key` than 0.1.0 did, so a `completePayment` retried by another version than the
+  one that first sent it reaches Adyen as a new request and can charge twice (Adyen captures
+  right after authorisation by default). That holds for an upgrade, a rolling deploy and a
+  rollback alike: before switching versions, stop retrying in-flight completions and settle
+  each from its `AUTHORISATION` webhook. Captures, cancels and refunds keep the 0.1.0 key.
+- Every call carries an `idempotency-key`, a SHA-256 digest (Adyen caps the header at 64
+  characters). On `/payments` it covers the caller's `idempotencyKey`, the merchant account
+  and the endpoint, and on `/payments/details` also the submitted `details` and
+  `paymentData`. On captures, cancels and refunds it covers the caller's key and the
+  endpoint, whose path carries the payment's `pspReference`, unique across Adyen
+  (`deriveAdyenIdempotencyKey` computes that one). Adyen checks keys across the whole company
+  account, so two merchant accounts, a capture and a refund, or the steps of a 3-D Secure
+  flow never receive each other's stored answers, while a replay of the same call is
+  deduplicated. Keys last 7 to 14 days and are not checked across location-based endpoints.
+  Use a random (v4) UUID per operation, as Adyen recommends, and a new one for a new attempt:
+  a refusal is replayed for its key.
+- The transport retries, with backoff and the same key (`maxNetworkRetries`, default 2):
+  network failures, timeouts, HTTP 408 and 429, `errorCode` 704 and 705, 5xx errors not
+  typed `validation`/`configuration`/`security` (those, and 501, reject as `invalid_request`),
+  a 2xx that is not a JSON object, and anything Adyen sends with `transient-error: true` (in
+  any letter case). The 5xx retry needs no `transient-error` header, deliberately: Adyen does
+  not store a request an internal error stopped, and the retry carries the same key.
 - **`returnUrl` is required on every payment.** Pass it per session, or set
   `defaultReturnUrl` once; a session with neither is refused with `invalid_request` instead
-  of reaching Adyen. A host `id` containing `:` or `\` is refused too. It becomes the
-  `merchantReference` Adyen signs into every webhook; the verifier accepts a `:` there, but
-  until the adapter has been exercised against a live Adyen test account the references it
-  creates stay clear of both characters.
+  of reaching Adyen, and so is one whose URL Adyen would reject: not absolute with a scheme
+  (`https://`, or an app scheme such as `my-app://`), containing whitespace, longer than 1024
+  characters once URL-encoded, or with `//` after the domain. A `defaultReturnUrl` like that
+  fails when the adapter is constructed. The URL is sent WHATWG-serialized, so non-ASCII
+  characters travel percent-encoded, as Adyen asks. A host `id` containing `:` or `\` is
+  refused too. It becomes the `merchantReference` Adyen signs into every webhook; the
+  verifier accepts a `:` there, but until the adapter has been exercised against a live Adyen
+  test account the references it creates stay clear of both characters.
 - Manual capture is requested per payment (`additionalData.manualCapture`), which overrides
   the merchant account's capture setting, so enabling it account-wide is not required.
   Automatic capture sends no capture parameter and follows the account's **Capture delay**

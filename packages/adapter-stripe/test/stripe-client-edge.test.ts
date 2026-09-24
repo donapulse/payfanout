@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { StripeClientAdapter, type StripeJsLike } from "../src/index.js";
+import { StripeClientAdapter, type StripeJsFactory, type StripeJsLike } from "../src/index.js";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -33,6 +33,53 @@ describe("StripeClientAdapter edge cases", () => {
       code: "psp_unavailable",
       retryable: true,
     });
+  });
+
+  it("retries the SDK injection after a failed script load instead of caching the rejection", async () => {
+    stubBrowser();
+    const failure = new Error("network hiccup");
+    let stripe: StripeJsFactory | undefined;
+    let loads = 0;
+    const adapter = new StripeClientAdapter({
+      publishableKey: "pk",
+      environment: "sandbox",
+      getStripeGlobal: () => stripe,
+      loadScript: async () => {
+        loads++;
+        if (loads === 1) throw failure;
+        stripe = () => ({}) as StripeJsLike;
+      },
+    });
+    // Concurrent calls share the one load, and its rejection surfaces unchanged.
+    const first = adapter.loadSdk();
+    const second = adapter.loadSdk();
+    await expect(first).rejects.toBe(failure);
+    await expect(second).rejects.toBe(failure);
+    expect(loads).toBe(1);
+    await expect(adapter.loadSdk()).resolves.toBeUndefined();
+    expect(loads).toBe(2);
+  });
+
+  it("loads the SDK again after a load that left window.Stripe missing", async () => {
+    stubBrowser();
+    let stripe: StripeJsFactory | undefined;
+    let loads = 0;
+    const adapter = new StripeClientAdapter({
+      publishableKey: "pk",
+      environment: "sandbox",
+      getStripeGlobal: () => stripe,
+      loadScript: async () => {
+        loads++;
+        if (loads === 2) stripe = () => ({}) as StripeJsLike;
+      },
+    });
+    await expect(adapter.loadSdk()).rejects.toMatchObject({
+      code: "psp_unavailable",
+      message: "Stripe.js loaded but window.Stripe is missing",
+      retryable: true,
+    });
+    await expect(adapter.loadSdk()).resolves.toBeUndefined();
+    expect(loads).toBe(2);
   });
 
   it("forwards returnUrl into confirmParams and maps unknown PSP statuses to processing", async () => {

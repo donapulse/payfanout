@@ -237,15 +237,23 @@ export class PayZenClientAdapter implements ClientPaymentAdapter {
       this.config.scriptUrl ?? KR_SCRIPT_URL,
       this.config.cssUrl ?? KR_CSS_URL,
     );
-    await this.sdkPromise;
-    if (!this.kr()) {
-      throw new PayFanoutError({
-        code: "psp_unavailable",
-        message: "krypton-client loaded but the KR global is missing",
-        retryable: true,
-        raw: undefined,
-        pspName: this.pspName,
-      });
+    const loading = this.sdkPromise;
+    try {
+      await loading;
+      if (!this.kr()) {
+        throw new PayFanoutError({
+          code: "psp_unavailable",
+          message: "krypton-client loaded but the KR global is missing",
+          retryable: true,
+          raw: undefined,
+          pspName: this.pspName,
+        });
+      }
+    } catch (err) {
+      // Drop this attempt, if still cached, so the next loadSdk() calls the loader
+      // again: a cached rejection would fail every later mount until the page reloads.
+      if (this.sdkPromise === loading) this.sdkPromise = undefined;
+      throw err;
     }
   }
 
@@ -714,7 +722,10 @@ function asRedirectHandle(handle: MountedFieldsHandle): PayZenRedirectHandle | u
 /**
  * Default asset injection: the theme stylesheet plus the krypton script.
  * Idempotent per page via DOM lookup — KR is a single global, so a second
- * adapter instance reuses the same script element. The script deliberately
+ * adapter instance reuses the same script element, resolving at once even while
+ * that script is still loading; loadSdk() then confirms the KR global. A script
+ * this loader injected is removed when it fails to load, so a later call
+ * injects a fresh one; the stylesheet link is kept. The script deliberately
  * sets async = false (dynamically injected scripts default to async, and
  * PayZen documents that async loading breaks on older mobile browsers);
  * kr-spa-mode keeps the library from auto-scanning the DOM before mount().
@@ -739,7 +750,7 @@ function injectKrAssets(publicKey: string): (scriptUrl: string, cssUrl: string) 
       script.setAttribute("kr-public-key", publicKey);
       script.setAttribute("kr-spa-mode", "true");
       script.onload = () => resolve();
-      script.onerror = () =>
+      script.onerror = () => {
         reject(
           new PayFanoutError({
             code: "psp_unavailable",
@@ -749,6 +760,11 @@ function injectKrAssets(publicKey: string): (scriptUrl: string, cssUrl: string) 
             pspName: "payzen",
           }),
         );
+        // A failed tag must not satisfy the next lookup, or a retry would resolve
+        // from it without fetching the library again. Element doubles without
+        // remove() must not make this handler throw.
+        if (typeof script.remove === "function") script.remove();
+      };
       document.head.appendChild(script);
     });
 }

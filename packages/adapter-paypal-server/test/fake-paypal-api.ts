@@ -448,18 +448,46 @@ export class FakePayPalApi {
       return json(422, unprocessable("ORDER_ALREADY_COMPLETED", "The order cannot be patched after it is completed."));
     }
     const unit = order.purchase_units[0]!;
+    const shipping = (unit.shipping ?? {}) as Record<string, unknown>;
+    // PayPal's patchable-attributes table for the paths the adapter sends. The
+    // PATCH is applied as a whole or not at all, so every op is checked first.
+    const allowed: Record<string, string[]> = {
+      amount: ["replace"],
+      soft_descriptor: ["replace", "remove"],
+      "shipping/name": ["replace", "add"],
+      "shipping/address": ["replace", "add"],
+    };
+    const prefix = "/purchase_units/@reference_id=='default'/";
+    const changes: Array<() => void> = [];
     for (const op of ops ?? []) {
       const path = op["path"] as string;
-      if (path === "/purchase_units/@reference_id=='default'/amount") {
-        unit.amount = op["value"] as FakeMoney;
-      } else if (path === "/purchase_units/@reference_id=='default'/soft_descriptor") {
-        unit.soft_descriptor = op["value"] as string;
-      } else if (path === "/purchase_units/@reference_id=='default'/shipping") {
-        unit.shipping = op["value"];
-      } else {
-        return json(400, { name: "INVALID_REQUEST", message: `Unsupported patch path ${path}`, debug_id: debugId() });
+      const kind = op["op"] as string;
+      const value = op["value"];
+      const attribute = path.startsWith(prefix) ? path.slice(prefix.length) : path;
+      const kinds = allowed[attribute];
+      if (!kinds) return json(422, unprocessable("FIELD_NOT_PATCHABLE", "Field cannot be patched."));
+      const shippingKey = attribute.startsWith("shipping/") ? attribute.slice("shipping/".length) : undefined;
+      const present =
+        attribute === "amount" ||
+        (attribute === "soft_descriptor" ? unit.soft_descriptor !== undefined : shipping[shippingKey!] !== undefined);
+      if (!kinds.includes(kind) || (kind === "add") === present) {
+        return json(
+          422,
+          unprocessable(
+            "INVALID_PATCH_OPERATION",
+            "The operation cannot be honored. Cannot add a property that's already present, use replace. Cannot remove a property thats not present, use add. Cannot replace a property thats not present, use add.",
+          ),
+        );
       }
+      if (attribute === "amount") changes.push(() => (unit.amount = value as FakeMoney));
+      else if (attribute === "soft_descriptor") {
+        changes.push(() => {
+          if (kind === "remove") delete unit.soft_descriptor;
+          else unit.soft_descriptor = (value as string).slice(0, 22);
+        });
+      } else changes.push(() => (unit.shipping = { ...((unit.shipping ?? {}) as object), [shippingKey!]: value }));
     }
+    for (const change of changes) change();
     return new Response(null, { status: 204 });
   }
 

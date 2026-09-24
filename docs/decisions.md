@@ -262,6 +262,14 @@ choices they forced:
   same-currency updates keep working, and PayPal decides on them. Refusing those locally
   would block refunding money already taken, and PayPal's pages do not say what happens to
   existing RUB payments.
+- **Doc-verified 2026-09-24:** order updates follow the Orders v2 patchable-attributes table.
+  Shipping is patched through `shipping/name` and `shipping/address` (add when absent,
+  replace when present), never as a whole object, and `soft_descriptor` can be replaced or
+  removed but not added, so adding a descriptor to an order created without one is refused
+  before the PATCH; PayPal applies a PATCH whole or not at all, so one refused operation
+  would take an amount change down with it. A statement descriptor longer than 22 characters
+  is cut to 22, since PayPal truncates it ("any content beyond 22 characters (including
+  spaces) will be truncated"), instead of being dropped.
 - **Sandbox-verified 2026-07-07:** orders created with `payment_source.paypal`
   (always, for the experience_context) answer `PAYER_ACTION_REQUIRED` immediately —
   not `CREATED` — so a fresh session reports `requires_action`; PATCH still works in

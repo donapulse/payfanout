@@ -84,18 +84,22 @@ export function normalizeGoCardlessEvent(event: GoCardlessEventLike): UnifiedWeb
   const links = event.links ?? {};
   const refundId = links["refund"];
   const resourceType = event.resource_type ?? "";
+  const paymentLink = links["payment"] ?? links["payment_request_payment"];
+  const billingRequest = resourceType === "billing_requests" ? links["billing_request"] : undefined;
   return {
     // GoCardless event ids (EV...) are globally unique — THE dedupe key. The
     // fallback hash keeps ids stable across parses if one is ever missing.
     id: event.id ?? `gocardless_${fnv1aHex(JSON.stringify(event))}`,
     pspName: "gocardless",
     type: mapEventType(resourceType, event.action ?? "", links),
-    // A billing request event with no payment names the billing request,
-    // the session id hosts hold and retrievePayment accepts.
+    // Billing request events name the billing request, the session id hosts
+    // hold and retrievePayment accepts. Only a fulfilment names its payment:
+    // GoCardless's examples carry payment_request_payment on every action,
+    // though before fulfilment that payment does not exist yet.
     pspPaymentId:
-      links["payment"] ??
-      links["payment_request_payment"] ??
-      (resourceType === "billing_requests" ? links["billing_request"] : undefined),
+      billingRequest && event.action !== "fulfilled"
+        ? billingRequest
+        : (paymentLink ?? billingRequest),
     // No amount/currency: GoCardless events carry links + details only, never
     // money fields — money truth stays on retrievePayment/retrieveRefund.
     ...(refundId ? { refundId } : {}),

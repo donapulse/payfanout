@@ -233,8 +233,11 @@ choices they forced:
   scenario simulators page.
   - *Billing request status.* The spec defines `ready_to_fulfil` as "the billing request is
     ready to fulfil" and `fulfilling` as "the billing request is currently undergoing
-    fulfilment", and a billing request's actions are those "required to fulfil the billing
-    request". Both states come after the payer's part, so `retrievePayment(BRQ…)` reports
+    fulfilment". A billing request's actions are those "that can be performed before this
+    billing request can be fulfilled", `bank_authorisation` is a required one on a payment
+    request, and the `billing_request_fulfilled` simulator starts from "the `pending` state,
+    with all actions completed except for `bank_authorisation`". Both states come after
+    the payer's part, so `retrievePayment(BRQ…)` reports
     them `processing`, as it does `fulfilled`; only `pending` ("the billing request is
     pending and can be used") stays `requires_action`. They were `requires_action`, which
     invited a host to send the payer to authorise again. An undocumented status reads
@@ -246,14 +249,22 @@ choices they forced:
     names a payment; a mandate-only one maps to `unknown`.
   - *`billing_requests`/`cancelled`* ("This billing request has been cancelled, none of the
     resources have been created") maps to `payment.canceled`, matching `retrievePayment`.
-    A billing request event that names no payment carries `links.billing_request` as
-    `pspPaymentId`. The event does not say whether the request had a `payment_request`, so
+    Billing request events carry `links.billing_request` as `pspPaymentId`, except a
+    fulfilment, which names its payment: the events guide's examples show
+    `links.payment_request_payment` on every action, pre-fulfilment ones included, while
+    the spec describes it as the payment "which has been created" (AMBIGUOUS; the
+    billing request id is right under either reading). The event does not say whether the
+    request had a `payment_request`, so
     a cancelled mandate-only request reads the same way; a host finds no session under a
     `BRQ…` id it did not create. `bank_authorisation_denied` stays `unknown`: "Payers can
     always return to the flow and create a new bank authorisation".
   - *Late failures.* The spec's payment `failed` status notes that "payments can fail after
     being confirmed if the failure message is sent late by the banks", and the simulators
-    list `Late` as `submitted` → `confirmed` → `failed`. `late_failure_settled` is "The
+    list `Late` as `submitted` → `confirmed` → `failed`; the `payment_late_failure_settled`
+    simulator "Behaves the same as the `payment_late_failure` simulator, except that the
+    late failure is additionally included as a debit item in a payout", and the Success+
+    guide says "On payment failure the `failed` event will always be sent."
+    `late_failure_settled` is "The
     payment was a late failure which had already been paid out, and has been debited from
     a payout", the counterpart of `chargeback_settled`, so it maps to `unknown` rather than
     a second `payment.failed`. The Success+ guide asks integrators to act on

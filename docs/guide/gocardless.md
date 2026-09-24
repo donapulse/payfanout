@@ -215,9 +215,13 @@ event's `links.payment_request_payment` names the payment the billing request cr
 mandate-only billing request, maps to `unknown`. `billing_requests.cancelled` →
 `payment.canceled`, as `retrievePayment` reports that billing request. Every other billing
 request action maps to `unknown`, `bank_authorisation_denied` included: the payer can
-return to the flow and authorise again. A billing request event that names no payment
-carries the billing request id (`BRQ…`) as `pspPaymentId`, which `retrievePayment`
-accepts.
+return to the flow and authorise again. Billing request events other than a fulfilment
+carry the billing request id (`BRQ…`) as `pspPaymentId`, which `retrievePayment`
+accepts. GoCardless sends every event in your account to the endpoint, so these can name
+billing requests you never created (Drop-in mandate setups, payment links, templates) —
+a cancelled mandate-only request arrives as `payment.canceled` too. Match `BRQ…` ids
+against the sessions you created and ignore the rest, and filter on the event type before
+re-reading anything.
 
 ::: warning A bank-debit chargeback is effectively final
 The direct debit guarantee reclaims the funds at `charged_back` itself, and GoCardless

@@ -508,6 +508,21 @@ describe("GoCardless webhook parsing (batched deliveries)", () => {
       }),
     );
     expect(denied).toMatchObject({ type: "unknown", pspPaymentId: "BRQ7" });
+    // GoCardless's own examples carry payment_request_payment before fulfilment
+    // too; a cancelled request created nothing, so it still names the request.
+    const [cancelledWithLink] = parseGoCardlessWebhookEvents(
+      JSON.stringify({
+        events: [
+          {
+            id: "EV5",
+            resource_type: "billing_requests",
+            action: "cancelled",
+            links: { billing_request: "BRQ5", payment_request_payment: "PM5" },
+          },
+        ],
+      }),
+    );
+    expect(cancelledWithLink).toMatchObject({ type: "payment.canceled", pspPaymentId: "BRQ5" });
     const [bare] = parseGoCardlessWebhookEvents(
       JSON.stringify({ events: [{ id: "EV2", resource_type: "mandates", action: "created" }] }),
     );

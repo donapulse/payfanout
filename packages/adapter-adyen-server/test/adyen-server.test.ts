@@ -112,7 +112,12 @@ function signed(item: AdyenNotificationItem): AdyenNotificationItem {
   return { ...item, additionalData: { ...item.additionalData, hmacSignature: signature } };
 }
 
-/** The published vector, verbatim, with its documented signature rather than a recomputed one. */
+/**
+ * The published vector's eight signed values with its documented signature
+ * rather than a recomputed one. Not the sample verbatim: its eventDate is
+ * replaced, its operations list dropped and an empty `reason` added, none of
+ * them being signed.
+ */
 const authorisationItem: AdyenNotificationItem = {
   additionalData: { hmacSignature: PUBLISHED_SIGNATURE },
   amount: { currency: "EUR", value: 1130 },
@@ -126,14 +131,19 @@ const authorisationItem: AdyenNotificationItem = {
   success: "true",
 };
 
-/** A real Adyen event code the adapter deliberately does not map. */
+/**
+ * A real Adyen event code the adapter deliberately does not map, shaped as
+ * Adyen documents it: the report's file name in pspReference, its download URL
+ * in reason.
+ */
 const reportAvailableItem = signed({
   amount: { currency: "EUR", value: 0 },
   eventCode: "REPORT_AVAILABLE",
   eventDate: "2026-08-02T10:05:00+02:00",
   merchantAccountCode: "TestMerchant",
-  merchantReference: "settlement_detail_report_batch_1",
-  pspReference: "8836100000000001",
+  merchantReference: "",
+  pspReference: "settlement_detail_report_batch_12.csv",
+  reason: "https://ca-test.adyen.com/reports/download/MerchantAccount/TestMerchant/settlement_detail_report_batch_12.csv",
   success: "true",
 });
 
@@ -185,8 +195,9 @@ runServerAdapterConformanceTests(
       validRawBody: envelope(authorisationItem),
       validHeaders: webhookHeaders(),
       expectedType: "payment.succeeded",
-      // pspReference alone repeats across an authorisation and its capture; the
-      // dedupe key is the pair.
+      // Adyen defines a duplicate as repeating eventCode and pspReference, and
+      // pspReference alone is shared by every event of one dispute; the dedupe
+      // key is the pair.
       expectedEventId: "AUTHORISATION:7914073381342284",
       expectedAmount: 1130,
       // The amount is one of the eight signed values; moving it while leaving the
@@ -266,9 +277,15 @@ runServerAdapterConformanceTests(
         expectedCode: "invalid_request",
       },
       {
-        name: "refundPayment on an unknown pspReference",
-        invoke: (a) =>
-          a.refundPayment({ pspPaymentId: "8836100000000042:1000:EUR", amount: 500, idempotencyKey: "k" }),
+        // The fake acknowledges a refund on any reference (assumed of Adyen,
+        // whose refund guide lists no unknown-reference failure), so the first
+        // call resolves; the second is answered with the first one's stored
+        // acknowledgement, which echoes another amount.
+        name: "refundPayment reusing an idempotency key for a different amount",
+        invoke: async (a) => {
+          await a.refundPayment({ pspPaymentId: "8836100000000042:1000:EUR", amount: 500, idempotencyKey: "k" });
+          return a.refundPayment({ pspPaymentId: "8836100000000042:1000:EUR", amount: 400, idempotencyKey: "k" });
+        },
         expectedCode: "invalid_request",
       },
       {
@@ -745,9 +762,11 @@ describe("AdyenServerAdapter specifics", () => {
     await expect(
       adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken: CLIENT_TOKEN, idempotencyKey: "c1" }),
     ).rejects.toMatchObject({ code: "processing_error", retryable: false });
+    // A refund replayed under the same key cannot be performed twice, so the
+    // unconfirmed acknowledgement is safe to retry.
     await expect(
       adapter.refundPayment({ pspPaymentId: "8836100000000042:1000:EUR", idempotencyKey: "r1" }),
-    ).rejects.toMatchObject({ code: "processing_error", retryable: false });
+    ).rejects.toMatchObject({ code: "processing_error", retryable: true });
   });
 
   it("rejects a host id longer than an Adyen reference and unknown payment method types", async () => {
@@ -837,11 +856,12 @@ describe("Adyen webhook verification", () => {
 
   it("refuses an item whose signed values make the signing payload ambiguous", async () => {
     const { adapter } = makePair();
-    // No escaping rule is documented for a value containing the delimiter, so a
-    // colon in the merchant reference is refused rather than signed ambiguously.
+    // Adyen joins the values unescaped, so a colon anywhere but in the merchant
+    // reference would let the joined string split into different values.
     const ambiguous: AdyenNotificationItem = {
       ...authorisationItem,
-      merchantReference: "order:1130:EUR:AUTHORISATION:true",
+      merchantAccountCode: "TestMerchant:TestPayment",
+      merchantReference: "1407325143704",
     };
     expect(buildAdyenHmacPayload(ambiguous)).toBeUndefined();
     await expect(adapter.verifyWebhookSignature(envelope(ambiguous), webhookHeaders())).resolves.toBe(false);
@@ -929,7 +949,8 @@ describe("Adyen webhook parsing", () => {
   it("maps the capture, cancellation, expiry and dispute vocabulary", async () => {
     const cases: Array<[string, string, string]> = [
       ["CAPTURE", "true", "payment.succeeded"],
-      ["CAPTURE", "false", "payment.failed"],
+      // A refused capture request is resubmittable, not a failed payment.
+      ["CAPTURE", "false", "unknown"],
       ["CAPTURE_FAILED", "true", "payment.failed"],
       ["CANCELLATION", "true", "payment.canceled"],
       // A cancel that itself failed says nothing about the payment.

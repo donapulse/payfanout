@@ -240,6 +240,13 @@ choices they forced:
   intent), `retrievePayment` accepts either and falls back order → capture, and
   `refundPayment` resolves order ids to their capture. Hosts are documented to
   store the capture id.
+- **Doc-verified 2026-09-24: client callbacks follow the JS SDK v5 reference.**
+  `createOrder` returns a Promise of the order id, the only form the reference's samples
+  show. Errors the buttons deliver through `onError` are non-retryable `processing_error`:
+  PayPal calls that handler a catch-all whose errors "aren't expected to be handled beyond
+  showing a generic error message or page". A mount that throws inside `paypal.Buttons()`
+  or `render()` stays a retryable `processing_error`: PayPal's docs say nothing about
+  render failures, and mounting again can succeed.
 - **Webhook verification via PayPal's postback API**
   (`POST /v1/notifications/verify-webhook-signature`), not local X.509 crypto:
   stateless, edge-clean, and PayPal does the certificate work. The raw body is
@@ -379,6 +386,17 @@ choices they forced:
     the adapter assumes; whether a DECLINED capture sent with `final_capture: true` leaves
     the authorization open, as the adapter also assumes; and whether an order created with
     `payment_source.paypal` and approved with Venmo reads back with `payment_source.venmo`.
+- **Negative-testing setup (AMBIGUOUS in the docs, 2026-09-24):** PayPal's request-headers
+  page says "REST API apps use a request header to invoke negative testing in the
+  sandbox. This header configures the sandbox into a negative testing state for
+  transactions that include the merchant." Its negative-testing overview lists negative
+  testing as available for "Classic PayPal API versions 2.4 and later", has the business
+  sandbox account's Negative Testing setting turned on before any test method, and adds
+  "Without this configuration, the sandbox does not raise error conditions unless the
+  error occurs through normal transaction processing." The guide and the integration
+  suite ask for both. An opt-in `PAYPAL_NEGATIVE_TESTING` run with the setting off would
+  settle which page holds; it runs locally only, since the integration workflow never
+  passes that variable.
 
 ## Versioning policy (2026-07-07, explicit user decision)
 

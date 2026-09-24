@@ -112,6 +112,11 @@ a mismatch fails late, at approval time, with an SDK error.
   (`layout`/`color`/`shape`/`label`/`height`) and `fundingSource`; `appearance` is the
   `style` fallback. The adapter owns only `createOrder`/`onApprove`/`onCancel`/`onError`
   (they are the integration itself).
+- A button render that fails, and anything the buttons deliver through `onError`, surface
+  as `processing_error` with the SDK's error on `raw`. The `onError` ones are **not
+  retryable**: PayPal's [JS SDK reference](https://developer.paypal.com/sdk/js/v5/reference#onerror)
+  documents that callback as a catch-all with nothing to handle beyond a generic error
+  message or page. A failed render is retryable, since mounting again can succeed.
 - `locale` is a load-time SDK param — set it on the adapter config, not per mount.
 - `userAction` is the client half of the server's `userAction`: `"continue"` (default)
   loads the SDK with `commit=false`, so the popup's final button says **Continue** and
@@ -357,12 +362,22 @@ strings PayPal wants exist only inside the adapter.
 
 - Approve popups by logging in with a **personal** sandbox account
   (sandbox.paypal.com uses the same credentials).
-- **Negative testing:** enable it on the business sandbox account (Account → Settings →
-  Negative Testing), then force errors per request with the
-  `PayPal-Mock-Response: {"mock_application_codes": "INSTRUMENT_DECLINED"}` header —
-  the integration suite has an env-gated case for this. Mock errors never work in live.
-- Sandbox rate limiting kicks in around 50 requests/minute per IP; the adapter already
-  maps 429 to a retryable `rate_limited`.
+- **Negative testing** (a sandbox beta): turn on Negative Testing on the **business**
+  sandbox account your REST app belongs to (developer dashboard → Sandbox → Accounts →
+  View/Edit Account → Settings), then force errors per request with the
+  `PayPal-Mock-Response: {"mock_application_codes": "INSTRUMENT_DECLINED"}` header. PayPal's
+  [request-headers page](https://developer.paypal.com/negative-testing/request-headers)
+  describes the header alone as enough for REST calls, while its
+  [negative-testing overview](https://developer.paypal.com/negative-testing/overview) has
+  you turn the setting on first; doing both covers either reading. The header works on the Orders v2 create, update, show, authorize and capture
+  calls, and on the Payments v2 show, capture and void authorization, show capture, refund
+  capture and show refund calls (reauthorize is not listed). The integration suite has an
+  env-gated case for this. Mock errors never work in live.
+- PayPal [publishes no rate-limit policy](https://developer.paypal.com/api/rest/reference/rate-limiting):
+  it may temporarily throttle traffic that looks abusive, answering `429` with
+  `RATE_LIMIT_REACHED`, which the adapter maps to a retryable `rate_limited`. PayPal
+  recommends webhooks over polling and cached OAuth tokens. The adapter caches its token
+  per instance, so reuse one adapter rather than building one per request.
 
 ## 11. Limitations (v1)
 

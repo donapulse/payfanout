@@ -181,7 +181,8 @@ export class PayPalClientAdapter implements ClientPaymentAdapter {
       const buttons = paypal.Buttons({
         ...hostOptions,
         ...(style ? { style } : {}),
-        createOrder: () => options.clientSecret,
+        // A Promise of the order id, the form PayPal's SDK reference documents.
+        createOrder: () => Promise.resolve(options.clientSecret),
         onApprove: (data?: { orderID?: string }) => {
           state.approvedOrderId = data?.orderID ?? options.clientSecret;
           options.onChange?.({ complete: true });
@@ -197,7 +198,9 @@ export class PayPalClientAdapter implements ClientPaymentAdapter {
         onError: (err: unknown) => {
           state.approvedOrderId = undefined;
           options.onChange?.({ complete: false });
-          const mapped = mapPayPalJsError(err);
+          // PayPal documents onError as a catch-all with nothing to handle
+          // beyond a generic error message or page, so it is not retryable.
+          const mapped = mapPayPalJsError(err, false);
           if (state.waiters.length > 0) resolveWaiters({ status: "failed", error: mapped });
           else options.onError?.(mapped);
         },
@@ -213,7 +216,7 @@ export class PayPalClientAdapter implements ClientPaymentAdapter {
       return brandMountedFieldsHandle(handle);
     } catch (err) {
       cleanup();
-      const mapped = err instanceof PayFanoutError ? err : mapPayPalJsError(err);
+      const mapped = err instanceof PayFanoutError ? err : mapPayPalJsError(err, true);
       options.onError?.(mapped);
       throw mapped;
     }
@@ -296,14 +299,15 @@ function asPayPalHandle(handle: MountedFieldsHandle): PayPalHandle {
 }
 
 /**
- * The SDK's onError delivers untyped Error objects with no stable codes —
- * processing_error with the raw preserved is the honest mapping.
+ * The SDK's errors are untyped Error objects with no stable codes —
+ * processing_error with the raw preserved is the honest mapping. A failed
+ * render stays retryable (mounting again can succeed); onError is not.
  */
-function mapPayPalJsError(err: unknown): PayFanoutError {
+function mapPayPalJsError(err: unknown, retryable: boolean): PayFanoutError {
   return new PayFanoutError({
     code: "processing_error",
     message: "The PayPal payment could not be completed. Please try again.",
-    retryable: true,
+    retryable,
     raw: err,
     pspName: "paypal",
   });

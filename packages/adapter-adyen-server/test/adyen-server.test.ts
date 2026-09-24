@@ -28,13 +28,50 @@ const PUBLISHED_SIGNING_STRING =
 const PUBLISHED_SIGNATURE = "coqCmt/IZ4E3CzPvMY8zTjQVL5hYJUiBRg8UU+iCWo0=";
 
 /** Documented sandbox test card, encrypted-credential form for server-side tests. */
-const CLIENT_TOKEN = JSON.stringify({
+const CARD = {
   type: "scheme",
   encryptedCardNumber: "test_4111111111111111",
   encryptedExpiryMonth: "test_03",
   encryptedExpiryYear: "test_2030",
   encryptedSecurityCode: "test_737",
-});
+};
+
+/**
+ * The envelope the client adapter's confirm() resolves from Adyen Web 6.41.0's
+ * Card state: the paymentMethod (with the checkoutAttemptId and sdkData every
+ * Adyen Web element adds) and the browser data. `paymentMethod` overrides card
+ * fields, such as the holder names the fake reads as triggers.
+ */
+function cardToken(paymentMethod: Record<string, string> = {}): string {
+  return JSON.stringify({
+    paymentMethod: {
+      ...CARD,
+      checkoutAttemptId: "checkout-attempt-1",
+      sdkData: "eyJzY2hlbWFWZXJzaW9uIjoxLCJjaGFubmVsIjoiV2ViIiwic2RrVmVyc2lvbiI6IjYuNDEuMCJ9",
+      ...paymentMethod,
+    },
+    browserInfo: {
+      acceptHeader: "*/*",
+      colorDepth: 24,
+      javaEnabled: false,
+      language: "en-US",
+      screenHeight: 1080,
+      screenWidth: 1920,
+      timeZoneOffset: 0,
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    },
+    origin: "https://host.example",
+    riskData: { clientData: "eyJ2ZXJzaW9uIjoiMS4wLjAifQ==" },
+  });
+}
+
+/** What the conformance suite completes with: the current client adapter's envelope. */
+const CLIENT_TOKEN = cardToken();
+
+/** The bare paymentMethod earlier client adapters send, which carries no browser data. */
+function bareCardToken(paymentMethod: Record<string, string> = {}): string {
+  return JSON.stringify({ ...CARD, ...paymentMethod });
+}
 
 function makePair(config: Partial<AdyenServerAdapterConfig> = {}): {
   adapter: AdyenServerAdapter;
@@ -223,7 +260,7 @@ runServerAdapterConformanceTests(
           const session = await a.createPaymentSession({ amount: 2500, currency: "EUR", idempotencyKey: "k" });
           return a.completePayment!({
             pspSessionId: session.pspSessionId,
-            clientToken: JSON.stringify({ ...JSON.parse(CLIENT_TOKEN), holderName: "REFUSED" }),
+            clientToken: cardToken({ holderName: "REFUSED" }),
             idempotencyKey: "k4",
           });
         },
@@ -435,29 +472,39 @@ describe("AdyenServerAdapter specifics", () => {
     });
     const info = await adapter.completePayment({
       pspSessionId: session.pspSessionId,
-      clientToken: JSON.stringify({ ...JSON.parse(CLIENT_TOKEN), holderName: "CHALLENGE" }),
+      clientToken: bareCardToken({ holderName: "CHALLENGE" }),
       idempotencyKey: "c1",
     });
     expect(info.status).toBe("requires_action");
-    expect((info.raw as { action?: { type?: string } }).action?.type).toBe("threeDS2");
+    // A bare card token carries no browser data, so the fake answers with a redirect action.
+    expect((info.raw as { action?: { type?: string } }).action?.type).toBe("redirect");
+    expect(info.pspPaymentId).toBe("");
   });
 
   it("finishes a resolved action through /payments/details", async () => {
     const { adapter, fake } = makePair();
+    fake.detailsCarryPaymentFacts = true;
     const session = await adapter.createPaymentSession({ amount: 3200, currency: "EUR", idempotencyKey: "k" });
+    const challenged = await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: bareCardToken({ holderName: "CHALLENGE" }),
+      idempotencyKey: "c1",
+    });
+    const details = fake.detailsFor((challenged.raw as { action: Record<string, unknown> }).action);
     const info = await adapter.completePayment({
       pspSessionId: session.pspSessionId,
-      clientToken: JSON.stringify({ details: { threeDSResult: "eyJ0..." }, paymentData: "Ab02b4c0..." }),
+      clientToken: JSON.stringify({ details, paymentData: "Ab02b4c0..." }),
       idempotencyKey: "c2",
     });
     expect(fake.lastRequestPath).toMatch(/\/payments\/details$/);
-    expect(fake.lastRequestBody).toEqual({ details: { threeDSResult: "eyJ0..." }, paymentData: "Ab02b4c0..." });
+    expect(fake.lastRequestBody).toEqual({ details, paymentData: "Ab02b4c0..." });
     expect(info.status).toBe("succeeded");
     expect(info.amount).toBe(3200); // from the signed context, not the details response
   });
 
   it("finishes a 3-D Secure challenge when one caller key drives /payments and /payments/details", async () => {
     const { adapter, fake } = makePair();
+    fake.detailsCarryPaymentFacts = true;
     const session = await adapter.createPaymentSession({
       amount: 3200,
       currency: "EUR",
@@ -470,16 +517,16 @@ describe("AdyenServerAdapter specifics", () => {
     // would replay the challenge response and the payment would never authorise.
     const challenged = await adapter.completePayment({
       pspSessionId: session.pspSessionId,
-      clientToken: JSON.stringify({ ...JSON.parse(CLIENT_TOKEN), holderName: "CHALLENGE" }),
+      clientToken: bareCardToken({ holderName: "CHALLENGE" }),
       idempotencyKey: "one-caller-key",
     });
     expect(challenged.status).toBe("requires_action");
     const challengeKey = fake.lastIdempotencyKey;
-    const action = (challenged.raw as { action: { paymentData: string } }).action;
+    const action = (challenged.raw as { action: Record<string, unknown> }).action;
 
     const finished = await adapter.completePayment({
       pspSessionId: session.pspSessionId,
-      clientToken: JSON.stringify({ details: { threeDSResult: "eyJ0..." }, paymentData: action.paymentData }),
+      clientToken: JSON.stringify({ details: fake.detailsFor(action) }),
       idempotencyKey: "one-caller-key",
     });
     expect(finished.status).toBe("succeeded");
@@ -635,7 +682,7 @@ describe("AdyenServerAdapter specifics", () => {
       try {
         await adapter.completePayment({
           pspSessionId: session.pspSessionId,
-          clientToken: JSON.stringify({ ...JSON.parse(CLIENT_TOKEN), holderName: `REFUSED:${refusalReasonCode}` }),
+          clientToken: cardToken({ holderName: `REFUSED:${refusalReasonCode}` }),
           idempotencyKey: `c-${refusalReasonCode}`,
         });
         expect.unreachable(`expected a rejection for refusalReasonCode ${refusalReasonCode}`);

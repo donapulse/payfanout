@@ -19,13 +19,15 @@ Two packages: [`@payfanout/adapter-adyen-server`](/guide/server) (holds your API
 [`@payfanout/adapter-adyen`](/guide/react) (browser-safe, holds only the public client key).
 
 ::: warning Validate against your own test account before going live
-Every provider-dependent fact in this adapter is verified against Adyen's current
-documentation, and the webhook signature is checked against Adyen's own published test
-vector — but the adapter has not yet been exercised against a live Adyen test account.
-Run one payment, one capture, one refund and one webhook delivery through **your** account
-before taking it to production, and check the results against §9. Account-specific
-behaviour — enabled payment methods, whether multiple partial capture is switched on, the
-exact `additionalData` your account returns — is only observable there.
+The provider-dependent facts in this adapter come from Adyen's documentation, not from test
+traffic. The webhook signature is checked against Adyen's own published test vector, but the
+adapter has not yet been exercised against an Adyen test account. Run one payment, one
+3-D Secure 2 challenge, one capture, one refund and one webhook delivery through **your**
+account before taking it to production, and check the results against
+[§9](#_9-test-values); if Adyen routes a payment to its 3-D Secure redirect flow, check the
+shopper's return to your `returnUrl` ([§6](#_6-3-d-secure)) as well. Account-specific
+behaviour — enabled payment methods, the capture delay, whether multiple partial capture is
+switched on, the exact `additionalData` your account returns — is only observable there.
 :::
 
 ::: warning Adyen API details evolve
@@ -48,12 +50,38 @@ From the **Adyen Customer Area** (Developers → API credentials, and Developers
 
 | Credential | What it is | Used by |
 | --- | --- | --- |
-| **API key** | Checkout API key, sent as `X-API-Key` (server-only) | server adapter (`apiKey`) |
-| **Merchant account** | The account every request is booked against | server adapter (`merchantAccount`) |
-| **HMAC key** | Generated per webhook; a **hex** string that signs deliveries | server adapter (`hmacKeys`) |
+| **API key** | The credential's key (Server settings → Authentication → API key), sent as `X-API-Key`; server-only, copy it when you generate it | server adapter (`apiKey`) |
+| **Merchant account** | The merchant account name, as the account switcher in the Customer Area's upper-left corner shows it; case-sensitive | server adapter (`merchantAccount`) |
+| **HMAC key** | Generated under **Security** on the webhook; a **hex** string, one per webhook endpoint | server adapter (`hmacKeys`) |
 | **Webhook username + password** | Basic authentication on the webhook endpoint | server adapter (`webhookBasicAuth`) |
-| **Live URL prefix** | The account's live prefix; **live only** | server adapter (`liveUrlPrefix`) |
-| **Client key** | Public, browser-safe key; its origins are allowlisted in the Customer Area | client adapter (`clientKey`) |
+| **Live URL prefix** | Developers → API URLs → Prefix in the **live** Customer Area, for example `1797a841fbb37ca7-AdyenDemo`; **live only** | server adapter (`liveUrlPrefix`) |
+| **Client key** | Public, browser-safe key (Client settings → Authentication → Client key), `test_…` or `live_…` | client adapter (`clientKey`) |
+
+**Enable the Checkout encrypted cardholder data role.** Adyen requires it to accept the
+encrypted card data the card fields produce, and it is not among the roles assigned by
+default ([roles](https://docs.adyen.com/development-resources/api-credentials/roles)). Tick
+it under **Permissions** on the credential. Any role your company's `ws` credential has can
+be assigned there; if that credential lacks this one, the roles page says: "If you need
+roles that your ws credential doesn't have, contact our Support Team." A credential missing
+a required role gets Adyen error `010` "Not allowed"
+([error codes](https://docs.adyen.com/development-resources/error-codes)). Live credentials
+are configured separately, so enable it there again.
+
+**Allowed origins** are set on the API credential: Adyen expects client-side requests only
+from those domains. A test credential accepts `https` origins and the local secure contexts
+`http://localhost`, `http://127.0.0.1` and `http://*.localhost`; live origins must be `https`.
+An origin can include a wildcard: in Adyen's example, `https://*.example.org` includes both
+`https://blue.example.org` and `https://red.example.org`.
+
+**The live URL prefix** is a hex-encoded random part followed by your company name, one per
+company account ([live endpoints](https://docs.adyen.com/development-resources/live-endpoints)).
+Pass the prefix alone, not a URL; the adapter builds
+`https://{liveUrlPrefix}-checkout-live.adyenpayments.com/checkout/{apiVersion}` from it.
+
+**Rotating keys.** A new API key is active at once and the previous one keeps working for 24
+hours; a replaced client key also expires after 24 hours. A new HMAC key takes some time to
+propagate, so keep the previous key in `hmacKeys` next to the new one for a while
+([secure webhooks](https://docs.adyen.com/development-resources/webhooks/secure-webhooks)).
 
 Sandbox and live are **separate credential sets** and **separate hosts**; the adapter derives
 the host from `environment` (`sandbox → checkout-test.adyen.com`,
@@ -233,59 +261,219 @@ const adyen = new AdyenClientAdapter({
   submission) and `onChange` (where the encrypted blob arrives). Everything else in
   `fieldOptions` passes through to Adyen untouched, and `appearance` becomes Adyen's `styles`
   object (`base`, `error`, `placeholder`, `validated`).
+- The cardholder name field is **shown and required by default** (`hasHolderName: true`,
+  `holderNameRequired: true`): Adyen's
+  [native 3-D Secure 2 guide](https://docs.adyen.com/online-payments/3d-secure/native-3ds2)
+  requires the name for Visa and JCB, and Adyen Web hides the field unless told otherwise.
+  Set `hasHolderName: false` in `fieldOptions` to hide it; Adyen Web then drops the
+  requirement as well.
+- Set `billingAddressRequired: true` in `fieldOptions` for better 3-D Secure 2 data. Adyen's
+  `/payments` reference lists the billing address as required for 3-D Secure 2 in browser
+  integrations, and its
+  [3-D Secure API reference](https://docs.adyen.com/online-payments/3d-secure/api-reference)
+  as recommended. The Card then includes the address in its state, and the server adapter
+  forwards it when it is complete and within Adyen's limits (`street`, `houseNumberOrName`,
+  `postalCode`, `city` and `country` all present), dropping it otherwise.
+- The Card recognizes Mastercard, Visa and American Express (`['mc','visa','amex']`) unless
+  told otherwise, and the adapter does not load your account's payment-method list — pass
+  `brands` in `fieldOptions` to accept other brands
+  ([Card Component options](https://docs.adyen.com/payment-methods/cards/web-component)).
+- Pressing **Enter** in the fields does nothing by default. Adyen Web's own handler submits
+  the Card, which has no `onSubmit` to call here; pass `onEnterKeyPressed` in `fieldOptions`
+  to run your own pay action instead.
 - `sdkVersion` pins the Adyen Web build the adapter loads; override `sdkUrl` /
   `stylesheetUrl` to self-host.
 
 ::: tip Content-Security-Policy
-A CSP-enforcing page must allow Adyen, or the fields fail quietly. Adyen's own guidance is
-the wildcard, because 3-D Secure and wallet frames are served from several hosts:
+A CSP-enforcing page must allow Adyen, or the fields fail quietly. 3-D Secure 2 challenges
+are harder: they load from the card **issuer's** domains, and Adyen documents that it cannot
+list them all, so a strict policy can block the challenge. Adyen's recommended policy is on
+its [script security](https://docs.adyen.com/development-resources/pci-dss-compliance-guide/script-security)
+page, which says it does not apply "if you are eligible for Self-Assessment Questionnaire A
+(SAQ A)", but the 3-D Secure constraint applies to any page that enforces a CSP. The
+[native 3-D Secure 2](https://docs.adyen.com/online-payments/3d-secure/native-3ds2) guide
+states it with no such condition: "A strict Content Security Policy (CSP) can prevent native
+3D Secure 2 challenges from being loaded on your website, because loading the 3D Secure 2
+interface requires adding more URLs to your CSP. Adyen does not maintain a list of all URLs."
+Adyen's own alternative is its redirect flow (the native 3-D Secure 2 guide's Limitations row:
+"You can use the redirect flow if you do not want to adjust your CSP"), but this adapter has
+no setting that selects it, so a page that keeps a strict `frame-src` or `form-action` should
+expect native challenges to fail.
+
+Following Adyen's recommended policy, a page running this adapter needs:
 
 ```
 script-src  https://*.adyen.com
-frame-src   https://*.adyen.com
-connect-src https://*.adyen.com
+style-src   https://*.adyen.com
+frame-src   *
+connect-src *
+form-action *
+img-src     *
 ```
+
+- **`script-src`, `style-src`**: the adapter loads Adyen Web's `adyen.js` and `adyen.css`
+  from Adyen's CDN. Adyen's sample policy lists `style-src` only for Cash App, which would
+  block the stylesheet, so allow the Adyen host there too.
+- **`frame-src`, `connect-src`, `form-action`, `img-src`**: the wildcard, as Adyen
+  recommends. For frames it gives the reason above — issuer challenge pages it cannot
+  list — and adds that its own iframes and the issuers' 3-D Secure iframes are sandboxed.
+
+Adyen's sample also allows wallet and partner hosts in `script-src`; this adapter mounts
+only the Card component, so it needs none of them. The onboarding descriptor
+(`adyenOnboarding.csp`) lists `https://*.adyen.com` under `script` and `*` under `frame` and
+`connect`; `style-src`, `form-action` and `img-src` have no descriptor field.
 :::
 
 ## 6. 3-D Secure
 
-Pass a `returnUrl` on `createPaymentSession` (or rely on `defaultReturnUrl` — Adyen requires
-one on every payment either way). When Adyen answers with an `action`,
-`completePayment` reports `requires_action` and preserves the action on `PaymentInfo.raw`.
-A `threeDS2` action resolves **inline** — hand it back to the mounted fields and complete the
-payment with the resulting token:
+Adyen decides per payment whether 3-D Secure 2 runs **natively**, inside the mounted fields,
+or through a **redirect** to Adyen. The adapter asks for the native flow and supports both.
+
+`confirm()` resolves a JSON `clientToken` holding the `paymentMethod`, `browserInfo`,
+`origin`, `billingAddress` and `riskData` of Adyen Web's state. The server adapter reads those
+keys and nothing else — the signed session stays the only source of amount, currency,
+reference, merchant account and capture method. It refuses a `paymentMethod` that is not a
+card (`type: "scheme"`) or that carries unencrypted card fields, and forwards only the card
+fields Adyen Web's Card produces: `type`, the `encrypted…` values, `holderName`, `brand`,
+`fundingSource`, `fastlaneData`, `checkoutAttemptId` and `sdkData` (the native guide lists
+the Card's complete `paymentMethod`, `sdkData` included, as required). With `browserInfo`
+and the page's bare `origin` (scheme, host and port, no path, at most 80 characters),
+`/payments` carries what the
+[native 3-D Secure 2 guide](https://docs.adyen.com/online-payments/3d-secure/native-3ds2)
+requires on the web: `channel: "Web"`, `origin`, `browserInfo` and
+`authenticationData.threeDSRequestData.nativeThreeDS: "preferred"`. Any other `origin` is
+dropped, and with it `channel` and `nativeThreeDS`, because Adyen documents that a missing or
+wrong origin keeps the 3-D Secure 2 action from being handled; that the payment then takes
+the redirect flow is an unverified inference (see [Redirect fallback](#redirect-fallback)).
+
+`shopperEmail` is the session's `receiptEmail`, or its `billingDetails.email` when there is
+none; a `billingDetails.email` that is not a usable address is left out rather than failing
+the session. Pass an email, because Adyen's documentation disagrees on `shopperIP`: the
+[v72 `/payments` reference](https://docs.adyen.com/api-explorer/Checkout/72/post/payments)
+requires it for Visa and JCB 3-D Secure 2 web payments only when no `shopperEmail` is sent,
+while the [3-D Secure API reference](https://docs.adyen.com/online-payments/3d-secure/api-reference)
+and the native and redirect guides list it as required for Visa and JCB on the web. The
+adapter sends none either way — PayFanout's session and completion inputs carry no shopper
+IP address — so whether Adyen accepts such a payment with an email alone is still to be
+confirmed in a sandbox.
+
+When Adyen answers with an action, `completePayment` reports `requires_action` with Adyen's
+answer on `PaymentInfo.raw` (`raw.action`). Adyen can answer an action without a
+`pspReference` (its native 3-D Secure 2 example does), and `pspPaymentId` is then the empty
+string. That is not a reference: `capturePayment`, `cancelPayment` and `refundPayment` refuse
+an empty `pspPaymentId` with `invalid_request`, so don't store it over one, and correlate the
+attempt by `PaymentInfo.id`, the merchant reference. When the `/payments` answer does carry a
+`pspReference` (Adyen's redirect example does), `pspPaymentId` is the usual composite. Hand
+the action to `handleAction`: Adyen Web replaces the card fields with the fingerprint or
+challenge in the same element and resolves with a second `clientToken`, the
+`onAdditionalDetails` data `{ details: { threeDSResult } }`, which you complete exactly like
+the first; the server sends it to `/payments/details`. That answer can carry another action,
+so loop until it doesn't:
 
 ```tsx
-// Server: completePayment reported requires_action and returned the action to the browser.
-// Client: resolve it against the mounted fields, then complete again.
-const { mountedRef } = usePayFanout();
+import { PayFanoutError } from "@payfanout/core";
+import { createEndpointCompletion, usePayFanoutContext, type PayResult } from "@payfanout/react";
 
-async function resolveChallenge(action: Record<string, unknown>) {
-  const handle = mountedRef.current!.handle;
-  const next = await adyen.handleAction(handle, action);   // resolves the challenge in place
-  if (next.status !== "requires_confirmation") return next.error;
-  // next.clientToken carries { details, paymentData } — POST it to your completion
-  // route exactly like the first one; the server sends it to /payments/details.
-  await fetch("/api/complete", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ sessionRef: mountedRef.current!.sessionRef, clientToken: next.clientToken }),
-  });
+// Pass what <PayButton onResult> reports through finish() before showing the outcome.
+function useAdyenActions() {
+  const { mountedRef } = usePayFanoutContext();
+  return async function finish(result: PayResult): Promise<PayResult> {
+    let current = result;
+    while (current.status === "requires_action") {
+      const mounted = mountedRef.current;
+      const action = (current.info?.raw as { action?: Record<string, unknown> } | undefined)?.action;
+      if (!mounted || !action) return current;
+      // Inline for a threeDS2 action; a redirect action navigates to Adyen instead.
+      const next = await adyen.handleAction(mounted.handle, action);
+      if (next.status !== "requires_confirmation" || !next.clientToken) {
+        return { status: next.status, error: next.error };
+      }
+      try {
+        const info = await createEndpointCompletion("/api/complete", mounted.sessionRef)(next.clientToken);
+        current = { status: info.status, info };
+      } catch (error) {
+        // A PayFanoutError passes through unchanged; anything else, such as a failed fetch, is wrapped.
+        return { status: "failed", error: PayFanoutError.wrap(error) };
+      }
+    }
+    return current;
+  };
 }
 ```
 
-`handleAction` is Adyen-specific (the unified contract has no action step, because most PSPs
-resolve challenges inside `confirm()`), and the second `completePayment` posts
-`/payments/details` instead of `/payments`. Routing both calls through one completion
-handler with one `idempotencyKey` is fine: the adapter scopes the key it sends to the
-endpoint, so the second call is not answered with the first one's stored response. One
-challenge runs at a time per mounted field set — calling `handleAction` again while one is
+`PayFanoutError` comes from `@payfanout/core`, which `@payfanout/react` depends on; add it to
+your own dependencies to import it. `handleAction` is Adyen-specific: the unified contract has
+no action step, because most PSPs resolve challenges inside `confirm()`. One completion
+handler with one `idempotencyKey` is fine across a multi-step challenge: the adapter derives
+the key it sends from your key, the merchant account, the endpoint and, on
+`/payments/details`, the details themselves.
+
+Every answer is checked against the session it completes. A `/payments` answer naming another
+`merchantReference` or `amount` is refused with `invalid_request`, not retryable: the answer
+belongs to another request, since an `idempotencyKey` reused across sessions replays the first
+answer. A `/payments/details` answer finishes whichever payment the details were issued for,
+so one whose `merchantReference` or `amount` differs from the signed session is refused the
+same way. An answer that does not name the session's merchant reference and amount (Adyen's
+own example answer names neither) reads `processing` and carries no `pspPaymentId`, and its
+`raw` keeps only `resultCode` and `action`; the `AUTHORISATION` webhook (§8), whose
+`merchantReference` is one of the signed values, supplies the reference: match
+`event.raw.merchantReference` to `PaymentInfo.id`, then store
+`encodeAdyenPaymentRef(event.pspPaymentId, event.amount, event.currency)`. Treat that
+`processing` as pending, not failed: wait for the webhook before offering the shopper another
+attempt, since a new attempt is a new payment, and never overwrite a stored `pspPaymentId` with
+the empty one.
+
+One challenge runs at a time per mounted field set: calling `handleAction` again while one is
 outstanding fails with `invalid_request` rather than abandoning the first caller's promise.
+Adyen Web's 3-D Secure 2 elements report timeouts through `onAdditionalDetails` and call
+`onError` only when they stop, so an error reported through `onError` meanwhile settles the
+pending promise as `failed` with `authentication_required` (or a retryable `psp_unavailable`
+when it reads as a load or network failure), and unmounting the fields settles it as `failed`
+too. Once `handleAction` has run, the card fields are gone: `confirm()` on that handle fails
+with `invalid_request`, so another attempt remounts `<PaymentFields>` on a new session with a
+new `idempotencyKey` (§7).
+
+### Redirect fallback
+
+`nativeThreeDS: "preferred"` states a preference: Adyen can still choose its redirect flow.
+When the `clientToken` carries no usable `browserInfo` or `origin`, the adapter omits
+`nativeThreeDS` (with `channel` and `origin`) and expects the redirect flow. That is an
+inference Adyen does not document — its redirect guide lists `channel` and `origin` as
+required too — and a sandbox run is still to confirm it. The action is then
+`type: "redirect"`, and `handleAction` navigates the page to Adyen; its promise never
+settles. After authenticating, the shopper returns to the session's `returnUrl` with a
+URL-encoded `redirectResult` appended to your own query parameters
+([redirect 3-D Secure guide](https://docs.adyen.com/online-payments/3d-secure/redirect-3ds2/web-component)).
+Carry your order reference in that `returnUrl`; the return page turns the result into a
+`clientToken` with `adyenRedirectResultToken` and completes the payment as usual:
+
+```ts
+import { adyenRedirectResultToken } from "@payfanout/adapter-adyen";
+import { createEndpointCompletion } from "@payfanout/react";
+
+// https://your-shop.example/checkout/return?order=1234&redirectResult=…
+const params = new URLSearchParams(window.location.search);
+const redirectResult = params.get("redirectResult"); // already URL-decoded
+if (redirectResult) {
+  const sessionRef = await clientSecretForOrder(params.get("order")); // your storage: the clientSecret the fields were mounted with
+  const info = await createEndpointCompletion("/api/complete", sessionRef)(adyenRedirectResultToken(redirectResult));
+  showOutcome(info);
+}
+```
+
+The card method is embedded, so `<RedirectReturn>` does not pick this page up. The completion
+still runs against the signed session, within `sessionTtlSeconds` of `createPaymentSession`
+(one hour by default); after that it is refused with `session_expired`. Adyen goes on to
+authorise the payment once the shopper has authenticated, whether or not they return, so the
+`AUTHORISATION` webhook is where its outcome arrives either way.
 
 ## 7. The server-completion route
 
 When the client encrypts the card, the library POSTs the resulting `clientToken` (with the
-session reference) to your `completionEndpoint`, where you mount `createCompletionHandler`:
+session reference) to your `completionEndpoint`, where you mount `createCompletionHandler`;
+the 3-D Secure tokens of §6 go to the same route. Store a random (v4) UUID on each completion
+attempt of an order and pass it as that attempt's `idempotencyKey`. The same key serves every
+step of the attempt, because the adapter derives a distinct Adyen key per request from it:
 
 ```ts
 import { createCompletionHandler } from "@payfanout/server";
@@ -293,15 +481,23 @@ import { createCompletionHandler } from "@payfanout/server";
 // POST /api/complete
 const complete = createCompletionHandler({
   resolveSession: async (sessionRef) => {
-    const order = await db.orderByClientSecret(sessionRef); // your storage
-    return { service: payments, pspName: "adyen", pspSessionId: order.pspSessionId, idempotencyKey: `complete-${order.id}` };
+    // One record per attempt: another card on the same order gets a new session and key.
+    const attempt = await db.paymentAttemptByClientSecret(sessionRef); // your storage
+    // attempt.idempotencyKey: crypto.randomUUID(), stored when the attempt was created.
+    return { service: payments, pspName: "adyen", pspSessionId: attempt.pspSessionId, idempotencyKey: attempt.idempotencyKey };
   },
 });
 ```
 
 Under the hood it calls `completePayment`, which verifies the session signature and expiry,
-then creates the payment. Prefer to hand-write the route? Call `completePayment` directly,
-both forms are in [Server usage](/guide/server#server-completion-tokenize-first).
+then creates the payment, or finishes it through `/payments/details` for a 3-D Secure token.
+Adyen answers a key it has seen with its first answer for
+[7 to 14 days](https://docs.adyen.com/development-resources/api-idempotency), so a key
+reused after a refusal replays the refusal instead of charging the shopper's next card:
+start a new attempt, with a new session and key, when the shopper tries again. Within an
+attempt the key stays the same, so a retried POST is deduplicated at Adyen. Prefer to
+hand-write the route? Call `completePayment` directly, both forms are in
+[Server usage](/guide/server#server-completion-tokenize-first).
 
 ::: warning Store the whole `pspPaymentId`
 Adyen has no payment read, so a capture or refund cannot look the amount and currency up.
@@ -530,31 +726,85 @@ persist every event, upsert by `event.id`, and alert on gaps.
 
 ## 9. Test values
 
-Use
-[Adyen's documented sandbox cards](https://docs.adyen.com/development-resources/test-cards-and-credentials/test-card-numbers)
-— Visa `4111 1111 1111 1111` and Mastercard `5555 5555 5555 4444`, both expiry `03/2030`,
-CVC `737`. **Refusals are triggered by field values, not by the card number**: put the
-trigger in `paymentMethod.holderName` or `additionalData.RequestedTestAcquirerResponseCode`,
-per
-[Adyen's testing page](https://docs.adyen.com/development-resources/testing/result-codes).
-Confirm the current list before relying on it.
+[Adyen's test cards](https://docs.adyen.com/development-resources/test-cards-and-credentials/test-card-numbers)
+work on its test platform only — for example Visa `4111 1111 1111 1111` and Mastercard
+`5555 5555 5555 4444`, both expiry `03/2030`, CVC `737`.
+
+**3-D Secure 2.** Adyen's
+[3-D Secure 2 testing page](https://docs.adyen.com/development-resources/testing/3d-secure-2-authentication)
+lists the enrolled cards, among them Mastercard `5454 5454 5454 5454` and Visa
+`4917 6100 0000 0000` (`03/2030`, `737`). Its challenge scenario uses Visa
+`4212 3456 7891 0006` and its frictionless scenario Mastercard `5201 2815 0512 9736`, both
+`03/2030`, `737`. Answer a browser challenge with the password `password`; any other value
+fails the authentication. If your test account's Dynamic 3D Secure default rule is
+**Prefer Not**, set it to **Always** while testing so these cards trigger 3-D Secure.
+
+**Refusals are triggered by the cardholder name, not the card number.** Adyen reads the
+trigger from `paymentMethod.holderName` or `additionalData.RequestedTestAcquirerResponseCode`
+([testing result codes](https://docs.adyen.com/development-resources/testing/result-codes)).
+This adapter never sends the second, so type the trigger into the Card's cardholder-name
+field, with any test card above. If the Card shows no cardholder-name field, enable it with
+`fieldOptions: { hasHolderName: true }`.
+
+| Cardholder name | Adyen `refusalReason` | `completePayment` rejects with |
+| --- | --- | --- |
+| `DECLINED` | Refused | `card_declined` |
+| `CARD_EXPIRED` | Expired Card | `expired_card` |
+| `NOT_ENOUGH_BALANCE` | Not enough balance | `insufficient_funds` |
+| `CVC_DECLINED` | CVC Declined | `invalid_card_data` |
+| `ISSUER_UNAVAILABLE` | Issuer Unavailable | `processing_error` |
+
+For the failure webhooks, a payment made with the name `capture failed` gets
+`CAPTURE_FAILED` on its capture, and one made with `refund failed` gets `REFUND_FAILED` on
+its refund; Adyen notes the simulation can take up to 24 hours
+([testing payments and modifications](https://docs.adyen.com/development-resources/testing/payments-and-modifications)).
+Confirm the current values on Adyen's pages before relying on them.
 
 ## 10. Go live
 
-- [ ] Swap in the **live** API key, merchant account, HMAC key and webhook credentials.
-- [ ] Set `environment: "live"` on **both** adapters and add `liveUrlPrefix` on the server one
-      — Adyen issues the prefix per company account, under Developers → API URLs in the live
-      Customer Area ([live endpoints](https://docs.adyen.com/development-resources/live-endpoints)).
-- [ ] Allowlist your production origin for the **live** client key in the Customer Area.
-- [ ] Register the **live** webhook, with HMAC **and** basic authentication, and verify a test
-      delivery reaches your queue.
+Adyen does not copy settings from your test Customer Area to the live one
+([go-live checklist](https://docs.adyen.com/online-payments/go-live-checklist)): everything
+you configured in test is configured again in the **live** Customer Area.
+
+- [ ] Generate a **live** API key and enable the **Checkout encrypted cardholder data** role
+      on its credential ([§1](#_1-get-your-adyen-credentials)).
+- [ ] Swap in the **live** merchant account, set `environment: "live"` on **both** adapters,
+      and add `liveUrlPrefix` on the server one, from Developers → API URLs → Prefix
+      ([live endpoints](https://docs.adyen.com/development-resources/live-endpoints)).
+- [ ] Generate the **live** client key (`live_…`) and add your production origins to its
+      credential; live origins must be `https`.
+- [ ] Check that the live merchant account's **Capture delay** (Settings → Account settings →
+      General) is **immediate**, Adyen's default. The adapter sends no capture parameter for
+      `captureMethod: "automatic"`, so that setting decides when the money is taken; a
+      manual-capture payment carries `additionalData.manualCapture`, which overrides it
+      ([capture](https://docs.adyen.com/online-payments/capture)).
+- [ ] Add the card brands you accept to the live account.
+- [ ] Register the **live** webhook with HMAC **and** basic authentication. Its HMAC key is new
+      and differs from the test key, and live endpoints must be HTTPS on port 443, 8443 or
+      8843. Send a test delivery from the live Customer Area and check it reaches your queue
+      ([configure webhooks](https://docs.adyen.com/development-resources/webhooks/configure-and-manage)).
+- [ ] If you read `additionalData` from `raw`, give the live account the same additional-data
+      settings for API responses and webhooks as the test one.
+- [ ] Allow for Mastercard 3-D Secure enrollment, which can take up to 12 hours after the live
+      Customer Area is activated.
+- [ ] Complete PCI DSS **SAQ A**, the document Adyen requires for this kind of integration,
+      and have an approved scanning vendor scan the page that loads Adyen's components every
+      quarter and after significant changes
+      ([PCI DSS compliance](https://docs.adyen.com/online-payments/pci-dss-compliance),
+      [vulnerability scanning](https://docs.adyen.com/development-resources/pci-dss-compliance-guide/vulnerability-scanning-regulation)).
 - [ ] Keep `ADYEN_SESSION_KEY` stable and secret in production; rotating it invalidates
       in-flight sessions.
-- [ ] Verify card fields are still Adyen's hosted iframes (SAQ-A), no raw card input.
+- [ ] Verify card fields are still Adyen's hosted iframes (SAQ A), no raw card input.
 - [ ] Re-check endpoint paths, [event codes](https://docs.adyen.com/development-resources/webhooks/webhook-types),
       [result codes](https://docs.adyen.com/online-payments/build-your-integration/payment-result-codes)
       and [refusal reason codes](https://docs.adyen.com/development-resources/refusal-reasons)
       against the current Adyen documentation.
+- [ ] Once the live account is configured, test end to end with real payment details, which
+      incur fees. Adyen's
+      [end-to-end testing](https://docs.adyen.com/online-payments/go-live-checklist#end-to-end-testing)
+      list includes a successful payment, a payment with `resultCode` **Refused** (for example
+      by entering incorrect card details), a refund and a partial refund, and a 3-D Secure
+      payment where the shopper fails to complete the challenge.
 
 Then continue with [Server usage](/guide/server), [React usage](/guide/react), and
 [Webhooks](/guide/webhooks).

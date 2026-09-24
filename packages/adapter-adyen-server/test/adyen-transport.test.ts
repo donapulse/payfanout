@@ -22,6 +22,18 @@ const CLIENT_TOKEN = JSON.stringify({
   encryptedSecurityCode: "test_737",
 });
 
+/** What Adyen Web 6.41.0's collectBrowserInfo() reports: every member the web flow requires. */
+const NATIVE_BROWSER_INFO = {
+  acceptHeader: "*/*",
+  javaEnabled: false,
+  colorDepth: 24,
+  language: "nl-NL",
+  screenHeight: 723,
+  screenWidth: 1536,
+  userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.110 Safari/537.36",
+  timeZoneOffset: 0,
+};
+
 /** A composite reference for a payment the fake has never seen. */
 const UNKNOWN_PAYMENT = "8836100000000042:1000:EUR";
 
@@ -231,28 +243,34 @@ describe("idempotency across one company account", () => {
 
   it("sends each /payments/details step as its own request, and a repeated step once", async () => {
     const { adapter, fake } = withFake();
+    // Native 3-D Secure: IdentifyShopper, one ChallengeShopper, then the result.
+    fake.challengesAfterIdentify = 1;
     const session = await adapter.createPaymentSession({ amount: 3200, currency: "EUR", idempotencyKey: "s" });
-    const challenged = await adapter.completePayment({
-      pspSessionId: session.pspSessionId,
-      clientToken: JSON.stringify({ ...JSON.parse(CLIENT_TOKEN), holderName: "CHALLENGE" }),
-      idempotencyKey: "one-caller-key",
-    });
-    const { paymentData } = (challenged.raw as { action: { paymentData: string } }).action;
     // Every step of the flow goes through one completion handler, one caller key.
-    const submit = (threeDSResult: string, withPaymentData = true) =>
-      adapter.completePayment({
-        pspSessionId: session.pspSessionId,
-        clientToken: JSON.stringify({ details: { threeDSResult }, ...(withPaymentData ? { paymentData } : {}) }),
-        idempotencyKey: "one-caller-key",
-      });
+    const complete = (clientToken: string) =>
+      adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken, idempotencyKey: "one-caller-key" });
+    const actionOf = (info: { raw?: unknown }) => (info.raw as { action: Record<string, unknown> }).action;
 
-    await submit("fingerprint-result");
-    const challengeResult = await submit("challenge-result");
+    const identify = await complete(
+      JSON.stringify({
+        paymentMethod: { ...JSON.parse(CLIENT_TOKEN), holderName: "CHALLENGE" },
+        browserInfo: NATIVE_BROWSER_INFO,
+        origin: "https://shop.example",
+      }),
+    );
+    expect(identify.status).toBe("requires_action");
+    const challenge = await complete(JSON.stringify({ details: fake.detailsFor(actionOf(identify)) }));
+    expect(challenge.status).toBe("requires_action");
+    const lastStep = JSON.stringify({ details: fake.detailsFor(actionOf(challenge)) });
+    const result = await complete(lastStep);
     expect(fake.replays).toBe(0);
-    expect(await submit("challenge-result")).toEqual(challengeResult);
+    expect(await complete(lastStep)).toEqual(result);
     expect(fake.replays).toBe(1);
-    // Without paymentData the step is a request of its own again.
-    await submit("challenge-result", false);
+    // With paymentData the same step is a request of its own again, not a replay:
+    // the fake has finished that payment, so it is refused.
+    await expect(complete(JSON.stringify({ ...JSON.parse(lastStep), paymentData: "Ab02" }))).rejects.toMatchObject({
+      code: "invalid_request",
+    });
     expect(fake.replays).toBe(1);
 
     const detailsKeys = fake.requests

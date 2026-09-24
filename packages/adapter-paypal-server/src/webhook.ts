@@ -42,7 +42,6 @@ export function buildWebhookVerificationBody(
   webhookId: string | undefined,
 ): string | undefined {
   if (!webhookId || !rawBody || rawBody.trim().length === 0) return undefined;
-  if (!isSingleJsonObject(rawBody)) return undefined;
   const lower = lowercaseKeys(headers);
   const values: Record<string, string> = {};
   for (const name of PAYPAL_WEBHOOK_HEADER_NAMES) {
@@ -50,6 +49,7 @@ export function buildWebhookVerificationBody(
     if (typeof value !== "string" || value.length === 0) return undefined;
     values[name] = value;
   }
+  if (!isSingleJsonObject(rawBody)) return undefined;
   return (
     `{"transmission_id":${JSON.stringify(values["paypal-transmission-id"]!)},` +
     `"transmission_time":${JSON.stringify(values["paypal-transmission-time"]!)},` +
@@ -61,7 +61,7 @@ export function buildWebhookVerificationBody(
   );
 }
 
-/** Whether the body parses as one JSON object, with nothing before or after it. */
+/** Whether the body parses as one JSON object, with nothing but JSON whitespace around it. */
 function isSingleJsonObject(rawBody: string): boolean {
   let parsed: unknown;
   try {

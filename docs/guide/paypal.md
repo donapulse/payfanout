@@ -131,10 +131,11 @@ child-src   *.paypal.com *.paypalobjects.com *.venmo.com
 img-src     *.paypal.com *.paypalobjects.com *.venmo.com data:
 ```
 
-PayPal calls a nonce safer than `'unsafe-inline'`: list the nonce in `script-src` and
-`style-src` and give the SDK script both a `nonce` and a `data-csp-nonce` attribute with
-it. The adapter injects the script without either, so a page relying on a nonce loads
-the SDK through the client adapter's `loadScript` option with those attributes. The
+PayPal calls a nonce safer than `'unsafe-inline'`: it replaces `'unsafe-inline'` with
+`'nonce-<value>'` in `script-src` and `style-src` and puts the same value in the SDK tag's
+`nonce` and `data-csp-nonce` attributes. The adapter's script loader sets neither, so use
+the `'unsafe-inline'` policy above with the adapter as shipped. PayPal also recommends
+`Cross-Origin-Opener-Policy: same-origin-allow-popups` on a page running the SDK. The
 onboarding descriptor (`paypalOnboarding.csp`) lists these hosts under `script`, `frame`
 and `connect`; `style-src`, `child-src` and `img-src` have no descriptor field.
 :::
@@ -214,10 +215,11 @@ own payment bookkeeping anyway, and every `refundPayment` result carries the amo
 In the dashboard (your app → Webhooks) add your listener URL —
 `https://your-api.example/webhooks/paypal` — subscribe it to the events the adapter maps
 (the list is `paypalOnboarding.webhook.events`; PayPal documents only `*`, every event
-type, as a wildcard), and copy the created webhook's **ID** into `PAYPAL_WEBHOOK_ID`. Verification is a **postback**: the adapter POSTs the delivery
-headers plus the raw body to PayPal's `verify-webhook-signature` endpoint and trusts only
-`SUCCESS`. Without `webhookId`, with any transmission header missing, or with a body that
-is not exactly one JSON object, it answers `false` without a network call.
+type, as a wildcard), and copy the created webhook's **ID** into `PAYPAL_WEBHOOK_ID`.
+Verification is a **postback**: the adapter POSTs the delivery headers plus the raw body
+to PayPal's `verify-webhook-signature` endpoint and trusts only `SUCCESS`. Without
+`webhookId`, with any transmission header missing, or with a body that is not exactly one
+JSON object, it answers `false` without a network call.
 
 Mount the handler with the **raw body** — verification splices the exact delivered bytes
 into the postback, so a parsed-and-re-serialized body fails by design:

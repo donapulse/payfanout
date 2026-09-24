@@ -26,13 +26,15 @@ export const PAYPAL_WEBHOOK_HEADER_NAMES = [
 
 /**
  * Builds the verify-webhook-signature request body, or undefined when it
- * cannot be verified at all (missing headers / empty body / no webhook id) —
- * callers must answer `false` without a network call in that case.
+ * cannot be verified at all (missing headers / empty body / a body that is not
+ * exactly one JSON object / no webhook id) — callers must answer `false`
+ * without a network call in that case.
  *
  * The raw body is spliced in VERBATIM as the `webhook_event` value: PayPal
  * verifies the exact delivered bytes, and parsing + re-stringifying (different
  * key order / whitespace) makes verification fail. Hence string concatenation
- * instead of JSON.stringify over a parsed object.
+ * instead of JSON.stringify over a parsed object, and the body must be exactly
+ * one JSON object for the request to hold it as the event.
  */
 export function buildWebhookVerificationBody(
   rawBody: string,
@@ -47,6 +49,7 @@ export function buildWebhookVerificationBody(
     if (typeof value !== "string" || value.length === 0) return undefined;
     values[name] = value;
   }
+  if (!isSingleJsonObject(rawBody)) return undefined;
   return (
     `{"transmission_id":${JSON.stringify(values["paypal-transmission-id"]!)},` +
     `"transmission_time":${JSON.stringify(values["paypal-transmission-time"]!)},` +
@@ -56,6 +59,18 @@ export function buildWebhookVerificationBody(
     `"webhook_id":${JSON.stringify(webhookId)},` +
     `"webhook_event":${rawBody}}`
   );
+}
+
+/** Whether the body parses as one JSON object, with nothing but JSON whitespace around it. */
+function isSingleJsonObject(rawBody: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawBody);
+  } catch {
+    // Not JSON at all, or trailing text after the value: no event to verify.
+    return false;
+  }
+  return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed);
 }
 
 interface PayPalLink {
@@ -71,6 +86,8 @@ export interface PayPalEventBody {
   summary?: string;
   resource?: {
     id?: string;
+    /** CHECKOUT.PAYMENT-APPROVAL.REVERSED names the order here and carries no id. */
+    order_id?: string;
     status?: string;
     create_time?: string;
     /** Capture and refund resources both carry their money object here. */
@@ -85,7 +102,7 @@ export interface PayPalEventBody {
 const EVENT_TYPE_MAP: Record<string, UnifiedWebhookEventType> = {
   "PAYMENT.CAPTURE.COMPLETED": "payment.succeeded",
   "PAYMENT.CAPTURE.PENDING": "payment.processing",
-  // The docs render this event name both ways — accept either string.
+  // DENIED is the Payments v1 event name, DECLINED the Payments v2 one.
   "PAYMENT.CAPTURE.DENIED": "payment.failed",
   "PAYMENT.CAPTURE.DECLINED": "payment.failed",
   "PAYMENT.CAPTURE.REFUNDED": "payment.refunded",
@@ -205,6 +222,10 @@ function extractPspPaymentId(eventType: string, resource: PayPalEventBody["resou
   if (eventType.startsWith("PAYMENT.AUTHORIZATION.")) {
     // Pre-capture the canonical PayFanout id is the ORDER id.
     return resource.supplementary_data?.related_ids?.order_id ?? resource.id;
+  }
+  if (eventType === "CHECKOUT.PAYMENT-APPROVAL.REVERSED") {
+    // An approved order PayPal cancelled before capture: its id is order_id.
+    return resource.order_id;
   }
   // Capture events: resource.id IS the capture id — the canonical post-capture id.
   return resource.id;

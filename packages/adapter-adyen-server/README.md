@@ -216,9 +216,14 @@ Customer Area settings it relies on.
   refused too. It becomes the `merchantReference` Adyen signs into every webhook; the
   verifier accepts a `:` there, but until the adapter has been exercised against a live Adyen
   test account the references it creates stay clear of both characters.
-- Manual capture is requested per payment (`additionalData.manualCapture`), so enabling it
-  account-wide is not required. Multiple partial captures are off by default at Adyen and a
-  single partial capture releases the remainder, so `supportsMultiCapture` is `false`.
+- Manual capture is requested per payment (`additionalData.manualCapture`), which overrides
+  the merchant account's capture setting, so enabling it account-wide is not required.
+  Automatic capture sends no capture parameter and follows the account's **Capture delay**
+  (Settings → Account settings in the Customer Area), so keep it at **immediate**, Adyen's
+  default: under a manual or N-day setting, a payment the adapter reports as `succeeded` is
+  not captured until you capture it or the delay runs out. Multiple partial captures are off
+  by default at Adyen and a single partial capture releases the remainder, so
+  `supportsMultiCapture` is `false`.
 - **CLP, CVE, IDR and ISK are rejected locally**: Adyen prices them with different fractional
   digits than ISO 4217 (PayFanout's minor-unit contract), so passing amounts through would
   shift the decimal point. The check runs on session creation *and* on the currency carried

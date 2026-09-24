@@ -22,7 +22,7 @@ const ISSUE_MAP: Record<string, UnifiedErrorCode> = {
   // insufficient_funds/expired_card split) — a funding failure is a decline.
   INSTRUMENT_DECLINED: "card_declined",
   REDIRECT_PAYER_FOR_ALTERNATE_FUNDING: "card_declined",
-  // The payer's account, not a funding source, is refused: another method is needed.
+  // Not about one funding source: re-approving the same order does not help.
   PAYMENT_DENIED: "card_declined",
   PAYER_CANNOT_PAY: "card_declined",
   PAYER_ACCOUNT_RESTRICTED: "card_declined",
@@ -62,12 +62,15 @@ const ISSUE_MAP: Record<string, UnifiedErrorCode> = {
 };
 
 /**
- * Declines of the payer's account rather than of one funding source: choosing
- * another source in the PayPal window does not help (PayPal's troubleshooting
- * advice for MAX_NUMBER_OF_PAYMENT_ATTEMPTS_EXCEEDED is to use a different
- * payment method).
+ * Declines that are not about one funding source, so re-approving the same
+ * order in the PayPal window does not help. PayPal points PAYER_CANNOT_PAY
+ * ("Please contact the payer to find other ways to pay for this transaction.")
+ * and MAX_NUMBER_OF_PAYMENT_ATTEMPTS_EXCEEDED ("Ask the buyer to use a
+ * different payment method.") away from it, and gives no remedy for
+ * PAYMENT_DENIED or the payer-account issues, where another payment method is
+ * the conservative advice.
  */
-const ACCOUNT_DECLINES: ReadonlySet<string> = new Set([
+const OTHER_METHOD_DECLINES: ReadonlySet<string> = new Set([
   "PAYMENT_DENIED",
   "PAYER_CANNOT_PAY",
   "PAYER_ACCOUNT_RESTRICTED",
@@ -92,7 +95,7 @@ export function mapPayPalError(httpStatus: number, body: unknown): PayFanoutErro
   const fallback = classifyHttpFallback(httpStatus);
   if (mappedIssue) {
     code = mappedIssue;
-    if (code === "card_declined" && ACCOUNT_DECLINES.has(issue!)) {
+    if (code === "card_declined" && OTHER_METHOD_DECLINES.has(issue!)) {
       message = "PayPal declined this payment — choose another payment method.";
     } else if (code === "card_declined") {
       // Recovery is a fresh approval on the SAME order: the buyer picks a

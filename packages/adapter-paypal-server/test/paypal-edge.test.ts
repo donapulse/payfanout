@@ -153,9 +153,10 @@ describe("mapPayPalError", () => {
     });
   }
 
-  it("gives declines the restart-in-popup guidance", () => {
-    const mapped = mapPayPalError(422, issue("INSTRUMENT_DECLINED"));
-    expect(mapped.message).toMatch(/different way to pay/);
+  it("gives funding-source declines the restart-in-popup guidance", () => {
+    for (const name of ["INSTRUMENT_DECLINED", "REDIRECT_PAYER_FOR_ALTERNATE_FUNDING"]) {
+      expect(mapPayPalError(422, issue(name)).message, name).toMatch(/different way to pay in the PayPal window/);
+    }
   });
 
   it("tells declines of the payer's account to use another payment method", () => {

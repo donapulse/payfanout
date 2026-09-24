@@ -50,6 +50,7 @@ export {
 
 export { lowercaseKeys, normalizeSecrets, normalizeTime } from "./webhook-util.js";
 
+export type { InjectScriptOptions } from "./sdk-loader.js";
 export { assertBrowser, injectScript } from "./sdk-loader.js";
 
 export { validateAdapterCapabilities } from "./capability-validation.js";

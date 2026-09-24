@@ -490,7 +490,8 @@ describe("PayPal updatePaymentSession (PATCH order)", () => {
 
   it("patches descriptor and shipping alongside the amount", async () => {
     const { adapter } = makePair();
-    const session = await adapter.createPaymentSession(sessionInput);
+    // PayPal replaces a descriptor but does not add one, so the order starts with one.
+    const session = await adapter.createPaymentSession({ ...sessionInput, statementDescriptor: "OLD DESCRIPTOR" });
     await adapter.updatePaymentSession({
       pspSessionId: session.pspSessionId,
       amount: 2100,

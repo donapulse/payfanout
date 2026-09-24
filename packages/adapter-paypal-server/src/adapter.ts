@@ -152,6 +152,7 @@ export interface PayPalOrderLike {
     custom_id?: string;
     soft_descriptor?: string;
     amount?: PayPalMoney;
+    shipping?: { name?: unknown; address?: unknown };
     payments?: {
       captures?: PayPalCaptureLike[];
       authorizations?: PayPalAuthorizationLike[];
@@ -595,7 +596,13 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * PATCH-amends a CREATED/APPROVED order in place (same order id, so the
    * mounted PayPal button keeps working). COMPLETED orders reject with
    * invalid_request. Currency changes require an explicit amount — the old
-   * minor amount is not silently reinterpreted in the new currency.
+   * minor amount is not silently reinterpreted in the new currency. The PATCH
+   * applies whole or not at all, and touches only attributes PayPal's patch
+   * table lists: shipping's name and address, and a statement descriptor the
+   * order already has. A name left out of an update keeps the order's
+   * current one (the table has no remove for it). Adding a descriptor to an
+   * order created without one is refused before any PATCH: pass
+   * statementDescriptor when creating the session.
    */
   async updatePaymentSession(input: UpdatePaymentSessionInput): Promise<PaymentSession> {
     if (input.amount !== undefined) assertMinorUnitAmount(input.amount, "amount");
@@ -627,11 +634,28 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     }
     const softDescriptor = toSoftDescriptor(input.statementDescriptor);
     if (softDescriptor) {
-      ops.push({ op: unit?.soft_descriptor ? "replace" : "add", path: `${unitPath}/soft_descriptor`, value: softDescriptor });
+      // PayPal's patchable-attributes table allows replace and remove, not add.
+      if (!unit?.soft_descriptor) {
+        throw PayFanoutError.invalidRequest(
+          "PayPal can replace an order's statement descriptor but not add one — pass statementDescriptor when creating the session",
+          { pspSessionId: input.pspSessionId },
+        );
+      }
+      ops.push({ op: "replace", path: `${unitPath}/soft_descriptor`, value: softDescriptor });
     }
     const shipping = toPayPalShipping(input.shippingDetails);
     if (shipping) {
-      ops.push({ op: "add", path: `${unitPath}/shipping`, value: shipping });
+      // Only shipping's own attributes are patchable, never the whole object. An
+      // attribute already there is replaced; a missing one is added under an
+      // existing shipping object, and replaced into an order that has none,
+      // following PayPal's "Add Shipping Address" sample (see docs/decisions.md).
+      const current = unit?.shipping;
+      for (const key of ["name", "address"] as const) {
+        const value = shipping[key];
+        if (value === undefined) continue;
+        const op = current === undefined || current[key] !== undefined ? "replace" : "add";
+        ops.push({ op, path: `${unitPath}/shipping/${key}`, value });
+      }
     }
     if (ops.length > 0) {
       // PATCH answers 204 No Content — the refreshed order needs its own GET.
@@ -1316,14 +1340,14 @@ function mapRefundStatus(status: string | undefined): RefundResult["status"] {
 }
 
 /**
- * Card statements truncate the soft descriptor at 22 characters — anything
- * longer is withheld rather than failing the payment (checkout-field rule:
- * validate locally, withhold what the PSP would reject).
+ * PayPal accepts a longer soft_descriptor but truncates anything beyond 22
+ * characters, the length its responses carry, so the adapter cuts it the same
+ * way instead of dropping it.
  */
 function toSoftDescriptor(statementDescriptor: string | undefined): string | undefined {
   const trimmed = statementDescriptor?.trim();
-  if (!trimmed || trimmed.length > 22) return undefined;
-  return trimmed;
+  if (!trimmed) return undefined;
+  return Array.from(trimmed).slice(0, 22).join("").trimEnd();
 }
 
 /** PayPal requires country_code on any provided address — withhold rather than 400. */

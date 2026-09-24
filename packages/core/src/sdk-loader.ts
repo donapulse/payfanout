@@ -2,12 +2,13 @@ import { PayFanoutError } from "./errors.js";
 
 // Lowercase only: the SRI draft lowercases algorithm names, but Chromium and
 // Firefox match them case-sensitively and skip a token they do not recognise,
-// which leaves the file unchecked. The digest is base64 or base64url, and
-// tokens split on ASCII whitespace only, as browsers split them.
-const SRI_TOKEN = /^sha(?:256|384|512)-[A-Za-z0-9+/_-]+={0,2}(?:\?.*)?$/;
+// which leaves the file unchecked. The digest is base64 or base64url, options
+// are printable ASCII, and tokens split only on the whitespace every engine
+// splits on (Firefox does not split on a form feed).
+const SRI_TOKEN = /^sha(?:256|384|512)-[A-Za-z0-9+/_-]+={0,2}(?:\?[!-~]*)?$/;
 
 function holdsUsableHash(integrity: string): boolean {
-  return integrity.split(/[\t\n\f\r ]+/).some((token) => SRI_TOKEN.test(token));
+  return integrity.split(/[\t\n\r ]+/).some((token) => SRI_TOKEN.test(token));
 }
 
 /**

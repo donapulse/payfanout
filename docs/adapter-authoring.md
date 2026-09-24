@@ -302,8 +302,8 @@ Implement `ClientPaymentAdapter`:
   hash, a conflicting `<script>` for the same URL, one without the same `integrity` or
   without a `crossorigin` attribute, makes the call reject with a non-retryable
   `invalid_request`, as does a value holding no well-formed `sha256-`, `sha384-` or
-  `sha512-` token (lowercase algorithm, base64 digest: Chromium and Firefox skip any other
-  token and would run the file unchecked).
+  `sha512-` token (lowercase algorithm, base64 digest: at least one major engine skips any
+  other token and would run the file unchecked).
   That detects a conflicting tag; it is not a trust boundary, since returning early on
   the SDK global means a copy the host page already loaded is used without any check.
 - `mount(container, options)`: render **hosted/iframe fields only** (SAQ-A), never a raw

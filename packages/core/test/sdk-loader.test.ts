@@ -197,8 +197,10 @@ describe("injectScript options", () => {
       "Sha512-abc",
       "sha384-abc,",
       "sha384-?",
-      " sha384-abc",
-      "md5-abc sha384-abc",
+      "\u00A0sha384-abc",
+      "md5-abc\u00A0sha384-abc",
+      "\fsha384-abc",
+      "sha384-abc?\u00E9",
     ]) {
       await expectRefused(
         injectScript(SDK_URL, "acme", { integrity }),

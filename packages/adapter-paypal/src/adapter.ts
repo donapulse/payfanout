@@ -68,6 +68,7 @@ export interface PayPalClientAdapterConfig {
   getPayPalGlobal?: () => PayPalJsLike | undefined;
 }
 
+// The JS SDK v5 loader; its reference lives under /sdk/js/v5/ (/sdk/js/reference is v6).
 const PAYPAL_SDK_URL = "https://www.paypal.com/sdk/js";
 
 interface PayPalApprovalState {
@@ -300,8 +301,8 @@ function asPayPalHandle(handle: MountedFieldsHandle): PayPalHandle {
 
 /**
  * The SDK's errors are untyped Error objects with no stable codes —
- * processing_error with the raw preserved is the honest mapping. A failed
- * render stays retryable (mounting again can succeed); onError is not.
+ * processing_error with the raw preserved is the honest mapping. A mount
+ * that throws is retryable (mounting again can succeed); onError is not.
  */
 function mapPayPalJsError(err: unknown, retryable: boolean): PayFanoutError {
   return new PayFanoutError({

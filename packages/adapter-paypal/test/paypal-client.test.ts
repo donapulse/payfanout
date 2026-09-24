@@ -273,6 +273,7 @@ describe("PayPalClientAdapter", () => {
     await expect(
       adapter.mount(container, { clientSecret: ORDER_ID, onError: (err) => surfaced.push(err) }),
     ).rejects.toThrowError(/funding/);
+    expect(surfaced[0]).toMatchObject({ code: "invalid_request", retryable: false }); // passed through untouched
     expect(container.children[0]!.remove).toHaveBeenCalled(); // no orphaned wrapper
     expect(surfaced).toHaveLength(1);
   });

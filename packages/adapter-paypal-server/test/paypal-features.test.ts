@@ -230,6 +230,115 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
     expect(adapter.getCapabilities().supportsMultiCapture).toBe(true);
   });
 
+  it("capturing the rest sends the uncaptured remainder explicitly, as the final capture", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    await adapter.capturePayment(orderId, 700, "k-cap-1");
+    const rest = await adapter.capturePayment(orderId, undefined, "k-cap-rest");
+    // PayPal reads a capture without an amount as the FULL authorized amount.
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "13.00" }, final_capture: true });
+    expect(rest.status).toBe("succeeded");
+    expect(rest.amount).toBe(2000);
+    expect(rest.amountCaptured).toBe(2000);
+    expect(rest.amountCapturable).toBe(0);
+    expect(fake.uniqueCaptureCreations).toBe(2);
+  });
+
+  it("an explicit capture of the whole remainder is the final capture too", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    await adapter.capturePayment(orderId, 700, "k-cap-1");
+    const rest = await adapter.capturePayment(orderId, 1300, "k-cap-2");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "13.00" }, final_capture: true });
+    expect(rest.amountCaptured).toBe(2000);
+    // The final capture closed the authorization: PayPal refuses anything further.
+    await expect(adapter.capturePayment(orderId, 100, "k-cap-3")).rejects.toMatchObject({
+      code: "invalid_request",
+      raw: { details: [{ issue: "AUTHORIZATION_ALREADY_CAPTURED" }] },
+    });
+  });
+
+  it("capturing the rest with nothing left rejects before any capture call", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    const all = await adapter.capturePayment(orderId, undefined, "k-cap-all");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "20.00" }, final_capture: true });
+    expect(all.amountCaptured).toBe(2000);
+
+    const before = fake.requestCount;
+    await expect(adapter.capturePayment(orderId, undefined, "k-cap-more")).rejects.toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      message: expect.stringMatching(/nothing left to capture/),
+    });
+    expect(fake.requestCount - before).toBe(1); // the order read only
+    expect(fake.uniqueCaptureCreations).toBe(1);
+
+    // A voided authorization — also how PayPal reports an expired one — has nothing left either.
+    const voided = await authorizedPayment(makePair());
+    await voided.adapter.cancelPayment(voided.orderId, "k-void");
+    await expect(voided.adapter.capturePayment(voided.orderId, undefined, "k-cap")).rejects.toThrowError(
+      /nothing left to capture \(authorization \w+ is VOIDED\)/,
+    );
+    expect(voided.fake.uniqueCaptureCreations).toBe(0);
+  });
+
+  it("captures, reads, and captures the rest by the capture id an earlier capture returned", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    const first = await adapter.capturePayment(orderId, 700, "k-cap-1");
+    expect(first.pspPaymentId).toMatch(/^2GG/); // the id hosts store once money moved
+
+    const second = await adapter.capturePayment(first.pspPaymentId, 500, "k-cap-2");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "5.00" }, final_capture: false });
+    expect(second.amountCaptured).toBe(1200);
+    expect(second.amountCapturable).toBe(800);
+    expect(second.pspPaymentId).toBe(first.pspPaymentId); // the stored id stays the canonical one
+
+    expect((await adapter.retrievePayment(first.pspPaymentId)).amountCaptured).toBe(1200);
+    await expect(adapter.cancelPayment(first.pspPaymentId, "k-void")).rejects.toThrowError(/already captured/);
+
+    const rest = await adapter.capturePayment(first.pspPaymentId, undefined, "k-cap-rest");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "8.00" }, final_capture: true });
+    expect(rest.amountCaptured).toBe(2000);
+  });
+
+  it("a PENDING capture keeps its slice of the authorization", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({ ...sessionInput, captureMethod: "manual" });
+    fake.approveOrder(session.pspSessionId, { pendingCapture: true });
+    await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: session.pspSessionId,
+      idempotencyKey: "k-auth",
+    });
+    const pending = await adapter.capturePayment(session.pspSessionId, 700, "k-cap-1");
+    expect(pending.status).toBe("processing");
+    expect(pending.amountCaptured).toBe(0); // nothing settled yet
+    expect(pending.amountCapturable).toBe(1300);
+
+    await adapter.capturePayment(session.pspSessionId, undefined, "k-cap-rest");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "13.00" }, final_capture: true });
+  });
+
+  it("captures the rest in a zero-decimal currency (JPY)", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({
+      amount: 5000,
+      currency: "JPY",
+      captureMethod: "manual",
+      idempotencyKey: "k-jpy",
+    });
+    fake.approveOrder(session.pspSessionId);
+    await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: session.pspSessionId,
+      idempotencyKey: "k-jpy-auth",
+    });
+    await adapter.capturePayment(session.pspSessionId, 1200, "k-jpy-1");
+    const rest = await adapter.capturePayment(session.pspSessionId, undefined, "k-jpy-rest");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "JPY", value: "3800" }, final_capture: true });
+    expect(rest.currency).toBe("JPY");
+    expect(rest.amountCaptured).toBe(5000);
+    expect(rest.amountCapturable).toBe(0);
+  });
+
   it("refuses to refund by order id once several captures exist — names the capture ids", async () => {
     const { adapter, orderId } = await authorizedPayment();
     const first = await adapter.capturePayment(orderId, 700, "k-cap-1");

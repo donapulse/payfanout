@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isPayFanoutError, type UnifiedErrorCode, type UnifiedPaymentStatus } from "@payfanout/core";
+import { getRefundState, isPayFanoutError, type UnifiedErrorCode, type UnifiedPaymentStatus } from "@payfanout/core";
 import {
   buildWebhookVerificationBody,
   fromPayPalValue,
@@ -9,6 +9,7 @@ import {
   toPayPalValue,
   type PayPalCaptureLike,
   type PayPalOrderLike,
+  type PayPalRefundLike,
 } from "../src/index.js";
 
 const OAUTH_OK = JSON.stringify({ access_token: "tok", token_type: "Bearer", expires_in: 3600 });
@@ -269,6 +270,59 @@ describe("PayPal order state mapping", () => {
     expect(info.status).toBe("succeeded"); // refund state is derived, never a payment status
   });
 
+  it("counts only refunds that returned money or are returning it", async () => {
+    const withRefunds = (refunds: object[]) =>
+      adapterWithOrder({
+        status: "COMPLETED",
+        purchase_units: [
+          {
+            reference_id: "default",
+            amount: { currency_code: "USD", value: "20.00" },
+            payments: {
+              captures: [{ id: "c1", status: "PARTIALLY_REFUNDED", amount: { currency_code: "USD", value: "20.00" } }],
+              refunds: refunds as PayPalRefundLike[],
+            },
+          },
+        ],
+      }).retrievePayment("5O1");
+
+    const failedThenCompleted = await withRefunds([
+      { id: "r1", status: "FAILED", amount: { currency_code: "USD", value: "5.00" } },
+      { id: "r2", status: "COMPLETED", amount: { currency_code: "USD", value: "3.00" } },
+    ]);
+    expect(failedThenCompleted.amountRefunded).toBe(300);
+
+    // PENDING money is on its way back and counts; a CANCELLED refund returned nothing.
+    const pendingAndCancelled = await withRefunds([
+      { id: "r3", status: "PENDING", amount: { currency_code: "USD", value: "2.00" } },
+      { id: "r4", status: "CANCELLED", amount: { currency_code: "USD", value: "4.00" } },
+    ]);
+    expect(pendingAndCancelled.amountRefunded).toBe(200);
+    expect(getRefundState(pendingAndCancelled)).toBe("partial");
+
+    const onlyFailed = await withRefunds([
+      { id: "r5", status: "FAILED", amount: { currency_code: "USD", value: "20.00" } },
+    ]);
+    expect(onlyFailed.amountRefunded).toBe(0);
+    expect(getRefundState(onlyFailed)).toBe("none");
+  });
+
+  it("reports a Venmo-funded order with the venmo wallet", async () => {
+    const info = await adapterWithOrder({
+      status: "COMPLETED",
+      purchase_units: [
+        {
+          reference_id: "default",
+          amount: { currency_code: "USD", value: "20.00" },
+          payments: { captures: [{ id: "c1", status: "COMPLETED", amount: { currency_code: "USD", value: "20.00" } }] },
+        },
+      ],
+      payment_source: { venmo: { email_address: "buyer@example.com", user_name: "example-buyer" } },
+    }).retrievePayment("5O1");
+    expect(info.paymentMethodType).toBe("paypal");
+    expect(info.paymentMethodDetails).toEqual({ wallet: "venmo" });
+  });
+
   it("surfaces guest-checkout card facts when payment_source.card appears", async () => {
     const info = await adapterWithOrder({
       status: "COMPLETED",
@@ -386,6 +440,203 @@ describe("PayPal bare-capture mapping (order aged out of GET)", () => {
     const info = await declined.retrievePayment("2GG1");
     expect(info.status).toBe("failed");
     expect(info.capturedAt).toBeUndefined();
+  });
+});
+
+/** Fixed responses keyed by "METHOD /path"; records what the adapter read and posted. */
+function adapterWithExchanges(routes: Record<string, { status: number; body: unknown }>): {
+  adapter: PayPalServerAdapter;
+  gets: string[];
+  posts: Array<{ path: string; body: unknown }>;
+} {
+  const gets: string[] = [];
+  const posts: Array<{ path: string; body: unknown }> = [];
+  const adapter = new PayPalServerAdapter({
+    clientId: "id",
+    clientSecret: "secret",
+    environment: "sandbox",
+    maxNetworkRetries: 0,
+    fetch: (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (url.endsWith("/v1/oauth2/token")) return new Response(OAUTH_OK, { status: 200 });
+      const method = init?.method ?? "GET";
+      const { pathname } = new URL(url);
+      if (method === "POST") posts.push({ path: pathname, body: JSON.parse(String(init?.body)) as unknown });
+      else gets.push(pathname);
+      const route = routes[`${method} ${pathname}`];
+      if (!route) {
+        return new Response(JSON.stringify({ name: "RESOURCE_NOT_FOUND", message: "missing" }), { status: 404 });
+      }
+      return new Response(JSON.stringify(route.body), { status: route.status });
+    }) as typeof fetch,
+  });
+  return { adapter, gets, posts };
+}
+
+const authorizedOrder = (payments: object): { status: number; body: unknown } => ({
+  status: 200,
+  body: {
+    id: "5O1",
+    intent: "AUTHORIZE",
+    status: "COMPLETED",
+    purchase_units: [{ reference_id: "default", amount: { currency_code: "USD", value: "20.00" }, payments }],
+  },
+});
+
+const alreadyCaptured = {
+  status: 422,
+  body: { name: "UNPROCESSABLE_ENTITY", details: [{ issue: "ORDER_ALREADY_CAPTURED" }] },
+};
+
+describe("PayPal capture requests", () => {
+  const capturedOk = { status: 201, body: { id: "c9", status: "COMPLETED" } };
+
+  it("declined and failed captures took nothing from the authorization", async () => {
+    const { adapter, posts } = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": authorizedOrder({
+        authorizations: [{ id: "A1", status: "CREATED", amount: { currency_code: "USD", value: "20.00" } }],
+        captures: [
+          { id: "c1", status: "DECLINED", amount: { currency_code: "USD", value: "7.00" } },
+          { id: "c2", status: "FAILED", amount: { currency_code: "USD", value: "3.00" } },
+        ],
+      }),
+      "POST /v2/payments/authorizations/A1/capture": capturedOk,
+    });
+    await adapter.capturePayment("5O1", undefined, "k-rest");
+    expect(posts).toEqual([
+      {
+        path: "/v2/payments/authorizations/A1/capture",
+        body: { amount: { currency_code: "USD", value: "20.00" }, final_capture: true },
+      },
+    ]);
+  });
+
+  it("an authorization that reports no amount: a first capture takes it all, later ones need an amount", async () => {
+    const fresh = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": authorizedOrder({ authorizations: [{ id: "A1", status: "CREATED" }] }),
+      "POST /v2/payments/authorizations/A1/capture": capturedOk,
+    });
+    await fresh.adapter.capturePayment("5O1", undefined, "k-all");
+    // No amount: PayPal captures the full authorized amount, so it is final.
+    expect(fresh.posts[0]?.body).toEqual({ final_capture: true });
+
+    const partial = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": authorizedOrder({
+        authorizations: [{ id: "A1", status: "PARTIALLY_CAPTURED" }],
+        captures: [{ id: "c1", status: "COMPLETED", amount: { currency_code: "USD", value: "5.00" } }],
+      }),
+      "POST /v2/payments/authorizations/A1/capture": capturedOk,
+    });
+    await expect(partial.adapter.capturePayment("5O1", undefined, "k-rest")).rejects.toThrowError(
+      /remainder after earlier captures is unknown/,
+    );
+    expect(partial.posts).toHaveLength(0);
+    // An explicit amount still goes out, and keeps the authorization open.
+    await partial.adapter.capturePayment("5O1", 300, "k-part");
+    expect(partial.posts[0]?.body).toEqual({ amount: { currency_code: "USD", value: "3.00" }, final_capture: false });
+  });
+
+  it("treats an authorization reporting no status as closed — nothing is captured", async () => {
+    const { adapter, posts } = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": authorizedOrder({
+        authorizations: [{ id: "A1", amount: { currency_code: "USD", value: "20.00" } }],
+      }),
+    });
+    await expect(adapter.capturePayment("5O1", undefined, "k")).rejects.toThrowError(/in an unreported state/);
+    expect(posts).toHaveLength(0);
+  });
+
+  it("surfaces an outage while resolving the order instead of probing for a capture", async () => {
+    const { adapter, gets, posts } = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": { status: 503, body: { name: "INTERNAL_SERVICE_ERROR" } },
+    });
+    await expect(adapter.capturePayment("5O1", 100, "k")).rejects.toMatchObject({
+      code: "psp_unavailable",
+      retryable: true,
+    });
+    expect(gets).toEqual(["/v2/checkout/orders/5O1"]);
+    expect(posts).toHaveLength(0);
+  });
+
+  it("rejects a capture id whose capture names no parent order", async () => {
+    const { adapter, posts } = adapterWithExchanges({
+      "GET /v2/payments/captures/2GG1": {
+        status: 200,
+        body: { id: "2GG1", status: "COMPLETED", amount: { currency_code: "USD", value: "5.00" } },
+      },
+    });
+    await expect(adapter.capturePayment("2GG1", 100, "k")).rejects.toThrowError(/names no parent order/);
+    expect(posts).toHaveLength(0);
+  });
+});
+
+describe("PayPal completion replays (ORDER_ALREADY_CAPTURED)", () => {
+  const complete = (adapter: PayPalServerAdapter) =>
+    adapter.completePayment({ pspSessionId: "5O1", clientToken: "5O1", idempotencyKey: "k-again" });
+
+  it("keeps the rejection when the re-read order is not completed", async () => {
+    const { adapter, gets } = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": {
+        status: 200,
+        body: { id: "5O1", intent: "CAPTURE", status: "APPROVED", purchase_units: [{ reference_id: "default" }] },
+      },
+      "POST /v2/checkout/orders/5O1/capture": alreadyCaptured,
+    });
+    await expect(complete(adapter)).rejects.toMatchObject({
+      code: "invalid_request",
+      raw: { details: [{ issue: "ORDER_ALREADY_CAPTURED" }] },
+    });
+    expect(gets).toEqual(["/v2/checkout/orders/5O1", "/v2/checkout/orders/5O1"]); // read, then re-read
+  });
+
+  it("keeps the rejection when the re-read answers another order or carries no capture", async () => {
+    const capturedUnit = {
+      reference_id: "default",
+      amount: { currency_code: "USD", value: "20.00" },
+      payments: { captures: [{ id: "c1", status: "COMPLETED", amount: { currency_code: "USD", value: "20.00" } }] },
+    };
+    const otherOrder = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": {
+        status: 200,
+        body: { id: "5OOTHER", intent: "CAPTURE", status: "COMPLETED", purchase_units: [capturedUnit] },
+      },
+      "POST /v2/checkout/orders/5O1/capture": alreadyCaptured,
+    });
+    await expect(complete(otherOrder.adapter)).rejects.toMatchObject({ code: "invalid_request" });
+
+    const noCapture = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": {
+        status: 200,
+        body: { id: "5O1", intent: "CAPTURE", status: "COMPLETED", purchase_units: [{ reference_id: "default", payments: {} }] },
+      },
+      "POST /v2/checkout/orders/5O1/capture": alreadyCaptured,
+    });
+    await expect(complete(noCapture.adapter)).rejects.toMatchObject({ code: "invalid_request" });
+  });
+
+  it("rethrows every other completion error without re-reading", async () => {
+    const declined = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": {
+        status: 200,
+        body: { id: "5O1", intent: "CAPTURE", status: "APPROVED", purchase_units: [{ reference_id: "default" }] },
+      },
+      "POST /v2/checkout/orders/5O1/capture": {
+        status: 422,
+        body: { name: "UNPROCESSABLE_ENTITY", details: [{ issue: "INSTRUMENT_DECLINED" }] },
+      },
+    });
+    await expect(complete(declined.adapter)).rejects.toMatchObject({ code: "card_declined" });
+    expect(declined.gets).toHaveLength(1);
+
+    const outage = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": {
+        status: 200,
+        body: { id: "5O1", intent: "CAPTURE", status: "APPROVED", purchase_units: [{ reference_id: "default" }] },
+      },
+      "POST /v2/checkout/orders/5O1/capture": { status: 500, body: { name: "INTERNAL_SERVICE_ERROR" } },
+    });
+    await expect(complete(outage.adapter)).rejects.toMatchObject({ code: "psp_unavailable", retryable: true });
+    expect(outage.gets).toHaveLength(1);
   });
 });
 

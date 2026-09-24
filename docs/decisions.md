@@ -254,6 +254,55 @@ choices they forced:
   not `CREATED` — so a fresh session reports `requires_action`; PATCH still works in
   that state, and capture/authorize still 422 `ORDER_NOT_APPROVED`. The in-memory
   fake mirrors this (bare orders without a payment_source keep `CREATED`).
+- **Captures, refunds and completions follow PayPal's documentation (2026-09-24).**
+  Doc-verified against the Payments v2 (2.12) and Orders v2 (2.36) OpenAPI schemas under
+  developer.paypal.com/api/, the Orders troubleshooting and error-messages pages, the
+  delay-capture and authorization/honor-period guides, and the webhook event names page.
+  - *Capturing the rest.* The capture request's `amount` reads "If amount is not specified,
+    the full authorized amount is captured", so after a partial capture a request without
+    an amount asked for the whole authorization again. `capturePayment(id, undefined)` now
+    sends the remainder explicitly: the authorized amount minus the captures that took
+    money. DECLINED ("The funds could not be captured") and FAILED captures are left out.
+    PENDING ones ("not yet credited to the payee's PayPal account") are kept, because
+    `MAX_CAPTURE_AMOUNT_EXCEEDED` documents a default overage of "up to 115% of the order
+    amount": a remainder that ignored a pending capture could be accepted and capture that
+    slice twice. `final_capture` ("Set to `true` if you do not intend to capture additional
+    payments against the authorization") is `true` when the amount, explicit or implied,
+    covers the remainder, and `false` below it; afterwards `AUTHORIZATION_ALREADY_CAPTURED`
+    ("If `final_capture` is set to to `true`, additional captures are not possible against
+    the authorization") refuses a second capture of the rest. With nothing left (CAPTURED,
+    DENIED, or VOIDED, which is also how an expired authorization reports: "voided either
+    due to authorization reaching its 30 day validity period or… manually voided") the call
+    rejects with `invalid_request` before any capture request, so a same-key retry of a
+    capture of the rest that already landed answers that error too; the guide tells hosts
+    to read the payment. Explicit amounts are not checked against the remainder: the
+    overage contradicts the same error's example ("You can only capture up to the original
+    authorization amount"), so PayPal judges them. The fake now captures the full authorized
+    amount for a request without an amount, closes the authorization on `final_capture`,
+    and keeps the no-overage rule.
+  - *Capture ids.* `capturePayment` and `cancelPayment` resolve a capture id, the id
+    completion and every capture return, through the capture's
+    `supplementary_data.related_ids.order_id`, as `retrievePayment` already did.
+  - *Refund counting.* `amountRefunded` counts COMPLETED and PENDING refunds and leaves out
+    FAILED ("The refund could not be processed") and CANCELLED ("The refund was
+    cancelled"). Counting PENDING is deliberate: that money is on its way back, and
+    counting it keeps `getRefundState` from offering it for refund again.
+  - *Repeated completions.* `ORDER_ALREADY_CAPTURED` ("Order already captured. If
+    'intent=CAPTURE' only one capture per order is allowed.") and `ORDER_ALREADY_AUTHORIZED`
+    are answered by re-reading the order, as the troubleshooting page prescribes ("No
+    further action is needed. Make a `GET` call on the order ID to get the capture ID"). A
+    PayPal session carries only the order id, so the order read back must be that order,
+    COMPLETED, with the capture or authorization its intent creates; otherwise the
+    rejection stands.
+  - *Refund reason withheld.* `note_to_payer` is "The reason for the refund. Appears in both
+    the payer's transaction history and the emails that the payer receives". A
+    `RefundRequest` carries a reason code and no text of the host's, so nothing is sent
+    rather than a code, or a fixed English phrase the host did not write.
+  - *Venmo.* An order with `payment_source.venmo` reports `wallet: "venmo"`.
+  - **Sandbox checks outstanding (AMBIGUOUS in the docs, 2026-09-24):** whether PayPal counts
+    a PENDING capture against the authorization and frees the amount of a DECLINED one, as
+    the adapter assumes; and whether an order created with `payment_source.paypal` and
+    approved with Venmo reads back with `payment_source.venmo`.
 
 ## Versioning policy (2026-07-07, explicit user decision)
 

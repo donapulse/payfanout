@@ -314,7 +314,11 @@ describe("Adyen native 3-D Secure 2 request", () => {
       expect(fake.lastPaymentBody?.["billingAddress"], JSON.stringify(billingAddress)).toEqual(billingAddress);
     }
     const { street: _street, ...withoutStreet } = BILLING_ADDRESS;
+    const { stateOrProvince: _state, ...usWithoutState } = US_ADDRESS;
     const dropped: Array<Record<string, unknown>> = [
+      // Adyen: stateOrProvince is "Required for the US and Canada".
+      usWithoutState,
+      { ...usWithoutState, postalCode: "H2Y 1C6", city: "Montreal", country: "CA" },
       { city: "Amsterdam", country: "NL" },
       withoutStreet,
       { ...BILLING_ADDRESS, houseNumberOrName: "" },
@@ -494,7 +498,8 @@ describe("Adyen 3-D Secure completion", () => {
       idempotencyKey: "complete-2",
     });
     expect(finished).toMatchObject({ status: "processing", pspPaymentId: "", amount: 2500, currency: "EUR" });
-    expect((finished.raw as { pspReference?: string }).pspReference).toMatch(/^\d{16}$/);
+    // An answer not shown to be the session's keeps only what the browser needs.
+    expect(finished.raw).toEqual({ resultCode: "Authorised" });
     // Correlated by the merchant reference until the AUTHORISATION webhook reports the pspReference.
     expect(finished.id).toBe(created.id);
 
@@ -504,6 +509,8 @@ describe("Adyen 3-D Secure completion", () => {
       { pspReference: "8836100000000042", resultCode: "Authorised", merchantReference: created.id },
       { pspReference: "8836100000000042", resultCode: "Authorised", amount: { value: 2500, currency: "EUR" } },
       { pspReference: "8836100000000042", resultCode: "Authorised", merchantReference: created.id, amount: { value: 2500 } },
+      // A null reads as absent, not as another payment's.
+      { pspReference: "8836100000000042", resultCode: "Authorised", merchantReference: null, amount: null },
     ];
     for (const answer of answers) {
       const info = await answering(answer).completePayment({
@@ -545,7 +552,7 @@ describe("Adyen 3-D Secure completion", () => {
       clientToken: JSON.stringify({ details: fake.detailsFor(actionOf(identified.raw)) }),
       idempotencyKey: "complete-2",
     });
-    expect((challenged.raw as { pspReference?: string }).pspReference).toMatch(/^\d{16}$/);
+    expect(Object.keys(challenged.raw as object).sort()).toEqual(["action", "resultCode"]);
     expect(challenged).toMatchObject({ status: "requires_action", pspPaymentId: "" });
   });
 
@@ -734,6 +741,9 @@ describe("Adyen session inputs 3-D Secure depends on", () => {
       "/checkout/return",
       "https://shop.example//return",
       "https://shop.example/checkout//return",
+      // Adyen: no "//" after the top-level domain, the query and fragment included.
+      "https://shop.example/return?next=https://other.example/done",
+      "https://shop.example/return#//done",
       "https://",
       "https://[bad/return",
       "https://shop.example/check out",

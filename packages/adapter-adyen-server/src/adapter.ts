@@ -648,7 +648,8 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
 
   /**
    * `ownAnswer` is false for an answer not shown to be the session's: its
-   * pspReference is then left out, since nothing ties it to this payment.
+   * pspReference is then left out, since nothing ties it to this payment, and
+   * `raw` keeps only `resultCode` and `action`, the parts the browser needs.
    */
   private toPaymentInfo(
     context: AdyenSessionContextV1,
@@ -676,7 +677,12 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
       paymentMethodType: "card",
       ...(context.metadata ? { metadata: context.metadata } : {}),
       createdAt: UNKNOWN_CREATED_AT,
-      raw: response,
+      raw: ownAnswer
+        ? response
+        : {
+            ...(response.resultCode !== undefined ? { resultCode: response.resultCode } : {}),
+            ...(response.action ? { action: response.action } : {}),
+          },
     };
   }
 
@@ -1143,15 +1149,16 @@ function detailsSubmission(body: unknown): { details?: unknown; paymentData?: st
 /**
  * The payment facts an answer carries, against the signed context: `differs`
  * when a `merchantReference`, `amount.value` or `amount.currency` is present
- * and not the session's; `names` when all three are present and match.
+ * and not the session's; `names` when all three are present and match. A null
+ * value reads as absent, as webhook values do.
  */
 function compareWithSession(
   response: AdyenPaymentResponse,
   context: AdyenSessionContextV1,
 ): { differs: boolean; names: boolean } {
-  const reference = response.merchantReference;
-  const value = response.amount?.value;
-  const currency = response.amount?.currency;
+  const reference = response.merchantReference ?? undefined;
+  const value = response.amount?.value ?? undefined;
+  const currency = response.amount?.currency ?? undefined;
   const differs =
     (reference !== undefined && reference !== context.reference) ||
     (value !== undefined && value !== context.amount) ||
@@ -1272,14 +1279,14 @@ function parseClientToken(clientToken: string): AdyenSubmission {
       { reason: "clientToken is not JSON" },
     );
   }
-  if (!isPlainObject(parsed)) {
+  if (!isJsonObject(parsed)) {
     throw PayFanoutError.invalidRequest("Adyen clientToken payload is not a JSON object", {
       reason: "clientToken is not a JSON object",
     });
   }
   if (parsed["details"] !== undefined) {
     const details = parsed["details"];
-    if (!isPlainObject(details) || parsed["paymentMethod"] !== undefined) {
+    if (!isJsonObject(details) || parsed["paymentMethod"] !== undefined) {
       throw PayFanoutError.invalidRequest(
         "An Adyen clientToken carries either a paymentMethod or the `details` object of an action",
         { reason: "malformed details" },
@@ -1313,7 +1320,7 @@ function parseClientToken(clientToken: string): AdyenSubmission {
 
 /** Rebuilt from CARD_PAYMENT_METHOD_FIELDS; a listed field that is not a string is left out. */
 function assertCardPaymentMethod(value: unknown): Record<string, string> {
-  if (!isPlainObject(value) || value["type"] !== CARD_PAYMENT_METHOD_TYPE) {
+  if (!isJsonObject(value) || value["type"] !== CARD_PAYMENT_METHOD_TYPE) {
     throw PayFanoutError.invalidRequest(
       `The Adyen adapter completes card payments, whose paymentMethod type is "${CARD_PAYMENT_METHOD_TYPE}"`,
       { reason: "paymentMethod is not a card" },
@@ -1338,7 +1345,7 @@ function assertCardPaymentMethod(value: unknown): Record<string, string> {
 
 /** Rebuilt from the documented fields; one missing or of the wrong type drops the object, as the web needs all of them. */
 function sanitizeBrowserInfo(value: unknown): AdyenBrowserInfo | undefined {
-  if (!isPlainObject(value)) return undefined;
+  if (!isJsonObject(value)) return undefined;
   const { acceptHeader, colorDepth, javaEnabled, javaScriptEnabled, language, screenHeight, screenWidth } = value;
   const { timeZoneOffset, userAgent } = value;
   if (
@@ -1392,14 +1399,15 @@ function sanitizeOrigin(value: unknown): string | undefined {
 
 /**
  * Forwarded only when complete and within Adyen's limits: the five required
- * fields, `stateOrProvince` when present, each within its maximum length, an
+ * fields, `stateOrProvince` when present and always for the US and Canada
+ * (Adyen: "Required for the US and Canada"), each within its maximum length, an
  * ISO 3166-1 alpha-2 country, and at most five digits for a US postal code.
- * Anything else drops the whole address rather than failing the payment.
- * Adyen Web fills the fields a country does not use with "N/A", so the Card's
- * own address is always complete.
+ * Anything else drops the whole address rather than failing the payment. Adyen
+ * Web fills the fields a country does not use with "N/A"; its partial address
+ * mode can still produce an address this drops.
  */
 function sanitizeBillingAddress(value: unknown): Record<string, string> | undefined {
-  if (!isPlainObject(value)) return undefined;
+  if (!isJsonObject(value)) return undefined;
   const address: Record<string, string> = {};
   for (const field of BILLING_ADDRESS_REQUIRED_FIELDS) {
     const entry = value[field];
@@ -1415,6 +1423,9 @@ function sanitizeBillingAddress(value: unknown): Record<string, string> | undefi
     ([field, entry]) => entry.length <= (BILLING_ADDRESS_MAX_LENGTHS[field] ?? Number.POSITIVE_INFINITY),
   );
   if (!withinLimits || !/^[A-Z]{2}$/.test(address["country"]!)) return undefined;
+  if ((address["country"] === "US" || address["country"] === "CA") && address["stateOrProvince"] === undefined) {
+    return undefined;
+  }
   if (address["country"] === "US" && !/^\d{1,5}$/.test(address["postalCode"]!)) return undefined;
   return address;
 }
@@ -1425,7 +1436,7 @@ function sanitizeBillingAddress(value: unknown): Record<string, string> | undefi
  * settings, not browser data.
  */
 function sanitizeRiskData(value: unknown): { clientData: string } | undefined {
-  if (!isPlainObject(value)) return undefined;
+  if (!isJsonObject(value)) return undefined;
   const clientData = value["clientData"];
   return isNonEmptyString(clientData) && clientData.length <= RISK_CLIENT_DATA_MAX_LENGTH ? { clientData } : undefined;
 }
@@ -1453,7 +1464,7 @@ function assertReturnUrl(returnUrl: string, field: "returnUrl" | "defaultReturnU
       { field },
     );
   }
-  if ((url.protocol === "https:" || url.protocol === "http:") && url.pathname.includes("//")) {
+  if ((url.protocol === "https:" || url.protocol === "http:") && `${url.pathname}${url.search}${url.hash}`.includes("//")) {
     throw PayFanoutError.invalidRequest(`Adyen refuses a ${field} with "//" after the domain`, { field });
   }
   if (url.href.length > RETURN_URL_MAX_LENGTH) {
@@ -1490,10 +1501,6 @@ function assertShopperEmail(email: string, field: "receiptEmail"): string {
 
 function isShopperEmail(email: string): boolean {
   return email.length <= SHOPPER_EMAIL_MAX_LENGTH && SHOPPER_EMAIL_PATTERN.test(email);
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isNonEmptyString(value: unknown): value is string {

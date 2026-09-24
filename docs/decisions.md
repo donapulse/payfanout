@@ -1599,8 +1599,9 @@ sandbox round-trip before production use, and the setup guide carries that warni
     define. It rebuilds `browserInfo` from its documented fields; forwards `billingAddress`
     only when complete and within the v72 limits (city, country, houseNumberOrName,
     postalCode and street required; postalCode at most 10 characters and five digits in the
-    US, stateOrProvince at most 3, the others at most 3000), which the Card's own address
-    always is, since Adyen Web fills the fields a country does not use with "N/A"; keeps
+    US, stateOrProvince at most 3 and required for the US and Canada, the others at most
+    3000); Adyen Web fills the fields a country does not use with "N/A", though its partial
+    address mode can still produce an address the adapter drops; keeps
     `riskData.clientData` alone (riskData's other fields are merchant risk settings, not
     browser data); refuses a non-`"scheme"` `paymentMethod` or unencrypted card fields
     without echoing the token; and still completes the bare `paymentMethod` of earlier

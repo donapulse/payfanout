@@ -357,9 +357,14 @@ belongs to another request, since an `idempotencyKey` reused across sessions rep
 answer. A `/payments/details` answer finishes whichever payment the details were issued for,
 so one whose `merchantReference` or `amount` differs from the signed session is refused the
 same way. An answer that does not name the session's merchant reference and amount (Adyen's
-own example answer names neither) reads `processing` and carries no `pspPaymentId`; the
-`AUTHORISATION` webhook (§8), whose `merchantReference` is one of the signed values, supplies
-the reference: `encodeAdyenPaymentRef(event.pspPaymentId, event.amount, event.currency)`.
+own example answer names neither) reads `processing` and carries no `pspPaymentId`, and its
+`raw` keeps only `resultCode` and `action`; the `AUTHORISATION` webhook (§8), whose
+`merchantReference` is one of the signed values, supplies the reference: match
+`event.raw.merchantReference` to `PaymentInfo.id`, then store
+`encodeAdyenPaymentRef(event.pspPaymentId, event.amount, event.currency)`. Treat that
+`processing` as pending, not failed: wait for the webhook before offering the shopper another
+attempt, since a new attempt is a new payment, and never overwrite a stored `pspPaymentId` with
+the empty one.
 
 One challenge runs at a time per mounted field set: calling `handleAction` again while one is
 outstanding fails with `invalid_request` rather than abandoning the first caller's promise.
@@ -368,8 +373,8 @@ Adyen Web's 3-D Secure 2 elements report timeouts through `onAdditionalDetails` 
 pending promise as `failed` with `authentication_required` (or a retryable `psp_unavailable`
 when it reads as a load or network failure), and unmounting the fields settles it as `failed`
 too. Once `handleAction` has run, the card fields are gone: `confirm()` on that handle fails
-with `invalid_request`, so remount `<PaymentFields>` for another attempt, with a fresh
-`idempotencyKey` (§7).
+with `invalid_request`, so another attempt remounts `<PaymentFields>` on a new session with a
+new `idempotencyKey` (§7).
 
 ### Redirect fallback
 

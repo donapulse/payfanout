@@ -266,12 +266,18 @@ describe("idempotency across one company account", () => {
     expect(fake.replays).toBe(0);
     expect(await complete(lastStep)).toEqual(result);
     expect(fake.replays).toBe(1);
+    // With paymentData the same step is a request of its own again, not a replay:
+    // the fake has finished that payment, so it is refused.
+    await expect(complete(JSON.stringify({ ...JSON.parse(lastStep), paymentData: "Ab02" }))).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+    expect(fake.replays).toBe(1);
 
     const detailsKeys = fake.requests
       .filter((request) => request.path.endsWith("/payments/details"))
       .map((request) => request.idempotencyKey);
-    expect(detailsKeys).toHaveLength(3);
-    expect(new Set(detailsKeys).size).toBe(2);
+    expect(detailsKeys).toHaveLength(4);
+    expect(new Set(detailsKeys).size).toBe(3);
   });
 });
 

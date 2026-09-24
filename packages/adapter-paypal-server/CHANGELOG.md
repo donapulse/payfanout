@@ -1,5 +1,14 @@
 # @payfanout/adapter-paypal-server
 
+## 2.0.2
+
+### Patch Changes
+
+- 3c42f70: `capturePayment` without an amount now captures only the uncaptured remainder of a PayPal authorization; earlier versions asked PayPal for the full authorized amount again, which PayPal's overage limit could accept after a partial capture, so review manual-capture payments captured that way. A capture that reaches the remainder, with or without an amount, now closes the authorization and later captures against it are refused; capturing the rest of a fully captured payment returns the payment without sending a capture to PayPal, capturing the rest of a voided or denied authorization rejects with `invalid_request`, and capturing and cancelling accept the capture id an earlier capture returned. `amountRefunded` leaves out failed and cancelled refunds, a completion repeated under a new idempotency key returns the existing capture or authorization instead of failing, refund reason codes are no longer sent to the payer as `note_to_payer`, Venmo-funded orders report `paymentMethodDetails.wallet: "venmo"`, and a payment read from a capture whose order has aged out leaves `paymentMethodDetails` out instead of reporting the PayPal wallet.
+- 21ab46d: PayPal declines that are not about a single funding source (`PAYMENT_DENIED`, `PAYER_CANNOT_PAY`, `PAYER_ACCOUNT_RESTRICTED`, `PAYER_ACCOUNT_LOCKED_OR_CLOSED`, `MAX_NUMBER_OF_PAYMENT_ATTEMPTS_EXCEEDED`) now reject with `card_declined` and a message asking for another payment method instead of `invalid_request`; `TRANSACTION_BLOCKED_BY_PAYEE` maps to `fraud_suspected` and `TRANSACTION_RECEIVING_LIMIT_EXCEEDED` to `processing_error`. An error named `INTERNAL_SERVER_ERROR`, PayPal's documented name for its HTTP 500, is a retryable `psp_unavailable` whatever status carries it.
+- c0a97b3: The PayPal server adapter no longer offers RUB, which PayPal's currency codes reference no longer lists. `supportedCurrencies` leaves it out, so `PaymentRouter` skips PayPal for a RUB payment and `PaymentService` refuses a RUB session for PayPal with `unsupported_operation`; the adapter itself refuses a new RUB session, or moving an order to RUB, with `invalid_request` before creating or changing the order. Payments made in RUB earlier can still be retrieved, captured and refunded.
+- 642eca0: `CHECKOUT.PAYMENT-APPROVAL.REVERSED` webhook events now carry the order id as `pspPaymentId`, read from `resource.order_id` where PayPal sends it, and `verifyWebhookSignature` answers `false` without calling PayPal for a body that is not exactly one JSON object. The onboarding descriptor's CSP lists `*.paypalobjects.com` and `*.venmo.com` for scripts, frames and connections, as PayPal recommends.
+
 ## 2.0.1
 
 ### Patch Changes

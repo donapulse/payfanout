@@ -144,9 +144,18 @@ describe("GoCardless status mapping", () => {
     fake.setBillingRequestStatus(fulfilled, "fulfilled");
     expect((await adapter.retrievePayment(fulfilled)).status).toBe("processing");
 
-    const fulfilling = await make();
-    fake.setBillingRequestStatus(fulfilling, "fulfilling");
-    expect((await adapter.retrievePayment(fulfilling)).status).toBe("requires_action");
+    // Ready to fulfil means every action required to fulfil, bank
+    // authorisation on Pay by Bank, is done. Reporting requires_action here
+    // would invite the payer to authorise the same payment again.
+    for (const status of ["ready_to_fulfil", "fulfilling"]) {
+      const id = await make();
+      fake.setBillingRequestStatus(id, status);
+      expect((await adapter.retrievePayment(id)).status, status).toBe("processing");
+    }
+
+    const undocumented = await make();
+    fake.setBillingRequestStatus(undocumented, "something_new");
+    expect((await adapter.retrievePayment(undocumented)).status).toBe("processing");
   });
 
   it("maps schemes onto unified payment method types", async () => {
@@ -159,8 +168,13 @@ describe("GoCardless status mapping", () => {
       ["sepa_credit_transfer", "bank_redirect_generic"],
       ["sepa_instant_credit_transfer", "bank_redirect_generic"],
       [undefined, "bank_redirect_generic"],
+      // Canadian Pre-Authorized Debit has its own unified type.
+      ["pad", "pad"],
       ["pay_to", "other"],
       ["becs", "other"],
+      ["becs_nz", "other"],
+      ["autogiro", "other"],
+      ["betalingsservice", "other"],
     ];
     for (const [scheme, expected] of cases) {
       const payment = fake.seedPayment({ scheme });
@@ -390,7 +404,7 @@ describe("GoCardless webhook parsing (batched deliveries)", () => {
   });
 
   it("maps every documented action family onto the unified vocabulary", () => {
-    const cases: Array<[string, string, UnifiedWebhookEventType]> = [
+    const cases: Array<[string, string, UnifiedWebhookEventType, Record<string, string>?]> = [
       ["payments", "created", "payment.processing"],
       ["payments", "submitted", "payment.processing"],
       ["payments", "customer_approval_granted", "payment.processing"],
@@ -399,7 +413,8 @@ describe("GoCardless webhook parsing (batched deliveries)", () => {
       ["payments", "paid_out", "unknown"],
       ["payments", "failed", "payment.failed"],
       ["payments", "customer_approval_denied", "payment.failed"],
-      ["payments", "late_failure_settled", "payment.failed"],
+      // The failure itself arrived as payments/failed; this is the payout debit.
+      ["payments", "late_failure_settled", "unknown"],
       ["payments", "cancelled", "payment.canceled"],
       ["payments", "charged_back", "payment.chargeback"],
       ["payments", "chargeback_cancelled", "payment.chargeback_won"],
@@ -412,19 +427,29 @@ describe("GoCardless webhook parsing (batched deliveries)", () => {
       ["refunds", "bounced", "payment.refund_failed"],
       ["refunds", "funds_returned", "payment.refund_failed"],
       ["mandates", "cancelled", "unknown"],
-      // fulfilled = hosted flow completed, payment exists — money is underway.
-      ["billing_requests", "fulfilled", "payment.processing"],
+      // Pay by Bank: the hosted flow completed and the event names the new payment.
+      [
+        "billing_requests",
+        "fulfilled",
+        "payment.processing",
+        { billing_request: "BRQ1", payment_request_payment: "PM1" },
+      ],
+      // A mandate-only billing request fulfils into a mandate, not a payment.
+      ["billing_requests", "fulfilled", "unknown", { billing_request: "BRQ1", mandate_request_mandate: "MD1" }],
       ["billing_requests", "created", "unknown"],
-      ["billing_requests", "cancelled", "unknown"],
+      ["billing_requests", "cancelled", "payment.canceled"],
+      // The payer can return to the flow and authorise again.
+      ["billing_requests", "bank_authorisation_denied", "unknown"],
+      ["billing_requests", "failed", "unknown"],
       ["subscriptions", "created", "unknown"],
     ];
-    for (const [resourceType, action, expected] of cases) {
+    for (const [resourceType, action, expected, links = {}] of cases) {
       const [event] = parseGoCardlessWebhookEvents(
         JSON.stringify({
-          events: [{ id: "EV1", created_at: "2026-07-07T10:00:00.000Z", resource_type: resourceType, action, links: {} }],
+          events: [{ id: "EV1", created_at: "2026-07-07T10:00:00.000Z", resource_type: resourceType, action, links }],
         }),
       );
-      expect(event!.type, `${resourceType}/${action}`).toBe(expected);
+      expect(event!.type, `${resourceType}/${action} ${JSON.stringify(links)}`).toBe(expected);
     }
   });
 
@@ -455,7 +480,7 @@ describe("GoCardless webhook parsing (batched deliveries)", () => {
     expect(confirmed!.refundId).toBeUndefined();
   });
 
-  it("takes pspPaymentId from links.payment, else links.payment_request_payment", () => {
+  it("takes pspPaymentId from links.payment, then links.payment_request_payment, then the billing request", () => {
     const [fulfilled] = parseGoCardlessWebhookEvents(
       JSON.stringify({
         events: [
@@ -469,10 +494,38 @@ describe("GoCardless webhook parsing (batched deliveries)", () => {
       }),
     );
     expect(fulfilled!.pspPaymentId).toBe("PM9");
+    // No payment yet: the billing request id, which retrievePayment accepts.
+    const [denied] = parseGoCardlessWebhookEvents(
+      JSON.stringify({
+        events: [
+          {
+            id: "EV3",
+            resource_type: "billing_requests",
+            action: "bank_authorisation_denied",
+            links: { billing_request: "BRQ7", bank_authorisation: "BAU7" },
+          },
+        ],
+      }),
+    );
+    expect(denied).toMatchObject({ type: "unknown", pspPaymentId: "BRQ7" });
     const [bare] = parseGoCardlessWebhookEvents(
       JSON.stringify({ events: [{ id: "EV2", resource_type: "mandates", action: "created" }] }),
     );
     expect(bare!.pspPaymentId).toBeUndefined();
+    // The billing request fallback belongs to billing request events only.
+    const [otherResource] = parseGoCardlessWebhookEvents(
+      JSON.stringify({
+        events: [
+          {
+            id: "EV4",
+            resource_type: "mandates",
+            action: "created",
+            links: { mandate: "MD8", billing_request: "BRQ8" },
+          },
+        ],
+      }),
+    );
+    expect(otherResource!.pspPaymentId).toBeUndefined();
   });
 
   it("hashes a stable fallback id and normalizes missing timestamps", () => {
@@ -484,6 +537,11 @@ describe("GoCardless webhook parsing (batched deliveries)", () => {
     expect(first!.id).toMatch(/^gocardless_[0-9a-f]{8}$/);
     expect(second!.id).toBe(first!.id);
     expect(first!.occurredAt).toBe("1970-01-01T00:00:00.000Z");
+
+    // Neither resource type nor action: surfaced as unknown, never dropped.
+    const [bare] = parseGoCardlessWebhookEvents(JSON.stringify({ events: [{ id: "EV_BARE" }] }));
+    expect(bare).toMatchObject({ id: "EV_BARE", type: "unknown" });
+    expect(bare!.pspPaymentId).toBeUndefined();
   });
 
   it("throws invalid_request on unparseable payloads", () => {
@@ -493,6 +551,141 @@ describe("GoCardless webhook parsing (batched deliveries)", () => {
     } catch (err) {
       expect(isPayFanoutError(err) && err.code === "invalid_request").toBe(true);
     }
+  });
+});
+
+describe("GoCardless billing request and late-failure events", () => {
+  // Shapes follow GoCardless's billing request events guide and payment
+  // events reference; the ids are local test values.
+  const fulfilledPayByBank = {
+    id: "EV_BRQ_FULFILLED_PBB",
+    created_at: "2026-09-24T10:00:00.000Z",
+    resource_type: "billing_requests",
+    action: "fulfilled",
+    links: {
+      customer: "CU_TEST_1",
+      customer_bank_account: "BA_TEST_1",
+      payment_request_payment: "PM_TEST_1",
+      billing_request: "BRQ_TEST_1",
+    },
+    details: {
+      origin: "gocardless",
+      cause: "billing_request_fulfilled",
+      description: "This billing request has been fulfilled, and the resources have been created.",
+    },
+    metadata: {},
+  };
+  const fulfilledMandateOnly = {
+    ...fulfilledPayByBank,
+    id: "EV_BRQ_FULFILLED_MANDATE",
+    links: {
+      customer: "CU_TEST_2",
+      customer_bank_account: "BA_TEST_2",
+      mandate_request: "MRQ_TEST_2",
+      mandate_request_mandate: "MD_TEST_2",
+      billing_request: "BRQ_TEST_2",
+    },
+  };
+
+  it("reports a Pay by Bank fulfilment as processing and a mandate-only fulfilment as unknown", async () => {
+    const { adapter } = makePair();
+    const payByBank = await adapter.parseWebhookEvent(JSON.stringify({ events: [fulfilledPayByBank] }));
+    expect(payByBank).toMatchObject({
+      id: "EV_BRQ_FULFILLED_PBB",
+      type: "payment.processing",
+      pspPaymentId: "PM_TEST_1",
+    });
+
+    const mandateOnly = await adapter.parseWebhookEvent(JSON.stringify({ events: [fulfilledMandateOnly] }));
+    // Surfaced with its billing request, but no payment exists to call processing.
+    expect(mandateOnly).toMatchObject({
+      id: "EV_BRQ_FULFILLED_MANDATE",
+      type: "unknown",
+      pspPaymentId: "BRQ_TEST_2",
+    });
+    expect(mandateOnly.raw).toEqual(fulfilledMandateOnly);
+  });
+
+  it("reports a cancelled billing request as payment.canceled, agreeing with retrievePayment", async () => {
+    const [cancelled] = parseGoCardlessWebhookEvents(
+      JSON.stringify({
+        events: [
+          {
+            id: "EV_BRQ_CANCELLED",
+            created_at: "2026-09-24T10:05:00.000Z",
+            resource_type: "billing_requests",
+            action: "cancelled",
+            links: { billing_request: "BRQ_TEST_3" },
+            details: {
+              origin: "api",
+              cause: "billing_request_cancelled",
+              description: "This billing request has been cancelled, none of the resources have been created.",
+            },
+            metadata: {},
+          },
+        ],
+      }),
+    );
+    expect(cancelled).toMatchObject({ type: "payment.canceled", pspPaymentId: "BRQ_TEST_3" });
+
+    // A session the adapter cancels: the polled event names the session id,
+    // and reading that id back reports the same outcome.
+    const { adapter } = makePair();
+    const session = await adapter.createPaymentSession({
+      amount: 1000,
+      currency: "GBP",
+      returnUrl: RETURN_URL,
+      idempotencyKey: "k-brq-cancel",
+    });
+    await adapter.cancelPayment(session.pspSessionId, "k-brq-cancel-action");
+    const { events } = await adapter.fetchEvents();
+    const canceled = events.filter((event) => event.type === "payment.canceled");
+    expect(canceled.map((event) => event.pspPaymentId)).toEqual([session.pspSessionId]);
+    expect((await adapter.retrievePayment(session.pspSessionId)).status).toBe("canceled");
+  });
+
+  it("reports a late failure once, on payments/failed, and not again on the payout debit", () => {
+    const paymentEvent = (id: string, minute: number, action: string, details: Record<string, unknown>) => ({
+      id,
+      created_at: `2026-09-24T10:0${minute}:00.000Z`,
+      resource_type: "payments",
+      action,
+      links: { payment: "PM_LATE" },
+      details,
+      metadata: {},
+    });
+    const events = parseGoCardlessWebhookEvents(
+      JSON.stringify({
+        events: [
+          paymentEvent("EV_LATE_1", 0, "confirmed", { origin: "gocardless", cause: "payment_confirmed" }),
+          paymentEvent("EV_LATE_2", 1, "paid_out", { origin: "gocardless", cause: "payment_paid_out" }),
+          // Banks can report a failure after confirmed; the payment moves to failed.
+          paymentEvent("EV_LATE_3", 2, "failed", {
+            origin: "bank",
+            cause: "refer_to_payer",
+            scheme: "bacs",
+            reason_code: "ARUDD-0",
+            will_attempt_retry: false,
+          }),
+          paymentEvent("EV_LATE_4", 3, "late_failure_settled", {
+            origin: "gocardless",
+            cause: "late_failure_settled",
+            description: "This late failed payment has been settled against a payout.",
+          }),
+        ],
+      }),
+    );
+    expect(events.map((event) => event.type)).toEqual([
+      "payment.succeeded",
+      "unknown",
+      "payment.failed",
+      "unknown",
+    ]);
+    expect(events.filter((event) => event.type === "payment.failed").map((event) => event.id)).toEqual([
+      "EV_LATE_3",
+    ]);
+    // Still delivered, with its payment, for hosts that reconcile payouts.
+    expect(events[3]).toMatchObject({ id: "EV_LATE_4", pspPaymentId: "PM_LATE" });
   });
 });
 

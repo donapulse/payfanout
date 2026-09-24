@@ -219,12 +219,53 @@ choices they forced:
   `parseWebhookEvent` throws on batched deliveries instead of dropping events;
   `parseGoCardlessWebhookEvents` (verify once, fan out per event) is the documented
   ingress. `billing_requests`/`fulfilled` maps to `payment.processing`, payment id
-  from `links.payment_request_payment`.
+  from `links.payment_request_payment` (corrected 2026-09-24: only when the event names
+  that payment; see the lifecycle entry below).
 - `supportsSavedPaymentMethods: false` in v1: mandates are genuinely reusable
   charging handles, but async bank rails cannot meet the vault contract's
   instantly-succeeded off-session charge; mandates-as-vault is future work.
 - `listRefunds` scopes with the server-side `?payment=` filter on GET /refunds
   (sandbox-verified: 200 + empty list for a refund-less payment).
+- **Doc-verified 2026-09-24: billing request and payment lifecycle.** Checked against the
+  OpenAPI spec for the pinned 2015-07-06 version
+  (docs.gocardless.com/openapi-schema-public.json), the billing request and payment event
+  references, the billing request events guide, the Drop-in and Success+ guides, and the
+  scenario simulators page.
+  - *Billing request status.* The spec defines `ready_to_fulfil` as "the billing request is
+    ready to fulfil" and `fulfilling` as "the billing request is currently undergoing
+    fulfilment", and a billing request's actions are those "required to fulfil the billing
+    request". Both states come after the payer's part, so `retrievePayment(BRQ…)` reports
+    them `processing`, as it does `fulfilled`; only `pending` ("the billing request is
+    pending and can be used") stays `requires_action`. They were `requires_action`, which
+    invited a host to send the payer to authorise again. An undocumented status reads
+    `processing` for the same reason.
+  - *`billing_requests`/`fulfilled`.* The event's `links.payment_request_payment` is "the
+    ID of the payment which has been created for Pay by Bank", while the Drop-in guide's
+    mandate flow says of the same event "Record the mandate_id from
+    links.mandate_request_mandate". A fulfilment maps to `payment.processing` only when it
+    names a payment; a mandate-only one maps to `unknown`.
+  - *`billing_requests`/`cancelled`* ("This billing request has been cancelled, none of the
+    resources have been created") maps to `payment.canceled`, matching `retrievePayment`.
+    A billing request event that names no payment carries `links.billing_request` as
+    `pspPaymentId`. The event does not say whether the request had a `payment_request`, so
+    a cancelled mandate-only request reads the same way; a host finds no session under a
+    `BRQ…` id it did not create. `bank_authorisation_denied` stays `unknown`: "Payers can
+    always return to the flow and create a new bank authorisation".
+  - *Late failures.* The spec's payment `failed` status notes that "payments can fail after
+    being confirmed if the failure message is sent late by the banks", and the simulators
+    list `Late` as `submitted` → `confirmed` → `failed`. `late_failure_settled` is "The
+    payment was a late failure which had already been paid out, and has been debited from
+    a payout", the counterpart of `chargeback_settled`, so it maps to `unknown` rather than
+    a second `payment.failed`. The Success+ guide asks integrators to act on
+    `late_failure_settled` because such a payment may be retried; the event is still
+    delivered, and a retry arrives as `resubmission_requested` → `payment.processing`.
+  - *Scheme `pad`*, listed in the spec's `payments.scheme`, maps to the unified `pad` type
+    chosen for it on 2026-07-15 instead of `other`.
+  - **AMBIGUOUS:** whether the payer can land on `redirect_uri` while the billing request
+    is still `fulfilling` (it reads `processing` either way), and which status a billing
+    request holds after a `billing_requests`/`failed` event, since the status list names
+    none. Sandbox checks: read the billing request in the return handler during a browser
+    run, and record the status when a `failed` event occurs.
 
 ## PayPal adapter (2026-07-07)
 

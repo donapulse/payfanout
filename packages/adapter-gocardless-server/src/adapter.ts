@@ -1019,16 +1019,22 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
   }
 }
 
+/**
+ * Only `pending` still waits on the payer: a billing request is ready to
+ * fulfil once every action required to fulfil it is complete (bank
+ * authorisation, on Pay by Bank), so ready_to_fulfil, fulfilling and a
+ * fulfilled request whose payment link has not landed are all money underway.
+ * Undocumented states read as processing too, since requires_action would
+ * invite a second authorisation of the same payment.
+ */
 function mapBillingRequestStatus(status: string | undefined): UnifiedPaymentStatus {
   switch (status) {
+    case "pending":
+      return "requires_action";
     case "cancelled":
       return "canceled";
-    // Fulfilled but the payment link has not landed yet — money is underway.
-    case "fulfilled":
-      return "processing";
-    // pending / ready_to_fulfil / fulfilling: the payer has not finished authorising.
     default:
-      return "requires_action";
+      return "processing";
   }
 }
 
@@ -1126,8 +1132,9 @@ function mapGoCardlessRefundStatus(status: string | undefined): RefundResult["st
 /**
  * Scheme -> unified method type. Payment requests without an explicit scheme
  * (the payer picks at the bank) still authorise via redirect, hence the
- * bank_redirect_generic default; unmapped debit schemes (pad, becs, becs_nz,
- * autogiro, betalingsservice, pay_to) stay "other" rather than mislabeled.
+ * bank_redirect_generic default; debit schemes with no unified type (becs,
+ * becs_nz, autogiro, betalingsservice, pay_to) stay "other" rather than
+ * mislabeled.
  */
 function mapSchemeToMethodType(scheme: string | undefined): UnifiedPaymentMethodType {
   switch ((scheme ?? "").toLowerCase()) {
@@ -1137,6 +1144,8 @@ function mapSchemeToMethodType(scheme: string | undefined): UnifiedPaymentMethod
       return "sepa_debit";
     case "ach":
       return "ach";
+    case "pad":
+      return "pad";
     case "faster_payments":
     case "sepa_credit_transfer":
     case "sepa_instant_credit_transfer":

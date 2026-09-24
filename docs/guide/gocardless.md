@@ -150,6 +150,12 @@ Follow up server-side — `retrievePayment(billing_request_id)` maps the current
 wait for the `payment.succeeded` webhook.
 :::
 
+Until the billing request has created its payment, `retrievePayment(billing_request_id)`
+reports the billing request itself: `requires_action` while it is `pending`, `processing`
+once it is `ready_to_fulfil`, `fulfilling` or `fulfilled` (every action GoCardless requires
+is done and the payment is being created, so never send the payer back to authorise), and
+`canceled` once it is `cancelled`. Once the payment exists, it reports the payment.
+
 ## 7. Register the webhook endpoint — deliveries are BATCHED
 
 Create the endpoint in Dashboard → Developers → Webhooks, point it at
@@ -194,12 +200,24 @@ batch or across deliveries. For missed-webhook recovery the adapter also support
 `fetchEvents` (`supportsEventPolling: true`).
 
 Notable mappings: `payments.confirmed` → `payment.succeeded` (money collected;
-`paid_out` is just the merchant payout and maps to `unknown`), `late_failure_settled` →
-`payment.failed` **after** a success (late failures are real on debit rails),
+`paid_out` is just the merchant payout and maps to `unknown`), `payments.failed` →
+`payment.failed` **even after a success**: banks can report a failure late, after
+`confirmed` or `paid_out`. The later `late_failure_settled` only records the failed
+amount being debited from a payout, so it maps to `unknown` and a late failure is one
+`payment.failed`, not two. A late failure is not always final: with Success+ GoCardless
+may retry the payment, which arrives as `resubmission_requested` → `payment.processing`.
 `charged_back` → `payment.chargeback`, `chargeback_cancelled` →
-`payment.chargeback_won`, `billing_requests.fulfilled` → `payment.processing` (the
-payer completed the hosted flow; the event's `links.payment_request_payment` is the new
-payment id).
+`payment.chargeback_won`.
+
+Billing request events: `billing_requests.fulfilled` → `payment.processing` when the
+event's `links.payment_request_payment` names the payment the billing request created
+(the payer completed the hosted flow); a fulfilment naming no payment, such as a
+mandate-only billing request, maps to `unknown`. `billing_requests.cancelled` →
+`payment.canceled`, as `retrievePayment` reports that billing request. Every other billing
+request action maps to `unknown`, `bank_authorisation_denied` included: the payer can
+return to the flow and authorise again. A billing request event that names no payment
+carries the billing request id (`BRQ…`) as `pspPaymentId`, which `retrievePayment`
+accepts.
 
 ::: warning A bank-debit chargeback is effectively final
 The direct debit guarantee reclaims the funds at `charged_back` itself, and GoCardless

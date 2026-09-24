@@ -267,7 +267,7 @@ choices they forced:
   amounts "must be a positive number"), a session `id` over 255 characters (the Orders v2
   `custom_id` limit), and a `brandName` over 127 characters or with a line break
   (`brand_name`, pattern `^.*$`). Lengths count characters, never UTF-16 units or bytes,
-  so the adapter never refuses what PayPal accepts under any unit; an empty `id` or
+  so the adapter never refuses what PayPal accepts under either of those; an empty `id` or
   `brandName` is still omitted rather than refused. A `fetchEvents` cursor must start with
   the events-list path and resolve to exactly that list, a trailing slash allowed, and the
   resolved path is what is requested. **AMBIGUOUS:** the shape of the list's `next` link

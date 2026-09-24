@@ -83,7 +83,10 @@ describe("PayPal local limits", () => {
     const tooLong = /brandName must be at most 127 characters on one line/;
     expect(() => makePair({ brandName: "B".repeat(128) })).toThrowError(tooLong);
     expect(() => makePair({ brandName: ASTRAL.repeat(128) })).toThrowError(tooLong);
-    expect(() => makePair({ brandName: `Line one${String.fromCharCode(10)}Line two` })).toThrowError(tooLong);
+    // LF, CR, LINE SEPARATOR and PARAGRAPH SEPARATOR: what `.` never matches.
+    for (const codePoint of [10, 13, 0x2028, 0x2029]) {
+      expect(() => makePair({ brandName: `Line one${String.fromCharCode(codePoint)}Line two` })).toThrowError(tooLong);
+    }
     expect(() => makePair({ brandName: "B".repeat(127) })).not.toThrow();
     expect(() => makePair({ brandName: ASTRAL.repeat(127) })).not.toThrow();
 

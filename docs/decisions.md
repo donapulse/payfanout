@@ -1403,7 +1403,11 @@ sandbox round-trip before production use, and the setup guide carries that warni
   webhook structure page: before anything is signed, each item's signed values are checked
   against the types that schema gives them. `pspReference`, `merchantAccountCode`,
   `amount.currency`, `eventCode` and `success` must be present as strings,
-  `originalReference` and `merchantReference` must be strings when present, and
+  `originalReference` and `merchantReference` must be strings when present (a `null` in
+  either reads as absent, added 2026-09-23: Adyen's Java `HMACValidator` documents "If any
+  value is null, it is represented as an empty string in the final payload" and its Node
+  validator's `join` does the same, so absent, `null` and `""` sign alike; `null` in a
+  required value stays refused), and
   `amount.value` a safe integer ("The numeric value of the amount, in minor units",
   `integer`/`int64`); anything else is refused as `malformed_payload`. The HMAC
   authenticates the joined strings, not the JSON types carrying them: a boolean `true` and
@@ -1487,8 +1491,9 @@ sandbox round-trip before production use, and the setup guide carries that warni
   while reporting none would detach the dispute's outcome from its payment. Sandbox check:
   which reference those four codes carry without the setting, which the setup guide asks
   hosts to enable. Any other event without `originalReference` names no payment, since its
-  own reference is a modification's, a dispute's or, on `REPORT_AVAILABLE`, a file name. `REFUND_NOT_CLEARED` and `SETTLED_REVERSED`, added to the Webhooks
-  contract on 2026-09-10, stay `unknown` as payout-batch adjustments. `CAPTURE_FAILED` stays
+  own reference is a modification's, a dispute's or, on `REPORT_AVAILABLE`, a file name.
+  `REFUND_NOT_CLEARED` and `SETTLED_REVERSED`, added to the Webhooks contract on
+  2026-09-10, stay `unknown` as payout-batch adjustments. `CAPTURE_FAILED` stays
   `payment.failed` even though "Technical failures are automatically re-captured by Adyen
   within 10 business days"; the setup guide flags it as not always final.
 - **`PaymentInfo.createdAt` falls back to epoch** — Checkout responses carry no creation

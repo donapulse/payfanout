@@ -69,8 +69,9 @@ until it sees success.
 - **Ordering is not guaranteed** by any PSP, treat events as unordered facts. When sequence
   matters, reconcile with `retrievePayment` where the adapter declares
   `supportsPaymentRetrieval`; a push-only PSP such as Adyen has no payment read, so apply its
-  events in `occurredAt` order, as step 8 of the
-  [Adyen guide](/guide/adyen#_8-register-the-webhook-endpoint) describes.
+  events in `occurredAt` order, except that a final dispute stage is never overridden by a
+  non-final one whatever the dates, as the Adyen guide's
+  [duplicates and ordering](/guide/adyen#duplicates-and-ordering) section describes.
 - **Batched deliveries (GoCardless):** the unified handlers process one event per
   delivery — a batched GoCardless webhook (up to 250 events under one signature) makes
   `parseWebhookEvent` throw instead of dropping events. Route GoCardless deliveries to

@@ -254,6 +254,25 @@ describe("Adyen webhook outcomes", () => {
     }
   });
 
+  it("keeps an event's own pspReference as the payment's on exactly seven codes", async () => {
+    const ownReference = new Set([
+      "AUTHORISATION",
+      "EXPIRE",
+      "OFFER_CLOSED",
+      "CHARGEBACK_REVERSED",
+      "SECOND_CHARGEBACK",
+      "PREARBITRATION_WON",
+      "PREARBITRATION_LOST",
+    ]);
+    const codes = [...(adyenOnboarding.webhook.events ?? []), "REPORT_AVAILABLE", "PREARBITRATION_OPEN"];
+    for (const code of ownReference) expect(codes, code).toContain(code);
+    for (const eventCode of codes) {
+      const { originalReference: _originalReference, ...orphan } = disputeEvent(eventCode);
+      const event = await parse(signed(orphan));
+      expect(event.pspPaymentId, eventCode).toBe(ownReference.has(eventCode) ? "9915555555555555" : undefined);
+    }
+  });
+
   it("reports a lost arbitration and the second chargeback that follows it as two losses", async () => {
     // Adyen follows SCHEME_ARBITRATION_LOST with a second chargeback that adds
     // the arbitration fees to the dispute amount.

@@ -33,8 +33,16 @@ export interface AdyenNotificationItem {
   eventCode?: string;
   eventDate?: string;
   merchantAccountCode?: string;
+  /**
+   * The payment's merchant reference. Adyen's schema types it as a string; a
+   * verified delivery may still carry `null`, which reads as absent, as Adyen's
+   * own validators sign it.
+   */
   merchantReference?: string;
-  /** On modification and dispute events: the ORIGINAL payment's reference. */
+  /**
+   * On modification and dispute events: the ORIGINAL payment's reference. A
+   * verified delivery may carry `null` here too; it reads as absent.
+   */
   originalReference?: string;
   paymentMethod?: string;
   pspReference?: string;
@@ -221,8 +229,10 @@ export function buildAdyenHmacPayload(item: AdyenNotificationItem): string | und
  *
  * Each item's signed values are checked against the types Adyen's webhook
  * schema documents before anything is signed: the required ones present, every
- * one a string except `amount.value`, a safe integer. A value of another type is
- * refused as `malformed_payload` rather than coerced into the joined string.
+ * one a string except `amount.value`, a safe integer. `null` in the two optional
+ * values (`originalReference`, `merchantReference`) reads as absent, as Adyen's
+ * own validators sign it. A value of another type is refused as
+ * `malformed_payload` rather than coerced into the joined string.
  *
  * A re-encoded body still verifies, and that is correct rather than a gap: the
  * signature covers values, not bytes, which is what

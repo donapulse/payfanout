@@ -59,7 +59,7 @@ Sandbox and live are **separate credential sets** and **separate hosts**; the ad
 the host from `environment` (`sandbox → checkout-test.adyen.com`,
 `live → {liveUrlPrefix}-checkout-live.adyenpayments.com`).
 
-Your own payment ids matter as much as the credentials: the `id` you pass to
+Your own payment ids have one rule too: the `id` you pass to
 `createPaymentSession` becomes Adyen's `merchantReference`, one of the values every webhook
 signature covers. Adyen joins those values unescaped and the webhook verifier accepts a `:` in
 `merchantReference`, but the adapter still keeps the references it creates free of `:` and

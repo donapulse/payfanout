@@ -179,8 +179,12 @@ Idempotency keys are mandatory on every mutating call, so transient failures are
 replay. Three layers act on that:
 
 - the **Stripe SDK** retries network failures itself (`maxNetworkRetries`, default 2);
-- the **Paysafe transport** retries timeouts/5xx/429 with backoff (`maxNetworkRetries`,
-  default 2, business errors like declines or `3406` are never replayed);
+- the **Paysafe transport** retries reads on timeouts/5xx/429 with backoff
+  (`maxNetworkRetries`, default 2). Paysafe rejects a repeated `merchantRefNum` instead
+  of replaying the original, so a write is re-sent only after a 429 or once a lookup by
+  its `merchantRefNum` shows it never landed
+  ([replays and lost answers](/guide/paysafe#replays-and-lost-answers)). Business errors
+  like declines or `3406` are never replayed;
 - `withRetry(fn, policy)` from `@payfanout/core` wraps any call with exponential backoff +
   jitter for `PayFanoutError.retryable` rejections.
 

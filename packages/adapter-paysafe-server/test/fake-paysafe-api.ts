@@ -6,6 +6,8 @@ import type {
   PaysafeSubscriptionLike,
 } from "../src/index.js";
 
+type PaysafeSettlementLike = NonNullable<PaysafePaymentLike["settlements"]>[number];
+
 /**
  * A MULTI_USE token the fake pre-vaults at construction, for fixtures
  * (conformance createInput) that cannot run a customer/save round-trip of
@@ -13,31 +15,80 @@ import type {
  */
 export const SEEDED_MULTI_USE_TOKEN = "MUseededfixturetok";
 
+/** Which requests a test lever applies to. */
+export interface RequestMatcher {
+  method: "GET" | "POST" | "PATCH" | "DELETE";
+  /** The exact pathname, or a pattern tested against it. */
+  path: string | RegExp;
+}
+
 /**
- * In-memory Paysafe Payments API. Dedupes on merchantRefNum exactly like the
- * real API, so the conformance idempotency test proves the adapter forwards
- * idempotency keys as merchantRefNum.
+ * How a processed request's answer goes missing: the connection drops
+ * ("network"), no answer ever comes ("hang", until the caller aborts), or a
+ * 5xx replaces it.
+ */
+export type LostAnswer = "network" | "hang" | 500 | 502 | 503 | 504;
+
+/** A refusal before any processing: rate limited, or a 5xx that never reached the transaction. */
+export type RefusalStatus = 429 | 500 | 502 | 503 | 504;
+
+export interface RecordedRequest {
+  method: string;
+  path: string;
+  search: string;
+  body: Record<string, unknown> | undefined;
+}
+
+type RefNumIndex<T> = Map<string, T[]>;
+
+/**
+ * In-memory Paysafe Payments API, modelled on what Paysafe documents rather
+ * than on what an adapter would find convenient:
+ * - with `dupCheck: true`, a merchantRefNum already used on that endpoint
+ *   answers 409/5031 ("The transaction you have submitted has already been
+ *   processed.") and the original is never replayed. Settlements, refunds
+ *   and verifications default dupCheck to true; /payments documents no
+ *   default, and /paymenthandles and /voidauths take no dupCheck at all;
+ * - a payments call spends a single-use handle whatever its outcome ("the
+ *   payment handle status always changes to COMPLETED"), so a second call
+ *   with it answers 400/5283. Verifications do not spend one;
+ * - a declined payment is recorded, with its error, like any other;
+ * - the GET ?merchantRefNum= lookups answer the documented collections.
+ * Where Paysafe documents nothing — a reused merchantRefNum without dupCheck
+ * on /payments, /paymenthandles or /voidauths — the fake takes the dangerous
+ * reading and processes the request again, so no test can pass on an
+ * adapter that relies on a replay being absorbed.
  */
 export class FakePaysafeApi {
   private readonly payments = new Map<string, PaysafePaymentLike>();
-  private readonly byRefNum = new Map<string, PaysafePaymentLike>();
-  private readonly settlementRefs = new Map<string, object>();
-  private readonly refundRefs = new Map<string, object>();
+  private readonly paymentsByRef: RefNumIndex<PaysafePaymentLike> = new Map();
+  private readonly settlementsByRef: RefNumIndex<PaysafeSettlementLike> = new Map();
+  private readonly refundsByRef: RefNumIndex<Record<string, unknown>> = new Map();
   private readonly refundsById = new Map<string, Record<string, unknown>>();
+  private readonly verificationsByRef: RefNumIndex<Record<string, unknown>> = new Map();
+  private readonly voidsByRef: RefNumIndex<Record<string, unknown>> = new Map();
   /** Customer Vault state: customers + MULTI_USE handles. */
   private readonly customers = new Map<string, { id: string; merchantCustomerId?: string; handles: PaysafeStoredHandleLike[] }>();
   private readonly multiUseTokens = new Set<string>();
-  private readonly storedHandleRefs = new Map<string, PaysafeStoredHandleLike>();
+  /** Single-use tokens a conversion already vaulted — converting one again is the same card again. */
+  private readonly convertedFrom = new Map<string, PaysafeStoredHandleLike>();
   /** Redirect/bank-rail handles, keyed by token, so createPayment can echo their paymentType and bank object. */
   private readonly railHandles = new Map<
     string,
     { paymentType: string; sepa?: PaysafeBankAccountLike; bacs?: PaysafeBankAccountLike }
   >();
-  private readonly handleRefs = new Map<string, Record<string, unknown>>();
+  private readonly handlesByRef: RefNumIndex<Record<string, unknown>> = new Map();
+  private readonly handlesByToken = new Map<string, Record<string, unknown>>();
+  /** Single-use handles a payments call has spent. */
+  private readonly spentHandles = new Set<string>();
   /** Payment Scheduler state (subscriptionsplans/v1): plans + subscriptions, deduped on merchantRefNum. */
   private readonly plans = new Map<string, PaysafePlanLike>();
   private readonly subscriptions = new Map<string, PaysafeSubscriptionLike>();
   private readonly subscriptionRefs = new Map<string, PaysafeSubscriptionLike>();
+  private readonly lostAnswers: Array<{ matcher: RequestMatcher; outcome: LostAnswer }> = [];
+  private readonly refusals: Array<{ matcher: RequestMatcher; status: RefusalStatus; remaining: number }> = [];
+  /** `${collection} ${merchantRefNum}` -> lookups still to answer empty. */
+  private readonly lookupLag = new Map<string, number>();
   private seq = 0;
   uniqueHandleCreations = 0;
   uniquePaymentCreations = 0;
@@ -50,12 +101,53 @@ export class FakePaysafeApi {
   lastHandleRequestBody: Record<string, unknown> | undefined;
   /** Subscription creation makes plan + subscription calls; this keeps the plan body. */
   lastPlanRequestBody: Record<string, unknown> | undefined;
+  /** Every request, in order, for asserting what went over the wire. */
+  readonly requests: RecordedRequest[] = [];
   /** Test levers for the verifyCredentials probe (bad key / transient outage). */
   authFailure = false;
   networkFailure = false;
+  /**
+   * Which rejection a /payments call carrying both a spent handle and a
+   * reused merchantRefNum gets — undocumented, so tests pin both orders.
+   * Default: the spent handle (5283) first.
+   */
+  duplicateCheckFirst = false;
+  /**
+   * Settlements and refunds: run the state check (remaining authorization,
+   * remaining settlement) before the merchantRefNum check, the other
+   * undocumented order. Default: 5031 first.
+   */
+  stateCheckFirst = false;
 
   constructor() {
     this.multiUseTokens.add(SEEDED_MULTI_USE_TOKEN);
+  }
+
+  /** The next matching request is processed in full, then its answer is lost. */
+  loseAnswer(matcher: RequestMatcher, outcome: LostAnswer = "network"): void {
+    this.lostAnswers.push({ matcher, outcome });
+  }
+
+  /**
+   * The next `count` matching requests are refused before any processing:
+   * 429 (1200, rate limited) by default, or a 5xx that never reached the
+   * transaction.
+   */
+  refuse(matcher: RequestMatcher, status: RefusalStatus = 429, count = 1): void {
+    this.refusals.push({ matcher, status, remaining: count });
+  }
+
+  /**
+   * The `collection` lookup (e.g. "payments") answers empty for this
+   * merchantRefNum `count` more times: the index trailing the write.
+   */
+  hideFromLookups(collection: string, merchantRefNum: string, count = Number.POSITIVE_INFINITY): void {
+    this.lookupLag.set(`${collection} ${merchantRefNum}`, count);
+  }
+
+  /** Requests of one method and exact path — the attempts a call made. */
+  requestsTo(method: string, path: string): RecordedRequest[] {
+    return this.requests.filter((r) => r.method === method && r.path === path);
   }
 
   readonly fetch: typeof fetch = async (input, init) => {
@@ -66,13 +158,64 @@ export class FakePaysafeApi {
     const path = parsed.pathname;
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined;
     this.lastRequestBody = body;
+    this.requests.push({ method, path, search: parsed.search, body });
 
     if (this.authFailure || !(init?.headers as Record<string, string>)?.["authorization"]?.startsWith("Basic ")) {
       return json(401, { error: { code: "5279", message: "Invalid credentials" } });
     }
+    const refusal = this.refusals.find((r) => matches(r.matcher, method, path));
+    if (refusal) {
+      refusal.remaining -= 1;
+      if (refusal.remaining <= 0) this.refusals.splice(this.refusals.indexOf(refusal), 1);
+      if (refusal.status !== 429) {
+        return json(refusal.status, { error: { code: "1000", message: "An internal error occurred." } });
+      }
+      return json(429, {
+        error: { code: "1200", message: "The API call has been denied as it has exceeded the permissible call rate limit." },
+      });
+    }
 
+    const response = this.route(method, path, parsed.searchParams, body);
+
+    const lostIndex = this.lostAnswers.findIndex((l) => matches(l.matcher, method, path));
+    if (lostIndex === -1) return response;
+    const [lost] = this.lostAnswers.splice(lostIndex, 1);
+    if (lost!.outcome === "network") throw new TypeError("simulated connection drop after processing");
+    if (lost!.outcome === "hang") {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("The operation was aborted.", "AbortError")),
+          { once: true },
+        );
+      });
+    }
+    return json(lost!.outcome, { error: { code: "1000", message: "An internal error occurred." } });
+  };
+
+  private route(
+    method: string,
+    path: string,
+    params: URLSearchParams,
+    body: Record<string, unknown> | undefined,
+  ): Response {
     if (method === "POST" && path === "/paymenthub/v1/payments") return this.createPayment(body!);
     if (method === "POST" && path === "/paymenthub/v1/paymenthandles") return this.createPaymentHandle(body!);
+    if (method === "GET" && path === "/paymenthub/v1/payments") {
+      return this.lookup("payments", this.paymentsByRef, params, (p) => this.publicPayment(p));
+    }
+    if (method === "GET" && path === "/paymenthub/v1/paymenthandles") {
+      return this.lookup("paymentHandles", this.handlesByRef, params);
+    }
+    // Real API: settlements are query-only, keyed by merchantRefNum.
+    if (method === "GET" && path === "/paymenthub/v1/settlements") {
+      return this.lookup("settlements", this.settlementsByRef, params);
+    }
+    if (method === "GET" && path === "/paymenthub/v1/refunds") return this.lookup("refunds", this.refundsByRef, params);
+    if (method === "GET" && path === "/paymenthub/v1/verifications") {
+      return this.lookup("verifications", this.verificationsByRef, params);
+    }
+    if (method === "GET" && path === "/paymenthub/v1/voidauths") return this.lookup("voidAuths", this.voidsByRef, params);
     if (method === "POST" && path === "/paymenthub/v1/customers") {
       const merchantCustomerId = body!["merchantCustomerId"] as string;
       // Real API 409s with 7505 on duplicate merchantCustomerId.
@@ -90,54 +233,21 @@ export class FakePaysafeApi {
       this.uniqueCustomerCreations++;
       return json(201, { id: customer.id, merchantCustomerId: customer.merchantCustomerId, status: "ACTIVE" });
     }
-    if (method === "GET" && path === "/paymenthub/v1/customers" && parsed.searchParams.get("merchantCustomerId")) {
-      const wanted = parsed.searchParams.get("merchantCustomerId");
+    if (method === "GET" && path === "/paymenthub/v1/customers" && params.get("merchantCustomerId")) {
+      const wanted = params.get("merchantCustomerId");
       const found = [...this.customers.values()].find((c) => c.merchantCustomerId === wanted);
       if (!found) return json(404, { error: { code: "5269", message: "No such customer" } });
       return json(200, { id: found.id, merchantCustomerId: found.merchantCustomerId, status: "ACTIVE" });
     }
     const custHandlesMatch = /^\/paymenthub\/v1\/customers\/([^/?]+)\/paymenthandles$/.exec(path);
     if (method === "POST" && custHandlesMatch) {
-      const customer = this.customers.get(decodeURIComponent(custHandlesMatch[1]!));
-      if (!customer) return json(404, { error: { code: "5269", message: "No such customer" } });
-      const refNum = body!["merchantRefNum"] as string;
-      const existing = this.storedHandleRefs.get(refNum);
-      if (existing) return json(200, existing);
-      if (typeof body!["paymentHandleTokenFrom"] !== "string") {
-        return json(400, {
-          error: { code: "5068", message: "Field error(s)", fieldErrors: [{ field: "paymentHandleTokenFrom", error: "required" }] },
-        });
-      }
-      // Real API 7503s when the card is already vaulted;
-      // the special token simulates re-saving a card this customer holds.
-      if (body!["paymentHandleTokenFrom"] === "tok_single_use_dupcard" && customer.handles[0]) {
-        return json(409, {
-          error: {
-            code: "7503",
-            message: "Card number already in use - some-owner-id",
-            details: [`This card is currently associated with Payment Handle Id: ${customer.handles[0].id}`],
-          },
-        });
-      }
-      const handle: PaysafeStoredHandleLike = {
-        id: `mhdl_${++this.seq}`,
-        paymentHandleToken: `MU${++this.seq}tok`,
-        merchantRefNum: refNum,
-        status: "PAYABLE",
-        usage: "MULTI_USE",
-        paymentType: "CARD",
-        card: { cardType: "VI", lastDigits: "1111", cardExpiry: { month: 12, year: 2030 } },
-      };
-      customer.handles.push(handle);
-      this.multiUseTokens.add(handle.paymentHandleToken);
-      this.storedHandleRefs.set(refNum, handle);
-      return json(201, handle);
+      return this.convertToMultiUse(decodeURIComponent(custHandlesMatch[1]!), body!);
     }
     const custGetMatch = /^\/paymenthub\/v1\/customers\/([^/?]+)$/.exec(path);
     if (method === "GET" && custGetMatch) {
       const customer = this.customers.get(decodeURIComponent(custGetMatch[1]!));
       if (!customer) return json(404, { error: { code: "5269", message: "No such customer" } });
-      const withHandles = parsed.searchParams.get("fields") === "paymenthandles";
+      const withHandles = params.get("fields") === "paymenthandles";
       return json(200, {
         id: customer.id,
         merchantCustomerId: customer.merchantCustomerId,
@@ -155,20 +265,6 @@ export class FakePaysafeApi {
       customer.handles.splice(index, 1);
       return new Response("", { status: 200 });
     }
-    if (method === "GET" && path === "/paymenthub/v1/settlements") {
-      // Real API: settlements are query-only, keyed by merchantRefNum.
-      const refNum = parsed.searchParams.get("merchantRefNum");
-      if (!refNum) {
-        return json(400, {
-          error: { code: "5068", message: "Field error(s)", fieldErrors: [{ field: "merchantRefNum", error: "Value is required." }] },
-        });
-      }
-      const settlement = this.settlementRefs.get(refNum);
-      return json(200, {
-        meta: { numberOfRecords: settlement ? 1 : 0 },
-        settlements: settlement ? [settlement] : [],
-      });
-    }
     const paymentMatch = /^\/paymenthub\/v1\/payments\/([^/]+)$/.exec(path);
     if (method === "GET" && paymentMatch) return this.getPayment(decodeURIComponent(paymentMatch[1]!));
     const refundGetMatch = /^\/paymenthub\/v1\/refunds\/([^/]+)$/.exec(path);
@@ -183,12 +279,7 @@ export class FakePaysafeApi {
     if (method === "POST" && voidMatch) return this.voidAuth(decodeURIComponent(voidMatch[1]!), body!);
     const refundMatch = /^\/paymenthub\/v1\/settlements\/([^/]+)\/refunds$/.exec(path);
     if (method === "POST" && refundMatch) return this.refund(decodeURIComponent(refundMatch[1]!), body!);
-    if (method === "POST" && path === "/paymenthub/v1/verifications") {
-      if (body!["paymentHandleToken"] === "tok_declined") {
-        return json(402, { error: { code: "3022", message: "Insufficient funds" } });
-      }
-      return json(200, { id: `ver_${++this.seq}`, status: "COMPLETED", txnTime: "2026-07-04T10:00:00Z" });
-    }
+    if (method === "POST" && path === "/paymenthub/v1/verifications") return this.verify(body!);
     if (method === "POST" && path === "/subscriptionsplans/v1/plans") return this.createPlan(body!);
     const planGetMatch = /^\/subscriptionsplans\/v1\/plans\/([^/?]+)$/.exec(path);
     if (method === "GET" && planGetMatch) {
@@ -201,30 +292,57 @@ export class FakePaysafeApi {
       return this.createSubscription(decodeURIComponent(subCreateMatch[1]!), body!);
     }
     if (method === "GET" && path === "/subscriptionsplans/v1/subscriptions") {
-      return this.listSubscriptions(parsed.searchParams);
+      return this.listSubscriptions(params);
     }
     const subMatch = /^\/subscriptionsplans\/v1\/subscriptions\/([^/?]+)$/.exec(path);
     if (method === "GET" && subMatch) {
       const sub = this.subscriptions.get(decodeURIComponent(subMatch[1]!));
       if (!sub) return json(404, { error: { code: "5269", message: "No such subscription" } });
-      return json(200, publicSubscription(sub, parsed.searchParams.get("fields")));
+      return json(200, publicSubscription(sub, params.get("fields")));
     }
     if (method === "PATCH" && subMatch) {
       return this.patchSubscription(decodeURIComponent(subMatch[1]!), body!);
     }
     return json(404, { error: { code: "5269", message: `No route ${method} ${path}` } });
-  };
+  }
+
+  /**
+   * GET /<collection>?merchantRefNum=: every record filed under the
+   * reference, in the documented `{ <collection>: [...], meta }` shape.
+   */
+  private lookup<T>(
+    collection: string,
+    index: RefNumIndex<T>,
+    params: URLSearchParams,
+    view: (record: T) => unknown = (record) => record,
+  ): Response {
+    const refNum = params.get("merchantRefNum");
+    if (!refNum) {
+      return json(400, {
+        error: { code: "5068", message: "Field error(s)", fieldErrors: [{ field: "merchantRefNum", error: "Value is required." }] },
+      });
+    }
+    const lagKey = `${collection} ${refNum}`;
+    const lag = this.lookupLag.get(lagKey) ?? 0;
+    if (lag > 0) {
+      this.lookupLag.set(lagKey, lag - 1);
+      return json(200, { meta: { numberOfRecords: 0 }, [collection]: [] });
+    }
+    const records = (index.get(refNum) ?? []).map(view);
+    return json(200, { meta: { numberOfRecords: records.length }, [collection]: records });
+  }
 
   /**
    * POST /paymenthandles for redirect and bank-debit rails. Redirect (Interac)
    * mirrors the documented response: INITIATED + action REDIRECT + the
-   * redirect_payment link. Bank rails come back immediately PAYABLE.
+   * redirect_payment link. Bank rails come back immediately PAYABLE. No
+   * dupCheck field exists here, so a reused merchantRefNum mints again.
    */
   private createPaymentHandle(body: Record<string, unknown>): Response {
     this.lastHandleRequestBody = body;
+    // The request schema carries no top-level dupCheck, and unknown fields are strict-rejected.
+    if ("dupCheck" in body) return unrecognizedField("dupCheck");
     const refNum = body["merchantRefNum"] as string;
-    const existing = this.handleRefs.get(refNum);
-    if (existing) return json(200, existing);
     const paymentType = body["paymentType"] as string;
     if (["SEPA", "ACH", "BACS", "EFT"].includes(paymentType)) {
       return this.createBankHandle(refNum, paymentType, body);
@@ -250,12 +368,11 @@ export class FakePaysafeApi {
       amount: body["amount"] as number,
       status: "INITIATED",
       action: "REDIRECT",
+      usage: "SINGLE_USE",
       txnTime: "2026-07-04T10:00:00Z",
       links: [{ rel: "redirect_payment", href: `https://api.test.paysafe.com/alternatepayments/v1/redirect?paymentHandleId=${id}` }],
     };
-    this.handleRefs.set(refNum, handle);
-    this.railHandles.set(handle.paymentHandleToken, { paymentType });
-    this.uniqueHandleCreations++;
+    this.fileHandle(refNum, handle, { paymentType });
     return json(201, handle);
   }
 
@@ -296,48 +413,82 @@ export class FakePaysafeApi {
       txnTime: "2026-07-04T10:00:00Z",
       ...(echo ? { [railKey]: echo } : {}),
     };
-    this.handleRefs.set(refNum, handle);
-    this.railHandles.set(handle.paymentHandleToken, {
+    this.fileHandle(refNum, handle, {
       paymentType,
       ...(echo && paymentType === "SEPA" ? { sepa: echo } : {}),
       ...(echo && paymentType === "BACS" ? { bacs: echo } : {}),
     });
-    this.uniqueHandleCreations++;
     return json(201, handle);
+  }
+
+  private fileHandle(
+    refNum: string,
+    handle: Record<string, unknown> & { paymentHandleToken: string },
+    rail: { paymentType: string; sepa?: PaysafeBankAccountLike; bacs?: PaysafeBankAccountLike },
+  ): void {
+    file(this.handlesByRef, refNum, handle);
+    this.handlesByToken.set(handle.paymentHandleToken, handle);
+    this.railHandles.set(handle.paymentHandleToken, rail);
+    this.uniqueHandleCreations++;
+  }
+
+  /** A payments call spends a single-use handle, whatever it answers. */
+  private spend(token: string): void {
+    if (this.multiUseTokens.has(token)) return;
+    this.spentHandles.add(token);
+    const handle = this.handlesByToken.get(token);
+    if (handle) handle["status"] = "COMPLETED";
   }
 
   private createPayment(body: Record<string, unknown>): Response {
     // Real API strict-parses the body: webhook/returnLinks/shippingDetails are
     // handle-level fields and get rejected here (error 5023).
     for (const field of ["webhook", "returnLinks", "shippingDetails"]) {
-      if (field in body) {
-        return json(400, {
-          error: { code: "5023", message: "Request body not parsable", details: [`field '${field}' not recognized`] },
-        });
-      }
+      if (field in body) return unrecognizedField(field);
     }
     const refNum = body["merchantRefNum"] as string;
-    if (this.byRefNum.has(refNum)) return json(200, this.publicPayment(this.byRefNum.get(refNum)!));
-    const token = body["paymentHandleToken"] as string;
-    if (token === "tok_declined") {
-      return json(402, { error: { code: "3022", message: "Insufficient funds" } });
+    const token = body["paymentHandleToken"];
+    if (typeof token !== "string" || !token) {
+      return json(400, { error: { code: "5068", message: "Missing paymentHandleToken" } });
     }
-    if (!token) return json(400, { error: { code: "5068", message: "Missing paymentHandleToken" } });
+    const reused = body["dupCheck"] === true && isFiled(this.paymentsByRef, refNum);
+    if (reused && this.duplicateCheckFirst) return duplicateRefNum();
+    if (this.spentHandles.has(token)) return handleNotPayable();
+    if (reused) return duplicateRefNum();
     // Deleted/unknown MULTI_USE tokens die exactly like the real API (5068).
     if (token.startsWith("MU") && !this.multiUseTokens.has(token)) {
       return json(400, {
         error: { code: "5068", message: "Field error(s)", fieldErrors: [{ field: "paymentHandleToken", error: "Either invalid or no value provided" }] },
       });
     }
+    this.spend(token);
     const settleWithAuth = body["settleWithAuth"] as boolean;
     const amount = body["amount"] as number;
+    const currencyCode = body["currencyCode"] as string;
+    if (token === "tok_declined") {
+      // Paysafe records the declined payment too; it answers the call with the error alone.
+      const declined: PaysafePaymentLike = {
+        id: `pay_${++this.seq}`,
+        merchantRefNum: refNum,
+        status: "FAILED",
+        amount,
+        currencyCode,
+        settleWithAuth,
+        txnTime: "2026-07-04T10:00:00Z",
+        paymentType: "CARD",
+        error: { code: "3022", message: "Insufficient funds" },
+      };
+      this.payments.set(declined.id, declined);
+      file(this.paymentsByRef, refNum, declined);
+      return json(402, { error: declined.error });
+    }
     const payment: PaysafePaymentLike = {
       id: `pay_${++this.seq}`,
       merchantRefNum: refNum,
       status: "COMPLETED",
       amount,
       availableToSettle: settleWithAuth ? 0 : amount,
-      currencyCode: body["currencyCode"] as string,
+      currencyCode,
       settleWithAuth,
       txnTime: "2026-07-04T10:00:00Z",
       paymentType: "CARD",
@@ -367,7 +518,7 @@ export class FakePaysafeApi {
         txnTime: "2026-07-04T10:00:01Z",
       };
       payment.settlements = [settlement];
-      this.settlementRefs.set(refNum, settlement);
+      file(this.settlementsByRef, refNum, settlement);
     }
     if (settleWithAuth && !railHandle) {
       // Real API: auto-capture creates an implicit settlement sharing the
@@ -383,10 +534,10 @@ export class FakePaysafeApi {
         txnTime: "2026-07-04T10:00:01Z",
       };
       payment.settlements = [settlement];
-      this.settlementRefs.set(refNum, settlement);
+      file(this.settlementsByRef, refNum, settlement);
     }
     this.payments.set(payment.id, payment);
-    this.byRefNum.set(refNum, payment);
+    file(this.paymentsByRef, refNum, payment);
     this.uniquePaymentCreations++;
     return json(200, this.publicPayment(payment));
   }
@@ -406,7 +557,9 @@ export class FakePaysafeApi {
     const payment = this.payments.get(id);
     if (!payment) return json(404, { error: { code: "5269", message: "No such payment" } });
     const refNum = body["merchantRefNum"] as string;
-    if (this.settlementRefs.has(refNum)) return json(200, this.settlementRefs.get(refNum)!);
+    // Settlements default dupCheck to true.
+    const reused = body["dupCheck"] !== false && isFiled(this.settlementsByRef, refNum);
+    if (reused && !this.stateCheckFirst) return duplicateRefNum();
     // Real Paysafe rejects settlements without an explicit amount.
     if (typeof body["amount"] !== "number") {
       return json(400, {
@@ -419,6 +572,7 @@ export class FakePaysafeApi {
     if (payment.status !== "COMPLETED" || payment.settleWithAuth || settleAmount > remaining) {
       return json(400, { error: { code: "5050", message: "Payment is not in a settleable state" } });
     }
+    if (reused) return duplicateRefNum();
     const settlement = {
       id: `stl_${++this.seq}`,
       merchantRefNum: refNum,
@@ -430,11 +584,13 @@ export class FakePaysafeApi {
     };
     payment.settlements = [...(payment.settlements ?? []), settlement];
     payment.availableToSettle = remaining - settleAmount;
-    this.settlementRefs.set(refNum, settlement);
+    file(this.settlementsByRef, refNum, settlement);
     return json(200, settlement);
   }
 
+  /** Voidauths take no dupCheck: only the remaining authorization stops a repeated void. */
   private voidAuth(id: string, body: Record<string, unknown>): Response {
+    if ("dupCheck" in body) return unrecognizedField("dupCheck");
     const payment = this.payments.get(id);
     if (!payment) return json(404, { error: { code: "5269", message: "No such payment" } });
     // Real Paysafe rejects voidauths without an explicit amount.
@@ -452,12 +608,22 @@ export class FakePaysafeApi {
     // Only a payment with no settlements at all flips to CANCELLED.
     payment.availableToSettle = remaining - (body["amount"] as number);
     if ((payment.settlements ?? []).length === 0) payment.status = "CANCELLED";
-    return json(200, { id: `void_${++this.seq}`, status: "COMPLETED", amount: body["amount"] });
+    const voided = {
+      id: `void_${++this.seq}`,
+      merchantRefNum: body["merchantRefNum"] as string,
+      status: "COMPLETED",
+      amount: body["amount"] as number,
+      txnTime: "2026-07-04T10:06:00Z",
+    };
+    file(this.voidsByRef, voided.merchantRefNum, voided);
+    return json(200, voided);
   }
 
   private refund(settlementId: string, body: Record<string, unknown>): Response {
     const refNum = body["merchantRefNum"] as string;
-    if (this.refundRefs.has(refNum)) return json(200, this.refundRefs.get(refNum)!);
+    // Refunds default dupCheck to true.
+    const reused = body["dupCheck"] !== false && isFiled(this.refundsByRef, refNum);
+    if (reused && !this.stateCheckFirst) return duplicateRefNum();
     for (const payment of this.payments.values()) {
       const settlement = (payment.settlements ?? []).find((s) => s.id === settlementId);
       if (settlement) {
@@ -465,6 +631,7 @@ export class FakePaysafeApi {
         if ((settlement.refundedAmount ?? 0) + amount > (settlement.amount ?? 0)) {
           return json(400, { error: { code: "3407", message: "Refund exceeds settled amount" } });
         }
+        if (reused) return duplicateRefNum();
         settlement.refundedAmount = (settlement.refundedAmount ?? 0) + amount;
         settlement.availableToRefund = (settlement.amount ?? 0) - settlement.refundedAmount;
         const refund = {
@@ -472,15 +639,75 @@ export class FakePaysafeApi {
           merchantRefNum: refNum,
           status: "COMPLETED",
           amount,
+          currencyCode: payment.currencyCode,
           txnTime: "2026-07-04T10:10:00Z",
         };
-        this.refundRefs.set(refNum, refund);
+        file(this.refundsByRef, refNum, refund);
         this.refundsById.set(refund.id, refund);
         this.uniqueRefundCreations++;
         return json(200, refund);
       }
     }
     return json(404, { error: { code: "5269", message: "No such settlement" } });
+  }
+
+  /** Verifications default dupCheck to true and do not spend the handle. */
+  private verify(body: Record<string, unknown>): Response {
+    const refNum = body["merchantRefNum"] as string;
+    if (body["dupCheck"] !== false && isFiled(this.verificationsByRef, refNum)) return duplicateRefNum();
+    if (body["paymentHandleToken"] === "tok_declined") {
+      return json(402, { error: { code: "3022", message: "Insufficient funds" } });
+    }
+    const verification = {
+      id: `ver_${++this.seq}`,
+      merchantRefNum: refNum,
+      status: "COMPLETED",
+      currencyCode: body["currencyCode"] as string,
+      txnTime: "2026-07-04T10:00:00Z",
+    };
+    file(this.verificationsByRef, refNum, verification);
+    return json(200, verification);
+  }
+
+  /**
+   * POST /customers/{id}/paymenthandles: single-use → MULTI_USE. Vault
+   * handles carry the merchantRefNum they were created under. Converting a
+   * token that was already converted vaults the same card again, which the
+   * real API refuses with 7503 naming the existing handle; the special token
+   * simulates re-saving a card this customer already holds.
+   */
+  private convertToMultiUse(customerId: string, body: Record<string, unknown>): Response {
+    const customer = this.customers.get(customerId);
+    if (!customer) return json(404, { error: { code: "5269", message: "No such customer" } });
+    const source = body["paymentHandleTokenFrom"];
+    if (typeof source !== "string") {
+      return json(400, {
+        error: { code: "5068", message: "Field error(s)", fieldErrors: [{ field: "paymentHandleTokenFrom", error: "required" }] },
+      });
+    }
+    const sameCard = source === "tok_single_use_dupcard" ? customer.handles[0] : this.convertedFrom.get(source);
+    if (sameCard) {
+      return json(409, {
+        error: {
+          code: "7503",
+          message: "Card number already in use - some-owner-id",
+          details: [`This card is currently associated with Payment Handle Id: ${sameCard.id}`],
+        },
+      });
+    }
+    const handle: PaysafeStoredHandleLike = {
+      id: `mhdl_${++this.seq}`,
+      paymentHandleToken: `MU${++this.seq}tok`,
+      merchantRefNum: body["merchantRefNum"] as string,
+      status: "PAYABLE",
+      usage: "MULTI_USE",
+      paymentType: "CARD",
+      card: { cardType: "VI", lastDigits: "1111", cardExpiry: { month: 12, year: 2030 } },
+    };
+    customer.handles.push(handle);
+    this.multiUseTokens.add(handle.paymentHandleToken);
+    this.convertedFrom.set(source, handle);
+    return json(201, handle);
   }
 
   /**
@@ -696,4 +923,39 @@ function publicSubscription(sub: PaysafeSubscriptionLike, fields: string | null)
   if (!requested.has("customerProfile")) delete copy.customerProfile;
   if (!requested.has("paymentsInformation")) delete copy.paymentsInformation;
   return copy;
+}
+
+function matches(matcher: RequestMatcher, method: string, path: string): boolean {
+  if (matcher.method !== method) return false;
+  return typeof matcher.path === "string" ? matcher.path === path : matcher.path.test(path);
+}
+
+function file<T>(index: RefNumIndex<T>, refNum: string, record: T): void {
+  const filed = index.get(refNum);
+  if (filed) filed.push(record);
+  else index.set(refNum, [record]);
+}
+
+/** dupCheck looks back 90 days; the fake keeps no clock, so every filed reference is recent. */
+function isFiled<T>(index: RefNumIndex<T>, refNum: string): boolean {
+  return (index.get(refNum)?.length ?? 0) > 0;
+}
+
+function duplicateRefNum(): Response {
+  return json(409, { error: { code: "5031", message: "The transaction you have submitted has already been processed." } });
+}
+
+function handleNotPayable(): Response {
+  return json(400, {
+    error: {
+      code: "5283",
+      message: "The requested operation can only be executed on a Payment Handle with the status of PAYABLE.",
+    },
+  });
+}
+
+function unrecognizedField(field: string): Response {
+  return json(400, {
+    error: { code: "5023", message: "Request body not parsable", details: [`field '${field}' not recognized`] },
+  });
 }

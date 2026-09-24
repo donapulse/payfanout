@@ -311,7 +311,7 @@ describe("Paysafe bank-debit sessions", () => {
     expect(info.amount).toBe(12_50);
   });
 
-  it("dedupes both calls on merchantRefNum, like the real API", async () => {
+  it("a replayed completion re-reads its handle and payment instead of minting or charging twice", async () => {
     const { adapter, fake } = makePair();
     const fixture = RAILS[0]!;
     const session = await adapter.createPaymentSession(sessionInput(fixture));

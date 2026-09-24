@@ -83,8 +83,8 @@ retrieved, not a separate credential).
   with `invalid_request` rather than approximating.
 - **Idempotency** rides `merchantRefNum` ("unique for this accountId"):
   `input.merchantRefNum` wins when supplied, `idempotencyKey` fills it otherwise, and a
-  replayed create recovers the existing subscription by that refNum. A transport-retried
-  inline plan creation can leave an orphan plan (plans carry no refNum); the
+  replayed create recovers the existing subscription by that refNum. A creation retried
+  after a lost answer can leave an orphan inline plan (plans carry no refNum); the
   subscription itself stays exactly-once, so nothing double-bills.
 - **Cancel** PATCHes the final `CANCELLED` status (never the reversible `SUSPENDED`) and
   is verified-idempotent: on a rejection the adapter re-reads the subscription and
@@ -96,8 +96,14 @@ retrieved, not a separate credential).
 
 ## Notes
 
-- The Paysafe transport retries timeouts/5xx/429 with backoff (`maxNetworkRetries`,
-  default 2).
+- Reads are retried on timeouts/5xx/429 with backoff (`maxNetworkRetries`, default 2);
+  writes are never re-sent blindly. Paysafe rejects a repeated `merchantRefNum` (409,
+  error `5031`, under `dupCheck`) instead of answering with the original, so a write
+  whose answer was lost is looked up by its `merchantRefNum` and returned when Paysafe
+  has it. Only a 429, or a write the lookup cannot find, is re-sent. A key reused for a
+  different amount rejects with `invalid_request`. A duplicate whose original cannot be
+  read back rejects with a non-retryable `processing_error`; retry it later with the same
+  key. The default `requestTimeoutMs` is 60000, the response timeout of Paysafe's own SDKs.
 - Paysafe has no public events API (`supportsEventPolling: false`), so missed-webhook
   recovery falls back to `retrievePayment` per order.
 - Scheduler availability is per merchant account, like every Paysafe product option —

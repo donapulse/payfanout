@@ -152,11 +152,18 @@ describe("Paysafe Interac e-Transfer sessions", () => {
     ).rejects.toThrow(/already minted/);
   });
 
-  it("dedupes handle creation on merchantRefNum, like the real API", async () => {
+  it("reuses its handle when the session is replayed under the same key", async () => {
+    // /paymenthandles takes no dupCheck, so nothing at Paysafe would stop a
+    // second handle under the same merchantRefNum — the adapter looks first.
     const { adapter, fake } = makePair();
-    await adapter.createPaymentSession({ ...interacInput });
-    await adapter.createPaymentSession({ ...interacInput });
+    const first = await adapter.createPaymentSession({ ...interacInput });
+    const again = await adapter.createPaymentSession({ ...interacInput });
     expect(fake.uniqueHandleCreations).toBe(1);
+    const [a, b] = await Promise.all(
+      [first, again].map((s) => decodeSessionContext(s.pspSessionId, SIGNING_KEY)),
+    );
+    expect(b!.paymentHandleToken).toBe(a!.paymentHandleToken);
+    expect(b!.redirectUrl).toBe(a!.redirectUrl);
   });
 
   it("models the rail honestly: redirect flow, and off until the account opts in", () => {

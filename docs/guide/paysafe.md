@@ -105,8 +105,8 @@ const payments = new PaymentService({ adapters: [paysafe] });
 | `sessionSigningKey` | ✅ | - | HMAC key for the stateless signed session. **You generate this.** Keep it stable across restarts/instances. |
 | `webhookHmacKey` | ✅ | - | Paysafe's webhook signing key. Pass a **`string[]`** to rotate with no cutover. |
 | `sessionTtlSeconds` | - | `3600` | How long a signed session stays completable (1h). Enforced at completion. |
-| `requestTimeoutMs` | - | `30000` | Abort a hung Paysafe connection; surfaces as a retryable `psp_unavailable`. |
-| `maxNetworkRetries` | - | `2` | Retries transport trouble (network/timeout/5xx/429) only, never business errors like declines. |
+| `requestTimeoutMs` | - | `60000` | Abort a hung Paysafe exchange (the response timeout of Paysafe's own SDKs); surfaces as a retryable `psp_unavailable`. A write that times out is looked up before anything is re-sent (§7). |
+| `maxNetworkRetries` | - | `2` | Reads are retried on network/timeout/5xx/429 trouble. A write is re-sent only after a 429, or once a lookup shows it never reached Paysafe (§7). Business errors like declines never repeat. |
 
 ::: tip `createPaymentSession` makes no network call — for cards
 For a card session it just mints and signs the self-contained session token locally, the
@@ -198,6 +198,31 @@ on a confirm-on-client PSP (Stripe) throws — it exists only for tokenize-first
 (`requiresServerCompletion: true`). Prefer to hand-write the route? Call `completePayment`
 directly; both forms are in [Server usage](/guide/server#server-completion-tokenize-first), and
 the client side is [React usage](/guide/react#built-in-completion-transport).
+
+### Replays and lost answers
+
+Paysafe does not answer a repeated `merchantRefNum` with the original response. With
+`dupCheck` it **rejects** the repeat (HTTP 409, error `5031`), and a payments call spends
+the single-use handle whatever its outcome, so a second call with that handle answers
+`5283`. The adapter is built around that rather than around blind retries:
+
+- Every mutating call sends your `idempotencyKey` as `merchantRefNum`, with `dupCheck: true`
+  on payments, settlements, refunds and verifications. Payment handles and authorization
+  voids take no `dupCheck`.
+- A write that times out, loses its connection or gets a 5xx is looked up by its
+  `merchantRefNum` before anything is re-sent. If Paysafe has the record, it becomes the
+  call's result. Only when nothing is found is the write re-sent, and `dupCheck` makes that
+  re-send fail safely if the first attempt landed after all. A 429 is re-sent after backoff,
+  because Paysafe refused it unprocessed.
+- Calling again with the same key returns the original, including a decline, which comes
+  back as the same decline. Payment handles (Interac sessions, bank-debit completions) are
+  looked up first and reused, because Paysafe would not reject a second handle.
+- A key already used for a **different** amount or currency rejects with `invalid_request`:
+  give every new payment its own key.
+- A duplicate whose original cannot be read back rejects with a non-retryable
+  `processing_error` that names the `merchantRefNum`. A fresh write can take a moment to
+  appear, and the lookup only covers the last 30 days by default. Retry later with the
+  **same** key: a new key would repeat the payment.
 
 ## 8. Interac e-Transfer (Canada)
 

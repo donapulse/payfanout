@@ -207,7 +207,9 @@ Idempotency keys are mandatory on every mutating call, so transient failures are
 to replay. Three layers act on that: the Stripe SDK retries network failures itself
 (`maxNetworkRetries`, default 2); every REST adapter's transport (Paysafe, GoCardless,
 PayPal, PayZen, Worldline, Adyen) retries timeouts/5xx/429 with backoff (`maxNetworkRetries`,
-business errors like declines are never replayed); and `withRetry(fn, policy)` from
+business errors like declines are never replayed; Paysafe, which rejects a repeated
+`merchantRefNum` instead of replaying the original, re-sends a write only after a 429 or
+once a lookup shows it never landed); and `withRetry(fn, policy)` from
 `@payfanout/core` wraps any call with
 exponential backoff + jitter for `PayFanoutError.retryable` rejections.
 
@@ -334,9 +336,10 @@ self-contained context**: amount/currency/merchant-account are HMAC-signed into
 round-trips the token but cannot tamper with the amount. Every context carries an
 **expiry** (`sessionTtlSeconds`, default 1h) enforced at completion, a signed token is
 never completable forever. The raw Paysafe transport also enforces a **network timeout**
-(`requestTimeoutMs`, default 30s): a hung PSP connection surfaces as a retryable
-`psp_unavailable` instead of hanging your request handler (safe, every mutating call
-carries an idempotent `merchantRefNum`).
+(`requestTimeoutMs`, default 60s, the response timeout of Paysafe's own SDKs): a hung PSP
+connection surfaces as a retryable `psp_unavailable` instead of hanging your request
+handler. A write that times out is looked up by its `merchantRefNum` before anything is
+re-sent, so a lost answer never turns into a second charge.
 
 ### Redirect payment methods: the return trip
 

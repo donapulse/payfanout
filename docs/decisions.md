@@ -51,6 +51,9 @@ were taken autonomously from the brief's own recommended defaults (§10/§11) du
 - **Retries:** `withRetry` in core (backoff+jitter over `retryable`); Stripe SDK
   `maxNetworkRetries` default 2; Paysafe transport retries timeouts/5xx/429 (default 2,
   never business errors — 3406 is retryable hours later, not milliseconds).
+  *(Amended 2026-09-24: Paysafe reads keep these retries, but Paysafe writes are no longer
+  transport-retried except after a 429 — Paysafe rejects a repeated `merchantRefNum`
+  rather than replaying it. See "Paysafe replay safety (2026-09-24)".)*
 - **Circuit breaker in PaymentRouter** (default on: threshold 5, cooldown 30s,
   half-open probe; business rejections close the circuit — they prove liveness;
   desperation mode attempts all-open chains rather than self-inflicting downtime).
@@ -1020,6 +1023,10 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   SEPA/ACH/BACS/EFT) with no PSP call; the handle is minted and charged inside
   `completePayment` (handle then payment, both with `merchantRefNum = idempotencyKey` —
   Paysafe dedupes per endpoint, so one key is replay-safe across both calls).
+  *(Corrected 2026-09-24: that dedupe was never documented. Paysafe documents duplicate
+  rejection (409/5031 under `dupCheck`), and `/paymenthandles` takes no `dupCheck` at all.
+  The shared key stays; the handle is now looked up before it is minted and the payment
+  is recovered by lookup, see "Paysafe replay safety (2026-09-24)".)*
   `settleWithAuth: true` unconditionally (doc-required for ACH/EFT; shown true in every
   SEPA/BACS payload example) and manual capture is rejected at session creation. One rail
   per session, mixed requests rejected — the Interac rule, for the same reason (the
@@ -2119,3 +2126,93 @@ description of what v2 changes is what the migration then had to implement.
   `stolen_card` decline code on the same error still yields `fraud_suspected`, whose message
   is generic as docs.stripe.com/declines/codes asks. Whether Stripe sends a decline code
   alongside this code is undocumented.
+
+## Paysafe replay safety (2026-09-24)
+
+- **Paysafe rejects a repeated `merchantRefNum`; it does not replay the original.**
+  Doc-verified 2026-09-24 against the Payments API OpenAPI spec
+  (developer.paysafe.com/fileadmin/openapi-spec/payments-api/apis/paysafe-ph-payments-api.yaml).
+  On `POST /v1/payments`, `merchantRefNum` "must be unique for each request if dupCheck
+  parameter is sent as "true"", and `dupCheck` "validates that this request is not a
+  duplicate. A duplicate request is when the merchantRefNum has already been used in a
+  previous request within the past 90 days." No default is documented there; settlements,
+  refunds and verifications state "This value defaults to true". The card-errors page gives
+  the answer as "409 | 5031 | The transaction you have submitted has already been
+  processed." The about-card-payments page adds "Regardless of the payments call response
+  status, the payment handle status always changes to COMPLETED when a payments call is
+  made", so the first payments call spends a single-use handle and a second one answers
+  5283. The tokenize page says single-use handles "are not consumed by verification". The
+  adapter had assumed Paysafe dedupes on `merchantRefNum`, and its transport re-sent every
+  POST after a timeout, 5xx or 429. Nothing documents that. Under the documented behaviour
+  a lost answer became an `invalid_request` for a payment that existed, and a re-sent
+  saved-card charge (a MULTI_USE token is never spent) could charge twice.
+- **Writes are never re-sent blindly.** Paysafe's Java and PHP SDK pages say "The client can
+  be configured to automatically retry GET requests that have failed due to network
+  problems or other unpredictable events", with "60 seconds for response timeout", and warn
+  that "some requests may take longer to process". The PHP SDK's retry middleware refuses
+  every method except GET. The adapter now sends `dupCheck: true` on every `POST
+  /payments` (card and Interac completion, bank debits, saved-method charges) and, where
+  the documented default already applies, on settlements, refunds and verifications. It
+  never sends it on `/paymenthandles` or `/voidauths`: neither request schema carries a
+  top-level `dupCheck` (the one under `/paymenthandles` is a writeOnly field of the nested
+  `eftObject`), and Paysafe strict-rejects unknown fields. After a timeout, network failure
+  or 5xx the record is looked up with the documented
+  `GET /v1/{payments,paymenthandles,settlements,refunds,verifications,voidauths}?merchantRefNum=`
+  and returned when exactly one record agrees with the request (amount, currency and, for
+  handles, payment type, wherever both sides state them). Only when none exists is the write
+  re-sent, bounded by `maxNetworkRetries`; `dupCheck` turns a re-send of a write that did
+  land into a recoverable 5031. A 429 (1200) is re-sent after backoff without a lookup, as
+  the request was refused unprocessed. A lookup that fails ends the call with the original
+  transport error, since its outcome stays unknown and a replay under the same key
+  recovers it later. Recovery reads are single attempts, which bounds a hung Paysafe to
+  one extra exchange per attempt. Reads keep their transport retries. The default
+  `requestTimeoutMs` moved from 30000 to 60000.
+- **Duplicate rejections are answered with the original.** A 5031, or a 5283 on a payments
+  call that spends a single-use handle, is recovered by up to three reads 250/500 ms apart,
+  because the lookup can trail the write. A 5283 on a caller-supplied handle (card token,
+  Interac context handle) counts as a replay only when an earlier attempt of the same call
+  may have spent it; otherwise the handle went into another call and Paysafe's rejection
+  stands. The handle a bank-debit completion minted under its own key can only have been
+  spent by that completion. A declined original, which Paysafe records with its error (see
+  the simulating-card-payments decline example, which carries an `id`), surfaces as the
+  same decline. Chosen outcomes: a record under the same reference that disagrees means the
+  key was reused and gives `invalid_request`; several agreeing records give a non-retryable
+  `processing_error`; a 5031 whose original cannot be read back gives a non-retryable
+  `processing_error` naming the `merchantRefNum`. Non-retryable is the conservative
+  choice: `withRetry` and the router cascade act on `retryable`, and neither may act while
+  it is unknown whether money moved. The host recovers by replaying the same key later.
+  The lookups default to the last 30 days ("Default = 30 days before the endDate") against
+  dupCheck's 90, so a replay more than 30 days later ends in that `processing_error`.
+  `startDate` is not widened because its maximum range is undocumented.
+- **Endpoints without a duplicate rejection are made safe on this side.** Payment handles
+  (Interac sessions, bank-debit completions) are looked up before one is minted and reused
+  when found, so a replayed bank completion re-reads its handle and payment. A void
+  recovers by lookup alone: a cancel whose pre-read shows nothing left to void looks for its
+  own void first, and a rejected void is checked against the lookup before it surfaces.
+  Captures and refunds do the same when the pre-read shows nothing left, and check the
+  lookup after a rejection too, in case Paysafe runs its state check before the reference
+  check. Customer creation, vault saves and deletes read back through the Customer Vault
+  instead of re-sending: profiles by `merchantCustomerId`, and saves by the
+  `merchantRefNum` that vault handles carry. The Scheduler create and cancel keep their
+  lookup and re-fetch recovery and are no longer re-sent after a timeout or 5xx.
+- **The test double models the documented behaviour.** It answers 409/5031 under
+  `dupCheck`, spends single-use handles (5283 on reuse), records declines, serves the six
+  lookups, and takes the dangerous reading wherever Paysafe documents nothing: a repeated
+  reference without `dupCheck` is processed again. Against it the previous adapter failed
+  the conformance "same key twice, same result" case, which it had only passed because the
+  old fake echoed replays. The suite passes unchanged.
+- **Open, to settle in the sandbox:**
+  - **A repeated `POST /payments` without `dupCheck`.** Undocumented. Run two saved-token
+    charges with the same `merchantRefNum`, without and then with `dupCheck: true`. Record
+    the code (5031 or another) and, on a single-use handle, whether 5031 or 5283 takes
+    precedence. The adapter recovers either.
+  - **Whether `dupCheck` on `/payments` counts the payment handle minted under the same
+    reference.** A bank-debit completion uses one key for both calls. Paysafe's Interac
+    guide reuses a handle's reference for its verification, whose `dupCheck` defaults to
+    true, which suggests a per-transaction-type check. The 2026-07-15 EFT run predates
+    `dupCheck`, so one EFT completion needs re-running.
+  - **How a lookup answers an unknown reference.** An empty collection or 404/5269; both
+    are handled.
+  - **How long the lookup trails a write.** This sizes the three bounded reads.
+  - **Whether a declined payment's lookup record carries `status` and `error`,** as the
+    simulator's decline example suggests.

@@ -118,7 +118,7 @@ export interface SeedSubscriptionOptions {
 
 const SUPPORTED_CURRENCIES = new Set([
   "AUD", "BRL", "CAD", "CHF", "CNY", "CZK", "DKK", "EUR", "GBP", "HKD", "HUF", "ILS",
-  "JPY", "MXN", "MYR", "NOK", "NZD", "PHP", "PLN", "RUB", "SEK", "SGD", "THB", "TWD", "USD",
+  "JPY", "MXN", "MYR", "NOK", "NZD", "PHP", "PLN", "SEK", "SGD", "THB", "TWD", "USD",
 ]);
 const WHOLE_UNIT = new Set(["HUF", "JPY", "TWD"]);
 const BASE = "https://api-m.sandbox.paypal.com";

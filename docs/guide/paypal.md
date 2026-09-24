@@ -251,14 +251,22 @@ for that list; its events dashboard searches only the last 30 days.
 
 ## 9. Currencies
 
-PayPal checkout supports 25 currencies — and **no 3-decimal ones** (BHD, KWD, TND, …
-are rejected locally with `invalid_request`):
+PayPal checkout supports the currencies of its
+[currency codes reference](https://developer.paypal.com/reference/currency-codes) — and
+**no 3-decimal ones** (BHD, KWD, TND, … are rejected locally with `invalid_request`):
 
 AUD, BRL, CAD, CHF, CNY, CZK, DKK, EUR, GBP, HKD, HUF, ILS, JPY, MXN, MYR, NOK, NZD,
-PHP, PLN, RUB, SEK, SGD, THB, TWD, USD.
+PHP, PLN, SEK, SGD, THB, TWD, USD.
 
-BRL, CNY, and MYR are supported for **in-country PayPal accounts only** — a business
-account registered elsewhere cannot charge them.
+RUB is no longer on that list: a new session in RUB is refused locally, while payments
+made in RUB earlier still read, capture and refund.
+
+BRL, CNY, and MYR are payment or settlement currencies for **in-country PayPal accounts
+only**: for an account based outside the country, PayPal converts the money into the
+account's primary currency at its conversion rate, which includes a spread or fee. A
+payment in a currency your PayPal account does not hold stays pending until you accept it
+in your PayPal account, unless your Payment Receiving Preferences handle it automatically;
+the adapter reports such a capture as `processing`.
 
 **Whole-unit rule:** PayPal accepts no decimals for **HUF, JPY, TWD**. JPY is 0-decimal in
 ISO anyway, but HUF and TWD are ISO 2-decimal — their minor-unit amounts must be a

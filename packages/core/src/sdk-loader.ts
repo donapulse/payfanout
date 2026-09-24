@@ -67,7 +67,9 @@ export interface InjectScriptOptions {
  *
  * A `<script>` already on the page for `url` is reused: the call resolves at
  * once and injects nothing, although that tag may still be loading or may
- * have failed (a failed tag stays on the page), so callers keep confirming
+ * have failed without this call seeing it (a tag this function injected is
+ * removed when its load fails, so the next call fetches the file again; a tag
+ * the page added itself is left alone), so callers keep confirming
  * the SDK global. With `options.integrity` the call also detects a
  * conflicting tag: every `<script>` for `url` must carry exactly the same
  * `integrity` string and a `crossorigin` attribute, whatever its value, since
@@ -123,7 +125,10 @@ export function injectScript(url: string, pspName: string, options: InjectScript
     script.src = url;
     script.async = true;
     script.onload = () => resolve();
-    script.onerror = () =>
+    script.onerror = () => {
+      // A tag whose load failed must not stay on the page: the next call would
+      // find it and resolve at once, and the file would never be fetched again.
+      if (typeof script.remove === "function") script.remove();
       reject(
         new PayFanoutError({
           code: "psp_unavailable",
@@ -133,6 +138,7 @@ export function injectScript(url: string, pspName: string, options: InjectScript
           pspName,
         }),
       );
+    };
     document.head.appendChild(script);
   });
 }

@@ -33,6 +33,8 @@ class FakeScript {
   srcSetWith: Record<string, string> | undefined;
   /** Attributes as they stood at insertion, which is when a browser reads them. */
   insertedWith: Record<string, string> | undefined;
+  /** Takes the tag off the page, as Element.remove() does; set by the page stub. */
+  remove: (() => void) | undefined;
   private srcValue = "";
 
   get src(): string {
@@ -73,7 +75,12 @@ function stubPage(...onPage: FakeScript[]): { injected: FakeScript[] } {
     querySelectorAll: (selector: string) => matching(selector),
     createElement: (tagName: string) => {
       expect(tagName).toBe("script");
-      return new FakeScript();
+      const script = new FakeScript();
+      script.remove = () => {
+        const index = head.indexOf(script);
+        if (index >= 0) head.splice(index, 1);
+      };
+      return script;
     },
     head: {
       appendChild: (script: FakeScript) => {
@@ -228,7 +235,7 @@ describe("injectScript reuse of a script already on the page", () => {
   });
 
   it("reuses a script carrying the same integrity, even while it is still loading", async () => {
-    // Locks today's early resolution; a follow-up may change it, since a failed tag stays on the page.
+    // A tag already on the page resolves the call at once, whatever its state.
     const { injected } = stubPage();
     const first = injectScript(SDK_URL, "acme", { integrity: HASH });
     await expect(injectScript(SDK_URL, "acme", { integrity: HASH })).resolves.toBeUndefined();
@@ -296,5 +303,30 @@ describe("injectScript reuse of a script already on the page", () => {
     const { injected } = stubPage(scriptOnPage(OTHER_URL));
     void injectScript(SDK_URL, "acme", { integrity: HASH });
     expect(injected.map((script) => script.src)).toEqual([SDK_URL]);
+  });
+});
+
+describe("injectScript after a failed load", () => {
+  it("removes the tag it injected, so the next call fetches the file again", async () => {
+    const { injected } = stubPage();
+    const first = injectScript(SDK_URL, "acme");
+    injected[0]!.onerror!();
+    await expectLoadFailure(first, SDK_URL);
+    const second = injectScript(SDK_URL, "acme");
+    expect(injected).toHaveLength(2);
+    injected[1]!.onload!();
+    await expect(second).resolves.toBeUndefined();
+  });
+
+  it("lets the file load under a new hash once the tag carrying the old one failed", async () => {
+    const { injected } = stubPage();
+    const first = injectScript(SDK_URL, "acme", { integrity: HASH });
+    injected[0]!.onerror!();
+    await expectLoadFailure(first, SDK_URL);
+    const second = injectScript(SDK_URL, "acme", { integrity: OTHER_HASH });
+    expect(injected).toHaveLength(2);
+    expect(injected[1]!.srcSetWith).toEqual({ integrity: OTHER_HASH, crossorigin: "anonymous" });
+    injected[1]!.onload!();
+    await expect(second).resolves.toBeUndefined();
   });
 });

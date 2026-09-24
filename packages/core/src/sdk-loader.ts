@@ -12,6 +12,12 @@ function holdsUsableHash(integrity: string): boolean {
 }
 
 /**
+ * The calls waiting on each tag injectScript added, from insertion until the
+ * tag loads or fails. A tag without an entry has loaded, or the page added it.
+ */
+const loadingTags = new WeakMap<Element, Array<(loaded: boolean) => void>>();
+
+/**
  * Guards a client adapter method against SSR: PSP browser SDKs need a real
  * `window`/`document`. `adapterName` names the throwing class in the message
  * (e.g. "StripeClientAdapter"), `operation` the method.
@@ -67,16 +73,22 @@ export interface InjectScriptOptions {
  * this only gets the script tag onto the page; an adapter that caches the
  * load promise must clear it when it rejects for that later call to happen.
  *
- * A `<script>` already on the page for `url` is reused: the call resolves at
- * once and injects nothing, even while that tag is still loading, and a tag the
- * page added itself is reused even if its load failed, so callers keep
- * confirming the SDK global. With `options.integrity` the call also detects a
- * conflicting tag: every `<script>` for `url` must carry exactly the same
- * `integrity` string and a `crossorigin` attribute, whatever its value, since
- * without one a cross-origin file is fetched without CORS and cannot pass the
- * check. A conflicting tag makes the call reject with a non-retryable
- * invalid_request attributed to `pspName`, as does an `integrity` holding no
- * sha256, sha384 or sha512 hash; either way nothing is injected.
+ * A `<script>` already on the page for `url` is reused and nothing is
+ * injected. If an earlier call injected that tag and it is still loading, the
+ * call waits for it: it resolves when the tag loads and, when the tag fails,
+ * rejects with its own retryable psp_unavailable attributed to `pspName`. There
+ * is no timeout: a tag that fires neither event keeps every call waiting on it
+ * pending. Any other tag resolves the call at once: one that has loaded, or one
+ * the page added itself, which the call never listens to or removes, whether it
+ * is still loading or its load failed, so callers keep confirming the SDK
+ * global. With `options.integrity` the call also detects a conflicting tag:
+ * every `<script>` for `url` must carry exactly the same `integrity` string and
+ * a `crossorigin` attribute, whatever its value, since without one a
+ * cross-origin file is fetched without CORS and cannot pass the check. A
+ * conflicting tag makes the call reject with a non-retryable invalid_request
+ * attributed to `pspName`, as does an `integrity` holding no sha256, sha384 or
+ * sha512 hash; either way nothing is injected, and the call rejects at once,
+ * even while a tag for `url` is still loading.
  *
  * This is not a trust boundary: every shipped client adapter's `loadSdk()`
  * returns before calling `injectScript` once the SDK global exists, so a copy
@@ -96,10 +108,25 @@ export function injectScript(url: string, pspName: string, options: InjectScript
           pspName,
         }),
       );
+    const settle = (loaded: boolean) => {
+      if (loaded) {
+        resolve();
+        return;
+      }
+      reject(
+        new PayFanoutError({
+          code: "psp_unavailable",
+          message: `Failed to load ${url}`,
+          retryable: true,
+          raw: undefined,
+          pspName,
+        }),
+      );
+    };
     const selector = `script[src="${url}"]`;
-    let onPage: boolean;
+    let onPage: Element | null | undefined;
     if (integrity === undefined) {
-      onPage = Boolean(document.querySelector(selector));
+      onPage = document.querySelector(selector);
     } else if (!holdsUsableHash(integrity)) {
       refuse(`The integrity for ${url} holds no sha256, sha384 or sha512 hash`);
       return;
@@ -111,10 +138,12 @@ export function injectScript(url: string, pspName: string, options: InjectScript
         );
         return;
       }
-      onPage = tags.length > 0;
+      onPage = tags[0];
     }
     if (onPage) {
-      resolve();
+      const waiting = loadingTags.get(onPage);
+      if (waiting) waiting.push(settle);
+      else resolve();
       return;
     }
     const script = document.createElement("script");
@@ -124,17 +153,15 @@ export function injectScript(url: string, pspName: string, options: InjectScript
     if (crossOrigin !== undefined) script.setAttribute("crossorigin", crossOrigin);
     script.src = url;
     script.async = true;
-    script.onload = () => resolve();
+    const settleCalls = [settle];
+    loadingTags.set(script, settleCalls);
+    const settleAll = (loaded: boolean) => {
+      loadingTags.delete(script);
+      for (const settleCall of settleCalls) settleCall(loaded);
+    };
+    script.onload = () => settleAll(true);
     script.onerror = () => {
-      reject(
-        new PayFanoutError({
-          code: "psp_unavailable",
-          message: `Failed to load ${url}`,
-          retryable: true,
-          raw: undefined,
-          pspName,
-        }),
-      );
+      settleAll(false);
       // A failed tag must not satisfy the next lookup, or the file would never be
       // fetched again. Element doubles without remove(), like the bare objects
       // adapter test fakes may return, must not make this handler throw.

@@ -363,6 +363,56 @@ describe("PayPalClientAdapter", () => {
     await expect(adapter.loadSdk()).rejects.toMatchObject({ code: "psp_unavailable" });
   });
 
+  it("retries the SDK injection after a failed script load instead of caching the rejection", async () => {
+    stubBrowser();
+    const fake = makeFakePayPal();
+    const failure = new Error("network hiccup");
+    let available = false;
+    let loads = 0;
+    const adapter = new PayPalClientAdapter({
+      clientId: "test-client-id",
+      environment: "sandbox",
+      getPayPalGlobal: () => (available ? fake : undefined),
+      loadScript: async () => {
+        loads++;
+        if (loads === 1) throw failure;
+        available = true;
+      },
+    });
+    // Concurrent calls share the one load, and its rejection surfaces unchanged.
+    const first = adapter.loadSdk();
+    const second = adapter.loadSdk();
+    await expect(first).rejects.toBe(failure);
+    await expect(second).rejects.toBe(failure);
+    expect(loads).toBe(1);
+    await adapter.mount(fakeContainer(), { clientSecret: ORDER_ID });
+    expect(loads).toBe(2);
+    expect(fake.created).toHaveLength(1);
+  });
+
+  it("loads the SDK again after a load that left the paypal global missing", async () => {
+    stubBrowser();
+    const fake = makeFakePayPal();
+    let available = false;
+    let loads = 0;
+    const adapter = new PayPalClientAdapter({
+      clientId: "test-client-id",
+      environment: "sandbox",
+      getPayPalGlobal: () => (available ? fake : undefined),
+      loadScript: async () => {
+        loads++;
+        if (loads === 2) available = true;
+      },
+    });
+    await expect(adapter.loadSdk()).rejects.toMatchObject({
+      code: "psp_unavailable",
+      message: "PayPal JS SDK loaded but the paypal global is missing",
+      retryable: true,
+    });
+    await expect(adapter.loadSdk()).resolves.toBeUndefined();
+    expect(loads).toBe(2);
+  });
+
   it("guards SSR on loadSdk and mount", async () => {
     const { adapter } = makeAdapter(); // no stubbed browser globals
     await expect(adapter.loadSdk()).rejects.toThrowError(/browser-only/);
@@ -444,6 +494,58 @@ describe("PayPalClientAdapter", () => {
       const loading = adapter.loadSdk();
       appended[0]!.onerror!();
       await expect(loading).rejects.toMatchObject({ code: "psp_unavailable", retryable: true });
+    });
+
+    it("injects the script again on the next loadSdk() after a failed load", async () => {
+      const { appended } = stubDom();
+      const fake = makeFakePayPal();
+      let loaded = false;
+      const adapter = new PayPalClientAdapter({
+        clientId: "test-client-id",
+        environment: "sandbox",
+        getPayPalGlobal: () => (loaded ? fake : undefined),
+      });
+      const first = adapter.loadSdk();
+      appended[0]!.onerror!();
+      await expect(first).rejects.toMatchObject({ code: "psp_unavailable", retryable: true });
+      expect(appended[0]!.remove).toHaveBeenCalledTimes(1);
+      const second = adapter.loadSdk();
+      expect(appended).toHaveLength(2);
+      expect(appended[1]!.src).toBe(appended[0]!.src);
+      loaded = true;
+      appended[1]!.onload!();
+      await expect(second).resolves.toBeUndefined();
+    });
+
+    it("lets a second instance wait for the load the first one started", async () => {
+      const appended: FakeScript[] = [];
+      vi.stubGlobal("window", {});
+      vi.stubGlobal("document", {
+        querySelector: (selector: string) =>
+          appended.find((el) => selector === `script[src="${el.src}"]`) ?? null,
+        createElement: () => ({ id: "", remove: vi.fn() }) as FakeScript,
+        head: {
+          appendChild: (el: FakeScript) => {
+            appended.push(el);
+          },
+        },
+      });
+      const fake = makeFakePayPal();
+      let loaded = false;
+      const config: PayPalClientAdapterConfig = {
+        clientId: "test-client-id",
+        environment: "sandbox",
+        getPayPalGlobal: () => (loaded ? fake : undefined),
+      };
+      const first = new PayPalClientAdapter(config).loadSdk();
+      const second = new PayPalClientAdapter(config).loadSdk();
+      // The second instance runs as far as it can while the tag is still loading.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(appended).toHaveLength(1);
+      loaded = true;
+      appended[0]!.onload!();
+      await expect(first).resolves.toBeUndefined();
+      await expect(second).resolves.toBeUndefined();
     });
   });
 

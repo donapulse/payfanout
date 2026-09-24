@@ -288,16 +288,18 @@ Implement `ClientPaymentAdapter`:
 - `loadSdk()`: inject the PSP script lazily and idempotently (core's `injectScript` /
   `assertBrowser` helpers); guard SSR with a clear error. `<PayFanoutProvider>` never
   calls you eagerly. Return before calling `injectScript` once the SDK global exists, as
-  every shipped client adapter does, and confirm the global after it resolves: a script
-  already on the page for the URL is reused at once, though it may still be loading or
-  may have failed. A tag `injectScript` added is removed when its load fails; if you cache
-  the load promise, clear it when it rejects, or one network error breaks every later
-  mount until the page reloads. If the PSP publishes Subresource Integrity hashes for a
-  version-pinned SDK file, pass the hash: `injectScript(url, pspName, { integrity })`
-  sets `integrity` (and `crossorigin="anonymous"` unless you pass `crossOrigin`), and a
-  file that fails the check rejects like any other load failure. The PSP's CDN must
-  answer CORS (`Access-Control-Allow-Origin`) for the check to run; otherwise the file
-  is blocked. Pass a pinned hash only for the adapter's default pinned URL, never after
+  every shipped client adapter does, and confirm the global after it resolves. A call
+  that finds a tag an earlier `injectScript` call added, still loading, waits for it: it
+  resolves when that tag loads and rejects when it fails. Any other script on the page
+  for the URL is reused at once, though one the page added itself may still be loading
+  or may have failed. A tag `injectScript` added is removed when its load fails; if you
+  cache the load promise, clear it when it rejects, or one network error breaks every
+  later mount until the page reloads. If the PSP publishes Subresource Integrity hashes
+  for a version-pinned SDK file, pass the hash:
+  `injectScript(url, pspName, { integrity })` sets `integrity` (and
+  `crossorigin="anonymous"` unless you pass `crossOrigin`), and a file that fails the
+  check rejects like any other load failure. The PSP's CDN must answer CORS
+  (`Access-Control-Allow-Origin`) for the check to run; otherwise the file is blocked. Pass a pinned hash only for the adapter's default pinned URL, never after
   a host overrides the SDK URL or version, and never pin a hash for a URL whose content
   the PSP updates in place: its next release would fail the check. A hash the PSP
   returns at runtime for the current file (such as Worldline's `sri`) is fine. With a

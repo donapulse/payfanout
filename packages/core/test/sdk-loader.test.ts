@@ -93,6 +93,17 @@ function stubPage(...onPage: FakeScript[]): { injected: FakeScript[] } {
   return { injected };
 }
 
+/** Whether `loading` has settled once every callback already queued has run. */
+async function hasSettled(loading: Promise<void>): Promise<boolean> {
+  let settled = false;
+  void loading.then(
+    () => (settled = true),
+    () => (settled = true),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  return settled;
+}
+
 async function rejection(loading: Promise<void>): Promise<PayFanoutError> {
   const error: unknown = await loading.then(
     () => undefined,
@@ -234,15 +245,18 @@ describe("injectScript reuse of a script already on the page", () => {
     expect(injected).toHaveLength(0);
   });
 
-  it("reuses a script carrying the same integrity, even while it is still loading", async () => {
-    // A tag already on the page resolves the call at once, whatever its state.
+  it("reuses a script carrying the same integrity, waiting for it while it is still loading", async () => {
     const { injected } = stubPage();
     const first = injectScript(SDK_URL, "acme", { integrity: HASH });
-    await expect(injectScript(SDK_URL, "acme", { integrity: HASH })).resolves.toBeUndefined();
-    await expect(injectScript(SDK_URL, "acme")).resolves.toBeUndefined();
+    const sameIntegrity = injectScript(SDK_URL, "acme", { integrity: HASH });
+    const withoutOptions = injectScript(SDK_URL, "acme");
+    expect(await hasSettled(sameIntegrity)).toBe(false);
+    expect(await hasSettled(withoutOptions)).toBe(false);
     expect(injected).toHaveLength(1);
     injected[0]!.onload!();
     await expect(first).resolves.toBeUndefined();
+    await expect(sameIntegrity).resolves.toBeUndefined();
+    await expect(withoutOptions).resolves.toBeUndefined();
   });
 
   it("reuses several scripts for the url that all carry the same integrity", async () => {
@@ -318,14 +332,47 @@ describe("injectScript after a failed load", () => {
     await expect(second).resolves.toBeUndefined();
   });
 
-  it("resolves a call that reused the tag while it loaded, then drops the tag once it fails", async () => {
+  it("rejects a call that waited on the tag while it loaded, then drops the tag once it fails", async () => {
     const { injected } = stubPage();
     const first = injectScript(SDK_URL, "acme");
-    await expect(injectScript(SDK_URL, "acme")).resolves.toBeUndefined();
+    const waiting = injectScript(SDK_URL, "acme");
+    expect(await hasSettled(waiting)).toBe(false);
     injected[0]!.onerror!();
     await expectLoadFailure(first, SDK_URL);
-    void injectScript(SDK_URL, "acme");
+    await expectLoadFailure(waiting, SDK_URL);
+    const third = injectScript(SDK_URL, "acme");
     expect(injected).toHaveLength(2);
+    injected[1]!.onload!();
+    await expect(third).resolves.toBeUndefined();
+  });
+
+  it("rejects each call that waited on the tag with its own error, attributed to its pspName", async () => {
+    const { injected } = stubPage();
+    const first = injectScript(SDK_URL, "acme");
+    const waiting = injectScript(SDK_URL, "acme-eu");
+    injected[0]!.onerror!();
+    await expectLoadFailure(first, SDK_URL);
+    const error = await rejection(waiting);
+    expect(error.toJSON()).toEqual({
+      name: "PayFanoutError",
+      code: "psp_unavailable",
+      message: `Failed to load ${SDK_URL}`,
+      retryable: true,
+      pspName: "acme-eu",
+    });
+    expect(error).not.toBe(await rejection(first));
+  });
+
+  it("drops the failed tag before rejecting the calls that waited on it", async () => {
+    // A caller retrying from its rejection handler must fetch the file again.
+    const { injected } = stubPage();
+    void injectScript(SDK_URL, "acme").catch(() => undefined);
+    const retried = injectScript(SDK_URL, "acme").catch(() => injectScript(SDK_URL, "acme"));
+    injected[0]!.onerror!();
+    expect(await hasSettled(retried)).toBe(false);
+    expect(injected).toHaveLength(2);
+    injected[1]!.onload!();
+    await expect(retried).resolves.toBeUndefined();
   });
 
   it("never takes over a tag the page added itself", async () => {
@@ -349,5 +396,45 @@ describe("injectScript after a failed load", () => {
     expect(injected[1]!.srcSetWith).toEqual({ integrity: OTHER_HASH, crossorigin: "anonymous" });
     injected[1]!.onload!();
     await expect(second).resolves.toBeUndefined();
+  });
+});
+
+describe("injectScript while the tag an earlier call injected is loading", () => {
+  it("keeps every later call for the url pending until the tag loads, then resolves them", async () => {
+    const { injected } = stubPage();
+    const first = injectScript(SDK_URL, "acme");
+    const second = injectScript(SDK_URL, "acme");
+    const third = injectScript(SDK_URL, "acme");
+    expect(await hasSettled(second)).toBe(false);
+    expect(await hasSettled(third)).toBe(false);
+    expect(injected).toHaveLength(1);
+    injected[0]!.onload!();
+    await expect(first).resolves.toBeUndefined();
+    await expect(second).resolves.toBeUndefined();
+    await expect(third).resolves.toBeUndefined();
+  });
+
+  it("resolves a later call at once after that tag has loaded", async () => {
+    const { injected } = stubPage();
+    const first = injectScript(SDK_URL, "acme", { integrity: HASH });
+    injected[0]!.onload!();
+    await expect(first).resolves.toBeUndefined();
+    const later = injectScript(SDK_URL, "acme", { integrity: HASH });
+    expect(await hasSettled(later)).toBe(true);
+    await expect(later).resolves.toBeUndefined();
+    expect(injected).toHaveLength(1);
+  });
+
+  it("runs the integrity checks first, refusing at once instead of waiting", async () => {
+    const { injected } = stubPage();
+    const first = injectScript(SDK_URL, "acme", { integrity: HASH });
+    await expectReuseRefused(injectScript(SDK_URL, "acme", { integrity: OTHER_HASH }));
+    await expectRefused(
+      injectScript(SDK_URL, "acme", { integrity: "sha384-?" }),
+      `The integrity for ${SDK_URL} holds no sha256, sha384 or sha512 hash`,
+    );
+    expect(injected).toHaveLength(1);
+    injected[0]!.onload!();
+    await expect(first).resolves.toBeUndefined();
   });
 });

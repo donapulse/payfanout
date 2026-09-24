@@ -887,6 +887,115 @@ describe("PayZenClientAdapter loadSdk", () => {
     await expect(loading).rejects.toMatchObject({ code: "psp_unavailable", retryable: true });
   });
 
+  it("retries the SDK injection after a failed script load instead of caching the rejection", async () => {
+    stubBrowser();
+    const failure = new Error("network hiccup");
+    let kr: KrLike | undefined;
+    let loads = 0;
+    const adapter = new PayZenClientAdapter({
+      publicKey: PUBLIC_KEY,
+      environment: "sandbox",
+      getKrGlobal: () => kr,
+      loadScript: async () => {
+        loads++;
+        if (loads === 1) throw failure;
+        kr = makeFakeKr();
+      },
+    });
+    // Concurrent calls share the one load, and its rejection surfaces unchanged.
+    const first = adapter.loadSdk();
+    const second = adapter.loadSdk();
+    await expect(first).rejects.toBe(failure);
+    await expect(second).rejects.toBe(failure);
+    expect(loads).toBe(1);
+    await expect(adapter.loadSdk()).resolves.toBeUndefined();
+    expect(loads).toBe(2);
+  });
+
+  it("loads the SDK again after a load that left the KR global missing", async () => {
+    stubBrowser();
+    let kr: KrLike | undefined;
+    let loads = 0;
+    const adapter = new PayZenClientAdapter({
+      publicKey: PUBLIC_KEY,
+      environment: "sandbox",
+      getKrGlobal: () => kr,
+      loadScript: async () => {
+        loads++;
+        if (loads === 2) kr = makeFakeKr();
+      },
+    });
+    await expect(adapter.loadSdk()).rejects.toMatchObject({
+      code: "psp_unavailable",
+      message: "krypton-client loaded but the KR global is missing",
+      retryable: true,
+    });
+    await expect(adapter.loadSdk()).resolves.toBeUndefined();
+    expect(loads).toBe(2);
+  });
+
+  it("removes a krypton script that failed to load, so the next loadSdk() injects a fresh one", async () => {
+    // A page whose lookups see what the loader appended and removed.
+    const head: FakeElement[] = [];
+    const created: FakeElement[] = [];
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("document", {
+      head: { appendChild: (el: FakeElement) => head.push(el) },
+      createElement: () => {
+        const el = fakeElement();
+        el.remove.mockImplementation(() => {
+          const index = head.indexOf(el);
+          if (index >= 0) head.splice(index, 1);
+        });
+        created.push(el);
+        return el;
+      },
+      querySelector: (selector: string) =>
+        head.find((el) => selector === `script[src="${el.src}"]` || selector === `link[href="${el.href}"]`) ?? null,
+    });
+    let kr: KrLike | undefined = undefined;
+    const adapter = new PayZenClientAdapter({ publicKey: PUBLIC_KEY, environment: "sandbox", getKrGlobal: () => kr });
+    const first = adapter.loadSdk();
+    const failed = created.find((el) => el.src)!;
+    failed.onerror?.();
+    await expect(first).rejects.toMatchObject({ code: "psp_unavailable", retryable: true });
+    expect(failed.remove).toHaveBeenCalledTimes(1);
+    expect(head).not.toContain(failed);
+
+    const second = adapter.loadSdk();
+    const scripts = created.filter((el) => el.src);
+    expect(scripts).toHaveLength(2);
+    const fresh = scripts[1]!;
+    expect(fresh.src).toBe(failed.src);
+    expect(fresh.async).toBe(false);
+    expect(fresh.attributes).toEqual({ "kr-public-key": PUBLIC_KEY, "kr-spa-mode": "true" });
+    expect(head).toContain(fresh);
+    // The stylesheet stays on the page and is not added twice.
+    expect(created.filter((el) => el.rel === "stylesheet")).toHaveLength(1);
+    kr = makeFakeKr();
+    fresh.onload?.();
+    await expect(second).resolves.toBeUndefined();
+  });
+
+  it("still rejects a failed load when the script double has no remove()", async () => {
+    const appended: Array<{ src?: string; onerror?: () => void }> = [];
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("document", {
+      head: { appendChild: (el: { src?: string }) => appended.push(el) },
+      createElement: () => ({ setAttribute: () => {} }),
+      querySelector: () => null,
+    });
+    const adapter = new PayZenClientAdapter({
+      publicKey: PUBLIC_KEY,
+      environment: "sandbox",
+      getKrGlobal: () => undefined,
+    });
+    const loading = adapter.loadSdk();
+    const script = appended.find((el) => el.src)!;
+    expect(() => script.onerror?.()).not.toThrow();
+    await expect(loading).rejects.toMatchObject({ code: "psp_unavailable", retryable: true });
+  });
+
   it("honors scriptUrl/cssUrl overrides", async () => {
     const { created } = stubBrowser();
     let kr: KrLike | undefined = undefined;

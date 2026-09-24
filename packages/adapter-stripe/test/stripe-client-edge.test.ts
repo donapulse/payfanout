@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { StripeClientAdapter, type StripeJsLike } from "../src/index.js";
+import { StripeClientAdapter, type StripeJsFactory, type StripeJsLike } from "../src/index.js";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -33,6 +33,76 @@ describe("StripeClientAdapter edge cases", () => {
       code: "psp_unavailable",
       retryable: true,
     });
+  });
+
+  it("keeps a newer load cached when a stale call's catch runs after it started", async () => {
+    stubBrowser();
+    const failure = new Error("network hiccup");
+    let rejectFirst!: (err: unknown) => void;
+    const firstLoad = new Promise<void>((_, reject) => (rejectFirst = reject));
+    let loads = 0;
+    const adapter = new StripeClientAdapter({
+      publishableKey: "pk",
+      environment: "sandbox",
+      getStripeGlobal: () => undefined,
+      loadScript: () => (++loads === 1 ? firstLoad : new Promise<void>(() => {})),
+    });
+    const a = adapter.loadSdk();
+    // Starts a second load between the two stale calls' catch blocks.
+    void firstLoad.catch(() => void adapter.loadSdk());
+    const b = adapter.loadSdk();
+    rejectFirst(failure);
+    await expect(a).rejects.toBe(failure);
+    await expect(b).rejects.toBe(failure);
+    void adapter.loadSdk();
+    expect(loads).toBe(2);
+  });
+
+  it("retries the SDK injection after a failed script load instead of caching the rejection", async () => {
+    stubBrowser();
+    const failure = new Error("network hiccup");
+    let stripe: StripeJsFactory | undefined;
+    let loads = 0;
+    const adapter = new StripeClientAdapter({
+      publishableKey: "pk",
+      environment: "sandbox",
+      getStripeGlobal: () => stripe,
+      loadScript: async () => {
+        loads++;
+        if (loads === 1) throw failure;
+        stripe = () => ({}) as StripeJsLike;
+      },
+    });
+    // Concurrent calls share the one load, and its rejection surfaces unchanged.
+    const first = adapter.loadSdk();
+    const second = adapter.loadSdk();
+    await expect(first).rejects.toBe(failure);
+    await expect(second).rejects.toBe(failure);
+    expect(loads).toBe(1);
+    await expect(adapter.loadSdk()).resolves.toBeUndefined();
+    expect(loads).toBe(2);
+  });
+
+  it("loads the SDK again after a load that left window.Stripe missing", async () => {
+    stubBrowser();
+    let stripe: StripeJsFactory | undefined;
+    let loads = 0;
+    const adapter = new StripeClientAdapter({
+      publishableKey: "pk",
+      environment: "sandbox",
+      getStripeGlobal: () => stripe,
+      loadScript: async () => {
+        loads++;
+        if (loads === 2) stripe = () => ({}) as StripeJsLike;
+      },
+    });
+    await expect(adapter.loadSdk()).rejects.toMatchObject({
+      code: "psp_unavailable",
+      message: "Stripe.js loaded but window.Stripe is missing",
+      retryable: true,
+    });
+    await expect(adapter.loadSdk()).resolves.toBeUndefined();
+    expect(loads).toBe(2);
   });
 
   it("forwards returnUrl into confirmParams and maps unknown PSP statuses to processing", async () => {

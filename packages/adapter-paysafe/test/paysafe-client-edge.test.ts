@@ -50,6 +50,53 @@ describe("PaysafeClientAdapter edge cases", () => {
     await expect(adapter.loadSdk()).rejects.toMatchObject({ code: "psp_unavailable" });
   });
 
+  it("retries the SDK injection after a failed script load instead of caching the rejection", async () => {
+    stubBrowser();
+    const failure = new Error("network hiccup");
+    let paysafe: PaysafeJsLike | undefined;
+    let loads = 0;
+    const adapter = new PaysafeClientAdapter({
+      apiKey: "k",
+      environment: "sandbox",
+      getPaysafeGlobal: () => paysafe,
+      loadScript: async () => {
+        loads++;
+        if (loads === 1) throw failure;
+        paysafe = {} as PaysafeJsLike;
+      },
+    });
+    // Concurrent calls share the one load, and its rejection surfaces unchanged.
+    const first = adapter.loadSdk();
+    const second = adapter.loadSdk();
+    await expect(first).rejects.toBe(failure);
+    await expect(second).rejects.toBe(failure);
+    expect(loads).toBe(1);
+    await expect(adapter.loadSdk()).resolves.toBeUndefined();
+    expect(loads).toBe(2);
+  });
+
+  it("loads the SDK again after a load that left the paysafe global missing", async () => {
+    stubBrowser();
+    let paysafe: PaysafeJsLike | undefined;
+    let loads = 0;
+    const adapter = new PaysafeClientAdapter({
+      apiKey: "k",
+      environment: "sandbox",
+      getPaysafeGlobal: () => paysafe,
+      loadScript: async () => {
+        loads++;
+        if (loads === 2) paysafe = {} as PaysafeJsLike;
+      },
+    });
+    await expect(adapter.loadSdk()).rejects.toMatchObject({
+      code: "psp_unavailable",
+      message: "Paysafe.js loaded but the paysafe global is missing",
+      retryable: true,
+    });
+    await expect(adapter.loadSdk()).resolves.toBeUndefined();
+    expect(loads).toBe(2);
+  });
+
   it("decodeSessionPayload rejects payloads missing amount/currency", () => {
     const bad = `${Buffer.from(JSON.stringify({ v: 1, note: "no money fields" })).toString("base64url")}.sig`;
     expect(() => decodeSessionPayload(bad)).toThrowError(/missing amount\/currency/);

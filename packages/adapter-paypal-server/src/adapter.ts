@@ -208,6 +208,10 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     ) {
       throw PayFanoutError.invalidRequest("PayPalServerAdapter config.maxNetworkRetries must be an integer >= 0");
     }
+    // experience_context.brand_name: 1–127 characters.
+    if (config.brandName !== undefined && (config.brandName.length === 0 || Array.from(config.brandName).length > 127)) {
+      throw PayFanoutError.invalidRequest("PayPalServerAdapter config.brandName must be 1–127 characters");
+    }
     this.config = config;
     this.baseUrl =
       config.baseUrl ??
@@ -251,7 +255,12 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
   }
 
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
-    assertMinorUnitAmount(input.amount, "amount");
+    assertPositiveAmount(input.amount, "amount");
+    if (input.id !== undefined && Array.from(input.id).length > 255) {
+      throw PayFanoutError.invalidRequest(
+        `PayPal keeps the session id as custom_id, at most 255 characters; this one has ${Array.from(input.id).length}`,
+      );
+    }
     // PayPal's currency allowlist for new payments, then the HUF/TWD/JPY whole-unit rule.
     const currency = assertPayPalCurrency(input.currency);
     const value = toPayPalValue(input.amount, currency);
@@ -439,7 +448,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     amount: MinorUnitAmount | undefined,
     idempotencyKey: string,
   ): Promise<PaymentInfo> {
-    if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
+    if (amount !== undefined) assertPositiveAmount(amount, "capture amount");
     const order = await this.resolveOrder(pspPaymentId);
     const unit = order.purchase_units?.[0];
     const authorization = unit?.payments?.authorizations?.[0];
@@ -550,7 +559,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * message for the payer.
    */
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
-    if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
+    if (req.amount !== undefined) assertPositiveAmount(req.amount, "refund amount");
     const target = await this.resolveCapture(req.pspPaymentId);
     const refund = await this.request<PayPalRefundLike>(
       "POST",
@@ -605,7 +614,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * statementDescriptor when creating the session.
    */
   async updatePaymentSession(input: UpdatePaymentSessionInput): Promise<PaymentSession> {
-    if (input.amount !== undefined) assertMinorUnitAmount(input.amount, "amount");
+    if (input.amount !== undefined) assertPositiveAmount(input.amount, "amount");
     const order = await this.request<PayPalOrderLike>(
       "GET",
       `/v2/checkout/orders/${encodeURIComponent(input.pspSessionId)}`,
@@ -681,12 +690,13 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
   async fetchEvents(input: FetchEventsInput = {}): Promise<FetchEventsResult> {
     let path: string;
     if (input.cursor) {
-      if (!input.cursor.startsWith("/v1/notifications/webhooks-events")) {
+      const cursorPath = input.cursor.startsWith("//") ? undefined : relativeEventsPath(input.cursor);
+      if (!input.cursor.startsWith("/") || cursorPath === undefined) {
         throw PayFanoutError.invalidRequest("fetchEvents cursor was not produced by this adapter", {
           cursor: input.cursor,
         });
       }
-      path = input.cursor;
+      path = cursorPath;
     } else {
       const params = new URLSearchParams();
       // The webhooks-events list documents no page_size maximum (its OpenAPI
@@ -1411,13 +1421,29 @@ function nextSubscriptionsPage(
   return itemCount > 0 && itemCount >= effectivePageSize ? page + 1 : undefined;
 }
 
+/**
+ * The path and query of an events-list link. Dot segments are resolved first,
+ * so only the list itself matches, never another path reached through it.
+ */
 function relativeEventsPath(href: string): string | undefined {
   try {
     const url = new URL(href, "https://api-m.paypal.com");
-    return url.pathname.startsWith("/v1/notifications/webhooks-events") ? `${url.pathname}${url.search}` : undefined;
+    return url.pathname === "/v1/notifications/webhooks-events" ? `${url.pathname}${url.search}` : undefined;
   } catch {
     // A malformed next link is PayPal's bug — stop paginating instead of throwing.
     return undefined;
+  }
+}
+
+/**
+ * PayPal refuses a zero amount on orders, captures and refunds
+ * (CANNOT_BE_ZERO_OR_NEGATIVE: "Must be greater than zero."), so one is
+ * refused before any request.
+ */
+function assertPositiveAmount(amount: unknown, context: string): asserts amount is MinorUnitAmount {
+  assertMinorUnitAmount(amount, context);
+  if (amount === 0) {
+    throw PayFanoutError.invalidRequest(`${context} must be greater than zero: PayPal refuses a zero amount`);
   }
 }
 

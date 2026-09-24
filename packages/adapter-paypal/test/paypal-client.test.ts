@@ -20,7 +20,7 @@ interface FakePayPal extends PayPalJsLike {
   created: ButtonsRecord[];
   /** The wired-up callbacks of the most recent Buttons instance. */
   drive(): {
-    createOrder: () => string;
+    createOrder: () => Promise<string>;
     onApprove: (data?: { orderID?: string }) => void;
     onCancel: () => void;
     onError: (err: unknown) => void;
@@ -34,7 +34,7 @@ function makeFakePayPal(overrides: { eligible?: boolean; renderError?: unknown; 
     drive() {
       const options = created.at(-1)!.options;
       return {
-        createOrder: options["createOrder"] as () => string,
+        createOrder: options["createOrder"] as () => Promise<string>,
         onApprove: options["onApprove"] as (data?: { orderID?: string }) => void,
         onCancel: options["onCancel"] as () => void,
         onError: options["onError"] as (err: unknown) => void,
@@ -121,7 +121,7 @@ describe("PayPalClientAdapter", () => {
     expect(ready).toBe(true);
     // Approval hasn't happened — the host's Pay button starts disabled.
     expect(changes).toEqual([{ complete: false, empty: true }]);
-    expect(fake.drive().createOrder()).toBe(ORDER_ID); // the server-created order id
+    await expect(fake.drive().createOrder()).resolves.toBe(ORDER_ID); // the server-created order id
   });
 
   it("approve-then-confirm resolves immediately with the approved order id", async () => {
@@ -190,11 +190,13 @@ describe("PayPalClientAdapter", () => {
     expect(result.status).toBe("failed");
     expect(result.error?.code).toBe("processing_error");
     expect(result.error?.raw).toBe(sdkError);
+    expect(result.error?.retryable).toBe(false); // PayPal's catch-all
     expect(isPayFanoutError(result.error)).toBe(true);
     expect(surfaced).toHaveLength(0); // consumed by the waiter
 
     fake.drive().onError(sdkError); // nobody waiting now
     expect(surfaced).toHaveLength(1);
+    expect(surfaced[0]).toMatchObject({ code: "processing_error", retryable: false, raw: sdkError });
   });
 
   it("an error clears a previous approval — confirm waits again", async () => {
@@ -251,7 +253,7 @@ describe("PayPalClientAdapter", () => {
     const options = fake.created[0]!.options;
     expect(options["style"]).toEqual({ layout: "horizontal", color: "blue" });
     expect(options["fundingSource"]).toBe("paypal");
-    expect((options["createOrder"] as () => string)()).toBe(ORDER_ID);
+    await expect((options["createOrder"] as () => Promise<string>)()).resolves.toBe(ORDER_ID);
     expect(hostCreateOrder).not.toHaveBeenCalled();
   });
 
@@ -271,6 +273,7 @@ describe("PayPalClientAdapter", () => {
     await expect(
       adapter.mount(container, { clientSecret: ORDER_ID, onError: (err) => surfaced.push(err) }),
     ).rejects.toThrowError(/funding/);
+    expect(surfaced[0]).toMatchObject({ code: "invalid_request", retryable: false }); // passed through untouched
     expect(container.children[0]!.remove).toHaveBeenCalled(); // no orphaned wrapper
     expect(surfaced).toHaveLength(1);
   });
@@ -282,6 +285,7 @@ describe("PayPalClientAdapter", () => {
     const container = fakeContainer();
     await expect(adapter.mount(container, { clientSecret: ORDER_ID })).rejects.toMatchObject({
       code: "processing_error",
+      retryable: true, // mounting again can succeed
     });
     expect(container.children[0]!.remove).toHaveBeenCalled();
   });

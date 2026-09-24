@@ -110,6 +110,11 @@ a mismatch fails late, at approval time, with an SDK error.
   (`layout`/`color`/`shape`/`label`/`height`) and `fundingSource`; `appearance` is the
   `style` fallback. The adapter owns only `createOrder`/`onApprove`/`onCancel`/`onError`
   (they are the integration itself).
+- A button render that fails, and anything the buttons deliver through `onError`, surface
+  as `processing_error` with the SDK's error on `raw`. The `onError` ones are **not
+  retryable**: PayPal's [JS SDK reference](https://developer.paypal.com/sdk/js/v5/reference#onerror)
+  documents that callback as a catch-all with nothing to handle beyond a generic error
+  message or page. A failed render is retryable, since mounting again can succeed.
 - `locale` is a load-time SDK param — set it on the adapter config, not per mount.
 - `userAction` is the client half of the server's `userAction`: `"continue"` (default)
   loads the SDK with `commit=false`, so the popup's final button says **Continue** and

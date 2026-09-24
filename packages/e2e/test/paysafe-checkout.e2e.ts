@@ -47,8 +47,8 @@ test("auto (routed): the server's PaymentRouter picks the PSP by currency; check
   const payButton = page.getByRole("button", { name: /pay/i });
   await expect(payButton).toBeDisabled();
 
-  await fillHostedField("Numéro de carte", "4111111111111111");
-  await fillHostedField("MM/AA", "12/30");
+  await fillHostedField("Card number", "4111111111111111");
+  await fillHostedField("MM/YY", "12/30");
   await fillHostedField("CVV", "111");
 
   await expect(payButton).toBeEnabled({ timeout: 15_000 });
@@ -85,8 +85,8 @@ test("save-and-pay on Paysafe: vault the tokenized card, then recharge it off-se
   // uniqueness record for 4111… (deleted ghost profile) permanently 7503s
   // public-key-origin conversions of that card. Re-runs of THIS card on the
   // same demo customer self-heal via the adapter's 7503 recovery.
-  await fillHostedField("Numéro de carte", "4510150000000321");
-  await fillHostedField("MM/AA", "12/30");
+  await fillHostedField("Card number", "4510150000000321");
+  await fillHostedField("MM/YY", "12/30");
   await fillHostedField("CVV", "111");
 
   // Save-and-pay: tokenize -> server converts to MULTI_USE -> charges the stored token.
@@ -138,8 +138,8 @@ test("tokenizes in hosted fields and completes on the server via the same PayBut
       throw new Error(`No hosted field found for "${name}" yet`);
     }).toPass({ timeout: 30_000, intervals: [500] });
   };
-  await fillHostedField("Numéro de carte", "4111111111111111");
-  await fillHostedField("MM/AA", "12/30");
+  await fillHostedField("Card number", "4111111111111111");
+  await fillHostedField("MM/YY", "12/30");
   await fillHostedField("CVV", "111");
 
   const urlBefore = page.url();

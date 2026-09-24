@@ -230,6 +230,121 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
     expect(adapter.getCapabilities().supportsMultiCapture).toBe(true);
   });
 
+  it("capturing the rest sends the uncaptured remainder explicitly, as the final capture", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    await adapter.capturePayment(orderId, 700, "k-cap-1");
+    const rest = await adapter.capturePayment(orderId, undefined, "k-cap-rest");
+    // PayPal reads a capture without an amount as the FULL authorized amount.
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "13.00" }, final_capture: true });
+    expect(rest.status).toBe("succeeded");
+    expect(rest.amount).toBe(2000);
+    expect(rest.amountCaptured).toBe(2000);
+    expect(rest.amountCapturable).toBe(0);
+    expect(fake.uniqueCaptureCreations).toBe(2);
+  });
+
+  it("an explicit capture of the whole remainder is the final capture too", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    await adapter.capturePayment(orderId, 700, "k-cap-1");
+    const rest = await adapter.capturePayment(orderId, 1300, "k-cap-2");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "13.00" }, final_capture: true });
+    expect(rest.amountCaptured).toBe(2000);
+    // The final capture closed the authorization: PayPal refuses anything further.
+    await expect(adapter.capturePayment(orderId, 100, "k-cap-3")).rejects.toMatchObject({
+      code: "invalid_request",
+      raw: { details: [{ issue: "AUTHORIZATION_ALREADY_CAPTURED" }] },
+    });
+  });
+
+  it("capturing the rest once captures took it all answers with the payment, without a capture call", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    const all = await adapter.capturePayment(orderId, undefined, "k-cap-all");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "20.00" }, final_capture: true });
+    expect(all.amountCaptured).toBe(2000);
+
+    // The same-key retry a host sends when that capture's response was lost.
+    const before = fake.requestCount;
+    const retried = await adapter.capturePayment(orderId, undefined, "k-cap-all");
+    expect(retried).toEqual(all);
+    expect(fake.requestCount - before).toBe(1); // the order read only
+    expect(fake.uniqueCaptureCreations).toBe(1);
+
+    // After a partial capture, the rest and then another capture of the rest.
+    const partial = await authorizedPayment(makePair());
+    await partial.adapter.capturePayment(partial.orderId, 700, "k-part");
+    const rest = await partial.adapter.capturePayment(partial.orderId, undefined, "k-rest");
+    expect(rest.amountCaptured).toBe(2000);
+    await expect(partial.adapter.capturePayment(partial.orderId, undefined, "k-rest")).resolves.toEqual(rest);
+    expect(partial.fake.uniqueCaptureCreations).toBe(2);
+
+    // A voided authorization — also how PayPal reports an expired one — has nothing left either.
+    const voided = await authorizedPayment(makePair());
+    await voided.adapter.cancelPayment(voided.orderId, "k-void");
+    await expect(voided.adapter.capturePayment(voided.orderId, undefined, "k-cap")).rejects.toThrowError(
+      /nothing left to capture \(authorization \w+ is VOIDED\)/,
+    );
+    expect(voided.fake.uniqueCaptureCreations).toBe(0);
+  });
+
+  it("captures, reads, and captures the rest by the capture id an earlier capture returned", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    const first = await adapter.capturePayment(orderId, 700, "k-cap-1");
+    expect(first.pspPaymentId).toMatch(/^2GG/); // the id hosts store once money moved
+
+    const second = await adapter.capturePayment(first.pspPaymentId, 500, "k-cap-2");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "5.00" }, final_capture: false });
+    expect(second.amountCaptured).toBe(1200);
+    expect(second.amountCapturable).toBe(800);
+    expect(second.pspPaymentId).toBe(first.pspPaymentId); // the stored id stays the canonical one
+
+    expect((await adapter.retrievePayment(first.pspPaymentId)).amountCaptured).toBe(1200);
+    await expect(adapter.cancelPayment(first.pspPaymentId, "k-void")).rejects.toThrowError(/already captured/);
+
+    const rest = await adapter.capturePayment(first.pspPaymentId, undefined, "k-cap-rest");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "8.00" }, final_capture: true });
+    expect(rest.amountCaptured).toBe(2000);
+  });
+
+  it("a PENDING capture keeps its slice of the authorization", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({ ...sessionInput, captureMethod: "manual" });
+    fake.approveOrder(session.pspSessionId, { pendingCapture: true });
+    await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: session.pspSessionId,
+      idempotencyKey: "k-auth",
+    });
+    const pending = await adapter.capturePayment(session.pspSessionId, 700, "k-cap-1");
+    expect(pending.status).toBe("processing");
+    expect(pending.amountCaptured).toBe(0); // nothing settled yet
+    expect(pending.amountCapturable).toBe(1300);
+
+    await adapter.capturePayment(session.pspSessionId, undefined, "k-cap-rest");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "13.00" }, final_capture: true });
+  });
+
+  it("captures the rest in a zero-decimal currency (JPY)", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({
+      amount: 5000,
+      currency: "JPY",
+      captureMethod: "manual",
+      idempotencyKey: "k-jpy",
+    });
+    fake.approveOrder(session.pspSessionId);
+    await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: session.pspSessionId,
+      idempotencyKey: "k-jpy-auth",
+    });
+    await adapter.capturePayment(session.pspSessionId, 1200, "k-jpy-1");
+    const rest = await adapter.capturePayment(session.pspSessionId, undefined, "k-jpy-rest");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "JPY", value: "3800" }, final_capture: true });
+    expect(rest.currency).toBe("JPY");
+    expect(rest.amountCaptured).toBe(5000);
+    expect(rest.amountCapturable).toBe(0);
+  });
+
   it("refuses to refund by order id once several captures exist — names the capture ids", async () => {
     const { adapter, orderId } = await authorizedPayment();
     const first = await adapter.capturePayment(orderId, 700, "k-cap-1");
@@ -266,6 +381,50 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
     // A distinct key is a distinct charge — multi-capture demands per-capture keys.
     const second = await adapter.capturePayment(orderId, 500, "k-cap-fresh");
     expect(second.amountCaptured).toBe(1000);
+  });
+
+  it("a same-key retry of a partial capture replays it, though final_capture reads the new remainder", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    await adapter.capturePayment(orderId, 500, "k-cap-a");
+    await adapter.capturePayment(orderId, 1200, "k-cap-b"); // 3.00 left
+
+    // The first capture is retried after the second landed: 5.00 now covers the 3.00 left,
+    // so the body says final_capture: true, but PayPal replays by the PayPal-Request-Id
+    // header and answers the original capture.
+    const retried = await adapter.capturePayment(orderId, 500, "k-cap-a");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "5.00" }, final_capture: true });
+    expect(fake.uniqueCaptureCreations).toBe(2);
+    expect(retried.amountCaptured).toBe(1700);
+    expect(retried.amountCapturable).toBe(300); // the replay closed nothing
+
+    const rest = await adapter.capturePayment(orderId, undefined, "k-cap-rest");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "3.00" }, final_capture: true });
+    expect(rest.amountCaptured).toBe(2000);
+  });
+
+  it("a capture in another currency than the authorization's is refused", async () => {
+    const fake = new FakePayPalApi({ webhookId: WEBHOOK_ID });
+    // Resends authorization captures in EUR, as a capture in the wrong currency would go out.
+    const inEuros: typeof fetch = (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if (!/\/v2\/payments\/authorizations\/[^/]+\/capture$/.test(new URL(url).pathname)) return fake.fetch(input, init);
+      return fake.fetch(input, { ...init, body: String(init?.body).replace('"currency_code":"USD"', '"currency_code":"EUR"') });
+    };
+    const adapter = new PayPalServerAdapter({
+      clientId: fake.clientId,
+      clientSecret: fake.clientSecret,
+      environment: "sandbox",
+      fetch: inEuros,
+      sleep: async () => {},
+    });
+    const { orderId } = await authorizedPayment({ adapter, fake });
+    await expect(adapter.capturePayment(orderId, 500, "k-cap")).rejects.toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      raw: { details: [{ issue: "AUTH_CAPTURE_CURRENCY_MISMATCH" }] },
+    });
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "EUR", value: "5.00" }, final_capture: false });
+    expect(fake.uniqueCaptureCreations).toBe(0);
   });
 
   it("rejects captures beyond the authorized amount via the PSP error", async () => {

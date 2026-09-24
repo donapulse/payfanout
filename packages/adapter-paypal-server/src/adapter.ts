@@ -30,7 +30,7 @@ import {
   type UpdatePaymentSessionInput,
   type VerifyCredentialsResult,
 } from "@payfanout/core";
-import { mapPayPalError, PAYPAL_PSP_NAME } from "./error-map.js";
+import { mapPayPalError, PAYPAL_PSP_NAME, payPalErrorIssue } from "./error-map.js";
 import { derivePayPalRequestId } from "./request-id.js";
 import { fromPayPalValue, PAYPAL_SUPPORTED_CURRENCIES, toPayPalValue } from "./money.js";
 import {
@@ -160,6 +160,7 @@ export interface PayPalOrderLike {
   }>;
   payment_source?: {
     paypal?: { email_address?: string; account_id?: string };
+    venmo?: { email_address?: string; account_id?: string; user_name?: string };
     card?: { brand?: string; last_digits?: string };
   };
   links?: PayPalLinkLike[];
@@ -223,7 +224,8 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       supportsRefundRetrieval: true, // GET /v2/payments/refunds/{id}
       supportsManualCapture: true, // intent AUTHORIZE + authorization capture
       // final_capture=false keeps an authorization open for repeated partial
-      // captures (CAPTURE-intent orders settle exactly once).
+      // captures until one takes the rest (CAPTURE-intent orders settle
+      // exactly once).
       supportsMultiCapture: true,
       modificationOutcome: "synchronous",
       supportsPaymentMethodVerification: false, // no zero-amount check for wallet approvals
@@ -307,7 +309,8 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * Tokenize-first completion: the client's confirm() resolves with the
    * approved order id as clientToken; money moves here. CAPTURE-intent orders
    * capture, AUTHORIZE-intent orders authorize (capture comes later via
-   * capturePayment).
+   * capturePayment). A completion repeated under another key answers with the
+   * order's existing capture or authorization, never a second one.
    */
   async completePayment(input: CompletePaymentInput): Promise<PaymentInfo> {
     if (!input.clientToken) {
@@ -328,12 +331,45 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       `/v2/checkout/orders/${encodeURIComponent(input.pspSessionId)}`,
     );
     const action = (order.intent ?? "CAPTURE").toUpperCase() === "AUTHORIZE" ? "authorize" : "capture";
-    const finalized = await this.request<PayPalOrderLike>(
-      "POST",
-      `/v2/checkout/orders/${encodeURIComponent(input.pspSessionId)}/${action}`,
-      { json: {}, requestId: await derivePayPalRequestId(input.idempotencyKey) },
-    );
+    let finalized: PayPalOrderLike;
+    try {
+      finalized = await this.request<PayPalOrderLike>(
+        "POST",
+        `/v2/checkout/orders/${encodeURIComponent(input.pspSessionId)}/${action}`,
+        { json: {}, requestId: await derivePayPalRequestId(input.idempotencyKey) },
+      );
+    } catch (err) {
+      finalized = await this.alreadyCompletedOrder(err, input.pspSessionId, action);
+    }
     return this.orderToPaymentInfo(finalized);
+  }
+
+  /**
+   * PayPal answers a second capture/authorize of a completed order with
+   * ORDER_ALREADY_CAPTURED / ORDER_ALREADY_AUTHORIZED. For the first, its
+   * troubleshooting guide says to read the order ("No further action is
+   * needed. Make a GET call on the order ID to get the capture ID"); for the
+   * second it says the funds are ready to capture ("call capture as the funds
+   * have been authorized"), so the order is read the same way to return that
+   * authorization for capturePayment. The re-read counts only while it is
+   * still the session's order — the order id is all a PayPal session carries
+   * — and COMPLETED with the money object its intent creates; otherwise the
+   * original rejection stands. A re-read that fails surfaces its own error, so
+   * an outage stays a retryable psp_unavailable.
+   */
+  private async alreadyCompletedOrder(
+    err: unknown,
+    orderId: string,
+    action: "capture" | "authorize",
+  ): Promise<PayPalOrderLike> {
+    const issue = err instanceof PayFanoutError ? payPalErrorIssue(err.raw) : undefined;
+    if (issue !== "ORDER_ALREADY_CAPTURED" && issue !== "ORDER_ALREADY_AUTHORIZED") throw err;
+    const order = await this.request<PayPalOrderLike>("GET", `/v2/checkout/orders/${encodeURIComponent(orderId)}`);
+    const payments = order.purchase_units?.[0]?.payments;
+    const outcome = action === "capture" ? payments?.captures : payments?.authorizations;
+    const completed = order.id === orderId && (order.status ?? "").toUpperCase() === "COMPLETED";
+    if (!completed || !outcome?.length) throw err;
+    return order;
   }
 
   /**
@@ -374,10 +410,28 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
   }
 
   /**
-   * Manual capture of an AUTHORIZE-intent payment; pspPaymentId is the order
-   * id. Each partial capture is its own charge under its own required key —
-   * a reused key replays the earlier capture via PayPal-Request-Id and moves
-   * no new money.
+   * Manual capture of an AUTHORIZE-intent payment. pspPaymentId is the order
+   * id or one of its capture ids (what completion and every capture return
+   * once money moved). Each partial capture is its own charge under its own
+   * required key — a reused key replays the earlier capture via
+   * PayPal-Request-Id and moves no new money.
+   *
+   * PayPal reads a capture without an amount as the FULL authorized amount,
+   * so `amount: undefined` goes out as the explicit uncaptured remainder:
+   * the authorized amount minus every capture that took money (PENDING ones
+   * included, DECLINED/FAILED ones took none). A capture covering the
+   * remainder is sent with final_capture: true, which closes the
+   * authorization; a smaller one keeps it open for the next capture. The flag
+   * reads the remainder at call time, so a same-key retry can send a
+   * different body; PayPal replays by PayPal-Request-Id either way.
+   *
+   * Once earlier captures took the whole authorization, capturing the rest
+   * sends no capture and answers with the payment, under the same key or a
+   * new one: the adapter keeps no state, so it cannot tell a retry whose
+   * response was lost from a new call, and a capture without an amount would
+   * ask PayPal for the full authorized amount again. Capturing the rest of an
+   * authorization voided or denied before captures took it all rejects before
+   * any capture call.
    */
   async capturePayment(
     pspPaymentId: string,
@@ -385,10 +439,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     idempotencyKey: string,
   ): Promise<PaymentInfo> {
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
-    const order = await this.request<PayPalOrderLike>(
-      "GET",
-      `/v2/checkout/orders/${encodeURIComponent(pspPaymentId)}`,
-    );
+    const order = await this.resolveOrder(pspPaymentId);
     const unit = order.purchase_units?.[0];
     const authorization = unit?.payments?.authorizations?.[0];
     if (!authorization) {
@@ -397,35 +448,64 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
         order,
       );
     }
-    const currency = (unit?.amount?.currency_code ?? "USD").toUpperCase();
+    // PayPal requires the capture in the authorization's own currency.
+    const currency = (authorization.amount?.currency_code ?? unit?.amount?.currency_code ?? "USD").toUpperCase();
+    const captures = unit?.payments?.captures ?? [];
+    const held = heldCaptureTotal(captures, currency);
+    const authorized = authorizedAmount(authorization, currency);
+    let captureAmount = amount;
+    let finalCapture: boolean;
+    if (authorized === undefined) {
+      if (captureAmount === undefined && held > 0) {
+        throw PayFanoutError.invalidRequest(
+          `Payment "${pspPaymentId}" reports no authorized amount, so the remainder after earlier captures is unknown — pass an explicit capture amount`,
+          order,
+        );
+      }
+      // Without an amount (reached only while nothing was captured) PayPal
+      // takes the full authorized amount, which leaves nothing to keep open.
+      finalCapture = captureAmount === undefined;
+    } else {
+      const remainder = capturableRemainder(authorization, captures, held, authorized);
+      if (captureAmount === undefined) {
+        if (remainder === 0) {
+          // PayPal is not called, so no money moves; the answer matches what the
+          // capture that took the rest returned.
+          if (isFullyCaptured(authorization, captures, held, authorized)) return this.orderToPaymentInfo(order);
+          throw PayFanoutError.invalidRequest(
+            `Payment "${pspPaymentId}" has nothing left to capture (authorization ${authorization.id} is ${authorization.status ?? "in an unreported state"})`,
+            order,
+          );
+        }
+        captureAmount = remainder;
+      }
+      finalCapture = captureAmount >= remainder;
+    }
     await this.request<PayPalCaptureLike>(
       "POST",
       `/v2/payments/authorizations/${encodeURIComponent(authorization.id)}/capture`,
       {
         requestId: await derivePayPalRequestId(idempotencyKey),
         json: {
-          ...(amount !== undefined ? { amount: { currency_code: currency, value: toPayPalValue(amount, currency) } } : {}),
-          // Leave the authorization open for further partial captures; PayPal
-          // releases whatever is left when the authorization expires.
-          final_capture: false,
+          ...(captureAmount !== undefined
+            ? { amount: { currency_code: currency, value: toPayPalValue(captureAmount, currency) } }
+            : {}),
+          final_capture: finalCapture,
         },
       },
     );
-    return this.retrievePayment(pspPaymentId);
+    return this.retrievePayment(order.id);
   }
 
   /**
-   * Voids the authorization of an AUTHORIZE-intent payment. CAPTURE-intent
-   * orders cannot be cancelled via the API — they expire on their own, so
-   * cancelling one is rejected rather than faked.
+   * Voids the authorization of an AUTHORIZE-intent payment (order id or one of
+   * its capture ids). CAPTURE-intent orders cannot be cancelled via the API —
+   * they expire on their own, so cancelling one is rejected rather than faked.
    */
   async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
     let order: PayPalOrderLike;
     try {
-      order = await this.request<PayPalOrderLike>(
-        "GET",
-        `/v2/checkout/orders/${encodeURIComponent(pspPaymentId)}`,
-      );
+      order = await this.resolveOrder(pspPaymentId, "captured payments cannot be canceled, refund them instead");
     } catch (err) {
       if (!isNotFound(err)) throw err;
       throw PayFanoutError.invalidRequest(
@@ -453,7 +533,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
           },
         );
       }
-      return this.retrievePayment(pspPaymentId);
+      return this.retrievePayment(order.id);
     }
     throw PayFanoutError.invalidRequest(
       "PayPal has no order-cancel API — an un-captured order simply expires; void applies only to authorized (AUTHORIZE-intent) payments",
@@ -461,7 +541,13 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     );
   }
 
-  /** Refunds settle against the CAPTURE — order ids are resolved to it here. */
+  /**
+   * Refunds settle against the CAPTURE — order ids are resolved to it here.
+   * `reason` is not forwarded: PayPal's only reason field, note_to_payer,
+   * is payer-facing text ("Appears in both the payer's transaction history
+   * and the emails that the payer receives"), and a reason code is not a
+   * message for the payer.
+   */
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
     if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
     const target = await this.resolveCapture(req.pspPaymentId);
@@ -470,13 +556,10 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       `/v2/payments/captures/${encodeURIComponent(target.captureId)}/refund`,
       {
         requestId: await derivePayPalRequestId(req.idempotencyKey),
-        json: {
-          ...(req.amount !== undefined
+        json:
+          req.amount !== undefined
             ? { amount: { currency_code: target.currency, value: toPayPalValue(req.amount, target.currency) } }
-            : {}),
-          // PayPal caps note_to_payer at 255 characters.
-          ...(req.reason ? { note_to_payer: req.reason.slice(0, 255) } : {}),
-        },
+            : {},
       },
     );
     return {
@@ -791,8 +874,13 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     const refunds = unit?.payments?.refunds ?? [];
     const currency = (unit?.amount?.currency_code ?? captures[0]?.amount?.currency_code ?? "USD").toUpperCase();
     const activeCaptures = captures.filter((c) => !isFailedCaptureStatus(c.status));
-    const captured = sumPayPalAmounts(activeCaptures.map((c) => c.amount), currency);
-    let refunded = sumPayPalAmounts(refunds.map((r) => r.amount), currency);
+    const captured = heldCaptureTotal(captures, currency);
+    // FAILED/CANCELLED refunds returned nothing. PENDING ones count: that
+    // money is on its way back and must never look refundable again.
+    let refunded = sumPayPalAmounts(
+      refunds.filter((r) => !isFailedRefundStatus(r.status)).map((r) => r.amount),
+      currency,
+    );
     if (refunds.length === 0) {
       // Without an embedded refunds[] list the capture status is the only
       // witness: full REFUNDED maps to the capture amount; PARTIALLY_REFUNDED
@@ -813,7 +901,11 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       currency,
     );
     const authorization = unit?.payments?.authorizations?.[0];
-    const amountCapturable = authorization ? capturableRemainder(authorization, captured, currency) : undefined;
+    const authorized = authorization ? authorizedAmount(authorization, currency) : undefined;
+    const amountCapturable =
+      authorization && authorized !== undefined
+        ? capturableRemainder(authorization, captures, captured, authorized)
+        : undefined;
     return {
       id: unit?.custom_id ?? order.id,
       pspName: this.pspName,
@@ -862,11 +954,38 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       amountCaptured: status === "succeeded" ? amount : 0,
       currency,
       paymentMethodType: "paypal",
-      paymentMethodDetails: { wallet: "paypal" },
+      // No paymentMethodDetails: a capture carries no payment_source, so
+      // nothing says which wallet paid.
       createdAt: capture.create_time ?? EPOCH,
       ...(status === "succeeded" && capture.create_time ? { capturedAt: capture.create_time } : {}),
       raw: capture,
     };
+  }
+
+  /**
+   * The order behind a payment id: the id itself when it is an order, else a
+   * capture id resolved through the capture's related order
+   * (supplementary_data.related_ids.order_id). `orphanHint` completes the
+   * rejection for a capture that names no parent order.
+   */
+  private async resolveOrder(pspPaymentId: string, orphanHint?: string): Promise<PayPalOrderLike> {
+    try {
+      return await this.request<PayPalOrderLike>("GET", `/v2/checkout/orders/${encodeURIComponent(pspPaymentId)}`);
+    } catch (err) {
+      if (!isNotFound(err)) throw err;
+      const capture = await this.request<PayPalCaptureLike>(
+        "GET",
+        `/v2/payments/captures/${encodeURIComponent(pspPaymentId)}`,
+      );
+      const orderId = parentOrderId(capture);
+      if (!orderId) {
+        throw PayFanoutError.invalidRequest(
+          `PayPal capture "${pspPaymentId}" names no parent order${orphanHint ? ` — ${orphanHint}` : ""}`,
+          capture,
+        );
+      }
+      return this.request<PayPalOrderLike>("GET", `/v2/checkout/orders/${encodeURIComponent(orderId)}`);
+    }
   }
 
   private async resolveCapture(
@@ -1064,23 +1183,75 @@ function isFailedCaptureStatus(status: string | undefined): boolean {
 }
 
 /**
- * Authorized-but-uncaptured remainder. `held` counts every non-failed capture
- * (PENDING ones already reserve their slice); VOIDED/DENIED/CAPTURED
- * authorizations report 0 — nothing is left to take.
+ * What the captures took from the authorization. DECLINED ("The funds could
+ * not be captured") and FAILED captures took nothing; a PENDING one has its
+ * slice, and leaving it out would let a capture of the rest overlap it within
+ * PayPal's overage limit (by default up to 115% of the authorized amount or
+ * USD 75 more, whichever is less; PSD2 countries allow none).
+ */
+function heldCaptureTotal(captures: PayPalCaptureLike[], fallbackCurrency: string): MinorUnitAmount {
+  return sumPayPalAmounts(
+    captures.filter((c) => !isFailedCaptureStatus(c.status)).map((c) => c.amount),
+    fallbackCurrency,
+  );
+}
+
+/** FAILED ("could not be processed") and CANCELLED refunds returned no money. */
+function isFailedRefundStatus(status: string | undefined): boolean {
+  return mapRefundStatus(status) === "failed";
+}
+
+/** The authorized amount in minor units; undefined when PayPal reports none. */
+function authorizedAmount(
+  authorization: PayPalAuthorizationLike,
+  fallbackCurrency: string,
+): MinorUnitAmount | undefined {
+  const money = authorization.amount;
+  if (money?.value === undefined) return undefined;
+  return fromPayPalValue(money.value, money.currency_code ?? fallbackCurrency);
+}
+
+/**
+ * A capture that took money went out with final_capture, which closes the
+ * authorization ("additional captures are not possible") whatever status the
+ * authorization still reports.
+ */
+function hasFinalCapture(captures: PayPalCaptureLike[]): boolean {
+  return captures.some((c) => c.final_capture === true && !isFailedCaptureStatus(c.status));
+}
+
+/**
+ * Authorized-but-uncaptured remainder of `authorized`. `held` counts every
+ * non-failed capture (PENDING ones already reserve their slice). Nothing is
+ * left to take once a final capture closed the authorization or it is
+ * VOIDED, DENIED or CAPTURED. The status set has no EXPIRED: an
+ * authorization past its validity period reports VOIDED.
  */
 function capturableRemainder(
   authorization: PayPalAuthorizationLike,
+  captures: PayPalCaptureLike[],
   held: MinorUnitAmount,
-  fallbackCurrency: string,
-): MinorUnitAmount | undefined {
-  if (authorization.amount?.value === undefined) return undefined;
-  const authorized = fromPayPalValue(
-    authorization.amount.value,
-    authorization.amount.currency_code ?? fallbackCurrency,
-  );
+  authorized: MinorUnitAmount,
+): MinorUnitAmount {
   const state = (authorization.status ?? "").toUpperCase();
   const open = state === "CREATED" || state === "PENDING" || state === "PARTIALLY_CAPTURED";
-  return open ? Math.max(0, authorized - held) : 0;
+  return open && !hasFinalCapture(captures) ? Math.max(0, authorized - held) : 0;
+}
+
+/**
+ * Whether captures, not a void or a denial, took the whole authorization:
+ * PayPal closed it as CAPTURED, a capture that took money went out as the
+ * final one, or the captures that took money cover the authorized amount.
+ */
+function isFullyCaptured(
+  authorization: PayPalAuthorizationLike,
+  captures: PayPalCaptureLike[],
+  held: MinorUnitAmount,
+  authorized: MinorUnitAmount,
+): boolean {
+  if (held === 0) return false;
+  if ((authorization.status ?? "").toUpperCase() === "CAPTURED") return true;
+  return hasFinalCapture(captures) || held >= authorized;
 }
 
 function sumPayPalAmounts(amounts: Array<PayPalMoney | undefined>, fallbackCurrency: string): number {
@@ -1123,7 +1294,8 @@ function detailsFrom(source: PayPalOrderLike["payment_source"]): PaymentMethodDe
   // may surface payment_source.card instead — prefer its display facts.
   const card = source.card;
   return {
-    wallet: "paypal",
+    // A Venmo-funded order reports payment_source.venmo; its receipt says Venmo.
+    wallet: source.venmo ? "venmo" : "paypal",
     ...(card?.brand ? { brand: card.brand.toLowerCase() } : {}),
     ...(card?.last_digits ? { last4: card.last_digits } : {}),
   };

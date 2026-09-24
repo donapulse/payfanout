@@ -5,6 +5,7 @@ import {
   PAYPAL_SUPPORTED_CURRENCIES,
   PayPalServerAdapter,
   paypalOnboarding,
+  type PayPalOrderLike,
   type PayPalServerAdapterConfig,
 } from "../src/index.js";
 import { FakePayPalApi } from "./fake-paypal-api.js";
@@ -510,7 +511,8 @@ describe("PayPalServerAdapter specifics", () => {
     });
     expect(partial.status).toBe("succeeded");
     expect(partial.amount).toBe(1500);
-    expect(fake.lastRequestBody).toMatchObject({ note_to_payer: "requested_by_customer" });
+    // note_to_payer is payer-facing text; a reason code never goes out as one.
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "15.00" } });
 
     let info = await adapter.retrievePayment(session.pspSessionId);
     expect(info.amountRefunded).toBe(1500);
@@ -528,6 +530,70 @@ describe("PayPalServerAdapter specifics", () => {
     expect(polled.amount).toBe(1500);
     expect(polled.pspPaymentId).toBe(info.pspPaymentId); // capture id from links[rel=up]
     expect(polled.createdAt).toBeDefined();
+  });
+
+  it("never sends a refund reason code to the payer as note_to_payer", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({ amount: 3000, currency: "USD", idempotencyKey: "k" });
+    fake.approveOrder(session.pspSessionId);
+    const paid = await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: session.pspSessionId,
+      idempotencyKey: "k-c",
+    });
+    for (const reason of ["duplicate", "fraudulent", "requested_by_customer"] as const) {
+      await adapter.refundPayment({ pspPaymentId: paid.pspPaymentId, amount: 100, reason, idempotencyKey: `r-${reason}` });
+      expect(fake.lastRequestBody, reason).not.toHaveProperty("note_to_payer");
+    }
+    // A full refund keeps PayPal's documented empty body.
+    const rest = await adapter.refundPayment({ pspPaymentId: paid.pspPaymentId, reason: "duplicate", idempotencyKey: "r-rest" });
+    expect(fake.lastRequestBody).toEqual({});
+    expect(rest.amount).toBe(2700);
+    expect(fake.uniqueRefundCreations).toBe(4);
+  });
+
+  it("a completion repeated under a new key returns the existing capture — never a second one", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({ id: "order-5", amount: 2500, currency: "USD", idempotencyKey: "k" });
+    fake.approveOrder(session.pspSessionId);
+    const first = await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: session.pspSessionId,
+      idempotencyKey: "k-complete-1",
+    });
+    // A double click or a retry with a fresh key: PayPal answers ORDER_ALREADY_CAPTURED.
+    const second = await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: session.pspSessionId,
+      idempotencyKey: "k-complete-2",
+    });
+    expect(second.status).toBe("succeeded");
+    expect(second.pspPaymentId).toBe(first.pspPaymentId);
+    expect(second.id).toBe("order-5");
+    expect(second.amountCaptured).toBe(2500);
+    expect(fake.uniqueCaptureCreations).toBe(1);
+  });
+
+  it("an authorization repeated under a new key returns the existing authorization", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({
+      amount: 2500,
+      currency: "USD",
+      captureMethod: "manual",
+      idempotencyKey: "k",
+    });
+    fake.approveOrder(session.pspSessionId);
+    const complete = (idempotencyKey: string) =>
+      adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken: session.pspSessionId, idempotencyKey });
+    await complete("k-auth-1");
+    // PayPal answers the second authorize with ORDER_ALREADY_AUTHORIZED.
+    const again = await complete("k-auth-2");
+    expect(again.status).toBe("requires_capture");
+    expect(again.pspPaymentId).toBe(session.pspSessionId);
+    expect(again.amountCapturable).toBe(2500);
+    const authorizations = (again.raw as PayPalOrderLike).purchase_units?.[0]?.payments?.authorizations ?? [];
+    expect(authorizations).toHaveLength(1);
+    expect(fake.uniqueCaptureCreations).toBe(0);
   });
 
   it("refusing to refund an uncaptured order names the problem", async () => {

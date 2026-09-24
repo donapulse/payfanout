@@ -1420,6 +1420,10 @@ sandbox round-trip before production use, and the setup guide carries that warni
   carrying the delimiter — so such an id would make every webhook for that payment fail
   verification, permanently and silently, after the shopper has paid. For a push-only
   provider that is total failure, so it is rejected while the host still owns the id.
+  Revised 2026-09-23: Adyen's own validators join the signed values unescaped, and the
+  verifier now accepts a `:` in `merchantReference` (see the escaping entry below). The
+  refusal stays as a conservative choice, so the references the adapter creates never rely
+  on that parse.
 - **The CLP/CVE/IDR/ISK exclusion is enforced on captures and refunds too**, not only at
   session creation: the composite `pspPaymentId` is documented, so a host can drive a
   modification for a payment created elsewhere, and an excluded currency would be priced
@@ -1466,9 +1470,44 @@ sandbox round-trip before production use, and the setup guide carries that warni
   whitespace to satisfy the raw-bytes assertion, but "Adyen never emits structural
   whitespace" is a guess about the wire format that no documentation supports, and a wrong
   guess rejects every legitimate delivery. The contract now models the scope instead.
+  Extended 2026-09-23, doc-verified against Adyen's Webhooks v1 OpenAPI contract
+  (`Adyen/adyen-openapi`, `json/Webhooks-v1.json`, spec release of 2026-09-10) and the
+  webhook structure page: before anything is signed, each item's signed values are checked
+  against the types that schema gives them. `pspReference`, `merchantAccountCode`,
+  `amount.currency`, `eventCode` and `success` must be present as strings,
+  `originalReference` and `merchantReference` must be strings when present (a `null` in
+  either reads as absent, added 2026-09-23: Adyen's Java `HMACValidator` documents "If any
+  value is null, it is represented as an empty string in the final payload" and its Node
+  validator's `join` does the same, so absent, `null` and `""` sign alike; `null` in a
+  required value stays refused), and
+  `amount.value` a safe integer ("The numeric value of the amount, in minor units",
+  `integer`/`int64`); anything else is refused as `malformed_payload`. The HMAC
+  authenticates the joined strings, not the JSON types carrying them: a boolean `true` and
+  the string "true" join alike, so the earlier coercing reader verified a re-typed copy of a
+  genuine delivery that the parser then read differently (a boolean `success` as a failure,
+  an array `eventCode` as an `unknown` event with the genuine event's id). Verification and
+  parsing now share one reader, so an event is built from exactly the values the signature
+  covered, and an envelope holding anything but notification items is refused whole. The
+  schema also lists `merchantReference` as required, but Adyen's capture and cancel examples
+  omit it, so it stays optional. Only the JSON method is read: the endpoint's other methods,
+  HTTP POST and SOAP, send bodies that are not JSON and fail verification.
 - **No escaping rule is documented for signed values containing the `:` delimiter**, so a
   delivery whose signed values contain `:` or `\` is refused as ambiguous rather than
   verified under an escaping convention Adyen would not apply on its side.
+  Revised 2026-09-23: the verification page's whole rule is "Assign an empty string to any
+  fields that are empty, and use a colon (":") to delimit the values", and Adyen's own
+  validators join the eight values with no escaping (`adyen-node-api-library`,
+  `src/utils/hmacValidator.ts`: `signedDataList.join(HmacValidator.DATA_SEPARATOR)`;
+  `adyen-java-api-library`, `HMACValidator.java`: `Util.implode(DATA_SEPARATOR,
+  signedDataList)`), so the verifier joins them the same way. A `:` is now refused only in
+  `pspReference`, `originalReference`, `merchantAccountCode`, `amount.currency`, `eventCode`
+  and `success`: with those colon-free and `value` an integer, the joined string splits into
+  the eight values one way only, so `merchantReference` may carry `:`. The `\` refusal is
+  dropped, since nothing escapes it. The earlier rule failed every delivery for a payment
+  created elsewhere on the same endpoint whose reference held a `:`, leaving it in Adyen's
+  retry queue, which retries for up to 30 days. Session creation keeps refusing `:` and `\`
+  in the references the adapter creates, as a conservative choice while no delivery from a
+  test account has been observed; it no longer protects verification, which accepts them.
 - **Event id is the pair `"{eventCode}:{pspReference}"`**: a redelivery repeats both, while
   `pspReference` alone is shared by a payment's own events and would collide. Modification
   events report the payment on `originalReference` and keep their own `pspReference` as
@@ -1479,6 +1518,56 @@ sandbox round-trip before production use, and the setup guide carries that warni
   claim. `CHARGEBACK_REVERSED` → `chargeback_won` and `SECOND_CHARGEBACK` →
   `chargeback_lost` follow Adyen's dispute documentation ("Lost", undefendable), with the
   caveat that a reversal is not final.
+  Corrected 2026-09-23 against the webhook-handling guide, the dispute webhooks and dispute
+  flow pages, and the capture, cancel and reversal guides. The pair is Adyen's own duplicate
+  definition: duplicates "have the same values in the `eventCode` and `pspReference` fields,
+  while the `eventDate` and other fields can be different. Your server should use the
+  details from the latest webhook event." So hosts upsert on the id, keeping the latest
+  `eventDate`. A bare `pspReference` is shared by several events, which is why the pair is the
+  id: every event of one dispute ("All events related to a dispute have the same PSP
+  reference"), `CAPTURE` and `CAPTURE_FAILED` (both carry the capture request's reference),
+  `REFUND` and `REFUND_FAILED` (the refund request's), and `AUTHORISATION`, `EXPIRE` and
+  `OFFER_CLOSED` (the payment's). Only refund-shaped events
+  report their `pspReference` as `refundId`. `CANCEL_OR_REFUND` does name its operation, in
+  `additionalData["modification.action"]` ("refund" or "cancel"), but outside the signed
+  values, so it stays `unknown`: reporting an outcome from it would present an unsigned
+  field as an accounting fact. `CAPTURE` with `success: "false"` → `unknown` (the capture
+  guide: "Review the reason, fix the issue if possible, and resubmit the capture request"),
+  and `TECHNICAL_CANCEL`, the outcome of a cancel requested by merchant reference, maps like
+  `CANCELLATION`. Dispute closures follow the statuses both dispute pages give:
+  `ISSUER_RESPONSE_TIMEFRAME_EXPIRED`, `PREARBITRATION_WON` and `SCHEME_ARBITRATION_WON`
+  ("Won") → `chargeback_won`; `PREARBITRATION_LOST`, `SCHEME_ARBITRATION_LOST` ("Lost") and
+  `DISPUTE_DEFENSE_PERIOD_ENDED` (a chargeback accepted or left undefended, its final stage)
+  → `chargeback_lost`. Pending stages stay `unknown`, including
+  `PREARBITRATION_ISSUER_WITHDRAWN` (the issuer can reopen pre-arbitration) and
+  `PREARBITRATION_ACCEPTED`, which the dispute webhooks page lists as "Pending" and the
+  dispute flow page as "Lost"; the second chargeback that follows it reports the loss either
+  way. A later loss overrides a reversal's provisional win, so hosts apply a payment's
+  events in `eventDate` order, with two limits: `eventDate` is unsigned, trusted only because
+  basic authentication authenticates the channel, and an unparseable one reads as the epoch
+  (time unknown); and a final stage (`SECOND_CHARGEBACK`, `SCHEME_ARBITRATION_WON`/`LOST`,
+  `DISPUTE_DEFENSE_PERIOD_ENDED`, `ISSUER_RESPONSE_TIMEFRAME_EXPIRED`, `PREARBITRATION_WON`)
+  is never overridden by a non-final one such as `CHARGEBACK_REVERSED`, whatever the dates. A
+  lost scheme arbitration arrives as `SCHEME_ARBITRATION_LOST` and then as a second chargeback
+  including the fees, so `chargeback_lost` is a state, never a sum.
+  `pspPaymentId` comes from `originalReference`, and from `pspReference` on `AUTHORISATION`,
+  `EXPIRE` and `OFFER_CLOSED`. On `CHARGEBACK_REVERSED`, `SECOND_CHARGEBACK` and
+  `PREARBITRATION_WON/LOST` it also comes from `pspReference` when `originalReference` is
+  absent (default, unconfirmed). The dispute webhooks page describes the Customer Area setting
+  "Include the originalReference for CHARGEBACK_REVERSED events" as returning "the PSP
+  reference of the payment in the `originalReference` field, and the PSP reference of the
+  dispute in the `pspReference`" for those four codes, which implies that without it
+  `pspReference` is the payment's. The additional-settings page says only "For
+  CHARGEBACK_REVERSED webhook events, receive the `pspReference` of the original payment." A
+  `pspReference` is globally unique, so a wrong reading only makes a host's lookup miss,
+  while reporting none would detach the dispute's outcome from its payment. Sandbox check:
+  which reference those four codes carry without the setting, which the setup guide asks
+  hosts to enable. Any other event without `originalReference` names no payment, since its
+  own reference is a modification's, a dispute's or, on `REPORT_AVAILABLE`, a file name.
+  `REFUND_NOT_CLEARED` and `SETTLED_REVERSED`, added to the Webhooks contract on
+  2026-09-10, stay `unknown` as payout-batch adjustments. `CAPTURE_FAILED` stays
+  `payment.failed` even though "Technical failures are automatically re-captured by Adyen
+  within 10 business days"; the setup guide flags it as not always final.
 - **`PaymentInfo.createdAt` falls back to epoch** — Checkout responses carry no creation
   timestamp and there is no read to fetch one; hosts take it from their own record or the
   webhook `eventDate`. The constant also keeps a replayed `completePayment` byte-identical.

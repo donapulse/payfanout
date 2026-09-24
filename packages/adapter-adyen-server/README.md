@@ -112,15 +112,32 @@ amount `value`/`currency`, `eventCode`, `success`):
   unsigned remainder of the payload (`additionalData`, `reason`, `paymentMethod`, …) arrived
   on — hosts read those fields from `event.raw`.
 
+Configure the endpoint with the **JSON** method: HTTP POST and SOAP deliveries are not JSON,
+so they fail verification.
+
 The signature covers those eight values rather than the delivered bytes, so a payload that
 was deserialized and re-serialized in transit still verifies — the adapter declares
 `webhookSignatureScope: "field-values"` and behaves accordingly, because refusing a
 re-encoded body would mean guessing Adyen's wire format and rejecting legitimate
 deliveries. What that scope costs is covered by the credentials above and by treating every
-unsigned field as untrusted input. A delivery whose signed values contain the `:` delimiter
-is refused (Adyen documents no escaping rule, so the signed payload would be ambiguous), as
-is one whose signed values were altered. `verifyAdyenWebhook` returns the specific reason;
-`verifyWebhookSignature` is the boolean the contract asks for.
+unsigned field as untrusted input. The signed values are read with the types Adyen's webhook
+schema gives them, so a delivery carrying one of another type (a boolean `success`, a string
+amount) is refused rather than coerced. Adyen joins the values with `:` and escapes nothing:
+a `:` is accepted in `merchantReference`, where it cannot change how the joined string
+splits, and refused in every other signed value, as is a delivery whose signed values were
+altered. `verifyAdyenWebhook` returns the specific reason; `verifyWebhookSignature` is the
+boolean the contract asks for.
+
+Events map by the outcomes Adyen documents. A refused capture or cancel request arrives as
+`unknown` — spot it by `raw.eventCode` (`CAPTURE`, `CANCELLATION` or `TECHNICAL_CANCEL`)
+with `raw.success` `"false"`, and read `raw.reason` — as does `CANCEL_OR_REFUND`, which names
+the operation only in an unsigned field;
+dispute closures arrive as `payment.chargeback_won` / `payment.chargeback_lost`, and a
+reversed chargeback's win can be overridden by a later loss. `event.id` is the pair
+`"{eventCode}:{pspReference}"` that defines a duplicate at Adyen, whose other fields may
+differ, so upsert on it and keep the latest delivery. The
+[setup guide](https://donapulse.github.io/payfanout/guide/adyen) has the full mapping and the
+Customer Area settings it relies on.
 
 ## What's inside
 
@@ -161,9 +178,10 @@ is one whose signed values were altered. `verifyAdyenWebhook` returns the specif
   not store a request an internal error stopped, and the retry carries the same key.
 - **`returnUrl` is required on every payment.** Pass it per session, or set
   `defaultReturnUrl` once; a session with neither is refused with `invalid_request` instead
-  of reaching Adyen. A host `id` containing `:` or `\` is refused too: it becomes the
-  `merchantReference` Adyen signs into every webhook, and the delimiter would make those
-  signatures unverifiable.
+  of reaching Adyen. A host `id` containing `:` or `\` is refused too. It becomes the
+  `merchantReference` Adyen signs into every webhook; the verifier accepts a `:` there, but
+  until the adapter has been exercised against a live Adyen test account the references it
+  creates stay clear of both characters.
 - Manual capture is requested per payment (`additionalData.manualCapture`), so enabling it
   account-wide is not required. Multiple partial captures are off by default at Adyen and a
   single partial capture releases the remainder, so `supportsMultiCapture` is `false`.

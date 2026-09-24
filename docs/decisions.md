@@ -373,6 +373,17 @@ choices they forced:
     the adapter assumes; whether a DECLINED capture sent with `final_capture: true` leaves
     the authorization open, as the adapter also assumes; and whether an order created with
     `payment_source.paypal` and approved with Venmo reads back with `payment_source.venmo`.
+- **Negative-testing setup (AMBIGUOUS in the docs, 2026-09-24):** PayPal's request-headers
+  page says "REST API apps use a request header to invoke negative testing in the
+  sandbox. This header configures the sandbox into a negative testing state for
+  transactions that include the merchant." Its negative-testing overview lists negative
+  testing as available for "Classic PayPal API versions 2.4 and later", has the business
+  sandbox account's Negative Testing setting turned on before any test method, and adds
+  "Without this configuration, the sandbox does not raise error conditions unless the
+  error occurs through normal transaction processing." The guide and the integration
+  suite ask for both. An opt-in `PAYPAL_NEGATIVE_TESTING` run with the setting off would
+  settle which page holds; it runs locally only, since the integration workflow never
+  passes that variable.
 
 ## Versioning policy (2026-07-07, explicit user decision)
 

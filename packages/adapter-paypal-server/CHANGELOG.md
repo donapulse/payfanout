@@ -1,5 +1,12 @@
 # @payfanout/adapter-paypal-server
 
+## 2.0.3
+
+### Patch Changes
+
+- 9f499d7: The PayPal server adapter now refuses with `invalid_request`, before calling PayPal, what PayPal would reject: a zero amount on sessions, updates, captures and refunds, and a session `id` longer than 255 characters (PayPal's `custom_id` limit). At construction it refuses a `brandName` longer than 127 characters or containing a line break; an empty one is still omitted. `fetchEvents` accepts as a cursor only the events-list path it hands out.
+- c199ff9: `updatePaymentSession` patches shipping through the name and address attributes PayPal documents, so updating the shipping of an order that already has one no longer fails (the failure also discarded any amount change sent with it). Adding a statement descriptor to an order created without one is now refused with `invalid_request` before any update, since PayPal can only replace or remove one, and `createPaymentSession` and `updatePaymentSession` now cut a statement descriptor longer than 22 characters to 22, as PayPal does, instead of leaving it out.
+
 ## 2.0.2
 
 ### Patch Changes

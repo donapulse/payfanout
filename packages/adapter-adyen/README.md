@@ -117,11 +117,12 @@ again.
 - The adapter loads Adyen Web 6.45.2 (`ADYEN_WEB_VERSION`) with the
   [Subresource Integrity](https://docs.adyen.com/online-payments/web-best-practices#implement-subresource-integrity-hashes)
   hashes Adyen publishes for it and `crossorigin="anonymous"`, so the browser refuses a
-  modified script or stylesheet. A `<script>` your page adds itself for that URL needs the
-  same `integrity`, exported as `ADYEN_WEB_SCRIPT_INTEGRITY`, and a `crossorigin` attribute:
-  while `window.AdyenWeb` is not defined yet, a conflicting tag makes `loadSdk()` reject with
-  `invalid_request`. A stylesheet `<link>` your page adds for its URL is used as it is, so
-  give it `ADYEN_WEB_STYLESHEET_INTEGRITY` and a `crossorigin` attribute to keep the check.
+  modified script or stylesheet. A `<script>` your page adds itself for the default URL needs
+  the same `integrity`, exported as `ADYEN_WEB_SCRIPT_INTEGRITY`, and a `crossorigin`
+  attribute: while `window.AdyenWeb` is not defined yet, a conflicting tag makes `loadSdk()`
+  reject with `invalid_request`. A stylesheet `<link>` your page adds for the default URL is
+  used as it is, so give it `ADYEN_WEB_STYLESHEET_INTEGRITY` and a `crossorigin` attribute
+  to keep the check.
 - If the script fails to load, the next mount fetches it again, with the stylesheet if that
   failed too; if it loaded without defining `window.AdyenWeb`, the next mount checks again
   instead of failing from a cached result. A stylesheet that fails to load never blocks the

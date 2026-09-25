@@ -309,7 +309,9 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
    * container carrying data-payfanout-field="cardNumber|expiryDate|cvv" become
    * the mount points (the host owns rows/grid/spacing); missing slots fall
    * back to adapter-created stacked containers. Placeholders and any other
-   * per-field or SDK option come from MountOptions.fieldOptions / locale.
+   * per-field or SDK option come from MountOptions.fieldOptions. The hosted
+   * fields carry no texts of their own and `locale` is no setup option, so
+   * MountOptions.locale is not forwarded.
    */
   async mount(container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
     assertBrowser("PaysafeClientAdapter", "mount");
@@ -365,8 +367,6 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
     const accountId = session.merchantAccountId ? toPaysafeAccountId(session.merchantAccountId) : undefined;
     try {
       const instance = await this.paysafeGlobal()!.fields.setup(this.config.apiKey, {
-        // Paysafe locales use underscores ("fr_CA"); accept BCP-47 from hosts.
-        ...(options.locale ? { locale: options.locale.replace(/-/g, "_") } : {}),
         ...hostSetupOptions,
         // Non-negotiables the host cannot clobber — the session decides them.
         environment: this.config.environment === "live" ? "LIVE" : "TEST",
@@ -735,15 +735,17 @@ const COMMON_APPEARANCE_TOKENS = new Set([
   "fontSize",
 ]);
 
-/** Common tokens Paysafe.js can honestly apply to its hosted card inputs. */
+/**
+ * Common tokens Paysafe.js can honestly apply to its hosted card inputs. Its
+ * style allowlist has no background property, so colorBackground is absent.
+ */
 const COMMON_APPEARANCE_TO_PAYSAFE: Record<string, string> = {
   colorText: "color",
-  colorBackground: "background-color",
   fontFamily: "font-family",
   fontSize: "font-size",
 };
 
-/** Stripe Appearance API keys — meaningless to Paysafe.js; forwarding them breaks ALL styling. */
+/** Stripe Appearance API keys — meaningless to Paysafe.js, whose sanitizer deletes them. */
 const STRIPE_APPEARANCE_KEYS = new Set(["variables", "rules", "theme", "labels"]);
 
 /**
@@ -751,15 +753,16 @@ const STRIPE_APPEARANCE_KEYS = new Set(["variables", "rules", "theme", "labels"]
  * CSS selectors to property objects). It handles three kinds of entry:
  *
  * - **Common tokens** — the cross-PSP set is mapped onto the hosted `input`
- *   selector (colorText→color, colorBackground→background-color,
- *   fontFamily→font-family, fontSize→font-size) so one `appearance` styles either
- *   PSP. `colorPrimary`/`colorDanger` have no honest hosted-card-input surface in
- *   Paysafe.js, so they are recognized but not applied (never faked).
+ *   selector (colorText→color, fontFamily→font-family, fontSize→font-size) so one
+ *   `appearance` styles either PSP. `colorPrimary`/`colorDanger` have no honest
+ *   hosted-card-input surface in Paysafe.js, and its style allowlist takes no
+ *   background, so those and `colorBackground` are recognized but not applied
+ *   (never faked).
  * - **Native Paysafe selectors** — object-valued entries (`input`, `:focus`, …)
  *   pass through untouched for power users; a native `input` wins over the tokens.
  * - **Stripe Appearance keys / other unusable entries** — dropped with a clear
- *   warning; forwarding them makes Paysafe.js log a cryptic "Invalid css property"
- *   and silently drop ALL styling.
+ *   warning; forwarded, Paysafe.js's sanitizer would delete each property it does
+ *   not allow and log a cryptic "Invalid css property" for it.
  */
 function toPaysafeStyle(appearance: Record<string, unknown> | undefined): { style: Record<string, unknown> } | undefined {
   if (!appearance) return undefined;
@@ -770,7 +773,7 @@ function toPaysafeStyle(appearance: Record<string, unknown> | undefined): { styl
     if (COMMON_APPEARANCE_TOKENS.has(key)) {
       const cssProp = COMMON_APPEARANCE_TO_PAYSAFE[key];
       if (cssProp !== undefined && typeof value === "string") inputCss[cssProp] = value;
-      // colorPrimary/colorDanger: recognized but not surfaced by Paysafe.js — ignore, don't warn.
+      // colorPrimary/colorDanger/colorBackground: recognized, no Paysafe.js surface — ignore, don't warn.
     } else if (STRIPE_APPEARANCE_KEYS.has(key)) {
       dropped.push(key);
     } else if (value !== null && typeof value === "object" && !Array.isArray(value)) {
@@ -786,7 +789,7 @@ function toPaysafeStyle(appearance: Record<string, unknown> | undefined): { styl
     console.warn(
       `[payfanout] Paysafe ignored appearance entries it cannot apply: ${dropped.join(", ")}. ` +
         `Paysafe hosted fields take a CSS selector-to-properties map (e.g. { input: { color, "font-family" } }) ` +
-        `or the common tokens colorText/colorBackground/fontFamily/fontSize; Stripe Appearance API keys ` +
+        `or the common tokens colorText/fontFamily/fontSize; Stripe Appearance API keys ` +
         `(variables/theme/rules/labels) do not apply to Paysafe.`,
     );
   }

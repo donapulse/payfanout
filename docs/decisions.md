@@ -584,6 +584,19 @@ One atomic core+conformance+all-adapters change (major changesets across the boa
   vocabulary is shared by convention (documented in the `appearance` JSDoc), not a core
   export — core stays UI-free. Not a contract change: `appearance` is
   `Record<string, unknown>` and each adapter handles it independently; conformance is unchanged.
+- **Corrected 2026-09-25: Paysafe applies no `colorBackground`, and a rejected property
+  drops alone.** Paysafe's setup page lists the supported CSS style names (color, opacity,
+  letter-spacing, text-align, text-indent, text-decoration, text-shadow, font, font-style,
+  font-weight, font-size, line-height, font-family, transition, -ms-filter), and the served
+  hosted-field iframe's `sanitize` deletes every property outside its allowlist (the same list
+  plus `-webkit-text-fill-color` and `box-shadow`), logging "Invalid css property: " for
+  each. The `background-color` the adapter sent for `colorBackground` was therefore always
+  deleted, so the token is now recognized and not applied, like `colorPrimary`. The
+  sanitizer drops only the offending properties, not all styling, as this entry first said.
+  `MountOptions.locale` is no longer forwarded: the setup options table (`currencyCode`,
+  `environment`, `fields`, `style`, `initializationTimeout`, `threshold`, `accounts`) has no
+  `locale`, and the served SDK reads one only for wallet buttons and
+  `customerDetails.profile.locale`.
 
 ## Built-in server-completion transport (2026-07-10)
 

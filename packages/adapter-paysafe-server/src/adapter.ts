@@ -84,10 +84,22 @@ export interface PaysafeServerAdapterConfig {
    * Abort a hung Paysafe exchange after this many milliseconds (default
    * 60000, the response timeout of Paysafe's own SDKs, which warn that "some
    * requests may take longer to process"). The timer covers the whole
-   * exchange including the response body read. A write that times out may
+   * exchange including the response body read. A read that times out
+   * surfaces as a retryable psp_unavailable; a write that times out may
    * still have been processed, so it is looked up by its merchantRefNum
-   * before anything is re-sent (see maxNetworkRetries). Timeouts surface as
-   * retryable psp_unavailable errors.
+   * instead (see maxNetworkRetries).
+   *
+   * One call can make several exchanges, each allowed this long. When
+   * Paysafe stops answering altogether, a completion or saved-method charge
+   * gives up after its request and three lookups (four exchanges, four
+   * minutes at the default), and a call that reads first gives up after that
+   * read's 1 + maxNetworkRetries attempts. When Paysafe answers some
+   * exchanges and hangs on others, a call can take longer: a refund, which
+   * reads the payment and its settlements first, up to about thirteen
+   * exchanges with the defaults. On a platform that ends requests after
+   * 25-30 seconds, lower this and maxNetworkRetries so the adapter gives up
+   * first, and replay a call the platform ended with the same
+   * idempotencyKey: the replay reads back what the ended call did.
    */
   requestTimeoutMs?: number;
   /**
@@ -96,12 +108,13 @@ export interface PaysafeServerAdapterConfig {
    * failure, timeout, HTTP 5xx or 429 (Paysafe's own SDKs retry GETs only).
    * A write is never re-sent blindly, because Paysafe rejects a reused
    * merchantRefNum (409/5031 under dupCheck) instead of answering with the
-   * original. After a timeout, network failure or 5xx the adapter first
-   * looks the request up by its merchantRefNum and returns the original when
-   * Paysafe has it. Only when nothing is found is the write re-sent, and
-   * dupCheck turns that re-send into a recoverable 5031 if the first attempt
-   * landed after all. A 429 is re-sent after backoff: Paysafe refused it
-   * unprocessed. Business errors (declines, 3406 unbatched settlement,
+   * original. A 429 is re-sent after backoff: Paysafe refused it
+   * unprocessed. After a timeout, network failure or 5xx the write is looked
+   * up by its merchantRefNum and the original returned when Paysafe has it.
+   * When it does not, a payment, capture or refund is not re-sent — the call
+   * fails with a non-retryable processing_error, to retry later with the
+   * same key — while a payment handle, verification or void, which move no
+   * money, are. Business errors (declines, 3406 unbatched settlement,
    * validation) never repeat here.
    */
   maxNetworkRetries?: number;
@@ -139,12 +152,15 @@ export interface PaysafeSettlementLike {
   txnTime?: string;
 }
 
-/** Masked bank-account facts as Paysafe's sepa/bacs payload objects echo them. */
+/** Masked bank-account facts as Paysafe's sepa/bacs/ach/eft payload objects echo them. */
 export interface PaysafeBankAccountLike {
   lastDigits?: string;
   accountHolderName?: string;
   bic?: string;
   sortCode?: string;
+  routingNumber?: string;
+  transitNumber?: string;
+  institutionId?: string;
   mandateReference?: string;
   bankReference?: string;
 }
@@ -152,6 +168,8 @@ export interface PaysafeBankAccountLike {
 export interface PaysafePaymentLike {
   id: string;
   merchantRefNum?: string;
+  /** The handle the payment spent: how a replay tells its own payment from earlier attempts under the key. */
+  paymentHandleToken?: string;
   status?: string;
   amount?: number;
   /** Remaining authorized funds not yet settled (manual-capture flow). */
@@ -181,6 +199,8 @@ export interface PaysafePaymentHandleLike {
   paymentType?: string;
   sepa?: PaysafeBankAccountLike;
   bacs?: PaysafeBankAccountLike;
+  ach?: PaysafeBankAccountLike;
+  eft?: PaysafeBankAccountLike;
   links?: Array<{ rel?: string; href?: string }>;
 }
 
@@ -674,7 +694,9 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
  * ?merchantRefNum=` answers `{ <key>: [...] }` and covers the last 30 days
  * by default ("Default = 30 days before the endDate"). Replay recovery reads
  * originals back through these, because Paysafe answers a reused
- * merchantRefNum with a rejection, never with the original response.
+ * merchantRefNum with a rejection, never with the original response. The
+ * lookups are account-wide: a settlement, refund or void record names no
+ * payment, so their keys must be unique across the account.
  */
 const REF_NUM_LOOKUPS = {
   payment: { path: "payments", key: "payments", noun: "payment" },
@@ -687,6 +709,10 @@ const REF_NUM_LOOKUPS = {
 
 /** 409: "The transaction you have submitted has already been processed." — a reused merchantRefNum under dupCheck. */
 const DUPLICATE_REF_NUM_CODE = "5031";
+/** 402: "There is already another request being processed on the transaction referenced for this request." */
+const IN_PROGRESS_CODE = "3417";
+/** Answers that the request, or another one on its transaction, is already processed or in progress (3044: "You have submitted a duplicate request."). */
+const REPLAY_CODES = new Set<string>([DUPLICATE_REF_NUM_CODE, "3044", IN_PROGRESS_CODE]);
 /**
  * 400: the handle is no longer PAYABLE. A payments call spends a single-use
  * handle whatever its outcome, so this can also mean the call already ran.
@@ -696,11 +722,21 @@ const HANDLE_NOT_PAYABLE_CODE = "5283";
 const NOT_FOUND_CODE = "5269";
 
 /**
- * Reads of an original Paysafe reported as already processed. The lookup
- * can trail the write it indexes; the bound keeps an unreadable original
- * from stalling the call.
+ * Reads of an original Paysafe reported as processed, or whose outcome is
+ * unknown. The lookup can trail the write it indexes; the bound keeps an
+ * unreadable original from stalling the call.
  */
 const REPLAY_READ_ATTEMPTS = 3;
+
+/**
+ * Paysafe's internal and gateway failures (the 500, 502 and 504 rows of its
+ * error tables). A record filed with one of them failed for good, so reading
+ * it back is a processing error, not a card decline.
+ */
+const INTERNAL_ERROR_CODES = new Set<string>([
+  "1000", "1001", "1002", "1003", "1007", "1008", "1020", "1100",
+  "3028", "3420", "3423", "3424", "3505", "5050", "9000",
+]);
 
 /**
  * What identifies the original of a replayed call: its merchantRefNum, plus
@@ -714,24 +750,32 @@ interface ReplayKey {
   amount?: number;
   currency?: string;
   paymentType?: string;
+  /** The handle the request charges or verifies; a record made with another one is not this call's. */
+  paymentHandleToken?: string;
+  /**
+   * The request spends a single-use handle (a card, Interac or bank-debit
+   * completion). Records made with other handles under the key are then
+   * earlier attempts rather than foreign requests: a failed one leaves the
+   * key open to a new attempt, a live one is the key's payment.
+   */
+  singleUse?: boolean;
 }
 
 /** How one write finds and returns its original. */
 interface ReplayableWrite<T> extends ReplayKey {
   /**
-   * Look for the original before writing at all: for endpoints without a
-   * duplicate rejection (/paymenthandles takes no dupCheck), and for writes
-   * whose pre-read shows the work already done.
+   * Payments, settlements and refunds are never re-sent while an attempt's
+   * outcome is unknown: only Paysafe's duplicate check would stop a second
+   * one, and Paysafe does not document that check for a request still in
+   * flight.
+   */
+  movesMoney?: boolean;
+  /**
+   * Look for the original before writing at all: for payment handles, which
+   * the adapter mints without dupCheck, and for writes whose pre-read shows
+   * the work already done.
    */
   lookupFirst?: boolean;
-  /**
-   * The write spends a single-use handle, which makes 5283 a possible sign
-   * that this call already ran. "own": the handle was minted for this very
-   * call, so 5283 always is. "shared": it came from the caller and may have
-   * gone into another call, so 5283 counts as a replay only after an attempt
-   * of this call whose outcome is unknown.
-   */
-  handle?: "own" | "shared";
   /**
    * Also read back after a business rejection: for endpoints where a replay
    * may hit a state check before the merchantRefNum check (a replayed
@@ -739,8 +783,10 @@ interface ReplayableWrite<T> extends ReplayKey {
    * duplicate rejection at all (voidauths).
    */
   readBackOnRejection?: boolean;
-  /** Turns a record read back into this call's answer; may throw. */
+  /** Turns a record read back into this call's answer; may throw. Defaults to recordedFailure. */
   recovered?: (record: T) => T;
+  /** Payment handles: which one the key minted to reuse; none mints a new one. */
+  choose?: (records: T[]) => T | undefined;
 }
 
 /** The lookup-record fields a replay is checked against. */
@@ -749,6 +795,21 @@ interface RefNumRecord {
   amount?: number;
   currencyCode?: string;
   paymentType?: string;
+  paymentHandleToken?: string;
+  status?: string;
+  error?: { code?: string; message?: string };
+}
+
+/** What a lookup shows about a call's original. */
+interface ReadBack<T> {
+  /** This call's own record. */
+  found?: T;
+  /** Single-use spends: agreeing records made with another handle that did not fail — the key's payment. */
+  live: T[];
+  /** Single-use spends: earlier attempts under the key that failed. */
+  failed: T[];
+  /** The lookup itself failed, so the outcome stays unknown. */
+  unreadable?: boolean;
 }
 
 /** POST /voidauths answer, and the `voidAuths` lookup record. */
@@ -766,30 +827,111 @@ interface PaysafeRefundLike {
   status?: string;
   amount?: number;
   currencyCode?: string;
+  error?: { code?: string; message?: string };
 }
 
-/** POST /payments, read back from the payments lookup; a recorded decline stays a decline. */
+/**
+ * POST /payments. `singleUse`: the handle is a Paysafe.js token, an Interac
+ * handle or a bank-debit handle, which the call spends; saved-method charges
+ * use a MULTI_USE token instead.
+ */
 function paymentWrite(
   merchantRefNum: string,
   amount: number,
   currency: string,
-  handle?: "own" | "shared",
+  paymentHandleToken: string,
+  singleUse: boolean,
 ): ReplayableWrite<PaysafePaymentLike> {
-  return { lookup: "payment", merchantRefNum, amount, currency, recovered: recordedDecline, ...(handle ? { handle } : {}) };
+  return { lookup: "payment", merchantRefNum, amount, currency, paymentHandleToken, singleUse, movesMoney: true };
 }
 
 /**
- * POST /paymenthandles takes no dupCheck, so nothing at Paysafe would reject
- * a second handle under one merchantRefNum: the handle a replay already
- * minted is looked up first and reused.
+ * The adapter sends no dupCheck on /paymenthandles (its default there is
+ * undocumented), so nothing at Paysafe is relied on to reject a second
+ * handle under one merchantRefNum: the handle a replay already minted is
+ * looked up first, and `choose` picks the one to reuse.
  */
 function handleWrite(
   merchantRefNum: string,
   amount: number,
   currency: string,
   paymentType: string,
+  choose: (handles: PaysafePaymentHandleLike[]) => PaysafePaymentHandleLike | undefined,
 ): ReplayableWrite<PaysafePaymentHandleLike> {
-  return { lookup: "paymentHandle", merchantRefNum, amount, currency, paymentType, lookupFirst: true };
+  return { lookup: "paymentHandle", merchantRefNum, amount, currency, paymentType, lookupFirst: true, choose };
+}
+
+/** Interac handle statuses a replayed session can still use, most advanced first. */
+const USABLE_INTERAC_HANDLE_STATUSES = ["COMPLETED", "PAYABLE", "INITIATED"];
+
+/**
+ * A replayed Interac session reuses the handle its first attempt minted: the
+ * one a payment already spent, else the one the customer authorized, else a
+ * redirect still pending. A failed or expired handle is minted anew.
+ */
+function usableInteracHandle(handles: PaysafePaymentHandleLike[]): PaysafePaymentHandleLike | undefined {
+  for (const status of USABLE_INTERAC_HANDLE_STATUSES) {
+    const handle = handles.find((h) => (h.status ?? "").toUpperCase() === status);
+    if (handle) return handle;
+  }
+  return undefined;
+}
+
+/** Where a handle echoes its bank object: the paymentType in lowercase, as sent. */
+const BANK_ECHO_FIELDS = { SEPA: "sepa", ACH: "ach", BACS: "bacs", EFT: "eft" } as const;
+
+/** The routing coordinates an echo may state, compared as sent. */
+const BANK_ROUTING_FIELDS = ["routingNumber", "sortCode", "transitNumber", "institutionId", "bic"] as const;
+
+/**
+ * The handle an earlier attempt of a bank-debit completion minted and never
+ * charged: PAYABLE, and minted from the same bank details as far as its
+ * echo shows. A spent handle belongs to a payment the key lookup has
+ * already accounted for, and one minted from other details would debit
+ * another account.
+ */
+function reusableBankHandle(
+  handles: PaysafePaymentHandleLike[],
+  paymentType: BankDebitPaymentType,
+  details: ParsedBankDetails,
+): PaysafePaymentHandleLike | undefined {
+  return handles.find(
+    (h) => (h.status ?? "").toUpperCase() === "PAYABLE" && sameBankAccount(h[BANK_ECHO_FIELDS[paymentType]], details),
+  );
+}
+
+/** Letters and digits only, uppercased: how account coordinates compare across formatting. */
+function compactAccountValue(value: string): string {
+  return value.replace(/[^0-9A-Za-z]/g, "").toUpperCase();
+}
+
+function normalizedHolder(name: string): string {
+  return name.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+/**
+ * Nothing the handle's bank echo states contradicts the envelope: holder,
+ * routing coordinates and last digits (Paysafe echoes `lastDigits`, never
+ * the full number). An echo that states nothing cannot contradict.
+ */
+function sameBankAccount(echo: PaysafeBankAccountLike | undefined, details: ParsedBankDetails): boolean {
+  if (!echo) return true;
+  if (echo.accountHolderName !== undefined && normalizedHolder(echo.accountHolderName) !== normalizedHolder(details.accountHolderName)) {
+    return false;
+  }
+  for (const field of BANK_ROUTING_FIELDS) {
+    const stated = echo[field];
+    const sent = details.bank[field];
+    if (stated !== undefined && sent !== undefined && compactAccountValue(stated) !== compactAccountValue(sent)) {
+      return false;
+    }
+  }
+  const account = details.bank["accountNumber"] ?? details.bank["iban"];
+  return !(
+    echo.lastDigits !== undefined &&
+    account !== undefined &&
+    !compactAccountValue(account).endsWith(compactAccountValue(echo.lastDigits))
+  );
 }
 
 /** A record agrees unless it states an amount, currency or type the request did not carry. */
@@ -811,14 +953,31 @@ function agreesWith(record: RefNumRecord, replay: ReplayKey): boolean {
   );
 }
 
+/** A record of an attempt that failed: Paysafe files a declined request together with its error. */
+function isFailedRecord(record: RefNumRecord): boolean {
+  if (record.error?.code) return true;
+  const status = (record.status ?? "").toUpperCase();
+  return status === "FAILED" || status === "ERROR";
+}
+
 /**
- * Paysafe records a declined payment together with its error, and answers
- * declines with HTTP 402. Read back, it is still that decline — never a
- * pending payment.
+ * A record Paysafe filed with its error is that failure, read back: a
+ * declined payment stays a decline, never a pending payment. The error body
+ * carries no HTTP status, so its code decides — Paysafe's internal and
+ * gateway errors are a processing error, anything else a decline — and it
+ * is never retryable, since replaying the call reads the same final record.
  */
-function recordedDecline(payment: PaysafePaymentLike): PaysafePaymentLike {
-  if (payment.error?.code) throw mapPaysafeError(402, payment);
-  return payment;
+function recordedFailure<T extends RefNumRecord>(record: T): T {
+  const pspCode = record.error?.code;
+  if (!pspCode) return record;
+  const code = INTERNAL_ERROR_CODES.has(pspCode) ? "processing_error" : mapPaysafeError(402, record).code;
+  throw new PayFanoutError({
+    code,
+    message: getUserMessage(code),
+    retryable: false,
+    raw: record,
+    pspName: PAYSAFE_PSP_NAME,
+  });
 }
 
 /** The Paysafe code on a mapped error: its `raw` is the Paysafe error body. */
@@ -995,7 +1154,13 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     }
     const returnHref = withReturnMarker(input.returnUrl);
     // A replayed session reuses the handle it minted instead of opening a second redirect.
-    const minted = handleWrite(input.idempotencyKey, context.amount, context.currency, INTERAC_PAYMENT_TYPE);
+    const minted = handleWrite(
+      input.idempotencyKey,
+      context.amount,
+      context.currency,
+      INTERAC_PAYMENT_TYPE,
+      usableInteracHandle,
+    );
     const handle = await this.sendWrite(minted, "/paymenthub/v1/paymenthandles", {
       merchantRefNum: input.idempotencyKey,
       transactionType: "PAYMENT",
@@ -1153,11 +1318,13 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     if (!paymentHandleToken) {
       throw PayFanoutError.invalidRequest("completePayment requires the clientToken produced by confirm()");
     }
-    const replay = paymentWrite(input.idempotencyKey, context.amount, context.currency, "shared");
+    const replay = paymentWrite(input.idempotencyKey, context.amount, context.currency, paymentHandleToken, true);
     const payment = await this.sendWrite(replay, "/paymenthub/v1/payments", {
       merchantRefNum: input.idempotencyKey,
       // Paysafe documents no answer to a reused merchantRefNum without
       // dupCheck; with it, a replay is rejected (5031) and read back instead.
+      // A key whose earlier attempts all failed (another card, declined) is
+      // re-sent as a new attempt without it (see sendWrite).
       dupCheck: true,
       amount: context.amount,
       currencyCode: context.currency,
@@ -1185,11 +1352,14 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   /**
    * Bank-debit completion is two calls in one round trip: mint the handle from
    * the envelope's bank details, then charge it. Both carry the caller's
-   * idempotencyKey as merchantRefNum. /paymenthandles takes no dupCheck, so
-   * the handle is looked up first and reused when this completion already
-   * minted it; the payment rides dupCheck and lookup recovery like every
-   * other charge. A replayed completion therefore re-reads the same handle
-   * and the same payment instead of minting or charging twice.
+   * idempotencyKey as merchantRefNum, as Paysafe's own EFT examples do. A
+   * payment the key already made answers a replayed completion before any
+   * handle is touched; otherwise a handle an earlier attempt minted from the
+   * same details and never charged is reused, and a new one is minted when
+   * there is none. The payment rides dupCheck and lookup recovery like every
+   * other single-use charge, so a key whose earlier attempts all failed takes
+   * a new attempt (other bank details after a decline), and none is charged
+   * twice.
    */
   private async completeBankDebitPayment(
     context: PaysafeSessionContextV1,
@@ -1198,7 +1368,11 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   ): Promise<PaymentInfo> {
     const details = parseBankEnvelope(input.clientToken, paymentType);
     const billingDetails = mergeBillingDetails(context.billingDetails, input.billingDetails);
-    const minted = handleWrite(input.idempotencyKey, context.amount, context.currency, paymentType);
+    const earlier = await this.keyPayment(input.idempotencyKey, context.amount, context.currency);
+    if (earlier) return this.toPaymentInfo(earlier, context.id);
+    const minted = handleWrite(input.idempotencyKey, context.amount, context.currency, paymentType, (handles) =>
+      reusableBankHandle(handles, paymentType, details),
+    );
     const handle = await this.sendWrite(minted, "/paymenthub/v1/paymenthandles", {
       merchantRefNum: input.idempotencyKey,
       transactionType: "PAYMENT",
@@ -1214,10 +1388,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     });
     // ACH/EFT document the handle as immediately PAYABLE; anything else cannot
     // be charged, and surfacing it here beats a cryptic /payments rejection.
-    // COMPLETED means a payments call already spent it — this completion's own,
-    // which the payment below reads back.
-    const handleStatus = (handle.status ?? "").toUpperCase();
-    if (handleStatus !== "PAYABLE" && handleStatus !== "COMPLETED") {
+    if ((handle.status ?? "").toUpperCase() !== "PAYABLE") {
       throw new PayFanoutError({
         code: "processing_error",
         message: `Paysafe returned a ${paymentType} payment handle in status ${handle.status ?? "unknown"} instead of PAYABLE`,
@@ -1226,7 +1397,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
         pspName: this.pspName,
       });
     }
-    const replay = paymentWrite(input.idempotencyKey, context.amount, context.currency, "own");
+    const replay = paymentWrite(input.idempotencyKey, context.amount, context.currency, handle.paymentHandleToken, true);
     const payment = await this.sendWrite(replay, "/paymenthub/v1/payments", {
       merchantRefNum: input.idempotencyKey,
       dupCheck: true,
@@ -1247,6 +1418,24 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     // The scheme mandate (SEPA/BACS) rides the payment's bank object — or, when
     // the payment echo omits it, the freshly minted handle's.
     return this.toPaymentInfo(payment, context.id, undefined, bankMandateReference(handle));
+  }
+
+  /**
+   * The payment a bank-debit completion already made under its key, whichever
+   * handle it spent: the one live payment with the completion's amount and
+   * currency. Failed attempts leave the key open to a new one.
+   */
+  private async keyPayment(
+    merchantRefNum: string,
+    amount: number,
+    currency: string,
+  ): Promise<PaysafePaymentLike | undefined> {
+    const key: ReplayKey = { lookup: "payment", merchantRefNum, amount, currency };
+    const live = (await this.recordsByRefNum<PaysafePaymentLike>(key, false)).filter((p) => !isFailedRecord(p));
+    const foreign = live.filter((p) => !agreesWith(p, key));
+    if (foreign.length > 0) throw this.differentRequest(key, foreign);
+    if (live.length > 1) throw this.severalRecords(key, live);
+    return live[0];
   }
 
   /** Signature + TTL verification with the adapter's clock. */
@@ -1284,10 +1473,13 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     // Nothing left to settle may be this very capture's work, replayed: its
     // settlement is looked up before a zero settlement is sent. "Capture
     // everything" leaves the amount unchecked — it was the remainder then.
+    // The lookup is account-wide and settlements name no payment, so the key
+    // must be unique across the account.
     const replay: ReplayableWrite<PaysafeSettlementLike> = {
       lookup: "settlement",
       merchantRefNum: idempotencyKey,
       amount,
+      movesMoney: true,
       lookupFirst: captureAmount === 0,
       readBackOnRejection: true,
     };
@@ -1314,6 +1506,9 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     const remaining = remainingToSettle(payment);
     // Voidauths take no dupCheck, so a replay is caught by lookup alone: an
     // authorization with nothing left to void may be this very void's work.
+    // Void records name no payment either: the key must be unique across the
+    // account. A void moves no money, so it is re-sent once a lookup after a
+    // lost answer shows nothing.
     const replay: ReplayableWrite<PaysafeVoidAuthLike> = {
       lookup: "voidAuth",
       merchantRefNum: idempotencyKey,
@@ -1368,11 +1563,14 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
     const payment = await this.fetchPayment(req.pspPaymentId);
     const settlements = payment.settlements?.length ? payment.settlements : await this.findSettlements(payment);
+    // Refund records name no settlement or payment and the lookup is
+    // account-wide, so the key must be unique across the account.
     const replay: ReplayableWrite<PaysafeRefundLike> = {
       lookup: "refund",
       merchantRefNum: req.idempotencyKey,
       amount: req.amount,
       currency: payment.currencyCode?.toUpperCase(),
+      movesMoney: true,
       readBackOnRejection: true,
     };
     const settlement = settlements.find(
@@ -1383,11 +1581,12 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       // answer with that refund instead of rejecting the replay.
       const earlier = await this.findReplayed<PaysafeRefundLike>(replay);
       if (earlier) {
+        const refund = recordedFailure(earlier);
         return {
-          refundId: earlier.id,
-          status: mapRefundStatus(earlier.status),
-          amount: earlier.amount ?? req.amount ?? 0,
-          raw: earlier,
+          refundId: refund.id,
+          status: mapRefundStatus(refund.status),
+          amount: refund.amount ?? req.amount ?? 0,
+          raw: refund,
         };
       }
       throw PayFanoutError.invalidRequest(
@@ -1449,11 +1648,13 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     const context = await this.decodeContext(input.pspSessionId);
     // Verification refNums must be unique per ATTEMPT: dupCheck defaults to
     // true here, so a replay answers 409/5031 and is read back. Verification
-    // does not spend the handle, so no 5283 can stand in for it.
+    // does not spend the handle, so no 5283 can stand in for it, and a
+    // verification of another handle under the key is not this call's.
     const replay: ReplayableWrite<PaysafePaymentLike> = {
       lookup: "verification",
       merchantRefNum: input.idempotencyKey,
       currency: context.currency,
+      paymentHandleToken: input.clientToken,
     };
     const verification = await this.sendWrite(replay, "/paymenthub/v1/verifications", {
       merchantRefNum: input.idempotencyKey,
@@ -1598,11 +1799,12 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     const currency = normalizeCurrency(input.currency);
     const merchantAccountId = this.config.merchantAccountResolver(currency, undefined) || undefined;
     const occurrence = input.occurrence ?? "recurring";
-    const replay = paymentWrite(input.idempotencyKey, input.amount, currency);
+    const replay = paymentWrite(input.idempotencyKey, input.amount, currency, input.savedPaymentMethodToken, false);
     const payment = await this.sendWrite(replay, "/paymenthub/v1/payments", {
       merchantRefNum: input.idempotencyKey,
       // A MULTI_USE token is never spent, so without dupCheck nothing would
-      // stop a replay from charging it twice.
+      // stop a replay from charging it twice. Unlike a single-use completion
+      // it is never re-sent without it: nothing else would guard that request.
       dupCheck: true,
       amount: input.amount,
       currencyCode: currency,
@@ -2060,63 +2262,103 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * Sends a Paysafe write so that no replay can move money twice. Paysafe
    * rejects a reused merchantRefNum (409/5031 under dupCheck) rather than
    * answering with the original, and a payments call spends a single-use
-   * handle whatever its outcome (5283 afterwards). So an attempt whose
-   * outcome is unknown (timeout, network failure, 5xx) is looked up by its
-   * merchantRefNum and re-sent only when nothing is found, and an "already
-   * processed" rejection is answered with the original, read back the same
-   * way. A 429 is re-sent after backoff with no lookup: Paysafe refused it
-   * unprocessed. Re-sends share the maxNetworkRetries budget.
+   * handle whatever its outcome (5283 afterwards). So an "already processed"
+   * or "in progress" rejection, or a spent handle, is answered with the
+   * original read back by merchantRefNum. After a timeout, network failure or
+   * 5xx the original is looked up the same way, and only a write that moves
+   * no money is re-sent when nothing is found. A 429 is re-sent after backoff
+   * with no lookup: Paysafe refused it unprocessed. Re-sends share the
+   * maxNetworkRetries budget.
+   *
+   * A single-use completion whose key carries only failed attempts made with
+   * other handles (a declined card, then another one) is a new attempt: once
+   * Paysafe has refused it as a duplicate, which proves it unprocessed, it is
+   * sent once more without dupCheck. That request spends its own handle, so
+   * 5283 still guards it.
    */
   private async sendWrite<T extends RefNumRecord>(
     write: ReplayableWrite<T>,
     path: string,
     body: Record<string, unknown>,
   ): Promise<T> {
-    const recovered = write.recovered ?? ((record: T) => record);
+    const recovered = write.recovered ?? recordedFailure;
     if (write.lookupFirst) {
       const earlier = await this.findReplayed<T>(write);
       if (earlier) return recovered(earlier);
     }
-    const attempts = this.transportAttempts();
+    let payload = body;
+    let resends = 0;
+    let newAttempt = false;
     let outcomeUnknown = false;
-    for (let attempt = 1; ; attempt += 1) {
+    for (;;) {
       // requestOnce only ever rejects with a mapped PayFanoutError.
       let failure: unknown;
       try {
-        return await this.requestOnce<T>("POST", path, body);
+        return await this.requestOnce<T>("POST", path, payload);
       } catch (err) {
         failure = err;
       }
       const pspCode = paysafeErrorCode(failure);
-      const spentHandle = write.handle !== undefined && pspCode === HANDLE_NOT_PAYABLE_CODE;
-      if (pspCode === DUPLICATE_REF_NUM_CODE || spentHandle) {
-        const original = await this.readBackPatiently<T>(write);
-        if (original) return recovered(original);
-        // The caller's handle went into some other call: Paysafe's own answer stands.
-        if (spentHandle && write.handle === "shared" && !outcomeUnknown) throw failure;
-        throw this.unreadableOriginal(write, (failure as PayFanoutError).raw);
+      if (
+        pspCode !== undefined &&
+        (REPLAY_CODES.has(pspCode) || (write.singleUse === true && pspCode === HANDLE_NOT_PAYABLE_CODE))
+      ) {
+        // Only a duplicate rejection of this call's own request proves it was never processed.
+        const refusedUnprocessed =
+          pspCode === DUPLICATE_REF_NUM_CODE && write.singleUse === true && !outcomeUnknown && !newAttempt;
+        const read = await this.readBackPatiently<T>(write, refusedUnprocessed);
+        if (read.found) return recovered(read.found);
+        if (refusedUnprocessed && read.live.length === 1) return recovered(read.live[0]!);
+        if (refusedUnprocessed && read.live.length === 0 && read.failed.length > 0) {
+          payload = { ...body, dupCheck: false };
+          newAttempt = true;
+          continue;
+        }
+        throw this.unreadableOriginal(write, pspCode, failure);
       }
       if (isOutcomeUnknown(failure)) {
+        outcomeUnknown = true;
+        if (write.movesMoney) return this.settleUnknownOutcome(write, failure, recovered);
         const read = await this.readBack<T>(write);
         if (read.found) return recovered(read.found);
-        if (read.unreadable || attempt >= attempts) throw failure;
-        outcomeUnknown = true;
+        if (read.unreadable || resends >= this.maxResends()) throw failure;
       } else if (isRateLimited(failure)) {
-        if (attempt >= attempts) throw failure;
+        if (resends >= this.maxResends()) {
+          if (outcomeUnknown) return this.settleUnknownOutcome(write, failure, recovered);
+          throw failure;
+        }
       } else {
-        if (outcomeUnknown || write.readBackOnRejection) {
+        // An earlier attempt whose outcome is unknown may be what this rejection is about.
+        if (outcomeUnknown) return this.settleUnknownOutcome(write, failure, recovered);
+        if (write.readBackOnRejection) {
           const read = await this.readBack<T>(write);
           if (read.found) return recovered(read.found);
         }
         throw failure;
       }
-      await this.backoff(attempt);
+      resends += 1;
+      await this.backoff(resends);
     }
   }
 
+  /**
+   * An attempt of this call may have been processed and nothing says whether
+   * it was: only the lookup can tell, and without the original the call ends
+   * instead of repeating the write.
+   */
+  private async settleUnknownOutcome<T extends RefNumRecord>(
+    write: ReplayableWrite<T>,
+    failure: unknown,
+    recovered: (record: T) => T,
+  ): Promise<T> {
+    const read = await this.readBackPatiently<T>(write, false);
+    if (read.found) return recovered(read.found);
+    throw this.unknownOutcome(write, failure);
+  }
+
   /** A replayed call's original, read with the usual GET retries. */
-  private async findReplayed<T extends RefNumRecord>(replay: ReplayKey): Promise<T | undefined> {
-    return this.pickReplayed(await this.recordsByRefNum<T>(replay, false), replay);
+  private async findReplayed<T extends RefNumRecord>(write: ReplayableWrite<T>): Promise<T | undefined> {
+    return this.classify(await this.recordsByRefNum<T>(write, false), write).found;
   }
 
   /**
@@ -2124,24 +2366,29 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * transport retries: recovery bounds its own reads. `unreadable` means the
    * lookup itself failed, so the outcome stays unknown.
    */
-  private async readBack<T extends RefNumRecord>(
-    replay: ReplayKey,
-  ): Promise<{ found?: T; unreadable?: boolean }> {
+  private async readBack<T extends RefNumRecord>(write: ReplayableWrite<T>): Promise<ReadBack<T>> {
     let records: T[];
     try {
-      records = await this.recordsByRefNum<T>(replay, true);
+      records = await this.recordsByRefNum<T>(write, true);
     } catch {
-      return { unreadable: true };
+      return { live: [], failed: [], unreadable: true };
     }
-    const found = this.pickReplayed(records, replay);
-    return found ? { found } : {};
+    return this.classify(records, write);
   }
 
-  /** An original Paysafe reported as processed can trail the lookup briefly. */
-  private async readBackPatiently<T extends RefNumRecord>(replay: ReplayKey): Promise<T | undefined> {
+  /**
+   * The lookup can trail the write it indexes, so an original is read up to
+   * three times. `othersSettle`: records of the key's other attempts answer
+   * the question too.
+   */
+  private async readBackPatiently<T extends RefNumRecord>(
+    write: ReplayableWrite<T>,
+    othersSettle: boolean,
+  ): Promise<ReadBack<T>> {
     for (let read = 1; ; read += 1) {
-      const { found } = await this.readBack<T>(replay);
-      if (found || read >= REPLAY_READ_ATTEMPTS) return found;
+      const result = await this.readBack<T>(write);
+      const settled = result.found !== undefined || (othersSettle && result.live.length + result.failed.length > 0);
+      if (settled || read >= REPLAY_READ_ATTEMPTS) return result;
       await this.backoff(read);
     }
   }
@@ -2170,55 +2417,116 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   }
 
   /**
-   * The one record that is this call's original, or none. A record that
-   * disagrees with the request means the key was reused for a different
-   * request; several agreeing records cannot be told apart.
+   * Sorts the records filed under a call's merchantRefNum. The call's own
+   * record agrees with the request and was made with its handle; several
+   * cannot be told apart. A record that disagrees means the key was reused
+   * for a different request. For a single-use spend, a record made with
+   * another handle is an earlier attempt instead: a failed one, or a live one
+   * that is the key's payment. A record that omits its handle is taken as
+   * the call's own.
    */
-  private pickReplayed<T extends RefNumRecord>(records: T[], replay: ReplayKey): T | undefined {
-    if (records.length === 0) return undefined;
-    const { noun } = REF_NUM_LOOKUPS[replay.lookup];
-    const foreign = records.filter((record) => !agreesWith(record, replay));
-    if (foreign.length > 0) {
-      throw PayFanoutError.invalidRequest(
-        `merchantRefNum "${replay.merchantRefNum}" already belongs to a different Paysafe ${noun} ` +
-          "(amount, currency or type differ) — every new request needs its own idempotency key",
-        {
-          merchantRefNum: replay.merchantRefNum,
-          expected: { amount: replay.amount, currency: replay.currency, paymentType: replay.paymentType },
-          found: foreign,
-        },
-      );
+  private classify<T extends RefNumRecord>(records: T[], write: ReplayableWrite<T>): ReadBack<T> {
+    const mine: T[] = [];
+    const live: T[] = [];
+    const failed: T[] = [];
+    const foreign: T[] = [];
+    for (const record of records) {
+      const sameHandle =
+        write.paymentHandleToken === undefined ||
+        record.paymentHandleToken === undefined ||
+        record.paymentHandleToken === write.paymentHandleToken;
+      if (!sameHandle && write.singleUse && isFailedRecord(record)) failed.push(record);
+      else if (!agreesWith(record, write)) foreign.push(record);
+      else if (sameHandle) mine.push(record);
+      else if (write.singleUse) live.push(record);
+      else foreign.push(record);
     }
-    if (records.length > 1) {
-      throw new PayFanoutError({
-        code: "processing_error",
-        message:
-          `Paysafe holds ${records.length} ${noun}s under merchantRefNum "${replay.merchantRefNum}", so this ` +
-          "call cannot tell which one it produced — reconcile them in the Paysafe portal",
-        retryable: false,
-        raw: records,
-        pspName: this.pspName,
-      });
+    if (write.choose) {
+      if (foreign.length > 0) throw this.differentRequest(write, foreign);
+      const found = write.choose(mine);
+      return found ? { found, live, failed } : { live, failed };
     }
-    return records[0];
+    if (mine.length > 1) throw this.severalRecords(write, mine);
+    if (mine.length === 1) return { found: mine[0], live, failed };
+    if (foreign.length > 0) throw this.differentRequest(write, foreign);
+    if (live.length > 1) throw this.severalRecords(write, live);
+    return { live, failed };
   }
 
-  /**
-   * Paysafe reports the request as processed, but the lookup cannot see it
-   * (yet, or beyond its 30-day default window). Not retryable: an automatic
-   * retry or a failover cannot know whether money moved. Replaying the call
-   * under the same key later recovers the original once it is visible; a new
-   * key would repeat it.
-   */
-  private unreadableOriginal(replay: ReplayKey, cause: unknown): PayFanoutError {
+  private differentRequest(replay: ReplayKey, foreign: RefNumRecord[]): PayFanoutError {
+    const { noun } = REF_NUM_LOOKUPS[replay.lookup];
+    return PayFanoutError.invalidRequest(
+      `merchantRefNum "${replay.merchantRefNum}" already belongs to a different Paysafe ${noun} ` +
+        "(amount, currency, type or payment handle differ) — every new request needs its own idempotency key",
+      {
+        merchantRefNum: replay.merchantRefNum,
+        expected: { amount: replay.amount, currency: replay.currency, paymentType: replay.paymentType },
+        found: foreign,
+      },
+    );
+  }
+
+  private severalRecords(replay: ReplayKey, records: RefNumRecord[]): PayFanoutError {
     const { noun } = REF_NUM_LOOKUPS[replay.lookup];
     return new PayFanoutError({
       code: "processing_error",
       message:
-        `Paysafe already processed the ${noun} with merchantRefNum "${replay.merchantRefNum}" but it cannot ` +
-        "be read back yet — retry later with the same idempotency key, never a new one",
+        `Paysafe holds ${records.length} ${noun}s under merchantRefNum "${replay.merchantRefNum}", so this ` +
+        "call cannot tell which one it produced — reconcile them in the Paysafe portal",
       retryable: false,
-      raw: { merchantRefNum: replay.merchantRefNum, cause },
+      raw: records,
+      pspName: this.pspName,
+    });
+  }
+
+  /**
+   * Paysafe answers that the request was processed, is still in progress, or
+   * that its handle is spent, but the lookup cannot show this call's
+   * original: not yet, or never once the original is older than the
+   * lookup's 30-day default window (dupCheck looks back 90). Not retryable:
+   * an automatic retry or a failover cannot know whether money moved.
+   * Replaying the call under the same key later recovers the original once
+   * it is visible; a new key would repeat it.
+   */
+  private unreadableOriginal(replay: ReplayKey, pspCode: string, failure: unknown): PayFanoutError {
+    const { noun } = REF_NUM_LOOKUPS[replay.lookup];
+    const ref = `merchantRefNum "${replay.merchantRefNum}"`;
+    const answer =
+      pspCode === HANDLE_NOT_PAYABLE_CODE
+        ? `Paysafe reports the payment handle as already used, but no ${noun} made with it under ${ref} can be read back`
+        : pspCode === IN_PROGRESS_CODE
+          ? `Paysafe is still processing another request on this transaction, and no ${noun} under ${ref} can be read back`
+          : `Paysafe reports the ${noun} with ${ref} as already processed, but it cannot be read back`;
+    return this.retryLater(
+      `${answer} — retry later with the same idempotency key, never a new one. Paysafe's lookup only reaches ` +
+        "30 days back, so an original older than that can no longer be read: reconcile it in the Paysafe portal",
+      replay,
+      failure,
+    );
+  }
+
+  /**
+   * An attempt went unanswered and the lookup does not show it, so whether
+   * Paysafe processed it is unknown and it is not repeated. Not retryable,
+   * for the same reason as unreadableOriginal.
+   */
+  private unknownOutcome(replay: ReplayKey, failure: unknown): PayFanoutError {
+    const { noun } = REF_NUM_LOOKUPS[replay.lookup];
+    return this.retryLater(
+      `An attempt of the ${noun} request with merchantRefNum "${replay.merchantRefNum}" went unanswered and ` +
+        "cannot be read back, so whether Paysafe processed it is unknown — retry later with the same " +
+        "idempotency key, never a new one",
+      replay,
+      failure,
+    );
+  }
+
+  private retryLater(message: string, replay: ReplayKey, failure: unknown): PayFanoutError {
+    return new PayFanoutError({
+      code: "processing_error",
+      message,
+      retryable: false,
+      raw: { merchantRefNum: replay.merchantRefNum, cause: (failure as PayFanoutError).raw },
       pspName: this.pspName,
     });
   }
@@ -2228,8 +2536,12 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     return (this.config.sleep ?? defaultSleep)(Math.min(2000, 250 * 2 ** (attempt - 1)));
   }
 
+  private maxResends(): number {
+    return this.config.maxNetworkRetries ?? 2;
+  }
+
   private transportAttempts(): number {
-    return 1 + (this.config.maxNetworkRetries ?? 2);
+    return 1 + this.maxResends();
   }
 
   private async requestOnce<T>(
@@ -2435,6 +2747,15 @@ const PAYSAFE_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "3009": "card_declined",
   // 3406: settlement not batched yet — a timing state, retry later.
   "3406": "processing_error",
+  // Capture, refund and void state checks (402): the authorization or
+  // settlement cannot take the request — not a card decline.
+  "3203": "invalid_request", // the authorization is fully settled or cancelled
+  "3204": "invalid_request", // the settlement exceeds the remaining authorization
+  "3402": "invalid_request", // the refund exceeds the remaining settlement
+  "3404": "invalid_request", // the settlement is already fully refunded
+  "3501": "invalid_request", // the void exceeds the remaining authorization
+  "3502": "invalid_request", // the authorization has been settled
+  "3506": "invalid_request", // the void exceeds the remaining authorization
   "8000": "fraud_suspected",
   "8001": "fraud_suspected",
 };

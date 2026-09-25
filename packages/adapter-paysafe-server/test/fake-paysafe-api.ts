@@ -32,6 +32,25 @@ export type LostAnswer = "network" | "hang" | 500 | 502 | 503 | 504;
 /** A refusal before any processing: rate limited, or a 5xx that never reached the transaction. */
 export type RefusalStatus = 429 | 500 | 502 | 503 | 504;
 
+/**
+ * Paysafe's other "already seen" answers (402): 3044 "You have submitted a
+ * duplicate request." and 3417 "There is already another request being
+ * processed on the transaction referenced for this request."
+ */
+export type ReplayRejectionCode = "3044" | "3417";
+
+const REPLAY_REJECTION_MESSAGES: Record<ReplayRejectionCode, string> = {
+  "3044": "You have submitted a duplicate request.",
+  "3417": "There is already another request being processed on the transaction referenced for this request.",
+};
+
+/** A write Paysafe processes into a FAILED record filed with this error, answered with `status`. */
+export interface RecordedFailure {
+  status: number;
+  code: string;
+  message: string;
+}
+
 export interface RecordedRequest {
   method: string;
   path: string;
@@ -47,12 +66,17 @@ type RefNumIndex<T> = Map<string, T[]>;
  * - with `dupCheck: true`, a merchantRefNum already used on that endpoint
  *   answers 409/5031 ("The transaction you have submitted has already been
  *   processed.") and the original is never replayed. Settlements, refunds
- *   and verifications default dupCheck to true; /payments documents no
- *   default, and /paymenthandles and /voidauths take no dupCheck at all;
+ *   and verifications default dupCheck to true; /payments and
+ *   /paymenthandles document no default (both accept the field, as Paysafe's
+ *   own examples send it), and /voidauths takes none at all;
  * - a payments call spends a single-use handle whatever its outcome ("the
  *   payment handle status always changes to COMPLETED"), so a second call
  *   with it answers 400/5283. Verifications do not spend one;
- * - a declined payment is recorded, with its error, like any other;
+ * - a declined payment or verification is recorded, with its error, like any
+ *   other, and payment and verification records carry their
+ *   paymentHandleToken;
+ * - capture, refund and void state checks answer the documented 402 codes
+ *   (3203/3204, 3402/3404, 3501/3502);
  * - the GET ?merchantRefNum= lookups answer the documented collections.
  * Where Paysafe documents nothing — a reused merchantRefNum without dupCheck
  * on /payments, /paymenthandles or /voidauths — the fake takes the dangerous
@@ -87,8 +111,12 @@ export class FakePaysafeApi {
   private readonly subscriptionRefs = new Map<string, PaysafeSubscriptionLike>();
   private readonly lostAnswers: Array<{ matcher: RequestMatcher; outcome: LostAnswer }> = [];
   private readonly refusals: Array<{ matcher: RequestMatcher; status: RefusalStatus; remaining: number }> = [];
+  private readonly replayRejections: Array<{ matcher: RequestMatcher; code: ReplayRejectionCode }> = [];
+  private readonly recordedFailures: Array<{ matcher: RequestMatcher; failure: RecordedFailure }> = [];
   /** `${collection} ${merchantRefNum}` -> lookups still to answer empty. */
   private readonly lookupLag = new Map<string, number>();
+  /** The recordFailure lever that applies to the request being routed. */
+  private activeFailure: RecordedFailure | undefined;
   private seq = 0;
   uniqueHandleCreations = 0;
   uniquePaymentCreations = 0;
@@ -118,6 +146,12 @@ export class FakePaysafeApi {
    * undocumented order. Default: 5031 first.
    */
   stateCheckFirst = false;
+  /**
+   * The answer to a reused merchantRefNum under dupCheck on /payments:
+   * Paysafe documents 409/5031, and 402/3044 "You have submitted a duplicate
+   * request." among its payment errors.
+   */
+  duplicateCode: "5031" | "3044" = "5031";
 
   constructor() {
     this.multiUseTokens.add(SEEDED_MULTI_USE_TOKEN);
@@ -135,6 +169,20 @@ export class FakePaysafeApi {
    */
   refuse(matcher: RequestMatcher, status: RefusalStatus = 429, count = 1): void {
     this.refusals.push({ matcher, status, remaining: count });
+  }
+
+  /** The next matching request is answered 402 with this code, unprocessed. */
+  rejectAs(matcher: RequestMatcher, code: ReplayRejectionCode): void {
+    this.replayRejections.push({ matcher, code });
+  }
+
+  /**
+   * The next matching payment, settlement, refund or verification is
+   * processed into a FAILED record filed with this error (a decline, or an
+   * internal error such as 1007), and answered with `failure.status`.
+   */
+  recordFailure(matcher: RequestMatcher, failure: RecordedFailure): void {
+    this.recordedFailures.push({ matcher, failure });
   }
 
   /**
@@ -174,8 +222,16 @@ export class FakePaysafeApi {
         error: { code: "1200", message: "The API call has been denied as it has exceeded the permissible call rate limit." },
       });
     }
+    const rejectionIndex = this.replayRejections.findIndex((r) => matches(r.matcher, method, path));
+    if (rejectionIndex !== -1) {
+      const [rejection] = this.replayRejections.splice(rejectionIndex, 1);
+      return json(402, { error: { code: rejection!.code, message: REPLAY_REJECTION_MESSAGES[rejection!.code] } });
+    }
 
+    const failureIndex = this.recordedFailures.findIndex((f) => matches(f.matcher, method, path));
+    this.activeFailure = failureIndex === -1 ? undefined : this.recordedFailures.splice(failureIndex, 1)[0]!.failure;
     const response = this.route(method, path, parsed.searchParams, body);
+    this.activeFailure = undefined;
 
     const lostIndex = this.lostAnswers.findIndex((l) => matches(l.matcher, method, path));
     if (lostIndex === -1) return response;
@@ -335,14 +391,15 @@ export class FakePaysafeApi {
   /**
    * POST /paymenthandles for redirect and bank-debit rails. Redirect (Interac)
    * mirrors the documented response: INITIATED + action REDIRECT + the
-   * redirect_payment link. Bank rails come back immediately PAYABLE. No
-   * dupCheck field exists here, so a reused merchantRefNum mints again.
+   * redirect_payment link. Bank rails come back immediately PAYABLE. The
+   * request takes a top-level dupCheck (the EFT schema defines it, and
+   * Paysafe's ACH, EFT and wallet examples send it); without `dupCheck: true`
+   * a reused merchantRefNum mints again, its default being undocumented.
    */
   private createPaymentHandle(body: Record<string, unknown>): Response {
     this.lastHandleRequestBody = body;
-    // The request schema carries no top-level dupCheck, and unknown fields are strict-rejected.
-    if ("dupCheck" in body) return unrecognizedField("dupCheck");
     const refNum = body["merchantRefNum"] as string;
+    if (body["dupCheck"] === true && isFiled(this.handlesByRef, refNum)) return duplicateRefNum();
     const paymentType = body["paymentType"] as string;
     if (["SEPA", "ACH", "BACS", "EFT"].includes(paymentType)) {
       return this.createBankHandle(refNum, paymentType, body);
@@ -379,9 +436,11 @@ export class FakePaysafeApi {
   /**
    * Bank-debit handles: immediately PAYABLE (doc: ACH/EFT handles "should
    * immediately have the status of PAYABLE"), no redirect and no returnLinks.
-   * SEPA/BACS echo their bank object with the scheme mandate reference, like
-   * the real payloads do; the object is required, as the rail cannot debit an
-   * account it was never told about.
+   * Each echoes its bank object masked: SEPA/BACS with the scheme mandate
+   * reference, like the real payloads do, and ACH/EFT with their routing
+   * fields and two last digits, as Paysafe's handle examples show. The
+   * object is required, as the rail cannot debit an account it was never
+   * told about.
    */
   private createBankHandle(refNum: string, paymentType: string, body: Record<string, unknown>): Response {
     const railKey = paymentType.toLowerCase();
@@ -393,14 +452,20 @@ export class FakePaysafeApi {
     }
     const id = `ph_${++this.seq}`;
     const account = bank["iban"] ?? bank["accountNumber"] ?? "";
-    const echo: PaysafeBankAccountLike | undefined =
+    const echo: PaysafeBankAccountLike =
       paymentType === "SEPA" || paymentType === "BACS"
         ? {
             accountHolderName: bank["accountHolderName"],
             lastDigits: account.slice(-4),
             mandateReference: `MND${this.seq}REF`,
           }
-        : undefined;
+        : {
+            accountHolderName: bank["accountHolderName"],
+            lastDigits: account.slice(-2),
+            ...(paymentType === "ACH"
+              ? { routingNumber: bank["routingNumber"] }
+              : { transitNumber: bank["transitNumber"], institutionId: bank["institutionId"] }),
+          };
     const handle = {
       id,
       paymentHandleToken: `PH${this.seq}Token`,

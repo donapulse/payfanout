@@ -1049,10 +1049,15 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   adapter handles both: non-2xx maps through `mapWorldlineError` (the primary decline path,
   modeled in the fake), and a 2xx whose payment maps to `failed` is defensively surfaced as
   `card_declined` rather than a "failed" PaymentInfo. Confirm the real sandbox shape.
+  Refined 2026-09-25: such a payment now maps from its own `statusOutput.errors` rather than
+  always to `card_declined`, see "Worldline decline codes (2026-09-25)"; the sandbox shape is
+  still unconfirmed.
 - **Decline sub-codes.** Only five reject codes are enumerated on the troubleshooting page
   (30511001 insufficient funds, 30591001 fraud, 40001134 3-D Secure, 30171001 customer
   cancelled, 30041001 issuer rejected); everything else on a 402 maps to the generic
   `card_declined`. Enumerate expired-card / invalid-card-data codes from the sandbox.
+  Superseded 2026-09-25 by "Worldline decline codes (2026-09-25)": the troubleshooting page
+  and the Sips response-code mapping now document those codes and many more.
 - **Sandbox triggers.** Doc-verified 2026-07-15: amount `1302` (EUR, `authorizationMode=SALE`)
   is the test-cases page's documented unsuccessful-transaction trigger (statusCode 2), as the
   fake models; the page also documents `1303`/`1309` (unsuccessful refund/capture) and
@@ -1784,7 +1789,8 @@ sandbox round-trip before production use, and the setup guide carries that warni
   Refusal codes map 2/5/46 → `card_declined`, 6 → `expired_card`, 8/24 →
   `invalid_card_data`, 11/38/42 → `authentication_required`, 12 → `insufficient_funds`,
   14/20/31 → `fraud_suspected` (31, Issuer Suspected Fraud, since 2026-09-23), 9 (Issuer
-  Unavailable) → `processing_error`. None is retryable:
+  Unavailable) → `processing_error` (42 questioned 2026-09-25: see "Worldline decline codes
+  (2026-09-25)" and #217). None is retryable:
   replaying the same idempotency key returns the same refusal, so a fresh attempt is the
   shopper's move, and an unrecognized code is still a decline.
 - **CLP, CVE, IDR and ISK are rejected locally** (`invalid_request`): Adyen prices them with
@@ -2309,6 +2315,10 @@ description of what v2 changes is what the migration then had to implement.
   from `authentication_required` to `card_declined` or `unknown`, if Stripe.js reports the
   general code there. Would be wrong if Stripe used the code for failures where no new
   authentication can succeed, where `card_declined`'s "use another card" is the only remedy.
+  (Clarified 2026-09-25: this holds for a failed cardholder authentication. A 3-D Secure that
+  fails outside the customer's control is `processing_error` on Worldline, and Adyen's refusal
+  42 is such a failure, which still maps to `authentication_required` until #217; see
+  "Worldline decline codes (2026-09-25)".)
 - **`payment_method_restricted` stays `card_declined`.** Stripe's example is a card reported
   lost or stolen; the existing `restricted_card` decline code ("it's possible it was reported
   lost or stolen") already falls through to `card_declined`, and a `lost_card` or
@@ -2670,6 +2680,146 @@ description of what v2 changes is what the migration then had to implement.
     tokenization while the first payment trails the lookup, and the second of two sent
     together. It waits on the in-flight answer above; the bank-debit case was built first
     because an identical resubmission, the common retry, debited twice there.
+
+## Worldline decline codes (2026-09-25)
+
+- **The `errorCode`s Worldline documents map onto the taxonomy; any other code stays
+  `card_declined` on a 402, and on a REJECTED payment its error's own status decides.**
+  Doc-verified 2026-09-25 against the API Troubleshooting page
+  (docs.direct.worldline-solutions.com/en/integration/api-developer-guide/api-troubleshooting,
+  "Fix errors.errorCode" and "Payment retry guidelines") and the Sips response-code mapping
+  (docs.direct.worldline-solutions.com/en/migrate/migrate-from-sips/response-codes-mapping,
+  whose third column is the Direct `errorCode`). `fraud_suspected`: 30431001 ("the card used
+  has been reported as stolen"), 30411001 ("Lost card, pick up"), 30071001 ("Pick up card,
+  special condition (fraud account)"), 30591001 ("the card used has been used for fraudulent
+  transactions"), and 30001100, 30001101, 30001102, 30001104, 30001105, 30001106, 30001120,
+  30001130, 30001140, 30001141, 30001142, 30001143, 30001158 and 30001180, each "Your Fraud
+  Prevention module rejected the transaction because …". `invalid_card_data`: 30141001
+  ("Invalid card number"; Sips "Invalid PAN") and 30151001 ("No such issuer").
+  `expired_card`: 30331001 and 30541001 (Sips "Payment mean expired"). `insufficient_funds`:
+  30511001. `authentication_required`: 40001134 ("a failed 3-D Secure check") and 40001139
+  ("As the issuer insists on 3-D Secure, the transaction was rejected"; Sips A1, "the 3-D
+  Secure authentication data is missing"). `processing_error`: 40001135 and 50001081 ("the
+  issuer was not available to confirm the identity of the cardholder"), 40001137 ("our
+  platform could not roll out 3-D Secure"), 40001138 ("due to an unexpected failure"),
+  40001146 ("could not be completed within the given time"), and the Sips page's 30911001
+  ("Payment mean issuer inaccessible"), 30681001 ("Response not received or received too
+  late"), 30991001 ("Incident with initiator domain") and 30201001 ("Invalid response (error
+  in server domain)"). `invalid_request`: 30031001 ("your MID (merchant ID) is not working properly"; Sips
+  "Invalid acceptor"), 50001087 (3-D Secure could not run "because there was an technical
+  issue with your request") and the Sips page's 30301001 ("Format error"). This supersedes
+  the 2026-07-14 "Decline sub-codes" item.
+- **Stolen, lost and fraud-module rejections are `fraud_suspected`, as in the other
+  adapters.** The Stripe server adapter maps `stolen_card`, `lost_card`, `fraudulent` and
+  `merchant_blacklist` there, and the merchant's own Fraud Prevention rules and blacklists are
+  the analogue of `merchant_blacklist`. The PayZen adapters map the acquirer response codes 41
+  (lost), 43 (stolen) and 59 the same way, and the Sips page gives those codes as 30411001,
+  30431001 and 30591001. The rest agrees too: PayZen's 14, 33/54 and 51 (`invalid_card_data`,
+  `expired_card`, `insufficient_funds`) are Sips 14, 33/54 and 51, that is 30141001,
+  30331001/30541001 and 30511001, and both read a missing strong authentication as
+  `authentication_required` (1A, which the PayZen server adapter labels "SCA soft decline";
+  Sips A1, which the page maps to 40001139). The customer learns nothing more: the catalog
+  message for `fraud_suspected` is the generic "Your card was declined.", and Worldline's
+  `message` is never relayed, since the API contract
+  (payment.preprod.direct.worldline-solutions.com/v1/public-contract-definition.yaml,
+  v2.507.0) describes it as "not meant to be relayed to customer as it might tip off people
+  who are trying to commit fraud". The answer stays whole on `raw`.
+- **The 3-D Secure failures and an unreachable issuer are `processing_error`, and none of the
+  mapped codes is retryable.** Worldline calls 40001135/50001081 and 40001137 "out of your
+  control", advises resubmitting later or offering another payment method for them and for
+  40001138, and asks the merchant to contact it about 40001146. `card_declined` would tell the
+  customer the card is at fault, and `authentication_required` would send them back to a 3-D
+  Secure step that could not complete. 30911001 and 30681001, an issuer out of reach and a
+  response that never came or came too late, and 30991001 and 30201001, incidents on the
+  acquiring side, follow the Adyen adapter's reading of Issuer Unavailable (refusal 9), also
+  `processing_error`. `retryable` means replaying the call
+  under the same idempotency key, and Worldline answers such a replay with "the same outcome
+  as the original request, even with different payloads" for its idempotence period, "at
+  least 24 hours"
+  (docs.direct.worldline-solutions.com/en/integration/api-developer-guide/idempotent-requests),
+  so a same-key retry only replays the rejection. `PaymentRouter` fails over on any
+  `processing_error` whatever `retryable` says, which is harmless here: it cascades session
+  creation only, and a Worldline session is an amountless CreateHostedTokenization. The
+  contract's `aPIError.retriable` flag reads "the same request can safely be sent again with a
+  new idempotence key", a new attempt rather than a replay; the adapter does not read it, and
+  the transport retries are unchanged.
+- **A failed cardholder authentication is `authentication_required`; a 3-D Secure that could
+  not complete is `processing_error`.** The first is Worldline 40001134, Adyen refusal 11 ("3D
+  Not Authenticated") and Stripe `authentication_failure`: the customer can authenticate
+  again, and Worldline's entry for 40001134 names "legitimate authentication failures (i.e.
+  technical problem with your customers' device or network, missing card readers or forgotten
+  PIN codes) or fraud attempts". The second is 40001135/50001081, 40001137, 40001138 and
+  40001146, where the issuer, the acquirer or the platform could not complete 3-D Secure:
+  authenticating again now does not help, and Worldline advises another payment method or a
+  later attempt (for 40001146, contacting it). The Adyen adapter maps its refusal 42 to
+  `authentication_required`, although Adyen's refusal-reasons page
+  (docs.adyen.com/development-resources/refusal-reasons) reads "The 3D Secure authentication
+  failed due to an issue at the card network or issuer". That is inconsistent with this
+  reading, and it is tracked in #217. The Stripe entry's `authentication_failure`
+  bullet carries the same clarification.
+- **The merchant's set-up and request refusals are `invalid_request`.** 30031001 is the
+  acquirer refusing the merchant id: Worldline asks the merchant to "Contact us and your
+  acquirer to make sure that the MID properly set up on our side and your acquirer's side",
+  and the Statuses page (docs.direct.worldline-solutions.com/en/integration/api-developer-guide/statuses)
+  names MIDs that are "not correctly setup" among the causes of an authorisation declined
+  (status 2). 50001087 is a request 3-D Secure could not run on, and 30301001 ("Format
+  error") an integration error. The merchant has to act: `processing_error`'s "please try
+  again" cannot help, and `card_declined`'s "use another card" helps only when that card
+  goes through another, working MID. The PayZen server adapter maps its merchant-configuration
+  refusals the same way (PSP_100, the REST API not enabled on the shop; PSP_109, production
+  mode not activated; PSP_610, no acceptance agreement). Its CB network table does not yet:
+  PayZen's acquirer codes 03, 30, 68 and 91, the Sips codes behind 30031001, 30301001,
+  30681001 and 30911001, stay `card_declined` there, tracked in #218.
+- **A 429 or a 5xx is classified by its status before any code.** Before, a 5xx carrying a
+  mapped code (30511001, say) came out as a non-retryable decline and skipped the transport
+  retries. The order is now: 429 or 5xx; the code map; 402 → `card_declined`; 409 → the
+  retryable `processing_error` of a replay racing its in-flight original; core's
+  `classifyHttpFallback`. The code is the first `errors` entry's `errorCode`, else its
+  deprecated `code` ("Use errorCode instead"), an empty `errorCode` counting as none, and it
+  is looked up among the map's own keys only.
+- **A 2xx CreatePayment carrying a REJECTED payment maps from the payment's own errors.** The
+  contract's `paymentStatusOutput` says "In case of failed payments and negative scenarios,
+  detailed error information is listed" in `errors`, the same `aPIError` array as an error
+  body, and the troubleshooting page's "Transaction exception" example shows a REJECTED
+  payment carrying `statusOutput.errors`. `payment.statusOutput.errors[0]` now goes through
+  the same map, never retryable, with the whole CreatePayment response on `raw`. This
+  refines the 2026-07-14 "Decline HTTP shape" item, which made every such payment a
+  `card_declined`. That example's error is 50001066 `INVALID_VALUE` with `httpStatusCode`
+  400, and no page documents the code. So on a REJECTED payment an error without a mapped
+  code is read by its embedded `httpStatusCode`: a 4xx other than 402 is `invalid_request`,
+  since Worldline refused the request rather than the card; a 5xx is `processing_error`,
+  since the platform failed rather than the card, and not `psp_unavailable`, which is always
+  retryable while a replay under the key answers the same rejected payment; anything else, a
+  missing status included, is `card_declined`.
+- **Plain declines stay `card_declined`.** 30051001 ("Do not honour"), 30121001, 30571001,
+  30581001, 30621001, 30921001, 33000972, 33000973, 33000975 and 33000833 reach it through the
+  402 default. 30041001 and 30171001 keep explicit entries because their descriptions invite
+  another reading. The troubleshooting table gives 30041001 for a card that "Has expired" or
+  "Is under suspicion of fraudulent use", its retry list calls it "Pick up card (no fraud)",
+  and the Sips page sends both acquirer 04 ("Keep the payment mean") and 07 ("Keep the payment
+  mean, special conditions") to it, so the conservative reading claims no fraud. 30171001 is
+  the customer cancelling "on the Hosted Checkout Page by clicking on the "Cancel" button"
+  (the code comment used to say "at the acquirer"). The two pages also disagree on 30581001
+  (a corporate card; Sips "Transaction forbidden to the terminal") and 30621001 ("(security)
+  restrictions"; Sips "Transaction awaiting payment confirmation"), declines either way, and
+  the Sips page maps acquirer 65, "Allowed number of daily transactions has been exceeded", to
+  40001139 as well; the troubleshooting page's reading decides. Sips codes left at the
+  `card_declined` default on purpose: 30941001 ("Duplicated transaction"), 30311001 ("Id of
+  the acquiring organisation unknown"), 30131001 ("Invalid amount") and 30251001
+  ("Transaction not found"), whose Direct meaning no page states.
+- **Recorded for a future dunning signal, not implemented.** The retry guidelines list
+  "Non-Retriable Errors", which "indicated permanent issues with the transaction. We strongly
+  recommend not resubmitting the payment request": 30041001, 30071001, 30121001, 30141001,
+  30151001, 30411001, 30431001, 30571001, 33000972, 33000973, 33000975 and 33000833. For every
+  other code, "You can retry, but limit to a maximum of 10 attempts within 30 days to stay
+  compliant with card scheme guidelines and avoid potential fees." Both concern
+  merchant-initiated resubmissions under the Card On File framework. Core cannot express
+  either today: `retryable` covers same-key replays only, with no "never resubmit this card"
+  signal and no attempt budget, and the Worldline adapter declares no vaulting, so no
+  merchant-initiated retry runs through it yet.
+- **Doc-derived only.** No sandbox run has observed a Worldline `errorCode` yet: which code the
+  sandbox's 1302 decline carries, and whether any decline arrives as a 2xx REJECTED payment
+  rather than a 402, remain open.
 
 ## Subscription renewals without a definitive answer (2026-09-25)
 

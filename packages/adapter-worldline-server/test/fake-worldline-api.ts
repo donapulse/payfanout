@@ -1,4 +1,5 @@
 import type {
+  WorldlineApiError,
   WorldlineCaptureLike,
   WorldlinePaymentLike,
   WorldlineRefundLike,
@@ -17,7 +18,8 @@ import type {
  *     capture and refund sub-resources (partial capture, over-refund
  *     rejection, cancel-before-capture); refunds are read ONLY via the
  *     per-payment list, as on the real platform (no refund-by-id route)
- *   - card declines as HTTP 402 with { errorId, errors, paymentResult }
+ *   - card declines as HTTP 402 with { errorId, errors, paymentResult }, or,
+ *     behind a lever, as a 201 carrying a REJECTED payment
  */
 interface StoredPayment {
   id: string;
@@ -32,6 +34,8 @@ interface StoredPayment {
   capturableRemaining: number;
   captures: WorldlineCaptureLike[];
   refunds: WorldlineRefundLike[];
+  /** statusOutput.errors: why a REJECTED payment failed. */
+  errors?: WorldlineApiError[];
 }
 
 /** Amount that triggers a decline (mirrors a Worldline sandbox amount trigger). */
@@ -54,6 +58,12 @@ export class FakeWorldlineApi {
   /** Test levers for the verifyCredentials probe. */
   authFailure = false;
   networkFailure = false;
+  /**
+   * CreatePayment answers 201 with a REJECTED payment (2/UNSUCCESSFUL), carrying
+   * these statusOutput.errors when given: the "Transaction exception" shape of
+   * the API Troubleshooting page.
+   */
+  rejectPayment: { errors?: WorldlineApiError[] } | undefined = undefined;
 
   readonly fetch: typeof fetch = async (input, init) => {
     if (this.networkFailure) throw new TypeError("simulated network failure");
@@ -205,6 +215,17 @@ export class FakeWorldlineApi {
     }
     const id = `pay_${++this.seq}`;
     const sale = (card.authorizationMode ?? "SALE").toUpperCase() !== "PRE_AUTHORIZATION";
+    if (this.rejectPayment) {
+      // Stored under its key: a replay answers the same rejected payment.
+      const payment: StoredPayment = {
+        id, amount, currencyCode, merchantReference: order.references?.merchantReference,
+        status: "REJECTED", statusCode: 2, statusCategory: "UNSUCCESSFUL",
+        sale, capturableRemaining: 0, captures: [], refunds: [],
+        ...(this.rejectPayment.errors ? { errors: this.rejectPayment.errors } : {}),
+      };
+      this.store(payment, idemKey);
+      return json(201, createResponse(payment));
+    }
     if (hostedTokenizationId === THREE_DS_TOKEN) {
       const payment: StoredPayment = {
         id, amount, currencyCode, merchantReference: order.references?.merchantReference,
@@ -453,7 +474,11 @@ function publicPayment(payment: StoredPayment): WorldlinePaymentLike {
   return {
     id: payment.id,
     status: payment.status,
-    statusOutput: { statusCode: payment.statusCode, statusCategory: payment.statusCategory },
+    statusOutput: {
+      statusCode: payment.statusCode,
+      statusCategory: payment.statusCategory,
+      ...(payment.errors ? { errors: payment.errors } : {}),
+    },
     paymentOutput: {
       amountOfMoney: { amount: payment.amount, currencyCode: payment.currencyCode },
       ...(payment.merchantReference ? { references: { merchantReference: payment.merchantReference } } : {}),

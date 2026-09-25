@@ -70,6 +70,18 @@ describe("mapStripeError", () => {
       retryable: false,
     },
     {
+      name: "failed PaymentIntent authentication, before dahlia",
+      err: { type: "StripeCardError", code: "payment_intent_authentication_failure", message: "…" },
+      code: "authentication_required",
+      retryable: false,
+    },
+    {
+      name: "failed SetupIntent authentication, before dahlia",
+      err: { type: "StripeCardError", code: "setup_intent_authentication_failure", message: "…" },
+      code: "authentication_required",
+      retryable: false,
+    },
+    {
       // A fraud decline code still wins over the authentication failure.
       name: "failed authentication on a card reported stolen",
       err: { type: "StripeCardError", code: "authentication_failure", decline_code: "stolen_card", message: "…" },

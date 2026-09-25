@@ -298,7 +298,8 @@ describe("GoCardless native subscription list", () => {
       if (!result.nextCursor) break;
       cursor = result.nextCursor;
     }
-    expect(seen).toEqual(seeded.map((s) => s.id));
+    // Newest first, as GoCardless orders every list.
+    expect(seen).toEqual(seeded.map((s) => s.id).reverse());
     expect(new Set(seen).size).toBe(seen.length);
   });
 

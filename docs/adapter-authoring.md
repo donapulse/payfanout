@@ -93,9 +93,20 @@ and `PaymentService` will hold you to:
 - **Idempotency:** `idempotencyKey` is REQUIRED on every mutating call — session
   creation, completion, refunds, **capture, cancel, and verification included**.
   Forward it through your PSP's mechanism (Stripe: `Idempotency-Key` request option;
-  Paysafe: `merchantRefNum`; GoCardless: `Idempotency-Key` header; PayPal:
-  `PayPal-Request-Id`). If your PSP has no idempotency channel (PayZen), document how
-  its state machine makes replays safe instead.
+  GoCardless: `Idempotency-Key` header; PayPal: `PayPal-Request-Id`). Check whether that
+  mechanism *replays* a duplicate or *rejects* it. Paysafe's `merchantRefNum` under
+  `dupCheck` rejects the repeat (409, error `5031`) instead of answering with the
+  original, so the Paysafe adapter never re-sends a write blindly: after a timeout, a 5xx
+  or a duplicate rejection it reads the original back through Paysafe's
+  `?merchantRefNum=` lookups, and a payment, capture or refund that cannot be read back
+  fails as "retry later with the same key" instead of going out again. Unless your PSP
+  documents that its channel absorbs a duplicate still in flight, do the same. Where the
+  instrument is single-use (a Paysafe payment handle refuses a second charge), that refusal
+  already guards the replay, and a duplicate check on top would block a new card after a
+  decline under a stable per-order key. Where the adapter mints the instrument itself on
+  each attempt (Paysafe's bank debits), a replay carries a new one, so the duplicate check
+  stays on until a failed attempt shows under the key. If your PSP has no idempotency
+  channel (PayZen), document how its state machine makes replays safe instead.
 - **Host id round-trip:** when `input.id` is present, stamp it into PSP metadata
   (`payfanout_id`) if your PSP supports metadata, and prefer it for `PaymentInfo.id`.
   Echo the stored metadata on `PaymentInfo.metadata`. If your PSP genuinely cannot

@@ -242,7 +242,8 @@ export interface StripeServerAdapterConfig {
    */
   requestTimeoutMs?: number;
   /**
-   * Automatic network-level retries inside the Stripe SDK. Default 2. Calls
+   * Automatic network-level retries inside the Stripe SDK: an integer >= 0,
+   * default 2. Calls
    * that create objects or move money carry the caller's idempotency key, so
    * a retry cannot duplicate them; at 0 the SDK still retries a closed
    * connection once. Only applies when the SDK is loaded lazily — an injected

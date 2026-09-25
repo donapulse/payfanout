@@ -63,12 +63,29 @@ describe("mapStripeError", () => {
       retryable: false,
     },
     {
-      // Unmapped for now: falls through to card_declined. Whether it should follow the adapters
-      // that map a failed 3-D Secure to authentication_required is an open decision
-      // (docs/decisions.md).
+      // A failed 3-D Secure, as the browser adapter and the other adapters map it (docs/decisions.md).
       name: "failed authentication",
       err: { type: "StripeCardError", code: "authentication_failure", message: "…" },
-      code: "card_declined",
+      code: "authentication_required",
+      retryable: false,
+    },
+    {
+      name: "failed PaymentIntent authentication, before dahlia",
+      err: { type: "StripeCardError", code: "payment_intent_authentication_failure", message: "…" },
+      code: "authentication_required",
+      retryable: false,
+    },
+    {
+      name: "failed SetupIntent authentication, before dahlia",
+      err: { type: "StripeCardError", code: "setup_intent_authentication_failure", message: "…" },
+      code: "authentication_required",
+      retryable: false,
+    },
+    {
+      // A fraud decline code still wins over the authentication failure.
+      name: "failed authentication on a card reported stolen",
+      err: { type: "StripeCardError", code: "authentication_failure", decline_code: "stolen_card", message: "…" },
+      code: "fraud_suspected",
       retryable: false,
     },
     {

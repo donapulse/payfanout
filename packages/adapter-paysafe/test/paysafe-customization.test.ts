@@ -127,7 +127,7 @@ describe("Paysafe field customization", () => {
     expect(fake.setupOptions[0]).toBeDefined();
   });
 
-  it("maps BCP-47 locales to Paysafe's underscore form and passes unknown setup options through", async () => {
+  it("does not forward locale, which is no setup option, and passes unknown setup options through", async () => {
     const { adapter, fake } = makeAdapter();
     stubBrowser();
     await adapter.mount({ appendChild: () => {} } as never, {
@@ -135,10 +135,15 @@ describe("Paysafe field customization", () => {
       locale: "fr-CA",
       fieldOptions: { someFutureSdkOption: { enabled: true } },
     });
-    expect(fake.setupOptions[0]).toMatchObject({
-      locale: "fr_CA",
-      someFutureSdkOption: { enabled: true },
-    });
+    expect(fake.setupOptions[0]).toMatchObject({ someFutureSdkOption: { enabled: true } });
+    expect(fake.setupOptions[0]).not.toHaveProperty("locale");
+  });
+
+  it("still hands a host's own locale setup option through untouched", async () => {
+    const { adapter, fake } = makeAdapter();
+    stubBrowser();
+    await adapter.mount({ appendChild: () => {} } as never, { clientSecret: TOKEN, fieldOptions: { locale: "fr_CA" } });
+    expect(fake.setupOptions[0]).toMatchObject({ locale: "fr_CA" });
   });
 
   it("non-negotiables win over fieldOptions: environment, currencyCode, accounts", async () => {
@@ -182,6 +187,23 @@ describe("Paysafe field customization", () => {
     expect(style["input"]).toEqual({ color: "#333", "font-family": "system-ui", "font-size": "16px" });
   });
 
+  it("recognizes colorBackground without sending a background Paysafe.js would delete", async () => {
+    stubBrowser();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { adapter, fake } = makeAdapter();
+    await adapter.mount({ appendChild: () => {} } as never, {
+      clientSecret: TOKEN,
+      appearance: { colorBackground: "#fafafa", colorText: "#333" },
+    });
+    expect(fake.setupOptions[0]!["style"]).toEqual({ input: { color: "#333" } });
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+
+    const { adapter: only, fake: onlyFake } = makeAdapter();
+    await only.mount({ appendChild: () => {} } as never, { clientSecret: TOKEN, appearance: { colorBackground: "#fafafa" } });
+    expect(onlyFake.setupOptions[0]).not.toHaveProperty("style");
+  });
+
   it("passes native Paysafe selectors through, and a native input wins over the common tokens", async () => {
     stubBrowser();
     const { adapter, fake } = makeAdapter();
@@ -194,7 +216,7 @@ describe("Paysafe field customization", () => {
     expect(style[":focus"]).toEqual({ color: "#000" });
   });
 
-  it("drops Stripe Appearance keys with a warning instead of silently breaking all styling", async () => {
+  it("drops Stripe Appearance keys with a warning instead of forwarding them to Paysafe.js", async () => {
     stubBrowser();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { adapter, fake } = makeAdapter();

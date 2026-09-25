@@ -1789,7 +1789,8 @@ sandbox round-trip before production use, and the setup guide carries that warni
   Refusal codes map 2/5/46 → `card_declined`, 6 → `expired_card`, 8/24 →
   `invalid_card_data`, 11/38/42 → `authentication_required`, 12 → `insufficient_funds`,
   14/20/31 → `fraud_suspected` (31, Issuer Suspected Fraud, since 2026-09-23), 9 (Issuer
-  Unavailable) → `processing_error`. None is retryable:
+  Unavailable) → `processing_error` (42 questioned 2026-09-25: see "Worldline decline codes
+  (2026-09-25)" and #217). None is retryable:
   replaying the same idempotency key returns the same refusal, so a fresh attempt is the
   shopper's move, and an unrecognized code is still a decline.
 - **CLP, CVE, IDR and ISK are rejected locally** (`invalid_request`): Adyen prices them with
@@ -2316,7 +2317,8 @@ description of what v2 changes is what the migration then had to implement.
   authentication can succeed, where `card_declined`'s "use another card" is the only remedy.
   (Clarified 2026-09-25: this holds for a failed cardholder authentication. A 3-D Secure that
   fails outside the customer's control is `processing_error` on Worldline, and Adyen's refusal
-  42 is such a failure; see "Worldline decline codes (2026-09-25)".)
+  42 is such a failure, which still maps to `authentication_required` until #217; see
+  "Worldline decline codes (2026-09-25)".)
 - **`payment_method_restricted` stays `card_declined`.** Stripe's example is a card reported
   lost or stolen; the existing `restricted_card` decline code ("it's possible it was reported
   lost or stolen") already falls through to `card_declined`, and a `lost_card` or
@@ -2701,8 +2703,9 @@ description of what v2 changes is what the migration then had to implement.
   issuer was not available to confirm the identity of the cardholder"), 40001137 ("our
   platform could not roll out 3-D Secure"), 40001138 ("due to an unexpected failure"),
   40001146 ("could not be completed within the given time"), and the Sips page's 30911001
-  ("Payment mean issuer inaccessible") and 30681001 ("Response not received or received too
-  late"). `invalid_request`: 30031001 ("your MID (merchant ID) is not working properly"; Sips
+  ("Payment mean issuer inaccessible"), 30681001 ("Response not received or received too
+  late"), 30991001 ("Incident with initiator domain") and 30201001 ("Invalid response (error
+  in server domain)"). `invalid_request`: 30031001 ("your MID (merchant ID) is not working properly"; Sips
   "Invalid acceptor"), 50001087 (3-D Secure could not run "because there was an technical
   issue with your request") and the Sips page's 30301001 ("Format error"). This supersedes
   the 2026-07-14 "Decline sub-codes" item.
@@ -2727,8 +2730,9 @@ description of what v2 changes is what the migration then had to implement.
   40001138, and asks the merchant to contact it about 40001146. `card_declined` would tell the
   customer the card is at fault, and `authentication_required` would send them back to a 3-D
   Secure step that could not complete. 30911001 and 30681001, an issuer out of reach and a
-  response that never came or came too late, follow the Adyen adapter's reading of Issuer
-  Unavailable (refusal 9), also `processing_error`. `retryable` means replaying the call
+  response that never came or came too late, and 30991001 and 30201001, incidents on the
+  acquiring side, follow the Adyen adapter's reading of Issuer Unavailable (refusal 9), also
+  `processing_error`. `retryable` means replaying the call
   under the same idempotency key, and Worldline answers such a replay with "the same outcome
   as the original request, even with different payloads" for its idempotence period, "at
   least 24 hours"
@@ -2759,11 +2763,13 @@ description of what v2 changes is what the migration then had to implement.
   and the Statuses page (docs.direct.worldline-solutions.com/en/integration/api-developer-guide/statuses)
   names MIDs that are "not correctly setup" among the causes of an authorisation declined
   (status 2). 50001087 is a request 3-D Secure could not run on, and 30301001 ("Format
-  error") an integration error. The customer can fix none of them: `card_declined` would send
-  them to another card and `processing_error`'s "please try again" to a retry, both for
-  nothing. The PayZen server adapter maps its merchant-configuration refusals the same way
-  (PSP_100, the REST API not enabled on the shop; PSP_109, production mode not activated;
-  PSP_610, no acceptance agreement).
+  error") an integration error. The merchant has to act: `processing_error`'s "please try
+  again" cannot help, and `card_declined`'s "use another card" helps only when that card
+  goes through another, working MID. The PayZen server adapter maps its merchant-configuration
+  refusals the same way (PSP_100, the REST API not enabled on the shop; PSP_109, production
+  mode not activated; PSP_610, no acceptance agreement). Its CB network table does not yet:
+  PayZen's acquirer codes 03, 30, 68 and 91, the Sips codes behind 30031001, 30301001,
+  30681001 and 30911001, stay `card_declined` there, tracked in #218.
 - **A 429 or a 5xx is classified by its status before any code.** Before, a 5xx carrying a
   mapped code (30511001, say) came out as a non-retryable decline and skipped the transport
   retries. The order is now: 429 or 5xx; the code map; 402 → `card_declined`; 409 → the
@@ -2797,7 +2803,10 @@ description of what v2 changes is what the migration then had to implement.
   (a corporate card; Sips "Transaction forbidden to the terminal") and 30621001 ("(security)
   restrictions"; Sips "Transaction awaiting payment confirmation"), declines either way, and
   the Sips page maps acquirer 65, "Allowed number of daily transactions has been exceeded", to
-  40001139 as well; the troubleshooting page's reading decides.
+  40001139 as well; the troubleshooting page's reading decides. Sips codes left at the
+  `card_declined` default on purpose: 30941001 ("Duplicated transaction"), 30311001 ("Id of
+  the acquiring organisation unknown"), 30131001 ("Invalid amount") and 30251001
+  ("Transaction not found"), whose Direct meaning no page states.
 - **Recorded for a future dunning signal, not implemented.** The retry guidelines list
   "Non-Retriable Errors", which "indicated permanent issues with the transaction. We strongly
   recommend not resubmitting the payment request": 30041001, 30071001, 30121001, 30141001,

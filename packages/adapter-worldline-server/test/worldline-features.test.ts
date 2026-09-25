@@ -214,6 +214,8 @@ describe("mapWorldlineError", () => {
     [402, "40001146", "processing_error", false],
     [402, "30911001", "processing_error", false],
     [402, "30681001", "processing_error", false],
+    [402, "30991001", "processing_error", false],
+    [402, "30201001", "processing_error", false],
     // The merchant's set-up or request, which the customer cannot fix.
     [402, "30031001", "invalid_request", false],
     [402, "30301001", "invalid_request", false],

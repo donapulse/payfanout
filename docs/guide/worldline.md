@@ -322,7 +322,7 @@ whose third column gives the `errorCode`:
 | `30331001`, `30541001` (expired) | `expired_card` |
 | `30511001` | `insufficient_funds` |
 | `40001134` (failed 3-D Secure check), `40001139` (the issuer insists on 3-D Secure) | `authentication_required` |
-| `40001135`, `50001081`, `40001137`, `40001138`, `40001146` (3-D Secure failed outside the customer's control), `30911001` (issuer unreachable), `30681001` (no response, or too late) | `processing_error` |
+| `40001135`, `50001081`, `40001137`, `40001138`, `40001146` (3-D Secure failed outside the customer's control), `30911001` (issuer unreachable), `30681001` (no response, or too late), `30991001` and `30201001` (an incident on the acquiring side) | `processing_error` |
 | `30031001` (the acquirer refused your merchant id), `30301001` (format error), `50001087` (3-D Secure failed on a technical issue with the request) | `invalid_request` |
 | Any other code, or none | `card_declined` |
 

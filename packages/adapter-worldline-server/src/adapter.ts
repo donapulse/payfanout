@@ -1069,6 +1069,8 @@ const WORLDLINE_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "40001146": "processing_error",
   "30911001": "processing_error", // Payment mean issuer inaccessible
   "30681001": "processing_error", // Response not received or received too late
+  "30991001": "processing_error", // Incident with initiator domain
+  "30201001": "processing_error", // Invalid response (error in server domain)
   // The merchant's set-up or request is at fault, which the customer cannot
   // fix (the PayZen adapter maps its merchant-configuration refusals the same
   // way).

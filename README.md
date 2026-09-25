@@ -400,7 +400,8 @@ parsed body before verifying** (same JSON value, different bytes ⇒ must reject
 Redelivery is limited: Paysafe, for one, counts only a `200` or `202` as received and makes
 at most three attempts, with no alert when they fail. **Dedupe is yours:** `event.id` is a
 stable key; keep the seen-set in your store. **Ordering is not guaranteed** by any PSP,
-treat events as unordered facts and reconcile with `retrievePayment` when sequence matters.
+treat events as unordered facts and reconcile with `retrievePayment` when sequence matters
+(a bank-debit return excepted: act on the return event itself).
 
 **Secret rotation without cutover:** the adapters accept an *array* of signing
 secrets/HMAC keys (Worldline's as `{ keyId, secretKey }` pairs matched by the webhook's

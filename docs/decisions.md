@@ -2212,9 +2212,9 @@ description of what v2 changes is what the migration then had to implement.
   official PHP SDK's webhook test fixture
   (`tests/Webhook/resources/json/valid_webhook_payload.json`) has an `eventDate` later than
   its `txnTime`, so what `eventDate` measures is unsettled and it is used only when the
-  payload has no time. The price is merging: card and refund payloads carry no
-  `statusTime`, so one resource reporting the same event twice at one status would share an
-  id. The Paysafe guide therefore tells hosts to re-read with `retrievePayment` /
+  payload has no time. The price is merging: Paysafe's card and refund webhook examples
+  carry no `statusTime`, so one resource reporting the same event twice at one status
+  would share an id. The Paysafe guide therefore tells hosts to re-read with `retrievePayment` /
   `retrieveRefund` whether or not the id was seen. A top-level `id` is not read: the example
   payload on the Configure Webhooks page is the bare resource with its own id there, and
   keying on it would merge every event of that resource. A body naming no resource hashes
@@ -2265,10 +2265,11 @@ description of what v2 changes is what the migration then had to implement.
   "Because Direct Debit requests can take up to 7 days to clear, you cannot be notified of
   errors such as these via the API response", pointing to Merchant Back Office reports. The
   adapter's `retrievePayment` has no return state, so a returned debit keeps reading
-  `succeeded`. The guides therefore tell hosts to act on the return webhook, reconcile bank
-  debits against the Back Office return reports, and never let a read override a return.
-  Sandbox check: on an EUR (SEPA) or GBP (Bacs) account with `PAYSAFE_WEBHOOK_HMAC_KEY`,
-  trigger a return and read the payment afterwards.
+  `succeeded` unless Paysafe moves the payment out of COMPLETED, which no page documents.
+  The guides therefore tell hosts to act on the return webhook, reconcile bank debits
+  against the Back Office return reports, and never let a read override a return. Sandbox
+  check: on an EUR (SEPA) or GBP (Bacs) account with `PAYSAFE_WEBHOOK_HMAC_KEY`, trigger a
+  return (no documented trigger; ask Paysafe support) and read the payment afterwards.
 - **Signature, doc-verified.** Configure Webhooks: digest = HMAC_SHA256(hmacKey, UTF-8
   JSON body), signature = base64(digest), example header `Signature`; the official PHP
   SDK's `SignatureVerifier` computes the same and compares with `hash_equals`. The exported

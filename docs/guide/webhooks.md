@@ -58,7 +58,7 @@ The handler verifies, parses, hands the event to your `onEvent`, and expects a 2
 immediately, `onEvent` must **enqueue, not process**. Redelivery is not unlimited: Paysafe,
 for one, counts only a `200` or `202` as received and stops after three attempts with no
 alert, so an event whose handler failed all three is gone. A `retrievePayment` re-read
-recovers a payment's outcome, but not a bank-debit return: Paysafe reports those only
+recovers a payment's outcome, but not a bank-debit return: Paysafe documents those only
 through the return webhook and its Merchant Back Office return reports, so reconcile bank
 debits against those reports, and never let a read that says `succeeded` override a return
 you received.

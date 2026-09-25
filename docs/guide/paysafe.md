@@ -332,7 +332,8 @@ step, and the mandate reference (SEPA/Bacs) surfaces on `PaymentInfo.mandateRefe
 `PAYMENT_COMPLETED` when the request is accepted into the banking network, and — days
 later — `PAYMENT_RETURNED_COMPLETED` (also delivered by Paysafe as
 `PAYMENT_RETURN_COMPLETED`; both map to `payment.failed`, with `pspPaymentId` naming the
-bounced payment) when the bank bounces the debit. Bacs runs a ~10-business-day cycle. Never ship the order on `processing`.
+bounced payment) when the bank bounces the debit. Bacs runs a ~10-business-day cycle.
+Never ship the order on `processing`.
 Settlement-lifecycle events (`SETTLEMENT_*`) carry settlement ids, not payment ids, and
 are delivered as `unknown` — correlate by payload `merchantRefNum` (your
 `idempotencyKey`) if you consume them. Paysafe documents **no refunds for Bacs**; refund
@@ -391,10 +392,11 @@ failing `onEvent` included, is retried, three attempts in all per Paysafe's webh
 and Paysafe sends no alert when they all fail. So `onEvent` must enqueue and return fast,
 and a delivery that never landed does not come back: Paysafe has no public events-polling
 API (`supportsEventPolling: false`), so reconcile open orders with `retrievePayment` on a
-schedule. A bank-debit return is the exception: "Because Direct Debit requests can take up
-to 7 days to clear, you cannot be notified of errors such as these via the API response",
-so a read keeps saying `succeeded`. Reconcile bank debits against the Merchant Back Office
-return reports, and never let a read override a return you received. See
+schedule. A bank-debit return is the exception. Paysafe's API reference says of bank-level
+failures: "Because Direct Debit requests can take up to 7 days to clear, you cannot be
+notified of errors such as these via the API response", so a read may keep saying
+`succeeded`. Reconcile bank debits against the Merchant Back Office return reports, and
+never let a read override a return you received. See
 [Webhooks](/guide/webhooks).
 :::
 
@@ -409,8 +411,8 @@ as well: one resource reporting the same event twice without a new status time d
 Paysafe's documented card and refund examples carry no `statusTime`. So don't let dedupe
 alone decide an outcome: re-read with `retrievePayment` for payment events and
 `retrieveRefund` for refund events, even for an id you have already seen (both reads are
-idempotent). A bank return is the exception: no read reflects it, so act on the return
-event itself.
+idempotent). A bank return is the exception: no read is documented to reflect it, so act
+on the return event itself.
 
 `event.pspPaymentId` names a payment, never another resource:
 

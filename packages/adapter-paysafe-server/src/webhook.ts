@@ -16,7 +16,8 @@ import {
  * in the `Signature` header. Verification MUST hash the exact raw body bytes.
  * Paysafe counts only a 200 or 202 as received, makes at most three attempts
  * in all, and raises no alert once they fail — ack fast, process async (see
- * @payfanout/server's handler contract), and reconcile with retrievePayment.
+ * @payfanout/server's handler contract), and reconcile with retrievePayment —
+ * except a bank-debit return, which no documented read reflects.
  *
  * WebCrypto (async) so this runs on edge runtimes as well as Node.
  */
@@ -120,9 +121,11 @@ type JsonObject = Record<string, unknown>;
  * normalized event name, the resource id (`payload.id`, else `resourceId`), the
  * payload `status`, and the payload `statusTime`, else its `txnTime`, else the
  * envelope `eventDate`. Distinct notifications agreeing on all four share an id
- * (card and refund payloads carry no `statusTime`), so a host that must see
- * every transition re-reads with `retrievePayment` / `retrieveRefund` whether or
- * not the id was seen. A top-level `id` is ignored — Paysafe's webhook page
+ * (Paysafe's card and refund webhook examples carry no `statusTime`), so a host
+ * that must see every transition re-reads with `retrievePayment` /
+ * `retrieveRefund` whether or not the id was seen — except a bank return, which
+ * no documented read reflects: act on the return event itself. A top-level `id`
+ * is ignored — Paysafe's webhook page
  * shows the resource's own id there — and a body naming no resource hashes its
  * key-sorted JSON without `attemptNumber`.
  */

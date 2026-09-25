@@ -1,5 +1,14 @@
 # @payfanout/react
 
+## 0.3.6
+
+### Patch Changes
+
+- 1d66371: Keep `outcomeUnknown` when rebuilding a `PayFanoutError` from the server completion endpoint's error response.
+- 659bc82: Report a failed mount to the `<PaymentFields>` `onError` prop once, even when the adapter also passes the same error to its `onError` option before rejecting.
+- Updated dependencies [1d66371]
+  - @payfanout/core@4.2.0
+
 ## 0.3.5
 
 ### Patch Changes

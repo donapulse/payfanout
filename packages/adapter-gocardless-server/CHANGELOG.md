@@ -1,5 +1,15 @@
 # @payfanout/adapter-gocardless-server
 
+## 2.0.3
+
+### Patch Changes
+
+- 8a36429: Mark `outcomeUnknown` on the `invalid_request` of a session or refund whose idempotency key already holds a different billing request or refund, unless that billing request was cancelled, its payment failed or was cancelled, or that refund was cancelled, bounced or had its funds returned: it may be the payment or refund the call was meant to make, so use a fresh key only once it is known to be another.
+- 40cf21a: While GoCardless reports an amount already refunded on a payment, `refundPayment` now checks the payment's refunds for one made with the same idempotency key before creating a refund, so a key GoCardless no longer honours returns the original refund instead of refunding again. When that check, or the one made after a create fails, cannot be answered, the call sends nothing further: an outage rejects with a retryable `psp_unavailable` or `rate_limited` (GoCardless's answer to the create on `raw.rejection`, the check's on `raw.lookup`), and any other failure rejects with a final error marked `outcomeUnknown`, both to be retried only with the same key. A blank idempotency key is now refused, a replayed session whose payment awaits the customer's approval reports `processing`, and a refund refused for exceeding what is left now carries the payment on `raw.payment` instead of as `raw`, with the check's answer on `raw.lookup` when it was refused.
+- 3dcc5a2: Replaying a GoCardless call with the same idempotency key now resolves to the original outcome, and a key reused for a different payment or refund (another amount, currency, session `id` or payment) rejects with `invalid_request` instead of returning the original. A replayed `createPaymentSession` reports the status of its payment, or of its billing request before a payment exists, and gets a new authorisation URL only while the billing request is `pending`, and `cancelPayment` resolves `canceled` when GoCardless refuses to cancel a payment or billing request that is already cancelled. Refunds are now created with the SHA-256 of their idempotency key in GoCardless metadata (`payfanout_key_sha256`), so a replayed `refundPayment` returns the original refund even after that refund used up the payment, without resending it and without relying on `total_amount_confirmation`, which GoCardless lets accounts opt out of (a replay of a refund created by an earlier version is still refused); an explicit refund `amount` of 0 now rejects before any request, and amounts GoCardless sends as digit strings are read as integers.
+- Updated dependencies [1d66371]
+  - @payfanout/core@4.2.0
+
 ## 2.0.2
 
 ### Patch Changes

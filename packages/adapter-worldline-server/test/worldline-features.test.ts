@@ -206,13 +206,17 @@ describe("mapWorldlineError", () => {
     [402, "30511001", "insufficient_funds", false],
     [402, "40001134", "authentication_required", false],
     [402, "40001139", "authentication_required", false],
-    // 3-D Secure failures outside the customer's control, and a refused merchant id.
+    // 3-D Secure failures outside the customer's control, and an issuer out of reach.
     [402, "40001135", "processing_error", false],
     [402, "50001081", "processing_error", false],
     [402, "40001137", "processing_error", false],
     [402, "40001138", "processing_error", false],
     [402, "40001146", "processing_error", false],
-    [402, "30031001", "processing_error", false],
+    [402, "30911001", "processing_error", false],
+    [402, "30681001", "processing_error", false],
+    // The merchant's set-up or request, which the customer cannot fix.
+    [402, "30031001", "invalid_request", false],
+    [402, "30301001", "invalid_request", false],
     [402, "50001087", "invalid_request", false],
     // Plain declines, named in the map or left to the 402 default.
     [402, "30041001", "card_declined", false],
@@ -260,7 +264,7 @@ describe("mapWorldlineError", () => {
   ];
   for (const [status, expected] of transient) {
     it(`keeps HTTP ${status} ${expected} and retryable, whatever code it carries`, () => {
-      for (const errorCode of ["30431001", "30511001", "30141001", "40001134", "40001135", "50001087", "30041001"]) {
+      for (const errorCode of ["30431001", "30511001", "30141001", "40001134", "40001135", "30911001", "30031001", "30301001", "50001087", "30041001"]) {
         const mapped = mapWorldlineError(status, { errors: [{ errorCode, httpStatusCode: status }] });
         expect(mapped).toMatchObject({ code: expected, retryable: true, message: getUserMessage(expected) });
       }

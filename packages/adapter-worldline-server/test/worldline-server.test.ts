@@ -448,6 +448,8 @@ describe("a 2xx CreatePayment carrying a REJECTED payment", () => {
     ["30511001", "insufficient_funds"],
     ["40001139", "authentication_required"],
     ["40001135", "processing_error"],
+    ["30911001", "processing_error"],
+    ["30031001", "invalid_request"],
     ["50001087", "invalid_request"],
     ["30051001", "card_declined"],
     ["99999999", "card_declined"],
@@ -460,7 +462,7 @@ describe("a 2xx CreatePayment carrying a REJECTED payment", () => {
       expect(error).toMatchObject({ code: expected, retryable: false, pspName: "worldline" });
       expect(error?.message).toBe(getUserMessage(expected));
       expect(error?.raw).toEqual({
-        creationOutput: { tokens: "" },
+        creationOutput: expect.anything(),
         payment: expect.objectContaining({
           status: "REJECTED",
           statusOutput: { statusCode: 2, statusCategory: "UNSUCCESSFUL", errors },
@@ -476,6 +478,24 @@ describe("a 2xx CreatePayment carrying a REJECTED payment", () => {
     expect(refused.error).toMatchObject({ code: "invalid_request", retryable: false });
     const declined = await rejectedCompletion({ errors: [{ ...invalidValue, httpStatusCode: 402 }] });
     expect(declined.error).toMatchObject({ code: "card_declined", retryable: false });
+  });
+
+  it("reads an undocumented code with a 5xx as the platform failing, never retryable, while a documented code still decides", async () => {
+    for (const httpStatusCode of [500, 503]) {
+      const { error } = await rejectedCompletion({ errors: [apiError({ errorCode: "99999999", httpStatusCode })] });
+      expect(error).toMatchObject({ code: "processing_error", retryable: false, message: getUserMessage("processing_error") });
+    }
+    const documented = await rejectedCompletion({ errors: [apiError({ errorCode: "30511001", httpStatusCode: 500 })] });
+    expect(documented.error).toMatchObject({ code: "insufficient_funds", retryable: false });
+  });
+
+  it("stays a decline when the error reports no status, or one that is not a number", async () => {
+    const withoutStatus: WorldlineApiError = { errorCode: "99999999", category: "PAYMENT_PLATFORM_ERROR" };
+    const textStatus = { ...withoutStatus, httpStatusCode: "500" } as unknown as WorldlineApiError;
+    for (const errors of [[withoutStatus], [textStatus]]) {
+      const { error } = await rejectedCompletion({ errors });
+      expect(error).toMatchObject({ code: "card_declined", retryable: false, message: getUserMessage("card_declined") });
+    }
   });
 
   it("falls back to the deprecated code when the error carries no errorCode", async () => {

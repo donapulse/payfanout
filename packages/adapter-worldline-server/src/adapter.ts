@@ -356,8 +356,9 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
    * A REDIRECT merchantAction (3-D Secure challenge) surfaces as
    * requires_action with the redirect URL on `raw`; the customer completes it
    * and the host reconciles with retrievePayment. A decline rejects with the
-   * same PayFanoutError whether Worldline answers it with a 402 or with a 2xx
-   * carrying a REJECTED payment (see mapWorldlineError).
+   * same error code whether Worldline answers it with a 402 or with a 2xx
+   * carrying a REJECTED payment (see mapWorldlineError); `raw` is the error
+   * body in the first case and the whole CreatePayment response in the second.
    */
   async completePayment(input: CompletePaymentInput): Promise<PaymentInfo> {
     const token = decodeWorldlineClientToken(input.clientToken);
@@ -423,8 +424,9 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       });
     }
     // Some Worldline flows answer 2xx with a REJECTED payment rather than an HTTP
-    // error. It throws what the 402 path would, mapped from the payment's own
-    // statusOutput.errors, rather than returning a "failed" PaymentInfo.
+    // error. It throws a rejection mapped from the payment's own
+    // statusOutput.errors, as the 402 path does from the error body, rather
+    // than returning a "failed" PaymentInfo.
     if (mapWorldlineStatus(payment.status, payment.statusOutput?.statusCode, payment.statusOutput?.statusCategory) === "failed") {
       throw mapWorldlineRejectedPayment(created);
     }
@@ -1022,10 +1024,11 @@ function mapRefundStatus(refund: WorldlineStatusFields): RefundStatus {
 /**
  * Worldline errorCodes → the unified taxonomy, from the API Troubleshooting
  * reference ("Fix errors.errorCode", "Payment retry guidelines") and the Sips
- * response-code mapping. Any other code on a 402, or on a REJECTED payment, is
- * a generic decline. None is retryable: Worldline answers a replay under the
- * same idempotence key with the original outcome, so only a new attempt can
- * change it.
+ * response-code mapping. Any other code on a 402 is a generic decline; on a
+ * REJECTED payment, the error's own httpStatusCode decides (see
+ * mapWorldlineRejectedPayment). None is retryable: Worldline answers a replay
+ * under the same idempotence key with the original outcome, so only a new
+ * attempt can change it.
  */
 const WORLDLINE_CODE_MAP: Record<string, UnifiedErrorCode> = {
   // Cards reported lost or stolen or used for fraud, and rejections by the
@@ -1055,15 +1058,22 @@ const WORLDLINE_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "30511001": "insufficient_funds",
   "40001134": "authentication_required", // failed 3-D Secure check
   "40001139": "authentication_required", // the issuer insists on 3-D Secure
-  // 3-D Secure that failed for reasons outside the customer's control (issuer
-  // unavailable, platform failure, timeout), and a merchant id the acquirer
-  // refuses: nothing says the card is at fault, so not a decline.
+  // 3-D Secure that could not complete for issuer- or platform-side reasons
+  // (issuer unavailable, platform failure, timeout), where authenticating
+  // again would not help, and an issuer out of reach or a response that never
+  // came or came too late: nothing says the card is at fault, so not a decline.
   "40001135": "processing_error",
   "50001081": "processing_error",
   "40001137": "processing_error",
   "40001138": "processing_error",
   "40001146": "processing_error",
-  "30031001": "processing_error",
+  "30911001": "processing_error", // Payment mean issuer inaccessible
+  "30681001": "processing_error", // Response not received or received too late
+  // The merchant's set-up or request is at fault, which the customer cannot
+  // fix (the PayZen adapter maps its merchant-configuration refusals the same
+  // way).
+  "30031001": "invalid_request", // the acquirer refuses the merchant id
+  "30301001": "invalid_request", // Format error
   "50001087": "invalid_request", // 3-D Secure not run: a technical issue with the request
   // Plain declines, listed because their descriptions invite another reading:
   // 30041001 is "Pick up card (no fraud)" in the retry list although the
@@ -1077,11 +1087,13 @@ const WORLDLINE_CODE_MAP: Record<string, UnifiedErrorCode> = {
  * Maps a non-2xx Worldline answer onto the unified taxonomy. A 429 or a 5xx is
  * `rate_limited` or `psp_unavailable`, retryable, whatever code it carries.
  * Otherwise a documented code on the first error (`errorCode`, else the
- * deprecated `code`) decides; failing that, a 402 is `card_declined`, a 409
- * (the original request under this idempotence key still in flight) a
- * retryable `processing_error`, and any other status `invalid_request`. The
- * message is the catalog's, never Worldline's own, which is "not meant to be
- * relayed to customer"; the body stays untouched on `raw`.
+ * deprecated `code`) decides; failing that, a 402 is `card_declined`, a 409 a
+ * retryable `processing_error`, and any other status `invalid_request`. A 409
+ * is usually the original request under this idempotence key still in
+ * flight, but on a cancel it can also mean the payment is closed, which
+ * cancelPayment tells apart by reading the payment. The message is the
+ * catalog's, never Worldline's own, which is "not meant to be relayed to
+ * customer"; the body stays untouched on `raw`.
  */
 export function mapWorldlineError(httpStatus: number, body: unknown): PayFanoutError {
   const mapped = unifiedCodeFor(firstErrorCode((body as { errors?: unknown } | null | undefined)?.errors));
@@ -1095,8 +1107,8 @@ export function mapWorldlineError(httpStatus: number, body: unknown): PayFanoutE
   } else if (httpStatus === 402) {
     code = "card_declined";
   } else if (httpStatus === 409) {
-    // The request with this idempotence key is still being processed — the
-    // outcome exists moments later, so a raced replay is retryable.
+    // Usually the request with this idempotence key still being processed,
+    // whose outcome exists moments later, so a raced replay is retryable.
     code = "processing_error";
     retryable = true;
   } else {
@@ -1119,16 +1131,14 @@ function isIdempotenceReplayInFlight(error: unknown): error is PayFanoutError {
 /**
  * A 2xx CreatePayment whose payment was REJECTED. The reason rides in
  * payment.statusOutput.errors, the same shape as an error body's `errors`, and
- * maps through the same codes. Without a documented code, the error's own
- * httpStatusCode tells a refused request (a 4xx other than 402, such as the
- * troubleshooting page's INVALID_VALUE example) from a decline. Never
- * retryable: a replay under this idempotence key answers the same payment.
+ * maps through the same codes; without a documented code, the error's own
+ * httpStatusCode decides (see unmappedRejectionCode). Never retryable: a
+ * replay under this idempotence key answers the same payment.
  */
 function mapWorldlineRejectedPayment(created: WorldlineCreatePaymentResponse): PayFanoutError {
   const errors = created.payment?.statusOutput?.errors;
   const status = Array.isArray(errors) ? errors[0]?.httpStatusCode : undefined;
-  const refusedRequest = typeof status === "number" && status >= 400 && status < 500 && status !== 402;
-  const code = unifiedCodeFor(firstErrorCode(errors)) ?? (refusedRequest ? "invalid_request" : "card_declined");
+  const code = unifiedCodeFor(firstErrorCode(errors)) ?? unmappedRejectionCode(status);
   return new PayFanoutError({
     code,
     message: getUserMessage(code),
@@ -1136,6 +1146,21 @@ function mapWorldlineRejectedPayment(created: WorldlineCreatePaymentResponse): P
     raw: created,
     pspName: WORLDLINE_PSP_NAME,
   });
+}
+
+/**
+ * A REJECTED payment's error without a documented code, read by its embedded
+ * httpStatusCode. A 5xx is the platform failing, not the card:
+ * `processing_error`, since `psp_unavailable` is always retryable and a replay
+ * answers the same payment. A 4xx other than 402 is a refused request, such as
+ * the troubleshooting page's INVALID_VALUE example: `invalid_request`.
+ * Anything else, a missing status included, is a decline.
+ */
+function unmappedRejectionCode(status: unknown): UnifiedErrorCode {
+  if (typeof status !== "number") return "card_declined";
+  if (status >= 500) return "processing_error";
+  if (status >= 400 && status < 500 && status !== 402) return "invalid_request";
+  return "card_declined";
 }
 
 /** The first error's code: `errorCode`, else the deprecated `code` it replaces. */

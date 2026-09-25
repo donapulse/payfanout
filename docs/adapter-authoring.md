@@ -98,8 +98,13 @@ and `PaymentService` will hold you to:
   `dupCheck` rejects the repeat (409, error `5031`) instead of answering with the
   original, so the Paysafe adapter never re-sends a write blindly: after a timeout, a 5xx
   or a duplicate rejection it reads the original back through Paysafe's
-  `?merchantRefNum=` lookups. If your PSP has no idempotency channel (PayZen), document
-  how its state machine makes replays safe instead.
+  `?merchantRefNum=` lookups, and a payment, capture or refund that cannot be read back
+  fails as "retry later with the same key" instead of going out again. Unless your PSP
+  documents that its channel absorbs a duplicate still in flight, do the same. Where the
+  instrument is single-use (a Paysafe payment handle refuses a second charge), that refusal
+  already guards the replay, and a duplicate check on top would block a new card after a
+  decline under a stable per-order key. If your PSP has no idempotency channel (PayZen),
+  document how its state machine makes replays safe instead.
 - **Host id round-trip:** when `input.id` is present, stamp it into PSP metadata
   (`payfanout_id`) if your PSP supports metadata, and prefer it for `PaymentInfo.id`.
   Echo the stored metadata on `PaymentInfo.metadata`. If your PSP genuinely cannot

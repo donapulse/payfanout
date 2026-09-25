@@ -100,10 +100,14 @@ retrieved, not a separate credential).
   writes are never re-sent blindly. Paysafe rejects a repeated `merchantRefNum` (409,
   error `5031`, under `dupCheck`) instead of answering with the original, so a write
   whose answer was lost is looked up by its `merchantRefNum` and returned when Paysafe
-  has it. Only a 429, or a write the lookup cannot find, is re-sent. A key reused for a
-  different amount rejects with `invalid_request`. A duplicate whose original cannot be
-  read back rejects with a non-retryable `processing_error`; retry it later with the same
-  key. The default `requestTimeoutMs` is 60000, the response timeout of Paysafe's own SDKs.
+  has it. A payment, capture or refund is re-sent only after a 429; a payment handle,
+  verification or void also once the lookup shows nothing. Card, Interac and bank-debit
+  completions send `dupCheck: false`, so another card can follow a decline under the same
+  key. A key reused for a different amount, currency or card rejects with
+  `invalid_request`. An original that cannot be read back rejects with a non-retryable
+  `processing_error`; retry it later with the same key. The default `requestTimeoutMs` is
+  60000, the response timeout of Paysafe's own SDKs, and bounds each exchange rather than
+  a whole call.
 - Paysafe has no public events API (`supportsEventPolling: false`), so missed-webhook
   recovery falls back to `retrievePayment` per order.
 - Scheduler availability is per merchant account, like every Paysafe product option —

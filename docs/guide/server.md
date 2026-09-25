@@ -181,10 +181,12 @@ replay. Three layers act on that:
 - the **Stripe SDK** retries network failures itself (`maxNetworkRetries`, default 2);
 - the **Paysafe transport** retries reads on timeouts/5xx/429 with backoff
   (`maxNetworkRetries`, default 2). Paysafe rejects a repeated `merchantRefNum` instead
-  of replaying the original, so a write is re-sent only after a 429 or once a lookup by
-  its `merchantRefNum` shows it never landed
-  ([replays and lost answers](/guide/paysafe#replays-and-lost-answers)). Business errors
-  like declines or `3406` are never replayed;
+  of replaying the original, so a write whose answer was lost is read back by its
+  `merchantRefNum` rather than re-sent. A payment, capture or refund is re-sent only after
+  a 429; when its original cannot be read back, the call fails with a non-retryable
+  `processing_error`, to retry later with the same key
+  ([replays, lost answers and timeouts](/guide/paysafe#_10-replays-lost-answers-and-timeouts)).
+  Business errors like declines or `3406` are never replayed;
 - `withRetry(fn, policy)` from `@payfanout/core` wraps any call with exponential backoff +
   jitter for `PayFanoutError.retryable` rejections.
 

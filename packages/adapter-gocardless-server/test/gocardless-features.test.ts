@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { isPayFanoutError, type UnifiedWebhookEventType } from "@payfanout/core";
+import { isPayFanoutError, type CreatePaymentSessionInput, type UnifiedWebhookEventType } from "@payfanout/core";
 import {
   GoCardlessServerAdapter,
   mapGoCardlessError,
@@ -912,6 +912,402 @@ describe("GoCardless idempotent-replay recovery", () => {
     await expect(
       adapter.createPaymentSession({ amount: 100, currency: "GBP", returnUrl: RETURN_URL, idempotencyKey: "k" }),
     ).rejects.toThrowError(/authorisation URL/);
+  });
+});
+
+/** A fake behind a fetch the test can intercept — answers the real API could lose or fail. */
+function makeInterceptedPair(
+  intercept: (request: { method: string; path: string }, forward: () => Promise<Response>) => Promise<Response>,
+): { adapter: GoCardlessServerAdapter; fake: FakeGoCardlessApi } {
+  const fake = new FakeGoCardlessApi();
+  const adapter = new GoCardlessServerAdapter({
+    accessToken: "fake-sandbox-access-token",
+    environment: "sandbox",
+    webhookSecret: WEBHOOK_SECRET,
+    sleep: async () => {},
+    fetch: (input, init) =>
+      intercept({ method: init?.method ?? "GET", path: new URL(String(input)).pathname }, () =>
+        fake.fetch(input, init),
+      ),
+  });
+  return { adapter, fake };
+}
+
+const gocardlessDown = (): Promise<Response> =>
+  Promise.resolve(
+    new Response(JSON.stringify({ error: { message: "down", type: "gocardless", code: 503 } }), { status: 503 }),
+  );
+
+async function confirmedPayment(
+  adapter: GoCardlessServerAdapter,
+  fake: FakeGoCardlessApi,
+  amount: number,
+): Promise<string> {
+  const session = await adapter.createPaymentSession({
+    amount,
+    currency: "GBP",
+    returnUrl: RETURN_URL,
+    idempotencyKey: `k-${Math.random()}`,
+  });
+  const { paymentId } = fake.fulfilBillingRequest(session.pspSessionId);
+  fake.confirmPayment(paymentId);
+  return paymentId;
+}
+
+describe("GoCardless session replays", () => {
+  const input = { amount: 2599, currency: "GBP", returnUrl: RETURN_URL } as const;
+  const flowCreates = (fake: FakeGoCardlessApi): number => fake.requestsTo("POST", "/billing_request_flows").length;
+
+  it("reports the billing request's own status once the payer has authorised, with no new flow", async () => {
+    const { adapter, fake } = makePair();
+    for (const status of ["ready_to_fulfil", "fulfilling"]) {
+      const request = { ...input, id: `order-${status}`, idempotencyKey: `k-${status}` };
+      const first = await adapter.createPaymentSession(request);
+      fake.setBillingRequestStatus(first.pspSessionId, status);
+      const replay = await adapter.createPaymentSession(request);
+      expect(replay, status).toEqual({
+        id: `order-${status}`,
+        pspName: "gocardless",
+        pspSessionId: first.pspSessionId,
+        amount: 2599,
+        currency: "GBP",
+        status: "processing",
+      });
+    }
+    // Each billing request kept the one authorisation URL its first call minted.
+    expect(flowCreates(fake)).toBe(2);
+    expect(fake.uniqueBillingRequestCreations).toBe(2);
+  });
+
+  it("mints no flow when replaying a fulfilled or cancelled billing request", async () => {
+    const { adapter, fake } = makePair();
+    const paid = { ...input, idempotencyKey: "k-fulfilled" };
+    const first = await adapter.createPaymentSession(paid);
+    fake.fulfilBillingRequest(first.pspSessionId);
+    const afterFulfilment = await adapter.createPaymentSession(paid);
+    expect(afterFulfilment).toMatchObject({ pspSessionId: first.pspSessionId, amount: 2599, status: "processing" });
+    expect(afterFulfilment.clientSecret).toBeUndefined();
+
+    const dropped = { ...input, idempotencyKey: "k-cancelled" };
+    const second = await adapter.createPaymentSession(dropped);
+    await adapter.cancelPayment(second.pspSessionId, "k-cancel");
+    const afterCancel = await adapter.createPaymentSession(dropped);
+    expect(afterCancel).toMatchObject({ pspSessionId: second.pspSessionId, status: "canceled" });
+    expect(afterCancel.clientSecret).toBeUndefined();
+
+    expect(flowCreates(fake)).toBe(2);
+    expect(fake.uniqueBillingRequestCreations).toBe(2);
+  });
+
+  it("rejects a reused key whose billing request is a different payment", async () => {
+    const { adapter, fake } = makePair();
+    const original = { ...input, id: "order-1", idempotencyKey: "k-reused" };
+    const first = await adapter.createPaymentSession(original);
+    const cases: Array<[Partial<CreatePaymentSessionInput>, string[]]> = [
+      [{ amount: 2600 }, ["amount"]],
+      [{ currency: "EUR" }, ["currency"]],
+      [{ id: "order-2" }, ["id"]],
+      [{ id: undefined }, ["id"]],
+      [{ amount: 100, currency: "EUR" }, ["amount", "currency"]],
+    ];
+    for (const [change, mismatched] of cases) {
+      await expect(adapter.createPaymentSession({ ...original, ...change }), JSON.stringify(change)).rejects.toMatchObject({
+        code: "invalid_request",
+        retryable: false,
+        pspName: "gocardless",
+        message: expect.stringMatching(/^Idempotency key reused for a different payment/),
+        raw: { billing_request: { id: first.pspSessionId }, mismatched },
+      });
+    }
+    // Nothing was created for the mismatches, and nobody got an authorisation URL for them.
+    expect(fake.uniqueBillingRequestCreations).toBe(1);
+    expect(flowCreates(fake)).toBe(1);
+  });
+
+  it("compares amounts across GoCardless's wire encodings and checks a mandate request's currency", async () => {
+    const { adapter, fake } = makePair();
+    const request = { ...input, idempotencyKey: "k-wire" };
+    const first = await adapter.createPaymentSession(request);
+    // The spec types amounts as integer or string.
+    fake.setBillingRequestFields(first.pspSessionId, {
+      payment_request: { amount: "2599", currency: "gbp", description: "Payment" },
+      mandate_request: { currency: "GBP", scheme: "bacs" },
+    });
+    await expect(adapter.createPaymentSession(request)).resolves.toMatchObject({
+      pspSessionId: first.pspSessionId,
+      status: "requires_action",
+    });
+
+    fake.setBillingRequestFields(first.pspSessionId, { mandate_request: { currency: "EUR", scheme: "sepa_core" } });
+    await expect(adapter.createPaymentSession(request)).rejects.toMatchObject({
+      raw: { mismatched: ["mandate currency"] },
+    });
+
+    fake.setBillingRequestFields(first.pspSessionId, {
+      payment_request: { amount: "25.99", currency: "GBP" },
+      mandate_request: undefined,
+    });
+    await expect(adapter.createPaymentSession(request)).rejects.toMatchObject({ raw: { mismatched: ["amount"] } });
+
+    // A mandate-only billing request under the key is not a payment at all.
+    fake.setBillingRequestFields(first.pspSessionId, { payment_request: undefined });
+    await expect(adapter.createPaymentSession(request)).rejects.toMatchObject({
+      raw: { mismatched: ["amount", "currency"] },
+    });
+  });
+});
+
+describe("GoCardless refund replays", () => {
+  const refundCreates = (fake: FakeGoCardlessApi) => fake.requestsTo("POST", "/refunds");
+
+  it("returns the original refund when a full refund is replayed after it used up the payment", async () => {
+    const { adapter, fake } = makePair();
+    const paymentId = await confirmedPayment(adapter, fake, 1000);
+    const request = { pspPaymentId: paymentId, reason: "requested_by_customer", idempotencyKey: "r-full" } as const;
+    const first = await adapter.refundPayment(request);
+    const replay = await adapter.refundPayment(request);
+    expect(first).toMatchObject({ amount: 1000, raw: { metadata: { reason: "requested_by_customer" } } });
+    expect(replay).toEqual(first);
+    expect(fake.uniqueRefundCreations).toBe(1);
+    expect((await adapter.retrievePayment(paymentId)).amountRefunded).toBe(1000);
+  });
+
+  it("returns the original when a partial refund that used up the remainder is replayed", async () => {
+    const { adapter, fake } = makePair();
+    const paymentId = await confirmedPayment(adapter, fake, 1000);
+    const first = await adapter.refundPayment({ pspPaymentId: paymentId, amount: 400, idempotencyKey: "r-1" });
+    const last = await adapter.refundPayment({ pspPaymentId: paymentId, amount: 600, idempotencyKey: "r-2" });
+    await expect(
+      adapter.refundPayment({ pspPaymentId: paymentId, amount: 600, idempotencyKey: "r-2" }),
+    ).resolves.toEqual(last);
+    await expect(
+      adapter.refundPayment({ pspPaymentId: paymentId, amount: 400, idempotencyKey: "r-1" }),
+    ).resolves.toEqual(first);
+    expect(fake.uniqueRefundCreations).toBe(2);
+    // The replay stated the refunded total as read — right only for a refund GoCardless already counts.
+    expect(refundCreates(fake).at(-1)?.body).toMatchObject({
+      refunds: { amount: 400, total_amount_confirmation: 1000 },
+    });
+  });
+
+  it("refuses a new over-refund before it reaches GoCardless", async () => {
+    const { adapter, fake } = makePair();
+    const paymentId = await confirmedPayment(adapter, fake, 1000);
+    await expect(
+      adapter.refundPayment({ pspPaymentId: paymentId, amount: 1500, idempotencyKey: "r-over" }),
+    ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringMatching(/exceeds the remaining/) });
+    await adapter.refundPayment({ pspPaymentId: paymentId, amount: 600, idempotencyKey: "r-1" });
+    // No refund of 500 exists for this request to be replaying.
+    await expect(
+      adapter.refundPayment({ pspPaymentId: paymentId, amount: 500, idempotencyKey: "r-2" }),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      message: expect.stringMatching(/Refund of 500 exceeds the remaining refundable amount/),
+      raw: { id: paymentId, amount_refunded: 600 },
+    });
+    expect(refundCreates(fake)).toHaveLength(1);
+    expect(fake.uniqueRefundCreations).toBe(1);
+  });
+
+  it("sends a refused request that could be a replay only in a form GoCardless cannot execute", async () => {
+    const { adapter, fake } = makePair();
+    const paymentId = await confirmedPayment(adapter, fake, 1000);
+    await adapter.refundPayment({ pspPaymentId: paymentId, amount: 600, idempotencyKey: "r-1" });
+    // Same amount as the existing refund under a fresh key: only GoCardless can tell it from a replay.
+    await expect(
+      adapter.refundPayment({ pspPaymentId: paymentId, amount: 600, idempotencyKey: "r-2" }),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringMatching(/Refund of 600 exceeds the remaining refundable amount/),
+      raw: { payment: { id: paymentId }, rejection: { error: { type: "validation_failed" } } },
+    });
+    expect(refundCreates(fake).at(-1)?.body).toMatchObject({
+      refunds: { amount: 600, total_amount_confirmation: 600 },
+    });
+
+    await adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: "r-rest" });
+    await expect(
+      adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: "r-rest-again" }),
+    ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringMatching(/nothing left to refund/) });
+    // A full refund is matched to the latest refund, the one that used up the payment.
+    expect(refundCreates(fake).at(-1)?.body).toMatchObject({
+      refunds: { amount: 400, total_amount_confirmation: 1000 },
+    });
+    expect(fake.uniqueRefundCreations).toBe(2);
+  });
+
+  it("keeps that form unexecutable where total_amount_confirmation is the only guard", async () => {
+    const { adapter, fake } = makePair();
+    const paymentId = await confirmedPayment(adapter, fake, 1000);
+    await adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: "r-1" });
+    fake.refundCapEnforced = false;
+    await expect(
+      adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: "r-2" }),
+    ).rejects.toMatchObject({
+      message: expect.stringMatching(/nothing left to refund/),
+      raw: { rejection: { error: { errors: [{ reason: "total_amount_confirmation_invalid" }] } } },
+    });
+    expect(fake.uniqueRefundCreations).toBe(1);
+    expect((await adapter.retrievePayment(paymentId)).amountRefunded).toBe(1000);
+  });
+
+  it("never states a replay amount no refund of the payment could have had", async () => {
+    const listing: { refunds?: unknown[] } = {};
+    const { adapter, fake } = makeInterceptedPair((request, forward) =>
+      listing.refunds && request.method === "GET" && request.path === "/refunds"
+        ? Promise.resolve(new Response(JSON.stringify({ refunds: listing.refunds }), { status: 200 }))
+        : forward(),
+    );
+    const paymentId = await confirmedPayment(adapter, fake, 1000);
+    const first = await adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: "r-full" });
+    listing.refunds = [
+      // Newest, but a zero amount would make the stated total right — and the request executable.
+      { id: "RF_ZERO", amount: 0, created_at: "2099-01-01T00:00:00.000Z", links: { payment: paymentId } },
+      { id: "RF_ODD", amount: "10.5", links: { payment: paymentId } },
+      { id: first.refundId, amount: "1000", links: { payment: paymentId } },
+    ];
+    await expect(adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: "r-full" })).resolves.toEqual(first);
+    expect(fake.requestsTo("POST", "/refunds").at(-1)?.body).toMatchObject({
+      refunds: { amount: 1000, total_amount_confirmation: 1000 },
+    });
+  });
+
+  it("rejects a reused refund key that belongs to another payment or amount", async () => {
+    const { adapter, fake } = makePair();
+    const first = await confirmedPayment(adapter, fake, 1000);
+    const second = await confirmedPayment(adapter, fake, 1000);
+    const original = await adapter.refundPayment({ pspPaymentId: first, amount: 300, idempotencyKey: "r-shared" });
+    await expect(
+      adapter.refundPayment({ pspPaymentId: second, amount: 300, idempotencyKey: "r-shared" }),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      message: expect.stringMatching(/^Idempotency key reused for a different refund/),
+      raw: { refund: { id: original.refundId }, mismatched: ["payment"] },
+    });
+    await expect(
+      adapter.refundPayment({ pspPaymentId: first, amount: 200, idempotencyKey: "r-shared" }),
+    ).rejects.toMatchObject({ raw: { mismatched: ["amount"] } });
+    // A full refund names no amount to compare, so the original stands.
+    await expect(adapter.refundPayment({ pspPaymentId: first, idempotencyKey: "r-shared" })).resolves.toMatchObject({
+      refundId: original.refundId,
+      amount: 300,
+    });
+    expect(fake.uniqueRefundCreations).toBe(1);
+    expect((await adapter.retrievePayment(second)).amountRefunded).toBe(0);
+  });
+
+  it("keeps a transient failure retryable when a refused request could be a replay", async () => {
+    let refundsDown = false;
+    const { adapter, fake } = makeInterceptedPair((request, forward) =>
+      refundsDown && request.method === "POST" && request.path === "/refunds" ? gocardlessDown() : forward(),
+    );
+    const paymentId = await confirmedPayment(adapter, fake, 1000);
+    const first = await adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: "r-full" });
+    refundsDown = true;
+    await expect(adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: "r-full" })).rejects.toMatchObject({
+      code: "psp_unavailable",
+      retryable: true,
+    });
+    refundsDown = false;
+    await expect(adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: "r-full" })).resolves.toEqual(first);
+  });
+});
+
+describe("GoCardless cancel verification", () => {
+  async function pendingPayment(adapter: GoCardlessServerAdapter, fake: FakeGoCardlessApi): Promise<string> {
+    const session = await adapter.createPaymentSession({
+      amount: 1000,
+      currency: "GBP",
+      returnUrl: RETURN_URL,
+      idempotencyKey: `k-${Math.random()}`,
+    });
+    return fake.fulfilBillingRequest(session.pspSessionId).paymentId; // pending_submission
+  }
+
+  it("resolves a repeated payment cancel as canceled — idempotency keys are documented for creates only", async () => {
+    const { adapter, fake } = makePair();
+    const paymentId = await pendingPayment(adapter, fake);
+    const first = await adapter.cancelPayment(paymentId, "c-same");
+    const second = await adapter.cancelPayment(paymentId, "c-same");
+    expect(first.status).toBe("canceled");
+    expect(second).toMatchObject({ status: "canceled", pspPaymentId: paymentId });
+    // The repeat reached GoCardless and was refused; the re-read decided.
+    expect(fake.requestsTo("POST", `/payments/${paymentId}/actions/cancel`)).toHaveLength(2);
+    expect(fake.requestsTo("GET", `/payments/${paymentId}`)).toHaveLength(1);
+  });
+
+  it("resolves a repeated billing request cancel as canceled", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({
+      amount: 1000,
+      currency: "GBP",
+      returnUrl: RETURN_URL,
+      idempotencyKey: "k-brq",
+    });
+    await adapter.cancelPayment(session.pspSessionId, "c-1");
+    await expect(adapter.cancelPayment(session.pspSessionId, "c-2")).resolves.toMatchObject({
+      status: "canceled",
+      pspPaymentId: session.pspSessionId,
+    });
+    expect(fake.requestsTo("POST", `/billing_requests/${session.pspSessionId}/actions/cancel`)).toHaveLength(2);
+  });
+
+  it("treats a cancel whose response was lost as done", async () => {
+    // GoCardless cancelled the payment but the answer never arrived, so the
+    // transport retry meets cancellation_failed.
+    let dropNextCancelAnswer = true;
+    const { adapter, fake } = makeInterceptedPair(async (request, forward) => {
+      const response = await forward();
+      if (dropNextCancelAnswer && request.method === "POST" && request.path.endsWith("/actions/cancel")) {
+        dropNextCancelAnswer = false;
+        throw new TypeError("connection reset");
+      }
+      return response;
+    });
+    const paymentId = await pendingPayment(adapter, fake);
+    await expect(adapter.cancelPayment(paymentId, "c-lost")).resolves.toMatchObject({ status: "canceled" });
+    expect(fake.requestsTo("POST", `/payments/${paymentId}/actions/cancel`)).toHaveLength(2);
+  });
+
+  it("rethrows the mapped rejection for a payment past cancellation", async () => {
+    const { adapter, fake } = makePair();
+    const paymentId = await pendingPayment(adapter, fake);
+    fake.confirmPayment(paymentId);
+    await expect(adapter.cancelPayment(paymentId, "c-late")).rejects.toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      raw: { error: { type: "invalid_state", errors: [{ reason: "cancellation_failed" }] } },
+    });
+    // Re-read, and not cancelled: the refusal stands.
+    expect(fake.requestsTo("GET", `/payments/${paymentId}`)).toHaveLength(1);
+  });
+
+  it("rethrows the original rejection when the re-read fails", async () => {
+    let readsDown = false;
+    const { adapter, fake } = makeInterceptedPair((request, forward) =>
+      readsDown && request.method === "GET" && request.path.startsWith("/payments/") ? gocardlessDown() : forward(),
+    );
+    const paymentId = await pendingPayment(adapter, fake);
+    fake.confirmPayment(paymentId);
+    readsDown = true;
+    await expect(adapter.cancelPayment(paymentId, "c")).rejects.toMatchObject({
+      code: "invalid_request",
+      raw: { error: { errors: [{ reason: "cancellation_failed" }] } },
+    });
+  });
+
+  it("rethrows a transport failure when the re-read shows the payment still pending", async () => {
+    const { adapter, fake } = makePair();
+    const paymentId = await pendingPayment(adapter, fake);
+    // Three failures exhaust the POST and its two transport retries; nothing was cancelled.
+    fake.failNextWith(500, { error: { message: "down", type: "gocardless", code: 500 } }, 3);
+    await expect(adapter.cancelPayment(paymentId, "c")).rejects.toMatchObject({
+      code: "psp_unavailable",
+      retryable: true,
+    });
+    expect((await adapter.retrievePayment(paymentId)).status).toBe("processing");
   });
 });
 

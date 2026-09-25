@@ -229,7 +229,8 @@ choices they forced:
   POST /billing_request_flows with the same Idempotency-Key returned two different
   flow ids). Idempotency therefore lives at the billing-request level: a replayed
   session returns the same billing request with a fresh authorisation URL (every flow
-  authorises that one billing request — no duplicate-payment risk), and the
+  authorises that one billing request — no duplicate-payment risk; refined 2026-09-25:
+  only while that billing request is `pending`, see the replay entry below), and the
   conformance idempotency proof moved to refunds (same key twice → the original
   refund, exactly one create).
 - Webhook deliveries are **batched** (up to 250 events, one HMAC over the raw body):
@@ -294,6 +295,51 @@ choices they forced:
     request holds after a `billing_requests`/`failed` event, since the status list names
     none. Sandbox checks: read the billing request in the return handler during a browser
     run, and record the status when a `failed` event occurs.
+- **Doc-verified 2026-09-25: replays of sessions, refunds and cancels.** The Limits page
+  documents idempotency for creates: "When creating resources, pass an `Idempotency-Key`
+  header to ensure the key can only be used for one successful request", and "If a
+  resource already exists for that key, the API returns a `409
+  idempotent_creation_conflict` error with a `links.conflicting_resource_id` pointing to
+  the existing resource." Keys "are honoured for at least 30 days". No comparison of the
+  replayed parameters is documented, so the adapter compares them itself.
+  - *Sessions.* A replayed billing request must match the input: its `payment_request`
+    amount and currency, the currency of any `mandate_request` (sessions send none and
+    choose no scheme), and the stamped `payfanout_id`. A mismatch rejects with
+    `invalid_request` instead of handing back another payment's billing request. The
+    session reports the billing request's mapped status, and a flow is created only while
+    it is `pending` ("pending and can be used"). Past that point the payer has authorised,
+    or the request is `fulfilled` ("fulfilled and a payment created") or `cancelled`
+    ("cancelled and cannot be used"), and the session carries no `clientSecret`. This
+    refines the 2026-07-07 flow decision above. Flows still go out without a key, since
+    they cannot be read back: the spec has no GET for them, and "Each flow currently lasts
+    for 7 days".
+  - *Refunds.* A replayed refund must belong to the payment and, when an amount is given,
+    be for that amount. A request the remainder check refuses can still be a replay whose
+    original used up the payment. It is sent only when the payment carries a refund it
+    could have created: one of exactly the requested amount, or any refund for a full
+    refund. GoCardless allows "Maximum of 5 refunds per payment", so one list page holds
+    them. It states `total_amount_confirmation` as the refunded total already read, and
+    the spec defines that field as "the sum of the existing refunds plus the amount of the
+    refund being created". A fresh key is therefore rejected and cannot refund twice,
+    while a consumed key answers 409 with the original. Any other refused request never
+    reaches GoCardless. Recovering such a replay assumes GoCardless checks the key before
+    it validates the body, an order the docs do not state (AMBIGUOUS). The API reference
+    names no error for a refund past the payment's amount; the support centre's "Refund a
+    payment" page allows refunds "up to the full amount of that payment", and the design
+    does not depend on that cap.
+  - *Cancels.* Idempotency keys are documented for creates only. The official Node client
+    (gocardless-nodejs `src/api/api.ts`) generates a key for every POST it is not given
+    one for, cancels included, and resolves no 409 for them. Whether an action is
+    deduplicated by key is AMBIGUOUS. `cancel_payment` "will fail with a
+    `cancellation_failed` error unless the payment's status is `pending_submission`", and
+    `cancellation_failed` covers a resource "already cancelled". So `cancelPayment`
+    re-reads the payment or billing request on any rejection and resolves `canceled` when
+    it is already cancelled, as `cancelNativeSubscription` does.
+  - Sandbox checks: (S2) cancel a `pending_submission` payment twice with the same key and
+    record whether the second call answers 200 or 422 `cancellation_failed`; (S3) create a
+    flow on a fulfilled and on a cancelled billing request and record the answer (the
+    adapter no longer does either); and replay a full refund with the same key once it has
+    used up the payment, to confirm the 409 arrives before the body is validated.
 
 ## PayPal adapter (2026-07-07)
 

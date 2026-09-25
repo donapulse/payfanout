@@ -85,10 +85,17 @@ rather than silently dropping events — use the recipe above for GoCardless ing
 
 ## Notes
 
-- Billing-request and refund creates carry an `Idempotency-Key`; a consumed key's 409
-  `idempotent_creation_conflict` is resolved by fetching the original resource.
-  GoCardless does not dedupe flow creates, so a replayed session returns the same
-  billing request with a fresh authorisation URL — replays stay side-effect free.
+- Replays are side-effect free. Billing-request, refund and subscription creates carry
+  the caller's `Idempotency-Key`, and a consumed key's 409
+  `idempotent_creation_conflict` resolves to the original resource. GoCardless
+  documents no parameter comparison, so a replayed session must match the original's
+  amount, currency and `id`, and a replayed refund its payment and any given amount, or
+  the call rejects with `invalid_request`. A replayed session reports its billing
+  request's real status and gets a fresh authorisation URL only while that request is
+  `pending` (GoCardless does not dedupe flow creates). A replayed refund returns the
+  original even after it used up the payment. Cancels are verified by re-reading the
+  payment or billing request: GoCardless documents idempotency keys for creates only,
+  and cancelling an already-cancelled resource answers `cancellation_failed`.
 - One-off billing request payments support **GBP and EUR** only; bank payments confirm
   **asynchronously** (seconds for instant rails, days for debit fallback) and late
   failures exist — webhooks are the source of truth.

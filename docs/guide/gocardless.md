@@ -92,12 +92,8 @@ to it) and returns:
   redirects to.
 - `status: "requires_action"` — the payer still has to authorise at their bank.
 
-Billing-request and refund creates carry an `Idempotency-Key`; replaying a key returns
-the **original** resource rather than creating a duplicate (GoCardless answers 409
-`idempotent_creation_conflict` and the adapter resolves it). GoCardless does **not**
-dedupe flow creates, so a replayed session returns the same billing request with a
-**fresh `clientSecret`** — either authorisation URL completes that one billing request,
-no duplicate payment is possible.
+Replaying the same `idempotencyKey` returns the original session instead of creating a
+second payment; see [Replays and idempotency keys](#replays-and-idempotency-keys).
 
 Two checkout-field mappings to know:
 
@@ -111,6 +107,34 @@ Two checkout-field mappings to know:
   insertion order, are forwarded; later keys are withheld rather than failing the
   payment, and a host key named `payfanout_id` never overrides the session id. Without
   a session `id`, three host keys fit.
+
+### Replays and idempotency keys
+
+GoCardless honours an `Idempotency-Key` on creates for at least 30 days. A key it has
+already used answers `409 idempotent_creation_conflict` with the id of the resource it
+created, and the adapter returns that resource. GoCardless documents no comparison of
+the new request with the original, so the adapter makes one: a key reused for a
+different payment or refund rejects with `invalid_request`.
+
+- **Sessions.** A replayed `createPaymentSession` returns the same billing request, and
+  its amount, currency and session `id` must match the new input. The session reports
+  the billing request's own status. While it is `pending` the payer gets a fresh
+  `clientSecret`: GoCardless does not deduplicate flow creates, flows cannot be read
+  back, and every flow authorises the one billing request. Once the payer has
+  authorised, or the billing request is fulfilled or cancelled, the replay creates no
+  flow and carries no `clientSecret`: it reports `processing` or `canceled`, so the
+  payer is never sent to authorise the same payment twice. Follow the payment itself
+  with `retrievePayment`.
+- **Refunds.** A replayed `refundPayment` returns the original refund, even when that
+  refund used up what was left to refund. The original must belong to the same payment
+  and, when you pass an `amount`, be for that amount.
+- **Cancels.** GoCardless documents idempotency keys for creates only, and cancelling a
+  payment or billing request that is already cancelled answers `cancellation_failed`.
+  `cancelPayment` then re-reads it and resolves `canceled`. Any other state rejects
+  with the original error.
+
+Use a fresh key for every new payment or refund, including the session you create
+after cancelling one.
 
 ## 5. Wire the client adapter
 
@@ -240,7 +264,10 @@ them from GoCardless support. Until then, `refundPayment` rejects with an
 `invalid_request` explaining exactly that (the API returns 403). Once enabled: full and
 partial refunds work, the adapter computes GoCardless's required
 `total_amount_confirmation` safety check from a fresh read, and refunds report
-`pending` until the money moves — poll `retrieveRefund` to a terminal state.
+`pending` until the money moves — poll `retrieveRefund` to a terminal state. A refund
+larger than what is left rejects with `invalid_request`, while a replay of a refund
+GoCardless already made returns that refund (see
+[Replays and idempotency keys](#replays-and-idempotency-keys)).
 
 ## 9. Supported currencies & schemes
 
@@ -288,7 +315,8 @@ webhooks. "Send test webhook" in the dashboard exercises your endpoint end to en
   `confirmed` event; Direct Debit fallback takes days, and **late failures can flip a
   succeeded payment to failed** — build order fulfilment on webhooks, not the redirect.
 - **No session updates.** A billing request's payment amount cannot be amended — cancel
-  the session (`cancelPayment` with the `BRQ…` id) and create a new one.
+  the session (`cancelPayment` with the `BRQ…` id) and create a new one under a new
+  idempotency key.
 
 ## 12. Go live
 

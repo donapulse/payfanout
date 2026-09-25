@@ -38,12 +38,16 @@ const BASE_TIME = Date.parse("2026-07-07T10:00:00.000Z");
  * the HTTP layer. Reproduces the documented behaviors the adapter depends on:
  * envelope-wrapped JSON, Bearer + GoCardless-Version header requirements,
  * Idempotency-Key consumption answering 409 idempotent_creation_conflict with
- * links.conflicting_resource_id (billing requests, refunds, and subscriptions
- * — flow creates never dedupe, matching the sandbox), invalid_state on bad
- * transitions (including cancelling an already-cancelled/finished
- * subscription), the refunds feature gate (403 until enabled),
- * total_amount_confirmation checking, the ?payment= filter on GET /refunds,
- * and cursor pagination.
+ * links.conflicting_resource_id, whatever the replayed body says (billing
+ * requests, refunds, and subscriptions — flow creates never dedupe, matching
+ * the sandbox), invalid_state on bad transitions (including cancelling an
+ * already-cancelled/finished subscription), the refunds feature gate (403
+ * until enabled), total_amount_confirmation checking, the ?payment= filter on
+ * GET /refunds, and cursor pagination. Actions ignore the Idempotency-Key —
+ * GoCardless documents keys for creates only — so a repeated cancel answers
+ * cancellation_failed. The key is checked before the body: the docs do not
+ * state that order, and a refund replayed after it used up the payment can
+ * only be recovered if it holds.
  */
 export class FakeGoCardlessApi {
   private readonly billingRequests = new Map<string, FakeBillingRequest>();
@@ -60,6 +64,8 @@ export class FakeGoCardlessApi {
   private networkFailure = 0;
 
   refundsEnabled = true;
+  /** Off leaves total_amount_confirmation as the only guard against a refund past the payment's amount. */
+  refundCapEnforced = true;
   mandateLookupFails = false;
   uniqueBillingRequestCreations = 0;
   uniqueRefundCreations = 0;
@@ -69,6 +75,13 @@ export class FakeGoCardlessApi {
   lastRequestBody: Record<string, unknown> | undefined;
   lastRequestUrl: string | undefined;
   readonly idempotencyKeysSeen: Array<{ path: string; key: string }> = [];
+  /** Every request that reached the fake, in order — proves what the adapter did and did not send. */
+  readonly requests: Array<{ method: string; path: string; body?: Record<string, unknown> }> = [];
+
+  /** Requests matching `method` and `path` exactly. */
+  requestsTo(method: string, path: string): Array<{ method: string; path: string; body?: Record<string, unknown> }> {
+    return this.requests.filter((request) => request.method === method && request.path === path);
+  }
 
   /** Injects an HTTP failure for the next `times` requests (transient-error tests). */
   failNextWith(status: number, body: unknown, times = 1): void {
@@ -95,6 +108,7 @@ export class FakeGoCardlessApi {
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined;
     this.lastRequestUrl = url;
     this.lastRequestBody = body;
+    this.requests.push({ method, path, ...(body ? { body } : {}) });
     const headers = init?.headers as Record<string, string> | undefined;
     const idempotencyKey = headers?.["idempotency-key"];
     if (idempotencyKey) this.idempotencyKeysSeen.push({ path, key: idempotencyKey });
@@ -273,7 +287,9 @@ export class FakeGoCardlessApi {
   }
 
   // Sandbox-verified: flow creates never dedupe — the same Idempotency-Key
-  // yields a fresh flow (new id, new authorisation_url) on every POST.
+  // yields a fresh flow (new id, new authorisation_url) on every POST. What
+  // GoCardless answers for a fulfilled or cancelled billing request is
+  // unverified; the adapter only creates flows for pending ones.
   private createFlow(body: Record<string, unknown>): Response {
     const request = body["billing_request_flows"] as {
       redirect_uri?: string;
@@ -325,7 +341,9 @@ export class FakeGoCardlessApi {
     if (!payment) return validationFailed("links.payment", "must exist");
     if (typeof request.amount !== "number") return validationFailed("amount", "is required");
     const alreadyRefunded = payment.amount_refunded ?? 0;
-    if (alreadyRefunded + request.amount > (payment.amount ?? 0)) {
+    // GoCardless refunds "up to the full amount of that payment" (support
+    // centre); the API reference names no error for it, so the shape is assumed.
+    if (this.refundCapEnforced && alreadyRefunded + request.amount > (payment.amount ?? 0)) {
       return validationFailed("amount", "exceeds the refundable amount");
     }
     if (request.total_amount_confirmation !== alreadyRefunded + request.amount) {
@@ -482,6 +500,13 @@ export class FakeGoCardlessApi {
     const br = this.billingRequests.get(billingRequestId);
     if (!br) throw new Error(`no billing request ${billingRequestId}`);
     br.status = status;
+  }
+
+  /** Overwrites stored billing request fields (wire-shape variations, replay comparisons). */
+  setBillingRequestFields(billingRequestId: string, fields: Record<string, unknown>): void {
+    const br = this.billingRequests.get(billingRequestId);
+    if (!br) throw new Error(`no billing request ${billingRequestId}`);
+    Object.assign(br, fields);
   }
 
   setRefundStatus(refundId: string, status: string): void {

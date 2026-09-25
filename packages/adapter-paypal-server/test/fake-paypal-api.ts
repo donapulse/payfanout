@@ -10,11 +10,14 @@
  * means the FULL authorized amount (never the remainder), a final_capture
  * closes the authorization (AUTHORIZATION_ALREADY_CAPTURED afterwards), and a
  * capture in another currency than the authorization's answers
- * AUTH_CAPTURE_CURRENCY_MISMATCH. MAX_CAPTURE_AMOUNT_EXCEEDED keeps "the sum
- * of all captures" on the order within PayPal's default overage limit, "up to
- * 115% of the order amount" and, in USD, no more than USD 75 over it (the
- * authorization and honor period guide); PSD2 countries allow no overage at
- * all, which the fake does not model. A reauthorization cannot be voided
+ * AUTH_CAPTURE_CURRENCY_MISMATCH. MAX_CAPTURE_AMOUNT_EXCEEDED applies PayPal's
+ * default overage limit twice: to the captures taken from one authorization,
+ * "up to 115% or $75 USD more than the original authorized amount, whichever
+ * is less" (the authorization and honor period guide), read here against each
+ * authorization's own amount, and to "the sum of all captures" on the order,
+ * "up to 115% of the order amount". Which of the two PayPal applies after a
+ * reauthorization is undocumented. PSD2 countries allow no overage at all,
+ * which the fake does not model. A reauthorization cannot be voided
  * (CANNOT_BE_VOIDED): its original parent is voided instead.
  *
  * Order reads shape captures as the Orders v2 schema does: no related_ids,
@@ -213,13 +216,16 @@ export class FakePayPalApi {
   /**
    * What a host's own POST /v2/payments/authorizations/{id}/reauthorize of the
    * order's original authorization leaves on the order: a new authorization,
-   * with its own id and a later create_time, beside the original. Without
-   * `amount` it is the empty-body request, which reauthorizes "the full
-   * amount"; the fake reads that as the original's amount, whatever was
-   * captured from it. The amount stays within the documented limit, "up to
-   * 115% of the original authorized amount, not to exceed an increase of $75
-   * USD", and a voided authorization cannot be reauthorized. What becomes of
-   * the original is undocumented, so the test decides (`original`: its status
+   * with its own id, beside the original. The fake's clock first moves on by
+   * `laterByMs` (four days by default: the honor period comes first), and the
+   * new authorization is created then, so a capture taken before it reports an
+   * earlier create_time than one taken after it. Without `amount` it is the
+   * empty-body request, which reauthorizes "the full amount"; the fake reads
+   * that as the original's amount, whatever was captured from it. The amount
+   * stays within the documented limit, "up to 115% of the original authorized
+   * amount, not to exceed an increase of $75 USD", and an authorization that is
+   * voided or fully captured cannot be reauthorized. What becomes of the
+   * original is undocumented, so the test decides (`original`: its status
    * afterwards).
    */
   reauthorize(
@@ -230,17 +236,24 @@ export class FakePayPalApi {
     const unit = order?.purchase_units[0];
     const first = unit?.payments?.authorizations?.[0];
     if (!order || !unit || !first) throw new Error(`FakePayPalApi.reauthorize: no authorization on ${orderId}`);
-    if (first.status === "VOIDED") throw new Error(`FakePayPalApi.reauthorize: ${first.id} is voided`);
+    // "A voided authorization cannot be captured or reauthorized"; the Extend
+    // guide lists "authorization already captured or voided" among the failures.
+    if (first.status === "VOIDED" || first.status === "CAPTURED") {
+      throw new Error(`FakePayPalApi.reauthorize: ${first.id} is ${first.status.toLowerCase()}`);
+    }
     const amount = options.amount ?? { ...first.amount };
     if (decimalToCents(amount.value) > overageLimit(first.amount)) {
       throw new Error(`FakePayPalApi.reauthorize: ${amount.value} is past the reauthorization limit`);
     }
+    const earlier = this.now;
+    const laterByMs = options.laterByMs ?? 4 * 24 * 3600 * 1000;
+    this.now = () => earlier() + laterByMs;
     const auth: FakeAuthorization = {
       id: `8AA831015G51${String(++this.seq).padStart(5, "0")}`,
       status: options.status ?? "CREATED",
       amount,
       expiration_time: new Date(this.now() + 29 * 24 * 3600 * 1000).toISOString(),
-      create_time: new Date(Date.parse(first.create_time) + (options.laterByMs ?? 4 * 24 * 3600 * 1000)).toISOString(),
+      create_time: this.iso(),
     };
     if (options.original !== undefined) first.status = options.original;
     unit.payments = { ...(unit.payments ?? {}), authorizations: [...(unit.payments?.authorizations ?? []), auth] };
@@ -630,11 +643,12 @@ export class FakePayPalApi {
     }
     // "If amount is not specified, the full authorized amount is captured."
     const requested = requestedMoney ? decimalToCents(requestedMoney.value) : authorized;
-    // "…allows the sum of all captures to be up to 115% of the order amount."
+    // The overage limit on this authorization's captures, then on "the sum of
+    // all captures" on the order.
     const taken = (unit.payments?.captures ?? [])
       .filter((capture) => capture.status !== "DECLINED" && capture.status !== "FAILED")
       .reduce((sum, capture) => sum + decimalToCents(capture.amount.value), 0);
-    if (taken + requested > overageLimit(unit.amount)) {
+    if (entry.captured + requested > overageLimit(entry.auth.amount) || taken + requested > overageLimit(unit.amount)) {
       return json(
         422,
         unprocessable(

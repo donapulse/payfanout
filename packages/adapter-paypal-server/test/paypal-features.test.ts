@@ -176,6 +176,7 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
   async function authorizedPayment(
     pair = makePair(),
     money: { amount: number; currency: string } = { amount: 2000, currency: "USD" },
+    approval: { pendingCapture?: boolean } = {},
   ): Promise<{
     adapter: PayPalServerAdapter;
     fake: FakePayPalApi;
@@ -188,7 +189,7 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
       captureMethod: "manual",
       idempotencyKey: `k-${Math.random()}`,
     });
-    fake.approveOrder(session.pspSessionId);
+    fake.approveOrder(session.pspSessionId, approval);
     const info = await adapter.completePayment({
       pspSessionId: session.pspSessionId,
       clientToken: session.pspSessionId,
@@ -249,8 +250,15 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
   });
 
   it("takes the later authorization when both report the same create_time", async () => {
-    const { adapter, fake, orderId } = await authorizedPayment();
+    // A stopped clock, so the reauthorization is created at the original's time.
+    const at = Date.parse("2026-09-01T10:00:00Z");
+    const { adapter, fake, orderId } = await authorizedPayment(makePair({}, { now: () => at }));
     const reauthorized = fake.reauthorize(orderId, { original: "CREATED", laterByMs: 0 });
+    const order = (await adapter.retrievePayment(orderId)).raw as PayPalOrderLike;
+    expect(order.purchase_units?.[0]?.payments?.authorizations?.map((a) => a.create_time)).toEqual([
+      new Date(at).toISOString(),
+      new Date(at).toISOString(),
+    ]);
     await adapter.capturePayment(orderId, 500, "k-cap-order");
     expect(fake.requestLog).toContain(`POST /v2/payments/authorizations/${reauthorized}/capture`);
   });
@@ -264,39 +272,87 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
   });
 
   it.each([
-    { currency: "USD", amount: 2000, first: 200, rest: "18.00", attributed: false },
-    { currency: "USD", amount: 2000, first: 200, rest: "18.00", attributed: true },
-    { currency: "JPY", amount: 5000, first: 1200, rest: "3800", attributed: true },
+    { currency: "USD", amount: 2000, first: 200, rest: "18.00", attributed: false, pending: false },
+    { currency: "USD", amount: 2000, first: 200, rest: "18.00", attributed: true, pending: false },
+    { currency: "USD", amount: 2000, first: 200, rest: "18.00", attributed: false, pending: true },
+    { currency: "USD", amount: 2000, first: 200, rest: "18.00", attributed: true, pending: true },
+    { currency: "JPY", amount: 5000, first: 1200, rest: "3800", attributed: false, pending: false },
+    { currency: "JPY", amount: 5000, first: 1200, rest: "3800", attributed: true, pending: false },
   ])(
-    "after an empty-body reauthorization, capturing the rest takes what the $currency order has left (attributed captures: $attributed)",
-    async ({ currency, amount, first, rest, attributed }) => {
+    "after an empty-body reauthorization, capturing the rest takes what the $currency order has left (attributed captures: $attributed, pending: $pending)",
+    async ({ currency, amount, first, rest, attributed, pending }) => {
       const pair = makePair();
       pair.fake.orderCaptureAttribution = attributed;
-      const { adapter, fake, orderId } = await authorizedPayment(pair, { amount, currency });
+      const { adapter, fake, orderId } = await authorizedPayment(pair, { amount, currency }, { pendingCapture: pending });
       await adapter.capturePayment(orderId, first, "k-cap-first");
       // "Reauthorize for the same amount": the new hold is the full amount again.
       const reauthorized = fake.reauthorize(orderId, { original: "PARTIALLY_CAPTURED" });
+      // A PENDING capture has taken its slice of the order too.
       expect((await adapter.retrievePayment(orderId)).amountCapturable).toBe(amount - first);
 
       const info = await adapter.capturePayment(orderId, undefined, "k-cap-rest");
       expect(capturesSent(fake).at(-1)).toBe(`POST /v2/payments/authorizations/${reauthorized}/capture`);
       expect(fake.lastRequestBody).toEqual({ amount: { currency_code: currency, value: rest }, final_capture: true });
-      expect(info).toMatchObject({ amountCaptured: amount, amountCapturable: 0 });
+      // amountCaptured counts settled money only.
+      expect(info).toMatchObject({ amountCaptured: pending ? 0 : amount, amountCapturable: 0 });
     },
   );
 
-  it("counts every capture against the hold when captures name no authorization, so the remainder errs low", async () => {
+  it("counts a capture that names no authorization only against authorizations created no later than it", async () => {
     // Order reads name no authorization on a capture, as the Orders v2 schema has them.
     const full = await authorizedPayment();
     await full.adapter.capturePayment(full.orderId, 700, "k-cap-first");
     full.fake.reauthorize(full.orderId, { original: "PARTIALLY_CAPTURED" });
     expect((await full.adapter.retrievePayment(full.orderId)).amountCapturable).toBe(1300);
 
-    // A reauthorization of what was left: the 7.00 taken from the original counts against it too.
+    // A reauthorization of what was left: the 7.00 was taken from the original before it.
     const rest = await authorizedPayment();
     await rest.adapter.capturePayment(rest.orderId, 700, "k-cap-first");
     rest.fake.reauthorize(rest.orderId, { original: "PARTIALLY_CAPTURED", amount: { currency_code: "USD", value: "13.00" } });
-    expect((await rest.adapter.retrievePayment(rest.orderId)).amountCapturable).toBe(600);
+    expect((await rest.adapter.retrievePayment(rest.orderId)).amountCapturable).toBe(1300);
+  });
+
+  it("captures 10.00 and then the last 3.00 from a reauthorization of the 13.00 left", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    await adapter.capturePayment(orderId, 700, "k-cap-first");
+    const reauthorized = fake.reauthorize(orderId, {
+      original: "PARTIALLY_CAPTURED",
+      amount: { currency_code: "USD", value: "13.00" },
+    });
+    const ten = await adapter.capturePayment(orderId, 1000, "k-cap-ten");
+    // 3.00 is left, so the reauthorization stays open for it.
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "10.00" }, final_capture: false });
+    expect(ten).toMatchObject({ amountCaptured: 1700, amountCapturable: 300 });
+    const three = await adapter.capturePayment(orderId, 300, "k-cap-three");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "3.00" }, final_capture: true });
+    expect(three).toMatchObject({ status: "succeeded", amountCaptured: 2000, amountCapturable: 0 });
+    expect(capturesSent(fake).slice(1)).toEqual([
+      `POST /v2/payments/authorizations/${reauthorized}/capture`,
+      `POST /v2/payments/authorizations/${reauthorized}/capture`,
+    ]);
+  });
+
+  it("leaves explicit captures to PayPal, which caps each authorization's captures and the order's", async () => {
+    // A reauthorization smaller than what is left: 5.00 allows 5.75 from it.
+    const small = await authorizedPayment();
+    await small.adapter.capturePayment(small.orderId, 700, "k-cap-first");
+    small.fake.reauthorize(small.orderId, { original: "PARTIALLY_CAPTURED", amount: { currency_code: "USD", value: "5.00" } });
+    expect((await small.adapter.retrievePayment(small.orderId)).amountCapturable).toBe(500);
+    await expect(small.adapter.capturePayment(small.orderId, 600, "k-cap-past")).rejects.toMatchObject({
+      code: "invalid_request",
+      raw: { details: [{ issue: "MAX_CAPTURE_AMOUNT_EXCEEDED" }] },
+    });
+
+    // A reauthorization of the full 20.00 after 15.00 was taken: 23.00 in all on the order.
+    const full = await authorizedPayment();
+    await full.adapter.capturePayment(full.orderId, 1500, "k-cap-first");
+    full.fake.reauthorize(full.orderId, { original: "PARTIALLY_CAPTURED" });
+    await expect(full.adapter.capturePayment(full.orderId, 900, "k-cap-past")).rejects.toMatchObject({
+      code: "invalid_request",
+      raw: { details: [{ issue: "MAX_CAPTURE_AMOUNT_EXCEEDED" }] },
+    });
+    await full.adapter.capturePayment(full.orderId, 800, "k-cap-within");
+    expect(full.fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "8.00" }, final_capture: true });
   });
 
   it("counts only the hold's own captures when order reads name each capture's authorization", async () => {
@@ -326,6 +382,8 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
     expect(captured.amountCapturable).toBe(0); // fully captured — nothing left to take
     expect(captured.pspPaymentId).toMatch(/^2GG/);
     expect(fake.lastRequestBody).toBeDefined();
+    // PayPal refuses to reauthorize a fully captured authorization.
+    expect(() => fake.reauthorize(orderId)).toThrowError(/is captured/);
   });
 
   it("supports multiple partial captures (final_capture stays false)", async () => {

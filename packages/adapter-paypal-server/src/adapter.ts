@@ -443,10 +443,13 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    * took money (PENDING ones included, DECLINED/FAILED ones took none). A
    * capture covering the remainder is sent with final_capture: true, which
    * closes the authorization; a smaller one keeps it open for the next
-   * capture. The flag reads the remainder at call time, so a same-key retry
-   * can send a different body; PayPal replays by PayPal-Request-Id either way.
-   * An explicit amount is not held to the remainder: PayPal judges its
-   * overage limit.
+   * capture. A remainder that rests on a capture another authorization could
+   * have given is an estimate that errs low (see capturesAgainst), and only a
+   * capture of all the order has left closes the authorization on it. The
+   * flag reads the remainder at call time, so a same-key retry can send a
+   * different body; PayPal replays by PayPal-Request-Id either way. An
+   * explicit amount is not held to the remainder: PayPal judges its overage
+   * limit.
    *
    * Once earlier captures took the whole authorization or the whole order,
    * capturing the rest sends no capture and answers with the payment, under
@@ -475,13 +478,22 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     // PayPal requires the capture in the authorization's own currency.
     const currency = (authorization.amount?.currency_code ?? unit?.amount?.currency_code ?? "USD").toUpperCase();
     const orderCaptures = unit?.payments?.captures ?? [];
-    const captures = capturesAgainst(authorization, authorizations, orderCaptures);
-    const held = heldCaptureTotal(captures, currency);
-    const authorized = authorizedAmount(authorization, currency);
     const orderHeld = heldCaptureTotal(orderCaptures, currency);
+    const original = originalAuthorization(authorizations);
+    const orderTotal = orderAmount(unit, original, currency);
+    const orderLeft = orderTotal === undefined ? undefined : orderTotal - orderHeld;
+    const authorized = authorizedAmount(authorization, currency);
     let captureAmount = amount;
     let finalCapture: boolean;
-    if (authorized === undefined) {
+    if (authorized === undefined || orderLeft === undefined) {
+      // PayPal would take the reauthorization's full amount, and nothing says
+      // how it compares with the order.
+      if (captureAmount === undefined && orderLeft === undefined && authorization !== original) {
+        throw PayFanoutError.invalidRequest(
+          `Payment "${pspPaymentId}" reports no amount for the order or its original authorization, so what reauthorization ${authorization.id} may take is unknown — pass an explicit capture amount`,
+          order,
+        );
+      }
       // Any capture on the order, not only this authorization's, leaves the
       // rest unknown: a reauthorization can hold again what it took.
       if (captureAmount === undefined && orderHeld > 0) {
@@ -490,11 +502,15 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
           order,
         );
       }
-      // Without an amount (reached only while nothing was captured) PayPal
-      // takes the full authorized amount, which leaves nothing to keep open.
-      finalCapture = captureAmount === undefined;
+      // With nothing captured, the rest is the order amount where one is
+      // known: without an amount PayPal takes the authorization's full amount,
+      // which a reauthorization can hold past the order. Knowing neither
+      // amount, PayPal takes it all, which leaves nothing to keep open.
+      captureAmount ??= orderLeft;
+      finalCapture = captureAmount === undefined || (orderLeft !== undefined && captureAmount >= orderLeft);
     } else {
-      const orderLeft = orderRemainder(unit, orderHeld, currency, authorized);
+      const { captures, estimated } = capturesAgainst(authorization, authorizations, orderCaptures);
+      const held = heldCaptureTotal(captures, currency);
       const remainder = capturableRemainder(authorization, captures, held, authorized, orderLeft);
       if (captureAmount === undefined) {
         if (remainder === 0) {
@@ -508,7 +524,10 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
         }
         captureAmount = remainder;
       }
-      finalCapture = captureAmount >= remainder;
+      // An estimate that sets the remainder may miss money left on the
+      // authorization, so it never closes it: only a capture of all the order
+      // has left does.
+      finalCapture = captureAmount >= (estimated && authorized - held < orderLeft ? orderLeft : remainder);
     }
     await this.request<PayPalCaptureLike>(
       "POST",
@@ -967,15 +986,16 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     const authorizations = unit?.payments?.authorizations ?? [];
     const authorization = holdingAuthorization(authorizations);
     const authorized = authorization ? authorizedAmount(authorization, currency) : undefined;
+    const orderTotal = authorization ? orderAmount(unit, originalAuthorization(authorizations), currency) : undefined;
     let amountCapturable: MinorUnitAmount | undefined;
-    if (authorization && authorized !== undefined) {
-      const held = capturesAgainst(authorization, authorizations, captures);
+    if (authorization && authorized !== undefined && orderTotal !== undefined) {
+      const holdCaptures = capturesAgainst(authorization, authorizations, captures).captures;
       amountCapturable = capturableRemainder(
         authorization,
-        held,
-        heldCaptureTotal(held, currency),
+        holdCaptures,
+        heldCaptureTotal(holdCaptures, currency),
         authorized,
-        orderRemainder(unit, captured, currency, authorized),
+        orderTotal - captured,
       );
     }
     return {
@@ -1273,31 +1293,54 @@ function holdingAuthorization(authorizations: PayPalAuthorizationLike[]): PayPal
 }
 
 /**
- * The authorization a void goes to, of a non-empty list: PayPal refuses to
- * void a reauthorization ("You must void the original parent authorized
- * payment"). No documented field ties a reauthorization to its parent, so the
- * oldest authorization is the original.
+ * The original authorization, of a non-empty list: the oldest, as no
+ * documented field ties a reauthorization to its parent. Voids go to it, since
+ * PayPal refuses to void a reauthorization ("You must void the original parent
+ * authorized payment"), and it measures an order read reporting no amount.
  */
 function originalAuthorization(authorizations: PayPalAuthorizationLike[]): PayPalAuthorizationLike {
   return byAge(authorizations)[0]!;
 }
 
 /**
- * The captures taken from one authorization, told by the capture's
- * related_ids.authorization_id or its `up` link. The Orders v2 read documents
- * neither on a capture, so when a capture names no authorization of the order,
- * every capture counts: the remainder errs low, and the order clamp in
- * capturableRemainder bounds it either way.
+ * The captures taken from one authorization, and whether that is an
+ * estimate. A capture naming an authorization of the order
+ * (related_ids.authorization_id or its `up` link) belongs to that one. The
+ * Orders v2 read documents neither on a capture, so one naming none counts
+ * against every authorization it could have come from: one created no later
+ * than the capture, a missing create_time ruling nothing out. That errs low,
+ * and the order clamp in capturableRemainder bounds it. The count is an
+ * estimate once such a capture took money and another authorization could
+ * have given it.
  */
 function capturesAgainst(
   authorization: PayPalAuthorizationLike,
   authorizations: PayPalAuthorizationLike[],
   captures: PayPalCaptureLike[],
-): PayPalCaptureLike[] {
+): { captures: PayPalCaptureLike[]; estimated: boolean } {
   const ids = new Set(authorizations.map((a) => a.id));
-  const owners = captures.map((capture) => capturedAuthorizationId(capture));
-  if (owners.some((owner) => owner === undefined || !ids.has(owner))) return captures;
-  return captures.filter((_, index) => owners[index] === authorization.id);
+  const others = authorizations.filter((a) => a !== authorization);
+  const taken: PayPalCaptureLike[] = [];
+  let estimated = false;
+  for (const capture of captures) {
+    const owner = capturedAuthorizationId(capture);
+    if (owner !== undefined && ids.has(owner)) {
+      if (owner === authorization.id) taken.push(capture);
+    } else if (couldComeFrom(capture, authorization)) {
+      taken.push(capture);
+      if (!isFailedCaptureStatus(capture.status) && others.some((other) => couldComeFrom(capture, other))) {
+        estimated = true;
+      }
+    }
+  }
+  return { captures: taken, estimated };
+}
+
+/** An authorization cannot give a capture taken before it was created. */
+function couldComeFrom(capture: PayPalCaptureLike, authorization: PayPalAuthorizationLike): boolean {
+  const captured = Date.parse(capture.create_time ?? "");
+  const created = Date.parse(authorization.create_time ?? "");
+  return Number.isNaN(captured) || Number.isNaN(created) || captured >= created;
 }
 
 /** The authorization a capture was taken from: related_ids, else the links[rel=up] href. */
@@ -1313,21 +1356,20 @@ function capturedAuthorizationId(capture: PayPalCaptureLike): string | undefined
 }
 
 /**
- * What the order has left: its amount less `taken`, what every capture on it
- * took. An order read reporting no amount (the response schema does not
- * require one) is measured by `fallbackAmount`, the holding authorization's,
- * so the rest errs low rather than past the order.
+ * The order amount. An order read reporting none (the response schema does not
+ * require one) is measured by the original authorization, which holds the
+ * order amount: PayPal authorizes an order without taking an amount and does
+ * not update a completed order. A reauthorization can hold more than the
+ * order, so it never stands in.
  */
-function orderRemainder(
+function orderAmount(
   unit: PayPalPurchaseUnitLike | undefined,
-  taken: MinorUnitAmount,
+  original: PayPalAuthorizationLike,
   fallbackCurrency: string,
-  fallbackAmount: MinorUnitAmount,
-): MinorUnitAmount {
+): MinorUnitAmount | undefined {
   const money = unit?.amount;
-  const amount =
-    money?.value === undefined ? fallbackAmount : fromPayPalValue(money.value, money.currency_code ?? fallbackCurrency);
-  return amount - taken;
+  if (money?.value === undefined) return authorizedAmount(original, fallbackCurrency);
+  return fromPayPalValue(money.value, money.currency_code ?? fallbackCurrency);
 }
 
 /** Money moved and stayed (or was later refunded — refund state is separate). */

@@ -102,7 +102,9 @@ have no Paysafe hosted-input equivalent, and Paysafe.js accepts no background pr
 its inputs, so Paysafe applies `colorText`, `fontFamily` and `fontSize` only.) `locale` does
 nothing on Paysafe, whose setup takes no locale: set the fields' texts (`placeholder`,
 `accessibilityLabel`, `accessibilityErrorMessage`, `iframeTitle`) per field under
-`fieldOptions.fields`. Paysafe's defaults, and the adapter's own placeholders, are English.
+`fieldOptions.fields`. Paysafe's defaults, and the adapter's own placeholders, are English,
+and a field without an `accessibilityLabel` falls back to its placeholder for screen
+readers, so localize both.
 Other PSPs (PayPal
 button, GoCardless panel, PayZen) take their own native `appearance` shape — the common
 tokens do not apply to them.

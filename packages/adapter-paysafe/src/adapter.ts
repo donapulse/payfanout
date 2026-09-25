@@ -313,7 +313,8 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
    * no `locale`, so MountOptions.locale is not forwarded: the fields' texts
    * (placeholder, accessibilityLabel, accessibilityErrorMessage, iframeTitle)
    * are set per field under fieldOptions.fields, and Paysafe's defaults, like
-   * the adapter's placeholders, are English.
+   * the adapter's placeholders, are English; a field without an
+   * accessibilityLabel falls back to its placeholder for screen readers.
    */
   async mount(container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
     assertBrowser("PaysafeClientAdapter", "mount");

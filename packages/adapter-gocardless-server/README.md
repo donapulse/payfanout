@@ -85,10 +85,23 @@ rather than silently dropping events — use the recipe above for GoCardless ing
 
 ## Notes
 
-- Billing-request and refund creates carry an `Idempotency-Key`; a consumed key's 409
-  `idempotent_creation_conflict` is resolved by fetching the original resource.
-  GoCardless does not dedupe flow creates, so a replayed session returns the same
-  billing request with a fresh authorisation URL — replays stay side-effect free.
+- Replays never create a second payment or refund while GoCardless honours the key
+  (at least 30 days). Billing-request, refund and subscription creates carry the
+  caller's `Idempotency-Key`, and a consumed key's 409 `idempotent_creation_conflict`
+  resolves to the original resource. GoCardless documents no parameter comparison, so a
+  replayed session must match the original's amount, currency and `id`, and a replayed
+  refund its payment and any given amount, or the call rejects with `invalid_request`.
+  A replayed session reports the real status of its payment, or of its billing request
+  before a payment exists, and gets a fresh authorisation URL only while that request
+  is `pending` (GoCardless does not dedupe flow creates). Every refund carries the
+  SHA-256 of its key in its metadata (`payfanout_key_sha256`), so a replayed refund
+  returns the original even after it used up the payment, and without relying on
+  `total_amount_confirmation`, which GoCardless lets accounts opt out of. Refunds
+  created before the stamp carry none: a replay of one that exceeds what is left
+  rejects, as before. Cancels are verified by re-reading the payment or billing
+  request: GoCardless documents idempotency keys for creates only, and documents
+  `cancellation_failed` for cancelling a payment that is already cancelled (its answer
+  for a billing request is undocumented).
 - One-off billing request payments support **GBP and EUR** only; bank payments confirm
   **asynchronously** (seconds for instant rails, days for debit fallback) and late
   failures exist — webhooks are the source of truth.

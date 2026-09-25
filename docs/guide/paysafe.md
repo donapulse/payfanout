@@ -385,10 +385,15 @@ retries, for every write it makes:
   adapter does not rely on it: it looks the key's handle up before minting one. Authorization
   voids take no `dupCheck`.
 - A completion reads its key before it sends anything. Completing again with the same key
-  and card returns the original, including a decline, which comes back as the same
-  decline. A new card after a decline is charged as a new attempt, and a completion retried
-  with a fresh tokenization after the payment went through returns that payment instead of
-  charging again, once Paysafe's lookup shows it.
+  and card returns the original, including a decline whose record names its card, which
+  comes back as the same decline; a decline filed without its card (as Paysafe's example
+  shows one) cannot be tied to it, so that replay ends in the non-retryable
+  `processing_error` instead. A new card or bank account after a decline is charged as a
+  new attempt, and a completion retried with a fresh tokenization after the payment went
+  through returns that payment instead of charging again, once Paysafe's lookup shows it.
+- Lookups read up to 50 records, Paysafe's maximum page. A key holding 50 or more records
+  in the 30-day window is refused with the non-retryable `processing_error` rather than
+  read in part: reconcile it in the Paysafe portal before starting over under a new key.
 - A write that times out, loses its connection or gets a 5xx is looked up by its
   `merchantRefNum`, and when Paysafe has the record it becomes the call's result. A payment,
   capture or refund is never re-sent after that: when the lookup cannot show it, the call

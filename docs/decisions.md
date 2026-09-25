@@ -2361,9 +2361,15 @@ description of what v2 changes is what the migration then had to implement.
   - **Whether a declined payment's lookup record carries `status`, `error` and
     `paymentHandleToken`.** The simulator's only decline example shows `error`, `id`,
     `merchantRefNum` and `settleWithAuth` with no `paymentHandleToken` or `status`, so a
-    failure that names no handle is not tied to the call's own: a completion sends
-    anyway (a replay of the same card is refused as spent and read back), and a bank
-    debit counts each such failure against one spent handle. Record the shape.
+    failure that names no handle is never taken as a single-use spend's own record: it
+    is an earlier attempt's, a new card or bank account is sent under the key, a replay of
+    the declined card itself ends in the non-retryable `processing_error` (nothing ties
+    the decline to it), and a bank debit counts each such failure against one spent
+    handle. Record the shape.
+  - **Lookups ask for 50 records, the documented maximum** (default 10, order
+    undocumented), and a full page is refused with the non-retryable `processing_error`
+    instead of being paged through or read as complete: a key holding that many records
+    in the 30-day window is reconciled in the portal.
   - **Whether a `/payments` rejection that files no payment (a 400 such as 5068) still
     spends the handle**, as "regardless of the payments call response status" suggests.
     If it does, a bank-debit key whose handle is spent with no payment under it ends every

@@ -1465,10 +1465,6 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    */
   private async keyPayment(replay: ReplayableWrite<PaysafePaymentLike>): Promise<PaysafePaymentLike | undefined> {
     const { found, live } = this.classify(await this.recordsByRefNum<PaysafePaymentLike>(replay, false), replay);
-    // Paysafe's decline example names no paymentHandleToken, so a failure
-    // without one cannot be tied to this handle: send, and a replay of that
-    // same card is refused as spent (5283) and read back instead.
-    if (found && isFailedRecord(found) && found.paymentHandleToken === undefined) return live[0];
     return found ? recordedFailure(found) : live[0];
   }
 
@@ -2483,7 +2479,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       const own =
         write.paymentHandleToken === undefined
           ? write.singleUse !== true
-          : record.paymentHandleToken === undefined || record.paymentHandleToken === write.paymentHandleToken;
+          : record.paymentHandleToken === write.paymentHandleToken ||
+            // A failure that names no handle (Paysafe's decline example) cannot be
+            // this spend's own: it is an earlier attempt's, never this card's answer.
+            (record.paymentHandleToken === undefined && !(write.singleUse === true && isFailedRecord(record)));
       if (!own && write.singleUse && isFailedRecord(record)) failed.push(record);
       else if (!agreesWith(record, write)) foreign.push(record);
       else if (own) mine.push(record);
@@ -2522,7 +2521,8 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       code: "processing_error",
       message:
         `Paysafe holds at least ${REF_NUM_LOOKUP_LIMIT} ${noun} records under merchantRefNum ` +
-        `"${replay.merchantRefNum}", more than one lookup reads — reconcile them in the Paysafe portal`,
+        `"${replay.merchantRefNum}", more than one lookup reads — reconcile them in the Paysafe portal ` +
+        "before starting over under a new key",
       retryable: false,
       raw: { merchantRefNum: replay.merchantRefNum },
       pspName: this.pspName,

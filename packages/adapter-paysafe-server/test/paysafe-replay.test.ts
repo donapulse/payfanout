@@ -279,11 +279,13 @@ describe("Paysafe card completion replays", () => {
     const declined = await rejection(
       adapter.completePayment({ pspSessionId, clientToken: "tok_card_a", idempotencyKey: "order-tokenless" }),
     );
-    // The same card again: its handle is spent (5283), and the decline is read back.
+    expect(declined.code).toBe("card_declined");
+    // The same card again: its handle is spent (5283), and no record under the key
+    // names it, so the outcome stays unknown rather than borrowing another's decline.
     const replayed = await rejection(
       adapter.completePayment({ pspSessionId, clientToken: "tok_card_a", idempotencyKey: "order-tokenless" }),
     );
-    expect(replayed).toMatchObject({ code: declined.code, retryable: false });
+    expect(replayed).toMatchObject({ code: "processing_error", retryable: false });
     const info = await adapter.completePayment({ pspSessionId, clientToken: "tok_card_b", idempotencyKey: "order-tokenless" });
     expect(info.status).toBe("succeeded");
     expect(fake.uniquePaymentCreations).toBe(1);
@@ -292,6 +294,39 @@ describe("Paysafe card completion replays", () => {
       "tok_card_a",
       "tok_card_b",
     ]);
+  });
+
+  it("never reads a handleless decline back as a charged card's answer", async () => {
+    const { adapter, fake } = makePair();
+    fake.failedPaymentsLikeDeclineExample = true;
+    const pspSessionId = await cardSession(adapter);
+    fake.recordFailure(CREATE_PAYMENT, { status: 402, code: "3009", message: "Your request has been declined by the issuing bank." });
+    await rejection(adapter.completePayment({ pspSessionId, clientToken: "tok_card_a", idempotencyKey: "order-lost" }));
+    // Card B is charged, its answer is lost, and its record trails the lookup.
+    fake.loseAnswer(CREATE_PAYMENT);
+    fake.hideFromLookups("payments", "order-lost", 4);
+    const lost = await rejection(
+      adapter.completePayment({ pspSessionId, clientToken: "tok_card_b", idempotencyKey: "order-lost" }),
+    );
+    expect(lost).toMatchObject({ code: "processing_error", retryable: false });
+    expect(fake.uniquePaymentCreations).toBe(1);
+    // Replayed with the same key and card once B is visible: B's own payment comes back.
+    const replay = await adapter.completePayment({ pspSessionId, clientToken: "tok_card_b", idempotencyKey: "order-lost" });
+    expect(replay.status).toBe("succeeded");
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
+  it("charges a new card once after two declines filed without their handles", async () => {
+    const { adapter, fake } = makePair();
+    fake.failedPaymentsLikeDeclineExample = true;
+    const pspSessionId = await cardSession(adapter);
+    for (const token of ["tok_card_a", "tok_card_b"]) {
+      fake.recordFailure(CREATE_PAYMENT, { status: 402, code: "3009", message: "Your request has been declined by the issuing bank." });
+      await rejection(adapter.completePayment({ pspSessionId, clientToken: token, idempotencyKey: "order-two-declines" }));
+    }
+    const info = await adapter.completePayment({ pspSessionId, clientToken: "tok_card_c", idempotencyKey: "order-two-declines" });
+    expect(info.status).toBe("succeeded");
+    expect(fake.uniquePaymentCreations).toBe(1);
   });
 
   it("lets a bank debit follow a declined one filed without its handle", async () => {

@@ -104,8 +104,9 @@ retrieved, not a separate credential).
   verification or void also once the lookup shows nothing. Card, Interac and bank-debit
   completions send `dupCheck: false`, so another card can follow a decline under the same
   key. A key reused for a different amount or currency, or a different saved card or
-  verification card, rejects with `invalid_request`. An original that cannot be read back rejects with a non-retryable
-  `processing_error`; retry it later with the same key. The default `requestTimeoutMs` is
+  verification card, rejects with `invalid_request`. An original that cannot be read
+  back rejects with a non-retryable `processing_error`; retry it later with the same
+  key. The default `requestTimeoutMs` is
   60000, the response timeout of Paysafe's own SDKs, and bounds each exchange rather than
   a whole call.
 - Paysafe has no public events API (`supportsEventPolling: false`), so missed-webhook

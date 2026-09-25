@@ -303,6 +303,46 @@ host id round-trips via `order.references.merchantReference` (`PaymentInfo.id`).
 hand-write the route? Call `completePayment` directly, both forms are in
 [Server usage](/guide/server#server-completion-tokenize-first).
 
+### Paying again under the same key
+
+Worldline answers a request sent again under an idempotency key it has seen with that key's
+first outcome, even with a different payload, for at least 24 hours. A stable key such as
+`complete-${order.id}` still lets the customer pay with another card after a failed attempt:
+when the key answers with a replayed failure, `completePayment` sends the payment again under
+a key derived from yours and the failed attempt, and goes on from there. Every completion
+walks the same keys in the same order and stops at the first attempt that did not fail, so a
+completion repeated after a success returns that payment and charges nothing.
+
+A replayed 3-D Secure challenge is read back first: one that failed or was cancelled is
+walked past, one that went through is returned as it now reads, and one still open comes back
+as `requires_action` with its redirect URL, because the customer may still finish it.
+
+The walk has limits:
+
+- **An abandoned challenge holds the key.** Worldline keeps a challenge the customer abandoned
+  open "indefinitely", so the key keeps returning it rather than send a second payment that
+  could be charged alongside it. A new attempt then needs a new idempotency key, and the open
+  payment stays yours to reconcile.
+- **A key carries at most 20 attempts.** The next completion rejects with a non-retryable
+  `invalid_request`: create a new session and complete it under a new idempotency key.
+- **The first attempt must outlive the session.** Every completion starts from your key's own
+  first attempt, which Worldline promises to keep for at least 24 hours. When that attempt
+  failed and the session could still be completed after Worldline may have forgotten it (a
+  session under the same key that expires 23 hours or more after that attempt, so one
+  created about 22 hours after it with the default one-hour `sessionTtlSeconds`, or any
+  session living 23 hours or more), the completion rejects with a non-retryable
+  `invalid_request` instead of sending anything, since a forgotten first attempt would go out
+  as a new one. The refusal reads no further than that first attempt, so once your records
+  show that no payment under the key went through, complete it under a new idempotency key,
+  for example one that includes the session.
+- **Past Worldline's idempotence period, a completion under the key is a new first attempt.**
+  Record every completed payment (`onCompleted`, webhooks) and never complete a paid order
+  again.
+- **Only the first send of a key in a call can be read as a replay.** After a timeout or a lost
+  connection, the answer to the re-send is the call's own even when it replays a decline, so
+  the call returns that decline and the next completion sends the new attempt. A 409, 429 or
+  5xx never leads to a new attempt; it keeps its retryable error.
+
 ### Declines
 
 `completePayment` rejects with a `PayFanoutError` when Worldline refuses the payment, whether
@@ -331,19 +371,19 @@ On a `REJECTED` payment, an error with no code from this table is read by its ow
 card, and comes back as `invalid_request`; a 5xx is a failure on Worldline's side rather than
 the card's, and comes back as `processing_error`.
 
-None of them is `retryable`: Worldline answers a request sent again under the same
-idempotency key with the original outcome, even with a different payload, for at least
-24 hours, so retrying under the same key only returns the same rejection. The `message` is
-PayFanout's text for the `code`, never Worldline's own, which Worldline marks as not meant
-for customers; Worldline's whole answer stays on `error.raw`. An HTTP 429 or 5xx answer is
-never read as a decline: it stays `rate_limited` or `psp_unavailable`, retryable, whatever
-code it carries.
+None of them is `retryable`: each is that attempt's answer, and a completion repeated under
+the same idempotency key goes out as a new attempt with the card it carries (see
+[Paying again under the same key](#paying-again-under-the-same-key)), which is the customer's
+step to take, never an automatic retry. The `message` is PayFanout's text for the `code`,
+never Worldline's own, which Worldline marks as not meant for customers; Worldline's whole
+answer stays on `error.raw`. An HTTP 429 or 5xx answer is never read as a decline: it stays
+`rate_limited` or `psp_unavailable`, retryable, whatever code it carries.
 
 A payment refused after a 3-D Secure redirect, on a failed challenge (`40001134`) for
 instance, does not reject with one of these codes, since `completePayment` has already
 returned `requires_action` (§6). `retrievePayment` reports it as `status: "failed"`, with
-Worldline's errors on `PaymentInfo.raw.statusOutput.errors`, and its `payment.rejected`
-webhook parses as `payment.failed`.
+Worldline's errors on `PaymentInfo.raw.statusOutput.errors`, its `payment.rejected` webhook
+parses as `payment.failed`, and the next completion under the key walks past it.
 
 ## 8. Register the webhook endpoint
 

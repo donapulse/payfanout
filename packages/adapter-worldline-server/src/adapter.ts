@@ -79,7 +79,9 @@ export interface WorldlineServerAdapterConfig {
   /**
    * How long a signed session context stays completable, in seconds.
    * Default 3600 (1h). A signed token must not be valid forever — expiry is
-   * enforced at completePayment.
+   * enforced at completePayment. Keep it under 23 hours: a session that lives
+   * longer cannot complete again after a failed attempt under the same
+   * idempotency key (see completePayment).
    */
   sessionTtlSeconds?: number;
   /**
@@ -186,6 +188,41 @@ export interface WorldlineApiError {
 }
 
 const DEFAULT_METHODS: PaymentMethodCapability[] = [{ type: "card", flow: "embedded", supported: true }];
+
+/**
+ * Payment attempts one completion idempotencyKey can carry. Each completion
+ * replays every earlier attempt under the key before its own, so the bound caps
+ * the replays as well as the attempts.
+ */
+const MAX_COMPLETION_ATTEMPTS = 20;
+
+/**
+ * Added "for any follow-up requests made with the same idempotency key", with
+ * "the timestamp of the initial request in milliseconds" (idempotent-requests
+ * guide).
+ */
+const REPLAY_HEADER = "X-GCS-Idempotence-Request-Timestamp";
+
+/**
+ * How long a key's outcome can be relied on: Worldline keeps it "at least 24
+ * hours" from the key's first request, less an hour for drift between its
+ * clock and the one that set the session's expiry.
+ */
+const RELIABLE_REPLAY_PERIOD_MS = 23 * 60 * 60 * 1000;
+
+/** A CreatePayment answer left unmapped: a 2xx, or a 4xx other than 409 and 429. */
+interface CreatePaymentAnswer {
+  status: number;
+  /** The parsed JSON, else the raw text. */
+  body: unknown;
+  /**
+   * The replay header's value when it came on the first send of the key within
+   * the call: the answer replays an earlier request, made at that time. The
+   * answer to a re-send carries the header whenever the first send was
+   * processed, so it is the call's own outcome and leaves this undefined.
+   */
+  replayOf: string | undefined;
+}
 
 export class WorldlineServerAdapter implements ServerPaymentAdapter {
   readonly pspName = WORLDLINE_PSP_NAME;
@@ -359,6 +396,21 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
    * same error code whether Worldline answers it with a 402 or with a 2xx
    * carrying a REJECTED payment (see mapWorldlineError); `raw` is the error
    * body in the first case and the whole CreatePayment response in the second.
+   *
+   * Worldline answers a key it has seen with that key's first outcome for at
+   * least 24 hours, so on its own a key whose attempt failed would answer every
+   * later card with that failure. When the first send of a key within the call
+   * is answered with a replay of a failure (`X-GCS-Idempotence-Request-Timestamp`
+   * set), the payment goes out again under a key derived from `idempotencyKey`
+   * and the failed attempt, and the walk goes on from there. It returns the
+   * first attempt that did not fail and sends nothing past it, so a completion
+   * repeated after a success returns that payment. A replayed 3-D Secure
+   * challenge is read back: one whose payment failed or was cancelled is walked
+   * past, one still open is returned as requires_action, and any other is
+   * returned as it now reads. The answer to a re-send within the call, a 409, a
+   * 429 and a 5xx are never walked past. After 20 attempts under one key, or
+   * when Worldline could forget the key's first attempt before the session
+   * expires, the completion is refused with a non-retryable invalid_request.
    */
   async completePayment(input: CompletePaymentInput): Promise<PaymentInfo> {
     const token = decodeWorldlineClientToken(input.clientToken);
@@ -375,62 +427,110 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       // reconciliation field; softDescriptor is the cardholder-statement text.
       ...(context.statementDescriptor ? { softDescriptor: context.statementDescriptor } : {}),
     };
-    const created = await this.request<WorldlineCreatePaymentResponse>(
-      "POST",
-      `/v2/${this.merchantPath()}/payments`,
-      {
-        order: {
-          amountOfMoney: { amount: context.amount, currencyCode: context.currency },
-          ...(Object.keys(references).length > 0 ? { references } : {}),
-          ...(toWorldlineCustomer(billing, email, token.device) ?? {}),
-          ...(toWorldlineShipping(context.shippingDetails) ?? {}),
-        },
-        // hostedTokenizationId rides at the ROOT of CreatePayment — it replaces
-        // the card-data source; cardPaymentMethodSpecificInput has no such field.
-        hostedTokenizationId: token.hostedTokenizationId,
-        cardPaymentMethodSpecificInput: {
-          authorizationMode: context.captureMethod === "manual" ? "PRE_AUTHORIZATION" : "SALE",
-          // The Hosted Tokenization guide names the flat returnUrl; the 3-D Secure
-          // guide lists the redirectionData form as mandatory — send both.
-          returnUrl,
-          threeDSecure: {
-            // Only here: the flat cardPaymentMethodSpecificInput.skipAuthentication
-            // is deprecated in favor of this one.
-            skipAuthentication: false,
-            redirectionData: { returnUrl },
-            ...(context.sca?.challenge === "force" ? { challengeIndicator: "challenge-required" } : {}),
-          },
+    const request = {
+      order: {
+        amountOfMoney: { amount: context.amount, currencyCode: context.currency },
+        ...(Object.keys(references).length > 0 ? { references } : {}),
+        ...(toWorldlineCustomer(billing, email, token.device) ?? {}),
+        ...(toWorldlineShipping(context.shippingDetails) ?? {}),
+      },
+      // hostedTokenizationId rides at the ROOT of CreatePayment — it replaces
+      // the card-data source; cardPaymentMethodSpecificInput has no such field.
+      hostedTokenizationId: token.hostedTokenizationId,
+      cardPaymentMethodSpecificInput: {
+        authorizationMode: context.captureMethod === "manual" ? "PRE_AUTHORIZATION" : "SALE",
+        // The Hosted Tokenization guide names the flat returnUrl; the 3-D Secure
+        // guide lists the redirectionData form as mandatory — send both.
+        returnUrl,
+        threeDSecure: {
+          // Only here: the flat cardPaymentMethodSpecificInput.skipAuthentication
+          // is deprecated in favor of this one.
+          skipAuthentication: false,
+          redirectionData: { returnUrl },
+          ...(context.sca?.challenge === "force" ? { challengeIndicator: "challenge-required" } : {}),
         },
       },
-      input.idempotencyKey,
-    );
-    const payment = created.payment;
-    if (!payment?.id) {
+    };
+    // The first attempt goes out under the host key itself, as it did before
+    // attempts were chained, so a completion in flight across an upgrade keeps
+    // its key. Each later key derives from the attempt that failed before it,
+    // which Worldline replays unchanged, so every completion walks the same keys.
+    let keySource = input.idempotencyKey;
+    let lastFailure: unknown;
+    for (let attempt = 1; attempt <= MAX_COMPLETION_ATTEMPTS; attempt++) {
+      const answer = await this.createPayment(request, keySource);
+      const step = await this.settleCreatePayment(answer, context);
+      if ("info" in step) return step.info;
+      // The first key is the oldest, so it is the first Worldline may forget.
+      if (attempt === 1) assertFirstAttemptOutlivesSession(step.replayOf, context.expiresAt, answer.body);
+      lastFailure = answer.body;
+      keySource = `${input.idempotencyKey}:after:${step.after}`;
+    }
+    throw new PayFanoutError({
+      code: "invalid_request",
+      message:
+        `The ${MAX_COMPLETION_ATTEMPTS} Worldline payment attempts one idempotency key allows have all failed, so no ` +
+        "further attempt is sent under this one — create a new session and complete it under a new idempotency key",
+      retryable: false,
+      raw: { attempts: MAX_COMPLETION_ATTEMPTS, lastFailure },
+      pspName: this.pspName,
+    });
+  }
+
+  /**
+   * What one CreatePayment answer settles: the payment to return, or, for a
+   * replay of an earlier attempt that failed, the id the next key derives from.
+   * Any other failure throws, mapped as it always was.
+   */
+  private async settleCreatePayment(
+    answer: CreatePaymentAnswer,
+    context: WorldlineSessionContextV1,
+  ): Promise<{ info: PaymentInfo } | { after: string; replayOf: string }> {
+    const { replayOf } = answer;
+    if (answer.status >= 400) {
+      if (replayOf === undefined) throw mapWorldlineError(answer.status, answer.body);
+      // A refusal that created no payment is named by its request's timestamp,
+      // which every replay repeats, not by its errorId, which Worldline
+      // describes as unique to one error response.
+      return { after: refusedPaymentId(answer.body) ?? replayOf, replayOf };
+    }
+    const created = answer.body as WorldlineCreatePaymentResponse | undefined;
+    const payment = created?.payment;
+    if (!created || !payment?.id) {
       throw new PayFanoutError({
         code: "processing_error",
         message: getUserMessage("processing_error"),
         retryable: false,
-        raw: created,
+        raw: answer.body,
         pspName: this.pspName,
       });
     }
     if (created.merchantAction?.actionType?.toUpperCase() === "REDIRECT") {
-      return this.buildPaymentInfo(payment, {
+      const challenge = this.buildPaymentInfo(payment, {
         raw: created,
         payfanoutId: context.id,
         statusOverride: "requires_action",
         amountFallback: context.amount,
         currencyFallback: context.currency,
       });
+      if (replayOf === undefined) return { info: challenge };
+      // An earlier attempt's challenge, whose payment may have moved since.
+      // Worldline keeps one the customer abandoned open "indefinitely", and an
+      // open one may yet be authorised, so only a failed or cancelled one is
+      // walked past.
+      const current = await this.retrievePayment(payment.id, context.id);
+      if (current.status === "failed" || current.status === "canceled") return { after: payment.id, replayOf };
+      return { info: current.status === "requires_action" ? challenge : current };
     }
     // Some Worldline flows answer 2xx with a REJECTED payment rather than an HTTP
     // error. It throws a rejection mapped from the payment's own
     // statusOutput.errors, as the 402 path does from the error body, rather
     // than returning a "failed" PaymentInfo.
     if (mapWorldlineStatus(payment.status, payment.statusOutput?.statusCode, payment.statusOutput?.statusCategory) === "failed") {
+      if (replayOf !== undefined) return { after: payment.id, replayOf };
       throw mapWorldlineRejectedPayment(created);
     }
-    return this.retrievePayment(payment.id, context.id);
+    return { info: await this.retrievePayment(payment.id, context.id) };
   }
 
   async retrievePayment(pspPaymentId: string, payfanoutId?: string): Promise<PaymentInfo> {
@@ -747,7 +847,41 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     body?: unknown,
     idempotencyKey?: string,
   ): Promise<T> {
-    return withTransportRetries(() => this.requestOnce<T>(method, path, body, idempotencyKey), {
+    return this.withRetries(async () => {
+      const { response, json, text } = await this.exchange(method, path, body, idempotencyKey);
+      if (!response.ok) throw mapWorldlineError(response.status, json ?? text);
+      return json as T;
+    });
+  }
+
+  /**
+   * CreatePayment under the same retries. A 2xx, and a 4xx other than 409 and
+   * 429, come back unmapped, with the replay header when it answered the first
+   * send of the key, which completePayment needs to tell a replayed failure
+   * from the call's own. A 409, a 429 and a 5xx are retried and mapped as on
+   * every other call, whatever headers they carry.
+   */
+  private createPayment(body: unknown, idempotencyKey: string): Promise<CreatePaymentAnswer> {
+    let sends = 0;
+    return this.withRetries(async () => {
+      const firstSend = sends++ === 0;
+      const { response, json, text } = await this.exchange(
+        "POST",
+        `/v2/${this.merchantPath()}/payments`,
+        body,
+        idempotencyKey,
+      );
+      const { status } = response;
+      const refused = status >= 400 && status < 500 && status !== 409 && status !== 429;
+      if (!response.ok && !refused) throw mapWorldlineError(status, json ?? text);
+      // An empty value marks nothing, as in Worldline's Node SDK.
+      const replayOf = firstSend ? response.headers.get(REPLAY_HEADER)?.trim() || undefined : undefined;
+      return { status, body: json ?? text, replayOf };
+    });
+  }
+
+  private withRetries<T>(send: () => Promise<T>): Promise<T> {
+    return withTransportRetries(send, {
       attempts: 1 + (this.config.maxNetworkRetries ?? 2),
       sleep: this.config.sleep,
       // Beyond transport trouble, a 409 (an idempotent replay racing the still
@@ -756,12 +890,13 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     });
   }
 
-  private async requestOnce<T>(
+  /** One signed exchange, unmapped: the response, its body text, and that text parsed when it is JSON. */
+  private async exchange(
     method: "GET" | "POST",
     path: string,
     body?: unknown,
     idempotencyKey?: string,
-  ): Promise<T> {
+  ): Promise<{ response: Response; json: unknown; text: string }> {
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
     const date = new Date(this.now()).toUTCString();
     const hasBody = body !== undefined;
@@ -804,9 +939,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
         ...(hasBody ? { body: JSON.stringify(body) } : {}),
       },
     );
-    const json = text ? safeJson(text) : undefined;
-    if (!response.ok) throw mapWorldlineError(response.status, json ?? text);
-    return json as T;
+    return { response, json: text ? safeJson(text) : undefined, text };
   }
 
   /**
@@ -1026,9 +1159,10 @@ function mapRefundStatus(refund: WorldlineStatusFields): RefundStatus {
  * reference ("Fix errors.errorCode", "Payment retry guidelines") and the Sips
  * response-code mapping. Any other code on a 402 is a generic decline; on a
  * REJECTED payment, the error's own httpStatusCode decides (see
- * mapWorldlineRejectedPayment). None is retryable: Worldline answers a replay
- * under the same idempotence key with the original outcome, so only a new
- * attempt can change it.
+ * mapWorldlineRejectedPayment). None is retryable: each is that attempt's
+ * answer, and a completion repeated under the same key goes out as a new
+ * attempt with the card it carries (see completePayment), which is the
+ * customer's step to take, not an automatic retry's.
  */
 const WORLDLINE_CODE_MAP: Record<string, UnifiedErrorCode> = {
   // Cards reported lost or stolen or used for fraud, and rejections by the
@@ -1130,12 +1264,45 @@ function isIdempotenceReplayInFlight(error: unknown): error is PayFanoutError {
   return isPayFanoutError(error) && error.code === "processing_error" && error.retryable;
 }
 
+/** The payment a refused CreatePayment created, when the error body's paymentResult reports one. */
+function refusedPaymentId(body: unknown): string | undefined {
+  const id = (body as { paymentResult?: { payment?: { id?: unknown } } } | null | undefined)?.paymentResult?.payment?.id;
+  return typeof id === "string" && id !== "" ? id : undefined;
+}
+
+/**
+ * Every completion of a session walks its keys from the first, so Worldline
+ * must still hold the first key's outcome whenever the session can be
+ * completed: a completion that found it forgotten would go out as a new first
+ * attempt, and charge again after a later attempt succeeded. A key reused for
+ * a session created about a day after its first attempt, or a session that
+ * lives that long, gets no further attempt; nor does a timestamp that is not
+ * the documented milliseconds. The refusal reads no further than the first
+ * key, so a success a later key holds from an earlier session goes unseen,
+ * which is why the message asks for a new key only once none succeeded.
+ */
+function assertFirstAttemptOutlivesSession(replayOf: string, expiresAt: number, lastFailure: unknown): void {
+  const firstRequestAt = /^\d+$/.test(replayOf) ? Number(replayOf) : Number.NaN;
+  if (firstRequestAt + RELIABLE_REPLAY_PERIOD_MS > expiresAt) return;
+  throw new PayFanoutError({
+    code: "invalid_request",
+    message:
+      "Worldline keeps an idempotency key's outcome for at least 24 hours from its first request, and it could " +
+      "forget the first payment attempt under this key before this session expires, so no further attempt is sent " +
+      "under it — once no payment under this key has succeeded, complete the payment under a new idempotency key",
+    retryable: false,
+    raw: { firstRequestAt: replayOf, sessionExpiresAt: expiresAt, lastFailure },
+    pspName: WORLDLINE_PSP_NAME,
+  });
+}
+
 /**
  * A 2xx CreatePayment whose payment was REJECTED. The reason rides in
  * payment.statusOutput.errors, the same shape as an error body's `errors`, and
  * maps through the same codes; without a documented code, the error's own
- * httpStatusCode decides (see unmappedRejectionCode). Never retryable: a
- * replay under this idempotence key answers the same payment.
+ * httpStatusCode decides (see unmappedRejectionCode). Never retryable, like a
+ * 402: repeating the completion makes a new attempt rather than replaying
+ * this one.
  */
 function mapWorldlineRejectedPayment(created: WorldlineCreatePaymentResponse): PayFanoutError {
   const errors = created.payment?.statusOutput?.errors;
@@ -1153,10 +1320,11 @@ function mapWorldlineRejectedPayment(created: WorldlineCreatePaymentResponse): P
 /**
  * A REJECTED payment's error without a documented code, read by its embedded
  * httpStatusCode. A 5xx is the platform failing, not the card:
- * `processing_error`, since `psp_unavailable` is always retryable and a replay
- * answers the same payment. A 4xx other than 402 is a refused request, such as
- * the troubleshooting page's INVALID_VALUE example: `invalid_request`.
- * Anything else, a missing status included, is a decline.
+ * `processing_error`, since `psp_unavailable` is always retryable and a
+ * repeated completion would make a new attempt rather than replay this one. A
+ * 4xx other than 402 is a refused request, such as the troubleshooting page's
+ * INVALID_VALUE example: `invalid_request`. Anything else, a missing status
+ * included, is a decline.
  */
 function unmappedRejectionCode(status: unknown): UnifiedErrorCode {
   if (typeof status !== "number") return "card_declined";

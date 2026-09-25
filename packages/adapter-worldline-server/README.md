@@ -165,6 +165,12 @@ Session creation also refuses, with `invalid_request` and before any call to Wor
 
 - The transport retries timeouts/5xx/429 with backoff (`maxNetworkRetries`, default 2); every
   money-moving call is idempotent, so a replay can never double-charge.
+- Worldline answers a repeated idempotency key with its first outcome for at least 24 hours,
+  so a completion repeated after a failed attempt goes out again under a key derived from
+  yours and that attempt: a stable per-order key still lets the customer pay with another
+  card, and a completion repeated after a success returns that payment. A key carries at most
+  20 attempts; [Set up Worldline](https://donapulse.github.io/payfanout/guide/worldline),
+  step 7, lists the other limits.
 - Worldline Direct has no refund-by-id endpoint, so `refundPayment` returns a **composite
   `refundId`** (`{paymentId}:{refundId}`) that `retrieveRefund` resolves through the payment's
   refund list. The part after the last `:` is Worldline's own refund id — the one webhooks

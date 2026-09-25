@@ -144,6 +144,9 @@ export function PaymentFields({
     setLastError(undefined);
 
     void (async () => {
+      // A failed mount can reach us through the onError option AND the
+      // rejection; adapters hand both the same instance, reported once.
+      const reported = new WeakSet<object>();
       try {
         await adapter.loadSdk();
         // A StrictMode/remount cleanup may have run while the SDK loaded —
@@ -159,6 +162,7 @@ export function PaymentFields({
           },
           onError: (err) => {
             if (cancelled) return;
+            if (typeof err === "object" && err !== null) reported.add(err);
             setLastError(err);
             setStatus("error");
             latestRef.current.onError?.(err);
@@ -184,7 +188,7 @@ export function PaymentFields({
         const wrapped = PayFanoutError.wrap(err, { pspName: targetPsp });
         setLastError(wrapped);
         setStatus("error");
-        latestRef.current.onError?.(wrapped);
+        if (!reported.has(wrapped)) latestRef.current.onError?.(wrapped);
       }
     })();
 

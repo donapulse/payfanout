@@ -2277,3 +2277,62 @@ description of what v2 changes is what the migration then had to implement.
   the adapter, reads `signature` first and still tolerates `x-signature` /
   `x-paysafe-signature`; raw-body hashing, constant-time comparison and key rotation are
   unchanged.
+
+## Subscription renewals without a definitive answer (2026-09-25)
+
+- **A renewal charge that fails without saying whether money moved is replayed under its
+  own key, never re-keyed.** Until now every failed renewal moved on to a new attempt key
+  (`-a<failedAttempts>`), so a charge whose answer was lost, a timeout after the PSP had
+  processed it, could be charged again by the next dunning run. The manager now classifies
+  each failure. Definitive: `card_declined`, `insufficient_funds`, `expired_card`,
+  `invalid_card_data`, `authentication_required`, `fraud_suspected`, `invalid_request`,
+  `session_expired`, `unsupported_operation`, a charge that resolved as failed, canceled
+  or requiring action, and a pending renewal resolved as failed. Uncertain:
+  `psp_unavailable`, `rate_limited`, `unknown`, any code added to the taxonomy later, and
+  any error marked `outcomeUnknown`. An uncertain failure pins `renewalAttempt.replay` (the
+  key and the request as sent), and every later charge of the period repeats that request.
+  The whole request is kept because a reused key with other parameters is refused or
+  misread. Stripe's idempotent-requests reference: "The idempotency layer compares incoming
+  parameters to those of the original request and errors if they're not the same".
+  Worldline's idempotent-requests guide: "Our server will respond with the same outcome as
+  the original request, even with different payloads." Both doc-verified 2026-09-25.
+- **`processing_error` is replayed once.** Stripe's adapter maps the card-error code
+  `processing_error` to it, and Stripe's decline-codes page says "Ask the customer to
+  attempt the payment again"; Stripe answers a reused key with the saved result of the
+  first request, so a second `processing_error` for the same request is that attempt's own
+  answer, and the retry moves on to a new key. Paysafe's replay-safe completions (PR #198)
+  report an unanswered write as a non-retryable `processing_error` that means the
+  opposite: retry under the same key, never a new one. The code cannot tell the two apart,
+  so core gained `PayFanoutError.outcomeUnknown`. An adapter that knows the outcome is
+  unknown says so, and the manager never re-keys such a failure, whatever its code.
+- **Replays run on their own short schedule.** Stripe's idempotent-requests reference says
+  keys can be removed "after they're at least 24 hours old" and "We generate a new request
+  if a key is reused after the original is pruned" (doc-verified 2026-09-25). The default
+  dunning retry comes 24 hours after a failure, too late for a replay to dedupe reliably.
+  `replayDelaysMinutes` (default 5, 30 and 120 minutes) spaces the replays of an uncertain
+  charge without spending a dunning attempt. A run spent without an answer counts as one
+  failed attempt, and the replays continue at the dunning pace under the same key until
+  the schedule ends the subscription. The residual risk: a charge that did go through while
+  the PSP stayed unreachable past the whole replay run, and whose key the PSP pruned before
+  the dunning retry, is charged again by that retry. Freezing such records instead was
+  rejected: every outage longer than the run would leave subscriptions stuck until someone
+  reconciled each one by hand, while in an outage the original has almost never been
+  processed.
+- **Attempt numbers never go back.** `renewalAttempt.attempt` carries the period's next
+  number, so a token change, which resets `failedAttempts`, no longer reuses `-a0`, and
+  `PendingRenewal.attempt` is the number of the key the pending charge used, no longer
+  copied into `failedAttempts` when it resolves as failed. A pinned charge of a card the
+  host has since replaced is replayed first, since it may have paid the period; when that
+  replay is declined, the decline does not count against the new card, which is charged on
+  the next run. Plan and metadata changes wait for the pin the same way.
+- **Settling a pin is explicit.** `resolvePendingRenewal` settles a pinned charge only when
+  given its `idempotencyKey`: a failure webhook alone cannot, because the payment it names
+  may belong to an earlier attempt. Settling as succeeded requires the payment id and
+  refuses the previous period's. `resumeSubscription` refuses while a pin is open, because
+  a replay long after the pause may reach a PSP that no longer holds the key, and a
+  canceled record keeps its pin for reconciliation.
+- **A replay is sent only when the service can still send it**: the adapter is registered
+  and supports saved payment methods. Otherwise the pin stays, since a local refusal says
+  nothing about the original charge. An answer that reaches the store after an overlapping
+  run collected the period, or settled the attempt, is dropped instead of overwriting that
+  outcome.

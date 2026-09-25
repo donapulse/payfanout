@@ -329,7 +329,7 @@ describe("dunning (failed renewals)", () => {
     scriptNext("declined");
     await manager.chargeDueSubscriptions(); // attempt 1 -> past_due (+24h)
     clock.now += 25 * HOUR;
-    scriptNext("psp_down");
+    scriptNext("declined"); // definitive: an unreachable PSP is replayed first, not counted at once
     await manager.chargeDueSubscriptions(); // attempt 2 -> past_due (+72h)
     expect((await manager.retrieveSubscription("sub_1")).failedAttempts).toBe(2);
 
@@ -410,7 +410,12 @@ describe("updates, retrieval, listing", () => {
 
     const run = await manager.chargeDueSubscriptions(); // no backoff left — retries immediately
     expect(run.charged).toHaveLength(1);
-    expect(charges[1]).toMatchObject({ savedPaymentMethodToken: "tok_new_card", amount: 4900 });
+    expect(charges[1]).toMatchObject({
+      savedPaymentMethodToken: "tok_new_card",
+      amount: 4900,
+      // The reset dunning count never rewinds the period's attempt numbers.
+      idempotencyKey: "payfanout-sub-sub_1-2026-02-28T10:00:00.000Z-a1",
+    });
   });
 
   it("rejects updates to canceled subscriptions and unknown ids", async () => {
@@ -447,6 +452,10 @@ describe("robustness", () => {
   it("validates manager options eagerly", () => {
     expect(() => harness({ catchUpLimit: 0 })).toThrowError(/catchUpLimit/);
     expect(() => harness({ retryDelaysHours: [24, -1] })).toThrowError(/retryDelaysHours/);
+    expect(() => harness({ retryDelaysHours: [Number.POSITIVE_INFINITY] })).toThrowError(/retryDelaysHours/);
+    expect(() => harness({ replayDelaysMinutes: [5, 0] })).toThrowError(/replayDelaysMinutes/);
+    expect(() => harness({ replayDelaysMinutes: [Number.NaN] })).toThrowError(/replayDelaysMinutes/);
+    expect(() => harness({ replayDelaysMinutes: [] })).not.toThrow();
   });
 
   it("generates ids when the host does not supply one", async () => {
@@ -1099,6 +1108,8 @@ describe("pause / resume", () => {
     expect(resolved).toMatchObject({ status: "paused", lastError: { code: "insufficient_funds" } });
     expect(resolved.pendingRenewal).toBeUndefined();
     expect(resolved.nextRetryAt).toBeUndefined();
+    // The settled charge spent its key: a later renewal of the period uses the next one.
+    expect(resolved.renewalAttempt).toEqual({ periodEnd: "2026-02-28T10:00:00.000Z", attempt: 1 });
   });
 
   it("a pause landing during a SUCCESSFUL renewal charge stands — window advances, status stays paused", async () => {

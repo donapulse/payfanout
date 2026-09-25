@@ -48,7 +48,7 @@ await subs.createSubscription({ pspName, pspCustomerId, savedPaymentMethodToken,
   plan: { amount: 1099, currency: "USD", interval: "month" }, idempotencyKey });
 
 // your cron, every few minutes:
-await subs.chargeDueSubscriptions();   // renews, retries (24h/72h dunning), cancels when exhausted
+await subs.chargeDueSubscriptions();   // renews, replays unanswered charges, retries (24h/72h dunning), cancels when exhausted
 
 // retrieveSubscription / listSubscriptions / updateSubscription / cancelSubscription({ atPeriodEnd })
 // pauseSubscription / resumeSubscription({ idempotencyKey })
@@ -80,6 +80,9 @@ skips paused records and dunning stops (`nextRetryAt` is cleared; `failedAttempt
 `"active"` again, no charge; lapsed → one immediate charge re-anchors the billing cycle at
 the resume instant. A failed resume charge leaves the record paused with `lastError` (no
 dunning) and throws; retry with the same key so the PSP replays instead of re-charging.
+A record paused over a renewal charge that never got a definitive answer cannot resume until
+you settle that charge (see [below](#renewals-without-a-definitive-answer)): it may already
+have paid the period.
 Events: `subscription.paused` / `subscription.resumed`.
 
 ### Renewals on async rails
@@ -99,6 +102,48 @@ await subs.resolvePendingRenewal(subscriptionId, {
 
 Resolving is replay-safe (a re-delivered webhook is a no-op) and a pending renewal that you
 never resolve stays frozen — the safe default is to not charge twice, never to assume.
+
+### Renewals without a definitive answer
+
+Some failed charges do not say whether money moved: the PSP was unreachable or rate
+limiting, the error was unknown, the adapter marked it `outcomeUnknown`, or a first
+`processing_error` came back. The manager then **pins** the attempt. `renewalAttempt.replay`
+holds the idempotency key and the request exactly as sent, and every later charge for the
+period repeats that request under that key, so a charge whose answer was lost is read back
+from the PSP instead of being made twice. Nothing counts as failed yet: the record goes
+`past_due` and the replays follow `replayDelaysMinutes` (default 5, 30 and 120 minutes),
+well inside the time a PSP keeps a key (Stripe may prune one once it is 24 hours old). A
+replay run that ends without an answer counts as one failed attempt, and the replays go on
+at the dunning pace until the schedule ends the subscription.
+
+A definitive answer settles the pin. A success pays the period. A decline, an
+authentication demand or a request error moves on to a new attempt number, and a second
+`processing_error` for the same request counts as that attempt's own failure. Attempt
+numbers are never reused, so a card set with `updateSubscription` is charged under a key the
+period has not used, but only after the pinned charge of the old card has been replayed,
+because it may already have paid the period. If that replay is declined, the new card is
+charged on the next run without waiting for a dunning delay; plan and metadata changes wait
+for the pin in the same way.
+
+When the PSP shows what became of a pinned charge, in its dashboard or through a webhook,
+settle it with the pinned key:
+
+```ts
+const pinned = record.renewalAttempt?.replay;
+if (pinned) {
+  await subs.resolvePendingRenewal(record.id, {
+    status: "succeeded",              // the charge went through: it pays the period
+    pspPaymentId: foundPaymentId,     // becomes lastPaymentId
+    idempotencyKey: pinned.idempotencyKey,
+  });
+  // or { status: "failed", idempotencyKey } once the PSP shows no such charge
+}
+```
+
+The key is required because a failure webhook alone cannot settle a pin: the payment it
+names may belong to an earlier attempt. A canceled subscription keeps its pin, so a charge
+that may have gone through never drops out of sight. Stores must persist `renewalAttempt`
+verbatim, like `pendingRenewal`.
 
 ### Scaling the cron: `listDue`
 
@@ -121,7 +166,8 @@ call. `updateSubscription` and the `cancelSubscription({ atPeriodEnd: true })` f
 emit `subscription.updated`; renewals never do. A storage failure after a successful
 charge never enters dunning: the run reports it under `ChargeDueResult.errors` and the
 next run replays the same attempt key, which the PSP answers from cache instead of
-charging again.
+charging again. An answer that reaches the store after an overlapping run has already
+collected the period, or settled the attempt, is dropped.
 
 ::: info Where PSP-native billing fits
 This engine bills from **your** cron with identical behavior on every vaulting-capable

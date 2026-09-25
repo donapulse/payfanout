@@ -123,6 +123,32 @@ describe("createEndpointCompletion", () => {
     expect(thrown).toMatchObject({ code: "card_declined", message: "Your card was declined.", retryable: false, pspName: "paysafe" });
   });
 
+  it("carries outcomeUnknown from the { error } body, and only when the server set it", async () => {
+    const doubtful = createEndpointCompletion(
+      "/c",
+      "cs",
+      undefined,
+      fakeFetch(502, {
+        error: { name: "PayFanoutError", code: "processing_error", message: "Outcome unknown.", retryable: false, outcomeUnknown: true },
+      }) as unknown as typeof fetch,
+    );
+    await expect(doubtful("t")).rejects.toMatchObject({ code: "processing_error", outcomeUnknown: true });
+
+    const plain = createEndpointCompletion(
+      "/c",
+      "cs",
+      undefined,
+      fakeFetch(402, {
+        error: { name: "PayFanoutError", code: "card_declined", message: "Declined.", retryable: false },
+      }) as unknown as typeof fetch,
+    );
+    let thrown: unknown;
+    await plain("t").catch((e: unknown) => {
+      thrown = e;
+    });
+    expect((thrown as PayFanoutError).outcomeUnknown).toBeUndefined();
+  });
+
   it("falls back to a generic unknown error when the non-2xx body is missing or unparseable", async () => {
     const fetchImpl = fakeFetch(500, undefined); // empty body -> response.json() throws -> generic fallback
     const complete = createEndpointCompletion("/c", "cs", undefined, fetchImpl as unknown as typeof fetch);

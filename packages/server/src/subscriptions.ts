@@ -48,9 +48,65 @@ export interface PendingRenewal {
   pspPaymentId: string;
   /** The period end the charge was renewing — the next window anchors here. */
   periodEnd: string;
-  /** Attempt counter the charge's idempotency key was derived from. */
+  /**
+   * Attempt number in the renewal idempotency key the charge used. A resume
+   * charge runs under the caller's key instead; its entry repeats the
+   * dunning count of the time.
+   */
   attempt: number;
   startedAt: string;
+}
+
+/** A renewal charge exactly as sent, kept so that a replay repeats it unchanged. */
+export interface RenewalRequest {
+  savedPaymentMethodToken: string;
+  amount: MinorUnitAmount;
+  currency: string;
+  billingDetails?: SubscriptionRecord["billingDetails"];
+  /** The record's metadata at charge time; payfanout_subscription_id is added when sending. */
+  metadata?: Record<string, string>;
+}
+
+/**
+ * A renewal charge that ended without a definitive answer, so the money may
+ * have moved: the PSP was unreachable or rate limiting, the error was unknown
+ * or marked outcomeUnknown, or it was a first processing_error. Until an
+ * answer settles it, every charge for the period replays this request under
+ * this key, and the PSP answers with the original instead of charging again.
+ * The request is kept as sent because a PSP refuses a reused key carrying
+ * other parameters, or answers it with the original's result.
+ */
+export interface RenewalReplay {
+  /** The key the original charge used; every replay reuses it. */
+  idempotencyKey: string;
+  request: RenewalRequest;
+  /**
+   * Uncertain answers in the current replay run. A run spent without a
+   * definitive answer counts as one failed attempt, and the next run starts
+   * at the dunning retry.
+   */
+  uncertainAnswers: number;
+  /**
+   * A processing_error not marked outcomeUnknown already answered this
+   * request, so the next one is taken as the attempt's definitive failure.
+   */
+  afterProcessingError: boolean;
+}
+
+/**
+ * Where the renewal charges of one period stand. Renewal keys are
+ * `payfanout-sub-<id>-<periodEnd>-a<attempt>`, and no attempt number serves
+ * two different requests: a definitive failure (a decline) moves on to the
+ * next number, and a charge without a definitive answer is replayed under
+ * its own key (see RenewalReplay).
+ */
+export interface RenewalAttempt {
+  /** The period end being renewed (the record's currentPeriodEnd at charge time). */
+  periodEnd: string;
+  /** Attempt number the next charge for this period uses. */
+  attempt: number;
+  /** Set while the charge under `attempt` awaits a definitive answer. */
+  replay?: RenewalReplay;
 }
 
 export interface SubscriptionRecord {
@@ -71,7 +127,10 @@ export interface SubscriptionRecord {
    */
   anchorDay?: number;
   cancelAtPeriodEnd: boolean;
-  /** Consecutive failed renewal attempts for the CURRENT period (dunning). */
+  /**
+   * Consecutive failed renewal attempts for the CURRENT period (dunning). A
+   * charge without a definitive answer counts once its replay run is spent.
+   */
   failedAttempts: number;
   /** ISO 8601 — when past_due, the earliest instant the next retry may run. */
   nextRetryAt?: string;
@@ -87,6 +146,13 @@ export interface SubscriptionRecord {
   metadata?: Record<string, string>;
   /** Money-safety state — stores MUST persist this field; dropping it re-charges unresolved renewals. */
   pendingRenewal?: PendingRenewal;
+  /**
+   * Money-safety state — stores MUST persist this field; dropping it lets a
+   * retry charge a period whose earlier charge may have gone through. Written
+   * by the manager only. Records without it derive the next attempt from
+   * failedAttempts, as earlier releases did.
+   */
+  renewalAttempt?: RenewalAttempt;
   createdAt: string;
   canceledAt?: string;
 }
@@ -195,7 +261,7 @@ export interface CreateSubscriptionInput {
 
 export interface ChargeDueResult {
   charged: SubscriptionRecord[];
-  /** Renewals that failed this run (now past_due, retry scheduled). */
+  /** Renewals that did not collect this run (now past_due, retry or replay scheduled). */
   failed: SubscriptionRecord[];
   /** Ended this run: dunning exhausted or cancelAtPeriodEnd reached. */
   canceled: SubscriptionRecord[];
@@ -213,11 +279,24 @@ export interface SubscriptionManagerOptions {
   service: PaymentService;
   store: SubscriptionStore;
   /**
-   * Dunning policy: hours to wait before each renewal retry. The Nth failure
-   * schedules a retry after retryDelaysHours[N-1]; failing with the schedule
-   * exhausted cancels the subscription. Default [24, 72] (3 attempts total).
+   * Dunning policy: hours to wait before each renewal retry. The Nth failed
+   * attempt schedules a retry after retryDelaysHours[N-1]; failing with the
+   * schedule exhausted cancels the subscription. Default [24, 72] (3 attempts
+   * total). A charge without a definitive answer is replayed on
+   * replayDelaysMinutes first and counts as a failed attempt only once those
+   * replays are spent.
    */
   retryDelaysHours?: number[];
+  /**
+   * Minutes to wait before each replay of a renewal charge that ended without
+   * a definitive answer (see RenewalReplay). A replay dedupes only while the
+   * PSP still holds the original idempotency key, and some PSPs prune keys a
+   * day after first use, so keep the whole schedule well inside a day. Once
+   * it is spent the attempt counts as failed and the replays go on at the
+   * dunning pace. Default [5, 30, 120]; [] counts the first uncertain answer
+   * as a failed attempt straight away.
+   */
+  replayDelaysMinutes?: number[];
   /**
    * How many overdue periods one chargeDueSubscriptions run may collect per
    * subscription. Default 1 — a long-dead cron must not surprise-charge a
@@ -246,6 +325,7 @@ export class SubscriptionManager {
   private readonly service: PaymentService;
   private readonly store: SubscriptionStore;
   private readonly retryDelaysHours: number[];
+  private readonly replayDelaysMinutes: number[];
   private readonly catchUpLimit: number;
   private readonly onEvent?: SubscriptionManagerOptions["onEvent"];
   private readonly now: () => number;
@@ -255,6 +335,7 @@ export class SubscriptionManager {
     this.service = options.service;
     this.store = options.store;
     this.retryDelaysHours = options.retryDelaysHours ?? [24, 72];
+    this.replayDelaysMinutes = options.replayDelaysMinutes ?? [5, 30, 120];
     this.catchUpLimit = options.catchUpLimit ?? 1;
     this.onEvent = options.onEvent;
     this.now = options.now ?? Date.now;
@@ -262,8 +343,12 @@ export class SubscriptionManager {
     if (this.catchUpLimit < 1) {
       throw PayFanoutError.invalidRequest("SubscriptionManager catchUpLimit must be >= 1");
     }
-    if (this.retryDelaysHours.some((h) => !(h > 0))) {
-      throw PayFanoutError.invalidRequest("SubscriptionManager retryDelaysHours must all be > 0");
+    // An infinite delay would not schedule anything: it has no ISO instant.
+    if (this.retryDelaysHours.some((h) => !(h > 0 && Number.isFinite(h)))) {
+      throw PayFanoutError.invalidRequest("SubscriptionManager retryDelaysHours must all be finite and > 0");
+    }
+    if (this.replayDelaysMinutes.some((m) => !(m > 0 && Number.isFinite(m)))) {
+      throw PayFanoutError.invalidRequest("SubscriptionManager replayDelaysMinutes must all be finite and > 0");
     }
   }
 
@@ -378,7 +463,11 @@ export class SubscriptionManager {
   /**
    * Plan/instrument changes apply from the NEXT period (no proration — the
    * already-paid window stands). Changing the token also clears dunning:
-   * a fresh card deserves a fresh chance at the next renewal.
+   * a fresh card deserves a fresh chance at the next renewal. The period's
+   * attempt numbers carry on, so the new card is charged under a key the
+   * period has not used, and a renewal charge still awaiting a definitive
+   * answer (renewalAttempt.replay) is replayed with its original card and
+   * amount before the new ones are charged.
    * Emits "subscription.updated" (renewals never do).
    */
   async updateSubscription(
@@ -401,7 +490,13 @@ export class SubscriptionManager {
         : {}),
       ...(updates.metadata ? { metadata: updates.metadata } : {}),
     };
-    if (updates.savedPaymentMethodToken) delete updated.nextRetryAt;
+    if (updates.savedPaymentMethodToken) {
+      delete updated.nextRetryAt;
+      // failedAttempts no longer tells which attempt numbers the period used.
+      const next = nextRenewalAttempt(record);
+      if (next.attempt > 0 || next.replay) updated.renewalAttempt = next;
+      else delete updated.renewalAttempt;
+    }
     await this.store.save(updated);
     await this.emit({ type: "subscription.updated", subscription: updated });
     return updated;
@@ -411,6 +506,8 @@ export class SubscriptionManager {
    * Immediate cancel stops everything now (the rest of the paid window is
    * forfeit — no refund is initiated; use refundPayment separately if owed).
    * atPeriodEnd lets the paid window run out, then ends without charging.
+   * A renewal charge still awaiting a definitive answer stays on the
+   * canceled record (renewalAttempt.replay) for reconciliation.
    */
   async cancelSubscription(id: string, options: { atPeriodEnd?: boolean } = {}): Promise<SubscriptionRecord> {
     const record = await this.retrieveSubscription(id);
@@ -434,10 +531,11 @@ export class SubscriptionManager {
 
   /**
    * Halts billing without ending the subscription: the cron skips paused
-   * records and dunning stops (nextRetryAt is cleared; failedAttempts and any
-   * pendingRenewal survive untouched — an unresolved renewal still resolves
-   * via resolvePendingRenewal, but a paused record is never re-charged).
-   * Pausing a paused record is a no-op; canceled records cannot pause.
+   * records and dunning stops (nextRetryAt is cleared; failedAttempts, any
+   * pendingRenewal and any renewalAttempt survive untouched — an unresolved
+   * renewal still resolves via resolvePendingRenewal, but a paused record is
+   * never re-charged). Pausing a paused record is a no-op; canceled records
+   * cannot pause.
    */
   async pauseSubscription(id: string): Promise<SubscriptionRecord> {
     const record = await this.retrieveSubscription(id);
@@ -461,6 +559,10 @@ export class SubscriptionManager {
    * paused with lastError — no dunning — and throws. A charge resolving as
    * "processing" freezes the still-paused record under pendingRenewal:
    * resolve it, then resume again (paid through by then, so no second charge).
+   * A record paused over a renewal charge without a definitive answer
+   * (renewalAttempt.replay) cannot resume until resolvePendingRenewal settles
+   * it: that charge may have paid the period, and a replay long after the
+   * fact may reach a PSP that no longer holds its key.
    */
   async resumeSubscription(id: string, options: { idempotencyKey: string }): Promise<SubscriptionRecord> {
     const record = await this.retrieveSubscription(id);
@@ -470,6 +572,13 @@ export class SubscriptionManager {
     if (record.pendingRenewal) {
       throw PayFanoutError.invalidRequest(
         `Subscription "${id}" has an unresolved renewal — apply its outcome with resolvePendingRenewal before resuming`,
+      );
+    }
+    const unsettled = pinnedReplay(record);
+    if (unsettled) {
+      throw PayFanoutError.invalidRequest(
+        `Subscription "${id}" has a renewal charge without a definitive answer — settle it with resolvePendingRenewal ` +
+          `(idempotencyKey "${unsettled.idempotencyKey}") before resuming`,
       );
     }
     const nowMs = this.now();
@@ -521,6 +630,7 @@ export class SubscriptionManager {
       delete updated.nextRetryAt;
       delete updated.lastError;
       delete updated.pendingRenewal;
+      delete updated.renewalAttempt;
       await this.store.save(updated);
       await this.emit({ type: "subscription.resumed", subscription: updated });
       await this.emit({ type: "subscription.charged", subscription: updated, payment });
@@ -654,32 +764,65 @@ export class SubscriptionManager {
   }
 
   /**
-   * Applies the final outcome of a renewal charge that resolved as
-   * "processing" (async rails). Wire it to the host's payment webhook ingress
-   * (payment.succeeded / payment.failed with a matching pspPaymentId) — until
-   * it runs, the subscription is frozen: chargeDueSubscriptions never charges
-   * on top of an unresolved renewal. Replay-safe: re-resolving an
-   * already-applied success is a no-op. Resolving never reactivates: a record
-   * paused (or canceled) in the meantime keeps its status — a success still
-   * advances the paid-through window (the money moved), a failure is recorded
-   * without entering dunning.
+   * Applies the final outcome of a renewal charge whose result the manager
+   * does not know. Two kinds exist:
+   *
+   * - A charge that resolved as "processing" (async rails, `pendingRenewal`).
+   *   Wire it to the host's payment webhook ingress (payment.succeeded /
+   *   payment.failed with a matching pspPaymentId). Until it runs the
+   *   subscription is frozen: chargeDueSubscriptions never charges on top of
+   *   an unresolved renewal.
+   * - A charge that ended without a definitive answer
+   *   (`renewalAttempt.replay`). The cron replays it by itself; settle it here
+   *   once the PSP shows what became of it, passing the pinned
+   *   `idempotencyKey`, which ties the outcome to that very charge. A failure
+   *   webhook alone cannot: the payment it names may be an earlier attempt's.
+   *
+   * Replay-safe: re-resolving an already-applied success is a no-op. Resolving
+   * never reactivates: a record paused (or canceled) in the meantime keeps its
+   * status — a success still advances the paid-through window (the money
+   * moved), a failure is recorded without entering dunning.
    */
   async resolvePendingRenewal(
     id: string,
     outcome: {
       status: "succeeded" | "failed";
-      /** From the webhook — guards against applying a different payment's outcome. */
+      /**
+       * From the webhook — guards against applying a different payment's
+       * outcome. Required to settle a charge without a definitive answer as
+       * succeeded: it becomes lastPaymentId.
+       */
       pspPaymentId?: string;
       error?: { code?: UnifiedErrorCode; message?: string };
+      /**
+       * Settles a renewal charge without a definitive answer; must equal its
+       * renewalAttempt.replay.idempotencyKey. Not consulted while a
+       * pendingRenewal is awaited — pspPaymentId guards that one.
+       */
+      idempotencyKey?: string;
     },
   ): Promise<SubscriptionRecord> {
     const record = await this.retrieveSubscription(id);
     const pending = record.pendingRenewal;
     if (!pending) {
+      const tracked = record.renewalAttempt;
+      if (
+        tracked?.replay &&
+        tracked.periodEnd === record.currentPeriodEnd &&
+        outcome.idempotencyKey === tracked.replay.idempotencyKey
+      ) {
+        return this.settleReplay(record, tracked, tracked.replay, outcome);
+      }
       if (outcome.status === "succeeded" && outcome.pspPaymentId !== undefined && record.lastPaymentId === outcome.pspPaymentId) {
         return record; // replayed webhook — outcome already applied
       }
-      throw PayFanoutError.invalidRequest(`Subscription "${id}" has no pending renewal to resolve`);
+      const unsettled = pinnedReplay(record);
+      throw PayFanoutError.invalidRequest(
+        unsettled
+          ? `Subscription "${id}" has no pending renewal to resolve; its renewal charge without a definitive answer ` +
+              `settles only with idempotencyKey "${unsettled.idempotencyKey}"`
+          : `Subscription "${id}" has no pending renewal to resolve`,
+      );
     }
     if (outcome.pspPaymentId !== undefined && outcome.pspPaymentId !== pending.pspPaymentId) {
       throw PayFanoutError.invalidRequest(
@@ -703,6 +846,7 @@ export class SubscriptionManager {
       delete updated.nextRetryAt;
       delete updated.lastError;
       delete updated.pendingRenewal;
+      delete updated.renewalAttempt;
       await this.store.save(updated);
       await this.emit({ type: "subscription.charged", subscription: updated });
       return updated;
@@ -713,16 +857,84 @@ export class SubscriptionManager {
       retryable: false,
       pspName: record.pspName,
     });
+    // A renewal's key is spent by its settled charge; a resume charge ran
+    // under the caller's key, and its periodEnd is the resume instant.
+    const renewal = pending.periodEnd === record.currentPeriodEnd;
     if (record.status === "canceled" || record.status === "paused") {
       // Ended or halted — record the failure; dunning never wakes such a record.
       const updated: SubscriptionRecord = { ...record, lastError: { code: error.code, message: error.message } };
       delete updated.pendingRenewal;
+      if (renewal) updated.renewalAttempt = { periodEnd: pending.periodEnd, attempt: pending.attempt + 1 };
       await this.store.save(updated);
       await this.emit({ type: "subscription.charge_failed", subscription: updated, error });
       return updated;
     }
     const sink: ChargeDueResult = { charged: [], failed: [], canceled: [], pending: [], errors: [] };
-    return this.recordRenewalFailure({ ...record, failedAttempts: pending.attempt }, this.now(), error, sink);
+    return this.recordRenewalFailure(
+      record,
+      this.now(),
+      error,
+      sink,
+      { periodEnd: pending.periodEnd, attempt: pending.attempt },
+      "definitive",
+    );
+  }
+
+  /**
+   * Settles a renewal charge that had no definitive answer, from what the
+   * PSP shows of it: succeeded pays the period; failed retires its key, and
+   * the next charge is a new attempt on the dunning schedule already running.
+   */
+  private async settleReplay(
+    record: SubscriptionRecord,
+    tracked: RenewalAttempt,
+    replay: RenewalReplay,
+    outcome: { status: "succeeded" | "failed"; pspPaymentId?: string; error?: { code?: UnifiedErrorCode; message?: string } },
+  ): Promise<SubscriptionRecord> {
+    const key = replay.idempotencyKey;
+    if (outcome.status === "succeeded") {
+      if (outcome.pspPaymentId === undefined) {
+        throw PayFanoutError.invalidRequest(`Settling the renewal charged under "${key}" as succeeded requires its pspPaymentId`);
+      }
+      if (outcome.pspPaymentId === record.lastPaymentId) {
+        throw PayFanoutError.invalidRequest(
+          `Payment "${outcome.pspPaymentId}" already paid the previous period of "${record.id}" — it cannot settle "${key}"`,
+        );
+      }
+      const updated: SubscriptionRecord = {
+        ...record,
+        status: record.status === "canceled" || record.status === "paused" ? record.status : "active",
+        currentPeriodStart: record.currentPeriodEnd,
+        currentPeriodEnd: addInterval(
+          record.currentPeriodEnd,
+          record.plan.interval,
+          record.plan.intervalCount,
+          record.anchorDay,
+        ),
+        failedAttempts: 0,
+        lastPaymentId: outcome.pspPaymentId,
+      };
+      delete updated.nextRetryAt;
+      delete updated.lastError;
+      delete updated.renewalAttempt;
+      await this.store.save(updated);
+      await this.emit({ type: "subscription.charged", subscription: updated });
+      return updated;
+    }
+    const error = new PayFanoutError({
+      code: outcome.error?.code ?? "processing_error",
+      message: outcome.error?.message ?? "The renewal charge was not collected.",
+      retryable: false,
+      pspName: record.pspName,
+    });
+    const updated: SubscriptionRecord = {
+      ...record,
+      renewalAttempt: { periodEnd: tracked.periodEnd, attempt: tracked.attempt + 1 },
+      lastError: { code: error.code, message: error.message },
+    };
+    await this.store.save(updated);
+    await this.emit({ type: "subscription.charge_failed", subscription: updated, error });
+    return updated;
   }
 
   /** One renewal attempt for the period ending at record.currentPeriodEnd. */
@@ -732,9 +944,22 @@ export class SubscriptionManager {
     result: ChargeDueResult,
   ): Promise<SubscriptionRecord> {
     // Deterministic per (id, period, attempt): a replayed run can never
-    // double-charge, and a RETRY is a genuinely new PSP request (replaying the
-    // failed attempt's key would just replay its cached failure).
-    const idempotencyKey = `payfanout-sub-${record.id}-${record.currentPeriodEnd}-a${record.failedAttempts}`;
+    // double-charge. A definitive failure moves on to a new attempt (its key
+    // would only replay the cached failure); a charge without a definitive
+    // answer is replayed exactly as sent, under its own key.
+    const next = nextRenewalAttempt(record);
+    const sent: RenewalSent = next.replay
+      ? { idempotencyKey: next.replay.idempotencyKey, request: next.replay.request, replayed: next.replay }
+      : {
+          idempotencyKey: renewalIdempotencyKey(record.id, record.currentPeriodEnd, next.attempt),
+          request: renewalRequestOf(record),
+        };
+    const tried: RenewalTry = { periodEnd: record.currentPeriodEnd, attempt: next.attempt, sent };
+    if (next.replay) {
+      // A replay the service cannot send says nothing about the original.
+      const blocked = this.replayBlocker(record.pspName);
+      if (blocked) return this.recordRenewalFailure(record, nowMs, blocked, result, tried, "uncertain");
+    }
     let payment: PaymentInfo;
     // Only the charge itself may enter the dunning path. A bookkeeping failure
     // AFTER a successful charge must propagate instead: dunning would retry
@@ -744,17 +969,17 @@ export class SubscriptionManager {
     try {
       payment = await this.service.chargeSavedPaymentMethod(record.pspName, {
         pspCustomerId: record.pspCustomerId,
-        savedPaymentMethodToken: record.savedPaymentMethodToken,
-        amount: record.plan.amount,
-        currency: record.plan.currency,
+        savedPaymentMethodToken: sent.request.savedPaymentMethodToken,
+        amount: sent.request.amount,
+        currency: sent.request.currency,
         id: record.id,
         occurrence: "recurring",
-        ...(record.billingDetails ? { billingDetails: record.billingDetails } : {}),
-        metadata: { ...record.metadata, payfanout_subscription_id: record.id },
-        idempotencyKey,
+        ...(sent.request.billingDetails ? { billingDetails: sent.request.billingDetails } : {}),
+        metadata: { ...sent.request.metadata, payfanout_subscription_id: record.id },
+        idempotencyKey: sent.idempotencyKey,
       });
     } catch (err) {
-      return this.recordRenewalFailure(record, nowMs, PayFanoutError.wrap(err, { pspName: record.pspName }), result);
+      return this.recordRenewalFailure(record, nowMs, PayFanoutError.wrap(err, { pspName: record.pspName }), result, tried);
     }
 
     if (payment.status === "succeeded") {
@@ -780,6 +1005,7 @@ export class SubscriptionManager {
       delete updated.nextRetryAt;
       delete updated.lastError;
       delete updated.pendingRenewal;
+      delete updated.renewalAttempt;
       await this.store.save(updated);
       await this.emit({ type: "subscription.charged", subscription: updated, payment });
       result.charged.push(updated);
@@ -788,16 +1014,19 @@ export class SubscriptionManager {
 
     if (payment.status === "processing") {
       // Async rails: the outcome is genuinely unknown. Freeze the record until
-      // the host's webhook ingress calls resolvePendingRenewal.
+      // the host's webhook ingress calls resolvePendingRenewal. The attempt
+      // number stays reserved by the pending charge, which a replay answered
+      // too: nothing is left to replay.
       const fresh = (await this.store.get(record.id)) ?? record;
       const updated: SubscriptionRecord = {
         ...fresh,
         pendingRenewal: {
           pspPaymentId: payment.pspPaymentId,
           periodEnd: record.currentPeriodEnd,
-          attempt: record.failedAttempts,
+          attempt: next.attempt,
           startedAt: new Date(nowMs).toISOString(),
         },
+        renewalAttempt: { periodEnd: record.currentPeriodEnd, attempt: next.attempt },
       };
       await this.store.save(updated);
       await this.emit({ type: "subscription.charge_pending", subscription: updated, payment });
@@ -806,7 +1035,8 @@ export class SubscriptionManager {
     }
 
     // Resolved but not collected (failed / canceled / requires_*): a renewal
-    // has no customer present, so anything short of money is a failed attempt.
+    // has no customer present, so anything short of money is a failed
+    // attempt, and a definitive one: the PSP answered.
     return this.recordRenewalFailure(
       record,
       nowMs,
@@ -818,22 +1048,112 @@ export class SubscriptionManager {
         pspName: record.pspName,
       }),
       result,
+      tried,
+      "definitive",
     );
   }
 
-  /** Dunning bookkeeping for a renewal attempt that did not collect. */
+  /**
+   * Why a pinned replay cannot be sent now, if it cannot: a service that lost
+   * the adapter, or its vault support, has learned nothing about the original
+   * charge, so the pin must stay.
+   */
+  private replayBlocker(pspName: string): PayFanoutError | undefined {
+    try {
+      if (this.service.getCapabilities(pspName).supportsSavedPaymentMethods) return undefined;
+    } catch (err) {
+      return PayFanoutError.wrap(err, { pspName });
+    }
+    return new PayFanoutError({
+      code: "unsupported_operation",
+      message: `"${pspName}" no longer supports saved payment methods, so the unsettled renewal charge cannot be replayed`,
+      retryable: false,
+      pspName,
+    });
+  }
+
+  /**
+   * Bookkeeping for a renewal attempt that did not collect. A definitive
+   * failure moves the period on to its next attempt number and into dunning.
+   * An uncertain one pins the request for replay (see RenewalReplay) and
+   * counts as a failed attempt only once its replay run is spent.
+   */
   private async recordRenewalFailure(
     record: SubscriptionRecord,
     nowMs: number,
     error: PayFanoutError,
     result: ChargeDueResult,
+    tried: RenewalTry,
+    verdict?: RenewalVerdict,
   ): Promise<SubscriptionRecord> {
     const fresh = (await this.store.get(record.id)) ?? record;
-    if (fresh.status === "canceled" || fresh.status === "paused") {
-      // Canceled or paused while the charge was failing — dunning would
-      // resurrect a past_due ghost on a record the host ended or halted.
+    const tracked = fresh.renewalAttempt?.periodEnd === tried.periodEnd ? fresh.renewalAttempt : undefined;
+    if (fresh.currentPeriodEnd !== tried.periodEnd || (tracked !== undefined && tracked.attempt > tried.attempt)) {
+      // A concurrent run already collected the period or settled this
+      // attempt: this answer is stale and must not overwrite that outcome.
       return fresh;
     }
+    const replayed = tracked?.replay ?? tried.sent?.replayed;
+    const sent = tried.sent;
+    const uncertain = sent !== undefined && (verdict ?? classifyRenewalFailure(error, replayed)) === "uncertain";
+    let renewalAttempt: RenewalAttempt = { periodEnd: tried.periodEnd, attempt: tried.attempt + 1 };
+    let replayDelayMinutes: number | undefined;
+    if (sent && uncertain) {
+      const answers = (replayed?.uncertainAnswers ?? 0) + 1;
+      replayDelayMinutes = this.replayDelaysMinutes[answers - 1];
+      renewalAttempt = {
+        periodEnd: tried.periodEnd,
+        attempt: tried.attempt,
+        replay: {
+          idempotencyKey: sent.idempotencyKey,
+          request: sent.request,
+          uncertainAnswers: replayDelayMinutes === undefined ? 0 : answers,
+          afterProcessingError:
+            replayed?.afterProcessingError === true ||
+            (error.code === "processing_error" && error.outcomeUnknown !== true),
+        },
+      };
+    }
+    const lastError = { code: error.code, message: error.message };
+
+    if (fresh.status === "canceled" || fresh.status === "paused") {
+      // Ended or halted while the charge was failing: dunning would resurrect
+      // a past_due ghost, but the attempt state stays — a pin must survive
+      // to be settled, and resume refuses to start a period over it.
+      const updated: SubscriptionRecord = { ...fresh, renewalAttempt, lastError };
+      await this.store.save(updated);
+      await this.emit({ type: "subscription.charge_failed", subscription: updated, error });
+      return updated;
+    }
+
+    if (!uncertain && sent?.replayed && sent.request.savedPaymentMethodToken !== fresh.savedPaymentMethodToken) {
+      // The replay settled a charge of the card the host has since replaced:
+      // its failure costs the new card nothing, which is charged next run.
+      const updated: SubscriptionRecord = { ...fresh, lastError, renewalAttempt };
+      await this.store.save(updated);
+      await this.emit({ type: "subscription.charge_failed", subscription: updated, error });
+      result.failed.push(updated);
+      return updated;
+    }
+
+    if (replayDelayMinutes !== undefined) {
+      // Nothing is known to have failed: replay soon, while the PSP still
+      // holds the key, without spending a dunning attempt.
+      const updated: SubscriptionRecord = {
+        ...fresh,
+        status: "past_due",
+        lastError,
+        renewalAttempt,
+        nextRetryAt: new Date(nowMs + replayDelayMinutes * 60_000).toISOString(),
+      };
+      delete updated.pendingRenewal;
+      await this.store.save(updated);
+      await this.emit({ type: "subscription.charge_failed", subscription: updated, error });
+      await this.emit({ type: "subscription.past_due", subscription: updated, error });
+      result.failed.push(updated);
+      return updated;
+    }
+
     // Attempt count follows the attempt that actually ran (record), while the
     // rest of the state merges onto the freshest read.
     const attempts = record.failedAttempts + 1;
@@ -842,7 +1162,8 @@ export class SubscriptionManager {
     const updated: SubscriptionRecord = {
       ...fresh,
       failedAttempts: attempts,
-      lastError: { code: error.code, message: error.message },
+      lastError,
+      renewalAttempt,
       ...(exhausted
         ? { status: "canceled" as const, canceledAt: new Date(nowMs).toISOString() }
         : {
@@ -850,7 +1171,11 @@ export class SubscriptionManager {
             nextRetryAt: new Date(nowMs + retryDelayHours * 3_600_000).toISOString(),
           }),
     };
-    if (exhausted) delete updated.nextRetryAt;
+    if (exhausted) {
+      delete updated.nextRetryAt;
+      // Nothing is charged any more; a pin stays for reconciliation.
+      if (!renewalAttempt.replay) delete updated.renewalAttempt;
+    }
     delete updated.pendingRenewal;
     await this.store.save(updated);
     await this.emit({ type: "subscription.charge_failed", subscription: updated, error });
@@ -871,6 +1196,79 @@ export class SubscriptionManager {
       // Observability must never break billing.
     }
   }
+}
+
+/** A renewal charge as sent: its key and request, and the pin it replayed, if it was a replay. */
+interface RenewalSent {
+  idempotencyKey: string;
+  request: RenewalRequest;
+  replayed?: RenewalReplay;
+}
+
+/** The attempt a failed renewal charge ran under. */
+interface RenewalTry {
+  periodEnd: string;
+  attempt: number;
+  /** Absent for a settled pendingRenewal: nothing of it is ever replayed. */
+  sent?: RenewalSent;
+}
+
+type RenewalVerdict = "definitive" | "uncertain";
+
+/** Failures that settle their attempt: the PSP answered, and no money moved. */
+const DEFINITIVE_FAILURE_CODES: ReadonlySet<UnifiedErrorCode> = new Set<UnifiedErrorCode>([
+  "card_declined",
+  "insufficient_funds",
+  "expired_card",
+  "invalid_card_data",
+  "authentication_required",
+  "fraud_suspected",
+  "invalid_request",
+  "session_expired",
+  "unsupported_operation",
+]);
+
+/**
+ * Whether a failed renewal charge settled its attempt. An error marked
+ * outcomeUnknown never does, nor does an unreachable or rate-limiting PSP,
+ * an unknown error, or a code added to the taxonomy later. A processing_error
+ * is replayed once: the same request answered by it twice is taken as the
+ * attempt's own failure.
+ */
+function classifyRenewalFailure(error: PayFanoutError, replayed: RenewalReplay | undefined): RenewalVerdict {
+  if (error.outcomeUnknown === true) return "uncertain";
+  if (DEFINITIVE_FAILURE_CODES.has(error.code)) return "definitive";
+  if (error.code === "processing_error" && replayed?.afterProcessingError === true) return "definitive";
+  return "uncertain";
+}
+
+function renewalIdempotencyKey(id: string, periodEnd: string, attempt: number): string {
+  return `payfanout-sub-${id}-${periodEnd}-a${attempt}`;
+}
+
+/** The attempt the next renewal charge of record.currentPeriodEnd uses. */
+function nextRenewalAttempt(record: SubscriptionRecord): RenewalAttempt {
+  const tracked = record.renewalAttempt;
+  if (tracked && tracked.periodEnd === record.currentPeriodEnd) return tracked;
+  // Untracked: a fresh period, or a record written before renewalAttempt
+  // existed, whose attempts 0..failedAttempts-1 each ended in a failure.
+  return { periodEnd: record.currentPeriodEnd, attempt: record.failedAttempts };
+}
+
+/** The current period's renewal charge awaiting a definitive answer, if any. */
+function pinnedReplay(record: SubscriptionRecord): RenewalReplay | undefined {
+  const tracked = record.renewalAttempt;
+  return tracked?.periodEnd === record.currentPeriodEnd ? tracked.replay : undefined;
+}
+
+function renewalRequestOf(record: SubscriptionRecord): RenewalRequest {
+  return {
+    savedPaymentMethodToken: record.savedPaymentMethodToken,
+    amount: record.plan.amount,
+    currency: record.plan.currency,
+    ...(record.billingDetails ? { billingDetails: record.billingDetails } : {}),
+    ...(record.metadata ? { metadata: record.metadata } : {}),
+  };
 }
 
 function normalizePlan(plan: SubscriptionPlan): Required<SubscriptionPlan> {

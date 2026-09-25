@@ -191,7 +191,9 @@ Every failure from every adapter is a `PayFanoutError` (a real `Error` subclass)
 `retryable` flag, and the untouched PSP error on `raw`, never dropped. Capability guards
 reject with `unsupported_operation`; an expired stateless session token is
 `session_expired` (create a fresh session to recover); `authentication_required` is never
-retryable — bring the customer back on-session.
+retryable — bring the customer back on-session. `outcomeUnknown: true` marks a failure
+whose effect at the PSP is unknown, typically a lost answer: retry it only under the same
+`idempotencyKey`, which reads the original back, never under a new one.
 
 Amounts are **integer minor units, always**, and minor units are currency-dependent, JPY
 has 0 decimals (`¥500` → `500`), BHD has 3 (`BD 1.234` → `1234`). Use

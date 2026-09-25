@@ -34,6 +34,13 @@ export interface UnifiedError {
   retryable: boolean;
   /** Untouched original PSP error, for logs/support — never dropped. */
   raw: unknown;
+  /**
+   * True when the call may have taken effect at the PSP although it failed
+   * here: the answer was lost, or the PSP could not say. Retry it only under
+   * the SAME idempotencyKey, which reads the original back — a new key can
+   * repeat the operation. Absent means the adapter reported no such doubt.
+   */
+  outcomeUnknown?: boolean;
 }
 
 export interface PayFanoutErrorInit {
@@ -43,6 +50,8 @@ export interface PayFanoutErrorInit {
   raw?: unknown;
   /** Which adapter produced the error, when known. */
   pspName?: string;
+  /** See {@link UnifiedError.outcomeUnknown}. Only `true` is recorded. */
+  outcomeUnknown?: boolean;
 }
 
 export class PayFanoutError extends Error implements UnifiedError {
@@ -50,6 +59,7 @@ export class PayFanoutError extends Error implements UnifiedError {
   readonly retryable: boolean;
   readonly raw: unknown;
   readonly pspName?: string;
+  readonly outcomeUnknown?: boolean;
 
   constructor(init: PayFanoutErrorInit) {
     super(init.message);
@@ -58,6 +68,7 @@ export class PayFanoutError extends Error implements UnifiedError {
     this.retryable = init.retryable ?? false;
     this.raw = init.raw;
     if (init.pspName !== undefined) this.pspName = init.pspName;
+    if (init.outcomeUnknown === true) this.outcomeUnknown = true;
   }
 
   /**
@@ -78,6 +89,7 @@ export class PayFanoutError extends Error implements UnifiedError {
       retryable: fallback?.retryable ?? false,
       raw: err,
       pspName: fallback?.pspName,
+      outcomeUnknown: fallback?.outcomeUnknown,
     });
   }
 
@@ -85,13 +97,21 @@ export class PayFanoutError extends Error implements UnifiedError {
     return new PayFanoutError({ code: "invalid_request", message, retryable: false, raw });
   }
 
-  toJSON(): { name: string; code: UnifiedErrorCode; message: string; retryable: boolean; pspName?: string } {
+  toJSON(): {
+    name: string;
+    code: UnifiedErrorCode;
+    message: string;
+    retryable: boolean;
+    pspName?: string;
+    outcomeUnknown?: true;
+  } {
     return {
       name: this.name,
       code: this.code,
       message: this.message,
       retryable: this.retryable,
       ...(this.pspName !== undefined ? { pspName: this.pspName } : {}),
+      ...(this.outcomeUnknown === true ? { outcomeUnknown: true as const } : {}),
     };
   }
 }

@@ -91,13 +91,20 @@ export function createEndpointCompletion(
 function errorFromResponse(status: number, payload: unknown): PayFanoutError {
   const wire = (payload as { error?: unknown } | undefined)?.error;
   if (wire && typeof wire === "object" && typeof (wire as { message?: unknown }).message === "string") {
-    const e = wire as { code?: UnifiedErrorCode; message: string; retryable?: boolean; pspName?: string };
+    const e = wire as {
+      code?: UnifiedErrorCode;
+      message: string;
+      retryable?: boolean;
+      pspName?: string;
+      outcomeUnknown?: boolean;
+    };
     return new PayFanoutError({
       code: e.code ?? "unknown",
       message: e.message,
       retryable: e.retryable === true,
       raw: payload,
       ...(typeof e.pspName === "string" ? { pspName: e.pspName } : {}),
+      ...(e.outcomeUnknown === true ? { outcomeUnknown: true } : {}),
     });
   }
   return new PayFanoutError({

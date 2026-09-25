@@ -89,13 +89,37 @@ and `PaymentService` will hold you to:
   `invalid_request` (core's `classifyHttpFallback` is that tail). Retryable semantics
   are contract, not taste: `rate_limited`/`psp_unavailable` are always retryable,
   `authentication_required` NEVER is (the customer comes back on-session) — the
-  conformance suite asserts both.
+  conformance suite asserts both. `psp_unavailable`, `rate_limited` and `unknown` already
+  mean the call may have taken effect: callers retry them only under the same
+  `idempotencyKey`, and the subscription engine never moves such a renewal to a new key.
+  When a money-moving call may have taken effect although you report it with a code that
+  would otherwise read as definitive (a `processing_error` for an answer you could not
+  read back, a refusal you cannot resolve), set `outcomeUnknown: true`, which callers
+  treat the same way. A PSP's refusal of a reused key (Stripe's `idempotency_error`, a
+  duplicate `merchantRefNum`), or a replay of its first answer that the adapter refuses
+  (Adyen answering a reused key with the first request's stored response), proves the
+  key's first request ran, so it carries the flag too. Reading that request back lifts the flag only when it shows the call's own request,
+  which then answers the call, or one that finally moved no money (failed, voided,
+  cancelled, expired). Anything else read back, a payment that went through, one still in
+  progress, a modification the PSP has only acknowledged, may be the money the call was
+  meant to move, and a caller told to use a new key would move it twice.
 - **Idempotency:** `idempotencyKey` is REQUIRED on every mutating call — session
   creation, completion, refunds, **capture, cancel, and verification included**.
   Forward it through your PSP's mechanism (Stripe: `Idempotency-Key` request option;
-  Paysafe: `merchantRefNum`; GoCardless: `Idempotency-Key` header; PayPal:
-  `PayPal-Request-Id`). If your PSP has no idempotency channel (PayZen), document how
-  its state machine makes replays safe instead.
+  GoCardless: `Idempotency-Key` header; PayPal: `PayPal-Request-Id`). Check whether that
+  mechanism *replays* a duplicate or *rejects* it. Paysafe's `merchantRefNum` under
+  `dupCheck` rejects the repeat (409, error `5031`) instead of answering with the
+  original, so the Paysafe adapter never re-sends a write blindly: after a timeout, a 5xx
+  or a duplicate rejection it reads the original back through Paysafe's
+  `?merchantRefNum=` lookups, and a payment, capture or refund that cannot be read back
+  fails as "retry later with the same key" instead of going out again. Unless your PSP
+  documents that its channel absorbs a duplicate still in flight, do the same. Where the
+  instrument is single-use (a Paysafe payment handle refuses a second charge), that refusal
+  already guards the replay, and a duplicate check on top would block a new card after a
+  decline under a stable per-order key. Where the adapter mints the instrument itself on
+  each attempt (Paysafe's bank debits), a replay carries a new one, so the duplicate check
+  stays on until a failed attempt shows under the key. If your PSP has no idempotency
+  channel (PayZen), document how its state machine makes replays safe instead.
 - **Host id round-trip:** when `input.id` is present, stamp it into PSP metadata
   (`payfanout_id`) if your PSP supports metadata, and prefer it for `PaymentInfo.id`.
   Echo the stored metadata on `PaymentInfo.metadata`. If your PSP genuinely cannot
@@ -315,6 +339,9 @@ Implement `ClientPaymentAdapter`:
   card input. Forward `options.appearance` to the PSP's styling hooks. Return a branded
   handle via `brandMountedFieldsHandle`, and validate handles you receive back. A
   redirect-only PSP (GoCardless) may mount a lightweight explainer instead of fields.
+  A failed mount rejects; if you also report it through `options.onError`, pass the
+  same error instance to both, which consumers such as `<PaymentFields>` dedupe by
+  identity.
 - **Customization is a passthrough, not an enumeration:** forward
   `options.fieldOptions` to your SDK's field-creation call untouched (host wins), and
   `options.locale` to its locale option, protect ONLY the keys your adapter must own

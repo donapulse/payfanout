@@ -89,8 +89,8 @@ retrieved, not a separate credential).
   with `invalid_request` rather than approximating.
 - **Idempotency** rides `merchantRefNum` ("unique for this accountId"):
   `input.merchantRefNum` wins when supplied, `idempotencyKey` fills it otherwise, and a
-  replayed create recovers the existing subscription by that refNum. A transport-retried
-  inline plan creation can leave an orphan plan (plans carry no refNum); the
+  replayed create recovers the existing subscription by that refNum. A creation retried
+  after a lost answer can leave an orphan inline plan (plans carry no refNum); the
   subscription itself stays exactly-once, so nothing double-bills.
 - **Cancel** PATCHes the final `CANCELLED` status (never the reversible `SUSPENDED`) and
   is verified-idempotent: on a rejection the adapter re-reads the subscription and
@@ -102,8 +102,28 @@ retrieved, not a separate credential).
 
 ## Notes
 
-- The Paysafe transport retries timeouts/5xx/429 with backoff (`maxNetworkRetries`,
-  default 2).
+- Reads are retried on timeouts/5xx/429 with backoff (`maxNetworkRetries`, default 2);
+  writes are never re-sent blindly. Paysafe rejects a repeated `merchantRefNum` (409,
+  error `5031`, under `dupCheck`) instead of answering with the original, so a write
+  whose answer was lost is looked up by its `merchantRefNum` and returned when Paysafe
+  has it. A payment, capture or refund is re-sent only after a 429; a payment handle,
+  verification or void also once the lookup shows nothing. Card and Interac completions
+  send `dupCheck: false`, so another card can follow a decline under the same key. A
+  bank-debit completion sends `dupCheck: true`, so a second attempt is refused instead of
+  debiting again while no failed attempt shows under the key, and `false` once one does,
+  so corrected bank details can follow. Once a failed attempt shows, the check is off: two
+  attempts sent together, or one resubmitted before the lookup shows the other's payment
+  or handle, can both be debited. [§10 of the setup
+  guide](https://donapulse.github.io/payfanout/guide/paysafe#_10-replays-lost-answers-and-timeouts)
+  covers these timings, and when a bank-debit key needs replacing. A key reused for a
+  different amount or currency, or a different saved card or verification card, rejects
+  with `invalid_request`, unless every earlier attempt under a card or Interac completion
+  key failed; while the key's payment, capture or refund may have moved money (it has not
+  failed, been voided, cancelled or expired), or a bank-debit key holds a spent handle
+  whose payment the lookup does not show, the rejection carries `outcomeUnknown`. An
+  original that cannot be read back rejects with a non-retryable `processing_error`; retry
+  it later with the same key. The default `requestTimeoutMs` is 60000, the response timeout
+  of Paysafe's own SDKs, and bounds each exchange rather than a whole call.
 - Paysafe has no public events API (`supportsEventPolling: false`), so missed-webhook
   recovery falls back to `retrievePayment` per order.
 - Scheduler availability is per merchant account, like every Paysafe product option —

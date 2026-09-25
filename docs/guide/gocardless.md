@@ -92,12 +92,8 @@ to it) and returns:
   redirects to.
 - `status: "requires_action"` — the payer still has to authorise at their bank.
 
-Billing-request and refund creates carry an `Idempotency-Key`; replaying a key returns
-the **original** resource rather than creating a duplicate (GoCardless answers 409
-`idempotent_creation_conflict` and the adapter resolves it). GoCardless does **not**
-dedupe flow creates, so a replayed session returns the same billing request with a
-**fresh `clientSecret`** — either authorisation URL completes that one billing request,
-no duplicate payment is possible.
+Replaying the same `idempotencyKey` returns the original session instead of creating a
+second payment; see [Replays and idempotency keys](#replays-and-idempotency-keys).
 
 Two checkout-field mappings to know:
 
@@ -111,6 +107,80 @@ Two checkout-field mappings to know:
   insertion order, are forwarded; later keys are withheld rather than failing the
   payment, and a host key named `payfanout_id` never overrides the session id. Without
   a session `id`, three host keys fit.
+
+### Replays and idempotency keys
+
+GoCardless honours an `Idempotency-Key` on creates for at least 30 days; after that, a
+replay under the same key may be treated as a new request. A key it has already used
+answers `409 idempotent_creation_conflict` with the id of the resource it created, and
+the adapter returns that resource. GoCardless documents no comparison of the new
+request with the original, so the adapter makes one: a key reused for a different
+payment or refund rejects with `invalid_request`. Unless the resource under the key is
+known to have moved no money (a cancelled billing request, a payment that failed or was
+cancelled, a refund cancelled, bounced or with its funds returned), the rejection carries
+`outcomeUnknown: true`: it may be the payment or refund you meant to make, so start again
+under a fresh key only once the GoCardless dashboard shows it is another one.
+
+- **Sessions.** A replayed `createPaymentSession` returns the same billing request, and
+  its amount, currency and session `id` must match the new input. The session reports
+  the status of the payment the billing request created, as `retrievePayment` does, or
+  the billing request's own status while there is no payment yet. One exception: a
+  payment awaiting the customer's approval (`pending_customer_approval`) reads
+  `processing` on a replay, where `retrievePayment` reports `requires_action`, because a
+  replayed session whose billing request has a payment carries no `clientSecret`. While
+  the billing request is `pending` the payer gets a fresh `clientSecret`: GoCardless does
+  not deduplicate flow creates, flows cannot be read back, and every flow authorises the
+  one billing request. Once the payer has authorised, or the billing request is fulfilled
+  or cancelled, the replay creates no flow and carries no `clientSecret`, so the payer is
+  never sent to authorise the same payment twice.
+- **Refunds.** A replayed `refundPayment` returns the original refund, which must belong
+  to the same payment and, when you pass an `amount`, be for that amount. Every refund
+  the adapter creates carries the SHA-256 of its idempotency key in its GoCardless
+  metadata, as `payfanout_key_sha256` next to `reason`, so a replay is recognised from
+  the refund itself. A request larger than what is left to refund, such as the replay of
+  a refund that used up the payment, is never sent: the adapter reads the payment's
+  refunds, returns the one stamped with the key, and otherwise rejects with
+  `invalid_request`, whose `raw` carries the payment as `raw.payment` and, when the
+  read was refused, GoCardless's answer as `raw.lookup`. When GoCardless rejects a refund, the same read decides whether it
+  was a replay. While GoCardless reports an amount already refunded on the payment
+  (`amount_refunded` above 0), the adapter also makes that read before it creates a
+  refund, so a key GoCardless no longer honours is still read back instead of refunding
+  again. GoCardless lets accounts opt out of the `total_amount_confirmation` check, so
+  the adapter does not rely on it, nor on whether GoCardless checks the key before the
+  rest of the request. This holds for every refund that carries the stamp. Refunds
+  created by adapter versions before the stamp carry none, and a replay of one that
+  exceeds what is left rejects with `invalid_request`, as it did then. The stamp
+  and `reason` take two of the three metadata keys GoCardless allows on a refund, leaving
+  one for you; if you update a refund's metadata yourself, keep `payfanout_key_sha256`.
+  Use random idempotency keys; GoCardless suggests UUIDv4 ("any non-repeating unique
+  identifier is sufficient"). Each refund stores the SHA-256 of its key.
+
+  When GoCardless cannot answer the read of the payment's refunds (a timeout, a network
+  or server error, rate limiting), whether before a create, after GoCardless rejected
+  one, or for a request larger than what is left, `refundPayment` sends nothing further
+  and rejects with a retryable `psp_unavailable` (`rate_limited` when GoCardless
+  rate-limits it). After a failed create, GoCardless's answer to it is on
+  `raw.rejection` and the read's own on `raw.lookup`. Retry with the same key: a new key
+  can refund twice. If the read fails for any other reason, the error is marked
+  `outcomeUnknown`, since whether the key already refunded stays open. Before a create,
+  the refund is not sent and the call rejects with a final `invalid_request`, whatever
+  the key, until the read works again: check the payment's refunds in the GoCardless
+  dashboard, then retry with the same key. After a rejected create, GoCardless's
+  rejection stands; retry that refund only with the same key.
+  On an account that opted out of the confirmation check, make refunds of one payment
+  one at a time, and wait until `retrievePayment` shows the previous refund in
+  `amountRefunded`: two refunds under different keys that read the same
+  `amount_refunded` can both be sent, refunding more than you intended, and GoCardless
+  does not document how soon it counts a new refund there.
+- **Cancels.** GoCardless documents idempotency keys for creates only, and documents
+  `cancellation_failed` for cancelling a payment that is already cancelled. What it
+  answers for a billing request that is already cancelled is not documented. When a
+  cancel is refused, `cancelPayment` re-reads the payment or billing request and
+  resolves `canceled` if it is already cancelled. Any other state rejects with the
+  original error.
+
+Use a fresh key for every new payment or refund, including the session you create
+after cancelling one.
 
 ## 5. Wire the client adapter
 
@@ -240,7 +310,11 @@ them from GoCardless support. Until then, `refundPayment` rejects with an
 `invalid_request` explaining exactly that (the API returns 403). Once enabled: full and
 partial refunds work, the adapter computes GoCardless's required
 `total_amount_confirmation` safety check from a fresh read, and refunds report
-`pending` until the money moves — poll `retrieveRefund` to a terminal state.
+`pending` until the money moves — poll `retrieveRefund` to a terminal state. A refund
+larger than what is left rejects with `invalid_request` without reaching GoCardless,
+unless it replays a refund the adapter stamped with the same key, which is then
+returned (see [Replays and idempotency keys](#replays-and-idempotency-keys)). An
+`amount` of 0 rejects the same way.
 
 ## 9. Supported currencies & schemes
 
@@ -288,7 +362,8 @@ webhooks. "Send test webhook" in the dashboard exercises your endpoint end to en
   `confirmed` event; Direct Debit fallback takes days, and **late failures can flip a
   succeeded payment to failed** — build order fulfilment on webhooks, not the redirect.
 - **No session updates.** A billing request's payment amount cannot be amended — cancel
-  the session (`cancelPayment` with the `BRQ…` id) and create a new one.
+  the session (`cancelPayment` with the `BRQ…` id) and create a new one under a new
+  idempotency key.
 
 ## 12. Go live
 

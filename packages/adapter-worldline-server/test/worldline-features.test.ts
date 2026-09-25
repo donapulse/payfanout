@@ -179,13 +179,64 @@ describe("mapWorldlineStatus", () => {
 
 describe("mapWorldlineError", () => {
   const cases: Array<[number, string | undefined, UnifiedErrorCode, boolean]> = [
-    [402, "30511001", "insufficient_funds", false],
+    // Cards reported stolen or lost, or flagged for fraud.
+    [402, "30431001", "fraud_suspected", false],
+    [402, "30411001", "fraud_suspected", false],
+    [402, "30071001", "fraud_suspected", false],
     [402, "30591001", "fraud_suspected", false],
+    // Rejections by the merchant's own Fraud Prevention module.
+    [402, "30001100", "fraud_suspected", false],
+    [402, "30001101", "fraud_suspected", false],
+    [402, "30001102", "fraud_suspected", false],
+    [402, "30001104", "fraud_suspected", false],
+    [402, "30001105", "fraud_suspected", false],
+    [402, "30001106", "fraud_suspected", false],
+    [402, "30001120", "fraud_suspected", false],
+    [402, "30001130", "fraud_suspected", false],
+    [402, "30001140", "fraud_suspected", false],
+    [402, "30001141", "fraud_suspected", false],
+    [402, "30001142", "fraud_suspected", false],
+    [402, "30001143", "fraud_suspected", false],
+    [402, "30001158", "fraud_suspected", false],
+    [402, "30001180", "fraud_suspected", false],
+    [402, "30141001", "invalid_card_data", false],
+    [402, "30151001", "invalid_card_data", false],
+    [402, "30331001", "expired_card", false],
+    [402, "30541001", "expired_card", false],
+    [402, "30511001", "insufficient_funds", false],
     [402, "40001134", "authentication_required", false],
-    [402, "30171001", "card_declined", false],
+    [402, "40001139", "authentication_required", false],
+    // 3-D Secure failures outside the customer's control, and an issuer out of reach.
+    [402, "40001135", "processing_error", false],
+    [402, "50001081", "processing_error", false],
+    [402, "40001137", "processing_error", false],
+    [402, "40001138", "processing_error", false],
+    [402, "40001146", "processing_error", false],
+    [402, "30911001", "processing_error", false],
+    [402, "30681001", "processing_error", false],
+    [402, "30991001", "processing_error", false],
+    [402, "30201001", "processing_error", false],
+    // The merchant's set-up or request, which the customer cannot fix.
+    [402, "30031001", "invalid_request", false],
+    [402, "30301001", "invalid_request", false],
+    [402, "50001087", "invalid_request", false],
+    // Plain declines, named in the map or left to the 402 default.
     [402, "30041001", "card_declined", false],
+    [402, "30171001", "card_declined", false],
+    [402, "30051001", "card_declined", false],
+    [402, "30121001", "card_declined", false],
+    [402, "30571001", "card_declined", false],
+    [402, "30581001", "card_declined", false],
+    [402, "30621001", "card_declined", false],
+    [402, "30921001", "card_declined", false],
+    [402, "33000972", "card_declined", false],
+    [402, "33000973", "card_declined", false],
+    [402, "33000975", "card_declined", false],
+    [402, "33000833", "card_declined", false],
     [402, "99999999", "card_declined", false], // unknown code on a 402 is still a decline
     [402, undefined, "card_declined", false],
+    // A documented code decides on any status that is not transient.
+    [400, "30431001", "fraud_suspected", false],
     [429, undefined, "rate_limited", true],
     [500, undefined, "psp_unavailable", true],
     [503, "1234", "psp_unavailable", true],
@@ -201,13 +252,65 @@ describe("mapWorldlineError", () => {
       const mapped = mapWorldlineError(status, body);
       expect(mapped.code).toBe(expected);
       expect(mapped.retryable).toBe(retryable);
+      expect(mapped.message).toBe(getUserMessage(expected));
       expect(mapped.raw).toBe(body);
       expect(mapped.pspName).toBe("worldline");
+      // Only the conflict of a request whose original is still in flight leaves the outcome open by a flag.
+      expect(mapped.outcomeUnknown).toBe(status === 409 ? true : undefined);
+    });
+  }
+
+  const transient: Array<[number, UnifiedErrorCode]> = [
+    [429, "rate_limited"],
+    [500, "psp_unavailable"],
+    [502, "psp_unavailable"],
+    [503, "psp_unavailable"],
+  ];
+  for (const [status, expected] of transient) {
+    it(`keeps HTTP ${status} ${expected} and retryable, whatever code it carries`, () => {
+      for (const errorCode of ["30431001", "30511001", "30141001", "40001134", "40001135", "30911001", "30031001", "30301001", "50001087", "30041001"]) {
+        const mapped = mapWorldlineError(status, { errors: [{ errorCode, httpStatusCode: status }] });
+        expect(mapped).toMatchObject({ code: expected, retryable: true, message: getUserMessage(expected) });
+      }
     });
   }
 
   it("reads the decline code from either errorCode or code", () => {
     expect(mapWorldlineError(402, { errors: [{ code: "30511001" }] }).code).toBe("insufficient_funds");
+  });
+
+  it("prefers errorCode over the deprecated code, and falls back to code when errorCode is missing or empty", () => {
+    expect(mapWorldlineError(402, { errors: [{ code: "30431001" }] }).code).toBe("fraud_suspected");
+    expect(mapWorldlineError(402, { errors: [{ errorCode: "", code: "30141001" }] }).code).toBe("invalid_card_data");
+    expect(mapWorldlineError(402, { errors: [{ errorCode: "30331001", code: "1099" }] }).code).toBe("expired_card");
+    expect(mapWorldlineError(402, { errors: [{ errorCode: "99999999", code: "30431001" }] }).code).toBe("card_declined");
+  });
+
+  it("reads a missing, empty or malformed errors array as carrying no code", () => {
+    for (const body of [undefined, null, "Bad Gateway", {}, { errors: [] }, { errors: [null] }, { errors: "30431001" }]) {
+      expect(mapWorldlineError(402, body)).toMatchObject({ code: "card_declined", retryable: false });
+      expect(mapWorldlineError(400, body)).toMatchObject({ code: "invalid_request", retryable: false });
+    }
+  });
+
+  it("never reads an inherited property as a mapped code", () => {
+    for (const errorCode of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+      expect(mapWorldlineError(402, { errors: [{ errorCode }] }).code).toBe("card_declined");
+      expect(mapWorldlineError(400, { errors: [{ errorCode }] }).code).toBe("invalid_request");
+    }
+  });
+
+  it("never relays Worldline's message, which is not meant for customers, and leaves the body untouched", () => {
+    const body = {
+      errorId: "err-1",
+      errors: [{ errorCode: "30431001", category: "PAYMENT_PLATFORM_ERROR", httpStatusCode: 402, message: "Authorisation declined" }],
+    };
+    const copy = structuredClone(body);
+    const mapped = mapWorldlineError(402, body);
+    expect(mapped.message).toBe(getUserMessage("fraud_suspected"));
+    expect(mapped.message).not.toContain("Authorisation declined");
+    expect(mapped.raw).toBe(body);
+    expect(body).toEqual(copy);
   });
 
   it("gives authentication_required the catalog message and never marks it retryable", () => {

@@ -56,6 +56,8 @@ const ISSUE_MAP: Record<string, UnifiedErrorCode> = {
   AUTHORIZATION_VOIDED: "invalid_request",
   AUTHORIZATION_EXPIRED: "invalid_request",
   PREVIOUSLY_CAPTURED: "invalid_request",
+  PREVIOUSLY_VOIDED: "invalid_request",
+  CANNOT_BE_VOIDED: "invalid_request",
   MAX_CAPTURE_COUNT_EXCEEDED: "invalid_request",
   MAX_CAPTURE_AMOUNT_EXCEEDED: "invalid_request",
   AUTH_CAPTURE_CURRENCY_MISMATCH: "invalid_request",
@@ -91,6 +93,7 @@ export function mapPayPalError(httpStatus: number, body: unknown): PayFanoutErro
   const mappedIssue = issue ? ISSUE_MAP[issue] : undefined;
   let code: UnifiedErrorCode;
   let retryable = false;
+  let outcomeUnknown = false;
   let message: string | undefined;
   const fallback = classifyHttpFallback(httpStatus);
   if (mappedIssue) {
@@ -121,9 +124,13 @@ export function mapPayPalError(httpStatus: number, body: unknown): PayFanoutErro
     code = "psp_unavailable";
     retryable = true;
   } else if (httpStatus === 409) {
-    // Conflict: a previous operation (e.g. a refund) is still in progress.
+    // Conflict: a previous operation (e.g. a refund) is still in progress. It
+    // can be this call's own first request under the same PayPal-Request-Id,
+    // which PayPal processes while it "might fail the second request", so the
+    // call may still take effect.
     code = "processing_error";
     retryable = true;
+    outcomeUnknown = true;
   } else {
     ({ code, retryable } = fallback);
   }
@@ -133,5 +140,6 @@ export function mapPayPalError(httpStatus: number, body: unknown): PayFanoutErro
     retryable,
     raw: body,
     pspName: PAYPAL_PSP_NAME,
+    outcomeUnknown,
   });
 }

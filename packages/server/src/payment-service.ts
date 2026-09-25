@@ -516,6 +516,7 @@ function ensurePspName(error: PayFanoutError, pspName: string): PayFanoutError {
     retryable: error.retryable,
     raw: error.raw,
     pspName,
+    outcomeUnknown: error.outcomeUnknown,
   });
   attributed.stack = error.stack;
   return attributed;

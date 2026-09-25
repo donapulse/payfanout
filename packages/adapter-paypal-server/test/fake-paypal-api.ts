@@ -8,13 +8,22 @@
  *
  * Authorization captures follow the Payments v2 capture request: no amount
  * means the FULL authorized amount (never the remainder), a final_capture
- * closes the authorization (AUTHORIZATION_ALREADY_CAPTURED afterwards), a
+ * closes the authorization (AUTHORIZATION_ALREADY_CAPTURED afterwards), and a
  * capture in another currency than the authorization's answers
- * AUTH_CAPTURE_CURRENCY_MISMATCH, and captures summing past the authorized
- * amount answer MAX_CAPTURE_AMOUNT_EXCEEDED. PayPal's overage limit lets
- * captures go past the authorized amount, by default up to 115% of it or
- * USD 75 more, whichever is less; PSD2 countries allow none, and the fake
- * keeps that no-overage rule, so no test can lean on an overage.
+ * AUTH_CAPTURE_CURRENCY_MISMATCH. MAX_CAPTURE_AMOUNT_EXCEEDED applies PayPal's
+ * default overage limit twice: to the captures taken from one authorization,
+ * "up to 115% or $75 USD more than the original authorized amount, whichever
+ * is less" (the authorization and honor period guide), read here against each
+ * authorization's own amount, and to "the sum of all captures" on the order,
+ * "up to 115% of the order amount". Which of the two PayPal applies after a
+ * reauthorization is undocumented. PSD2 countries allow no overage at all,
+ * which the fake does not model. A reauthorization cannot be voided
+ * (CANNOT_BE_VOIDED): its original parent is voided instead.
+ *
+ * Order reads shape captures as the Orders v2 schema does: no related_ids,
+ * and an `up` link to the order. `orderCaptureAttribution` opts into the
+ * Payments v2 attribution (related_ids.authorization_id, `up` to the
+ * authorization), which the Orders schema does not document there.
  */
 
 interface FakeMoney {
@@ -136,9 +145,10 @@ const BASE = "https://api-m.sandbox.paypal.com";
 export class FakePayPalApi {
   private readonly orders = new Map<string, FakeOrder>();
   private readonly captures = new Map<string, { capture: FakeCapture; orderId: string }>();
+  /** `parentId` marks a reauthorization: the authorization it was reauthorized from. */
   private readonly authorizations = new Map<
     string,
-    { auth: FakeAuthorization; orderId: string; captured: number; closed: boolean }
+    { auth: FakeAuthorization; orderId: string; captured: number; closed: boolean; parentId?: string }
   >();
   private readonly refunds = new Map<string, FakeRefund>();
   private readonly subscriptions = new Map<string, FakeSubscription>();
@@ -165,6 +175,14 @@ export class FakePayPalApi {
   requestCount = 0;
   lastRequestBody: unknown;
   lastRequestHeaders: Record<string, string> = {};
+  /** Every authenticated request, as "METHOD path". */
+  readonly requestLog: string[] = [];
+  /**
+   * Order reads name each capture's authorization, as Payments v2 captures do.
+   * Off by default: the Orders v2 capture has no related_ids, and its
+   * examples link `up` to the order.
+   */
+  orderCaptureAttribution = false;
 
   constructor(options: { clientId?: string; clientSecret?: string; webhookId?: string; now?: () => number; tokenTtlSeconds?: number } = {}) {
     this.clientId = options.clientId ?? "fake-client-id";
@@ -193,6 +211,54 @@ export class FakePayPalApi {
         address: { country_code: "US" },
       },
     };
+  }
+
+  /**
+   * What a host's own POST /v2/payments/authorizations/{id}/reauthorize of the
+   * order's original authorization leaves on the order: a new authorization,
+   * with its own id, beside the original. The fake's clock first moves on by
+   * `laterByMs` (four days by default: the honor period comes first), and the
+   * new authorization is created then, so a capture taken before it reports an
+   * earlier create_time than one taken after it. Without `amount` it is the
+   * empty-body request, which reauthorizes "the full amount"; the fake reads
+   * that as the original's amount, whatever was captured from it. The amount
+   * stays within the documented limit, "up to 115% of the original authorized
+   * amount, not to exceed an increase of $75 USD", and an authorization that is
+   * voided or fully captured cannot be reauthorized. What becomes of the
+   * original is undocumented, so the test decides (`original`: its status
+   * afterwards).
+   */
+  reauthorize(
+    orderId: string,
+    options: { original?: string; amount?: FakeMoney; laterByMs?: number; status?: string } = {},
+  ): string {
+    const order = this.orders.get(orderId);
+    const unit = order?.purchase_units[0];
+    const first = unit?.payments?.authorizations?.[0];
+    if (!order || !unit || !first) throw new Error(`FakePayPalApi.reauthorize: no authorization on ${orderId}`);
+    // "A voided authorization cannot be captured or reauthorized"; the Extend
+    // guide lists "authorization already captured or voided" among the failures.
+    if (first.status === "VOIDED" || first.status === "CAPTURED") {
+      throw new Error(`FakePayPalApi.reauthorize: ${first.id} is ${first.status.toLowerCase()}`);
+    }
+    const amount = options.amount ?? { ...first.amount };
+    if (decimalToCents(amount.value) > overageLimit(first.amount)) {
+      throw new Error(`FakePayPalApi.reauthorize: ${amount.value} is past the reauthorization limit`);
+    }
+    const earlier = this.now;
+    const laterByMs = options.laterByMs ?? 4 * 24 * 3600 * 1000;
+    this.now = () => earlier() + laterByMs;
+    const auth: FakeAuthorization = {
+      id: `8AA831015G51${String(++this.seq).padStart(5, "0")}`,
+      status: options.status ?? "CREATED",
+      amount,
+      expiration_time: new Date(this.now() + 29 * 24 * 3600 * 1000).toISOString(),
+      create_time: this.iso(),
+    };
+    if (options.original !== undefined) first.status = options.original;
+    unit.payments = { ...(unit.payments ?? {}), authorizations: [...(unit.payments?.authorizations ?? []), auth] };
+    this.authorizations.set(auth.id, { auth, orderId, captured: 0, closed: false, parentId: first.id });
+    return auth.id;
   }
 
   registerWebhookFixture(rawBody: string, headers: Record<string, string>): void {
@@ -310,6 +376,7 @@ export class FakePayPalApi {
     }
 
     this.lastRequestHeaders = headers;
+    this.requestLog.push(`${method} ${path}`);
     const body = rawBody !== undefined && isJson(rawBody) ? (JSON.parse(rawBody) as unknown) : undefined;
     // Tracks the last request that CARRIED a body (bodiless GETs don't erase it).
     if (body !== undefined && path !== "/v1/notifications/verify-webhook-signature") this.lastRequestBody = body;
@@ -333,7 +400,7 @@ export class FakePayPalApi {
     if (match) {
       const order = this.orders.get(decodeURIComponent(match[1]!));
       if (!order) return notFound();
-      if (method === "GET") return json(200, publicOrder(order));
+      if (method === "GET") return json(200, this.publicOrder(order));
       if (method === "PATCH") return this.patchOrder(order, body as Array<Record<string, unknown>>);
     }
     match = /^\/v2\/checkout\/orders\/([^/]+)\/capture$/.exec(path);
@@ -440,7 +507,7 @@ export class FakePayPalApi {
     };
     this.orders.set(order.id, order);
     this.uniqueOrderCreations++;
-    return remember(201, publicOrder(order));
+    return remember(201, this.publicOrder(order));
   }
 
   private patchOrder(order: FakeOrder, ops: Array<Record<string, unknown>>): Response {
@@ -525,7 +592,7 @@ export class FakePayPalApi {
     });
     unit.payments = { ...(unit.payments ?? {}), captures: [...(unit.payments?.captures ?? []), capture] };
     order.status = "COMPLETED";
-    return remember(201, publicOrder(order));
+    return remember(201, this.publicOrder(order));
   }
 
   private authorizeOrder(orderId: string, remember: (s: number, p: unknown) => Response): Response {
@@ -548,7 +615,7 @@ export class FakePayPalApi {
     unit.payments = { ...(unit.payments ?? {}), authorizations: [auth] };
     order.status = "COMPLETED";
     this.authorizations.set(auth.id, { auth, orderId: order.id, captured: 0, closed: false });
-    return remember(201, publicOrder(order));
+    return remember(201, this.publicOrder(order));
   }
 
   private captureAuthorization(
@@ -576,7 +643,12 @@ export class FakePayPalApi {
     }
     // "If amount is not specified, the full authorized amount is captured."
     const requested = requestedMoney ? decimalToCents(requestedMoney.value) : authorized;
-    if (entry.captured + requested > authorized) {
+    // The overage limit on this authorization's captures, then on "the sum of
+    // all captures" on the order.
+    const taken = (unit.payments?.captures ?? [])
+      .filter((capture) => capture.status !== "DECLINED" && capture.status !== "FAILED")
+      .reduce((sum, capture) => sum + decimalToCents(capture.amount.value), 0);
+    if (entry.captured + requested > overageLimit(entry.auth.amount) || taken + requested > overageLimit(unit.amount)) {
       return json(
         422,
         unprocessable(
@@ -598,16 +670,25 @@ export class FakePayPalApi {
     return remember(201, capture);
   }
 
+  /**
+   * Voiding the original parent also voids its reauthorizations here: the
+   * docs send a void of a reauthorization to the parent, and say nothing of
+   * what either reports afterwards (AMBIGUOUS, see docs/decisions.md).
+   */
   private voidAuthorization(authId: string): Response {
     const entry = this.authorizations.get(authId);
     if (!entry) return notFound();
-    if (entry.captured > 0) {
+    if (entry.parentId !== undefined) {
+      return json(422, unprocessable("CANNOT_BE_VOIDED", "A reauthorization cannot be voided. Please void the original parent authorization."));
+    }
+    const reauthorizations = [...this.authorizations.values()].filter((other) => other.parentId === authId);
+    if (entry.captured > 0 || reauthorizations.some((other) => other.captured > 0)) {
       return json(422, unprocessable("PREVIOUSLY_CAPTURED", "Authorization has been previously captured and hence cannot be voided."));
     }
     if (entry.auth.status === "VOIDED") {
-      return json(422, unprocessable("AUTHORIZATION_VOIDED", "Authorization has been previously voided."));
+      return json(422, unprocessable("PREVIOUSLY_VOIDED", "Authorization has been previously voided and hence cannot be voided again."));
     }
-    entry.auth.status = "VOIDED";
+    for (const voided of [entry, ...reauthorizations]) voided.auth.status = "VOIDED";
     return new Response(null, { status: 204 });
   }
 
@@ -814,6 +895,25 @@ export class FakePayPalApi {
     return capture;
   }
 
+  /**
+   * The order as reads return it: internal test flags stripped, and captures
+   * as the Orders v2 schema has them unless orderCaptureAttribution is on.
+   */
+  private publicOrder(order: FakeOrder): unknown {
+    const { declineCapture: _declineCapture, pendingCapture: _pendingCapture, ...visible } = order;
+    const copy = JSON.parse(JSON.stringify(visible)) as { purchase_units: Array<{ payments?: { captures?: unknown[] } }> };
+    const payments = copy.purchase_units[0]?.payments;
+    if (payments?.captures && !this.orderCaptureAttribution) {
+      payments.captures = (payments.captures as FakeCapture[]).map(({ supplementary_data: _related, ...capture }) => ({
+        ...capture,
+        links: capture.links.map((link) =>
+          link.rel === "up" ? { ...link, href: `${BASE}/v2/checkout/orders/${order.id}` } : link,
+        ),
+      }));
+    }
+    return copy;
+  }
+
   private iso(): string {
     return new Date(this.now()).toISOString();
   }
@@ -854,12 +954,6 @@ function unprocessable(issue: string, description: string): unknown {
   };
 }
 
-/** The order as GET returns it — internal test flags stripped. */
-function publicOrder(order: FakeOrder): unknown {
-  const { declineCapture: _declineCapture, pendingCapture: _pendingCapture, ...visible } = order;
-  return JSON.parse(JSON.stringify(visible)) as unknown;
-}
-
 /** The subscription as reads return it — the inline plan only under fields=plan. */
 function publicSubscription(subscription: FakeSubscription, includePlan: boolean): unknown {
   const { plan, ...visible } = subscription;
@@ -890,6 +984,17 @@ function base64(value: string): string {
 function decimalToCents(value: string): number {
   const [units = "0", frac = ""] = value.split(".");
   return Number(units) * 100 + Number(frac.padEnd(2, "0").slice(0, 2));
+}
+
+/**
+ * PayPal's default overage limit on `money`, in decimalToCents units: 115% of
+ * it and, in USD, no more than USD 75 over it. The USD 75 cap is stated in
+ * USD only, so other currencies get the percentage alone.
+ */
+function overageLimit(money: FakeMoney): number {
+  const amount = decimalToCents(money.value);
+  const percentage = amount + Math.floor((amount * 15) / 100);
+  return money.currency_code === "USD" ? Math.min(percentage, amount + 7500) : percentage;
 }
 
 function centsToDecimal(cents: number, currency: string): string {

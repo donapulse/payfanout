@@ -326,6 +326,7 @@ function withAttemptTrail(error: PayFanoutError, attempts: RoutedAttempt[]): Pay
     message: error.message,
     retryable: error.retryable,
     pspName: error.pspName,
+    outcomeUnknown: error.outcomeUnknown,
     raw: {
       pspError: error.raw,
       attempts: attempts.map((a) => ({ pspName: a.pspName, code: a.error.code, message: a.error.message })),

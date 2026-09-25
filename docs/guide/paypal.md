@@ -116,7 +116,12 @@ a mismatch fails late, at approval time, with an SDK error.
   as `processing_error` with the SDK's error on `raw`. The `onError` ones are **not
   retryable**: PayPal's [JS SDK reference](https://developer.paypal.com/sdk/js/v5/reference#onerror)
   documents that callback as a catch-all with nothing to handle beyond a generic error
-  message or page. A failed render is retryable, since mounting again can succeed.
+  message or page. A failed render is retryable, since mounting again can succeed. PayPal's
+  SDK hands a failed render to `onError` and then rejects it; the adapter reports it once,
+  as the retryable render failure `mount()` rejects with. Any other error PayPal reports
+  while the buttons render is reported once too, before `onReady` when the render
+  succeeds. A host `onError` or `onReady` that throws after a successful render does not
+  remove the buttons: its exception is reported as uncaught.
 - `locale` is a load-time SDK param — set it on the adapter config, not per mount.
 - `userAction` is the client half of the server's `userAction`: `"continue"` (default)
   loads the SDK with `commit=false`, so the popup's final button says **Continue** and
@@ -209,6 +214,12 @@ A repeated completion succeeds under any key, so `onCompleted` can run more than
 one payment; hosts should make it idempotent on `info.pspPaymentId` and check `info.id` and
 `info.amount` against their own record.
 
+A `409` from PayPal (the Payments API documents `RESOURCE_CONFLICT` with
+`PREVIOUS_REQUEST_IN_PROGRESS` on captures, voids and refunds) rejects with a retryable
+`processing_error` marked `outcomeUnknown: true`: the request still in progress can be your
+call's own first one under the same `PayPal-Request-Id`, which PayPal processes while it
+"might fail the second request". Retry under the same idempotency key, never a new one.
+
 ### Declines: `INSTRUMENT_DECLINED` recovery
 
 When the buyer's funding source fails, capture rejects with `card_declined`
@@ -252,15 +263,17 @@ explicitly: the authorized amount minus every capture that took money, completed
 pending (declined and failed captures took nothing).
 
 The capture that takes the rest, with or without an explicit amount, goes out with
-`final_capture: true`, which closes the authorization: PayPal refuses any further capture
-against it (`AUTHORIZATION_ALREADY_CAPTURED`). Once earlier captures took the whole
+`final_capture: true` (on an estimate after a reauthorization, only once it takes
+everything the order has left, see below),
+which closes the authorization: PayPal refuses any further capture against it
+(`AUTHORIZATION_ALREADY_CAPTURED`). Once earlier captures took the whole
 authorization (PayPal reports it `CAPTURED`, a capture that took money went out as the
-final one, or those captures cover the authorized amount), capturing the rest sends no
-capture and answers with the payment, under the same key or a new one. A retry you issue
-yourself of a capture of the rest whose response was lost therefore gets the payment back
-rather than an error. An authorization voided or denied before captures took it all
-(PayPal reports an expired authorization as voided) has nothing left to take: capturing the
-rest rejects with `invalid_request` before any capture call.
+final one, or those captures cover the authorized amount) or the whole order amount,
+capturing the rest sends no capture and answers with the payment, under the same key or a
+new one. A retry you issue yourself of a capture of the rest whose response was lost
+therefore gets the payment back rather than an error. An authorization voided or denied
+before captures took it all (PayPal reports an expired authorization as voided) has nothing
+left to take: capturing the rest rejects with `invalid_request` before any capture call.
 
 PayPal lets captures exceed the authorized amount up to the account's overage limit (by
 default up to 115% of the authorized amount or USD 75 more, whichever is less; PSD2
@@ -268,6 +281,54 @@ countries allow none). The adapter passes an explicit amount through for PayPal 
 and never adds an overage itself. Authorizations last 29 days, and captures succeed best
 within the first three days. A remainder you will not capture is left to expire;
 `cancelPayment` voids only an authorization with no capture yet.
+
+If you reauthorize through PayPal (the adapter never does), PayPal creates a new
+authorization, with its own id, beside the original, and its guides send later captures to
+the new one. The adapter then captures and reports against the newest authorization by
+`create_time` (one reporting none counts as the oldest) and then list order, unless it was
+denied; an older one counts as superseded whatever status it still reports. PayPal's pages
+disagree on whether an authorization can be reauthorized more than once, and the adapter
+reads any number.
+
+`cancelPayment` still voids the original, the oldest authorization: PayPal refuses to void
+a reauthorization (`CANNOT_BE_VOIDED`, "Please void the original parent authorization"),
+although its reauthorization example shows a `void` link on the new one. PayPal does not
+say what either authorization reports once the original is voided, so `cancelPayment`
+returns what the order read shows. If the original already reads `VOIDED` next to a
+reauthorization that still holds the funds, the void fails with PayPal's refusal rather
+than a `canceled` the adapter cannot confirm.
+
+The rest to capture is what the newest authorization holds less the captures taken from
+it, and never more than the order amount less every capture that took money: a
+reauthorization with an empty body holds "the full amount" again, so the new authorization
+alone could take past the order. `amountCapturable` reports the same figure. An order read
+that reports no amount is measured by the original authorization, which holds the order
+amount; a reauthorization can hold up to 115% of it, so when neither reports an amount,
+capturing the rest of a reauthorization needs an explicit amount.
+
+A capture belongs to the authorization PayPal ties it to (`related_ids.authorization_id` or
+the capture's `up` link), but PayPal's order read documents no such tie. A capture that
+names none counts against every authorization created no later than it, by `create_time`,
+so a capture taken before the reauthorization leaves the new authorization whole. A missing
+`create_time`, on the capture or on an authorization, rules nothing out, which errs low. If
+such a capture could have come from either authorization, the rest is an estimate:
+capturing it goes out with
+`final_capture: false`, so the authorization stays open for whatever the estimate missed,
+which you can take with an explicit amount, also once the estimate reaches zero and
+capturing the rest answers with the payment. Only a capture of everything the order has
+left closes it then. Once an estimate reaches zero, `PaymentInfo` no longer shows what is
+left (`amount` then equals `amountCaptured`): compare `raw.purchase_units[0].amount` with
+`amountCaptured`. What you never capture is left to expire, as `cancelPayment` voids
+only an authorization with no capture yet. An explicit amount still goes to PayPal as it
+is, for PayPal to judge against its overage limit.
+
+After a reauthorization, a `payment.canceled` event (PayPal's
+`PAYMENT.AUTHORIZATION.VOIDED`) may concern the original rather than the authorization
+holding the funds: PayPal documents that event for a void or an expiry and says nothing of
+reauthorizations. The event's `pspPaymentId` is the order id when the event carries
+`related_ids.order_id`, as PayPal's example does, and `raw.resource.id` is the voided
+authorization, so re-read the payment with `retrievePayment` before you treat it as
+canceled.
 
 ### `amountRefunded` caveat
 

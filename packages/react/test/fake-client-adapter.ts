@@ -1,5 +1,6 @@
 import {
   brandMountedFieldsHandle,
+  PayFanoutError,
   type ClientPaymentAdapter,
   type ConfirmResult,
   type MountedFieldsHandle,
@@ -33,6 +34,10 @@ export class FakeClientAdapter implements ClientPaymentAdapter {
   /** When set, mount() waits on it — lets tests exercise the unmount-while-loading race. */
   mountGate?: Deferred<void>;
   mountError?: unknown;
+  /** Also hand mountError to the onError option before rejecting, as most real adapters do. */
+  reportMountErrorToo = false;
+  /** An error mount() reports through the onError option before it rejects with mountError. */
+  mountCallbackError?: PayFanoutError;
   confirmImpl: () => Promise<ConfirmResult> = async () => ({ status: "succeeded" });
   /**
    * Assign to make this adapter redirect-return-capable (the optional contract
@@ -51,7 +56,11 @@ export class FakeClientAdapter implements ClientPaymentAdapter {
   async mount(_container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
     this.mountCalls.push(options);
     if (this.mountGate) await this.mountGate.promise;
-    if (this.mountError) throw this.mountError;
+    if (this.mountCallbackError) options.onError?.(this.mountCallbackError);
+    if (this.mountError) {
+      if (this.reportMountErrorToo) options.onError?.(this.mountError as PayFanoutError);
+      throw this.mountError;
+    }
     options.onReady?.();
     return brandMountedFieldsHandle({ pspName: this.pspName, seq: this.mountCalls.length });
   }

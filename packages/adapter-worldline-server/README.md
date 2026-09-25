@@ -189,6 +189,10 @@ Session creation also refuses, with `invalid_request` and before any call to Wor
   repeating a cancellation that already took effect answers `canceled`. A 409 that persists
   while the payment is still cancellable stays a retryable `processing_error`, since an
   original under the same key may still be in flight; retry with the same `idempotencyKey`.
+- A 409 on any call, Worldline's answer while the original request under the same key is
+  still being processed, is retried, and one that outlives the retries rejects with a
+  retryable `processing_error` marked `outcomeUnknown`: the original may still go through,
+  so retry only under the same `idempotencyKey`.
 - A refund the acquirer refuses leaves the payment `succeeded`: `retrieveRefund` reports the
   refund `failed` and it stays out of `amountRefunded`. Its `payment.rejected` webhook,
   carrying status code 73 or 83, arrives as `payment.refund_failed`; that reading follows

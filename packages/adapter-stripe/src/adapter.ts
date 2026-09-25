@@ -310,6 +310,7 @@ const CLIENT_CODE_MAP: Record<string, UnifiedErrorCode> = {
   authentication_required: "authentication_required",
   payment_intent_authentication_failure: "authentication_required",
   setup_intent_authentication_failure: "authentication_required",
+  authentication_failure: "authentication_required",
   processing_error: "processing_error",
   card_declined: "card_declined",
 };

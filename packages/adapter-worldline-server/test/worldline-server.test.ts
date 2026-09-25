@@ -1,11 +1,19 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { getRefundState, isPayFanoutError, type ServerPaymentAdapter } from "@payfanout/core";
+import {
+  getRefundState,
+  getUserMessage,
+  isPayFanoutError,
+  type PayFanoutError,
+  type ServerPaymentAdapter,
+  type UnifiedErrorCode,
+} from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
 import {
   encodeSessionContext,
   worldlineOnboarding,
   WorldlineServerAdapter,
+  type WorldlineApiError,
   type WorldlineServerAdapterConfig,
 } from "../src/index.js";
 import { FakeWorldlineApi } from "./fake-worldline-api.js";
@@ -363,6 +371,37 @@ describe("WorldlineServerAdapter specifics", () => {
     expect(conflicts).toBe(0);
   });
 
+  it("ends a completion whose in-flight original outlives the retries outcomeUnknown, to retry under the same key", async () => {
+    const fake = new FakeWorldlineApi();
+    let conflicts = 3; // every attempt the default retry budget allows
+    const adapter = new WorldlineServerAdapter({
+      apiKeyId: "api-key-id",
+      secretApiKey: "secret-api-key",
+      merchantId: "mid-1",
+      environment: "sandbox",
+      sessionSigningKey: SIGNING_KEY,
+      webhookKeys: [{ keyId: WEBHOOK_KEY_ID, secretKey: WEBHOOK_SECRET }],
+      defaultReturnUrl: "https://host.example/default-return",
+      sleep: async () => {},
+      fetch: async (input, init) => {
+        if (conflicts > 0 && init?.method === "POST" && String(input).endsWith("/payments")) {
+          conflicts--;
+          return new Response(JSON.stringify({ errorId: "dup", errors: [{ message: "request in progress", httpStatusCode: 409 }] }), { status: 409 });
+        }
+        return fake.fetch(input, init);
+      },
+    });
+    const session = await adapter.createPaymentSession({ amount: 2000, currency: "EUR", idempotencyKey: "k" });
+    const input = { pspSessionId: session.pspSessionId, clientToken: "htp_1", idempotencyKey: "c1" };
+    await expect(adapter.completePayment(input)).rejects.toMatchObject({
+      code: "processing_error",
+      retryable: true,
+      outcomeUnknown: true,
+    });
+    expect(conflicts).toBe(0);
+    expect((await adapter.completePayment(input)).status).toBe("succeeded");
+  });
+
   it("verifyCredentials classifies auth, network, and success", async () => {
     const ok = makePair();
     await expect(ok.adapter.verifyCredentials!()).resolves.toEqual({ ok: true });
@@ -392,5 +431,127 @@ describe("WorldlineServerAdapter specifics", () => {
         expect(err.pspName).toBe("worldline");
       }
     }
+  });
+
+  it("retries a 5xx or a 429 as transport trouble even when it carries a decline code", async () => {
+    const cases: Array<[number, UnifiedErrorCode]> = [
+      [503, "psp_unavailable"],
+      [429, "rate_limited"],
+    ];
+    for (const [status, expected] of cases) {
+      let calls = 0;
+      const { adapter } = makePair({
+        sleep: async () => {},
+        fetch: async () => {
+          calls++;
+          const errors = [{ errorCode: "30511001", httpStatusCode: status, message: "x" }];
+          return new Response(JSON.stringify({ errorId: "x", errors }), { status });
+        },
+      });
+      await expect(adapter.retrievePayment("pay_1")).rejects.toMatchObject({ code: expected, retryable: true });
+      expect(calls).toBe(3); // the first attempt and both transport retries
+    }
+  });
+});
+
+describe("a 2xx CreatePayment carrying a REJECTED payment", () => {
+  function apiError(fields: Partial<WorldlineApiError>): WorldlineApiError {
+    return { category: "PAYMENT_PLATFORM_ERROR", httpStatusCode: 402, message: "Authorisation declined", retriable: false, ...fields };
+  }
+
+  async function rejectedCompletion(
+    rejection: { errors?: WorldlineApiError[] },
+  ): Promise<{ error: PayFanoutError | undefined; fake: FakeWorldlineApi }> {
+    const { adapter, fake } = makePair();
+    fake.rejectPayment = rejection;
+    const session = await adapter.createPaymentSession({ amount: 2500, currency: "EUR", idempotencyKey: "session-rejected" });
+    const error = await adapter
+      .completePayment({ pspSessionId: session.pspSessionId, clientToken: "htp_rejected", idempotencyKey: "complete-rejected" })
+      .then(() => undefined, (err: unknown) => err as PayFanoutError);
+    return { error, fake };
+  }
+
+  const cases: Array<[string, UnifiedErrorCode]> = [
+    ["30431001", "fraud_suspected"],
+    ["30001140", "fraud_suspected"],
+    ["30141001", "invalid_card_data"],
+    ["30331001", "expired_card"],
+    ["30511001", "insufficient_funds"],
+    ["40001139", "authentication_required"],
+    ["40001135", "processing_error"],
+    ["30911001", "processing_error"],
+    ["30031001", "invalid_request"],
+    ["50001087", "invalid_request"],
+    ["30051001", "card_declined"],
+    ["99999999", "card_declined"],
+  ];
+  for (const [errorCode, expected] of cases) {
+    it(`maps statusOutput error ${errorCode} -> ${expected}, never retryable, with the whole response on raw`, async () => {
+      const errors = [apiError({ errorCode })];
+      const { error, fake } = await rejectedCompletion({ errors });
+      expect(isPayFanoutError(error)).toBe(true);
+      expect(error).toMatchObject({ code: expected, retryable: false, pspName: "worldline" });
+      expect(error?.message).toBe(getUserMessage(expected));
+      expect(error?.raw).toEqual({
+        creationOutput: expect.anything(),
+        payment: expect.objectContaining({
+          status: "REJECTED",
+          statusOutput: { statusCode: 2, statusCategory: "UNSUCCESSFUL", errors },
+        }),
+      });
+      expect(fake.uniquePaymentCreations).toBe(1);
+    });
+  }
+
+  it("reads an undocumented code with a 4xx other than 402 as a refused request, not a decline", async () => {
+    const invalidValue = { errorCode: "50001066", id: "INVALID_VALUE", category: "PAYMENT_PLATFORM_ERROR", httpStatusCode: 400 };
+    const refused = await rejectedCompletion({ errors: [invalidValue] });
+    expect(refused.error).toMatchObject({ code: "invalid_request", retryable: false });
+    const declined = await rejectedCompletion({ errors: [{ ...invalidValue, httpStatusCode: 402 }] });
+    expect(declined.error).toMatchObject({ code: "card_declined", retryable: false });
+  });
+
+  it("reads an undocumented code with a 5xx as the platform failing, never retryable, while a documented code still decides", async () => {
+    for (const httpStatusCode of [500, 503]) {
+      const { error } = await rejectedCompletion({ errors: [apiError({ errorCode: "99999999", httpStatusCode })] });
+      expect(error).toMatchObject({ code: "processing_error", retryable: false, message: getUserMessage("processing_error") });
+    }
+    const documented = await rejectedCompletion({ errors: [apiError({ errorCode: "30511001", httpStatusCode: 500 })] });
+    expect(documented.error).toMatchObject({ code: "insufficient_funds", retryable: false });
+  });
+
+  it("stays a decline when the error reports no status, or one that is not a number", async () => {
+    const withoutStatus: WorldlineApiError = { errorCode: "99999999", category: "PAYMENT_PLATFORM_ERROR" };
+    const textStatus = { ...withoutStatus, httpStatusCode: "500" } as unknown as WorldlineApiError;
+    for (const errors of [[withoutStatus], [textStatus]]) {
+      const { error } = await rejectedCompletion({ errors });
+      expect(error).toMatchObject({ code: "card_declined", retryable: false, message: getUserMessage("card_declined") });
+    }
+  });
+
+  it("falls back to the deprecated code when the error carries no errorCode", async () => {
+    const { error } = await rejectedCompletion({ errors: [{ code: "30411001", httpStatusCode: 402 }] });
+    expect(error).toMatchObject({ code: "fraud_suspected", retryable: false });
+  });
+
+  it("is a plain decline when the payment reports no error, or an empty list", async () => {
+    for (const rejection of [{}, { errors: [] }]) {
+      const { error } = await rejectedCompletion(rejection);
+      expect(error).toMatchObject({ code: "card_declined", retryable: false, message: getUserMessage("card_declined") });
+      expect(error?.raw).toMatchObject({ payment: { status: "REJECTED" } });
+    }
+  });
+
+  it("answers a completion replayed under its key with the same rejection, however the card would fare now", async () => {
+    const { adapter, fake } = makePair();
+    fake.rejectPayment = { errors: [apiError({ errorCode: "30431001" })] };
+    const session = await adapter.createPaymentSession({ amount: 2500, currency: "EUR", idempotencyKey: "session-stolen" });
+    const input = { pspSessionId: session.pspSessionId, clientToken: "htp_stolen", idempotencyKey: "complete-stolen" };
+    const first = await adapter.completePayment(input).then(() => undefined, (err: unknown) => err);
+    fake.rejectPayment = undefined;
+    const second = await adapter.completePayment(input).then(() => undefined, (err: unknown) => err);
+    expect(first).toMatchObject({ code: "fraud_suspected", retryable: false });
+    expect(second).toMatchObject({ code: "fraud_suspected", retryable: false });
+    expect(fake.uniquePaymentCreations).toBe(1);
   });
 });

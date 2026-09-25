@@ -204,6 +204,22 @@ describe("error and status mapping", () => {
     expect(duplicate).toMatchObject({ code: "processing_error", retryable: true });
   });
 
+  it("marks the answers to a request whose key's original may still go through outcomeUnknown", () => {
+    // Adyen: a duplicate sent "before the first request has completed" gets 704 (409 or 422), a
+    // same-key race can end in a transient error, and a 409 means "already processed or is in progress".
+    const answers = [
+      mapAdyenError(409, { status: 409, errorCode: "704", message: "Request already processed or in progress" }),
+      mapAdyenError(422, { status: 422, errorCode: "704", message: "Request already processed or in progress" }),
+      mapAdyenError(422, { status: 422, message: "in progress" }, { transient: true }),
+      mapAdyenError(409, { status: 409, message: "conflict" }),
+    ];
+    for (const answer of answers) expect(answer).toMatchObject({ code: "processing_error", outcomeUnknown: true });
+    // Answers that already leave the outcome open, or that say nothing was done, stay unmarked.
+    expect(mapAdyenError(503, { status: 503, errorCode: "703" }, { transient: true }).outcomeUnknown).toBeUndefined();
+    expect(mapAdyenError(422, { status: 422 }).outcomeUnknown).toBeUndefined();
+    expect(mapAdyenError(429, { status: 429 }).outcomeUnknown).toBeUndefined();
+  });
+
   it("classifies the documented HTTP statuses", () => {
     expect(mapAdyenError(401, { status: 401 })).toMatchObject({ code: "invalid_request", retryable: false });
     expect(mapAdyenError(403, { status: 403 })).toMatchObject({ code: "invalid_request", retryable: false });

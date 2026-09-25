@@ -506,12 +506,21 @@ export interface MountOptions {
    *
    *  - Stripe: Payment Element options — `layout` (tabs/accordion),
    *    `paymentMethodOrder`, `fields`, `defaultValues`, `terms`, `wallets`, …
-   *  - Paysafe: per-field config under `fields` (placeholders, …), `locale`, …
+   *  - Paysafe: per-field config under `fields` (`placeholder`, `accessibilityLabel`,
+   *    `iframeTitle`, …), `initializationTimeout`, …
    */
   fieldOptions?: Record<string, unknown>;
   /** BCP-47 locale for the PSP's own field texts, where the SDK supports one. */
   locale?: string;
   onReady?: () => void;
+  /**
+   * Errors raised while the fields are live, such as the SDK failing after
+   * mount() resolved, or while they render: an error the SDK reports during a
+   * render that still succeeds arrives before onReady. A failure of mount()
+   * itself rejects the returned promise; an adapter that also reports it here
+   * passes the SAME error instance to both, so a consumer listening to both
+   * reports it once by identity, as `<PaymentFields>` does.
+   */
   onError?: (err: UnifiedError) => void;
   /**
    * Fires as the customer types, whenever field validity changes. Adapters

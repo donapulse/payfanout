@@ -51,6 +51,10 @@ were taken autonomously from the brief's own recommended defaults (§10/§11) du
 - **Retries:** `withRetry` in core (backoff+jitter over `retryable`); Stripe SDK
   `maxNetworkRetries` default 2; Paysafe transport retries timeouts/5xx/429 (default 2,
   never business errors — 3406 is retryable hours later, not milliseconds).
+  *(Amended 2026-09-24: Paysafe reads keep these retries, but a Paysafe write is re-sent only
+  after a 429, or, when it moves no money, once a lookup shows the first attempt never
+  landed — Paysafe rejects a repeated `merchantRefNum` rather than replaying it. See
+  "Paysafe replay safety (2026-09-24)".)*
 - **Circuit breaker in PaymentRouter** (default on: threshold 5, cooldown 30s,
   half-open probe; business rejections close the circuit — they prove liveness;
   desperation mode attempts all-open chains rather than self-inflicting downtime).
@@ -167,7 +171,8 @@ than enumerated options (future SDK options need no library release):
   SDK makes it during setup only for a single payment method and answers a repeat call
   with the first result, so the call is harmless for the card-only fields and keeps any
   other setup from staying locked (9100).
-- **`MountOptions.locale`** — BCP-47, mapped per PSP (Paysafe underscore form).
+- **`MountOptions.locale`** — BCP-47, mapped per PSP. Paysafe no longer receives it: its setup
+  takes no locale (corrected 2026-09-25, see "Common appearance tokens").
 - **Slot convention for split-field PSPs:** `data-payfanout-field="cardNumber|
   expiryDate|cvv"` elements inside the container become the mount points — the host
   owns the layout (grids, rows, labels); adapter-created stacked divs remain the
@@ -229,7 +234,8 @@ choices they forced:
   POST /billing_request_flows with the same Idempotency-Key returned two different
   flow ids). Idempotency therefore lives at the billing-request level: a replayed
   session returns the same billing request with a fresh authorisation URL (every flow
-  authorises that one billing request — no duplicate-payment risk), and the
+  authorises that one billing request — no duplicate-payment risk; refined 2026-09-25:
+  only while that billing request is `pending`, see the replay entry below), and the
   conformance idempotency proof moved to refunds (same key twice → the original
   refund, exactly one create).
 - Webhook deliveries are **batched** (up to 250 events, one HMAC over the raw body):
@@ -294,6 +300,118 @@ choices they forced:
     request holds after a `billing_requests`/`failed` event, since the status list names
     none. Sandbox checks: read the billing request in the return handler during a browser
     run, and record the status when a `failed` event occurs.
+- **Doc-verified 2026-09-25: replays of sessions, refunds and cancels.** The Limits page
+  documents idempotency for creates: "When creating resources, pass an `Idempotency-Key`
+  header to ensure the key can only be used for one successful request", and "If a
+  resource already exists for that key, the API returns a `409
+  idempotent_creation_conflict` error with a `links.conflicting_resource_id` pointing to
+  the existing resource." Keys "are honoured for at least 30 days"; after that a replay
+  may be treated as a new request. No comparison of the replayed parameters is
+  documented, so the adapter compares them itself.
+  - *Sessions.* A replayed billing request must match the input: its `payment_request`
+    amount and currency, the currency of any `mandate_request` (sessions send none and
+    choose no scheme), and the stamped `payfanout_id`. A mismatch rejects with
+    `invalid_request` instead of handing back another payment's billing request. Once the
+    billing request names its payment (`links.payment_request_payment`, the "ID of the
+    payment that was created from this payment request"), the replay reads that payment
+    and reports its status, as `retrievePayment` does, so a payment that already failed
+    never reads `processing`. One exception (2026-09-25): a `pending_customer_approval`
+    payment ("we're waiting for the customer to approve this payment") reads
+    `processing` on a replay, where `retrievePayment` reports `requires_action`, because
+    a replayed session whose billing request names a payment carries no `clientSecret`.
+    Before the billing request names a payment, the replay reports the billing
+    request's mapped status.
+    The payment read happens on replays only, and if it fails the billing request's status
+    stands: failing the replay would let `PaymentRouter` fail over to another PSP for a
+    payment that already exists. A flow is created only while the billing request is
+    `pending` ("pending and can be used") and names no payment. Past that point the payer
+    has authorised, or the request is `fulfilled` ("fulfilled and a payment created") or
+    `cancelled` ("cancelled and cannot be used"), and the session carries no
+    `clientSecret`. This refines the 2026-07-07 flow decision above. Flows still go out
+    without a key, since they cannot be read back: the spec has no GET for them, and "Each
+    flow currently lasts for 7 days".
+  - *Refunds: the key stamp.* Every refund is created with the SHA-256 (lowercase hex,
+    computed with WebCrypto) of its idempotency key in its metadata, as
+    `payfanout_key_sha256` next to `reason`. The spec allows "Up to 3 keys", "key names up
+    to 50 characters and values up to 500 characters": the stamp is 64 characters, and
+    `reason` plus the stamp take two keys. A hash rather than the key keeps the host's
+    key, which can carry its own identifiers, out of the GoCardless dashboard at a fixed
+    length; an unkeyed hash, unlike an HMAC, survives credential rotation. The stamp is
+    data held at GoCardless, like `payfanout_id` on payments and PayZen's `payfanout_key`,
+    not PayFanout persistence: PayFanout stores nothing, and reads the payment's refunds
+    back only when a replay has to be told apart.
+  - *Refunds: replays.* A replayed refund must belong to the payment and, when an amount
+    is given, be for that amount. A request the remainder check refuses, as it refuses
+    the replay of a refund that used up the payment, is never sent. The adapter reads
+    `GET /refunds?payment=` (the spec's `payment` filter; `refund_type` defaults to
+    `payment`, "refunds created against payments only") and returns the refund stamped
+    with the key, checked like any replay. With none, the refusal stands, its `raw`
+    holding the payment as `payment` and, when the read was refused, the read's answer as
+    `lookup`: one shape either way. One page holds every refund of a payment: the adapter
+    asks for `limit=500`, the most the Data Conventions page allows ("Default 50, max
+    500"), and the Responses and Errors page describes `number_of_refunds_exceeded` as
+    "Maximum of 5 refunds per payment already reached". Should two refunds carry the
+    stamp, which a key reused past the 30-day window can cause, the newest wins. The same
+    read settles a POST that GoCardless rejects with anything but the 409: a stamped
+    refund is the original, and anything else rethrows the rejection. A transient failure
+    of the read stays retryable, after a refusal and after a rejected POST alike (a
+    rejection that reads as final could hide the original); after a rejected POST, the
+    rejection rides `raw.rejection` and the read's answer `raw.lookup`, whether GoCardless
+    rejected the POST or failed to answer it. Any other failure keeps the refusal, or the
+    rejection marked `outcomeUnknown` (2026-09-25): whether the key already refunded
+    stays open, so only the same key may follow. An answer without a `refunds` array
+    counts as a failed read. While GoCardless reports an amount already
+    refunded (`amount_refunded` above 0), the read also runs before the create
+    (2026-09-25), so a key past the window GoCardless honours keys for is read back too.
+    That read exists only to prevent a second refund, so it fails closed: the refund is
+    not sent, and the call rejects retryable when the failure is transient and with a
+    final `invalid_request` marked `outcomeUnknown` otherwise, whose message sends the
+    host to the dashboard and back to the same key. Replays of stamped refunds therefore depend
+    neither on `total_amount_confirmation` nor on whether GoCardless checks the key before
+    the body (AMBIGUOUS: the docs do not state the order). Refunds created before the
+    stamp carry none: a replay of one that the remainder check refuses rejects, as it
+    always did, and one within the remainder relies on the 409. Past the window
+    GoCardless honours keys for, a same-key refund of a stamped original is read back
+    before any create while `amount_refunded` is above 0; one of a refund made before the
+    stamp may be created anew.
+  - *Refunds: amounts.* The spec types a payment's `amount` and `amount_refunded`, and a
+    refund's `amount`, as integer or string. The refund path reads digit strings as
+    integers and rejects anything else with a non-retryable `unknown` before any
+    arithmetic or `RefundResult`, and an explicit `amount` of 0 rejects before any
+    request.
+  - **AMBIGUOUS: the `total_amount_confirmation` opt-out.** The spec defines the field as
+    "the sum of the existing refunds plus the amount of the refund being created", says
+    it "Must be supplied if `links[payment]` is present", and fails a mismatch with
+    `total_amount_confirmation_invalid`. It also says "It is possible to opt out of
+    requiring `total_amount_confirmation`", and does not say whether a value still
+    supplied is checked after that. The API reference defines no cap on a refund's
+    amount either; the support centre's "up to the full amount of that payment" is a step
+    of the Dashboard refund flow. GoCardless lets accounts opt out of the confirmation
+    check, so the adapter no longer relies on it: it still sends the value from a fresh
+    read, and recognises replays by the stamp alone. What that cannot close statelessly:
+    on an opted-out account two refunds under different keys that read the same
+    `amount_refunded` can both be sent, so the guide asks hosts to refund one payment at a
+    time there, each once the previous one shows in `amount_refunded`. **AMBIGUOUS too:
+    whether `amount_refunded` counts a refund as soon as it is created**; the spec says
+    only that GoCardless "will update the `amount_refunded` property of the payment"
+    (sandbox check S4 below).
+  - *Cancels.* Idempotency keys are documented for creates only. The official Node client
+    (gocardless-nodejs `src/api/api.ts`) generates a key for every POST it is not given
+    one for, cancels included, and resolves no 409 for them. Whether an action is
+    deduplicated by key is AMBIGUOUS. `cancel_payment` "will fail with a
+    `cancellation_failed` error unless the payment's status is `pending_submission`", and
+    `cancellation_failed` covers a resource "already cancelled". The billing request
+    cancel documents no error ("Immediately cancels a billing request, causing all billing
+    request flows to expire"), so its answer for a request already cancelled is
+    unverified. `cancelPayment` re-reads the payment or billing request on any rejection
+    and resolves `canceled` when it is already cancelled, as `cancelNativeSubscription`
+    does, whichever answer GoCardless gives.
+  - Sandbox checks: (S2) cancel a `pending_submission` payment twice with the same key,
+    and a pending billing request twice, and record whether each second call answers 200
+    or 422 `cancellation_failed`; (S3) create a flow on a fulfilled and on a cancelled
+    billing request and record the answer (the adapter no longer does either); (S4)
+    create a refund, read the payment at once, and record whether `amount_refunded`
+    includes it.
 
 ## PayPal adapter (2026-07-07)
 
@@ -584,6 +702,21 @@ One atomic core+conformance+all-adapters change (major changesets across the boa
   vocabulary is shared by convention (documented in the `appearance` JSDoc), not a core
   export — core stays UI-free. Not a contract change: `appearance` is
   `Record<string, unknown>` and each adapter handles it independently; conformance is unchanged.
+- **Corrected 2026-09-25: Paysafe applies no `colorBackground`, and a rejected property
+  drops alone.** Paysafe's setup page lists the supported CSS style names (color, opacity,
+  letter-spacing, text-align, text-indent, text-decoration, text-shadow, font, font-style,
+  font-weight, font-size, line-height, font-family, transition, -ms-filter), and the served
+  hosted-field iframe's `sanitize` deletes every property outside its allowlist (the same list
+  plus `-webkit-text-fill-color` and `box-shadow`), logging "Invalid css property: " for
+  each. The `background-color` the adapter sent for `colorBackground` was therefore always
+  deleted, so the token is now recognized and not applied, like `colorPrimary`. The
+  sanitizer drops only the offending properties of a flat selector object, not all styling,
+  as this entry first said; a Stripe key whose value is a string (`theme`, `labels`) fails
+  setup with 9021 and a nested one (`rules`) with 9022, per the setup page's error table.
+  `MountOptions.locale` is no longer forwarded: the setup options table (`currencyCode`,
+  `environment`, `fields`, `style`, `initializationTimeout`, `threshold`, `accounts`) has no
+  `locale`, and the served SDK reads one only for wallet buttons and
+  `customerDetails.profile.locale`.
 
 ## Built-in server-completion transport (2026-07-10)
 
@@ -673,6 +806,8 @@ docs.direct.worldline-solutions.com unless noted):
   money-side safety comes from CreatePayment idempotency). A 409 means the request with
   this idempotence key is still being processed, so it maps to a retryable
   `processing_error` and the transport loop replays it instead of surfacing a hard error.
+  Since 2026-09-25 one that outlives the retries carries `outcomeUnknown` (see "Renewal
+  re-key paths").
 - **Stateless session = signed context** (same pattern as Paysafe): createPaymentSession
   calls `POST /hostedtokenizations` (no amount) and encodes amount/currency/captureMethod/
   returnUrl/billing/hostedTokenizationId + enforced `expiresAt` into `pspSessionId`;
@@ -943,10 +1078,15 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   adapter handles both: non-2xx maps through `mapWorldlineError` (the primary decline path,
   modeled in the fake), and a 2xx whose payment maps to `failed` is defensively surfaced as
   `card_declined` rather than a "failed" PaymentInfo. Confirm the real sandbox shape.
+  Refined 2026-09-25: such a payment now maps from its own `statusOutput.errors` rather than
+  always to `card_declined`, see "Worldline decline codes (2026-09-25)"; the sandbox shape is
+  still unconfirmed.
 - **Decline sub-codes.** Only five reject codes are enumerated on the troubleshooting page
   (30511001 insufficient funds, 30591001 fraud, 40001134 3-D Secure, 30171001 customer
   cancelled, 30041001 issuer rejected); everything else on a 402 maps to the generic
   `card_declined`. Enumerate expired-card / invalid-card-data codes from the sandbox.
+  Superseded 2026-09-25 by "Worldline decline codes (2026-09-25)": the troubleshooting page
+  and the Sips response-code mapping now document those codes and many more.
 - **Sandbox triggers.** Doc-verified 2026-07-15: amount `1302` (EUR, `authorizationMode=SALE`)
   is the test-cases page's documented unsuccessful-transaction trigger (statusCode 2), as the
   fake models; the page also documents `1303`/`1309` (unsuccessful refund/capture) and
@@ -1091,6 +1231,12 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   SEPA/ACH/BACS/EFT) with no PSP call; the handle is minted and charged inside
   `completePayment` (handle then payment, both with `merchantRefNum = idempotencyKey` —
   Paysafe dedupes per endpoint, so one key is replay-safe across both calls).
+  *(Corrected 2026-09-24: that dedupe was never documented. Paysafe documents duplicate
+  rejection (409/5031 under `dupCheck`), and `/paymenthandles` accepts `dupCheck` with an
+  undocumented default; the adapter sends none there. The shared key stays, as in Paysafe's
+  own EFT examples, where the handle and the payment share one `merchantRefNum`. The key's
+  payments and handles are now read before a handle is minted, and the payment is
+  recovered by lookup, see "Paysafe replay safety (2026-09-24)".)*
   `settleWithAuth: true` unconditionally (doc-required for ACH/EFT; shown true in every
   SEPA/BACS payload example) and manual capture is rejected at session creation. One rail
   per session, mixed requests rejected — the Interac rule, for the same reason (the
@@ -1570,7 +1716,8 @@ sandbox round-trip before production use, and the setup guide carries that warni
   authorise; a host reusing one key for a capture and a refund hits the same wall.
   `errorCode` 704 (a duplicate racing the still in-flight original) maps to a retryable
   `processing_error` and the transport loop replays it; a 409 is retried only when Adyen
-  sends `transient-error: true`.
+  sends `transient-error: true`. Since 2026-09-25 both, and a transient 4xx, carry
+  `outcomeUnknown` (see "Renewal re-key paths").
   - **Rescoped 2026-09-23**, doc-verified against the API idempotency guide, the HTTP status
     codes and error codes pages, the capture/cancel/refund guides, the Checkout v72 release
     note and the v72 OpenAPI contract (`github.com/Adyen/adyen-openapi`,
@@ -1620,7 +1767,10 @@ sandbox round-trip before production use, and the setup guide carries that warni
     says only "After a payment has been captured, you can no longer cancel it."). Error 906
     ("Invalid Request: Original pspReference is invalid for this environment", cause
     "LIVE/TEST PSP mismatch") is an error response, so a modification on an unknown reference
-    is acknowledged only within one environment.
+    is acknowledged only within one environment. Since 2026-09-25 the refusal of an echo
+    naming another amount carries `outcomeUnknown` and advises a new key only once the
+    earlier one is known to be another: that request is only received (see "Renewal re-key
+    paths").
   - **Classification, 2026-09-23**, from the same pages: `transient-error: true` (the value
     read case-insensitively) is retryable at any status (`processing_error` below 500,
     `psp_unavailable` from 500), `errorCode` 705 is `rate_limited`, 408 ("You can retry the
@@ -1672,7 +1822,8 @@ sandbox round-trip before production use, and the setup guide carries that warni
   Refusal codes map 2/5/46 → `card_declined`, 6 → `expired_card`, 8/24 →
   `invalid_card_data`, 11/38/42 → `authentication_required`, 12 → `insufficient_funds`,
   14/20/31 → `fraud_suspected` (31, Issuer Suspected Fraud, since 2026-09-23), 9 (Issuer
-  Unavailable) → `processing_error`. None is retryable:
+  Unavailable) → `processing_error` (42 questioned 2026-09-25: see "Worldline decline codes
+  (2026-09-25)" and #217). None is retryable:
   replaying the same idempotency key returns the same refusal, so a fresh attempt is the
   shopper's move, and an unrecognized code is still a decline.
 - **CLP, CVE, IDR and ISK are rejected locally** (`invalid_request`): Adyen prices them with
@@ -1877,7 +2028,9 @@ sandbox round-trip before production use, and the setup guide carries that warni
     reference — Adyen's example details answer names neither. A `/payments` answer naming
     another `merchantReference` or `amount` is refused the same way, before any refusal in it
     is mapped: the request named the session's own, so the answer belongs to another request
-    (an `idempotencyKey` reused across sessions replays the first answer).
+    (an `idempotencyKey` reused across sessions replays the first answer). Since 2026-09-25
+    that refusal carries `outcomeUnknown` unless the answer is `Refused`, `Error` or
+    `Cancelled` (see "Renewal re-key paths").
     `returnUrl`/`defaultReturnUrl` are checked where they enter (absolute with a scheme, no
     whitespace, at most 1024 characters once serialized, no `//` after the domain) and sent
     WHATWG-serialized, since Adyen asks for non-ASCII characters to be URL-encoded.
@@ -2161,7 +2314,8 @@ description of what v2 changes is what the migration then had to implement.
 - **Server half only, and only for hosts pinned to 2026-08-26.dahlia or later.**
   `mapStripeError` sees the errors of the adapter's own calls, which carry the host's pinned
   `apiVersion`. The browser adapter follows the account's default API version through
-  Stripe.js and maps none of these codes (nor `incorrect_zip`); aligning it is a follow-up.
+  Stripe.js and maps none of these codes (nor `incorrect_zip`) except `authentication_failure`
+  (decided 2026-09-25, below); aligning the rest is a follow-up (#213).
 - **The checks live in the `StripeCardError` branch only.** Neither page states which error
   `type` the new codes arrive with, so the conservative reading extends the branch that
   already handles `expired_card` and `incorrect_zip`; under any other type they fall through
@@ -2170,10 +2324,12 @@ description of what v2 changes is what the migration then had to implement.
   show which codes those cards return on this version and, where a new code appears, its
   `type` and `decline_code`. The integration suite pins an older version, so this needs a new
   case, not a re-run. Seeing `authentication_failure` needs a failed 3-D Secure challenge
-  instead, a browser step on Stripe's mock authentication page; its mapping stays a sign-off
-  decision either way.
-- **`authentication_failure` is left unmapped (default, unconfirmed).** It falls through to
-  `card_declined`. Its docs.stripe.com/error-codes entry states no remedy; the changelog
+  instead, a browser step on Stripe's mock authentication page; its mapping was decided on
+  2026-09-25 (below) without one.
+- **`authentication_failure` maps to `authentication_required` (decided 2026-09-25; until
+  then it fell through to `card_declined`).** Its docs.stripe.com/error-codes entry reads "The
+  payment was declined because the payment method failed to pass authentication." and states no
+  remedy; the changelog
   presents it as the general form of `payment_intent_authentication_failure` and
   `setup_intent_authentication_failure`, whose documented remedy is a new payment method.
   The Stripe browser adapter maps those two codes to `authentication_required`, as Worldline
@@ -2182,8 +2338,22 @@ description of what v2 changes is what the migration then had to implement.
   code and message the host shows. Stripe's 3-D Secure guide
   (docs.stripe.com/payments/3d-secure/authentication-flow) gives both remedies after a failed
   authentication: try a different payment method, or retry 3-D Secure by reconfirming. Which
-  way the Stripe server half should go is an open decision; a unit test records the current
-  fall-through so that a change is deliberate.
+  way the Stripe server half should go was left open. Decided for consistency: the browser
+  adapter's intent-specific codes and every other adapter's failed 3-D Secure already surface as
+  `authentication_required`, and retrying 3-D Secure is one of the two remedies Stripe's guide
+  gives. Both halves now map `authentication_failure` that way, and the server half also maps
+  the two intent-specific codes, which hosts pinned before dahlia still receive. On the server
+  a fraud decline code on the same error still takes precedence. The browser half maps no
+  fraud decline codes at all (`fraudulent`, `stolen_card`, `lost_card`,
+  `merchant_blacklist`); that gap and the dahlia codes above are tracked in #213. Left
+  unmapped, an account moving to dahlia could see a failed browser 3-D Secure change quietly
+  from `authentication_required` to `card_declined` or `unknown`, if Stripe.js reports the
+  general code there. Would be wrong if Stripe used the code for failures where no new
+  authentication can succeed, where `card_declined`'s "use another card" is the only remedy.
+  (Clarified 2026-09-25: this holds for a failed cardholder authentication. A 3-D Secure that
+  fails outside the customer's control is `processing_error` on Worldline, and Adyen's refusal
+  42 is such a failure, which still maps to `authentication_required` until #217; see
+  "Worldline decline codes (2026-09-25)".)
 - **`payment_method_restricted` stays `card_declined`.** Stripe's example is a card reported
   lost or stolen; the existing `restricted_card` decline code ("it's possible it was reported
   lost or stolen") already falls through to `card_declined`, and a `lost_card` or
@@ -2277,3 +2447,796 @@ description of what v2 changes is what the migration then had to implement.
   the adapter, reads `signature` first and still tolerates `x-signature` /
   `x-paysafe-signature`; raw-body hashing, constant-time comparison and key rotation are
   unchanged.
+
+## Paysafe replay safety (2026-09-24)
+
+- **Paysafe rejects a repeated `merchantRefNum`; it does not replay the original.**
+  Doc-verified 2026-09-24 against the Payments API OpenAPI spec
+  (developer.paysafe.com/fileadmin/openapi-spec/payments-api/apis/paysafe-ph-payments-api.yaml).
+  On `POST /v1/payments`, `merchantRefNum` "must be unique for each request if dupCheck
+  parameter is sent as "true"", and `dupCheck` "validates that this request is not a
+  duplicate. A duplicate request is when the merchantRefNum has already been used in a
+  previous request within the past 90 days." No default is documented there; settlements,
+  refunds and verifications state "This value defaults to true". The card-errors page gives
+  the answer as "409 | 5031 | The transaction you have submitted has already been
+  processed.", and the spec's payment errors add "402 | 3044 | You have submitted a
+  duplicate request." The about-card-payments page adds "Regardless of the payments call
+  response status, the payment handle status always changes to COMPLETED when a payments
+  call is made", so the first payments call spends a single-use handle and a second one
+  answers 5283 ("The requested operation can only be executed on a Payment Handle with the
+  status of PAYABLE."). The tokenize page says single-use handles "are not consumed by
+  verification". The adapter had assumed Paysafe dedupes on `merchantRefNum`, and its
+  transport re-sent every POST after a timeout, 5xx or 429. Nothing documents that. Under
+  the documented behaviour a lost answer became an `invalid_request` for a payment that
+  existed, and a re-sent saved-card charge (a MULTI_USE token is never spent) could charge
+  twice.
+- **Card and Interac completions send `dupCheck: false`; the spent handle guards their
+  replay.**
+  Doc-verified 2026-09-25: the spec's "Card - with Settlement" request example and the
+  Paysafe.js "Transaction with Payment Handle" payment example both send `"dupCheck": false`
+  with a single-use token, and the Interac guide's payment request omits the field while its
+  response echoes `"dupCheck": true`, so false is sent explicitly. With `dupCheck: true` and
+  a stable per-order completion key (the server guide's `complete-${order.id}`), a declined
+  card left its record under the key and every later card for that order was refused as a
+  duplicate. Card and Interac completions therefore send false, and a replay of the same
+  handle is answered 5283 and read back. Bank debits, whose attempts can each mint a
+  handle, follow the next entry. Saved-method charges (a MULTI_USE token is
+  never spent), settlements, refunds and verifications keep `dupCheck: true`. Payment and
+  verification records carry `paymentHandleToken` (the `payment` and `verification`
+  schemas, and both lookup examples), so recovery matches on it: a record made with the
+  call's token is its original, a record made with another one under the same key is an
+  earlier attempt. A completion reads its key before sending anything. Its own record
+  answers a replay (a decline stays that decline), and a failed attempt with another token
+  leaves the key open. A live payment made with another token is returned as the key's
+  payment. That last rule goes beyond "a new token is a new attempt", deliberately: the
+  client adapter tokenizes on every Pay click, so a customer whose completion answer was
+  lost and who pays again arrives with a new token under the same key, and processing it
+  would charge the order twice. What remains open for cards is concurrency: two completions
+  with different cards sent under one key before either record is visible in the lookup can
+  both be charged, since no duplicate check spans them.
+- **Bank-debit completions send `dupCheck: true` until a failed attempt shows under the
+  key** (2026-09-25). A bank-debit attempt mints its own handle unless the lookup shows an
+  uncharged one minted from the same details, so the spent-handle refusal did not span two
+  attempts: two identical completions sent together, or one resubmitted while both lookups
+  trailed the first, each minted a handle and debited it. Doc-verified 2026-09-25 against
+  the spec: the ACH, EFT, SEPA and BACS payment request examples all send
+  `"dupCheck": true`. The EFT pair mints the handle and charges it under one
+  `merchantRefNum` ("4533863971"); the handle request carries no `dupCheck` (it sends
+  `"dupcheck": true`, a spelling the schema does not define), and the payment, sent with
+  `dupCheck: true`, answers `COMPLETED`, so a handle minted under the key does not trip the
+  payment's check. Two more pairs in the spec show the same (doc-verified 2026-09-25):
+  Paysafecash, `merchantRefNum` "a9318b525273ee3cda79a2f947a9", handle `PH4lXuM1iYSK64xG`
+  minted `INITIATED` without `dupCheck`, then paid with `dupCheck: true` and answered
+  `COMPLETED`; and Mazooma, `merchantRefNum` "285a1d9f-ab6b-4851-870b-b725148a5162", handle
+  `PH0gRuaOS9Yr7PNQ`, the same sequence, also `COMPLETED`.
+  The payment therefore carries `dupCheck: true` while the key's read shows no failed
+  payment, whatever handles it shows: no handle stops another attempt from debiting.
+  Paysafe then refuses a later payment under the key (5031, or 3044/3417), which says that
+  request was not processed, so the read-back takes the key's live payment as the answer
+  whichever handle made it, and ends in the non-retryable `processing_error` while none
+  shows. After an unknown
+  outcome only the call's own record settles it: another handle's payment does not say
+  whether this one went through too. The check would refuse corrected bank details for 90
+  days, so it stops at the first failed payment the key shows. Two things remain. Once a
+  failed attempt shows, the check is off: two attempts sent together, or one resubmitted
+  before the lookup shows the other's payment or handle, can both be debited (a test pins
+  the two debits of two corrected attempts sent together). And whether the check catches a
+  payment Paysafe is still processing is the first open item below. The handle mint still
+  sends no `dupCheck`: among the handle instruments only `eftObject` defines it (a boolean
+  with no description and no default), `achObject`, `sepaObject` and `bacsObject` do not,
+  the ACH handle example sends `false`, and a handle moves no money, so a handle-level
+  refusal would only add a path that reads back a handle rather than the payment that
+  answers the call. A handle's mandate reference now stands in only for a payment whose
+  record names that handle's token; a record that names no handle takes no mandate.
+- **Writes are never re-sent blindly, and payments, settlements and refunds are not re-sent
+  after an unknown outcome.** Paysafe's Java and PHP SDK pages say "The client can be
+  configured to automatically retry GET requests that have failed due to network problems
+  or other unpredictable events", with "60 seconds for response timeout", and warn that
+  "some requests may take longer to process". The PHP SDK's retry middleware refuses every
+  method except GET. After a timeout, network failure or 5xx the record is looked up with
+  the documented
+  `GET /v1/{payments,paymenthandles,settlements,refunds,verifications,voidauths}?merchantRefNum=`
+  and returned when exactly one record is this call's (amount, currency, payment type and
+  handle token, wherever both sides state them). When three reads show none, a payment,
+  settlement or refund ends with a non-retryable `processing_error`: its outcome is unknown,
+  and the host retries later with the same key, never a new one. Only Paysafe's duplicate
+  check could stop a second one, and Paysafe does not document that check for a request
+  still in flight. Payment handles, verifications and voids move no money, so they are still
+  re-sent once one lookup shows nothing, bounded by `maxNetworkRetries`. A 429 (1200) is
+  re-sent after backoff without a lookup, as the request was refused unprocessed. Once an
+  attempt's outcome is unknown, no later answer settles the call on its own: a rejection of
+  a re-send, or a 429 when the budget runs out, is followed by the same three reads and ends
+  in the same `processing_error`. Reads keep their transport retries. The default
+  `requestTimeoutMs` moved from 30000 to 60000.
+- **Duplicate and in-progress rejections are answered with the original.** 5031, 3044,
+  3417 ("There is already another request being processed on the transaction referenced
+  for this request.", 402, among the refund errors), and a 5283 on a payments call that
+  spends a single-use handle are recovered by reading the original back, because the lookup
+  can trail the write. When it cannot be read, the call ends with a non-retryable
+  `processing_error` naming the `merchantRefNum`, never `invalid_request`: a 5283 whose
+  handle made no record under the key means either that the lookup trails or that another
+  call spent the handle, and nothing tells the two apart. A declined original, which
+  Paysafe records with its error (see the simulating-card-payments decline example, which
+  carries an `id`), surfaces as the same decline. A recorded failure maps from its own code,
+  and from its status where the code does not decide: the verification statuses define
+  `ERROR` as a failure "for non-business reason" and `FAILED` as the gateway's 402, so
+  `ERROR` and Paysafe's internal and gateway codes give `processing_error`, and anything
+  else a decline. Recorded settlement, refund and verification failures are rethrown the
+  same way as payments. Chosen outcomes: a record under the same reference that disagrees
+  means the key was reused and gives `invalid_request` (marked `outcomeUnknown` on a
+  payment, settlement or refund while that record may have moved money, since 2026-09-25;
+  see "Renewal re-key paths"); several agreeing records give a
+  non-retryable `processing_error`. Non-retryable is the conservative choice, because
+  `withRetry` acts on `retryable` and must not act while it is unknown whether money moved.
+  `PaymentRouter` fails over on any `processing_error` whatever `retryable` says. That is
+  harmless here, because the router cascades session creation only, and the one Paysafe
+  session that calls Paysafe mints an Interac handle, which moves no money. The lookups
+  default to the last 30 days ("Default = 30 days before the endDate") against dupCheck's
+  90, so an original older than 30 days can never be read back, and the error message says
+  so. `startDate` is not widened because its maximum range is undocumented (re-verified
+  2026-09-25 on the `payments` and `paymenthandles` lookups: a date with that default and
+  no stated limit); the sandbox check is an open item below. For a bank debit the gap has a
+  second effect (2026-09-25): a failed attempt 31 to 90 days old is out of the lookup's
+  sight but still trips `dupCheck`, so every attempt under the key is refused, and retrying
+  under it cannot get past that. The refusal's error therefore does not say "never a new
+  one": it states the 90- and 30-day windows, that what refuses the key may be a payment
+  the lookup does not show yet or a failed attempt older than the lookup, and that only
+  once a later retry still ends in the error and the Paysafe portal shows every payment
+  under it as failed or cancelled, or none at all, does the host start again under a new
+  idempotency key; a payment received, pending, processing, held or completed is live
+  (corrected 2026-09-25: "no successful payment" also matched a debit still processing,
+  and an empty portal right after the refusal may only be lagging, hence the later
+  retry). The guide adds that the replaced key is retired for good, because once the 90
+  days lapse, a completion under it would start a new debit for the order. "Never a
+  new one" stays where it holds, where the attempt may have been processed and the lookup
+  can still show it: after an unknown outcome, and on the other rejections that stand for
+  this call's own original.
+- **How recovery reads.** An original is read back up to three times, 250 and 500 ms apart,
+  each read a single attempt, which bounds a hung Paysafe to three more exchanges. The reads
+  a call makes before it writes use the usual GET retries: a completion's key, a payment
+  handle lookup, a capture or void whose pre-read shows nothing left, and a refund that
+  finds no refundable settlement.
+- **Endpoints without a usable duplicate rejection are made safe on this side.**
+  `/paymenthandles` does accept `dupCheck`. The 2026-09-24 reading that its request carries
+  none was wrong (doc-verified 2026-09-25): `paymentHandleRequest` composes
+  `paymentHandleBaseRequest` with `paymentInstrument`, whose `eftObject` defines
+  `dupCheck`, and the handle examples send it, false for ACH, Google Pay, Apple Pay and
+  Venmo and true for the Safetypay rails. The adapter still sends none. Its default there is
+  undocumented, and an attempt that follows a failed, expired or spent handle needs a new
+  handle under the same key, which a duplicate check could refuse. Handles are looked up
+  before one is minted and reused when found; an Interac session with several reuses the
+  most advanced (COMPLETED, then PAYABLE, PROCESSING, INITIATED) among those minted for its
+  customer's email. The Interac guide's handle response echoes `interacEtransfer.consumerId`
+  (doc-verified 2026-09-25), and a handle minted for another email would collect from
+  another alias, so, like a bank handle minted from other details, it is left alone and a
+  new one is minted; the addresses compare trimmed and case-insensitively, and an echo that
+  states none cannot contradict. The handle lookup's item schema (`paymentHandleResponse`,
+  composing the `x-internal` `paymentInstrumentResponse` and `interacObject`) spells the
+  echo `interacETransfer`, while every example and the Interac guide write
+  `interacEtransfer`, and the spec has no lookup example to settle it (doc-verified
+  2026-09-25), so a replay reads both spellings, and either naming another alias rules the
+  handle out. A bank-debit completion
+  reads its key's payments first, and a live one answers the replay whichever handle it
+  spent. It then reads the key's handles and reuses an uncharged one minted from the same
+  bank details. A COMPLETED handle with no payment of its own in the lookup does not prove a
+  payment exists (corrected 2026-09-25; this entry said it did). Either the lookup does not
+  show that payment yet, or Paysafe refused an attempt (5031, 3044 or 3417) and the refused
+  call spent its handle all the same, which is the plain reading of the card page's
+  "Regardless of the payments call response status, the payment handle status always
+  changes to COMPLETED when a payments call is made." The payments are read again, and the
+  call ends with the non-retryable `processing_error` rather than debit again. Its message
+  says that a refused attempt can leave a spent handle, and that once a later retry still
+  ends in the error and the Paysafe portal shows every payment under the key as failed or
+  cancelled, or none at all, the host may start again under a new key: on the plain
+  reading, retrying under the key never gets past such a handle. Sharing one key
+  across the handle and the payment follows Paysafe's own EFT examples: the handle and the
+  payment both carry `merchantRefNum` "4533863971", the payment is sent with
+  `dupCheck: true` and comes back `COMPLETED`, so the handle's use of the reference does not
+  make the payment a duplicate. Voidauths take no `dupCheck` (their schema has none), so a
+  void recovers by lookup alone: a cancel whose pre-read shows nothing left to void looks
+  for its own void first. Captures and refunds do the same when the pre-read shows nothing
+  left. All three also read the lookup after a rejection, in case Paysafe runs its state
+  check before the reference check. Settlement, refund and void records name no payment and
+  the lookups are account-wide, so capture, cancel and refund keys must be unique across
+  the account. Customer creation, vault saves and deletes read back through the Customer
+  Vault instead of re-sending: profiles by `merchantCustomerId`, and saves by the
+  `merchantRefNum` that vault handles carry. The Scheduler create and cancel keep their
+  lookup and re-fetch recovery and are no longer re-sent after a timeout or 5xx.
+- **The timeout bounds one exchange, not a call.** A read makes up to
+  1 + `maxNetworkRetries` attempts, and a write up to 1 + `maxNetworkRetries` attempts with up
+  to three reads after the last one, so one write step stays within
+  (1 + `maxNetworkRetries`) × 4 exchanges, plus 1 + `maxNetworkRetries` for each read the
+  call makes first. If Paysafe hangs on every exchange, that is minutes at the defaults. The
+  config docs and the setup guide say so, and tell hosts on platforms that end requests
+  after 25-30 seconds to lower `requestTimeoutMs` and `maxNetworkRetries` and to replay a
+  call the platform ended with the same key.
+- **The test double models the documented behaviour.** It answers 409/5031 under `dupCheck`
+  (or 402/3044), spends single-use handles (5283 on reuse), including on a 5031, 3044 or
+  3417 refusal, the plain reading of the card page, with a switch for the other reading
+  (2026-09-25), keeps a clock so that its lookups show the last 30 days while `dupCheck`
+  counts 90 (2026-09-25), records declined payments and
+  verifications with their handle tokens, answers the capture, refund and void state checks
+  with the documented 402 codes (3203/3204, 3402/3404, 3501/3502) and an unknown settlement
+  with 400/3407, serves the six lookups, accepts `dupCheck` on handles, echoes the Interac
+  alias on its handles, and takes the
+  dangerous reading wherever Paysafe documents nothing: a repeated reference without
+  `dupCheck` is processed again. Against it the previous adapter failed the conformance
+  "same key twice, same result" case, which it had only passed because the old fake echoed
+  replays. The suite passes unchanged.
+- **Open, to settle in the sandbox:**
+  - **What a second same-key payment answers while the first is still processing.**
+    Undocumented, and it decides whether a payment, settlement or refund could ever be
+    re-sent after an unknown outcome. Charge a saved card for the simulator's amount 95
+    ("Approved with 30-second delay"), send the same request with the same
+    `merchantRefNum` and `dupCheck: true` during the delay, and record whether the second
+    answers 5031, 3044 or 3417 or is processed as a second payment, and how many payments
+    the lookup then shows. The integration suite carries this probe. Until it is settled,
+    those writes are not re-sent.
+  - **A second payment under one reference with `dupCheck: false`.** The spec implies it is
+    allowed ("unique for each request if dupCheck parameter is sent as "true""). Decline a
+    card under one key, pay with another card under the same key, and confirm it goes
+    through. Also record whether `/payments` defaults to `dupCheck: true` when the field is
+    omitted, as the Interac response echo suggests.
+  - **Whether `/paymenthandles` applies a duplicate check when `dupCheck` is omitted.** If it
+    does, a new handle under a key whose earlier attempt failed would be refused, and the
+    adapter would end that attempt with the non-retryable `processing_error` instead. Mint
+    two EFT handles under one reference without the field.
+  - **How a lookup answers an unknown reference.** An empty collection or 404/5269; both
+    are handled.
+  - **How long the lookup trails a write.** This sizes the three bounded reads.
+  - **Whether a declined payment's lookup record carries `status`, `error` and
+    `paymentHandleToken`.** The simulator's only decline example shows `error`, `id`,
+    `merchantRefNum` and `settleWithAuth` with no `paymentHandleToken` or `status`, so a
+    failure that names no handle is never taken as a single-use spend's own record: it
+    is an earlier attempt's, a new card or bank account is sent under the key, a replay of
+    the declined card itself ends in the non-retryable `processing_error` (nothing ties
+    the decline to it), and a bank debit counts each such failure against one spent
+    handle. Record the shape.
+  - **Lookups ask for 50 records, the documented maximum** (default 10, order
+    undocumented), and a full page is refused with the non-retryable `processing_error`
+    instead of being paged through or read as complete: a key holding that many records
+    in the 30-day window is reconciled in the portal.
+  - **Whether a refused payments call spends its handle.** The adapter and the test double
+    take "regardless of the payments call response status" plainly: a 5031, 3044 or 3417
+    refusal leaves the handle COMPLETED with no payment, and a bank-debit key holding one
+    ends every retry in the non-retryable `processing_error` until the host starts again
+    under a new key, once the portal shows no live payment under it. Probe: decline a bank
+    debit under a key K, mint a fresh handle and pay it under K with `dupCheck: true`,
+    expect 5031, then `GET /paymenthandles/{id}` and record the handle's status. PAYABLE
+    would mean a refusal leaves the handle payable, and the key could then debit once the
+    failure shows. Record the same for a 400 that files no payment (5068).
+  - **Whether the lookups accept a 90-day `startDate` range.** The `payments` and
+    `paymenthandles` lookups document `startDate` as "Default = 30 days before the endDate"
+    and state no maximum range, so the adapter reads the default window. Under a reference
+    last used 31 to 90 days ago, send both lookups with `startDate` 90 days back and record
+    whether the old records come back or the range is refused. If it works, a bank debit
+    can see the failed attempt that refuses its key and send corrected details without
+    `dupCheck`, instead of ending in the new-key guidance.
+  - **Card and Interac completions, not built:** the bank-debit rule above, `dupCheck: true`
+    until a failed attempt shows, would also refuse a card completion retried with a fresh
+    tokenization while the first payment trails the lookup, and the second of two sent
+    together. It waits on the in-flight answer above; the bank-debit case was built first
+    because an identical resubmission, the common retry, debited twice there.
+
+## Worldline decline codes (2026-09-25)
+
+- **The `errorCode`s Worldline documents map onto the taxonomy; any other code stays
+  `card_declined` on a 402, and on a REJECTED payment its error's own status decides.**
+  Doc-verified 2026-09-25 against the API Troubleshooting page
+  (docs.direct.worldline-solutions.com/en/integration/api-developer-guide/api-troubleshooting,
+  "Fix errors.errorCode" and "Payment retry guidelines") and the Sips response-code mapping
+  (docs.direct.worldline-solutions.com/en/migrate/migrate-from-sips/response-codes-mapping,
+  whose third column is the Direct `errorCode`). `fraud_suspected`: 30431001 ("the card used
+  has been reported as stolen"), 30411001 ("Lost card, pick up"), 30071001 ("Pick up card,
+  special condition (fraud account)"), 30591001 ("the card used has been used for fraudulent
+  transactions"), and 30001100, 30001101, 30001102, 30001104, 30001105, 30001106, 30001120,
+  30001130, 30001140, 30001141, 30001142, 30001143, 30001158 and 30001180, each "Your Fraud
+  Prevention module rejected the transaction because …". `invalid_card_data`: 30141001
+  ("Invalid card number"; Sips "Invalid PAN") and 30151001 ("No such issuer").
+  `expired_card`: 30331001 and 30541001 (Sips "Payment mean expired"). `insufficient_funds`:
+  30511001. `authentication_required`: 40001134 ("a failed 3-D Secure check") and 40001139
+  ("As the issuer insists on 3-D Secure, the transaction was rejected"; Sips A1, "the 3-D
+  Secure authentication data is missing"). `processing_error`: 40001135 and 50001081 ("the
+  issuer was not available to confirm the identity of the cardholder"), 40001137 ("our
+  platform could not roll out 3-D Secure"), 40001138 ("due to an unexpected failure"),
+  40001146 ("could not be completed within the given time"), and the Sips page's 30911001
+  ("Payment mean issuer inaccessible"), 30681001 ("Response not received or received too
+  late"), 30991001 ("Incident with initiator domain") and 30201001 ("Invalid response (error
+  in server domain)"). `invalid_request`: 30031001 ("your MID (merchant ID) is not working properly"; Sips
+  "Invalid acceptor"), 50001087 (3-D Secure could not run "because there was an technical
+  issue with your request") and the Sips page's 30301001 ("Format error"). This supersedes
+  the 2026-07-14 "Decline sub-codes" item.
+- **Stolen, lost and fraud-module rejections are `fraud_suspected`, as in the other
+  adapters.** The Stripe server adapter maps `stolen_card`, `lost_card`, `fraudulent` and
+  `merchant_blacklist` there, and the merchant's own Fraud Prevention rules and blacklists are
+  the analogue of `merchant_blacklist`. The PayZen adapters map the acquirer response codes 41
+  (lost), 43 (stolen) and 59 the same way, and the Sips page gives those codes as 30411001,
+  30431001 and 30591001. The rest agrees too: PayZen's 14, 33/54 and 51 (`invalid_card_data`,
+  `expired_card`, `insufficient_funds`) are Sips 14, 33/54 and 51, that is 30141001,
+  30331001/30541001 and 30511001, and both read a missing strong authentication as
+  `authentication_required` (1A, which the PayZen server adapter labels "SCA soft decline";
+  Sips A1, which the page maps to 40001139). The customer learns nothing more: the catalog
+  message for `fraud_suspected` is the generic "Your card was declined.", and Worldline's
+  `message` is never relayed, since the API contract
+  (payment.preprod.direct.worldline-solutions.com/v1/public-contract-definition.yaml,
+  v2.507.0) describes it as "not meant to be relayed to customer as it might tip off people
+  who are trying to commit fraud". The answer stays whole on `raw`.
+- **The 3-D Secure failures and an unreachable issuer are `processing_error`, and none of the
+  mapped codes is retryable.** Worldline calls 40001135/50001081 and 40001137 "out of your
+  control", advises resubmitting later or offering another payment method for them and for
+  40001138, and asks the merchant to contact it about 40001146. `card_declined` would tell the
+  customer the card is at fault, and `authentication_required` would send them back to a 3-D
+  Secure step that could not complete. 30911001 and 30681001, an issuer out of reach and a
+  response that never came or came too late, and 30991001 and 30201001, incidents on the
+  acquiring side, follow the Adyen adapter's reading of Issuer Unavailable (refusal 9), also
+  `processing_error`. `retryable` means replaying the call
+  under the same idempotency key, and Worldline answers such a replay with "the same outcome
+  as the original request, even with different payloads" for its idempotence period, "at
+  least 24 hours"
+  (docs.direct.worldline-solutions.com/en/integration/api-developer-guide/idempotent-requests),
+  so a same-key retry only replays the rejection. `PaymentRouter` fails over on any
+  `processing_error` whatever `retryable` says, which is harmless here: it cascades session
+  creation only, and a Worldline session is an amountless CreateHostedTokenization. The
+  contract's `aPIError.retriable` flag reads "the same request can safely be sent again with a
+  new idempotence key", a new attempt rather than a replay; the adapter does not read it, and
+  the transport retries are unchanged.
+- **A failed cardholder authentication is `authentication_required`; a 3-D Secure that could
+  not complete is `processing_error`.** The first is Worldline 40001134, Adyen refusal 11 ("3D
+  Not Authenticated") and Stripe `authentication_failure`: the customer can authenticate
+  again, and Worldline's entry for 40001134 names "legitimate authentication failures (i.e.
+  technical problem with your customers' device or network, missing card readers or forgotten
+  PIN codes) or fraud attempts". The second is 40001135/50001081, 40001137, 40001138 and
+  40001146, where the issuer, the acquirer or the platform could not complete 3-D Secure:
+  authenticating again now does not help, and Worldline advises another payment method or a
+  later attempt (for 40001146, contacting it). The Adyen adapter maps its refusal 42 to
+  `authentication_required`, although Adyen's refusal-reasons page
+  (docs.adyen.com/development-resources/refusal-reasons) reads "The 3D Secure authentication
+  failed due to an issue at the card network or issuer". That is inconsistent with this
+  reading, and it is tracked in #217. The Stripe entry's `authentication_failure`
+  bullet carries the same clarification.
+- **The merchant's set-up and request refusals are `invalid_request`.** 30031001 is the
+  acquirer refusing the merchant id: Worldline asks the merchant to "Contact us and your
+  acquirer to make sure that the MID properly set up on our side and your acquirer's side",
+  and the Statuses page (docs.direct.worldline-solutions.com/en/integration/api-developer-guide/statuses)
+  names MIDs that are "not correctly setup" among the causes of an authorisation declined
+  (status 2). 50001087 is a request 3-D Secure could not run on, and 30301001 ("Format
+  error") an integration error. The merchant has to act: `processing_error`'s "please try
+  again" cannot help, and `card_declined`'s "use another card" helps only when that card
+  goes through another, working MID. The PayZen server adapter maps its merchant-configuration
+  refusals the same way (PSP_100, the REST API not enabled on the shop; PSP_109, production
+  mode not activated; PSP_610, no acceptance agreement). Its CB network table does not yet:
+  PayZen's acquirer codes 03, 30, 68 and 91, the Sips codes behind 30031001, 30301001,
+  30681001 and 30911001, stay `card_declined` there, tracked in #218.
+- **A 429 or a 5xx is classified by its status before any code.** Before, a 5xx carrying a
+  mapped code (30511001, say) came out as a non-retryable decline and skipped the transport
+  retries. The order is now: 429 or 5xx; the code map; 402 → `card_declined`; 409 → the
+  retryable `processing_error` of a replay racing its in-flight original; core's
+  `classifyHttpFallback`. The code is the first `errors` entry's `errorCode`, else its
+  deprecated `code` ("Use errorCode instead"), an empty `errorCode` counting as none, and it
+  is looked up among the map's own keys only.
+- **A 2xx CreatePayment carrying a REJECTED payment maps from the payment's own errors.** The
+  contract's `paymentStatusOutput` says "In case of failed payments and negative scenarios,
+  detailed error information is listed" in `errors`, the same `aPIError` array as an error
+  body, and the troubleshooting page's "Transaction exception" example shows a REJECTED
+  payment carrying `statusOutput.errors`. `payment.statusOutput.errors[0]` now goes through
+  the same map, never retryable, with the whole CreatePayment response on `raw`. This
+  refines the 2026-07-14 "Decline HTTP shape" item, which made every such payment a
+  `card_declined`. That example's error is 50001066 `INVALID_VALUE` with `httpStatusCode`
+  400, and no page documents the code. So on a REJECTED payment an error without a mapped
+  code is read by its embedded `httpStatusCode`: a 4xx other than 402 is `invalid_request`,
+  since Worldline refused the request rather than the card; a 5xx is `processing_error`,
+  since the platform failed rather than the card, and not `psp_unavailable`, which is always
+  retryable while a replay under the key answers the same rejected payment; anything else, a
+  missing status included, is `card_declined`.
+- **Plain declines stay `card_declined`.** 30051001 ("Do not honour"), 30121001, 30571001,
+  30581001, 30621001, 30921001, 33000972, 33000973, 33000975 and 33000833 reach it through the
+  402 default. 30041001 and 30171001 keep explicit entries because their descriptions invite
+  another reading. The troubleshooting table gives 30041001 for a card that "Has expired" or
+  "Is under suspicion of fraudulent use", its retry list calls it "Pick up card (no fraud)",
+  and the Sips page sends both acquirer 04 ("Keep the payment mean") and 07 ("Keep the payment
+  mean, special conditions") to it, so the conservative reading claims no fraud. 30171001 is
+  the customer cancelling "on the Hosted Checkout Page by clicking on the "Cancel" button"
+  (the code comment used to say "at the acquirer"). The two pages also disagree on 30581001
+  (a corporate card; Sips "Transaction forbidden to the terminal") and 30621001 ("(security)
+  restrictions"; Sips "Transaction awaiting payment confirmation"), declines either way, and
+  the Sips page maps acquirer 65, "Allowed number of daily transactions has been exceeded", to
+  40001139 as well; the troubleshooting page's reading decides. Sips codes left at the
+  `card_declined` default on purpose: 30941001 ("Duplicated transaction"), 30311001 ("Id of
+  the acquiring organisation unknown"), 30131001 ("Invalid amount") and 30251001
+  ("Transaction not found"), whose Direct meaning no page states.
+- **Recorded for a future dunning signal, not implemented.** The retry guidelines list
+  "Non-Retriable Errors", which "indicated permanent issues with the transaction. We strongly
+  recommend not resubmitting the payment request": 30041001, 30071001, 30121001, 30141001,
+  30151001, 30411001, 30431001, 30571001, 33000972, 33000973, 33000975 and 33000833. For every
+  other code, "You can retry, but limit to a maximum of 10 attempts within 30 days to stay
+  compliant with card scheme guidelines and avoid potential fees." Both concern
+  merchant-initiated resubmissions under the Card On File framework. Core cannot express
+  either today: `retryable` covers same-key replays only, with no "never resubmit this card"
+  signal and no attempt budget, and the Worldline adapter declares no vaulting, so no
+  merchant-initiated retry runs through it yet.
+- **Doc-derived only.** No sandbox run has observed a Worldline `errorCode` yet: which code the
+  sandbox's 1302 decline carries, and whether any decline arrives as a 2xx REJECTED payment
+  rather than a 402, remain open.
+
+## Subscription renewals without a definitive answer (2026-09-25)
+
+- **A renewal charge that fails without saying whether money moved is replayed under its
+  own key, never re-keyed.** Until now every failed renewal moved on to a new attempt key
+  (`-a<failedAttempts>`), so a charge whose answer was lost, a timeout after the PSP had
+  processed it, could be charged again by the next dunning run. The manager now classifies
+  each failure. Definitive: `card_declined`, `insufficient_funds`, `expired_card`,
+  `invalid_card_data`, `authentication_required`, `fraud_suspected`, `invalid_request`,
+  `session_expired`, `unsupported_operation`, a charge that resolved as failed, canceled
+  or requiring action, and a pending renewal resolved as failed. Uncertain:
+  `psp_unavailable`, `rate_limited`, `unknown`, any code added to the taxonomy later, and
+  any error marked `outcomeUnknown`. An uncertain failure pins `renewalAttempt.replay` (the
+  key and the request as sent), and later charges of the period repeat that request. The
+  whole request is kept because a reused key with other parameters is refused or misread.
+  Stripe's idempotent-requests reference: "The idempotency layer compares incoming
+  parameters to those of the original request and errors if they're not the same".
+  Worldline's idempotent-requests guide: "Our server will respond with the same outcome as
+  the original request, even with different payloads." Both doc-verified 2026-09-25.
+- **A replay reads the original back only where the PSP, or its adapter, makes it so.**
+  Stripe keeps the result of a request that began executing: "Subsequent requests with the
+  same key return the same result, including 500 errors" (idempotent-requests reference).
+  Paysafe refuses a reused `merchantRefNum` under `dupCheck` (409/5031) rather than
+  replaying it; its adapter reads the original back by `merchantRefNum` (PR #198) and marks
+  what it cannot read back `outcomeUnknown`, as it does a key holding several records or a
+  full lookup page, where it cannot tell which record is the call's own. A PSP that neither
+  keeps results nor has an adapter doing so gains nothing from the replay, which is why
+  core gained `PayFanoutError.outcomeUnknown` and why every refusal of a reused key must
+  carry it unless the adapter has read the key's first request back as the call's own, or as
+  one that finally moved no money (narrowed 2026-09-25 from any read-back): Stripe's
+  `idempotency_error` now does, since it proves the key's first request ran, and so does
+  Paysafe's refusal of a key another request holds (`invalid_request`) while that request's
+  payment, settlement or refund may have moved money (corrected 2026-09-25: it carried none;
+  see "Renewal re-key paths").
+- **`processing_error` is replayed once.** Stripe's adapter maps the card-error code
+  `processing_error` to it, and Stripe's decline-codes page says "Ask the customer to
+  attempt the payment again"; Stripe answers a reused key with the saved result of the
+  first request, so a second `processing_error` for the same request is that attempt's own
+  answer, and the retry moves on to a new key. An adapter that means "outcome unknown" by a
+  `processing_error` marks it `outcomeUnknown`, which is never re-keyed.
+- **Replays run inside a window, then freeze.** Stripe's low-level error guide: clients
+  "can safely retry requests that include an idempotency key as long as the second request
+  occurs within 24 hours", and a `500` is "indeterminate": "the idempotency-cached response
+  to those requests won't change", while Stripe may still complete the operation and "fire
+  webhooks for new objects that are created" (doc-verified 2026-09-25). A replay after the
+  key expired is a new charge, so replays follow `replayDelaysMinutes` (default 5, 30, 120,
+  360 and 720 minutes) only within `replayWindowHours` (default 24) of the first send. Past
+  that, or with the schedule spent, the pin is `frozen`: the cron sends nothing more, emits
+  `subscription.charge_pending`, and waits for `resolvePendingRenewal`, as it does for a
+  pending renewal. An unsettled charge never counts for dunning; settling it as failed
+  does. An earlier draft kept replaying at the dunning pace after a spent run; that was
+  dropped, because a replay 24 or 72 hours later can reach a PSP that no longer holds the
+  key. The price is that a charge left unanswered for the whole window waits for the host.
+- **The key rides the charge.** Every renewal charge carries `payfanout_renewal_key` in its
+  metadata, derived from the key so a replay stays identical, following Stripe's advice to
+  "send in a local identifier with the metadata" to cross-reference objects created during
+  an incident. `resolvePendingRenewal` settles a pin only when given that key: a failure
+  webhook alone cannot, because the payment it names may belong to an earlier attempt, and
+  a failure naming an earlier attempt's key is a no-op. Settling as succeeded requires the
+  payment id and refuses the previous period's. `parseRenewalIdempotencyKey` reads the
+  subscription back from a key for PSPs that store no metadata (Paysafe echoes the key as
+  `merchantRefNum`).
+- **Attempt numbers never go back.** `renewalAttempt.attempt` carries the period's next
+  number, so a token change, which resets `failedAttempts`, no longer reuses `-a0`, and
+  `PendingRenewal.attempt` is the number of the key the pending charge used, no longer
+  copied into `failedAttempts` when it resolves as failed. A pinned charge of a card the
+  host has since replaced is replayed first, since it may have paid the period, and a
+  decline of a replaced card, replayed, in flight or pending, costs the new card nothing.
+  Plan and metadata changes wait for the pin the same way, and so does `cancelAtPeriodEnd`:
+  a charge that went through moves the period end. A token change on a `past_due` record
+  sets `nextRetryAt` to now instead of deleting it, so a store querying `nextRetryAt` still
+  finds it.
+- **Overtaken answers are dropped.** An answer that reaches the store after an overlapping
+  run collected the period, or settled or made pending the same attempt, changes nothing;
+  a settlement the host applies is authoritative for its attempt. Resume refuses while a
+  pin is open, and a canceled record keeps its pin for reconciliation. Before a replay the
+  manager checks the service can still send it (the adapter is registered and supports
+  saved payment methods); otherwise the pin stays.
+- **Stores that drop `renewalAttempt`** would replay every few minutes forever, so after
+  saving a pin the manager reads the record back, and when it comes back as that write
+  without the pin, the failure counts for dunning at once: nothing is replayed under the
+  same key, and the retry follows `retryDelaysHours` under the next attempt number, as
+  releases before pins did. Only fields older than `renewalAttempt` are compared (status,
+  period, `failedAttempts`, `lastError.code`), since that is what a schema from before the
+  field keeps; any other write landing between the save and the read keeps the pin's key.
+  An earlier draft inferred a dropping store from `lastError.code` alone. It counted the
+  retry of a record the previous release had left `past_due` after a timeout as a second
+  failure, so a lost `-a1` was followed by `-a2` for the same period, and it replayed an
+  `invalid_request` marked `outcomeUnknown` without bound on a store that really drops the
+  field. The changeset leads with the requirement to persist the field.
+- **A late freeze re-reads the record.** Freezing a pin whose window has passed changes only
+  that pin's `frozen` flag on the record as it stands, and leaves the record alone when its
+  period moved or its pin changed. It used to write back the record read at the start of
+  the run, so a cancel landing in between was lost, and settling the pin later made the
+  canceled subscription `active` again.
+- **An answer to another request under the pinned key never settles the pin.** A card or
+  plan change while a renewal charge is in flight can make an overlapping run send a
+  different request under the same key. The PSP holds the first one it received, which
+  neither run knows. The pin keeps the request it was first pinned with, and an answer to
+  another request is dropped, but it marks the pin `contested`: from then on a failure of
+  the pinned request freezes the pin instead of moving on to a new key, because it may be
+  the PSP refusing the other request, and Paysafe answers a replay of a request it does not
+  hold under a key with `invalid_request`. Without the mark, a run whose request was pinned
+  first but reached Paysafe second would be refused that way once Paysafe's lookup showed
+  the other payment, and `-a1` would charge the period again. A contested pin still settles
+  on a success. Neither keeping the first pinned request nor taking the latest answer's, as
+  an earlier draft did, is safe alone: each leaves one arrival order charging the period
+  twice on Paysafe. Together they cover the orders in which a pin exists before the other
+  request's answer arrives, not every order: when the refusal of the pinned run's request
+  lands before any pin, only the adapter marking that refusal `outcomeUnknown` keeps the
+  period on its key (corrected 2026-09-25; see "Renewal re-key paths").
+- **`listDue` leaves out records waiting for `resolvePendingRenewal`.** A frozen pin has no
+  `nextRetryAt`, so a store falling back to `currentPeriodEnd` returned it first on every
+  call, and a full batch of them, which one PSP incident can produce, held back every other
+  due record. The cron does nothing for a frozen pin or a pending renewal (no polling), so
+  `InMemorySubscriptionStore.listDue` leaves both out and the `listDue` contract asks host
+  stores to do the same.
+- **`subscription.past_due` fires when a pin changes the status**, not on every replay;
+  `subscription.charge_failed` fires once per uncertain answer, with its error. A failed
+  attempt under dunning still emits `subscription.past_due` each time, as before, since it
+  starts a new retry schedule.
+
+## PayPal: captures after a reauthorization (2026-09-25)
+
+Doc-verified 2026-09-25 against the Payments v2 (2.12) and Orders v2 (2.36) schemas under
+developer.paypal.com/api/, the Authorize and capture page (`/v5/checkout/auth-capture`,
+where `/docs/checkout/standard/customize/authorization/` now redirects), the Authorization
+and honor period page (`/payment-methods/auth-honor`), the Extend an authorization guide
+(`/checkout/extend-authorization`) and the webhook event names page.
+
+- **The newest authorization that was not denied carries the hold, and captures go to it.**
+  Reauthorize "Reauthorizes an authorized PayPal account payment", and its example answers
+  with an authorization id different from the one reauthorized; the Extend guide says it
+  generates "a new authorization with a refreshed expiration date". The capture target is
+  guide-only: the Authorize and capture page ("A reauthorization generates a new
+  authorization ID and restarts the 3-day honor period. Use the new authorization ID on
+  subsequent captures") and the honor period page ("Perform any subsequent capture against
+  the new authorization ID, not the original"); the Authorize and capture page's capture step
+  also reads "The authorization ID is either the original authorization ID or the ID from
+  reauthorizing the transaction". The adapter captures and reports against the newest
+  authorization by `create_time`, then list position, and treats an older one as superseded
+  whatever its status. One reporting no `create_time` sorts as the oldest, so the list's
+  arrangement decides ties only: with A undated, B five days in and C one day in, listed B,
+  A, C, the former comparator took C, and B is taken now. A denied newer authorization is
+  skipped, since it replaced nothing. The adapter never reauthorizes itself; this covers a
+  host that reauthorizes through PayPal.
+- **Voids go to the original.** `CANNOT_BE_VOIDED`: "A reauthorization cannot be voided.
+  Please void the original parent authorization." / "You cannot void a reauthorized payment.
+  You must void the original parent authorized payment." `cancelPayment` voids the oldest
+  authorization unless the one holding the funds already reports `VOIDED`. No documented field
+  ties a reauthorization to its parent (an order's authorization links to itself, its capture,
+  void and reauthorize operations and the order), so age decides. AMBIGUOUS: the reauthorize
+  200 and 201 examples, and the Authorize and capture page's sample, show a `void` link on the
+  new authorization, and no page says what either authorization reports once the original is
+  voided. The fake voids both and answers `CANNOT_BE_VOIDED` for a reauthorization. An original
+  that already reads `VOIDED` next to a live reauthorization gets the void anyway, and PayPal's
+  refusal (`PREVIOUSLY_VOIDED`, "Authorization has been previously voided and hence cannot be
+  voided again.") surfaces instead of a `canceled` the adapter cannot confirm.
+  `CANNOT_BE_VOIDED` and `PREVIOUSLY_VOIDED` map to `invalid_request`, not retryable, as
+  `PREVIOUSLY_CAPTURED` does.
+- **Capturing the rest never reaches past the order.** An empty-body reauthorization
+  reauthorizes "the full amount" (the schema's "Reauthorize with empty request body" flow; the
+  Extend guide's "Reauthorize for the same amount" sends `{}`), so after a partial capture the
+  new authorization can hold again what was taken. The remainder, and `amountCapturable`, is
+  the lesser of the holding authorization's amount less the captures taken from it and the
+  order amount less every capture on the order that took money, in integer minor units and
+  never below zero. When captures name their authorization it is exact whether the
+  reauthorization is for the full amount or for what was left. An order read reporting no
+  amount (the Orders v2 response schema does not require one) is measured by the original
+  authorization's amount, which is the order amount: the Orders v2 authorize request takes no
+  amount, and an order "with the `COMPLETED` status" cannot be updated. It was measured by the
+  holding authorization before, and a reauthorization can hold "up to 115% of original" (the
+  Extend guide), so a 23.00 reauthorization after 2.00 was taken from a 20.00 order read
+  21.00 left where 18.00 is. When neither the order read nor the original reports an amount,
+  capturing the rest of a reauthorization needs an explicit amount (without one PayPal takes
+  the reauthorization's full amount), and `amountCapturable` is left out.
+  Capturing the rest answers with the payment once the order's captures cover the order
+  amount. A holding authorization that reports no amount gets what the order has left as an
+  explicit amount while nothing is captured, where it went out with no amount before (PayPal:
+  "If amount is not specified, the full authorized amount is captured"), and needs an explicit
+  amount once any capture on the order took money, not only one of its own; an explicit amount
+  then closes it only when it takes all the order has left. `MAX_CAPTURE_AMOUNT_EXCEEDED` caps
+  "the sum of all captures to be up to 115% of the order amount" (its example says "You can
+  only capture up to the original authorization amount"), and the honor period page caps
+  captures at "up to 115% or $75 USD more than the original authorized amount, whichever is
+  less", so an explicit amount still goes to PayPal as it is. The fake enforces both, the
+  second against each authorization's own amount (USD 75 applied in USD only). AMBIGUOUS:
+  which cap PayPal applies to the captures from a reauthorization, its own amount, the
+  original's or only the order's; no page says.
+- **Captures count against the authorization they name, else by time (AMBIGUOUS on the order
+  read).** `supplementary_data.related_ids.authorization_id` is a Payments v2 capture field,
+  and a Payments v2 capture's `up` link points to its authorization. The Orders v2 capture
+  schema has no `supplementary_data` or `related_ids`, and its examples link `up` to the
+  order, so an order read may name no authorization at all. A capture naming none counts
+  against every authorization created no later than it, by `create_time`, since an
+  authorization cannot give a capture taken before it existed. The former rule counted every
+  capture against the new authorization once one named none: on a 20.00 order with 7.00
+  taken and a reauthorization of the 13.00 left, the rest read 6.00 and its capture went out
+  final, closing the reauthorization with 7.00 still on it (an explicit 10.00 went out final
+  too, leaving 3.00), so the next capture met `AUTHORIZATION_ALREADY_CAPTURED`. A missing
+  `create_time`, on the capture or on an authorization, rules nothing out, which errs low;
+  the order clamp still bounds the result. AMBIGUOUS: the Orders v2 capture schema defines
+  `create_time` (through `activity_timestamps`, "The date and time when the transaction
+  occurred") and the Orders v2 capture examples carry it, but no example shows the captures
+  of an AUTHORIZE order's read. An estimate never closes a hold: when a capture naming no
+  authorization took money and another authorization could have given it, the capture goes
+  out with `final_capture: false`, even when it takes the whole estimate, and only a capture
+  of all the order has left closes the authorization. That holds even when the holding
+  authorization still covers what the order has left: a final capture the count relies on,
+  taken from the superseded original outside the adapter, may not have closed this one
+  (review of 2026-09-25). The hold stays open for whatever the
+  estimate missed, which a capture with an explicit amount can take; once the estimate
+  reaches zero, capturing the rest answers with the payment, as when captures cover the
+  authorization, and `amountCapturable` reads 0. What is never captured is left to expire:
+  `cancelPayment` voids only an authorization with no capture yet, so it releases nothing
+  here. The fake's order reads carry no attribution unless a test opts in, which makes the
+  time rule the default path, and its reauthorizations are stamped by its own clock, moved
+  on four days first; it refuses to reauthorize an original that is voided
+  (`AUTHORIZATION_VOIDED`, "A voided authorization cannot be captured or reauthorized") or
+  fully captured (the Extend guide lists "authorization already captured or voided" among
+  the failures). The `up` link is parsed as the order link is: one path segment, no
+  decoding.
+- **Repeatability (AMBIGUOUS).** The sources conflict. Once: `reauthorize_request` ("You can
+  reauthorize a payment only once from days four to 29", "You can reauthorize an authorized
+  payment once"), `REAUTHORIZATION_NOT_SUPPORTED` ("cannot be attempted on an authorization_id
+  that is the result of a prior reauthorization"), `REAUTHORIZATION_TOO_SOON` ("only allowed
+  once from Day 4 to Day 29") and the Extend guide ("Each authorization can be reauthorized a
+  single time"). Several: the reauthorize operation ("you can issue multiple
+  re-authorizations after the honor period expires"), the Authorize and capture page, and the
+  honor period page, whose table shows a "Reauthorization 2" on day 8. The adapter reads any
+  number of authorizations and reauthorizes none.
+- **The original's status after a reauthorization (AMBIGUOUS).** No page says it. The tests
+  cover it staying `CREATED` and turning `VOIDED`; capturing and reporting behave the same
+  either way.
+- **Webhooks (AMBIGUOUS).** `PAYMENT.AUTHORIZATION.VOIDED` still maps to `payment.canceled`.
+  The event names page gives its causes as the authorization "reaching its 30 day validity
+  period" or being "manually voided using the Void Authorized Payment API", and neither it nor
+  the Payments v2 callbacks name a reauthorization event. A `VOIDED` event for a superseded
+  original would contradict `retrievePayment`, which follows the newest authorization; the
+  guide tells hosts to re-read the payment before acting on the event.
+- **Sandbox check outstanding.** Reauthorization is refused within the honor period, so every
+  order needs an authorization at least four days old. On a first AUTHORIZE order, capture
+  part, reauthorize with an empty body, and record in an order GET the new authorization's
+  amount, both authorizations' statuses, and whether the captures carry `create_time`,
+  `related_ids.authorization_id` or an `up` link to their authorization. GET the
+  reauthorization itself (`GET /v2/payments/authorizations/{id}`) and record whether its
+  Payments v2 `supplementary_data.related_ids.authorization_id` names the parent; then
+  reauthorize a second time, from the original and from the reauthorization. On a second
+  order, capture part, reauthorize for less than what is left, and capture more than that
+  reauthorization's own amount but less than the order has left, to learn which cap applies.
+  On a third order with no capture, reauthorize, void the reauthorization (expected
+  `CANNOT_BE_VOIDED`), void the original, and record both statuses. On the first order,
+  also capture from the original after the reauthorization and record whether PayPal
+  accepts it. Record every webhook PayPal sends for all three orders.
+
+## Renewal re-key paths (2026-09-25)
+
+- **Paysafe marks its refusal of a key another live request holds `outcomeUnknown`.** The
+  final review of the renewal replays found an arrival order the `contested` mark misses.
+  Run A reads a subscription with the old card; the host sets a new one, and run B reads it.
+  B sends `-a0` with the new card, which Paysafe charges while the answer and every
+  read-back are lost. A's `-a0` with the old card is refused (5031), the lookup shows B's
+  payment, and A's `invalid_request`, a definitive code, reached the store first, before any
+  pin: the attempt moved on to 1, B's uncertain answer was dropped as overtaken, and `-a1`
+  charged the new card again. On a payment, settlement or refund, the refusal of a key whose
+  records disagree with the call (another amount, currency, type or handle) now carries
+  `outcomeUnknown` while any of those records may have moved money, since it may be the money
+  the call was meant to move, and its message says to start again under a new key only once
+  that record is known to be another one. A record that failed moved none, and nor did one
+  voided, cancelled or expired: the Payments API spec gives a payment's `CANCELLED` as "The
+  request has been fully voided (reversed)", and its settlement and refund statuses add
+  `CANCELLED` ("The transaction request is cancelled.") and `EXPIRED` ("The transaction
+  request is expired."); the adapter's portal advice and its refund's settlement filter
+  already read `CANCELLED` as no money. When every record is one of those, nothing
+  under the key moved money and the call's own request was refused (the duplicate check
+  counts failed requests, and a failed payment spent its single-use handle), so the refusal
+  keeps no flag; two requests in flight together remain the first open item of the Paysafe
+  replay entry. Payment handles, verifications and voids move no money and are unchanged,
+  except in a bank-debit completion, whose key's handles are read before the handle is
+  minted: a handle spent (`COMPLETED`, "The Payment request was initiated successfully using
+  the Payment Handle.") that no failed payment of the key accounts for may be a payment the
+  lookup does not show yet, so the refusal of another request's handle carries the flag while
+  one is under the key. A manager-over-Paysafe test runs that exact order and ends with one
+  renewal payment and the pin `contested`, then frozen; the same run without the flag charges
+  `-a1`.
+- **A store that drops `lastError` along with `renewalAttempt` no longer replays without
+  bound.** The dropped-pin check compared `lastError.code`, so on such a store it never
+  matched, and `-a0` went out every 5 minutes. A `lastError` missing from the read-back now
+  matches; a present one must still hold the saved code, and status, period and
+  `failedAttempts` still tell a host write that landed in between apart.
+- **On a store that drops the pin, a replaced card's failure no longer counts.** The
+  fallback counted every uncertain failure, so a card replaced while its charge was in
+  flight, with `failedAttempts` at the limit, canceled the subscription before the new card
+  was ever charged. That failure is now recorded as a replaced card's decline is: not
+  counted, the status as it was before the pin, and the new card due on the next run. On
+  such a store the next attempt number still comes from `failedAttempts`, as releases before
+  pins derived it, and the card change resets `failedAttempts` to 0, so the new card is sent
+  under a number the period may already have used. A PSP still holding that key refuses it
+  (Stripe removes keys only "after they're at least 24 hours old", and answers other
+  parameters with `idempotency_error`; Paysafe's duplicate check covers "the past 90 days",
+  5031), that refusal counts for dunning, and the next retry charges the new card under the
+  following number. Nothing such a store keeps can carry the period's used numbers past a
+  card change, so this stays open with the dropped pin itself; a test pins the sequence.
+- **An empty object compares like an absent field.** A pinned request and the one sent are
+  the same charge when one side has `{}` (as `metadata`, or inside `billingDetails`) where
+  the other has nothing: a store that drops empty objects, or writes them, made a replay look
+  like another request, and its own pin was marked `contested`.
+- **Conflicts with a request still in progress under the same key carry `outcomeUnknown` on
+  Adyen, PayPal and Worldline.** Doc-verified 2026-09-25. Adyen's API idempotency guide: "If
+  you submit a duplicate request before the first request has completed, the API returns an
+  HTTP 422 – Unprocessable Entity or HTTP 409 - Conflict status with the error code 704:
+  "request already processed or in progress"", and a transient error "could come from a race
+  condition of sending two payment requests with the same idempotency key at the same time.
+  One will end up being processed while the other will return a transient error." Its
+  response-handling page gives 409 as "A conflict occurred because the request was already
+  processed or is in progress." Worldline's idempotent-requests guide: "For requests in
+  progress: A response with an HTTP status code of 409 (Conflict) will indicate that the
+  request is currently being processed", and its API troubleshooting page: "Either you
+  submitted a duplicate request or you are trying to create something with a duplicate
+  key." PayPal's idempotency reference: "When you send two simultaneous API requests with
+  same `PayPal-Request-Id` header, PayPal processes the first request and might fail the
+  second request", and its Payments v2 schema documents the 409 `RESOURCE_CONFLICT` with
+  `PREVIOUS_REQUEST_IN_PROGRESS` ("A previous request on this resource is currently in
+  progress") on authorization capture and void and on capture refund. Each can be the
+  refusal of a request whose key's first request is still running and may go through, which
+  the adapter cannot read back, so a caller moving to a new key could repeat the payment,
+  capture or refund. The mappers now set `outcomeUnknown` on them (Adyen's 704, its other
+  409s and its transient 4xx; Worldline's 409; PayPal's 409), keeping their codes and
+  `retryable`. A cancel's conflict gets it too, since the flag only says that the call may
+  have taken effect. None of these adapters supports saved payment methods, so the
+  subscription engine does not reach them: the flag is for hosts.
+- **A request read back under the key keeps the flag while it may be the call's money, on
+  Adyen and GoCardless too.** Reading the key's first request back lifts the flag only when
+  it shows the call's own request, which then answers the call, or one that finally moved no
+  money; the adapter-authoring rule now says so. Doc-verified 2026-09-25. Adyen answers a
+  reused key with "the response to the first attempt" (API idempotency guide), and a capture
+  or refund answer is only an acknowledgement, `status` `received`: "Your capture request
+  will be processed asynchronously. You will receive the result in a webhook." (capture
+  guide; "The refund process is asynchronous.", refund guide). A capture or refund
+  acknowledgement echoing another amount therefore always carries `outcomeUnknown`, and a
+  completion answered with another request's stored payment carries it unless that answer's
+  `resultCode` is `Refused`, `Error` or `Cancelled`: the result-codes page lists them among
+  its "Final state result codes" with `Authorised`, and `Cancelled` is "The payment was
+  cancelled (by either the shopper or your own system) before processing was completed".
+  The same page opens with "The status of a payment can sometimes change after you get the
+  result code"; a final code is weighed as final here, and a later change reaches the host
+  by webhook.
+  GoCardless answers a consumed key with "a `409 idempotent_creation_conflict` error with a
+  `links.conflicting_resource_id` pointing to the existing resource" (limits page), which the
+  adapter reads back and compares with the call, refunds also by their key stamp. The
+  refusal now carries the flag unless that billing request is `cancelled` ("the billing
+  request has been cancelled and cannot be used"), the payment it created `failed` or
+  `cancelled` (the adapter reads `customer_approval_denied` and `charged_back` as failed
+  too), or the refund `cancelled`, `bounced` ("the refund has failed to be paid") or
+  `funds_returned` ("the refund has had its funds returned"), per the OpenAPI spec's status
+  enums. A failed GoCardless payment can be retried by an explicit
+  `POST /payments/{id}/actions/retry`, or automatically when the billing request asked for
+  `payment_request.retry_if_possible` ("On failure, automatically retry payments using
+  intelligent retries. Default is `false`"). The adapter never sends that field, so a failed
+  payment counts as final; adding the field would reopen this decision. The messages follow Paysafe's:
+  use a new key only once that record is known to be another one.
+- **Left unmarked.** PayZen has no idempotency channel, so no refusal of a reused key exists
+  to mark, and its unanswered writes stay `psp_unavailable`. Stripe does not save a request
+  that "conflicts with another request that's executing concurrently" (idempotent-requests
+  reference, doc-verified 2026-09-25); stripe-node 22.6.2 retries a 409 and raises one that
+  persists as `StripeAPIError`, which the adapter maps to `psp_unavailable`, already open. An
+  Adyen `/payments/details` answer naming another payment is no reused key's answer, since
+  that endpoint's key also covers the details: they finished the payment they were issued
+  for, and the refusal stays unmarked. A Paysafe Interac session refuses another request's
+  handle under the session key, while the payment goes under the completion key, which the
+  session cannot read, and a session moves no money.
+- **Stripe renewals charged by a release before pins.** Sent again after the upgrade under
+  the same key, now with `payfanout_renewal_key` in the metadata, such a renewal is refused
+  as a key reused with other parameters (`idempotency_error`, marked `outcomeUnknown`) while
+  Stripe keeps the key, so it is pinned and ends frozen, and the host settles it by hand:
+  the original carries only `payfanout_subscription_id`. The recurring guide says so.
+- **What stays uncovered.** A store that drops `renewalAttempt` counts an uncertain failure
+  at once and retries under a new key, and sends a card set meanwhile under a number the
+  period may have used. Two requests under one key that both reach Paysafe
+  before either is filed can both be charged. A replay is never sent past
+  `replayWindowHours`, and a lock around `chargeDueSubscriptions` removes overlapping runs
+  altogether. The recurring guide and the `chargeDueSubscriptions` JSDoc now say this
+  instead of calling concurrent runs safe for money.

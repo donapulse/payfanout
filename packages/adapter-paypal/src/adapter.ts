@@ -179,10 +179,11 @@ export class PayPalClientAdapter implements ClientPaymentAdapter {
     const cleanup = (): void => wrapper.remove();
     // PayPal's SDK reports a failed render through onError and then rejects
     // render() with the same failure: while render() is pending the callback
-    // only keeps the error, so the host hears of the failure once.
+    // only keeps each distinct error, so the host hears of every failure once.
     let rendering = true;
-    let heldError: PayFanoutError | undefined;
+    const held: PayFanoutError[] = [];
 
+    let handle: PayPalHandle;
     try {
       const buttons = paypal.Buttons({
         ...hostOptions,
@@ -207,8 +208,9 @@ export class PayPalClientAdapter implements ClientPaymentAdapter {
           // PayPal documents onError as a catch-all with nothing to handle
           // beyond a generic error message or page, so it is not retryable.
           const mapped = mapPayPalJsError(err, false);
-          if (rendering) heldError ??= mapped;
-          else if (state.waiters.length > 0) resolveWaiters({ status: "failed", error: mapped });
+          if (rendering) {
+            if (!held.some((kept) => kept.raw === err)) held.push(mapped);
+          } else if (state.waiters.length > 0) resolveWaiters({ status: "failed", error: mapped });
           else options.onError?.(mapped);
         },
       });
@@ -219,18 +221,22 @@ export class PayPalClientAdapter implements ClientPaymentAdapter {
       }
       await buttons.render(wrapper);
       rendering = false;
-      if (heldError) options.onError?.(heldError);
-      options.onReady?.();
-      const handle: PayPalHandle = { pspName: "paypal", orderId: options.clientSecret, buttons, state, cleanup };
-      return brandMountedFieldsHandle(handle);
+      handle = { pspName: "paypal", orderId: options.clientSecret, buttons, state, cleanup };
     } catch (err) {
       rendering = false;
       cleanup();
-      // The rejection stands for the failure the callback kept, if any.
+      // The rejection stands for the failure the callback kept for the same
+      // error; any other kept error is reported before it.
       const mapped = err instanceof PayFanoutError ? err : mapPayPalJsError(err, true);
+      for (const kept of held) if (kept.raw !== mapped.raw) options.onError?.(kept);
       options.onError?.(mapped);
       throw mapped;
     }
+    // The buttons are rendered: a host callback that throws from here on must
+    // not tear them down, so its exception is reported as uncaught instead.
+    for (const kept of held) callHost(() => options.onError?.(kept));
+    callHost(() => options.onReady?.());
+    return brandMountedFieldsHandle(handle);
   }
 
   /**
@@ -314,6 +320,19 @@ function asPayPalHandle(handle: MountedFieldsHandle): PayPalHandle {
  * processing_error with the raw preserved is the honest mapping. A mount
  * that throws is retryable (mounting again can succeed); onError is not.
  */
+/** Runs a host callback; its exception surfaces as uncaught, as an event listener's does. */
+function callHost(callback: () => void): void {
+  try {
+    callback();
+  } catch (hostError) {
+    if (typeof globalThis.reportError === "function") globalThis.reportError(hostError);
+    else
+      setTimeout(() => {
+        throw hostError;
+      }, 0);
+  }
+}
+
 function mapPayPalJsError(err: unknown, retryable: boolean): PayFanoutError {
   return new PayFanoutError({
     code: "processing_error",

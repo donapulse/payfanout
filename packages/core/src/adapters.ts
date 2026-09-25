@@ -514,10 +514,11 @@ export interface MountOptions {
   onReady?: () => void;
   /**
    * Errors raised while the fields are live, such as the SDK failing after
-   * mount() resolved. A failure of mount() itself rejects the returned
-   * promise; an adapter that also reports it here passes the SAME error
-   * instance to both, so a consumer listening to both reports it once by
-   * identity, as `<PaymentFields>` does.
+   * mount() resolved, or while they render: an error the SDK reports during a
+   * render that still succeeds arrives before onReady. A failure of mount()
+   * itself rejects the returned promise; an adapter that also reports it here
+   * passes the SAME error instance to both, so a consumer listening to both
+   * reports it once by identity, as `<PaymentFields>` does.
    */
   onError?: (err: UnifiedError) => void;
   /**

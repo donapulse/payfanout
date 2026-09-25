@@ -35,6 +35,8 @@ function makeFakePayPal(
     renderErrorViaOnError?: boolean;
     /** An error handed to onError during a render that still resolves. */
     renderWarning?: unknown;
+    /** Errors handed to onError, in order, before the render resolves or rejects. */
+    renderWarnings?: unknown[];
     close?: () => Promise<void>;
   } = {},
 ): FakePayPal {
@@ -57,6 +59,7 @@ function makeFakePayPal(
         isEligible: () => overrides.eligible ?? true,
         render: async (el) => {
           const onError = options["onError"] as (err: unknown) => void;
+          for (const warning of overrides.renderWarnings ?? []) onError(warning);
           if (overrides.renderError !== undefined) {
             if (overrides.renderErrorViaOnError) onError(overrides.renderError);
             throw overrides.renderError;
@@ -338,6 +341,85 @@ describe("PayPalClientAdapter", () => {
     expect(surfaced).toHaveLength(1);
     expect(surfaced[0]).toMatchObject({ retryable: false });
     expect(order).toEqual(["error", "ready"]);
+  });
+
+  it("reports every distinct error PayPal raised during a render that still succeeded, each once", async () => {
+    stubBrowser();
+    const first = new Error("popup blocked");
+    const second = new Error("funding source unavailable");
+    const flaky = makeFakePayPal({ renderWarnings: [first, second, first] });
+    const { adapter } = makeAdapter(flaky);
+    const surfaced: Array<{ raw?: unknown }> = [];
+    const order: string[] = [];
+    await adapter.mount(fakeContainer(), {
+      clientSecret: ORDER_ID,
+      onError: (err) => {
+        surfaced.push(err);
+        order.push("error");
+      },
+      onReady: () => order.push("ready"),
+    });
+    expect(surfaced.map((err) => err.raw)).toEqual([first, second]);
+    expect(order).toEqual(["error", "error", "ready"]);
+  });
+
+  it("reports an error kept during a failed render when the rejection carries another one", async () => {
+    stubBrowser();
+    const warning = new Error("popup blocked");
+    const failure = new Error("render exploded");
+    const broken = makeFakePayPal({ renderWarnings: [warning], renderError: failure, renderErrorViaOnError: true });
+    const { adapter } = makeAdapter(broken);
+    const surfaced: Array<{ raw?: unknown }> = [];
+    let rejected: unknown;
+    await adapter
+      .mount(fakeContainer(), { clientSecret: ORDER_ID, onError: (err) => surfaced.push(err) })
+      .catch((err: unknown) => {
+        rejected = err;
+      });
+    expect(surfaced.map((err) => err.raw)).toEqual([warning, failure]);
+    expect(surfaced[1]).toBe(rejected); // the rejection is reported once, by the instance it rejects with
+  });
+
+  it("keeps a rendered button when the host's onError or onReady throws", async () => {
+    stubBrowser();
+    vi.useFakeTimers();
+    try {
+      const flaky = makeFakePayPal({ renderWarning: new Error("popup blocked") });
+      const { adapter, fake } = makeAdapter(flaky);
+      const container = fakeContainer();
+      const handle = await adapter.mount(container, {
+        clientSecret: ORDER_ID,
+        onError: () => {
+          throw new Error("host onError bug");
+        },
+        onReady: () => {
+          throw new Error("host onReady bug");
+        },
+      });
+      expect(handle).toBeDefined();
+      expect(fake.created[0]!.rendered).toHaveLength(1);
+      expect(container.children[0]!.remove).not.toHaveBeenCalled();
+      // Each host exception surfaces as uncaught, on its own timer.
+      expect(() => vi.advanceTimersToNextTimer()).toThrow("host onError bug");
+      expect(() => vi.advanceTimersToNextTimer()).toThrow("host onReady bug");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("hands a host callback's exception to reportError where the platform has it", async () => {
+    stubBrowser();
+    const reported: unknown[] = [];
+    vi.stubGlobal("reportError", (error: unknown) => reported.push(error));
+    const hostBug = new Error("host onReady bug");
+    const { adapter } = makeAdapter();
+    await adapter.mount(fakeContainer(), {
+      clientSecret: ORDER_ID,
+      onReady: () => {
+        throw hostBug;
+      },
+    });
+    expect(reported).toEqual([hostBug]);
   });
 
   it("requires a clientSecret and validates foreign handles", async () => {

@@ -21,6 +21,13 @@ const INVALID_CARD_DATA_CODES = new Set([
 
 const FRAUD_DECLINE_CODES = new Set(["fraudulent", "stolen_card", "lost_card", "merchant_blacklist"]);
 
+/** A failed 3-D Secure: the general code 2026-08-26.dahlia added and the intent-specific forms before it. */
+const AUTHENTICATION_FAILURE_CODES = new Set([
+  "authentication_failure",
+  "payment_intent_authentication_failure",
+  "setup_intent_authentication_failure",
+]);
+
 /** Maps any Stripe SDK error onto the unified taxonomy, preserving the original on `raw`. */
 export function mapStripeError(err: unknown): PayFanoutError {
   if (isPayFanoutError(err)) return err;
@@ -74,6 +81,11 @@ function classify(e: StripeErrorLike): {
     }
     if (e.decline_code && FRAUD_DECLINE_CODES.has(e.decline_code)) {
       return { code: "fraud_suspected", retryable: false, message: "Your card was declined." };
+    }
+    if (e.code && AUTHENTICATION_FAILURE_CODES.has(e.code)) {
+      // Mapped as the browser adapter maps these codes and the other adapters map
+      // their failed 3-D Secure.
+      return { code: "authentication_required", retryable: false, message: userMessage };
     }
     if (e.code === "processing_error") {
       return { code: "processing_error", retryable: true, message: userMessage };

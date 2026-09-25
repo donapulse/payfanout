@@ -334,6 +334,9 @@ Implement `ClientPaymentAdapter`:
   card input. Forward `options.appearance` to the PSP's styling hooks. Return a branded
   handle via `brandMountedFieldsHandle`, and validate handles you receive back. A
   redirect-only PSP (GoCardless) may mount a lightweight explainer instead of fields.
+  A failed mount rejects; if you also report it through `options.onError`, pass the
+  same error instance to both, which consumers such as `<PaymentFields>` dedupe by
+  identity.
 - **Customization is a passthrough, not an enumeration:** forward
   `options.fieldOptions` to your SDK's field-creation call untouched (host wins), and
   `options.locale` to its locale option, protect ONLY the keys your adapter must own

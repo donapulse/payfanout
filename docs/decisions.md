@@ -2280,18 +2280,89 @@ description of what v2 changes is what the migration then had to implement.
 
 ## PayPal: captures after a reauthorization (2026-09-25)
 
-- **The newest authorization that was not denied carries the hold.** Payments v2 (doc-verified
-  2026-09-25, `/api/payments/v2/schema.json`): a reauthorization "Reauthorizes an authorized
-  PayPal account payment", may be repeated within the 29-day period, and its example answers
-  with an authorization id different from the one reauthorized; the Extend an authorization
-  guide (`/checkout/extend-authorization`) says it generates "a new authorization with a
-  refreshed expiration date". Neither says what status the original then reports, so the
-  adapter takes the newest authorization, by `create_time` and then list order, as the one
-  to capture, void and report, and an older one as superseded whatever its status. A denied
-  newer authorization is skipped, since it replaced nothing. The adapter never reauthorizes
-  itself; this covers a host that reauthorizes through PayPal. AMBIGUOUS, sandbox check:
-  reauthorize past the honor period, then GET the order and record both authorizations' status.
-- **Captures count against the authorization they name.** The remainder counts the captures
-  whose `supplementary_data.related_ids.authorization_id` (Payments v2 `related_ids`) or `up`
-  link names that authorization. When a capture names none, every capture counts, so the
-  remainder errs low and a capture never reaches past the hold.
+Doc-verified 2026-09-25 against the Payments v2 (2.12) and Orders v2 (2.36) schemas under
+developer.paypal.com/api/, the Authorize and capture page (`/v5/checkout/auth-capture`,
+where `/docs/checkout/standard/customize/authorization/` now redirects), the Authorization
+and honor period page (`/payment-methods/auth-honor`), the Extend an authorization guide
+(`/checkout/extend-authorization`) and the webhook event names page.
+
+- **The newest authorization that was not denied carries the hold, and captures go to it.**
+  Reauthorize "Reauthorizes an authorized PayPal account payment", and its example answers
+  with an authorization id different from the one reauthorized; the Extend guide says it
+  generates "a new authorization with a refreshed expiration date". The capture target is
+  guide-only: the Authorize and capture page ("A reauthorization generates a new
+  authorization ID and restarts the 3-day honor period. Use the new authorization ID on
+  subsequent captures") and the honor period page ("Perform any subsequent capture against
+  the new authorization ID, not the original"); the Authorize and capture page's capture step
+  also reads "The authorization ID is either the original authorization ID or the ID from
+  reauthorizing the transaction". The adapter captures and reports against the newest
+  authorization by `create_time`, then list position, and treats an older one as superseded
+  whatever its status. One reporting no `create_time` sorts as the oldest, so the list's
+  arrangement decides ties only: with A undated, B five days in and C one day in, listed B,
+  A, C, the former comparator took C, and B is taken now. A denied newer authorization is
+  skipped, since it replaced nothing. The adapter never reauthorizes itself; this covers a
+  host that reauthorizes through PayPal.
+- **Voids go to the original.** `CANNOT_BE_VOIDED`: "A reauthorization cannot be voided.
+  Please void the original parent authorization." / "You cannot void a reauthorized payment.
+  You must void the original parent authorized payment." `cancelPayment` voids the oldest
+  authorization unless the one holding the funds already reports `VOIDED`. No documented field
+  ties a reauthorization to its parent (an order's authorization links to itself, its capture,
+  void and reauthorize operations and the order), so age decides. AMBIGUOUS: the reauthorize
+  200 and 201 examples, and the Authorize and capture page's sample, show a `void` link on the
+  new authorization, and no page says what either authorization reports once the original is
+  voided. The fake voids both and answers `CANNOT_BE_VOIDED` for a reauthorization. An original
+  that already reads `VOIDED` next to a live reauthorization gets the void anyway, and PayPal's
+  refusal (`PREVIOUSLY_VOIDED` in the fake) surfaces instead of a `canceled` the adapter cannot
+  confirm.
+- **Capturing the rest never reaches past the order.** An empty-body reauthorization
+  reauthorizes "the full amount" (the schema's "Reauthorize with empty request body" flow; the
+  Extend guide's "Reauthorize for the same amount" sends `{}`), so after a partial capture the
+  new authorization can hold again what was taken. The remainder, and `amountCapturable`, is
+  the lesser of the holding authorization's amount less the captures taken from it and the
+  order amount less every capture on the order that took money, in integer minor units and
+  never below zero. When captures name their authorization it is exact whether the
+  reauthorization is for the full amount or for what was left. An order read reporting no
+  amount (the Orders v2 response schema does not require one) is measured by the holding
+  authorization's amount instead, so the rest errs low. Capturing the rest answers
+  with the payment once the order's captures cover the order amount. A holding authorization
+  that reports no amount needs an explicit amount once any capture on the order took money,
+  not only one of its own. `MAX_CAPTURE_AMOUNT_EXCEEDED` caps "the sum of all captures to be
+  up to 115% of the order amount" (its example says "You can only capture up to the original
+  authorization amount"), so an explicit amount still goes to PayPal as it is. The fake
+  enforces that order-level cap, and no more than USD 75 over the amount in USD (the honor
+  period page: "up to 115% or $75 USD more than the original authorized amount, whichever is
+  less"), instead of its former per-authorization no-overage rule.
+- **Captures count against the authorization they name, when they name one (AMBIGUOUS on the
+  order read).** `supplementary_data.related_ids.authorization_id` is a Payments v2 capture
+  field, and a Payments v2 capture's `up` link points to its authorization. The Orders v2
+  capture schema has no `supplementary_data` or `related_ids`, and its examples link `up` to
+  the order, so an order read may name no authorization at all. When a capture names no
+  authorization of the order, every capture counts, so the remainder errs low. The fake's
+  order reads carry no attribution unless a test opts in, which makes that fallback the
+  default path. The `up` link is parsed as the order link is: one path segment, no decoding.
+- **Repeatability (AMBIGUOUS).** The sources conflict. Once: `reauthorize_request` ("You can
+  reauthorize a payment only once from days four to 29", "You can reauthorize an authorized
+  payment once"), `REAUTHORIZATION_NOT_SUPPORTED` ("cannot be attempted on an authorization_id
+  that is the result of a prior reauthorization"), `REAUTHORIZATION_TOO_SOON` ("only allowed
+  once from Day 4 to Day 29") and the Extend guide ("Each authorization can be reauthorized a
+  single time"). Several: the reauthorize operation ("you can issue multiple
+  re-authorizations after the honor period expires"), the Authorize and capture page, and the
+  honor period page, whose table shows a "Reauthorization 2" on day 8. The adapter reads any
+  number of authorizations and reauthorizes none.
+- **The original's status after a reauthorization (AMBIGUOUS).** No page says it. The tests
+  cover it staying `CREATED` and turning `VOIDED`; capturing and reporting behave the same
+  either way.
+- **Webhooks (AMBIGUOUS).** `PAYMENT.AUTHORIZATION.VOIDED` still maps to `payment.canceled`.
+  The event names page gives its causes as the authorization "reaching its 30 day validity
+  period" or being "manually voided using the Void Authorized Payment API", and neither it nor
+  the Payments v2 callbacks name a reauthorization event. A `VOIDED` event for a superseded
+  original would contradict `retrievePayment`, which follows the newest authorization; the
+  guide tells hosts to re-read the payment before acting on the event.
+- **Sandbox check outstanding.** Reauthorization is refused within the honor period, so both
+  orders need an authorization at least four days old. On a first AUTHORIZE order, capture
+  part, reauthorize with an empty body, and record in an order GET the new authorization's
+  amount, both authorizations' statuses, and whether the captures carry
+  `related_ids.authorization_id` or an `up` link to their authorization; then reauthorize a
+  second time, from the original and from the reauthorization. On a second order with no
+  capture, reauthorize, void the reauthorization (expected `CANNOT_BE_VOIDED`), void the
+  original, and record both statuses. Record every webhook PayPal sends for both orders.

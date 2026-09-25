@@ -3,6 +3,7 @@ import { isPayFanoutError } from "@payfanout/core";
 import {
   derivePayPalRequestId,
   PayPalServerAdapter,
+  type PayPalOrderLike,
   type PayPalServerAdapterConfig,
 } from "../src/index.js";
 import { FakePayPalApi } from "./fake-paypal-api.js";
@@ -172,15 +173,18 @@ describe("PayPal-Request-Id derivation", () => {
 });
 
 describe("PayPal manual capture (intent AUTHORIZE)", () => {
-  async function authorizedPayment(pair = makePair()): Promise<{
+  async function authorizedPayment(
+    pair = makePair(),
+    money: { amount: number; currency: string } = { amount: 2000, currency: "USD" },
+  ): Promise<{
     adapter: PayPalServerAdapter;
     fake: FakePayPalApi;
     orderId: string;
+    authorizationId: string;
   }> {
     const { adapter, fake } = pair;
     const session = await adapter.createPaymentSession({
-      amount: 2000,
-      currency: "USD",
+      ...money,
       captureMethod: "manual",
       idempotencyKey: `k-${Math.random()}`,
     });
@@ -195,9 +199,14 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
     expect(info.pspPaymentId).toBe(session.pspSessionId);
     expect(info.capturedAt).toBeUndefined();
     expect(info.amountCaptured).toBe(0);
-    expect(info.amountCapturable).toBe(2000); // the full authorization is still open
-    return { adapter, fake, orderId: session.pspSessionId };
+    expect(info.amountCapturable).toBe(money.amount); // the full authorization is still open
+    const authorizationId = (info.raw as PayPalOrderLike).purchase_units?.[0]?.payments?.authorizations?.[0]?.id;
+    expect(authorizationId).toBeDefined();
+    return { adapter, fake, orderId: session.pspSessionId, authorizationId: authorizationId! };
   }
+
+  const voidsSent = (fake: FakePayPalApi): string[] => fake.requestLog.filter((line) => line.endsWith("/void"));
+  const capturesSent = (fake: FakePayPalApi): string[] => fake.requestLog.filter((line) => line.endsWith("/capture"));
 
   it.each([
     ["stays CREATED", "CREATED"],
@@ -216,12 +225,27 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
     expect(rest).toMatchObject({ status: "succeeded", amountCaptured: 2000, amountCapturable: 0 });
   });
 
-  it("voids the reauthorized hold, not the original, on cancel", async () => {
-    const { adapter, fake, orderId } = await authorizedPayment();
-    const reauthorized = fake.reauthorize(orderId, { original: "CREATED" });
+  it("cancels a reauthorized payment by voiding the original authorization, as PayPal requires", async () => {
+    const { adapter, fake, orderId, authorizationId } = await authorizedPayment();
+    fake.reauthorize(orderId, { original: "CREATED" });
     const canceled = await adapter.cancelPayment(orderId, "k-void-reauth");
-    expect(fake.requestLog).toContain(`POST /v2/payments/authorizations/${reauthorized}/void`);
-    expect(canceled.status).toBe("canceled");
+    // PayPal answers a void of the reauthorization with CANNOT_BE_VOIDED.
+    expect(voidsSent(fake)).toEqual([`POST /v2/payments/authorizations/${authorizationId}/void`]);
+    expect(canceled).toMatchObject({ status: "canceled", amountCapturable: 0 });
+    // The fake voids the reauthorization with its parent, so a second cancel sends nothing.
+    await expect(adapter.cancelPayment(orderId, "k-void-reauth-2")).resolves.toMatchObject({ status: "canceled" });
+    expect(voidsSent(fake)).toHaveLength(1);
+  });
+
+  it("still voids an original that reads VOIDED beside its reauthorization, and PayPal's refusal stands", async () => {
+    const { adapter, fake, orderId, authorizationId } = await authorizedPayment();
+    fake.reauthorize(orderId, { original: "VOIDED" });
+    await expect(adapter.cancelPayment(orderId, "k-void")).rejects.toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      raw: { details: [{ issue: "PREVIOUSLY_VOIDED" }] },
+    });
+    expect(voidsSent(fake)).toEqual([`POST /v2/payments/authorizations/${authorizationId}/void`]);
   });
 
   it("takes the later authorization when both report the same create_time", async () => {
@@ -232,21 +256,65 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
   });
 
   it("keeps the original authorization in charge when the newer one was denied", async () => {
-    const { adapter, fake, orderId } = await authorizedPayment();
+    const { adapter, fake, orderId, authorizationId } = await authorizedPayment();
     fake.reauthorize(orderId, { status: "DENIED" });
     expect(await adapter.retrievePayment(orderId)).toMatchObject({ status: "requires_capture", amountCapturable: 2000 });
     await adapter.capturePayment(orderId, 500, "k-cap-denied");
-    const original = fake.requestLog.find((line) => line.endsWith("/capture"));
-    expect(original).not.toContain("8AA831015G51");
+    expect(capturesSent(fake)).toEqual([`POST /v2/payments/authorizations/${authorizationId}/capture`]);
   });
 
-  it("counts every capture against the hold when captures name no authorization", async () => {
-    const { adapter, fake, orderId } = await authorizedPayment();
-    await adapter.capturePayment(orderId, 700, "k-cap-first");
-    fake.reauthorize(orderId, { original: "PARTIALLY_CAPTURED" });
-    expect((await adapter.retrievePayment(orderId)).amountCapturable).toBe(2000); // the new hold, attributed
-    fake.stripCaptureAttribution(orderId);
-    expect((await adapter.retrievePayment(orderId)).amountCapturable).toBe(1300); // unattributed: errs low
+  it.each([
+    { currency: "USD", amount: 2000, first: 200, rest: "18.00", attributed: false },
+    { currency: "USD", amount: 2000, first: 200, rest: "18.00", attributed: true },
+    { currency: "JPY", amount: 5000, first: 1200, rest: "3800", attributed: true },
+  ])(
+    "after an empty-body reauthorization, capturing the rest takes what the $currency order has left (attributed captures: $attributed)",
+    async ({ currency, amount, first, rest, attributed }) => {
+      const pair = makePair();
+      pair.fake.orderCaptureAttribution = attributed;
+      const { adapter, fake, orderId } = await authorizedPayment(pair, { amount, currency });
+      await adapter.capturePayment(orderId, first, "k-cap-first");
+      // "Reauthorize for the same amount": the new hold is the full amount again.
+      const reauthorized = fake.reauthorize(orderId, { original: "PARTIALLY_CAPTURED" });
+      expect((await adapter.retrievePayment(orderId)).amountCapturable).toBe(amount - first);
+
+      const info = await adapter.capturePayment(orderId, undefined, "k-cap-rest");
+      expect(capturesSent(fake).at(-1)).toBe(`POST /v2/payments/authorizations/${reauthorized}/capture`);
+      expect(fake.lastRequestBody).toEqual({ amount: { currency_code: currency, value: rest }, final_capture: true });
+      expect(info).toMatchObject({ amountCaptured: amount, amountCapturable: 0 });
+    },
+  );
+
+  it("counts every capture against the hold when captures name no authorization, so the remainder errs low", async () => {
+    // Order reads name no authorization on a capture, as the Orders v2 schema has them.
+    const full = await authorizedPayment();
+    await full.adapter.capturePayment(full.orderId, 700, "k-cap-first");
+    full.fake.reauthorize(full.orderId, { original: "PARTIALLY_CAPTURED" });
+    expect((await full.adapter.retrievePayment(full.orderId)).amountCapturable).toBe(1300);
+
+    // A reauthorization of what was left: the 7.00 taken from the original counts against it too.
+    const rest = await authorizedPayment();
+    await rest.adapter.capturePayment(rest.orderId, 700, "k-cap-first");
+    rest.fake.reauthorize(rest.orderId, { original: "PARTIALLY_CAPTURED", amount: { currency_code: "USD", value: "13.00" } });
+    expect((await rest.adapter.retrievePayment(rest.orderId)).amountCapturable).toBe(600);
+  });
+
+  it("counts only the hold's own captures when order reads name each capture's authorization", async () => {
+    const attributed = () => {
+      const pair = makePair();
+      pair.fake.orderCaptureAttribution = true;
+      return authorizedPayment(pair);
+    };
+    const full = await attributed();
+    await full.adapter.capturePayment(full.orderId, 700, "k-cap-first");
+    full.fake.reauthorize(full.orderId, { original: "PARTIALLY_CAPTURED" });
+    // The new hold took nothing yet, and the order has 13.00 left.
+    expect((await full.adapter.retrievePayment(full.orderId)).amountCapturable).toBe(1300);
+
+    const rest = await attributed();
+    await rest.adapter.capturePayment(rest.orderId, 700, "k-cap-first");
+    rest.fake.reauthorize(rest.orderId, { original: "PARTIALLY_CAPTURED", amount: { currency_code: "USD", value: "13.00" } });
+    expect((await rest.adapter.retrievePayment(rest.orderId)).amountCapturable).toBe(1300);
   });
 
   it("authorizes on completePayment, then captures via the authorization", async () => {
@@ -477,12 +545,18 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
     expect(fake.uniqueCaptureCreations).toBe(0);
   });
 
-  it("rejects captures beyond the authorized amount via the PSP error", async () => {
-    const { adapter, orderId } = await authorizedPayment();
+  it("leaves an explicit capture past the remainder to PayPal, which refuses one past its overage limit", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
     await adapter.capturePayment(orderId, 1800, "k-cap-1");
-    await expect(adapter.capturePayment(orderId, 300, "k-cap-2")).rejects.toMatchObject({
+    // 2.00 is left, and 115% of the 20.00 order allows 23.00 in all.
+    await expect(adapter.capturePayment(orderId, 600, "k-cap-2")).rejects.toMatchObject({
       code: "invalid_request",
+      retryable: false,
+      raw: { details: [{ issue: "MAX_CAPTURE_AMOUNT_EXCEEDED" }] },
     });
+    const within = await adapter.capturePayment(orderId, 300, "k-cap-3");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "3.00" }, final_capture: true });
+    expect(within).toMatchObject({ amountCaptured: 2100, amountCapturable: 0 });
   });
 
   it("cancelPayment voids an uncaptured authorization and is idempotent-friendly", async () => {

@@ -126,8 +126,9 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       config.requestTimeoutMs !== undefined &&
       (!Number.isInteger(config.requestTimeoutMs) || config.requestTimeoutMs <= 0)
     ) {
-      // The SDK takes whole milliseconds and silently swaps any other value
-      // for its 80000 default, so a bad setting would go unnoticed.
+      // The SDK takes whole milliseconds and silently swaps any non-integer
+      // for its 80000 default, so a bad setting would go unnoticed; zero and
+      // negative integers it would pass through.
       throw PayFanoutError.invalidRequest(
         "StripeServerAdapter config.requestTimeoutMs must be a positive integer (milliseconds)",
       );

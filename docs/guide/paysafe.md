@@ -71,7 +71,7 @@ PAYSAFE_WEBHOOK_HMAC_KEY=…
 
 # client bundle, must be VITE_-prefixed to reach the browser
 VITE_PAYSAFE_PUBLIC_KEY=…         # the public single-use-token Base64 key
-VITE_PAYSAFE_CURRENCY=CAD         # match your sandbox account's currency (see §11)
+VITE_PAYSAFE_CURRENCY=CAD         # match your sandbox account's currency (see §12)
 ```
 
 Env-var names deliberately **differ** from config field names, e.g. `PAYSAFE_SESSION_KEY`
@@ -105,8 +105,8 @@ const payments = new PaymentService({ adapters: [paysafe] });
 | `sessionSigningKey` | ✅ | - | HMAC key for the stateless signed session. **You generate this.** Keep it stable across restarts/instances. |
 | `webhookHmacKey` | ✅ | - | Paysafe's webhook signing key. Pass a **`string[]`** to rotate with no cutover. |
 | `sessionTtlSeconds` | - | `3600` | How long a signed session stays completable (1h). Enforced at completion. |
-| `requestTimeoutMs` | - | `30000` | Abort a hung Paysafe connection; surfaces as a retryable `psp_unavailable`. |
-| `maxNetworkRetries` | - | `2` | Retries transport trouble (network/timeout/5xx/429) only, never business errors like declines. |
+| `requestTimeoutMs` | - | `60000` | Bounds one Paysafe exchange (the response timeout of Paysafe's own SDKs), not a whole call, which can make several (§10). A read that times out surfaces as a retryable `psp_unavailable`; a write that times out is looked up instead. |
+| `maxNetworkRetries` | - | `2` | Reads are retried on network/timeout/5xx/429 trouble. A payment, capture or refund is re-sent only after a 429; a payment handle, verification or void also once a lookup shows it never reached Paysafe (§10). Business errors like declines never repeat. |
 
 ::: tip `createPaymentSession` makes no network call — for cards
 For a card session it just mints and signs the self-contained session token locally, the
@@ -136,7 +136,7 @@ const paysafe = new PaysafeClientAdapter({
 - `apiKey` must be the **public** Base64 tokenization key, never the server
   username/password. It can only mint single-use tokens and holds no secret authority.
 - **Currency comes from the signed session**, not from client config. It must be a currency
-  your Paysafe account supports, or Paysafe.js fails to set up (error `9055`). See §11.
+  your Paysafe account supports, or Paysafe.js fails to set up (error `9055`). See §12.
 - **So does the merchant account.** When `merchantAccountResolver` returns one for the
   session, setup preselects it with Paysafe.js's `accounts.default` option, which a key
   holding more than one account for the currency needs: without it, setup fails with error
@@ -213,6 +213,13 @@ on a confirm-on-client PSP (Stripe) throws — it exists only for tokenize-first
 directly; both forms are in [Server usage](/guide/server#server-completion-tokenize-first), and
 the client side is [React usage](/guide/react#built-in-completion-transport).
 
+Keep the completion key stable per order, as above: a retried POST, a customer who pays
+again after a lost answer, or a new card after a decline all reuse it. §10 explains how
+each one is answered, the timings in which a replay can still be charged twice, and the
+bank-debit errors after which you start again under a new key, once a later retry still
+fails and the Paysafe portal shows every payment under the old one as failed or cancelled,
+or none at all.
+
 ## 8. Interac e-Transfer (Canada)
 
 Paysafe.js cannot tokenize Interac e-Transfer — it is a Payments-API rail — so PayFanout
@@ -281,8 +288,9 @@ customer is redirected, announced by a `PAYMENT_HANDLE_PAYABLE` webhook (deliver
 Paysafe's documented cue to complete. If you never complete, Paysafe completes on your
 behalf once the ~15-minute handle window closes (when the customer paid) or fails the
 handle. Either way the terminal state arrives on the mapped webhooks (`PAYMENT_COMPLETED` /
-`PAYMENT_FAILED`), so a completion attempt that rejects because the handle already left
-`PAYABLE` means "reconcile by webhook", not "the customer failed". Bank debits settle
+`PAYMENT_FAILED`), so a completion attempt that fails with a non-retryable
+`processing_error` because the handle already left `PAYABLE` means "reconcile by webhook",
+not "the customer failed". Bank debits settle
 later: `completePayment` usually returns `processing` (`succeeded` once Interac has already
 confirmed the transfer to Paysafe).
 :::
@@ -360,7 +368,106 @@ proven. If a provisioned account still answers `5005`, contact Paysafe support a
 the required handle setup before going live.
 :::
 
-## 10. Register the webhook endpoint
+## 10. Replays, lost answers and timeouts
+
+Paysafe does not answer a repeated `merchantRefNum` with the original response. With
+`dupCheck` it **rejects** the repeat (HTTP 409 with error `5031`, or 402 with `3044`), it
+can refuse a request while another one on the same transaction is in progress (`3417`),
+and a payments call spends the single-use handle whatever its outcome, so a second call
+with that handle answers `5283`. The adapter is built around that rather than around blind
+retries, for every write it makes:
+
+- Every payment, payment handle (vault saves included), capture, void, refund and
+  verification sends your `idempotencyKey` as its `merchantRefNum`. Customer profiles key
+  on `merchantCustomerId` instead (your customer `id`, or the key), native subscriptions on
+  the `merchantRefNum` you pass (or the key), and deleting a saved card carries no key: the
+  vault is checked instead.
+- `dupCheck` is `true` on saved-card charges, captures, refunds and verifications, and
+  `false` on card and Interac completions, whose single-use handle already refuses a second
+  charge. With `dupCheck: true`, a card declined under your completion key would block every
+  later card for that order. A bank-debit completion can mint a new handle on each attempt,
+  so no spent handle stands between two attempts: its payment carries `dupCheck: true` until
+  a failed attempt shows under the key, and `false` after that, so corrected bank details
+  can follow a decline. Payment handles accept `dupCheck`, but the adapter does not rely on
+  it: it looks the key's handle up before minting one, and reuses it only when it was
+  minted for the same Interac email or the same bank details. Authorization voids take no
+  `dupCheck`.
+- A completion reads its key before it sends anything. Completing again with the same key
+  and card returns the original, including a decline whose record names its card, which
+  comes back as the same decline; a decline filed without its card (as Paysafe's example
+  shows one) cannot be tied to it, so that replay ends in the non-retryable
+  `processing_error` instead. A new card or bank account after a decline is charged as a
+  new attempt, and a completion retried with a fresh tokenization after the payment went
+  through returns that payment instead of charging again, once Paysafe's lookup shows it.
+- Lookups read up to 50 records, Paysafe's maximum page. A key holding 50 or more records
+  in the 30-day window is refused with the non-retryable `processing_error` rather than
+  read in part: reconcile it in the Paysafe portal, and start over under a new key only
+  once every record under it has failed or been cancelled.
+- A write that times out, loses its connection or gets a 5xx is looked up by its
+  `merchantRefNum`, and when Paysafe has the record it becomes the call's result. A payment,
+  capture or refund is never re-sent after that: when the lookup cannot show it, the call
+  fails with a non-retryable `processing_error` that names the `merchantRefNum`. Retry it
+  later with the **same** key, never a new one, which could repeat the payment. A payment
+  handle, verification or void moves no money, so it is re-sent once the lookup shows
+  nothing. A 429 is re-sent after backoff, because Paysafe refused it unprocessed.
+- A key already used for a **different** amount or currency, or for a different saved card
+  or verification card, rejects with `invalid_request`: give every new payment its own
+  key. The exception is a card or Interac completion key whose earlier attempts all
+  failed: a failed attempt is set aside before any amount is compared, so the next attempt
+  goes through at its own amount and currency. A bank-debit key still rejects it, because
+  the failed attempt's payment handle states its amount. On a card, Interac or bank-debit
+  completion a new card is a new attempt under the same key; a payment the key already
+  made is returned instead, and a fully voided one comes back `canceled` (start a new
+  attempt after a void under a new key). Capture, cancel and refund keys must be unique
+  across the merchant account, because Paysafe's lookups for them are account-wide.
+- A duplicate whose original cannot be read back rejects with the same non-retryable
+  `processing_error`. A fresh write can take a moment to appear, and the lookup only
+  covers the last 30 days, so an original older than that can never be read back:
+  reconcile it in the Paysafe portal.
+- A bank-debit key can stay refused, so its errors say when to leave it. When Paysafe
+  refuses the payment as a duplicate and no payment under the key other than a failed
+  attempt can be read back, the error says that what stands in the way may be a payment
+  the lookup does not show yet, or a failed attempt older than the lookup, since Paysafe's
+  duplicate check covers 90 days while the lookup reaches only 30. When the key holds a
+  spent payment handle with no payment of its own, the error says that a refused attempt
+  can leave one, since Paysafe marks a handle `COMPLETED` whatever its payments call
+  answers. Both are the non-retryable `processing_error`. Retry later with the same key,
+  which returns the payment once the lookup shows it. Start again under a new idempotency
+  key (a key derived from the order, like `complete-${order.id}`, needs a suffix you can
+  bump) only once such a later retry still ends in the same error and the Paysafe portal
+  shows every payment under the key as failed or cancelled, or none at all: right after
+  the error, an empty portal may only be lagging. A payment received, pending, processing,
+  held or completed there is live: a new key while it is out of the lookup's sight would
+  debit twice. Retire the replaced key for good: sent again once the 90 days lapse, it
+  would start a new debit.
+- Two card completions with different cards under one key can both be charged when the
+  second is sent before the first shows in Paysafe's lookup, because nothing at Paysafe
+  spans them. Two bank-debit attempts are held apart by `dupCheck` instead, while no
+  failed attempt shows under the key: Paysafe refuses the later payment (`5031`), and the
+  adapter answers it with the first one, or with the non-retryable `processing_error`
+  while the lookup does not show it yet. Whether the check also catches a payment Paysafe
+  is still processing is undocumented. Once a failed attempt shows, the check is off: two
+  attempts sent together, or one resubmitted before the lookup shows the other's payment
+  or handle, can both be debited. Keep one completion in flight per order.
+
+::: warning A timeout bounds one exchange, not a call
+`requestTimeoutMs` (default `60000`, the response timeout of Paysafe's own SDKs) applies to
+each exchange with Paysafe, and one call can make several: a read up to
+`1 + maxNetworkRetries` attempts, a write up to `1 + maxNetworkRetries` attempts with up to
+three lookups after one that went unanswered, and many calls read before they write (a
+completion reads its key, a refund the payment and its settlements). If Paysafe hangs on
+every exchange, one write can take about `(1 + maxNetworkRetries) × 4 × requestTimeoutMs`,
+plus `(1 + maxNetworkRetries) × requestTimeoutMs` for each read before it: minutes, at the
+defaults. On a platform that ends requests sooner (serverless functions often allow 25-30
+seconds), lower `requestTimeoutMs` and `maxNetworkRetries` until a call fits, and replay a
+call the platform ended with the same key: the replay reads back what the ended call did
+once Paysafe shows it. A card completion replayed from the browser carries a fresh
+tokenization, so it is charged again if the first payment is not visible yet. A bank-debit
+replay is refused by `dupCheck` instead, unless an earlier attempt under the key failed
+(see above). Keep one completion in flight per order.
+:::
+
+## 11. Register the webhook endpoint
 
 ::: warning Configured in the portal, not via the API
 Paysafe's `POST /payments` **rejects** webhook/return-link fields (error `5023`), so you
@@ -428,7 +535,7 @@ it at the top level. The adapter reads both, and gives the same event the same i
 The onboarding descriptor's event list (`paysafeOnboarding.webhook.events`) holds only the
 event names Paysafe documents.
 
-## 11. Test cards & the sandbox-currency trap
+## 12. Test cards & the sandbox-currency trap
 
 ::: danger Match your account's currency
 Paysafe sandbox accounts are usually provisioned for a **single currency** (the reference
@@ -443,7 +550,7 @@ amount) depends on your account configuration. A commonly available test Visa is
 `4111 1111 1111 1111`; **confirm the current list, decline triggers, and 3DS test cards in
 your Paysafe portal** rather than assuming.
 
-## 12. Go live
+## 13. Go live
 
 - [ ] Swap in the **live** API username/password and the **live** public tokenization key.
 - [ ] Set `environment: "live"` on **both** adapters (host flips to `api.paysafe.com`).

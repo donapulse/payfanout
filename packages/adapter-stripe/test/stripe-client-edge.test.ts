@@ -161,6 +161,12 @@ describe("StripeClientAdapter edge cases", () => {
     expect(aResult.error?.code).toBe("authentication_required");
     expect(aResult.error?.retryable).toBe(false);
 
+    // The general form of the intent-specific authentication failures maps the same way.
+    const failed = makeAdapter({ type: "card_error", code: "authentication_failure", message: "Authentication failed." });
+    const fResult = await failed.confirm(await failed.mount({} as HTMLElement, { clientSecret: "pi_1_secret" }));
+    expect(fResult.error?.code).toBe("authentication_required");
+    expect(fResult.error?.retryable).toBe(false);
+
     const exotic = makeAdapter({ type: "api_error", message: "Something odd." });
     const eHandle = await exotic.mount({} as HTMLElement, { clientSecret: "pi_1_secret" });
     const eResult = await exotic.confirm(eHandle);

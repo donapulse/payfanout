@@ -116,7 +116,12 @@ a mismatch fails late, at approval time, with an SDK error.
   as `processing_error` with the SDK's error on `raw`. The `onError` ones are **not
   retryable**: PayPal's [JS SDK reference](https://developer.paypal.com/sdk/js/v5/reference#onerror)
   documents that callback as a catch-all with nothing to handle beyond a generic error
-  message or page. A failed render is retryable, since mounting again can succeed.
+  message or page. A failed render is retryable, since mounting again can succeed. PayPal's
+  SDK hands a failed render to `onError` and then rejects it; the adapter reports it once,
+  as the retryable render failure `mount()` rejects with. Any other error PayPal reports
+  while the buttons render is reported once too, before `onReady` when the render
+  succeeds. A host `onError` or `onReady` that throws after a successful render does not
+  remove the buttons: its exception is reported as uncaught.
 - `locale` is a load-time SDK param — set it on the adapter config, not per mount.
 - `userAction` is the client half of the server's `userAction`: `"continue"` (default)
   loads the SDK with `commit=false`, so the popup's final button says **Continue** and

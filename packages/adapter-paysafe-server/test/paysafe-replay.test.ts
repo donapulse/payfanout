@@ -240,6 +240,71 @@ describe("Paysafe card completion replays", () => {
     expect(attempts[1]!.body).toMatchObject({ merchantRefNum: "order-1", paymentHandleToken: "tok_card_b" });
   });
 
+  it("reads a key's records past Paysafe's default page of ten", async () => {
+    const { adapter, fake } = makePair();
+    const pspSessionId = await cardSession(adapter);
+    const decline = { status: 402, code: "3009", message: "Your request has been declined by the issuing bank." };
+    for (let n = 0; n < 10; n += 1) {
+      fake.recordFailure(CREATE_PAYMENT, decline);
+      await rejection(adapter.completePayment({ pspSessionId, clientToken: `tok_decline_${n}`, idempotencyKey: "order-many" }));
+    }
+    const paid = await adapter.completePayment({ pspSessionId, clientToken: "tok_good", idempotencyKey: "order-many" });
+    // Paid again with a fresh tokenization: the key's eleventh record is its payment.
+    const again = await adapter.completePayment({ pspSessionId, clientToken: "tok_again", idempotencyKey: "order-many" });
+    expect(again.pspPaymentId).toBe(paid.pspPaymentId);
+    expect(fake.uniquePaymentCreations).toBe(1);
+    expect(sent(fake, CREATE_PAYMENT)).toHaveLength(11);
+  });
+
+  it("refuses a key holding a full lookup page rather than reading part of it", async () => {
+    const { adapter, fake } = makePair();
+    const pspSessionId = await cardSession(adapter);
+    const decline = { status: 402, code: "3009", message: "Your request has been declined by the issuing bank." };
+    for (let n = 0; n < 50; n += 1) {
+      fake.recordFailure(CREATE_PAYMENT, decline);
+      await rejection(adapter.completePayment({ pspSessionId, clientToken: `tok_decline_${n}`, idempotencyKey: "order-full" }));
+    }
+    const err = await rejection(
+      adapter.completePayment({ pspSessionId, clientToken: "tok_good", idempotencyKey: "order-full" }),
+    );
+    expect(err).toMatchObject({ code: "processing_error", retryable: false });
+    expect(sent(fake, CREATE_PAYMENT)).toHaveLength(50);
+  });
+
+  it("sends a new card after a decline filed without its handle, as Paysafe's decline example is", async () => {
+    const { adapter, fake } = makePair();
+    fake.failedPaymentsLikeDeclineExample = true;
+    const pspSessionId = await cardSession(adapter);
+    fake.recordFailure(CREATE_PAYMENT, { status: 402, code: "3009", message: "Your request has been declined by the issuing bank." });
+    const declined = await rejection(
+      adapter.completePayment({ pspSessionId, clientToken: "tok_card_a", idempotencyKey: "order-tokenless" }),
+    );
+    // The same card again: its handle is spent (5283), and the decline is read back.
+    const replayed = await rejection(
+      adapter.completePayment({ pspSessionId, clientToken: "tok_card_a", idempotencyKey: "order-tokenless" }),
+    );
+    expect(replayed).toMatchObject({ code: declined.code, retryable: false });
+    const info = await adapter.completePayment({ pspSessionId, clientToken: "tok_card_b", idempotencyKey: "order-tokenless" });
+    expect(info.status).toBe("succeeded");
+    expect(fake.uniquePaymentCreations).toBe(1);
+    expect(sent(fake, CREATE_PAYMENT).map((a) => a.body?.["paymentHandleToken"])).toEqual([
+      "tok_card_a",
+      "tok_card_a",
+      "tok_card_b",
+    ]);
+  });
+
+  it("lets a bank debit follow a declined one filed without its handle", async () => {
+    const { adapter, fake } = makePair();
+    fake.failedPaymentsLikeDeclineExample = true;
+    const pspSessionId = await cardSession(adapter, eftSession());
+    fake.recordFailure(CREATE_PAYMENT, { status: 402, code: "3009", message: "Your request has been declined by the issuing bank." });
+    await rejection(adapter.completePayment({ pspSessionId, clientToken: eftEnvelope, idempotencyKey: "order-eft-retry" }));
+    await adapter.completePayment({ pspSessionId, clientToken: eftEnvelope, idempotencyKey: "order-eft-retry" });
+    expect(fake.uniquePaymentCreations).toBe(1);
+    expect(sent(fake, CREATE_PAYMENT)).toHaveLength(2);
+  });
+
   it("answers a completion retried with a fresh tokenization with the payment the key already made", async () => {
     // The completion's answer never reached the browser, and the customer paid again.
     const { adapter, fake } = makePair();
@@ -574,7 +639,7 @@ describe("Paysafe write transport", () => {
     const info = await adapter.completePayment({ pspSessionId, clientToken: "tok_card", idempotencyKey: "k-complete" });
     expect(info.pspPaymentId).toBe("pay_9");
     expect(posts).toBe(1);
-    expect(reads).toEqual([`https://api.test.paysafe.com${PAYMENTS}?merchantRefNum=k-complete`]);
+    expect(reads).toEqual([`https://api.test.paysafe.com${PAYMENTS}?merchantRefNum=k-complete&limit=50`]);
   });
 
   it("keeps replaying reads on transport trouble, as Paysafe's own SDKs do", async () => {

@@ -396,10 +396,13 @@ retries, for every write it makes:
   later with the **same** key, never a new one, which could repeat the payment. A payment
   handle, verification or void moves no money, so it is re-sent once the lookup shows
   nothing. A 429 is re-sent after backoff, because Paysafe refused it unprocessed.
-- A key already used for a **different** amount, currency or card rejects with
-  `invalid_request`: give every new payment its own key. Capture, cancel and refund keys
-  must be unique across the merchant account, because Paysafe's lookups for them are
-  account-wide.
+- A key already used for a **different** amount or currency, or for a different saved card
+  or verification card, rejects with `invalid_request`: give every new payment its own
+  key. On a card, Interac or bank-debit completion a new card is a new attempt under the
+  same key; a payment the key already made is returned instead, and a fully voided one
+  comes back `canceled` (start a new attempt after a void under a new key). Capture,
+  cancel and refund keys must be unique across the merchant account, because Paysafe's
+  lookups for them are account-wide.
 - A duplicate whose original cannot be read back rejects with the same non-retryable
   `processing_error`. A fresh write can take a moment to appear, and the lookup only
   covers the last 30 days, so an original older than that can never be read back:
@@ -418,7 +421,9 @@ every exchange, one write can take about `(1 + maxNetworkRetries) × 4 × reques
 plus `(1 + maxNetworkRetries) × requestTimeoutMs` for each read before it: minutes, at the
 defaults. On a platform that ends requests sooner (serverless functions often allow 25-30
 seconds), lower `requestTimeoutMs` and `maxNetworkRetries` until a call fits, and replay a
-call the platform ended with the same key: the replay reads back what the ended call did.
+call the platform ended with the same key: the replay reads back what the ended call did
+once Paysafe shows it. A browser completion replays with a fresh tokenization, so it is
+charged if the first payment is not visible yet; keep one completion in flight per order.
 :::
 
 ## 11. Register the webhook endpoint

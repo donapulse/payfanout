@@ -153,6 +153,12 @@ export class FakePaysafeApi {
    * request." among its payment errors.
    */
   duplicateCode: "5031" | "3044" = "5031";
+  /**
+   * File failed payments the way Paysafe's only decline example shows them:
+   * id, merchantRefNum, settleWithAuth and the error, with no
+   * paymentHandleToken, status, amount or currency.
+   */
+  failedPaymentsLikeDeclineExample = false;
 
   constructor() {
     this.multiUseTokens.add(SEEDED_MULTI_USE_TOKEN);
@@ -385,7 +391,10 @@ export class FakePaysafeApi {
       this.lookupLag.set(lagKey, lag - 1);
       return json(200, { meta: { numberOfRecords: 0 }, [collection]: [] });
     }
-    const records = (index.get(refNum) ?? []).map(view);
+    // Paysafe pages every lookup: limit defaults to 10, at most 50, from `offset`.
+    const limit = Math.min(Number(params.get("limit") ?? 10), 50);
+    const offset = Number(params.get("offset") ?? 0);
+    const records = (index.get(refNum) ?? []).map(view).slice(offset, offset + limit);
     return json(200, { meta: { numberOfRecords: records.length }, [collection]: records });
   }
 
@@ -538,18 +547,25 @@ export class FakePaysafeApi {
       (token === "tok_declined" ? { status: 402, code: "3022", message: "Insufficient funds" } : undefined);
     if (failure) {
       // Paysafe records the failed payment too; it answers the call with the error alone.
-      const failed: PaysafePaymentLike = {
-        id: `pay_${++this.seq}`,
-        merchantRefNum: refNum,
-        paymentHandleToken: token,
-        status: failure.recordStatus ?? "FAILED",
-        amount,
-        currencyCode,
-        settleWithAuth,
-        txnTime: "2026-07-04T10:00:00Z",
-        paymentType: this.railHandles.get(token)?.paymentType ?? "CARD",
-        error: { code: failure.code, message: failure.message },
-      };
+      const failed: PaysafePaymentLike = this.failedPaymentsLikeDeclineExample
+        ? {
+            id: `pay_${++this.seq}`,
+            merchantRefNum: refNum,
+            settleWithAuth,
+            error: { code: failure.code, message: failure.message },
+          }
+        : {
+            id: `pay_${++this.seq}`,
+            merchantRefNum: refNum,
+            paymentHandleToken: token,
+            status: failure.recordStatus ?? "FAILED",
+            amount,
+            currencyCode,
+            settleWithAuth,
+            txnTime: "2026-07-04T10:00:00Z",
+            paymentType: this.railHandles.get(token)?.paymentType ?? "CARD",
+            error: { code: failure.code, message: failure.message },
+          };
       this.payments.set(failed.id, failed);
       file(this.paymentsByRef, refNum, failed);
       return json(failure.status, { error: failed.error });

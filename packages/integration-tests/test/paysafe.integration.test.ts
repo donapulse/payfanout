@@ -44,7 +44,7 @@ const BILLING: Record<string, { country: string; zip: string }> = {
 };
 const billing = BILLING[CURRENCY] ?? BILLING["USD"]!;
 
-function makeAdapter(): PaysafeServerAdapter {
+function makeAdapter(fetchImpl?: typeof fetch): PaysafeServerAdapter {
   return new PaysafeServerAdapter({
     username: USERNAME!,
     password: PASSWORD!,
@@ -53,6 +53,7 @@ function makeAdapter(): PaysafeServerAdapter {
     merchantAccountResolver: () => ACCOUNT_ID,
     sessionSigningKey: "integration-session-signing-key",
     webhookHmacKey: process.env.PAYSAFE_WEBHOOK_HMAC_KEY || "not-used-in-these-tests",
+    ...(fetchImpl ? { fetch: fetchImpl } : {}),
   });
 }
 
@@ -225,8 +226,23 @@ describeIf("Paysafe sandbox integration", () => {
   it("a second card under the key of a declined attempt is processed, not refused as a duplicate", async () => {
     // Simulator amount 5: "402 | 3009 | Your request has been declined by the issuing bank."
     // Both attempts decline by amount; the second answering 3009 rather than 5031 is the
-    // proof that dupCheck: false lets a new attempt through under the same reference.
-    const adapter = makeAdapter();
+    // proof that dupCheck: false lets a new attempt through under the same reference, and
+    // both attempts must reach POST /payments: the first decline's record may name no handle.
+    let paymentPosts = 0;
+    const counting: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const path = new URL(url).pathname;
+      if (init?.method === "POST" && path.endsWith("/paymenthub/v1/payments")) paymentPosts += 1;
+      const response = await fetch(input, init);
+      if ((init?.method ?? "GET") === "GET" && path.endsWith("/paymenthub/v1/payments")) {
+        // Field names only, never values: which fields a declined record carries is an
+        // open question recorded in docs/decisions.md.
+        const body = (await response.clone().json()) as { payments?: Array<Record<string, unknown>> };
+        console.log("[paysafe] payments lookup record fields:", (body.payments ?? []).map((p) => Object.keys(p).sort()));
+      }
+      return response;
+    };
+    const adapter = makeAdapter(counting);
     const session = await adapter.createPaymentSession({
       amount: 5,
       currency: CURRENCY,
@@ -244,6 +260,7 @@ describeIf("Paysafe sandbox integration", () => {
         expect((err.raw as { error?: { code?: string } } | undefined)?.error?.code, `attempt ${attempt}`).toBe("3009");
       }
     }
+    expect(paymentPosts).toBe(2);
   }, 120_000);
 
   it("in-flight probe: a second same-key saved-card charge while the first is still processing", async () => {

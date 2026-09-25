@@ -691,6 +691,13 @@ function toBankProfile(accountHolderName: string, email: string | undefined): Re
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 
 /**
+ * Lookups page ("limit" defaults to 10, at most 50) in an undocumented
+ * order, so each asks for the maximum and a full page is refused rather than
+ * read as everything the key holds.
+ */
+const REF_NUM_LOOKUP_LIMIT = 50;
+
+/**
  * Paysafe's lookup for each mutating endpoint: `GET /paymenthub/v1/<path>
  * ?merchantRefNum=` answers `{ <key>: [...] }` and covers the last 30 days
  * by default ("Default = 30 days before the endDate"). Replay recovery reads
@@ -1458,6 +1465,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    */
   private async keyPayment(replay: ReplayableWrite<PaysafePaymentLike>): Promise<PaysafePaymentLike | undefined> {
     const { found, live } = this.classify(await this.recordsByRefNum<PaysafePaymentLike>(replay, false), replay);
+    // Paysafe's decline example names no paymentHandleToken, so a failure
+    // without one cannot be tied to this handle: send, and a replay of that
+    // same card is refused as spent (5283) and read back instead.
+    if (found && isFailedRecord(found) && found.paymentHandleToken === undefined) return live[0];
     return found ? recordedFailure(found) : live[0];
   }
 
@@ -1480,10 +1491,13 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     const foreign = handles.filter((h) => !agreesWith(h, minted));
     if (foreign.length > 0) throw this.differentRequest(minted, foreign);
     for (let attempt = 1; ; attempt += 1) {
-      const charged = new Set(read.failed.map((p) => p.paymentHandleToken));
-      const hidden = handles.find(
+      const charged = new Set(read.failed.map((p) => p.paymentHandleToken).filter((t) => t !== undefined));
+      // A failed payment that names no handle accounts for one spent handle.
+      const unattributed = read.failed.filter((p) => p.paymentHandleToken === undefined).length;
+      const spent = handles.filter(
         (h) => (h.status ?? "").toUpperCase() === "COMPLETED" && !charged.has(h.paymentHandleToken),
       );
+      const hidden = spent[unattributed];
       if (!hidden) break;
       if (attempt >= REPLAY_READ_ATTEMPTS) throw this.unreadableOriginal(keyed, HANDLE_NOT_PAYABLE_CODE, hidden);
       await this.backoff(attempt);
@@ -2429,7 +2443,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
 
   private async recordsByRefNum<T extends RefNumRecord>(replay: ReplayKey, once: boolean): Promise<T[]> {
     const { path, key } = REF_NUM_LOOKUPS[replay.lookup];
-    const url = `/paymenthub/v1/${path}?merchantRefNum=${encodeURIComponent(replay.merchantRefNum)}`;
+    const url = `/paymenthub/v1/${path}?merchantRefNum=${encodeURIComponent(replay.merchantRefNum)}&limit=${REF_NUM_LOOKUP_LIMIT}`;
     let result: Record<string, unknown> | undefined;
     try {
       result = once
@@ -2441,6 +2455,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     }
     const records = result?.[key];
     if (!Array.isArray(records)) return [];
+    if (records.length >= REF_NUM_LOOKUP_LIMIT) throw this.fullLookupPage(replay);
     // Only records filed under this very merchantRefNum can be this call's.
     return records.filter(
       (record): record is T =>
@@ -2498,6 +2513,20 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
         found: foreign,
       },
     );
+  }
+
+  /** A key holding a full lookup page may hold more than this call can see. */
+  private fullLookupPage(replay: ReplayKey): PayFanoutError {
+    const { noun } = REF_NUM_LOOKUPS[replay.lookup];
+    return new PayFanoutError({
+      code: "processing_error",
+      message:
+        `Paysafe holds at least ${REF_NUM_LOOKUP_LIMIT} ${noun} records under merchantRefNum ` +
+        `"${replay.merchantRefNum}", more than one lookup reads — reconcile them in the Paysafe portal`,
+      retryable: false,
+      raw: { merchantRefNum: replay.merchantRefNum },
+      pspName: this.pspName,
+    });
   }
 
   private severalRecords(replay: ReplayKey, records: RefNumRecord[]): PayFanoutError {

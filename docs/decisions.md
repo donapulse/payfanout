@@ -2307,5 +2307,16 @@ description of what v2 changes is what the migration then had to implement.
     are handled.
   - **How long the lookup trails a write.** This sizes the three bounded reads.
   - **Whether a declined payment's lookup record carries `status`, `error` and
-    `paymentHandleToken`,** as the simulator's decline example and the lookup example
-    suggest.
+    `paymentHandleToken`.** The simulator's only decline example shows `error`, `id`,
+    `merchantRefNum` and `settleWithAuth` with no `paymentHandleToken` or `status`, so a
+    failure that names no handle is not tied to the call's own: a completion sends
+    anyway (a replay of the same card is refused as spent and read back), and a bank
+    debit counts each such failure against one spent handle. Record the shape.
+  - **Whether a `/payments` rejection that files no payment (a 400 such as 5068) still
+    spends the handle**, as "regardless of the payments call response status" suggests.
+    If it does, a bank-debit key whose handle is spent with no payment under it ends every
+    retry in `processing_error`: when the Paysafe portal shows no payment under the key,
+    the host starts a new attempt under a new key.
+  - **Follow-up, not built:** sending `dupCheck: true` on a completion whose key holds no
+    records yet would stop the second of two first attempts sent together. It waits on the
+    in-flight and decline-shape answers above.

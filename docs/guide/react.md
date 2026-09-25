@@ -100,8 +100,10 @@ warns (console) about entries it can't apply — e.g. a Stripe `variables` objec
 Paysafe — instead of forwarding them for Paysafe.js to delete. (`colorPrimary`/`colorDanger`
 have no Paysafe hosted-input equivalent, and Paysafe.js accepts no background property on
 its inputs, so Paysafe applies `colorText`, `fontFamily` and `fontSize` only.) `locale` does
-nothing on Paysafe: its hosted fields carry no texts of their own, and placeholders come from
-`fieldOptions`. Other PSPs (PayPal
+nothing on Paysafe, whose setup takes no locale: set the fields' texts (`placeholder`,
+`accessibilityLabel`, `accessibilityErrorMessage`, `iframeTitle`) per field under
+`fieldOptions.fields`. Paysafe's defaults, and the adapter's own placeholders, are English.
+Other PSPs (PayPal
 button, GoCardless panel, PayZen) take their own native `appearance` shape — the common
 tokens do not apply to them.
 

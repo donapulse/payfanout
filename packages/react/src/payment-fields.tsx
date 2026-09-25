@@ -23,7 +23,8 @@ export interface PaymentFieldsProps {
    * card fields — today **Stripe** and **Paysafe** — translate a small cross-PSP
    * **common token set** (`colorPrimary`, `colorText`, `colorDanger`,
    * `colorBackground`, `fontFamily`, `fontSize`) to their native format, so one
-   * `appearance` styles either of them. PSP-native shapes still pass through for
+   * `appearance` styles either of them (Paysafe applies `colorText`, `fontFamily`
+   * and `fontSize`). PSP-native shapes still pass through for
    * power users (Stripe's Appearance API `{ variables, theme, rules }`; Paysafe's
    * `style` selector map like `{ input: { … } }`): Stripe ignores unrecognized keys,
    * and Paysafe warns (console) about entries it cannot apply. Other PSPs take their
@@ -34,7 +35,8 @@ export interface PaymentFieldsProps {
   /**
    * PSP-vocabulary UI options passed through to the SDK (Stripe: Payment
    * Element `layout`/`paymentMethodOrder`/`fields`/`terms`/…; Paysafe:
-   * per-field placeholders under `fields`, `locale`, …).
+   * per-field texts under `fields` — `placeholder`, `accessibilityLabel`,
+   * `iframeTitle` — and other setup options).
    */
   fieldOptions?: Record<string, unknown>;
   /** BCP-47 locale for the PSP's own field texts, where supported. */

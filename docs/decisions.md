@@ -167,7 +167,8 @@ than enumerated options (future SDK options need no library release):
   SDK makes it during setup only for a single payment method and answers a repeat call
   with the first result, so the call is harmless for the card-only fields and keeps any
   other setup from staying locked (9100).
-- **`MountOptions.locale`** — BCP-47, mapped per PSP (Paysafe underscore form).
+- **`MountOptions.locale`** — BCP-47, mapped per PSP. Paysafe no longer receives it: its setup
+  takes no locale (corrected 2026-09-25, see "Common appearance tokens").
 - **Slot convention for split-field PSPs:** `data-payfanout-field="cardNumber|
   expiryDate|cvv"` elements inside the container become the mount points — the host
   owns the layout (grids, rows, labels); adapter-created stacked divs remain the
@@ -592,7 +593,9 @@ One atomic core+conformance+all-adapters change (major changesets across the boa
   plus `-webkit-text-fill-color` and `box-shadow`), logging "Invalid css property: " for
   each. The `background-color` the adapter sent for `colorBackground` was therefore always
   deleted, so the token is now recognized and not applied, like `colorPrimary`. The
-  sanitizer drops only the offending properties, not all styling, as this entry first said.
+  sanitizer drops only the offending properties of a flat selector object, not all styling,
+  as this entry first said; a Stripe key whose value is a string (`theme`, `labels`) fails
+  setup with 9021 and a nested one (`rules`) with 9022, per the setup page's error table.
   `MountOptions.locale` is no longer forwarded: the setup options table (`currencyCode`,
   `environment`, `fields`, `style`, `initializationTimeout`, `threshold`, `accounts`) has no
   `locale`, and the served SDK reads one only for wallet buttons and

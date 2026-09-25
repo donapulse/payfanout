@@ -309,9 +309,11 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
    * container carrying data-payfanout-field="cardNumber|expiryDate|cvv" become
    * the mount points (the host owns rows/grid/spacing); missing slots fall
    * back to adapter-created stacked containers. Placeholders and any other
-   * per-field or SDK option come from MountOptions.fieldOptions. The hosted
-   * fields carry no texts of their own and `locale` is no setup option, so
-   * MountOptions.locale is not forwarded.
+   * per-field or SDK option come from MountOptions.fieldOptions. Setup takes
+   * no `locale`, so MountOptions.locale is not forwarded: the fields' texts
+   * (placeholder, accessibilityLabel, accessibilityErrorMessage, iframeTitle)
+   * are set per field under fieldOptions.fields, and Paysafe's defaults, like
+   * the adapter's placeholders, are English.
    */
   async mount(container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
     assertBrowser("PaysafeClientAdapter", "mount");
@@ -745,7 +747,7 @@ const COMMON_APPEARANCE_TO_PAYSAFE: Record<string, string> = {
   fontSize: "font-size",
 };
 
-/** Stripe Appearance API keys — meaningless to Paysafe.js, whose sanitizer deletes them. */
+/** Stripe Appearance API keys — meaningless to Paysafe.js, which would strip or refuse them. */
 const STRIPE_APPEARANCE_KEYS = new Set(["variables", "rules", "theme", "labels"]);
 
 /**
@@ -761,8 +763,10 @@ const STRIPE_APPEARANCE_KEYS = new Set(["variables", "rules", "theme", "labels"]
  * - **Native Paysafe selectors** — object-valued entries (`input`, `:focus`, …)
  *   pass through untouched for power users; a native `input` wins over the tokens.
  * - **Stripe Appearance keys / other unusable entries** — dropped with a clear
- *   warning; forwarded, Paysafe.js's sanitizer would delete each property it does
- *   not allow and log a cryptic "Invalid css property" for it.
+ *   warning. Forwarded, a flat object (`variables`) would lose each property the
+ *   sanitizer does not allow, with a cryptic "Invalid css property" each, and a
+ *   string value (`theme`, `labels`) or a nested one (`rules`) would fail setup
+ *   with 9021 or 9022.
  */
 function toPaysafeStyle(appearance: Record<string, unknown> | undefined): { style: Record<string, unknown> } | undefined {
   if (!appearance) return undefined;

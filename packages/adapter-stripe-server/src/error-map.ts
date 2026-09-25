@@ -32,22 +32,33 @@ const AUTHENTICATION_FAILURE_CODES = new Set([
 export function mapStripeError(err: unknown): PayFanoutError {
   if (isPayFanoutError(err)) return err;
   const e = (err ?? {}) as StripeErrorLike;
-  const { code, retryable, message } = classify(e);
+  const { code, retryable, message, outcomeUnknown } = classify(e);
   return new PayFanoutError({
     code,
     message,
     retryable,
     raw: err,
     pspName: "stripe",
+    ...(outcomeUnknown ? { outcomeUnknown } : {}),
   });
 }
 
-function classify(e: StripeErrorLike): { code: UnifiedErrorCode; retryable: boolean; message: string } {
+function classify(e: StripeErrorLike): {
+  code: UnifiedErrorCode;
+  retryable: boolean;
+  message: string;
+  outcomeUnknown?: true;
+} {
   if (e.type === "StripeRateLimitError" || e.statusCode === 429) {
     return { code: "rate_limited", retryable: true, message: "Too many requests — please retry shortly." };
   }
   if (e.type === "StripeConnectionError" || e.type === "StripeAPIError" || (e.statusCode ?? 0) >= 500) {
     return { code: "psp_unavailable", retryable: true, message: "The payment provider is temporarily unavailable." };
+  }
+  if (e.type === "StripeIdempotencyError") {
+    // The key was already used, by a request whose result Stripe keeps: that
+    // request may have gone through, so only the same key may follow.
+    return { code: "invalid_request", retryable: false, message: "The payment request was invalid.", outcomeUnknown: true };
   }
   if (e.type === "StripeAuthenticationError") {
     return { code: "invalid_request", retryable: false, message: "Payment configuration error." };

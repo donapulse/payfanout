@@ -2600,6 +2600,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
         `"${replay.merchantRefNum}", more than one lookup reads — reconcile them in the Paysafe portal, and start ` +
         "over under a new key only once every one of them has failed or been cancelled",
       retryable: false,
+      outcomeUnknown: true,
       raw: { merchantRefNum: replay.merchantRefNum },
       pspName: this.pspName,
     });
@@ -2613,6 +2614,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
         `Paysafe holds ${records.length} ${noun}s under merchantRefNum "${replay.merchantRefNum}", so this ` +
         "call cannot tell which one it produced — reconcile them in the Paysafe portal",
       retryable: false,
+      outcomeUnknown: true,
       raw: records,
       pspName: this.pspName,
     });
@@ -2698,11 +2700,17 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     );
   }
 
+  /**
+   * outcomeUnknown on every retry-later ending, as on the several-records and
+   * full-page refusals: money may have moved under the key without the lookup
+   * showing it, so nothing automatic may start over under a new key.
+   */
   private retryLater(message: string, replay: ReplayKey, cause: unknown): PayFanoutError {
     return new PayFanoutError({
       code: "processing_error",
       message,
       retryable: false,
+      outcomeUnknown: true,
       raw: { merchantRefNum: replay.merchantRefNum, cause },
       pspName: this.pspName,
     });

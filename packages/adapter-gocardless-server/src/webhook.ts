@@ -83,13 +83,23 @@ export function parseGoCardlessWebhookEvents(rawBody: string): UnifiedWebhookEve
 export function normalizeGoCardlessEvent(event: GoCardlessEventLike): UnifiedWebhookEvent {
   const links = event.links ?? {};
   const refundId = links["refund"];
+  const resourceType = event.resource_type ?? "";
+  const paymentLink = links["payment"] ?? links["payment_request_payment"];
+  const billingRequest = resourceType === "billing_requests" ? links["billing_request"] : undefined;
   return {
     // GoCardless event ids (EV...) are globally unique — THE dedupe key. The
     // fallback hash keeps ids stable across parses if one is ever missing.
     id: event.id ?? `gocardless_${fnv1aHex(JSON.stringify(event))}`,
     pspName: "gocardless",
-    type: mapEventType(event.resource_type ?? "", event.action ?? ""),
-    pspPaymentId: links["payment"] ?? links["payment_request_payment"],
+    type: mapEventType(resourceType, event.action ?? "", links),
+    // Billing request events name the billing request, the session id hosts
+    // hold and retrievePayment accepts. Only a fulfilment names its payment:
+    // GoCardless's examples carry payment_request_payment on every action,
+    // though before fulfilment that payment does not exist yet.
+    pspPaymentId:
+      billingRequest && event.action !== "fulfilled"
+        ? billingRequest
+        : (paymentLink ?? billingRequest),
     // No amount/currency: GoCardless events carry links + details only, never
     // money fields — money truth stays on retrievePayment/retrieveRefund.
     ...(refundId ? { refundId } : {}),
@@ -98,16 +108,19 @@ export function normalizeGoCardlessEvent(event: GoCardlessEventLike): UnifiedWeb
   };
 }
 
-function mapEventType(resourceType: string, action: string): UnifiedWebhookEventType {
+function mapEventType(
+  resourceType: string,
+  action: string,
+  links: Record<string, string | undefined>,
+): UnifiedWebhookEventType {
   if (resourceType === "payments") {
     switch (action) {
       case "confirmed":
         return "payment.succeeded";
-      // late_failure_settled: a confirmed/paid-out payment can flip to failed
-      // days later on bank debit rails — consumers must handle succeeded -> failed.
+      // A late failure arrives as `failed` after confirmed or paid_out —
+      // consumers must handle succeeded -> failed.
       case "failed":
       case "customer_approval_denied":
-      case "late_failure_settled":
         return "payment.failed";
       case "cancelled":
         return "payment.canceled";
@@ -122,11 +135,11 @@ function mapEventType(resourceType: string, action: string): UnifiedWebhookEvent
       // merchant win (direct debit chargebacks have no merchant dispute flow).
       case "chargeback_cancelled":
         return "payment.chargeback_won";
-      // paid_out / chargeback_settled / surcharge_fee_debited are payout
-      // accounting, not payer-state changes. chargeback_settled in particular
-      // records already-reclaimed funds being debited from a payout, NOT a
-      // dispute outcome — the loss is final at charged_back itself, so no
-      // action here maps to payment.chargeback_lost (see the guide).
+      // paid_out / late_failure_settled / chargeback_settled /
+      // surcharge_fee_debited are payout accounting, not payer-state changes:
+      // the *_settled actions debit a payout for a failure already reported as
+      // `failed`, or a loss already final at charged_back. No action here maps
+      // to payment.chargeback_lost (see the guide).
       default:
         return "unknown";
     }
@@ -148,11 +161,19 @@ function mapEventType(resourceType: string, action: string): UnifiedWebhookEvent
     }
   }
   if (resourceType === "billing_requests") {
-    // fulfilled = the payer completed the hosted authorisation and the
-    // payment now exists (links.payment_request_payment carries its id) —
-    // the earliest "money is underway" signal on this rail. Other billing
-    // request actions are session lifecycle, not payer-state changes.
-    return action === "fulfilled" ? "payment.processing" : "unknown";
+    switch (action) {
+      // Only a Pay by Bank fulfilment names a payment; a mandate-only billing
+      // request fulfils into a mandate alone.
+      case "fulfilled":
+        return links["payment_request_payment"] ? "payment.processing" : "unknown";
+      // Nothing was created; retrievePayment reports the same billing request as canceled.
+      case "cancelled":
+        return "payment.canceled";
+      // bank_authorisation_denied is not terminal (the payer can return to the
+      // flow and authorise again), and failed maps to no documented status.
+      default:
+        return "unknown";
+    }
   }
   // mandates / future resources — surfaced, never dropped.
   return "unknown";

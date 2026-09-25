@@ -126,6 +126,9 @@ describe("mapPayPalError", () => {
     [422, issue("AUTHORIZATION_ALREADY_CAPTURED"), "invalid_request", false],
     [422, issue("AUTHORIZATION_DENIED"), "invalid_request", false],
     [422, issue("AUTH_CAPTURE_CURRENCY_MISMATCH"), "invalid_request", false],
+    [422, issue("PREVIOUSLY_CAPTURED"), "invalid_request", false],
+    [422, issue("PREVIOUSLY_VOIDED"), "invalid_request", false],
+    [422, issue("CANNOT_BE_VOIDED"), "invalid_request", false],
     [422, issue("SOMETHING_BRAND_NEW"), "invalid_request", false],
     // Malformed details never break the mapping: null entries are skipped, a non-list is ignored.
     [422, { name: "UNPROCESSABLE_ENTITY", details: [null, { issue: "INSTRUMENT_DECLINED" }] }, "card_declined", false],
@@ -554,14 +557,31 @@ describe("PayPal capture requests", () => {
     ]);
   });
 
-  it("an authorization that reports no amount: a first capture takes it all, later ones need an amount", async () => {
+  it("an authorization that reports no amount: a first capture takes the order amount, later ones need an amount", async () => {
     const fresh = adapterWithExchanges({
       "GET /v2/checkout/orders/5O1": authorizedOrder({ authorizations: [{ id: "A1", status: "CREATED" }] }),
       "POST /v2/payments/authorizations/A1/capture": capturedOk,
     });
     await fresh.adapter.capturePayment("5O1", undefined, "k-all");
-    // No amount: PayPal captures the full authorized amount, so it is final.
-    expect(fresh.posts[0]?.body).toEqual({ final_capture: true });
+    // Nothing was captured, so the rest is the whole order, and it is final.
+    expect(fresh.posts[0]?.body).toEqual({ amount: { currency_code: "USD", value: "20.00" }, final_capture: true });
+
+    // With no order amount either, PayPal captures the full authorized amount.
+    const unknown = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": {
+        status: 200,
+        body: {
+          id: "5O1",
+          intent: "AUTHORIZE",
+          status: "COMPLETED",
+          purchase_units: [{ reference_id: "default", payments: { authorizations: [{ id: "A1", status: "CREATED" }] } }],
+        },
+      },
+      "POST /v2/payments/authorizations/A1/capture": capturedOk,
+    });
+    expect((await unknown.adapter.retrievePayment("5O1")).amountCapturable).toBeUndefined();
+    await unknown.adapter.capturePayment("5O1", undefined, "k-all");
+    expect(unknown.posts[0]?.body).toEqual({ final_capture: true });
 
     const partial = adapterWithExchanges({
       "GET /v2/checkout/orders/5O1": authorizedOrder({
@@ -571,12 +591,16 @@ describe("PayPal capture requests", () => {
       "POST /v2/payments/authorizations/A1/capture": capturedOk,
     });
     await expect(partial.adapter.capturePayment("5O1", undefined, "k-rest")).rejects.toThrowError(
-      /remainder after earlier captures is unknown/,
+      /reports no authorized amount, so the remainder after earlier captures is unknown/,
     );
     expect(partial.posts).toHaveLength(0);
-    // An explicit amount still goes out, and keeps the authorization open.
+    // An explicit amount still goes out, and closes the authorization only when it takes the 15.00 the order has left.
     await partial.adapter.capturePayment("5O1", 300, "k-part");
-    expect(partial.posts[0]?.body).toEqual({ amount: { currency_code: "USD", value: "3.00" }, final_capture: false });
+    await partial.adapter.capturePayment("5O1", 1500, "k-last");
+    expect(partial.posts.map((post) => post.body)).toEqual([
+      { amount: { currency_code: "USD", value: "3.00" }, final_capture: false },
+      { amount: { currency_code: "USD", value: "15.00" }, final_capture: true },
+    ]);
   });
 
   it("treats an authorization reporting no status as closed — nothing is captured", async () => {
@@ -687,6 +711,324 @@ describe("PayPal capture requests", () => {
         body: { amount: { currency_code: "USD", value: "20.00" }, final_capture: true },
       },
     ]);
+  });
+});
+
+describe("PayPal authorizations after a reauthorization", () => {
+  const capturedOk = { status: 201, body: { id: "c9", status: "COMPLETED" } };
+  const voidedOk = { status: 200, body: {} };
+  const usd = (value: string) => ({ currency_code: "USD", value });
+  const day = (n: number) => new Date(Date.parse("2026-09-01T10:00:00Z") + n * 24 * 3600 * 1000).toISOString();
+
+  it("orders authorizations by create_time whatever the list order, one reporting none as the oldest", async () => {
+    const a = { id: "A", status: "CREATED", amount: usd("20.00") };
+    const b = { id: "B", status: "CREATED", amount: usd("20.00"), create_time: day(5) };
+    const c = { id: "C", status: "CREATED", amount: usd("20.00"), create_time: day(1) };
+    for (const listed of [[b, a, c], [a, b, c], [c, a, b]]) {
+      const { adapter, posts } = adapterWithExchanges({
+        "GET /v2/checkout/orders/5O1": authorizedOrder({ authorizations: listed }),
+        "POST /v2/payments/authorizations/B/capture": capturedOk,
+        "POST /v2/payments/authorizations/A/void": voidedOk,
+      });
+      await adapter.capturePayment("5O1", 500, "k-cap");
+      await adapter.cancelPayment("5O1", "k-void");
+      // The newest carries the hold; the oldest takes the void.
+      expect(posts.map((post) => post.path), listed.map((authorization) => authorization.id).join("")).toEqual([
+        "/v2/payments/authorizations/B/capture",
+        "/v2/payments/authorizations/A/void",
+      ]);
+    }
+  });
+
+  it("voids the oldest authorization when the list names the reauthorization first", async () => {
+    const { adapter, posts } = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": authorizedOrder({
+        authorizations: [
+          { id: "R", status: "CREATED", amount: usd("20.00"), create_time: day(4) },
+          { id: "O", status: "CREATED", amount: usd("20.00"), create_time: day(0) },
+        ],
+      }),
+      "POST /v2/payments/authorizations/O/void": voidedOk,
+    });
+    await adapter.cancelPayment("5O1", "k-void");
+    expect(posts.map((post) => post.path)).toEqual(["/v2/payments/authorizations/O/void"]);
+  });
+
+  it("reads a capture's authorization from its up link whatever the link's form", async () => {
+    const order = (upToA1: string, relToA2: string): Exchange =>
+      authorizedOrder({
+        authorizations: [
+          { id: "A1", status: "PARTIALLY_CAPTURED", amount: usd("20.00"), create_time: day(0) },
+          { id: "A2", status: "PARTIALLY_CAPTURED", amount: usd("10.00"), create_time: day(4) },
+        ],
+        captures: [
+          {
+            id: "c1",
+            status: "COMPLETED",
+            amount: usd("7.00"),
+            // A link without a rel and an up link without an href are passed over.
+            links: [{ href: "https://api-m.paypal.com/v2/payments/captures/c1" }, { rel: "up" }, { rel: "up", href: upToA1 }],
+          },
+          {
+            id: "c2",
+            status: "COMPLETED",
+            amount: usd("2.00"),
+            links: [{ rel: relToA2, href: "https://api-m.paypal.com/v2/payments/authorizations/A2" }],
+          },
+        ],
+      });
+    // A trailing slash with a query, and an upper-case rel, still name the authorization:
+    // A2 holds 10.00 and 2.00 of it is taken, while the order has 11.00 left.
+    const named = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": order("https://api-m.paypal.com/v2/payments/authorizations/A1/?page=1", "UP"),
+    });
+    expect((await named.adapter.retrievePayment("5O1")).amountCapturable).toBe(800);
+
+    // A malformed escape names no authorization of the order, so every capture counts.
+    const malformed = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": order("https://api-m.paypal.com/v2/payments/authorizations/%E0%A4%A", "up"),
+    });
+    expect((await malformed.adapter.retrievePayment("5O1")).amountCapturable).toBe(100);
+  });
+
+  it("keeps the reauthorization open on a partial capture after a final one it may not have given", async () => {
+    // The host captured 5.00 from the superseded original with final_capture, outside the adapter.
+    // It names no authorization, so whether it closed A2 is an estimate.
+    for (const [amount, final] of [
+      [1000, false],
+      [1500, true],
+    ] as const) {
+      const { adapter, posts } = adapterWithExchanges({
+        "GET /v2/checkout/orders/5O1": authorizedOrder({
+          authorizations: [
+            { id: "A1", status: "CAPTURED", amount: usd("20.00"), create_time: day(0) },
+            { id: "A2", status: "CREATED", amount: usd("20.00"), create_time: day(4) },
+          ],
+          captures: [{ id: "c1", status: "COMPLETED", final_capture: true, amount: usd("5.00"), create_time: day(5) }],
+        }),
+        "POST /v2/payments/authorizations/A2/capture": capturedOk,
+      });
+      await adapter.capturePayment("5O1", amount, `k-cap-${amount}`);
+      expect(
+        posts.map((post) => post.body),
+        String(amount),
+      ).toEqual([{ amount: usd((amount / 100).toFixed(2)), final_capture: final }]);
+    }
+  });
+
+  it("keeps the reauthorization open when what is left rests on a capture another authorization could have given", async () => {
+    // A2 reauthorized the 13.00 left; the 7.00 names no authorization, and A1 or A2 could have given it.
+    for (const [label, taken] of [
+      ["undated", {}],
+      ["taken after the reauthorization", { create_time: day(5) }],
+    ] as const) {
+      const { adapter, posts } = adapterWithExchanges({
+        "GET /v2/checkout/orders/5O1": authorizedOrder({
+          authorizations: [
+            { id: "A1", status: "PARTIALLY_CAPTURED", amount: usd("20.00"), create_time: day(0) },
+            { id: "A2", status: "CREATED", amount: usd("13.00"), create_time: day(4) },
+          ],
+          captures: [{ id: "c1", status: "COMPLETED", amount: usd("7.00"), ...taken }],
+        }),
+        "POST /v2/payments/authorizations/A2/capture": capturedOk,
+      });
+      // Counting the 7.00 against A2 leaves 6.00, an estimate that may miss 7.00 still on A2.
+      expect((await adapter.retrievePayment("5O1")).amountCapturable, label).toBe(600);
+      await adapter.capturePayment("5O1", undefined, "k-rest");
+      await adapter.capturePayment("5O1", 600, "k-six");
+      // Taking all the order has left closes it whatever the estimate.
+      await adapter.capturePayment("5O1", 1300, "k-all");
+      expect(posts.map((post) => post.body), label).toEqual([
+        { amount: usd("6.00"), final_capture: false },
+        { amount: usd("6.00"), final_capture: false },
+        { amount: usd("13.00"), final_capture: true },
+      ]);
+    }
+  });
+
+  it("closes the reauthorization after a presumed capture when the order sets what is left", async () => {
+    // A2 reauthorized the full 20.00: 7.00 came from A1 before it, 5.00 from either after it.
+    const { adapter, posts } = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": authorizedOrder({
+        authorizations: [
+          { id: "A1", status: "PARTIALLY_CAPTURED", amount: usd("20.00"), create_time: day(0) },
+          { id: "A2", status: "PARTIALLY_CAPTURED", amount: usd("20.00"), create_time: day(4) },
+        ],
+        captures: [
+          { id: "c1", status: "COMPLETED", amount: usd("7.00"), create_time: day(1) },
+          { id: "c2", status: "COMPLETED", amount: usd("5.00"), create_time: day(5) },
+        ],
+      }),
+      "POST /v2/payments/authorizations/A2/capture": capturedOk,
+    });
+    // A2 has at least 15.00 left and the order 8.00, which is exact.
+    expect((await adapter.retrievePayment("5O1")).amountCapturable).toBe(800);
+    await adapter.capturePayment("5O1", undefined, "k-rest");
+    expect(posts.map((post) => post.body)).toEqual([{ amount: usd("8.00"), final_capture: true }]);
+  });
+
+  it("a declined capture that names no authorization took nothing, so the count stays exact", async () => {
+    // A2 reauthorized 13.00 of the 20.00 order.
+    const { adapter, posts } = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": authorizedOrder({
+        authorizations: [
+          { id: "A1", status: "CREATED", amount: usd("20.00"), create_time: day(0) },
+          { id: "A2", status: "CREATED", amount: usd("13.00"), create_time: day(4) },
+        ],
+        captures: [{ id: "c1", status: "DECLINED", amount: usd("7.00") }],
+      }),
+      "POST /v2/payments/authorizations/A2/capture": capturedOk,
+    });
+    await adapter.capturePayment("5O1", undefined, "k-rest");
+    expect(posts.map((post) => post.body)).toEqual([{ amount: usd("13.00"), final_capture: true }]);
+  });
+
+  it("capturing the rest once the order's captures cover it answers with the payment, the reauthorization still open", async () => {
+    // The host took 5.00 from the reauthorization itself, without final_capture.
+    const { adapter, posts } = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": authorizedOrder({
+        authorizations: [
+          { id: "A1", status: "PARTIALLY_CAPTURED", amount: usd("20.00"), create_time: day(0) },
+          { id: "A2", status: "PARTIALLY_CAPTURED", amount: usd("20.00"), create_time: day(4) },
+        ],
+        captures: [
+          { id: "c1", status: "COMPLETED", amount: usd("15.00"), supplementary_data: { related_ids: { authorization_id: "A1" } } },
+          { id: "c2", status: "COMPLETED", amount: usd("5.00"), supplementary_data: { related_ids: { authorization_id: "A2" } } },
+        ],
+      }),
+    });
+    const info = await adapter.capturePayment("5O1", undefined, "k-rest");
+    expect(info).toMatchObject({ amountCaptured: 2000, amountCapturable: 0 });
+    expect(posts).toHaveLength(0);
+  });
+
+  it("measures an order read reporting no amount by the original authorization, and a bare order amount in its currency", async () => {
+    const orderWith = (authorizations: object[], captures: object[], amount?: object): Exchange => ({
+      status: 200,
+      body: {
+        id: "5O1",
+        intent: "AUTHORIZE",
+        status: "COMPLETED",
+        purchase_units: [{ reference_id: "default", ...(amount ? { amount } : {}), payments: { authorizations, captures } }],
+      },
+    });
+    // A reauthorization of the 13.00 left after a 7.00 capture from the original.
+    const ofTheRest = [
+      { id: "A1", status: "PARTIALLY_CAPTURED", amount: usd("20.00"), create_time: day(0) },
+      { id: "A2", status: "CREATED", amount: usd("13.00"), create_time: day(4) },
+    ];
+    const seven = [
+      { id: "c1", status: "COMPLETED", amount: usd("7.00"), supplementary_data: { related_ids: { authorization_id: "A1" } } },
+    ];
+    const amountless = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": orderWith(ofTheRest, seven),
+      "POST /v2/payments/authorizations/A2/capture": capturedOk,
+    });
+    expect((await amountless.adapter.retrievePayment("5O1")).amountCapturable).toBe(1300);
+    await amountless.adapter.capturePayment("5O1", undefined, "k-rest");
+    expect(amountless.posts.at(-1)?.body).toEqual({ amount: usd("13.00"), final_capture: true });
+
+    // A reauthorization for 23.00, 115% of the 20.00 order, after 2.00 was taken: 18.00 is left, not 21.00.
+    const higher = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": orderWith(
+        [
+          { id: "A1", status: "PARTIALLY_CAPTURED", amount: usd("20.00"), create_time: day(0) },
+          { id: "A2", status: "CREATED", amount: usd("23.00"), create_time: day(4) },
+        ],
+        [{ id: "c1", status: "COMPLETED", amount: usd("2.00"), create_time: day(1) }],
+      ),
+      "POST /v2/payments/authorizations/A2/capture": capturedOk,
+    });
+    expect((await higher.adapter.retrievePayment("5O1")).amountCapturable).toBe(1800);
+    await higher.adapter.capturePayment("5O1", undefined, "k-rest");
+    expect(higher.posts.at(-1)?.body).toEqual({ amount: usd("18.00"), final_capture: true });
+
+    const bare = adapterWithExchanges({ "GET /v2/checkout/orders/5O1": orderWith(ofTheRest, seven, { value: "20.00" }) });
+    expect((await bare.adapter.retrievePayment("5O1")).amountCapturable).toBe(1300);
+  });
+
+  it("capturing the rest of a reauthorization needs an explicit amount when neither the order nor the original reports one", async () => {
+    const { adapter, posts } = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": {
+        status: 200,
+        body: {
+          id: "5O1",
+          intent: "AUTHORIZE",
+          status: "COMPLETED",
+          purchase_units: [
+            {
+              reference_id: "default",
+              payments: {
+                authorizations: [
+                  { id: "A1", status: "CREATED", create_time: day(0) },
+                  { id: "A2", status: "CREATED", amount: usd("23.00"), create_time: day(4) },
+                ],
+              },
+            },
+          ],
+        },
+      },
+      "POST /v2/payments/authorizations/A2/capture": capturedOk,
+    });
+    expect((await adapter.retrievePayment("5O1")).amountCapturable).toBeUndefined();
+    // Without an amount PayPal would take all 23.00, however much the order was.
+    await expect(adapter.capturePayment("5O1", undefined, "k-rest")).rejects.toThrowError(
+      /reports no amount for the order or its original authorization, so what reauthorization A2 may take is unknown/,
+    );
+    expect(posts).toHaveLength(0);
+    await adapter.capturePayment("5O1", 2000, "k-explicit");
+    expect(posts.map((post) => post.body)).toEqual([{ amount: usd("20.00"), final_capture: false }]);
+  });
+
+  it("capturing the rest of an authorization PayPal closed as CAPTURED answers with the payment", async () => {
+    // Its captures cover less than the order, and none went out as the final one.
+    const { adapter, posts } = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": authorizedOrder({
+        authorizations: [{ id: "A1", status: "CAPTURED", amount: usd("20.00") }],
+        captures: [{ id: "c1", status: "COMPLETED", amount: usd("12.00") }],
+      }),
+    });
+    await expect(adapter.capturePayment("5O1", undefined, "k-rest")).resolves.toMatchObject({
+      amountCaptured: 1200,
+      amountCapturable: 0,
+    });
+    expect(posts).toHaveLength(0);
+  });
+
+  it("capturing the rest of a reauthorization reporting no amount takes what the order has left while nothing was captured", async () => {
+    const { adapter, posts } = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": authorizedOrder({
+        authorizations: [
+          { id: "A1", status: "CREATED", amount: usd("20.00"), create_time: day(0) },
+          { id: "A2", status: "CREATED", create_time: day(4) },
+        ],
+      }),
+      "POST /v2/payments/authorizations/A2/capture": capturedOk,
+    });
+    // Without an amount PayPal would take A2's full amount, which can be up to 115% of the order.
+    await adapter.capturePayment("5O1", undefined, "k-rest");
+    expect(posts).toEqual([
+      { path: "/v2/payments/authorizations/A2/capture", body: { amount: usd("20.00"), final_capture: true } },
+    ]);
+  });
+
+  it("capturing the rest of a reauthorization reporting no amount needs an explicit amount once the order has a capture", async () => {
+    const { adapter, posts } = adapterWithExchanges({
+      "GET /v2/checkout/orders/5O1": authorizedOrder({
+        authorizations: [
+          { id: "A1", status: "PARTIALLY_CAPTURED", amount: usd("20.00"), create_time: day(0) },
+          { id: "A2", status: "CREATED", create_time: day(4) },
+        ],
+        captures: [
+          { id: "c1", status: "COMPLETED", amount: usd("7.00"), supplementary_data: { related_ids: { authorization_id: "A1" } } },
+        ],
+      }),
+    });
+    // Without an amount PayPal would capture A2's full amount, which can reach past the order.
+    await expect(adapter.capturePayment("5O1", undefined, "k-rest")).rejects.toThrowError(
+      /remainder after earlier captures is unknown/,
+    );
+    expect(posts).toHaveLength(0);
   });
 });
 

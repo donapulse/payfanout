@@ -2341,9 +2341,14 @@ description of what v2 changes is what the migration then had to implement.
   trailed the first, each minted a handle and debited it. Doc-verified 2026-09-25 against
   the spec: the ACH, EFT, SEPA and BACS payment request examples all send
   `"dupCheck": true`. The EFT pair mints the handle and charges it under one
-  `merchantRefNum` ("4533863971"); the handle request carries no `dupCheck` (it sends a
-  `"dupcheck"` the schema does not define), and the payment, sent with `dupCheck: true`,
-  answers `COMPLETED`, so a handle minted under the key does not trip the payment's check.
+  `merchantRefNum` ("4533863971"); the handle request carries no `dupCheck` (it sends
+  `"dupcheck": true`, a spelling the schema does not define), and the payment, sent with
+  `dupCheck: true`, answers `COMPLETED`, so a handle minted under the key does not trip the
+  payment's check. Two more pairs in the spec show the same (doc-verified 2026-09-25):
+  Paysafecash, `merchantRefNum` "a9318b525273ee3cda79a2f947a9", handle `PH4lXuM1iYSK64xG`
+  minted `INITIATED` without `dupCheck`, then paid with `dupCheck: true` and answered
+  `COMPLETED`; and Mazooma, `merchantRefNum` "285a1d9f-ab6b-4851-870b-b725148a5162", handle
+  `PH0gRuaOS9Yr7PNQ`, the same sequence, also `COMPLETED`.
   The payment therefore carries `dupCheck: true` while the key's read shows no failed
   payment, whatever handles it shows: no handle stops another attempt from debiting.
   Paysafe then refuses a later payment under the key (5031, or 3044/3417), which says that
@@ -2351,17 +2356,18 @@ description of what v2 changes is what the migration then had to implement.
   whichever handle made it, and ends in the non-retryable `processing_error` while none
   shows. After an unknown
   outcome only the call's own record settles it: another handle's payment does not say
-  whether this one went through too. Once a failed payment shows, the check is off, because
-  it would refuse corrected bank details for 90 days. What remains: after a visible
-  failure, a later attempt whose answer is lost, and whose payment and handle the lookup
-  does not show yet, is debited again if resubmitted; and whether the check catches a
+  whether this one went through too. The check would refuse corrected bank details for 90
+  days, so it stops at the first failed payment the key shows. Two things remain. Once a
+  failed attempt shows, the check is off: two attempts sent together, or one resubmitted
+  before the lookup shows the other's payment or handle, can both be debited (a test pins
+  the two debits of two corrected attempts sent together). And whether the check catches a
   payment Paysafe is still processing is the first open item below. The handle mint still
   sends no `dupCheck`: among the handle instruments only `eftObject` defines it (a boolean
   with no description and no default), `achObject`, `sepaObject` and `bacsObject` do not,
   the ACH handle example sends `false`, and a handle moves no money, so a handle-level
   refusal would only add a path that reads back a handle rather than the payment that
-  answers the call. A handle's mandate reference now stands in only for the payment that
-  spent it.
+  answers the call. A handle's mandate reference now stands in only for a payment whose
+  record names that handle's token; a record that names no handle takes no mandate.
 - **Writes are never re-sent blindly, and payments, settlements and refunds are not re-sent
   after an unknown outcome.** Paysafe's Java and PHP SDK pages say "The client can be
   configured to automatically retry GET requests that have failed due to network problems
@@ -2405,7 +2411,17 @@ description of what v2 changes is what the migration then had to implement.
   session that calls Paysafe mints an Interac handle, which moves no money. The lookups
   default to the last 30 days ("Default = 30 days before the endDate") against dupCheck's
   90, so an original older than 30 days can never be read back, and the error message says
-  so. `startDate` is not widened because its maximum range is undocumented.
+  so. `startDate` is not widened because its maximum range is undocumented (re-verified
+  2026-09-25 on the `payments` and `paymenthandles` lookups: a date with that default and
+  no stated limit); the sandbox check is an open item below. For a bank debit the gap has a
+  second effect (2026-09-25): a failed attempt 31 to 90 days old is out of the lookup's
+  sight but still trips `dupCheck`, so every attempt under the key is refused, and retrying
+  under it cannot get past that. The refusal's error therefore does not say "never a new
+  one": it states the 90- and 30-day windows, that a failed attempt older than the lookup
+  can refuse the key, and that once the Paysafe portal shows no successful payment under
+  it, the host starts again under a new idempotency key. "Never a new one" stays where it
+  holds, where the attempt may have been processed and the lookup can still show it: after
+  an unknown outcome, and on the other rejections that stand for this call's own original.
 - **How recovery reads.** An original is read back up to three times, 250 and 500 ms apart,
   each read a single attempt, which bounds a hung Paysafe to three more exchanges. The reads
   a call makes before it writes use the usual GET retries: a completion's key, a payment
@@ -2425,12 +2441,24 @@ description of what v2 changes is what the migration then had to implement.
   (doc-verified 2026-09-25), and a handle minted for another email would collect from
   another alias, so, like a bank handle minted from other details, it is left alone and a
   new one is minted; the addresses compare trimmed and case-insensitively, and an echo that
-  states none cannot contradict. A bank-debit completion
+  states none cannot contradict. The handle lookup's item schema (`paymentHandleResponse`,
+  composing the `x-internal` `paymentInstrumentResponse` and `interacObject`) spells the
+  echo `interacETransfer`, while every example and the Interac guide write
+  `interacEtransfer`, and the spec has no lookup example to settle it (doc-verified
+  2026-09-25), so a replay reads both spellings, and either naming another alias rules the
+  handle out. A bank-debit completion
   reads its key's payments first, and a live one answers the replay whichever handle it
   spent. It then reads the key's handles and reuses an uncharged one minted from the same
-  bank details. A COMPLETED handle with no payment of its own in the lookup means a payment
-  exists that the lookup does not show yet, so the payments are read again, and the call
-  ends with the non-retryable `processing_error` rather than debit again. Sharing one key
+  bank details. A COMPLETED handle with no payment of its own in the lookup does not prove a
+  payment exists (corrected 2026-09-25; this entry said it did). Either the lookup does not
+  show that payment yet, or Paysafe refused an attempt (5031, 3044 or 3417) and the refused
+  call spent its handle all the same, which is the plain reading of the card page's
+  "Regardless of the payments call response status, the payment handle status always
+  changes to COMPLETED when a payments call is made." The payments are read again, and the
+  call ends with the non-retryable `processing_error` rather than debit again. Its message
+  says that a refused attempt can leave a spent handle, and that once the Paysafe portal
+  shows no successful payment under the key, the host may start again under a new key: on
+  the plain reading, retrying under the key never gets past such a handle. Sharing one key
   across the handle and the payment follows Paysafe's own EFT examples: the handle and the
   payment both carry `merchantRefNum` "4533863971", the payment is sent with
   `dupCheck: true` and comes back `COMPLETED`, so the handle's use of the reference does not
@@ -2453,7 +2481,10 @@ description of what v2 changes is what the migration then had to implement.
   after 25-30 seconds to lower `requestTimeoutMs` and `maxNetworkRetries` and to replay a
   call the platform ended with the same key.
 - **The test double models the documented behaviour.** It answers 409/5031 under `dupCheck`
-  (or 402/3044), spends single-use handles (5283 on reuse), records declined payments and
+  (or 402/3044), spends single-use handles (5283 on reuse), including on a 5031, 3044 or
+  3417 refusal, the plain reading of the card page, with a switch for the other reading
+  (2026-09-25), keeps a clock so that its lookups show the last 30 days while `dupCheck`
+  counts 90 (2026-09-25), records declined payments and
   verifications with their handle tokens, answers the capture, refund and void state checks
   with the documented 402 codes (3203/3204, 3402/3404, 3501/3502) and an unknown settlement
   with 400/3407, serves the six lookups, accepts `dupCheck` on handles, echoes the Interac
@@ -2495,12 +2526,22 @@ description of what v2 changes is what the migration then had to implement.
     undocumented), and a full page is refused with the non-retryable `processing_error`
     instead of being paged through or read as complete: a key holding that many records
     in the 30-day window is reconciled in the portal.
-  - **Whether a `/payments` rejection that files no payment (a 400 such as 5068, or the
-    409/5031 that refuses a second bank debit under `dupCheck`) still spends the handle**,
-    as "regardless of the payments call response status" suggests. If it does, a
-    bank-debit key whose handle is spent with no payment under it ends every retry in
-    `processing_error` unless the key's payment shows: when the Paysafe portal shows no
-    payment under the key, the host starts a new attempt under a new key.
+  - **Whether a refused payments call spends its handle.** The adapter and the test double
+    take "regardless of the payments call response status" plainly: a 5031, 3044 or 3417
+    refusal leaves the handle COMPLETED with no payment, and a bank-debit key holding one
+    ends every retry in the non-retryable `processing_error` until the host starts again
+    under a new key. Probe: decline a bank debit under a key K, mint a fresh handle and pay
+    it under K with `dupCheck: true`, expect 5031, then `GET /paymenthandles/{id}` and
+    record the handle's status. PAYABLE would mean a refusal leaves the handle payable, and
+    the key could then debit once the failure shows. Record the same for a 400 that files no
+    payment (5068).
+  - **Whether the lookups accept a 90-day `startDate` range.** The `payments` and
+    `paymenthandles` lookups document `startDate` as "Default = 30 days before the endDate"
+    and state no maximum range, so the adapter reads the default window. Under a reference
+    last used 31 to 90 days ago, send both lookups with `startDate` 90 days back and record
+    whether the old records come back or the range is refused. If it works, a bank debit
+    can see the failed attempt that refuses its key and send corrected details without
+    `dupCheck`, instead of ending in the new-key guidance.
   - **Card and Interac completions, not built:** the bank-debit rule above, `dupCheck: true`
     until a failed attempt shows, would also refuse a card completion retried with a fresh
     tokenization while the first payment trails the lookup, and the second of two sent

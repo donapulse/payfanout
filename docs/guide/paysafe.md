@@ -215,7 +215,9 @@ the client side is [React usage](/guide/react#built-in-completion-transport).
 
 Keep the completion key stable per order, as above: a retried POST, a customer who pays
 again after a lost answer, or a new card after a decline all reuse it. §10 explains how
-each one is answered, and the timings in which a replay can still be charged twice.
+each one is answered, the timings in which a replay can still be charged twice, and the
+bank-debit errors after which you start again under a new key, once the Paysafe portal
+shows no successful payment under the old one.
 
 ## 8. Interac e-Transfer (Canada)
 
@@ -420,15 +422,27 @@ retries, for every write it makes:
   `processing_error`. A fresh write can take a moment to appear, and the lookup only
   covers the last 30 days, so an original older than that can never be read back:
   reconcile it in the Paysafe portal.
+- A bank-debit key can stay refused, so its errors say when to leave it. When Paysafe
+  refuses the payment as a duplicate and no payment under the key other than a failed
+  attempt can be read back, the error says that Paysafe's duplicate check covers 90 days
+  while the lookup reaches only 30: a failed attempt older than the lookup can refuse the
+  key. When the key holds a spent payment handle with no payment of its own, the error
+  says that a refused attempt can leave one, since Paysafe marks a handle `COMPLETED`
+  whatever its payments call answers. Both are the non-retryable `processing_error`.
+  Retry later with the same key, which returns the payment once the lookup shows it, and
+  once the Paysafe portal shows no successful payment under the key, start again under a
+  new idempotency key (a key derived from the order, like `complete-${order.id}`, needs a
+  suffix you can bump). Check the portal first: a new key while a payment under the old
+  one is still out of sight would debit twice.
 - Two card completions with different cards under one key can both be charged when the
   second is sent before the first shows in Paysafe's lookup, because nothing at Paysafe
-  spans them. Two bank-debit attempts are held apart by `dupCheck` instead: Paysafe refuses
-  the later payment (`5031`), and the adapter answers it with the first one, or with the
-  non-retryable `processing_error` while the lookup does not show it yet. Whether the check
-  also catches a payment Paysafe is still processing is undocumented. Once a failed attempt
-  shows under the key the check is off, and an attempt resubmitted after a lost answer,
-  before Paysafe's lookup shows its payment or its handle, can be debited twice. Keep one
-  completion in flight per order.
+  spans them. Two bank-debit attempts are held apart by `dupCheck` instead, while no
+  failed attempt shows under the key: Paysafe refuses the later payment (`5031`), and the
+  adapter answers it with the first one, or with the non-retryable `processing_error`
+  while the lookup does not show it yet. Whether the check also catches a payment Paysafe
+  is still processing is undocumented. Once a failed attempt shows, the check is off: two
+  attempts sent together, or one resubmitted before the lookup shows the other's payment
+  or handle, can both be debited. Keep one completion in flight per order.
 
 ::: warning A timeout bounds one exchange, not a call
 `requestTimeoutMs` (default `60000`, the response timeout of Paysafe's own SDKs) applies to

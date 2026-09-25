@@ -246,34 +246,47 @@ describe("Paysafe bank-debit sessions", () => {
   });
 
   it("falls back to the freshly minted handle's mandate when the payment echo omits it", async () => {
-    const { adapter } = makePair({
-      fetch: (async (input) => {
-        const url = typeof input === "string" ? input : (input as Request).url;
-        if (url.endsWith("/paymenthandles")) {
+    // Only a payment naming the handle it spent can borrow that handle's mandate.
+    for (const [spentToken, expected] of [
+      ["PH1", "4677MNAO66"],
+      [undefined, undefined],
+    ] as const) {
+      const { adapter } = makePair({
+        fetch: (async (input) => {
+          const url = typeof input === "string" ? input : (input as Request).url;
+          if (url.endsWith("/paymenthandles")) {
+            return new Response(
+              JSON.stringify({
+                id: "ph_1",
+                paymentHandleToken: "PH1",
+                status: "PAYABLE",
+                bacs: { mandateReference: "4677MNAO66" },
+              }),
+              { status: 201, headers: { "content-type": "application/json" } },
+            );
+          }
           return new Response(
             JSON.stringify({
-              id: "ph_1",
-              paymentHandleToken: "PH1",
-              status: "PAYABLE",
-              bacs: { mandateReference: "4677MNAO66" },
+              id: "pay_1",
+              status: "PROCESSING",
+              amount: 12_50,
+              currencyCode: "GBP",
+              paymentType: "BACS",
+              ...(spentToken ? { paymentHandleToken: spentToken } : {}),
             }),
-            { status: 201, headers: { "content-type": "application/json" } },
+            { status: 200, headers: { "content-type": "application/json" } },
           );
-        }
-        return new Response(
-          JSON.stringify({ id: "pay_1", status: "PROCESSING", amount: 12_50, currencyCode: "GBP", paymentType: "BACS" }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        );
-      }) as typeof fetch,
-    });
-    const fixture = RAILS[2]!;
-    const session = await adapter.createPaymentSession(sessionInput(fixture));
-    const info = await adapter.completePayment({
-      pspSessionId: session.pspSessionId,
-      clientToken: envelope(fixture.details),
-      idempotencyKey: "complete-mandate-fallback",
-    });
-    expect(info.mandateReference).toBe("4677MNAO66");
+        }) as typeof fetch,
+      });
+      const fixture = RAILS[2]!;
+      const session = await adapter.createPaymentSession(sessionInput(fixture));
+      const info = await adapter.completePayment({
+        pspSessionId: session.pspSessionId,
+        clientToken: envelope(fixture.details),
+        idempotencyKey: "complete-mandate-fallback",
+      });
+      expect(info.mandateReference, String(spentToken)).toBe(expected);
+    }
   });
 
   it("leaves mandateReference off ACH/EFT payments — the schemes document none", async () => {

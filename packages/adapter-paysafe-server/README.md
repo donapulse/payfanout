@@ -109,14 +109,19 @@ retrieved, not a separate credential).
   has it. A payment, capture or refund is re-sent only after a 429; a payment handle,
   verification or void also once the lookup shows nothing. Card and Interac completions
   send `dupCheck: false`, so another card can follow a decline under the same key. A
-  bank-debit completion sends `dupCheck: true` until a failed attempt shows under its key,
-  so a second attempt is refused instead of debiting again, and `false` after one, so
-  corrected bank details can follow. A key reused for a different amount or currency, or
-  a different saved card or verification card, rejects with `invalid_request`, unless
-  every earlier attempt under a card or Interac completion key failed. An original that
-  cannot be read back rejects with a non-retryable `processing_error`; retry it later
-  with the same key. The default `requestTimeoutMs` is 60000, the response timeout of
-  Paysafe's own SDKs, and bounds each exchange rather than a whole call.
+  bank-debit completion sends `dupCheck: true`, so a second attempt is refused instead of
+  debiting again while no failed attempt shows under the key, and `false` once one does,
+  so corrected bank details can follow. Once a failed attempt shows, the check is off: two
+  attempts sent together, or one resubmitted before the lookup shows the other's payment
+  or handle, can both be debited. [§10 of the setup
+  guide](https://donapulse.github.io/payfanout/guide/paysafe#_10-replays-lost-answers-and-timeouts)
+  covers these timings, and when a bank-debit key needs replacing. A key reused for a
+  different amount or currency, or a different saved card or verification card, rejects
+  with `invalid_request`, unless every earlier attempt under a card or Interac completion
+  key failed. An original that cannot be read back rejects with a non-retryable
+  `processing_error`; retry it later with the same key. The default `requestTimeoutMs` is
+  60000, the response timeout of Paysafe's own SDKs, and bounds each exchange rather than
+  a whole call.
 - Paysafe has no public events API (`supportsEventPolling: false`), so missed-webhook
   recovery falls back to `retrievePayment` per order.
 - Scheduler availability is per merchant account, like every Paysafe product option —

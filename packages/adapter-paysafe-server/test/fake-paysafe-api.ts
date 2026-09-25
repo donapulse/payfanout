@@ -77,14 +77,18 @@ type RefNumIndex<T> = Map<string, T[]>;
  *   own examples send it true and false), and /voidauths takes none at all;
  * - a payments call spends a single-use handle whatever its outcome ("the
  *   payment handle status always changes to COMPLETED"), so a second call
- *   with it answers 400/5283. Verifications do not spend one;
+ *   with it answers 400/5283. Read plainly, that covers a call Paysafe
+ *   refuses as a duplicate or as in progress too (`refusalSpendsHandle`).
+ *   Verifications do not spend one;
  * - a declined payment or verification is recorded, with its error, like any
  *   other, and payment and verification records carry their
  *   paymentHandleToken;
  * - capture, refund and void state checks answer the documented 402 codes
  *   (3203/3204, 3402/3404, 3501/3502), and a refund of an unknown
  *   settlement 400/3407;
- * - the GET ?merchantRefNum= lookups answer the documented collections.
+ * - the GET ?merchantRefNum= lookups answer the documented collections, over
+ *   their default window ("Default = 30 days before the endDate"), while
+ *   dupCheck looks back 90 days (`passDays` ages what is filed).
  * Where Paysafe documents nothing — a reused merchantRefNum without dupCheck
  * on /payments, /paymenthandles or /voidauths — the fake takes the dangerous
  * reading and processes the request again, so no test can pass on an
@@ -126,6 +130,9 @@ export class FakePaysafeApi {
   private readonly trailingHandles: Array<{ collection: string; paymentHandleToken: string; remaining: number }> = [];
   /** The recordFailure lever that applies to the request being routed. */
   private activeFailure: RecordedFailure | undefined;
+  /** Days since the fake started, and the day each record was filed on: how old the lookups and dupCheck see it. */
+  private today = 0;
+  private readonly filedOn = new WeakMap<object, number>();
   private seq = 0;
   uniqueHandleCreations = 0;
   uniquePaymentCreations = 0;
@@ -161,6 +168,15 @@ export class FakePaysafeApi {
    * paymentHandleToken, status, amount or currency.
    */
   failedPaymentsLikeDeclineExample = false;
+  /**
+   * A payments call Paysafe refuses as a duplicate or as in progress (5031,
+   * 3044, 3417) spends its single-use handle, the plain reading of "Regardless
+   * of the payments call response status, the payment handle status always
+   * changes to COMPLETED when a payments call is made." Set false for the
+   * reading where a refusal leaves the handle PAYABLE; which one Paysafe
+   * follows is undocumented (docs/decisions.md).
+   */
+  refusalSpendsHandle = true;
 
   constructor() {
     this.multiUseTokens.add(SEEDED_MULTI_USE_TOKEN);
@@ -211,6 +227,23 @@ export class FakePaysafeApi {
     this.trailingHandles.push({ collection, paymentHandleToken, remaining: count });
   }
 
+  /**
+   * Everything filed so far grows `days` older. Past 30 days a record leaves
+   * the lookups, which the adapter reads over their default window, and past
+   * 90 days dupCheck no longer counts it.
+   */
+  passDays(days: number): void {
+    this.today += days;
+  }
+
+  /** A payment answered PROCESSING fails afterwards, as a bank debit can: its record turns FAILED with this error. */
+  failLater(paymentId: string, error: { code: string; message: string }): void {
+    const payment = this.payments.get(paymentId);
+    if (!payment) throw new Error(`No payment ${paymentId} to fail`);
+    payment.status = "FAILED";
+    payment.error = error;
+  }
+
   /** Requests of one method and exact path — the attempts a call made. */
   requestsTo(method: string, path: string): RecordedRequest[] {
     return this.requests.filter((r) => r.method === method && r.path === path);
@@ -243,6 +276,8 @@ export class FakePaysafeApi {
     const rejectionIndex = this.replayRejections.findIndex((r) => matches(r.matcher, method, path));
     if (rejectionIndex !== -1) {
       const [rejection] = this.replayRejections.splice(rejectionIndex, 1);
+      const token = body?.["paymentHandleToken"];
+      if (method === "POST" && path === "/paymenthub/v1/payments" && typeof token === "string") this.spendOnRefusal(token);
       return json(402, { error: { code: rejection!.code, message: REPLAY_REJECTION_MESSAGES[rejection!.code] } });
     }
 
@@ -402,7 +437,7 @@ export class FakePaysafeApi {
       this.lookupLag.set(lagKey, lag - 1);
       return json(200, { meta: { numberOfRecords: 0 }, [collection]: [] });
     }
-    let filed = index.get(refNum) ?? [];
+    let filed = (index.get(refNum) ?? []).filter((record) => this.ageOf(record) <= LOOKUP_WINDOW_DAYS);
     for (const trailing of this.trailingHandles) {
       if (trailing.collection !== collection || trailing.remaining <= 0) continue;
       const shown = filed.filter((record) => handleTokenOf(record) !== trailing.paymentHandleToken);
@@ -429,7 +464,7 @@ export class FakePaysafeApi {
   private createPaymentHandle(body: Record<string, unknown>): Response {
     this.lastHandleRequestBody = body;
     const refNum = body["merchantRefNum"] as string;
-    if (body["dupCheck"] === true && isFiled(this.handlesByRef, refNum)) return duplicateRefNum();
+    if (body["dupCheck"] === true && this.isFiled(this.handlesByRef, refNum)) return duplicateRefNum();
     const paymentType = body["paymentType"] as string;
     if (["SEPA", "ACH", "BACS", "EFT"].includes(paymentType)) {
       return this.createBankHandle(refNum, paymentType, body);
@@ -522,7 +557,7 @@ export class FakePaysafeApi {
     handle: Record<string, unknown> & { paymentHandleToken: string },
     rail: { paymentType: string; sepa?: PaysafeBankAccountLike; bacs?: PaysafeBankAccountLike },
   ): void {
-    file(this.handlesByRef, refNum, handle);
+    this.file(this.handlesByRef, refNum, handle);
     this.handlesByToken.set(handle.paymentHandleToken, handle);
     this.railHandles.set(handle.paymentHandleToken, rail);
     this.uniqueHandleCreations++;
@@ -534,6 +569,26 @@ export class FakePaysafeApi {
     this.spentHandles.add(token);
     const handle = this.handlesByToken.get(token);
     if (handle) handle["status"] = "COMPLETED";
+  }
+
+  private spendOnRefusal(token: string): void {
+    if (this.refusalSpendsHandle) this.spend(token);
+  }
+
+  private file<T extends object>(index: RefNumIndex<T>, refNum: string, record: T): void {
+    const filed = index.get(refNum);
+    if (filed) filed.push(record);
+    else index.set(refNum, [record]);
+    this.filedOn.set(record, this.today);
+  }
+
+  private ageOf(record: unknown): number {
+    return this.today - (this.filedOn.get(record as object) ?? this.today);
+  }
+
+  /** dupCheck: "a previous request within the past 90 days". */
+  private isFiled<T extends object>(index: RefNumIndex<T>, refNum: string): boolean {
+    return (index.get(refNum) ?? []).some((record) => this.ageOf(record) <= DUP_CHECK_DAYS);
   }
 
   private createPayment(body: Record<string, unknown>): Response {
@@ -549,10 +604,11 @@ export class FakePaysafeApi {
     }
     // A spent handle is refused first; which check Paysafe runs first is
     // undocumented, and a bank-debit completion, which sends dupCheck with its
-    // single-use handle, reads either answer back. Neither refusal spends the
-    // handle here; whether Paysafe's do is undocumented (docs/decisions.md).
+    // single-use handle, reads either answer back. The duplicate refusal still
+    // spends the handle unless refusalSpendsHandle is off.
     if (this.spentHandles.has(token)) return handleNotPayable();
-    if (body["dupCheck"] === true && isFiled(this.paymentsByRef, refNum)) {
+    if (body["dupCheck"] === true && this.isFiled(this.paymentsByRef, refNum)) {
+      this.spendOnRefusal(token);
       return this.duplicateCode === "3044" ? duplicateRequest() : duplicateRefNum();
     }
     // Deleted/unknown MULTI_USE tokens die exactly like the real API (5068).
@@ -590,7 +646,7 @@ export class FakePaysafeApi {
             error: { code: failure.code, message: failure.message },
           };
       this.payments.set(failed.id, failed);
-      file(this.paymentsByRef, refNum, failed);
+      this.file(this.paymentsByRef, refNum, failed);
       return json(failure.status, { error: failed.error });
     }
     const payment: PaysafePaymentLike = {
@@ -630,7 +686,7 @@ export class FakePaysafeApi {
         txnTime: "2026-07-04T10:00:01Z",
       };
       payment.settlements = [settlement];
-      file(this.settlementsByRef, refNum, settlement);
+      this.file(this.settlementsByRef, refNum, settlement);
     }
     if (settleWithAuth && !railHandle) {
       // Real API: auto-capture creates an implicit settlement sharing the
@@ -646,10 +702,10 @@ export class FakePaysafeApi {
         txnTime: "2026-07-04T10:00:01Z",
       };
       payment.settlements = [settlement];
-      file(this.settlementsByRef, refNum, settlement);
+      this.file(this.settlementsByRef, refNum, settlement);
     }
     this.payments.set(payment.id, payment);
-    file(this.paymentsByRef, refNum, payment);
+    this.file(this.paymentsByRef, refNum, payment);
     this.uniquePaymentCreations++;
     return json(200, this.publicPayment(payment));
   }
@@ -670,7 +726,7 @@ export class FakePaysafeApi {
     if (!payment) return json(404, { error: { code: "5269", message: "No such payment" } });
     const refNum = body["merchantRefNum"] as string;
     // Settlements default dupCheck to true.
-    const reused = body["dupCheck"] !== false && isFiled(this.settlementsByRef, refNum);
+    const reused = body["dupCheck"] !== false && this.isFiled(this.settlementsByRef, refNum);
     if (reused && !this.stateCheckFirst) return duplicateRefNum();
     // Real Paysafe rejects settlements without an explicit amount.
     if (typeof body["amount"] !== "number") {
@@ -690,7 +746,7 @@ export class FakePaysafeApi {
     if (reused) return duplicateRefNum();
     if (this.activeFailure) {
       const failed = { id: `stl_${++this.seq}`, merchantRefNum: refNum, ...failedRecord(this.activeFailure), amount: settleAmount };
-      file(this.settlementsByRef, refNum, failed);
+      this.file(this.settlementsByRef, refNum, failed);
       return json(this.activeFailure.status, { error: failed.error });
     }
     const settlement = {
@@ -704,7 +760,7 @@ export class FakePaysafeApi {
     };
     payment.settlements = [...(payment.settlements ?? []), settlement];
     payment.availableToSettle = remaining - settleAmount;
-    file(this.settlementsByRef, refNum, settlement);
+    this.file(this.settlementsByRef, refNum, settlement);
     return json(200, settlement);
   }
 
@@ -744,14 +800,14 @@ export class FakePaysafeApi {
       amount: body["amount"] as number,
       txnTime: "2026-07-04T10:06:00Z",
     };
-    file(this.voidsByRef, voided.merchantRefNum, voided);
+    this.file(this.voidsByRef, voided.merchantRefNum, voided);
     return json(200, voided);
   }
 
   private refund(settlementId: string, body: Record<string, unknown>): Response {
     const refNum = body["merchantRefNum"] as string;
     // Refunds default dupCheck to true.
-    const reused = body["dupCheck"] !== false && isFiled(this.refundsByRef, refNum);
+    const reused = body["dupCheck"] !== false && this.isFiled(this.refundsByRef, refNum);
     if (reused && !this.stateCheckFirst) return duplicateRefNum();
     for (const payment of this.payments.values()) {
       const settlement = (payment.settlements ?? []).find((s) => s.id === settlementId);
@@ -773,7 +829,7 @@ export class FakePaysafeApi {
             amount,
             currencyCode: payment.currencyCode,
           };
-          file(this.refundsByRef, refNum, failed);
+          this.file(this.refundsByRef, refNum, failed);
           return json(this.activeFailure.status, { error: failed.error });
         }
         settlement.refundedAmount = refunded + amount;
@@ -786,7 +842,7 @@ export class FakePaysafeApi {
           currencyCode: payment.currencyCode,
           txnTime: "2026-07-04T10:10:00Z",
         };
-        file(this.refundsByRef, refNum, refund);
+        this.file(this.refundsByRef, refNum, refund);
         this.refundsById.set(refund.id, refund);
         this.uniqueRefundCreations++;
         return json(200, refund);
@@ -800,7 +856,7 @@ export class FakePaysafeApi {
   /** Verifications default dupCheck to true and do not spend the handle; a declined one is recorded too. */
   private verify(body: Record<string, unknown>): Response {
     const refNum = body["merchantRefNum"] as string;
-    if (body["dupCheck"] !== false && isFiled(this.verificationsByRef, refNum)) return duplicateRefNum();
+    if (body["dupCheck"] !== false && this.isFiled(this.verificationsByRef, refNum)) return duplicateRefNum();
     const token = body["paymentHandleToken"] as string;
     const base = {
       id: `ver_${++this.seq}`,
@@ -814,11 +870,11 @@ export class FakePaysafeApi {
       (token === "tok_declined" ? { status: 402, code: "3022", message: "Insufficient funds" } : undefined);
     if (failure) {
       const failed = { ...base, ...failedRecord(failure) };
-      file(this.verificationsByRef, refNum, failed);
+      this.file(this.verificationsByRef, refNum, failed);
       return json(failure.status, { error: failed.error });
     }
     const verification = { ...base, status: "COMPLETED" };
-    file(this.verificationsByRef, refNum, verification);
+    this.file(this.verificationsByRef, refNum, verification);
     return json(200, verification);
   }
 
@@ -1091,16 +1147,10 @@ function matches(matcher: RequestMatcher, method: string, path: string): boolean
   return typeof matcher.path === "string" ? matcher.path === path : matcher.path.test(path);
 }
 
-function file<T>(index: RefNumIndex<T>, refNum: string, record: T): void {
-  const filed = index.get(refNum);
-  if (filed) filed.push(record);
-  else index.set(refNum, [record]);
-}
-
-/** dupCheck looks back 90 days; the fake keeps no clock, so every filed reference is recent. */
-function isFiled<T>(index: RefNumIndex<T>, refNum: string): boolean {
-  return (index.get(refNum)?.length ?? 0) > 0;
-}
+/** The lookups' default window: "Default = 30 days before the endDate". */
+const LOOKUP_WINDOW_DAYS = 30;
+/** dupCheck: "already been used in a previous request within the past 90 days". */
+const DUP_CHECK_DAYS = 90;
 
 function duplicateRefNum(): Response {
   return json(409, { error: { code: "5031", message: "The transaction you have submitted has already been processed." } });

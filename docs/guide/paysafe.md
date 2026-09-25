@@ -216,8 +216,9 @@ the client side is [React usage](/guide/react#built-in-completion-transport).
 Keep the completion key stable per order, as above: a retried POST, a customer who pays
 again after a lost answer, or a new card after a decline all reuse it. §10 explains how
 each one is answered, the timings in which a replay can still be charged twice, and the
-bank-debit errors after which you start again under a new key, once the Paysafe portal
-shows every payment under the old one as failed or cancelled, or none at all.
+bank-debit errors after which you start again under a new key, once a later retry still
+fails and the Paysafe portal shows every payment under the old one as failed or cancelled,
+or none at all.
 
 ## 8. Interac e-Transfer (Canada)
 
@@ -400,7 +401,8 @@ retries, for every write it makes:
   through returns that payment instead of charging again, once Paysafe's lookup shows it.
 - Lookups read up to 50 records, Paysafe's maximum page. A key holding 50 or more records
   in the 30-day window is refused with the non-retryable `processing_error` rather than
-  read in part: reconcile it in the Paysafe portal before starting over under a new key.
+  read in part: reconcile it in the Paysafe portal, and start over under a new key only
+  once every record under it has failed or been cancelled.
 - A write that times out, loses its connection or gets a 5xx is looked up by its
   `merchantRefNum`, and when Paysafe has the record it becomes the call's result. A payment,
   capture or refund is never re-sent after that: when the lookup cannot show it, the call
@@ -424,17 +426,20 @@ retries, for every write it makes:
   reconcile it in the Paysafe portal.
 - A bank-debit key can stay refused, so its errors say when to leave it. When Paysafe
   refuses the payment as a duplicate and no payment under the key other than a failed
-  attempt can be read back, the error says that Paysafe's duplicate check covers 90 days
-  while the lookup reaches only 30: a failed attempt older than the lookup can refuse the
-  key. When the key holds a spent payment handle with no payment of its own, the error
-  says that a refused attempt can leave one, since Paysafe marks a handle `COMPLETED`
-  whatever its payments call answers. Both are the non-retryable `processing_error`.
-  Retry later with the same key, which returns the payment once the lookup shows it. Start
-  again under a new idempotency key (a key derived from the order, like
-  `complete-${order.id}`, needs a suffix you can bump) only once the Paysafe portal shows
-  every payment under the key as failed or cancelled, or none at all. A payment received,
-  pending, processing, held or completed there is live: a new key while it is out of the
-  lookup's sight would debit twice.
+  attempt can be read back, the error says that what stands in the way may be a payment
+  the lookup does not show yet, or a failed attempt older than the lookup, since Paysafe's
+  duplicate check covers 90 days while the lookup reaches only 30. When the key holds a
+  spent payment handle with no payment of its own, the error says that a refused attempt
+  can leave one, since Paysafe marks a handle `COMPLETED` whatever its payments call
+  answers. Both are the non-retryable `processing_error`. Retry later with the same key,
+  which returns the payment once the lookup shows it. Start again under a new idempotency
+  key (a key derived from the order, like `complete-${order.id}`, needs a suffix you can
+  bump) only once such a later retry still ends in the same error and the Paysafe portal
+  shows every payment under the key as failed or cancelled, or none at all: right after
+  the error, an empty portal may only be lagging. A payment received, pending, processing,
+  held or completed there is live: a new key while it is out of the lookup's sight would
+  debit twice. Retire the replaced key for good: sent again once the 90 days lapse, it
+  would start a new debit.
 - Two card completions with different cards under one key can both be charged when the
   second is sent before the first shows in Paysafe's lookup, because nothing at Paysafe
   spans them. Two bank-debit attempts are held apart by `dupCheck` instead, while no

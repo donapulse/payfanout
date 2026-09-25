@@ -2503,11 +2503,15 @@ description of what v2 changes is what the migration then had to implement.
   second effect (2026-09-25): a failed attempt 31 to 90 days old is out of the lookup's
   sight but still trips `dupCheck`, so every attempt under the key is refused, and retrying
   under it cannot get past that. The refusal's error therefore does not say "never a new
-  one": it states the 90- and 30-day windows, that a failed attempt older than the lookup
-  can refuse the key, and that only once the Paysafe portal shows every payment under it as
-  failed or cancelled, or none at all, does the host start again under a new idempotency
-  key; a payment received, pending, processing, held or completed is live (corrected
-  2026-09-25: "no successful payment" also matched a debit still processing). "Never a
+  one": it states the 90- and 30-day windows, that what refuses the key may be a payment
+  the lookup does not show yet or a failed attempt older than the lookup, and that only
+  once a later retry still ends in the error and the Paysafe portal shows every payment
+  under it as failed or cancelled, or none at all, does the host start again under a new
+  idempotency key; a payment received, pending, processing, held or completed is live
+  (corrected 2026-09-25: "no successful payment" also matched a debit still processing,
+  and an empty portal right after the refusal may only be lagging, hence the later
+  retry). The guide adds that the replaced key is retired for good, because once the 90
+  days lapse, a completion under it would start a new debit for the order. "Never a
   new one" stays where it holds, where the attempt may have been processed and the lookup
   can still show it: after an unknown outcome, and on the other rejections that stand for
   this call's own original.
@@ -2545,10 +2549,10 @@ description of what v2 changes is what the migration then had to implement.
   "Regardless of the payments call response status, the payment handle status always
   changes to COMPLETED when a payments call is made." The payments are read again, and the
   call ends with the non-retryable `processing_error` rather than debit again. Its message
-  says that a refused attempt can leave a spent handle, and that once the Paysafe portal
-  shows every payment under the key as failed or cancelled, or none at all, the host may
-  start again under a new key: on
-  the plain reading, retrying under the key never gets past such a handle. Sharing one key
+  says that a refused attempt can leave a spent handle, and that once a later retry still
+  ends in the error and the Paysafe portal shows every payment under the key as failed or
+  cancelled, or none at all, the host may start again under a new key: on the plain
+  reading, retrying under the key never gets past such a handle. Sharing one key
   across the handle and the payment follows Paysafe's own EFT examples: the handle and the
   payment both carry `merchantRefNum` "4533863971", the payment is sent with
   `dupCheck: true` and comes back `COMPLETED`, so the handle's use of the reference does not
@@ -2620,11 +2624,11 @@ description of what v2 changes is what the migration then had to implement.
     take "regardless of the payments call response status" plainly: a 5031, 3044 or 3417
     refusal leaves the handle COMPLETED with no payment, and a bank-debit key holding one
     ends every retry in the non-retryable `processing_error` until the host starts again
-    under a new key. Probe: decline a bank debit under a key K, mint a fresh handle and pay
-    it under K with `dupCheck: true`, expect 5031, then `GET /paymenthandles/{id}` and
-    record the handle's status. PAYABLE would mean a refusal leaves the handle payable, and
-    the key could then debit once the failure shows. Record the same for a 400 that files no
-    payment (5068).
+    under a new key, once the portal shows no live payment under it. Probe: decline a bank
+    debit under a key K, mint a fresh handle and pay it under K with `dupCheck: true`,
+    expect 5031, then `GET /paymenthandles/{id}` and record the handle's status. PAYABLE
+    would mean a refusal leaves the handle payable, and the key could then debit once the
+    failure shows. Record the same for a 400 that files no payment (5068).
   - **Whether the lookups accept a 90-day `startDate` range.** The `payments` and
     `paymenthandles` lookups document `startDate` as "Default = 30 days before the endDate"
     and state no maximum range, so the adapter reads the default window. Under a reference

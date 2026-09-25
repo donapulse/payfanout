@@ -744,13 +744,14 @@ const REPLAY_READ_ATTEMPTS = 3;
  * The way out of a bank-debit key Paysafe refuses with nothing to read back:
  * its payment may still show, and when the portal shows no live payment, no
  * retry under that key gets past the refusal. A debit still in progress is
- * live: only failed or cancelled payments, or none, let a new key follow.
+ * live: only failed or cancelled payments, or none, let a new key follow, and
+ * only after a later retry, because the portal can trail the refused request.
  */
 const RETRY_OR_START_AGAIN =
   "Retry later with the same idempotency key, which returns the payment once the lookup shows it. Start again " +
-  "under a new idempotency key only once the Paysafe portal shows every payment under that key as failed or " +
-  "cancelled, or none at all: a payment received, pending, processing, held or completed there is live, and a " +
-  "new key would debit again";
+  "under a new idempotency key only once such a later retry still ends in this error and the Paysafe portal " +
+  "shows every payment under that key as failed or cancelled, or none at all: a payment received, pending, " +
+  "processing, held or completed there is live, and a new key would debit again";
 
 /**
  * Paysafe's internal and gateway failures (the 500, 502 and 504 rows of its
@@ -2596,8 +2597,8 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       code: "processing_error",
       message:
         `Paysafe holds at least ${REF_NUM_LOOKUP_LIMIT} ${noun} records under merchantRefNum ` +
-        `"${replay.merchantRefNum}", more than one lookup reads — reconcile them in the Paysafe portal ` +
-        "before starting over under a new key",
+        `"${replay.merchantRefNum}", more than one lookup reads — reconcile them in the Paysafe portal, and start ` +
+        "over under a new key only once every one of them has failed or been cancelled",
       retryable: false,
       raw: { merchantRefNum: replay.merchantRefNum },
       pspName: this.pspName,
@@ -2647,10 +2648,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
 
   /**
    * A bank debit sent with dupCheck: true that Paysafe refused as a
-   * duplicate, with no live payment under the key to answer it. The check
-   * covers 90 days and the lookup 30, so the request in the way can be a
-   * failed attempt the lookup no longer shows. Not retryable, for the same
-   * reason as unreadableOriginal.
+   * duplicate, with no live payment in the lookup to answer it. The request
+   * in the way can be a payment the lookup does not show yet or, since the
+   * check covers 90 days and the lookup 30, a failed attempt the lookup no
+   * longer shows. Not retryable, for the same reason as unreadableOriginal.
    */
   private refusedDuplicate(replay: ReplayKey, cause: unknown): PayFanoutError {
     const { noun } = REF_NUM_LOOKUPS[replay.lookup];

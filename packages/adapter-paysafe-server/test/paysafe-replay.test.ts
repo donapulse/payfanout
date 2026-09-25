@@ -126,8 +126,9 @@ function inPairs(fake: FakePaysafeApi): typeof fetch {
 
 /** How every bank-debit ending that may need a new key tells the host so. */
 const START_AGAIN =
-  "Start again under a new idempotency key only once the Paysafe portal shows every payment under that key as " +
-  "failed or cancelled, or none at all: a payment received, pending, processing, held or completed there is live";
+  "Start again under a new idempotency key only once such a later retry still ends in this error and the Paysafe " +
+  "portal shows every payment under that key as failed or cancelled, or none at all: a payment received, pending, " +
+  "processing, held or completed there is live";
 
 const DECLINED_BY_ISSUER = { status: 402, code: "3009", message: "Your request has been declined by the issuing bank." };
 
@@ -1520,7 +1521,8 @@ describe("Paysafe payment-handle replays", () => {
     expect(again.message).toContain(START_AGAIN);
     expect(fake.uniquePaymentCreations).toBe(0);
     expect(sent(fake, CREATE_PAYMENT).map((r) => r.body?.["dupCheck"])).toEqual([true, true]);
-    // The portal shows every payment under the key failed, so the host starts again under a new one.
+    // The later retry still ends in this error and the portal shows every payment under the key
+    // failed, so the host starts again under a new one.
     const fresh = await adapter.completePayment({ ...input, idempotencyKey: "k-eft-2" });
     expect(fresh.status).toBe("processing");
     expect(fake.uniquePaymentCreations).toBe(1);
@@ -1628,7 +1630,10 @@ describe("Paysafe payment-handle replays", () => {
       const fresh = await adapter.completePayment({ ...input, idempotencyKey: "k-eft-2" });
       expect(fresh.status, label).toBe("processing");
       expect(fake.uniquePaymentCreations, label).toBe(1);
-      // Past 90 days the duplicate check no longer counts the failure: the key debits again.
+      // Past 90 days the duplicate check no longer counts the failure: the key debits again,
+      // which is why the guide retires a replaced key. The fake counts only recorded payments
+      // toward the 90 days; if Paysafe also counts refused requests, the key stays refused
+      // longer, which still ends without a debit.
       fake.passDays(60);
       expect((await adapter.completePayment(input)).status, label).toBe("processing");
       expect(fake.uniquePaymentCreations, label).toBe(2);

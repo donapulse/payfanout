@@ -3047,10 +3047,12 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `create_time` (through `activity_timestamps`, "The date and time when the transaction
   occurred") and the Orders v2 capture examples carry it, but no example shows the captures
   of an AUTHORIZE order's read. An estimate never closes a hold: when a capture naming no
-  authorization took money, another authorization could have given it, and it brings the
-  holding authorization's figure below what the order has left, the capture goes out with
-  `final_capture: false`, even when it takes the whole estimate, and only a capture of all
-  the order has left closes the authorization. The hold stays open for whatever the
+  authorization took money and another authorization could have given it, the capture goes
+  out with `final_capture: false`, even when it takes the whole estimate, and only a capture
+  of all the order has left closes the authorization. That holds even when the holding
+  authorization still covers what the order has left: a final capture the count relies on,
+  taken from the superseded original outside the adapter, may not have closed this one
+  (review of 2026-09-25). The hold stays open for whatever the
   estimate missed, which a capture with an explicit amount can take; once the estimate
   reaches zero, capturing the rest answers with the payment, as when captures cover the
   authorization, and `amountCapturable` reads 0. What is never captured is left to expire:
@@ -3091,5 +3093,6 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   order, capture part, reauthorize for less than what is left, and capture more than that
   reauthorization's own amount but less than the order has left, to learn which cap applies.
   On a third order with no capture, reauthorize, void the reauthorization (expected
-  `CANNOT_BE_VOIDED`), void the original, and record both statuses. Record every webhook
-  PayPal sends for all three orders.
+  `CANNOT_BE_VOIDED`), void the original, and record both statuses. On the first order,
+  also capture from the original after the reauthorization and record whether PayPal
+  accepts it. Record every webhook PayPal sends for all three orders.

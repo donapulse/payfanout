@@ -257,7 +257,8 @@ explicitly: the authorized amount minus every capture that took money, completed
 pending (declined and failed captures took nothing).
 
 The capture that takes the rest, with or without an explicit amount, goes out with
-`final_capture: true` (after a reauthorization, only when the rest is certain, see below),
+`final_capture: true` (on an estimate after a reauthorization, only once it takes
+everything the order has left, see below),
 which closes the authorization: PayPal refuses any further capture against it
 (`AUTHORIZATION_ALREADY_CAPTURED`). Once earlier captures took the whole
 authorization (PayPal reports it `CAPTURED`, a capture that took money went out as the
@@ -304,12 +305,14 @@ the capture's `up` link), but PayPal's order read documents no such tie. A captu
 names none counts against every authorization created no later than it, by `create_time`,
 so a capture taken before the reauthorization leaves the new authorization whole. A missing
 `create_time`, on the capture or on an authorization, rules nothing out, which errs low. If
-such a capture could have come from either authorization and brings the rest below what
-the order has left, the rest is an estimate: capturing it goes out with
+such a capture could have come from either authorization, the rest is an estimate:
+capturing it goes out with
 `final_capture: false`, so the authorization stays open for whatever the estimate missed,
 which you can take with an explicit amount, also once the estimate reaches zero and
 capturing the rest answers with the payment. Only a capture of everything the order has
-left closes it then. What you never capture is left to expire, as `cancelPayment` voids
+left closes it then. Once an estimate reaches zero, `PaymentInfo` no longer shows what is
+left (`amount` then equals `amountCaptured`): compare `raw.purchase_units[0].amount` with
+`amountCaptured`. What you never capture is left to expire, as `cancelPayment` voids
 only an authorization with no capture yet. An explicit amount still goes to PayPal as it
 is, for PayPal to judge against its overage limit.
 

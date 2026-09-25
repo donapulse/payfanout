@@ -527,7 +527,9 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       // An estimate that sets the remainder may miss money left on the
       // authorization, so it never closes it: only a capture of all the order
       // has left does.
-      finalCapture = captureAmount >= (estimated && authorized - held < orderLeft ? orderLeft : remainder);
+      // On an estimate, even a final capture the count relies on may not have
+      // been this hold's, so only a capture of all the order has left closes it.
+      finalCapture = captureAmount >= (estimated ? orderLeft : remainder);
     }
     await this.request<PayPalCaptureLike>(
       "POST",

@@ -789,6 +789,31 @@ describe("PayPal authorizations after a reauthorization", () => {
     expect((await malformed.adapter.retrievePayment("5O1")).amountCapturable).toBe(100);
   });
 
+  it("keeps the reauthorization open on a partial capture after a final one it may not have given", async () => {
+    // The host captured 5.00 from the superseded original with final_capture, outside the adapter.
+    // It names no authorization, so whether it closed A2 is an estimate.
+    for (const [amount, final] of [
+      [1000, false],
+      [1500, true],
+    ] as const) {
+      const { adapter, posts } = adapterWithExchanges({
+        "GET /v2/checkout/orders/5O1": authorizedOrder({
+          authorizations: [
+            { id: "A1", status: "CAPTURED", amount: usd("20.00"), create_time: day(0) },
+            { id: "A2", status: "CREATED", amount: usd("20.00"), create_time: day(4) },
+          ],
+          captures: [{ id: "c1", status: "COMPLETED", final_capture: true, amount: usd("5.00"), create_time: day(5) }],
+        }),
+        "POST /v2/payments/authorizations/A2/capture": capturedOk,
+      });
+      await adapter.capturePayment("5O1", amount, `k-cap-${amount}`);
+      expect(
+        posts.map((post) => post.body),
+        String(amount),
+      ).toEqual([{ amount: usd((amount / 100).toFixed(2)), final_capture: final }]);
+    }
+  });
+
   it("keeps the reauthorization open when what is left rests on a capture another authorization could have given", async () => {
     // A2 reauthorized the 13.00 left; the 7.00 names no authorization, and A1 or A2 could have given it.
     for (const [label, taken] of [

@@ -62,11 +62,6 @@ export class FakeGoCardlessApi {
   private readonly events: Array<GoCardlessEventLike & { id: string; created_at: string }> = [];
   /** Consumed Idempotency-Keys per collection — replay 409s like the real API. */
   private readonly idempotencyKeys = new Map<string, string>();
-
-  /** GoCardless honours keys for at least 30 days: past that, a used key reads as new. */
-  forgetIdempotencyKeys(): void {
-    this.idempotencyKeys.clear();
-  }
   private seq = 0;
   private failure: { status: number; body: unknown; times: number } | undefined;
   private networkFailure = 0;
@@ -110,6 +105,11 @@ export class FakeGoCardlessApi {
   /** Rejects the next `times` requests at the transport layer (fetch throws) — the psp_unavailable path. */
   failNextWithNetworkError(times = 1): void {
     this.networkFailure = times;
+  }
+
+  /** GoCardless honours keys for at least 30 days: past that, a used key reads as new. */
+  forgetIdempotencyKeys(): void {
+    this.idempotencyKeys.clear();
   }
 
   readonly fetch: typeof fetch = async (input, init) => {
@@ -376,20 +376,11 @@ export class FakeGoCardlessApi {
       this.totalAmountConfirmationChecked &&
       request.total_amount_confirmation !== alreadyRefunded + request.amount
     ) {
-      return json(422, {
-        error: {
-          message: "Validation failed",
-          type: "validation_failed",
-          code: 422,
-          errors: [
-            {
-              reason: "total_amount_confirmation_invalid",
-              field: "total_amount_confirmation",
-              message: "does not match the total amount refunded",
-            },
-          ],
-        },
-      });
+      // An invalid_state reason on the Responses and Errors page, not a field validation.
+      return invalidState(
+        "Total amount refunded does not match the confirmation value",
+        "total_amount_confirmation_invalid",
+      );
     }
     if (replay) return replay;
     const refund: GoCardlessRefundLike = {

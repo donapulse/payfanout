@@ -315,8 +315,13 @@ choices they forced:
     billing request names its payment (`links.payment_request_payment`, the "ID of the
     payment that was created from this payment request"), the replay reads that payment
     and reports its status, as `retrievePayment` does, so a payment that already failed
-    never reads `processing`. Before that it reports the billing request's mapped status.
-    The read happens on replays only, and if it fails the billing request's status
+    never reads `processing`. One exception (2026-09-25): a `pending_customer_approval`
+    payment ("we're waiting for the customer to approve this payment") reads
+    `processing` on a replay, where `retrievePayment` reports `requires_action`, because
+    a replayed session whose billing request names a payment carries no `clientSecret`.
+    Before the billing request names a payment, the replay reports the billing
+    request's mapped status.
+    The payment read happens on replays only, and if it fails the billing request's status
     stands: failing the replay would let `PaymentRouter` fail over to another PSP for a
     payment that already exists. A flow is created only while the billing request is
     `pending` ("pending and can be used") and names no payment. Past that point the payer
@@ -338,25 +343,32 @@ choices they forced:
   - *Refunds: replays.* A replayed refund must belong to the payment and, when an amount
     is given, be for that amount. A request the remainder check refuses, as it refuses
     the replay of a refund that used up the payment, is never sent. The adapter reads
-    `GET /refunds?payment=` (the spec's `payment` filter) and returns the refund stamped
-    with the key, checked like any replay; with none, the refusal stands. One page holds
-    every refund of a payment: the Data Conventions page has every list "ordered and
-    paginated reverse-chronologically" with a default `limit` of 50, and the Responses and
-    Errors page describes `number_of_refunds_exceeded` as "Maximum of 5 refunds per
-    payment already reached". Should two refunds carry the stamp, which a key reused past
-    the 30-day window can cause, the newest wins. The same read settles a POST that
-    GoCardless rejects with anything but the 409: a stamped refund is the original, and
-    anything else rethrows the rejection. A transient failure of the read stays retryable,
-    after a refusal and after a rejected POST alike (a rejection that reads as final could
-    hide the original); any other failure keeps the refusal, or the rejection. While the
-    payment already holds refunds the read also runs before the create (2026-09-25), so a
-    key past the window GoCardless honours keys for is read back too. Replays
-    of stamped refunds therefore depend neither on `total_amount_confirmation` nor on
-    whether GoCardless checks the key before the body (AMBIGUOUS: the docs do not state
-    the order). Refunds created before the stamp carry none: a replay of one that the
-    remainder check refuses rejects, as it always did, and one within the remainder
-    relies on the 409. Past the window GoCardless honours keys for, a same-key refund of
-    a stamped original is read back before any create; one of a refund made before the
+    `GET /refunds?payment=` (the spec's `payment` filter; `refund_type` defaults to
+    `payment`, "refunds created against payments only") and returns the refund stamped
+    with the key, checked like any replay. With none, the refusal stands, its `raw`
+    holding the payment as `payment` and, when the read was refused, the read's answer as
+    `lookup`: one shape either way. One page holds every refund of a payment: the adapter
+    asks for `limit=500`, the most the Data Conventions page allows ("Default 50, max
+    500"), and the Responses and Errors page describes `number_of_refunds_exceeded` as
+    "Maximum of 5 refunds per payment already reached". Should two refunds carry the
+    stamp, which a key reused past the 30-day window can cause, the newest wins. The same
+    read settles a POST that GoCardless rejects with anything but the 409: a stamped
+    refund is the original, and anything else rethrows the rejection. A transient failure
+    of the read stays retryable, after a refusal and after a rejected POST alike (a
+    rejection that reads as final could hide the original); after a rejected POST, the
+    rejection rides `raw.rejection` and the read's answer `raw.lookup`. Any other failure
+    keeps the refusal, or the rejection. While GoCardless reports an amount already
+    refunded (`amount_refunded` above 0), the read also runs before the create
+    (2026-09-25), so a key past the window GoCardless honours keys for is read back too.
+    That read exists only to prevent a second refund, so it fails closed: the refund is
+    not sent, and the call rejects retryable when the failure is transient and with a
+    final `invalid_request` otherwise. Replays of stamped refunds therefore depend
+    neither on `total_amount_confirmation` nor on whether GoCardless checks the key before
+    the body (AMBIGUOUS: the docs do not state the order). Refunds created before the
+    stamp carry none: a replay of one that the remainder check refuses rejects, as it
+    always did, and one within the remainder relies on the 409. Past the window
+    GoCardless honours keys for, a same-key refund of a stamped original is read back
+    before any create while `amount_refunded` is above 0; one of a refund made before the
     stamp may be created anew.
   - *Refunds: amounts.* The spec types a payment's `amount` and `amount_refunded`, and a
     refund's `amount`, as integer or string. The refund path reads digit strings as
@@ -375,9 +387,10 @@ choices they forced:
     read, and recognises replays by the stamp alone. What that cannot close statelessly:
     on an opted-out account two refunds under different keys that read the same
     `amount_refunded` can both be sent, so the guide asks hosts to refund one payment at a
-    time there. **AMBIGUOUS too: whether `amount_refunded` counts a refund as soon as it is
-    created**; the spec says only that GoCardless "will update" it. Sandbox check S4: create
-    a refund, read the payment at once, and record whether `amount_refunded` includes it.
+    time there, each once the previous one shows in `amount_refunded`. **AMBIGUOUS too:
+    whether `amount_refunded` counts a refund as soon as it is created**; the spec says
+    only that GoCardless "will update the `amount_refunded` property of the payment"
+    (sandbox check S4 below).
   - *Cancels.* Idempotency keys are documented for creates only. The official Node client
     (gocardless-nodejs `src/api/api.ts`) generates a key for every POST it is not given
     one for, cancels included, and resolves no 409 for them. Whether an action is
@@ -392,7 +405,9 @@ choices they forced:
   - Sandbox checks: (S2) cancel a `pending_submission` payment twice with the same key,
     and a pending billing request twice, and record whether each second call answers 200
     or 422 `cancellation_failed`; (S3) create a flow on a fulfilled and on a cancelled
-    billing request and record the answer (the adapter no longer does either).
+    billing request and record the answer (the adapter no longer does either); (S4)
+    create a refund, read the payment at once, and record whether `amount_refunded`
+    includes it.
 
 ## PayPal adapter (2026-07-07)
 

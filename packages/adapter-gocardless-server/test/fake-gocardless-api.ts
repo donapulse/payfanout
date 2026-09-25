@@ -45,8 +45,9 @@ const BASE_TIME = Date.parse("2026-07-07T10:00:00.000Z");
  * until enabled), total_amount_confirmation checking, at most 5 refunds per
  * payment (number_of_refunds_exceeded), the metadata limits on refunds (3
  * keys, 50-character names, 500-character values), the ?payment= filter on
- * GET /refunds, and cursor pagination over lists ordered newest first. Actions ignore the Idempotency-Key — GoCardless
- * documents keys for creates only — so a repeated cancel answers
+ * GET /refunds, and cursor pagination over lists ordered newest first.
+ * Actions ignore the Idempotency-Key — GoCardless documents keys for creates
+ * only — so a repeated cancel answers
  * cancellation_failed. Where the docs leave a refund rule open, a flag
  * selects the reading (refundCapEnforced, totalAmountConfirmationChecked,
  * keyCheckedBeforeBody).
@@ -61,6 +62,11 @@ export class FakeGoCardlessApi {
   private readonly events: Array<GoCardlessEventLike & { id: string; created_at: string }> = [];
   /** Consumed Idempotency-Keys per collection — replay 409s like the real API. */
   private readonly idempotencyKeys = new Map<string, string>();
+
+  /** GoCardless honours keys for at least 30 days: past that, a used key reads as new. */
+  forgetIdempotencyKeys(): void {
+    this.idempotencyKeys.clear();
+  }
   private seq = 0;
   private failure: { status: number; body: unknown; times: number } | undefined;
   private networkFailure = 0;

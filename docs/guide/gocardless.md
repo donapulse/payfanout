@@ -138,8 +138,15 @@ payment or refund rejects with `invalid_request`.
   check, so the adapter does not rely on it, nor on whether GoCardless checks the key
   before the rest of the request. This holds for every refund that carries the stamp.
   Refunds created by adapter versions before the stamp carry none, and a replay of one
-  that exceeds what is left rejects with `invalid_request`, as it did then. If you
-  update a refund's metadata yourself, keep `payfanout_key_sha256`.
+  that exceeds what is left rejects with `invalid_request`, as it did then. While a
+  payment already holds refunds, the stamp is checked before any create too, so a key
+  GoCardless no longer honours is still read back instead of refunding again. The stamp
+  and `reason` take two of the three metadata keys GoCardless allows on a refund, leaving
+  one for you; if you update a refund's metadata yourself, keep `payfanout_key_sha256`.
+  Use random idempotency keys, as GoCardless recommends ("Use UUIDv4"): each refund
+  stores the SHA-256 of its key. On an account that opted out of the confirmation check,
+  make refunds of one payment one at a time: two refunds under different keys that read
+  the same `amount_refunded` can both be sent.
 - **Cancels.** GoCardless documents idempotency keys for creates only, and documents
   `cancellation_failed` for cancelling a payment that is already cancelled. What it
   answers for a billing request that is already cancelled is not documented. When a

@@ -1010,6 +1010,8 @@ describe("GoCardless session replays", () => {
     const outcomes: Array<[string, (paymentId: string) => void, string]> = [
       ["failed", (paymentId) => fake.failPayment(paymentId), "failed"],
       ["confirmed", (paymentId) => fake.confirmPayment(paymentId), "succeeded"],
+      // A replay carries no flow: a payment awaiting the customer's approval is waited on.
+      ["awaiting approval", (paymentId) => fake.setPaymentStatus(paymentId, "pending_customer_approval"), "processing"],
     ];
     for (const [label, settle, status] of outcomes) {
       const request = { ...input, id: `order-${label}`, idempotencyKey: `k-${label}` };
@@ -1027,7 +1029,7 @@ describe("GoCardless session replays", () => {
       // One read of the payment, made by the replay.
       expect(fake.requestsTo("GET", `/payments/${paymentId}`), label).toHaveLength(1);
     }
-    expect(flowCreates(fake)).toBe(2);
+    expect(flowCreates(fake)).toBe(3);
   });
 
   it("falls back to the billing request's status when the payment cannot be read", async () => {
@@ -1419,12 +1421,34 @@ describe("GoCardless refund replays", () => {
       code: "invalid_request",
       raw: { error: { errors: [{ reason: "number_of_refunds_exceeded" }] } },
     });
-    // The rejection was checked against the payment's refunds before it was rethrown.
-    expect(fake.requestsTo("GET", "/refunds")).toHaveLength(1);
+    // A payment holding refunds is read before each create (four here, then the sixth), and
+    // the rejection was checked against the payment's refunds before it was rethrown.
+    expect(fake.requestsTo("GET", "/refunds")).toHaveLength(6);
     expect(fake.uniqueRefundCreations).toBe(5);
   });
 
-  it("rethrows GoCardless's rejection when the stamp lookup after it fails", async () => {
+  it("rethrows GoCardless's rejection when the stamp lookup after it is refused for good", async () => {
+    let listsForbidden = false;
+    const { adapter, fake } = makeInterceptedPair((request, forward) =>
+      listsForbidden && request.method === "GET" && request.path === "/refunds"
+        ? Promise.resolve(
+            new Response(JSON.stringify({ error: { message: "Forbidden", type: "invalid_api_usage", code: 403, errors: [] } }), {
+              status: 403,
+            }),
+          )
+        : forward(),
+    );
+    const paymentId = await confirmedPayment(adapter, fake, 1000);
+    fake.refundsEnabled = false;
+    listsForbidden = true;
+    await expect(adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: "r-off" })).rejects.toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      message: expect.stringMatching(/Refunds are not enabled/),
+    });
+  });
+
+  it("keeps a rejected create retryable while the stamp lookup after it is down", async () => {
     let listsDown = false;
     const { adapter, fake } = makeInterceptedPair((request, forward) =>
       listsDown && request.method === "GET" && request.path === "/refunds" ? gocardlessDown() : forward(),
@@ -1432,11 +1456,42 @@ describe("GoCardless refund replays", () => {
     const paymentId = await confirmedPayment(adapter, fake, 1000);
     fake.refundsEnabled = false;
     listsDown = true;
-    await expect(adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: "r-off" })).rejects.toMatchObject({
-      code: "invalid_request",
-      retryable: false,
-      message: expect.stringMatching(/Refunds are not enabled/),
+    const error = await adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: "r-off" }).catch((err: unknown) => err);
+    expect(error).toMatchObject({ code: "psp_unavailable", retryable: true });
+    expect((error as { raw: { rejection: unknown } }).raw.rejection).toBeDefined();
+  });
+
+  it("reads back a refund made under a key GoCardless no longer honours, and creates no second one", async () => {
+    const { adapter, fake } = makePair();
+    const paymentId = await confirmedPayment(adapter, fake, 1000);
+    const first = await adapter.refundPayment({ pspPaymentId: paymentId, amount: 300, idempotencyKey: "r-old" });
+    fake.forgetIdempotencyKeys();
+    const replay = await adapter.refundPayment({ pspPaymentId: paymentId, amount: 300, idempotencyKey: "r-old" });
+    expect(replay.refundId).toBe(first.refundId);
+    expect(refundCreates(fake)).toHaveLength(1);
+  });
+
+  it("returns the refund whose create answer was lost, from its stamp", async () => {
+    // Every answer to the create is lost, so the transport retries run out and only the stamp settles it.
+    const { adapter, fake } = makeInterceptedPair(async (request, forward) => {
+      const response = await forward();
+      if (request.method === "POST" && request.path === "/refunds") throw new TypeError("socket hang up");
+      return response;
     });
+    const paymentId = await confirmedPayment(adapter, fake, 1000);
+    const refund = await adapter.refundPayment({ pspPaymentId: paymentId, amount: 400, idempotencyKey: "r-lost" });
+    expect(refund).toMatchObject({ amount: 400 });
+    expect(fake.uniqueRefundCreations).toBe(1);
+  });
+
+  it("refuses an empty idempotency key before any request", async () => {
+    const { adapter, fake } = makePair();
+    const paymentId = await confirmedPayment(adapter, fake, 1000);
+    const before = fake.requestsTo("GET", `/payments/${paymentId}`).length;
+    await expect(adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: "" })).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+    expect(fake.requestsTo("GET", `/payments/${paymentId}`)).toHaveLength(before);
   });
 
   it("keeps a transient failure retryable when a refused request could be a replay", async () => {
@@ -1466,8 +1521,12 @@ describe("GoCardless refund replays", () => {
     const paymentId = await confirmedPayment(adapter, fake, 1000);
     await adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: "r-full" });
     const answers = [
-      { status: 403, body: { error: { message: "Forbidden", type: "invalid_api_usage", code: 403, errors: [] } } },
-      { status: 200, body: { meta: { cursors: {}, limit: 50 } } },
+      {
+        status: 403,
+        body: { error: { message: "Forbidden", type: "invalid_api_usage", code: 403, errors: [] } },
+        raw: { payment: { id: paymentId }, lookup: { error: { code: 403 } } },
+      },
+      { status: 200, body: { meta: { cursors: {}, limit: 50 } }, raw: { id: paymentId } },
     ];
     for (const answer of answers) {
       listAnswer = answer;
@@ -1478,7 +1537,7 @@ describe("GoCardless refund replays", () => {
         code: "invalid_request",
         retryable: false,
         message: expect.stringMatching(/nothing left to refund/),
-        raw: { id: paymentId },
+        raw: answer.raw,
       });
     }
     expect(refundCreates(fake)).toHaveLength(1);
@@ -1536,7 +1595,8 @@ describe("GoCardless refund amounts", () => {
       ).rejects.toMatchObject({ code: "unknown", retryable: false, pspName: "gocardless", raw: { id: paymentId } });
     }
     expect(fake.requestsTo("POST", "/refunds")).toHaveLength(2);
-    expect(fake.requestsTo("GET", "/refunds")).toHaveLength(0);
+    // Only the second refund, on a payment already holding one, read the refunds first.
+    expect(fake.requestsTo("GET", "/refunds")).toHaveLength(1);
   });
 
   it("reads a refund amount sent as a digit string, and fails closed on one that does not read", async () => {

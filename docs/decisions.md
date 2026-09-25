@@ -341,15 +341,18 @@ choices they forced:
     payment already reached". Should two refunds carry the stamp, which a key reused past
     the 30-day window can cause, the newest wins. The same read settles a POST that
     GoCardless rejects with anything but the 409: a stamped refund is the original, and
-    anything else rethrows the rejection. A transient failure of the read after a refusal stays retryable, and
-    any other failure keeps the refusal, or after a rejected POST the rejection. Replays
+    anything else rethrows the rejection. A transient failure of the read stays retryable,
+    after a refusal and after a rejected POST alike (a rejection that reads as final could
+    hide the original); any other failure keeps the refusal, or the rejection. While the
+    payment already holds refunds the read also runs before the create (2026-09-25), so a
+    key past the window GoCardless honours keys for is read back too. Replays
     of stamped refunds therefore depend neither on `total_amount_confirmation` nor on
     whether GoCardless checks the key before the body (AMBIGUOUS: the docs do not state
     the order). Refunds created before the stamp carry none: a replay of one that the
     remainder check refuses rejects, as it always did, and one within the remainder
-    relies on the 409. Past the window GoCardless honours keys for, a same-key refund
-    within the remainder may be created anew; one past the remainder still returns the
-    stamped original.
+    relies on the 409. Past the window GoCardless honours keys for, a same-key refund of
+    a stamped original is read back before any create; one of a refund made before the
+    stamp may be created anew.
   - *Refunds: amounts.* The spec types a payment's `amount` and `amount_refunded`, and a
     refund's `amount`, as integer or string. The refund path reads digit strings as
     integers and rejects anything else with a non-retryable `unknown` before any
@@ -364,7 +367,12 @@ choices they forced:
     amount either; the support centre's "up to the full amount of that payment" is a step
     of the Dashboard refund flow. GoCardless lets accounts opt out of the confirmation
     check, so the adapter no longer relies on it: it still sends the value from a fresh
-    read, and recognises replays by the stamp alone.
+    read, and recognises replays by the stamp alone. What that cannot close statelessly:
+    on an opted-out account two refunds under different keys that read the same
+    `amount_refunded` can both be sent, so the guide asks hosts to refund one payment at a
+    time there. **AMBIGUOUS too: whether `amount_refunded` counts a refund as soon as it is
+    created**; the spec says only that GoCardless "will update" it. Sandbox check S4: create
+    a refund, read the payment at once, and record whether `amount_refunded` includes it.
   - *Cancels.* Idempotency keys are documented for creates only. The official Node client
     (gocardless-nodejs `src/api/api.ts`) generates a key for every POST it is not given
     one for, cancels included, and resolves no 409 for them. Whether an action is

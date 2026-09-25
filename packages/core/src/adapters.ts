@@ -506,7 +506,8 @@ export interface MountOptions {
    *
    *  - Stripe: Payment Element options — `layout` (tabs/accordion),
    *    `paymentMethodOrder`, `fields`, `defaultValues`, `terms`, `wallets`, …
-   *  - Paysafe: per-field config under `fields` (placeholders, …), `locale`, …
+   *  - Paysafe: per-field config under `fields` (`placeholder`, `accessibilityLabel`,
+   *    `iframeTitle`, …), `initializationTimeout`, …
    */
   fieldOptions?: Record<string, unknown>;
   /** BCP-47 locale for the PSP's own field texts, where the SDK supports one. */

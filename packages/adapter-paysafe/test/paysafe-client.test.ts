@@ -1,39 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isPayFanoutError } from "@payfanout/core";
 import { runClientAdapterConformanceTests } from "@payfanout/conformance";
-import {
-  decodeSessionPayload,
-  PaysafeClientAdapter,
-  type PaysafeFieldsInstanceLike,
-  type PaysafeJsLike,
-} from "../src/index.js";
+import { decodeSessionPayload, PaysafeClientAdapter } from "../src/index.js";
+import { createFakePaysafeJs, type FakePaysafeJsOptions } from "./fake-paysafe-js.js";
 
 function sessionToken(payload: object): string {
   return `${Buffer.from(JSON.stringify(payload)).toString("base64url")}.fake-signature`;
 }
 
-const TOKEN = sessionToken({ v: 1, amount: 2500, currency: "EUR", merchantAccountId: "acct-EUR", id: "order-1" });
+const TOKEN = sessionToken({ v: 1, amount: 2500, currency: "EUR", merchantAccountId: "1001234567", id: "order-1" });
 
-function makeFakePaysafe(tokenizeImpl?: PaysafeFieldsInstanceLike["tokenize"]): PaysafeJsLike & {
-  setupCalls: Array<{ apiKey: string; options: Record<string, unknown> }>;
-  tokenizeCalls: Record<string, unknown>[];
-} {
-  const fake = {
-    setupCalls: [] as Array<{ apiKey: string; options: Record<string, unknown> }>,
-    tokenizeCalls: [] as Record<string, unknown>[],
-    fields: {
-      setup: async (apiKey: string, options: Record<string, unknown>) => {
-        fake.setupCalls.push({ apiKey, options });
-        return {
-          tokenize: async (opts: Record<string, unknown>) => {
-            fake.tokenizeCalls.push(opts);
-            return tokenizeImpl ? tokenizeImpl(opts) : { token: "SPtok_handle_1" };
-          },
-        };
-      },
-    },
-  };
-  return fake as never;
+function makeFakePaysafe(tokenize?: FakePaysafeJsOptions["tokenize"]) {
+  return createFakePaysafeJs({ tokenize });
 }
 
 function makeAdapter(fake = makeFakePaysafe()): { adapter: PaysafeClientAdapter; fake: typeof fake } {
@@ -82,7 +60,7 @@ describe("PaysafeClientAdapter", () => {
 
   it("decodes the session payload half without needing the signing key", () => {
     const payload = decodeSessionPayload(TOKEN);
-    expect(payload).toMatchObject({ amount: 2500, currency: "EUR", merchantAccountId: "acct-EUR" });
+    expect(payload).toMatchObject({ amount: 2500, currency: "EUR", merchantAccountId: "1001234567" });
     expect(() => decodeSessionPayload("garbage")).toThrowError(/not a Paysafe session context/);
   });
 
@@ -97,7 +75,9 @@ describe("PaysafeClientAdapter", () => {
     const setup = fake.setupCalls[0]!;
     expect(setup.options["environment"]).toBe("TEST");
     expect(setup.options["currencyCode"]).toBe("EUR"); // Paysafe.js 9055s without it
-    expect(setup.options["accountId"]).toBe("acct-EUR");
+    // accountId is not a setup option; accounts.default is, and takes a number.
+    expect(setup.options).not.toHaveProperty("accountId");
+    expect(setup.options["accounts"]).toEqual({ default: 1001234567 });
     expect(Object.keys(setup.options["fields"] as object)).toEqual(["cardNumber", "expiryDate", "cvv"]);
   });
 
@@ -112,27 +92,47 @@ describe("PaysafeClientAdapter", () => {
       paymentType: "CARD",
       amount: 2500,
       currencyCode: "EUR",
-      accountId: "acct-EUR",
-      merchantRefNum: "order-1",
+      accountId: 1001234567,
+      merchantRefNum: expect.stringMatching(/^order-1-/),
     });
+  });
+
+  it("confirm() fails as invalid_request when the account id is not the number Paysafe.js takes", async () => {
+    stubBrowser();
+    const { adapter, fake } = makeAdapter();
+    const stringAccount = sessionToken({ v: 1, amount: 2500, currency: "EUR", merchantAccountId: "acct-EUR", id: "o2" });
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: stringAccount });
+    expect(fake.setupCalls[0]!.options).not.toHaveProperty("accounts");
+    const result = await adapter.confirm(handle);
+    expect(result).toMatchObject({ status: "failed", error: { code: "invalid_request" } });
+    expect(fake.tokenizeCalls[0]!["accountId"]).toBe("acct-EUR");
   });
 
   it("coerces a digit-only merchantAccountId to the number Paysafe.js requires, but never rounds an oversized id", async () => {
     stubBrowser();
     const { adapter, fake } = makeAdapter();
     // A real per-currency account id is numeric — Paysafe.js rejects the string
-    // form with 9003, so setup() and tokenize() must receive a number.
+    // form (setup 9061, tokenize 9003), so both must receive a number.
     const numericToken = sessionToken({ v: 1, amount: 2500, currency: "CAD", merchantAccountId: "1003178470", id: "o1" });
     const handle = await adapter.mount(fakeContainer(), { clientSecret: numericToken });
-    expect(fake.setupCalls[0]!.options["accountId"]).toBe(1003178470);
+    expect(fake.setupCalls[0]!.options["accounts"]).toEqual({ default: 1003178470 });
     await adapter.confirm(handle);
     expect(fake.tokenizeCalls[0]!["accountId"]).toBe(1003178470);
 
     // An id too large to represent exactly stays a string — silently rounding it
-    // could route the tokenize to a different merchant account.
+    // could route the tokenize to a different merchant account. Setup takes no
+    // string, so it goes without; tokenize still carries it, and Paysafe.js
+    // rejects it there as the configuration error mapped further down.
     const huge = "9".repeat(20);
-    await adapter.mount(fakeContainer(), { clientSecret: sessionToken({ v: 1, amount: 2500, currency: "CAD", merchantAccountId: huge }) });
-    expect(fake.setupCalls[1]!.options["accountId"]).toBe(huge);
+    const hugeHandle = await adapter.mount(fakeContainer(), {
+      clientSecret: sessionToken({ v: 1, amount: 2500, currency: "CAD", merchantAccountId: huge }),
+    });
+    expect(fake.setupCalls[1]!.options).not.toHaveProperty("accounts");
+    await expect(adapter.confirm(hugeHandle)).resolves.toMatchObject({
+      status: "failed",
+      error: { code: "invalid_request" },
+    });
+    expect(fake.tokenizeCalls[1]!["accountId"]).toBe(huge);
   });
 
   it("maps tokenize failures to unified errors with raw preserved", async () => {

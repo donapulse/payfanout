@@ -149,7 +149,24 @@ than enumerated options (future SDK options need no library release):
   `wallets`, …). Paysafe: per-field options under `fields` (placeholders, …) plus any
   top-level setup option. Adapters protect ONLY their functional keys (Stripe:
   clientSecret; Paysafe: environment/currencyCode/accountId/mount selectors) — the
-  host wins everywhere else.
+  host wins everywhere else. *Update 2026-09-24:* Paysafe's protected setup key is
+  `accounts` (`accounts.default`, the documented setup option for a key holding several
+  accounts in one currency), not `accountId`, which setup never read; tokenize still
+  carries `accountId`, as its reference documents. When the session's account is
+  numeric, it replaces a host's whole `fieldOptions.accounts`: tokenize's `accountId`
+  overrides the setup account and the server charges the session's account, so sibling
+  entries could never route a payment.
+- **Doc-verified 2026-09-24: Paysafe.js tokenize and show.** Tokenize requires
+  `merchantRefNum` ("A unique identifier is provided by the merchant for every transaction
+  from Paysafe JS"; the served SDK fails a missing value with 9003), so each attempt sends a
+  fresh one: the session `id` minus Paysafe's global invalid characters, cut so the whole
+  stays within 255 characters, then a random suffix (`crypto.randomUUID`, or
+  `getRandomValues` outside secure contexts). It names the single-use handle only; the
+  payment keeps the caller's `idempotencyKey`. The adapter always calls `show()` after
+  setup ("The function should be invoked immediately after the setup function"): the served
+  SDK makes it during setup only for a single payment method and answers a repeat call
+  with the first result, so the call is harmless for the card-only fields and keeps any
+  other setup from staying locked (9100).
 - **`MountOptions.locale`** — BCP-47, mapped per PSP (Paysafe underscore form).
 - **Slot convention for split-field PSPs:** `data-payfanout-field="cardNumber|
   expiryDate|cvv"` elements inside the container become the mount points — the host
@@ -219,12 +236,64 @@ choices they forced:
   `parseWebhookEvent` throws on batched deliveries instead of dropping events;
   `parseGoCardlessWebhookEvents` (verify once, fan out per event) is the documented
   ingress. `billing_requests`/`fulfilled` maps to `payment.processing`, payment id
-  from `links.payment_request_payment`.
+  from `links.payment_request_payment` (corrected 2026-09-24: only when the event names
+  that payment; see the lifecycle entry below).
 - `supportsSavedPaymentMethods: false` in v1: mandates are genuinely reusable
   charging handles, but async bank rails cannot meet the vault contract's
   instantly-succeeded off-session charge; mandates-as-vault is future work.
 - `listRefunds` scopes with the server-side `?payment=` filter on GET /refunds
   (sandbox-verified: 200 + empty list for a refund-less payment).
+- **Doc-verified 2026-09-24: billing request and payment lifecycle.** Checked against the
+  OpenAPI spec for the pinned 2015-07-06 version
+  (docs.gocardless.com/openapi-schema-public.json), the billing request and payment event
+  references, the billing request events guide, the Drop-in and Success+ guides, and the
+  scenario simulators page.
+  - *Billing request status.* The spec defines `ready_to_fulfil` as "the billing request is
+    ready to fulfil" and `fulfilling` as "the billing request is currently undergoing
+    fulfilment". A billing request's actions are those "that can be performed before this
+    billing request can be fulfilled", `bank_authorisation` is a required one on a payment
+    request, and the `billing_request_fulfilled` simulator starts from "the `pending` state,
+    with all actions completed except for `bank_authorisation`". Both states come after
+    the payer's part, so `retrievePayment(BRQ…)` reports
+    them `processing`, as it does `fulfilled`; only `pending` ("the billing request is
+    pending and can be used") stays `requires_action`. They were `requires_action`, which
+    invited a host to send the payer to authorise again. An undocumented status reads
+    `processing` for the same reason.
+  - *`billing_requests`/`fulfilled`.* The event's `links.payment_request_payment` is "the
+    ID of the payment which has been created for Pay by Bank", while the Drop-in guide's
+    mandate flow says of the same event "Record the mandate_id from
+    links.mandate_request_mandate". A fulfilment maps to `payment.processing` only when it
+    names a payment; a mandate-only one maps to `unknown`.
+  - *`billing_requests`/`cancelled`* ("This billing request has been cancelled, none of the
+    resources have been created") maps to `payment.canceled`, matching `retrievePayment`.
+    Billing request events carry `links.billing_request` as `pspPaymentId`, except a
+    fulfilment, which names its payment: the events guide's examples show
+    `links.payment_request_payment` on every action, pre-fulfilment ones included, while
+    the spec describes it as the payment "which has been created" (AMBIGUOUS; the
+    billing request id is right under either reading). The event does not say whether the
+    request had a `payment_request`, so
+    a cancelled mandate-only request reads the same way; a host finds no session under a
+    `BRQ…` id it did not create. `bank_authorisation_denied` stays `unknown`: "Payers can
+    always return to the flow and create a new bank authorisation".
+  - *Late failures.* The spec's payment `failed` status notes that "payments can fail after
+    being confirmed if the failure message is sent late by the banks", and the simulators
+    list `Late` as `submitted` → `confirmed` → `failed`; the `payment_late_failure_settled`
+    simulator "Behaves the same as the `payment_late_failure` simulator, except that the
+    late failure is additionally included as a debit item in a payout", and the Success+
+    guide says "On payment failure the `failed` event will always be sent."
+    `late_failure_settled` is "The
+    payment was a late failure which had already been paid out, and has been debited from
+    a payout", the counterpart of `chargeback_settled`, so it maps to `unknown` rather than
+    a second `payment.failed`. The Success+ guide asks integrators to act on
+    `late_failure_settled` because such a payment may be retried; the event is still
+    delivered, and a retry arrives as `resubmission_requested` → `payment.processing`.
+  - *Scheme `pad`*, listed in the spec's `payments.scheme`, maps to the unified `pad` type
+    chosen for it on 2026-07-15 instead of `other`.
+  - **AMBIGUOUS:** whether the payer can land on `redirect_uri` while the billing request
+    is still `fulfilling` (it reads `processing` either way), and which status a billing
+    request holds after a `billing_requests`/`failed` event, since the status list names
+    none. Sandbox checks: read the billing request in the return handler during a browser
+    run, and record the status when a `failed` event occurs.
 
 ## PayPal adapter (2026-07-07)
 
@@ -413,8 +482,10 @@ choices they forced:
 ## Open items requiring humans or infrastructure
 
 - Webhook delivery verification (both PSPs) needs a public URL/tunnel + real webhook
-  secrets; deferred by user request. Paysafe's signature **header name** is still
-  unconfirmed (adapter accepts `signature` / `x-signature` / `x-paysafe-signature`).
+  secrets; deferred by user request. *Closed 2026-09-24:* Paysafe's signature header
+  name is doc-verified as `Signature` (Payments API "Configure Webhooks" page, "Example
+  Header: Signature: …"); the adapter reads it first and still tolerates `x-signature` /
+  `x-paysafe-signature`. See "Paysafe webhook correlation and event ids (2026-09-24)".
 - Team sign-off on every *(default, unconfirmed)* item above.
 
 ## Contract hardening (2026-07-08, explicit user-approved review follow-up)
@@ -2119,3 +2190,90 @@ description of what v2 changes is what the migration then had to implement.
   `stolen_card` decline code on the same error still yields `fraud_suspected`, whose message
   is generic as docs.stripe.com/declines/codes asks. Whether Stripe sends a decline code
   alongside this code is undocumented.
+
+## Paysafe webhook correlation and event ids (2026-09-24)
+
+- **A Paysafe delivery carries no event id, and a retry is the same notification with the
+  next `attemptNumber`.** Doc-verified 2026-09-24: the SEPA and Bacs Direct Debit pages, the
+  EPS, Openbucks and SafetyPay webhook pages and the Java SDK's `WebhookEvent` model
+  (`payload`, `attemptNumber`, `type`, `resourceId`, `eventDate`, `eventName`) show no
+  top-level event id; the EPS-style envelopes carry `links[].rel` instead of `type`. The
+  Payments API reference ("Some Notes on Webhooks") says Paysafe "makes a maximum of 2
+  additional attempts (total 3 attempts)" without a 200 or 202, and "In case you have
+  received the same notification multiple times for an already processed event, we request
+  you to ignore the duplicate notification." The old fallback id, a hash of the raw body,
+  changed with every attempt, so host dedupe by `event.id` let the retries through.
+- **The event id is `paysafe_` + the SHA-256 hex of `[name, resourceId, status, time]`.**
+  The name is the normalized event name, the resource id `payload.id` (else `resourceId`),
+  the status `payload.status`, and the time `payload.statusTime`, else `payload.txnTime`,
+  else the envelope `eventDate`. `statusTime` comes first because the payment schema defines
+  it as "the date and time the resource status was last updated", while the SEPA page's
+  settlement examples give `eventDate` the payment's `txnTime` and a later `statusTime`; the
+  official PHP SDK's webhook test fixture
+  (`tests/Webhook/resources/json/valid_webhook_payload.json`) has an `eventDate` later than
+  its `txnTime`, so what `eventDate` measures is unsettled and it is used only when the
+  payload has no time. The price is merging: Paysafe's card and refund webhook examples
+  carry no `statusTime`, so one resource reporting the same event twice at one status
+  would share an id. The Paysafe guide therefore tells hosts to re-read with `retrievePayment` /
+  `retrieveRefund` whether or not the id was seen. A top-level `id` is not read: the example
+  payload on the Configure Webhooks page is the bare resource with its own id there, and
+  keying on it would merge every event of that resource. A body naming no resource hashes
+  its key-sorted JSON without `attemptNumber`. The derivation changed every Paysafe event
+  id, so a host deduping across the upgrade may process one duplicate per in-flight event;
+  the changeset says so.
+- **`pspPaymentId` names a payment only.** A bank return reports `payload.paymentId`: on the
+  SEPA and Bacs `PAYMENT_RETURN_COMPLETED` examples (`type: "PAYMENT_RETURN"`) `payload.id`
+  is the return's own id, and `paymentId` / `settlementId` carry the payment's. Refund
+  events report `refundId` and no `pspPaymentId`: the spec's `refunds` schema has no payment
+  field and the EPS refund examples name none, so hosts match `refundId` to the one
+  `refundPayment` returned. Handle, settlement and every other resource leave it unset; the
+  2026-07-15 rule stands (`SETTLEMENT_*` and `PAYMENT_HANDLE_PAYABLE` delivered `unknown`,
+  correlated by payload `merchantRefNum`). Nuance: a settle-with-auth payment's settlement
+  can share the payment's id (the SEPA and Bacs examples' `settlementId` and `SETTLEMENT_*`
+  payload ids do, as does the embedded settlement of the card delivery captured in #77),
+  but a settlement made later through `POST /payments/{paymentId}/settlements` is its own
+  resource with its own `id`, so a settlement id is never reported as a payment id even
+  where the two coincide. Dispute names (`CHARGEBACK_*`, `DISPUTE_*`) appear on no
+  Payments API page and keep reporting `payload.id`, unchanged.
+- **Event names.** `REFUND_CANCELLED` ("The refund request is cancelled.", the Webhook
+  Events page the Configure Webhooks page links as its event list) and `REFUND_ERRORED`
+  (EPS webhooks page) now map to `payment.refund_failed`, as `mapRefundStatus` already reads
+  `CANCELLED` and `ERROR`; `PAYMENT_ERRORED` (Interac e-Transfer page, "The payment has an
+  error (non http status 402 error).") maps to `payment.failed`, as the `ERROR` payment
+  status does. `PAYMENT_PENDING` stays mapped and advertised: the Pay by Bank (US), PayPal
+  and Rapid Transfer webhook pages document it. `PAYMENT_DECLINED`, `PAYMENT_EXPIRED`,
+  `PAYMENT_AUTHENTICATION_REQUIRED`, `REFUND_DECLINED` and `REFUND_ERROR` appear on no page:
+  still parsed, no longer in the onboarding descriptor, whose list now derives from the
+  parser's documented names. `REFUND_RECEIVED` / `_PENDING` / `_PROCESSING` stay `unknown`
+  (no in-flight refund type in the unified vocabulary) but carry `refundId`.
+- **The `variables` envelope is read defensively (AMBIGUOUS).** The Bacs page nests
+  `payload`, `attemptNumber`, `type` and `eventDate` under `variables`; every other page,
+  the Java SDK model and the delivery captured in #77 keep them at the top level. The parser
+  reads either and gives both forms the same id. A real Bacs delivery would settle which
+  one Paysafe sends; it needs a GBP-provisioned account and `PAYSAFE_WEBHOOK_HMAC_KEY`,
+  neither of which this project has yet.
+- **Delivery limits, corrected in the docs.** Same reference section: receipt is
+  acknowledged by "200 OK or 202 ACCEPTED", Paysafe "does not have a notification method to
+  alert you when callbacks are not reaching your endpoint URL", and "only the default HTTPS
+  port 443 is supported". The Configure Webhooks page words the retry as "retry the webhook
+  up to three times" after a 4XX or 5XX; the docs use the reference's count of three
+  attempts in all. "Retries effectively forever" is gone from the guide, the webhooks page,
+  the server README, the root README, `@payfanout/server`'s `WebhookRequest` comment and
+  `webhook.ts`. The server handler answers 200, which Paysafe accepts.
+- **Bank returns cannot be recovered by a read (AMBIGUOUS whether any read reflects them).**
+  The spec defines no return resource, and its Direct Debit Return Codes section says
+  "Because Direct Debit requests can take up to 7 days to clear, you cannot be notified of
+  errors such as these via the API response", pointing to Merchant Back Office reports. The
+  adapter's `retrievePayment` has no return state, so a returned debit keeps reading
+  `succeeded` unless Paysafe moves the payment out of COMPLETED, which no page documents.
+  The guides therefore tell hosts to act on the return webhook, reconcile bank debits
+  against the Back Office return reports, and never let a read override a return. Sandbox
+  check: on an EUR (SEPA) or GBP (Bacs) account with `PAYSAFE_WEBHOOK_HMAC_KEY`, trigger a
+  return (no documented trigger; ask Paysafe support) and read the payment afterwards.
+- **Signature, doc-verified.** Configure Webhooks: digest = HMAC_SHA256(hmacKey, UTF-8
+  JSON body), signature = base64(digest), example header `Signature`; the official PHP
+  SDK's `SignatureVerifier` computes the same and compares with `hash_equals`. The exported
+  `verifyPaysafeWebhookSignature` now lowercases header names itself instead of relying on
+  the adapter, reads `signature` first and still tolerates `x-signature` /
+  `x-paysafe-signature`; raw-body hashing, constant-time comparison and key rotation are
+  unchanged.

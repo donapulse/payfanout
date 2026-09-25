@@ -1,4 +1,4 @@
-import { createHmac } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { getRefundState, isPayFanoutError, type ServerPaymentAdapter } from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
@@ -35,23 +35,50 @@ function makePair(config: Partial<PaysafeServerAdapterConfig> = {}): {
 function signedWebhook(body: object): { rawBody: string; headers: Record<string, string> } {
   const rawBody = JSON.stringify(body);
   const signature = createHmac("sha256", WEBHOOK_KEY).update(rawBody, "utf8").digest("base64");
-  return { rawBody, headers: { signature } };
+  return { rawBody, headers: { Signature: signature } };
 }
 
-// Real Paysafe Payments-API deliveries carry the event in `eventName` (see webhook.ts) —
-// the conformance contract exercises that real-world shape.
+// The documented delivery envelope: no event id, an attempt counter, the resource
+// category in `type` and the event in `eventName`. Values are made up.
+const WEBHOOK_PAYMENT_ID = "3f6c2a1e-7b4d-4c21-9a8e-2d5f0b6c9e14";
 const webhookFixture = signedWebhook({
-  id: "psf_evt_1",
-  eventName: "PAYMENT.COMPLETED",
-  txnTime: "2026-07-04T10:00:02Z",
-  payload: { id: "pay_42", status: "COMPLETED", merchantRefNum: "order-1", amount: 1099, currencyCode: "USD" },
+  payload: {
+    accountId: "1001234567",
+    id: WEBHOOK_PAYMENT_ID,
+    merchantRefNum: "order-1",
+    amount: 1099,
+    currencyCode: "USD",
+    status: "COMPLETED",
+    txnTime: "2026-07-04T10:00:02Z",
+    settleWithAuth: true,
+  },
+  attemptNumber: "1",
+  type: "PAYMENT",
+  resourceId: WEBHOOK_PAYMENT_ID,
+  eventDate: "2026-07-04T10:00:02Z",
+  eventName: "PAYMENT_COMPLETED",
 });
+// Paysafe sends no event id; the adapter derives one (see webhook.ts), recomputed here.
+const webhookFixtureEventId = `paysafe_${createHash("sha256")
+  .update(JSON.stringify(["PAYMENT_COMPLETED", WEBHOOK_PAYMENT_ID, "COMPLETED", "2026-07-04T10:00:02Z"]), "utf8")
+  .digest("hex")}`;
 
+// A documented event the adapter leaves unmapped: settlements are not payments.
 const unknownWebhookFixture = signedWebhook({
-  id: "psf_evt_new",
-  eventName: "WALLET.SOMETHING.NEW",
-  txnTime: "2026-07-04T10:00:03Z",
-  payload: { id: "obj_1" },
+  payload: {
+    accountId: "1001234567",
+    id: WEBHOOK_PAYMENT_ID,
+    merchantRefNum: "order-1",
+    amount: 1099,
+    currencyCode: "USD",
+    status: "COMPLETED",
+    statusTime: "2026-07-05T02:00:00Z",
+    txnTime: "2026-07-04T10:00:02Z",
+  },
+  attemptNumber: "1",
+  type: "SETTLEMENT",
+  eventDate: "2026-07-04T10:00:02Z",
+  eventName: "SETTLEMENT_COMPLETED",
 });
 
 /** Tokenize-first completion of a fresh session — how every "money moved" fixture starts. */
@@ -112,7 +139,7 @@ runServerAdapterConformanceTests(
       validRawBody: webhookFixture.rawBody,
       validHeaders: webhookFixture.headers,
       expectedType: "payment.succeeded",
-      expectedEventId: "psf_evt_1",
+      expectedEventId: webhookFixtureEventId,
       expectedAmount: 1099,
       unknownEvent: { rawBody: unknownWebhookFixture.rawBody, headers: unknownWebhookFixture.headers },
     },
@@ -369,19 +396,16 @@ describe("PaysafeServerAdapter specifics", () => {
     expect(fake.lastRequestBody).not.toHaveProperty("accountId"); // Paysafe routes by key + currency
   });
 
-  it("maps chargeback-ish and exotic webhook events, hashing a stable id when Paysafe omits one", async () => {
+  it("tolerates undocumented dispute spellings and keeps unknown events, each with a stable id", async () => {
+    // No Paysafe page documents a dispute webhook for the Payments API; these legacy
+    // spellings (dotted, `eventType`) are parsed rather than dropped.
     const { adapter } = makePair();
-    const chargeback = await adapter.parseWebhookEvent(
-      JSON.stringify({ eventType: "PAYMENT.CHARGEBACK.OPENED", payload: { id: "pay_9" } }),
-    );
+    const body = JSON.stringify({ eventType: "PAYMENT.CHARGEBACK.OPENED", payload: { id: "pay_9" } });
+    const chargeback = await adapter.parseWebhookEvent(body);
     expect(chargeback.type).toBe("payment.chargeback");
     expect(chargeback.pspPaymentId).toBe("pay_9");
     expect(chargeback.id).toMatch(/^paysafe_[0-9a-f]{64}$/);
-
-    const again = await adapter.parseWebhookEvent(
-      JSON.stringify({ eventType: "PAYMENT.CHARGEBACK.OPENED", payload: { id: "pay_9" } }),
-    );
-    expect(again.id).toBe(chargeback.id); // stable dedupe key from raw bytes
+    expect((await adapter.parseWebhookEvent(body)).id).toBe(chargeback.id);
 
     const exotic = await adapter.parseWebhookEvent(JSON.stringify({ eventType: "WALLET.SOMETHING.NEW" }));
     expect(exotic.type).toBe("unknown");

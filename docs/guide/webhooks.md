@@ -55,16 +55,25 @@ handlers take them regardless of scope.
 ## Ack fast, process async
 
 The handler verifies, parses, hands the event to your `onEvent`, and expects a 2xx
-immediately, `onEvent` must **enqueue, not process**. Paysafe retries effectively forever
-until it sees success.
+immediately, `onEvent` must **enqueue, not process**. Redelivery is not unlimited: Paysafe,
+for one, counts only a `200` or `202` as received and stops after three attempts with no
+alert, so an event whose handler failed all three is gone. A `retrievePayment` re-read
+recovers a payment's outcome, but not a bank-debit return: Paysafe documents those only
+through the return webhook and its Merchant Back Office return reports, so reconcile bank
+debits against those reports, and never let a read that says `succeeded` override a return
+you received.
 
 - **Dedupe is yours:** `event.id` is a stable key; keep the seen-set in your store.
   Worldline can give two genuine refund events one id, so re-read its refund-type events
   before dropping one as a duplicate, as step 8 of the
-  [Worldline guide](/guide/worldline#_8-register-the-webhook-endpoint) describes. Adyen
-  duplicates can differ outside `eventCode` and `pspReference`, and Adyen asks you to use the
-  latest one, so upsert by `event.id` and keep the latest delivery's details rather than
-  dropping the repeat, as step 8 of the
+  [Worldline guide](/guide/worldline#_8-register-the-webhook-endpoint) describes. Paysafe
+  sends no event id, so its adapter derives one that every redelivery shares and that two
+  genuine events can also share; re-read a Paysafe event with `retrievePayment` or
+  `retrieveRefund` before dropping it as a duplicate, as the Paysafe guide's
+  [event ids and correlation](/guide/paysafe#event-ids-and-correlation) section describes.
+  Adyen duplicates can differ outside `eventCode` and `pspReference`, and Adyen asks you to
+  use the latest one, so upsert by `event.id` and keep the latest delivery's details rather
+  than dropping the repeat, as step 8 of the
   [Adyen guide](/guide/adyen#_8-register-the-webhook-endpoint) describes.
 - **Ordering is not guaranteed** by any PSP, treat events as unordered facts. When sequence
   matters, reconcile with `retrievePayment` where the adapter declares

@@ -3201,6 +3201,9 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `resultCode` is `Refused`, `Error` or `Cancelled`: the result-codes page lists them among
   its "Final state result codes" with `Authorised`, and `Cancelled` is "The payment was
   cancelled (by either the shopper or your own system) before processing was completed".
+  The same page opens with "The status of a payment can sometimes change after you get the
+  result code"; a final code is weighed as final here, and a later change reaches the host
+  by webhook.
   GoCardless answers a consumed key with "a `409 idempotent_creation_conflict` error with a
   `links.conflicting_resource_id` pointing to the existing resource" (limits page), which the
   adapter reads back and compares with the call, refunds also by their key stamp. The
@@ -3209,8 +3212,11 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `cancelled` (the adapter reads `customer_approval_denied` and `charged_back` as failed
   too), or the refund `cancelled`, `bounced` ("the refund has failed to be paid") or
   `funds_returned` ("the refund has had its funds returned"), per the OpenAPI spec's status
-  enums. A failed GoCardless payment can be retried, but only by an explicit
-  `POST /payments/{id}/actions/retry`, so it counts as final. The messages follow Paysafe's:
+  enums. A failed GoCardless payment can be retried by an explicit
+  `POST /payments/{id}/actions/retry`, or automatically when the billing request asked for
+  `payment_request.retry_if_possible` ("On failure, automatically retry payments using
+  intelligent retries. Default is `false`"). The adapter never sends that field, so a failed
+  payment counts as final; adding the field would reopen this decision. The messages follow Paysafe's:
   use a new key only once that record is known to be another one.
 - **Left unmarked.** PayZen has no idempotency channel, so no refusal of a reused key exists
   to mark, and its unanswered writes stay `psp_unavailable`. Stripe does not save a request

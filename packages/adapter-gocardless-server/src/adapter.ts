@@ -430,6 +430,8 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
               input.statementDescriptor ??
               input.metadata?.description ??
               (input.id ? `Payment ${input.id}` : "Payment"),
+            // No retry_if_possible: a failed payment then stays final, which the
+            // outcomeUnknown lift on a reused key relies on (docs/decisions.md).
             // payment_request.metadata is stored on the payment the billing
             // request creates — how payfanout_id and host metadata reach
             // retrievePayment once the payment exists.

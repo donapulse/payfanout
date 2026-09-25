@@ -27,7 +27,17 @@ interface FakePayPal extends PayPalJsLike {
   };
 }
 
-function makeFakePayPal(overrides: { eligible?: boolean; renderError?: unknown; close?: () => Promise<void> } = {}): FakePayPal {
+function makeFakePayPal(
+  overrides: {
+    eligible?: boolean;
+    renderError?: unknown;
+    /** Hand the render error to onError before rejecting, as PayPal's SDK does. */
+    renderErrorViaOnError?: boolean;
+    /** An error handed to onError during a render that still resolves. */
+    renderWarning?: unknown;
+    close?: () => Promise<void>;
+  } = {},
+): FakePayPal {
   const created: ButtonsRecord[] = [];
   const fake: FakePayPal = {
     created,
@@ -46,7 +56,12 @@ function makeFakePayPal(overrides: { eligible?: boolean; renderError?: unknown; 
       return {
         isEligible: () => overrides.eligible ?? true,
         render: async (el) => {
-          if (overrides.renderError !== undefined) throw overrides.renderError;
+          const onError = options["onError"] as (err: unknown) => void;
+          if (overrides.renderError !== undefined) {
+            if (overrides.renderErrorViaOnError) onError(overrides.renderError);
+            throw overrides.renderError;
+          }
+          if (overrides.renderWarning !== undefined) onError(overrides.renderWarning);
           record.rendered.push(el);
         },
         close:
@@ -288,6 +303,41 @@ describe("PayPalClientAdapter", () => {
       retryable: true, // mounting again can succeed
     });
     expect(container.children[0]!.remove).toHaveBeenCalled();
+  });
+
+  it("reports a render failure once when PayPal's SDK hands it to onError before rejecting", async () => {
+    stubBrowser();
+    const broken = makeFakePayPal({ renderError: new Error("render exploded"), renderErrorViaOnError: true });
+    const { adapter } = makeAdapter(broken);
+    const surfaced: unknown[] = [];
+    let rejected: unknown;
+    await adapter
+      .mount(fakeContainer(), { clientSecret: ORDER_ID, onError: (err) => surfaced.push(err) })
+      .catch((err: unknown) => {
+        rejected = err;
+      });
+    expect(surfaced).toHaveLength(1);
+    expect(surfaced[0]).toBe(rejected); // one failure, one instance
+    expect(rejected).toMatchObject({ code: "processing_error", retryable: true });
+  });
+
+  it("reports an error PayPal raised during a render that still succeeded, once render is done", async () => {
+    stubBrowser();
+    const flaky = makeFakePayPal({ renderWarning: new Error("popup blocked") });
+    const { adapter } = makeAdapter(flaky);
+    const surfaced: Array<{ code?: string; retryable?: boolean }> = [];
+    const order: string[] = [];
+    await adapter.mount(fakeContainer(), {
+      clientSecret: ORDER_ID,
+      onError: (err) => {
+        surfaced.push(err);
+        order.push("error");
+      },
+      onReady: () => order.push("ready"),
+    });
+    expect(surfaced).toHaveLength(1);
+    expect(surfaced[0]).toMatchObject({ retryable: false });
+    expect(order).toEqual(["error", "ready"]);
   });
 
   it("requires a clientSecret and validates foreign handles", async () => {

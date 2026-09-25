@@ -153,6 +153,22 @@ describe("PaymentFields", () => {
     expect(onError.mock.calls[0]![0]).toBe(failure);
   });
 
+  it("reports once when the adapter hands the same plain error object to onError and the rejection", async () => {
+    const adapter = new FakeClientAdapter();
+    const plain = { code: "psp_unavailable", message: "SDK failed.", retryable: true, raw: undefined };
+    adapter.mountError = plain;
+    adapter.reportMountErrorToo = true;
+    const onError = vi.fn();
+    render(
+      <PayFanoutProvider adapters={[adapter]}>
+        <PaymentFields clientSecret="cs_1" onError={onError} />
+        <StatusProbe />
+      </PayFanoutProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("status").textContent).toBe("error"));
+    expect(onError).toHaveBeenCalledTimes(1);
+  });
+
   it("still reports a different error the adapter raised through onError while mounting", async () => {
     const adapter = new FakeClientAdapter();
     const earlier = new PayFanoutError({ code: "invalid_card_data", message: "Field broke.", pspName: "fakepsp" });

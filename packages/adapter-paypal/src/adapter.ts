@@ -177,6 +177,11 @@ export class PayPalClientAdapter implements ClientPaymentAdapter {
     const wrapper = document.createElement("div");
     container.appendChild(wrapper);
     const cleanup = (): void => wrapper.remove();
+    // PayPal's SDK reports a failed render through onError and then rejects
+    // render() with the same failure: while render() is pending the callback
+    // only keeps the error, so the host hears of the failure once.
+    let rendering = true;
+    let heldError: PayFanoutError | undefined;
 
     try {
       const buttons = paypal.Buttons({
@@ -202,7 +207,8 @@ export class PayPalClientAdapter implements ClientPaymentAdapter {
           // PayPal documents onError as a catch-all with nothing to handle
           // beyond a generic error message or page, so it is not retryable.
           const mapped = mapPayPalJsError(err, false);
-          if (state.waiters.length > 0) resolveWaiters({ status: "failed", error: mapped });
+          if (rendering) heldError ??= mapped;
+          else if (state.waiters.length > 0) resolveWaiters({ status: "failed", error: mapped });
           else options.onError?.(mapped);
         },
       });
@@ -212,11 +218,15 @@ export class PayPalClientAdapter implements ClientPaymentAdapter {
         );
       }
       await buttons.render(wrapper);
+      rendering = false;
+      if (heldError) options.onError?.(heldError);
       options.onReady?.();
       const handle: PayPalHandle = { pspName: "paypal", orderId: options.clientSecret, buttons, state, cleanup };
       return brandMountedFieldsHandle(handle);
     } catch (err) {
+      rendering = false;
       cleanup();
+      // The rejection stands for the failure the callback kept, if any.
       const mapped = err instanceof PayFanoutError ? err : mapPayPalJsError(err, true);
       options.onError?.(mapped);
       throw mapped;

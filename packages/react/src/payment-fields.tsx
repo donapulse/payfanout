@@ -188,7 +188,8 @@ export function PaymentFields({
         const wrapped = PayFanoutError.wrap(err, { pspName: targetPsp });
         setLastError(wrapped);
         setStatus("error");
-        if (!reported.has(wrapped)) latestRef.current.onError?.(wrapped);
+        const alreadyReported = reported.has(wrapped) || (typeof err === "object" && err !== null && reported.has(err));
+        if (!alreadyReported) latestRef.current.onError?.(wrapped);
       }
     })();
 

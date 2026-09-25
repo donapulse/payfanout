@@ -2,7 +2,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { JSX } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getUiLabel, type PaymentInfo } from "@payfanout/core";
+import { getUiLabel, PayFanoutError, type PaymentInfo } from "@payfanout/core";
 import { PayButton, PayFanoutProvider, PaymentFields, usePayFanout, type PayResult } from "../src/index.js";
 import { deferred, FakeClientAdapter } from "./fake-client-adapter.js";
 
@@ -134,6 +134,55 @@ describe("PaymentFields", () => {
     const err = onError.mock.calls[0]![0] as { code: string; raw: unknown };
     expect(err.code).toBe("unknown");
     expect(err.raw).toBe(adapter.mountError);
+  });
+
+  it("reports a mount failure once when the adapter also passes it to the onError option", async () => {
+    const adapter = new FakeClientAdapter();
+    const failure = new PayFanoutError({ code: "psp_unavailable", message: "SDK failed.", retryable: true, pspName: "fakepsp" });
+    adapter.mountError = failure;
+    adapter.reportMountErrorToo = true;
+    const onError = vi.fn();
+    render(
+      <PayFanoutProvider adapters={[adapter]}>
+        <PaymentFields clientSecret="cs_1" onError={onError} />
+        <StatusProbe />
+      </PayFanoutProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("status").textContent).toBe("error"));
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError.mock.calls[0]![0]).toBe(failure);
+  });
+
+  it("reports once when the adapter hands the same plain error object to onError and the rejection", async () => {
+    const adapter = new FakeClientAdapter();
+    const plain = { code: "psp_unavailable", message: "SDK failed.", retryable: true, raw: undefined };
+    adapter.mountError = plain;
+    adapter.reportMountErrorToo = true;
+    const onError = vi.fn();
+    render(
+      <PayFanoutProvider adapters={[adapter]}>
+        <PaymentFields clientSecret="cs_1" onError={onError} />
+        <StatusProbe />
+      </PayFanoutProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("status").textContent).toBe("error"));
+    expect(onError).toHaveBeenCalledTimes(1);
+  });
+
+  it("still reports a different error the adapter raised through onError while mounting", async () => {
+    const adapter = new FakeClientAdapter();
+    const earlier = new PayFanoutError({ code: "invalid_card_data", message: "Field broke.", pspName: "fakepsp" });
+    const failure = new PayFanoutError({ code: "psp_unavailable", message: "SDK failed.", retryable: true, pspName: "fakepsp" });
+    adapter.mountCallbackError = earlier;
+    adapter.mountError = failure;
+    const onError = vi.fn();
+    render(
+      <PayFanoutProvider adapters={[adapter]}>
+        <PaymentFields clientSecret="cs_1" onError={onError} />
+      </PayFanoutProvider>,
+    );
+    await waitFor(() => expect(onError).toHaveBeenCalledTimes(2));
+    expect(onError.mock.calls.map((call) => call[0])).toEqual([earlier, failure]);
   });
 
   it("errors cleanly when the requested psp has no registered adapter", async () => {

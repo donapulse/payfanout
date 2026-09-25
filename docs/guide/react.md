@@ -97,8 +97,15 @@ their native format, so one object styles either of them. PSP-native shapes stil
 through for power users (Stripe's Appearance API `{ variables, theme, rules }`; Paysafe's
 `style` selector map like `{ input: { … } }`): Stripe ignores unrecognized keys, and Paysafe
 warns (console) about entries it can't apply — e.g. a Stripe `variables` object handed to
-Paysafe — instead of silently dropping all styling. (`colorPrimary`/`colorDanger` have no
-Paysafe hosted-input equivalent, so Paysafe applies the others only.) Other PSPs (PayPal
+Paysafe — instead of forwarding them for Paysafe.js to delete. (`colorPrimary`/`colorDanger`
+have no Paysafe hosted-input equivalent, and Paysafe.js accepts no background property on
+its inputs, so Paysafe applies `colorText`, `fontFamily` and `fontSize` only.) `locale` does
+nothing on Paysafe, whose setup takes no locale: set the fields' texts (`placeholder`,
+`accessibilityLabel`, `accessibilityErrorMessage`, `iframeTitle`) per field under
+`fieldOptions.fields`. Paysafe's defaults, and the adapter's own placeholders, are English,
+and a field without an `accessibilityLabel` falls back to its placeholder for screen
+readers, so localize both.
+Other PSPs (PayPal
 button, GoCardless panel, PayZen) take their own native `appearance` shape — the common
 tokens do not apply to them.
 

@@ -315,8 +315,13 @@ choices they forced:
     billing request names its payment (`links.payment_request_payment`, the "ID of the
     payment that was created from this payment request"), the replay reads that payment
     and reports its status, as `retrievePayment` does, so a payment that already failed
-    never reads `processing`. Before that it reports the billing request's mapped status.
-    The read happens on replays only, and if it fails the billing request's status
+    never reads `processing`. One exception (2026-09-25): a `pending_customer_approval`
+    payment ("we're waiting for the customer to approve this payment") reads
+    `processing` on a replay, where `retrievePayment` reports `requires_action`, because
+    a replayed session whose billing request names a payment carries no `clientSecret`.
+    Before the billing request names a payment, the replay reports the billing
+    request's mapped status.
+    The payment read happens on replays only, and if it fails the billing request's status
     stands: failing the replay would let `PaymentRouter` fail over to another PSP for a
     payment that already exists. A flow is created only while the billing request is
     `pending` ("pending and can be used") and names no payment. Past that point the payer
@@ -338,23 +343,37 @@ choices they forced:
   - *Refunds: replays.* A replayed refund must belong to the payment and, when an amount
     is given, be for that amount. A request the remainder check refuses, as it refuses
     the replay of a refund that used up the payment, is never sent. The adapter reads
-    `GET /refunds?payment=` (the spec's `payment` filter) and returns the refund stamped
-    with the key, checked like any replay; with none, the refusal stands. One page holds
-    every refund of a payment: the Data Conventions page has every list "ordered and
-    paginated reverse-chronologically" with a default `limit` of 50, and the Responses and
-    Errors page describes `number_of_refunds_exceeded` as "Maximum of 5 refunds per
-    payment already reached". Should two refunds carry the stamp, which a key reused past
-    the 30-day window can cause, the newest wins. The same read settles a POST that
-    GoCardless rejects with anything but the 409: a stamped refund is the original, and
-    anything else rethrows the rejection. A transient failure of the read after a refusal stays retryable, and
-    any other failure keeps the refusal, or after a rejected POST the rejection. Replays
-    of stamped refunds therefore depend neither on `total_amount_confirmation` nor on
-    whether GoCardless checks the key before the body (AMBIGUOUS: the docs do not state
-    the order). Refunds created before the stamp carry none: a replay of one that the
-    remainder check refuses rejects, as it always did, and one within the remainder
-    relies on the 409. Past the window GoCardless honours keys for, a same-key refund
-    within the remainder may be created anew; one past the remainder still returns the
-    stamped original.
+    `GET /refunds?payment=` (the spec's `payment` filter; `refund_type` defaults to
+    `payment`, "refunds created against payments only") and returns the refund stamped
+    with the key, checked like any replay. With none, the refusal stands, its `raw`
+    holding the payment as `payment` and, when the read was refused, the read's answer as
+    `lookup`: one shape either way. One page holds every refund of a payment: the adapter
+    asks for `limit=500`, the most the Data Conventions page allows ("Default 50, max
+    500"), and the Responses and Errors page describes `number_of_refunds_exceeded` as
+    "Maximum of 5 refunds per payment already reached". Should two refunds carry the
+    stamp, which a key reused past the 30-day window can cause, the newest wins. The same
+    read settles a POST that GoCardless rejects with anything but the 409: a stamped
+    refund is the original, and anything else rethrows the rejection. A transient failure
+    of the read stays retryable, after a refusal and after a rejected POST alike (a
+    rejection that reads as final could hide the original); after a rejected POST, the
+    rejection rides `raw.rejection` and the read's answer `raw.lookup`, whether GoCardless
+    rejected the POST or failed to answer it. Any other failure keeps the refusal, or the
+    rejection marked `outcomeUnknown` (2026-09-25): whether the key already refunded
+    stays open, so only the same key may follow. An answer without a `refunds` array
+    counts as a failed read. While GoCardless reports an amount already
+    refunded (`amount_refunded` above 0), the read also runs before the create
+    (2026-09-25), so a key past the window GoCardless honours keys for is read back too.
+    That read exists only to prevent a second refund, so it fails closed: the refund is
+    not sent, and the call rejects retryable when the failure is transient and with a
+    final `invalid_request` marked `outcomeUnknown` otherwise, whose message sends the
+    host to the dashboard and back to the same key. Replays of stamped refunds therefore depend
+    neither on `total_amount_confirmation` nor on whether GoCardless checks the key before
+    the body (AMBIGUOUS: the docs do not state the order). Refunds created before the
+    stamp carry none: a replay of one that the remainder check refuses rejects, as it
+    always did, and one within the remainder relies on the 409. Past the window
+    GoCardless honours keys for, a same-key refund of a stamped original is read back
+    before any create while `amount_refunded` is above 0; one of a refund made before the
+    stamp may be created anew.
   - *Refunds: amounts.* The spec types a payment's `amount` and `amount_refunded`, and a
     refund's `amount`, as integer or string. The refund path reads digit strings as
     integers and rejects anything else with a non-retryable `unknown` before any
@@ -369,7 +388,13 @@ choices they forced:
     amount either; the support centre's "up to the full amount of that payment" is a step
     of the Dashboard refund flow. GoCardless lets accounts opt out of the confirmation
     check, so the adapter no longer relies on it: it still sends the value from a fresh
-    read, and recognises replays by the stamp alone.
+    read, and recognises replays by the stamp alone. What that cannot close statelessly:
+    on an opted-out account two refunds under different keys that read the same
+    `amount_refunded` can both be sent, so the guide asks hosts to refund one payment at a
+    time there, each once the previous one shows in `amount_refunded`. **AMBIGUOUS too:
+    whether `amount_refunded` counts a refund as soon as it is created**; the spec says
+    only that GoCardless "will update the `amount_refunded` property of the payment"
+    (sandbox check S4 below).
   - *Cancels.* Idempotency keys are documented for creates only. The official Node client
     (gocardless-nodejs `src/api/api.ts`) generates a key for every POST it is not given
     one for, cancels included, and resolves no 409 for them. Whether an action is
@@ -384,7 +409,9 @@ choices they forced:
   - Sandbox checks: (S2) cancel a `pending_submission` payment twice with the same key,
     and a pending billing request twice, and record whether each second call answers 200
     or 422 `cancellation_failed`; (S3) create a flow on a fulfilled and on a cancelled
-    billing request and record the answer (the adapter no longer does either).
+    billing request and record the answer (the adapter no longer does either); (S4)
+    create a refund, read the payment at once, and record whether `amount_refunded`
+    includes it.
 
 ## PayPal adapter (2026-07-07)
 
@@ -2820,6 +2847,255 @@ description of what v2 changes is what the migration then had to implement.
 - **Doc-derived only.** No sandbox run has observed a Worldline `errorCode` yet: which code the
   sandbox's 1302 decline carries, and whether any decline arrives as a 2xx REJECTED payment
   rather than a 402, remain open.
+
+## Subscription renewals without a definitive answer (2026-09-25)
+
+- **A renewal charge that fails without saying whether money moved is replayed under its
+  own key, never re-keyed.** Until now every failed renewal moved on to a new attempt key
+  (`-a<failedAttempts>`), so a charge whose answer was lost, a timeout after the PSP had
+  processed it, could be charged again by the next dunning run. The manager now classifies
+  each failure. Definitive: `card_declined`, `insufficient_funds`, `expired_card`,
+  `invalid_card_data`, `authentication_required`, `fraud_suspected`, `invalid_request`,
+  `session_expired`, `unsupported_operation`, a charge that resolved as failed, canceled
+  or requiring action, and a pending renewal resolved as failed. Uncertain:
+  `psp_unavailable`, `rate_limited`, `unknown`, any code added to the taxonomy later, and
+  any error marked `outcomeUnknown`. An uncertain failure pins `renewalAttempt.replay` (the
+  key and the request as sent), and later charges of the period repeat that request. The
+  whole request is kept because a reused key with other parameters is refused or misread.
+  Stripe's idempotent-requests reference: "The idempotency layer compares incoming
+  parameters to those of the original request and errors if they're not the same".
+  Worldline's idempotent-requests guide: "Our server will respond with the same outcome as
+  the original request, even with different payloads." Both doc-verified 2026-09-25.
+- **A replay reads the original back only where the PSP, or its adapter, makes it so.**
+  Stripe keeps the result of a request that began executing: "Subsequent requests with the
+  same key return the same result, including 500 errors" (idempotent-requests reference).
+  Paysafe refuses a reused `merchantRefNum` under `dupCheck` (409/5031) rather than
+  replaying it; its adapter reads the original back by `merchantRefNum` (PR #198) and marks
+  what it cannot read back `outcomeUnknown`, as it does a key holding several records or a
+  full lookup page, where it cannot tell which record is the call's own. A PSP that neither
+  keeps results nor has an adapter doing so gains nothing from the replay, which is why
+  core gained `PayFanoutError.outcomeUnknown` and why every refusal of a reused key must
+  carry it unless the adapter has read the key's first request back: Stripe's
+  `idempotency_error` now does, since it proves the key's first request ran, while
+  Paysafe's refusal of a key another request holds (`invalid_request`) is read back first
+  and carries none.
+- **`processing_error` is replayed once.** Stripe's adapter maps the card-error code
+  `processing_error` to it, and Stripe's decline-codes page says "Ask the customer to
+  attempt the payment again"; Stripe answers a reused key with the saved result of the
+  first request, so a second `processing_error` for the same request is that attempt's own
+  answer, and the retry moves on to a new key. An adapter that means "outcome unknown" by a
+  `processing_error` marks it `outcomeUnknown`, which is never re-keyed.
+- **Replays run inside a window, then freeze.** Stripe's low-level error guide: clients
+  "can safely retry requests that include an idempotency key as long as the second request
+  occurs within 24 hours", and a `500` is "indeterminate": "the idempotency-cached response
+  to those requests won't change", while Stripe may still complete the operation and "fire
+  webhooks for new objects that are created" (doc-verified 2026-09-25). A replay after the
+  key expired is a new charge, so replays follow `replayDelaysMinutes` (default 5, 30, 120,
+  360 and 720 minutes) only within `replayWindowHours` (default 24) of the first send. Past
+  that, or with the schedule spent, the pin is `frozen`: the cron sends nothing more, emits
+  `subscription.charge_pending`, and waits for `resolvePendingRenewal`, as it does for a
+  pending renewal. An unsettled charge never counts for dunning; settling it as failed
+  does. An earlier draft kept replaying at the dunning pace after a spent run; that was
+  dropped, because a replay 24 or 72 hours later can reach a PSP that no longer holds the
+  key. The price is that a charge left unanswered for the whole window waits for the host.
+- **The key rides the charge.** Every renewal charge carries `payfanout_renewal_key` in its
+  metadata, derived from the key so a replay stays identical, following Stripe's advice to
+  "send in a local identifier with the metadata" to cross-reference objects created during
+  an incident. `resolvePendingRenewal` settles a pin only when given that key: a failure
+  webhook alone cannot, because the payment it names may belong to an earlier attempt, and
+  a failure naming an earlier attempt's key is a no-op. Settling as succeeded requires the
+  payment id and refuses the previous period's. `parseRenewalIdempotencyKey` reads the
+  subscription back from a key for PSPs that store no metadata (Paysafe echoes the key as
+  `merchantRefNum`).
+- **Attempt numbers never go back.** `renewalAttempt.attempt` carries the period's next
+  number, so a token change, which resets `failedAttempts`, no longer reuses `-a0`, and
+  `PendingRenewal.attempt` is the number of the key the pending charge used, no longer
+  copied into `failedAttempts` when it resolves as failed. A pinned charge of a card the
+  host has since replaced is replayed first, since it may have paid the period, and a
+  decline of a replaced card, replayed, in flight or pending, costs the new card nothing.
+  Plan and metadata changes wait for the pin the same way, and so does `cancelAtPeriodEnd`:
+  a charge that went through moves the period end. A token change on a `past_due` record
+  sets `nextRetryAt` to now instead of deleting it, so a store querying `nextRetryAt` still
+  finds it.
+- **Overtaken answers are dropped.** An answer that reaches the store after an overlapping
+  run collected the period, or settled or made pending the same attempt, changes nothing;
+  a settlement the host applies is authoritative for its attempt. Resume refuses while a
+  pin is open, and a canceled record keeps its pin for reconciliation. Before a replay the
+  manager checks the service can still send it (the adapter is registered and supports
+  saved payment methods); otherwise the pin stays.
+- **Stores that drop `renewalAttempt`** would replay every few minutes forever, so after
+  saving a pin the manager reads the record back, and when it comes back as that write
+  without the pin, the failure counts for dunning at once: nothing is replayed under the
+  same key, and the retry follows `retryDelaysHours` under the next attempt number, as
+  releases before pins did. Only fields older than `renewalAttempt` are compared (status,
+  period, `failedAttempts`, `lastError.code`), since that is what a schema from before the
+  field keeps; any other write landing between the save and the read keeps the pin's key.
+  An earlier draft inferred a dropping store from `lastError.code` alone. It counted the
+  retry of a record the previous release had left `past_due` after a timeout as a second
+  failure, so a lost `-a1` was followed by `-a2` for the same period, and it replayed an
+  `invalid_request` marked `outcomeUnknown` without bound on a store that really drops the
+  field. The changeset leads with the requirement to persist the field.
+- **A late freeze re-reads the record.** Freezing a pin whose window has passed changes only
+  that pin's `frozen` flag on the record as it stands, and leaves the record alone when its
+  period moved or its pin changed. It used to write back the record read at the start of
+  the run, so a cancel landing in between was lost, and settling the pin later made the
+  canceled subscription `active` again.
+- **An answer to another request under the pinned key never settles the pin.** A card or
+  plan change while a renewal charge is in flight can make an overlapping run send a
+  different request under the same key. The PSP holds the first one it received, which
+  neither run knows. The pin keeps the request it was first pinned with, and an answer to
+  another request is dropped, but it marks the pin `contested`: from then on a failure of
+  the pinned request freezes the pin instead of moving on to a new key, because it may be
+  the PSP refusing the other request, and Paysafe answers a replay of a request it does not
+  hold under a key with `invalid_request`. Without the mark, a run whose request was pinned
+  first but reached Paysafe second would be refused that way once Paysafe's lookup showed
+  the other payment, and `-a1` would charge the period again. A contested pin still settles
+  on a success. Neither keeping the first pinned request nor taking the latest answer's, as
+  an earlier draft did, is safe alone: each leaves one arrival order charging the period
+  twice on Paysafe.
+- **`listDue` leaves out records waiting for `resolvePendingRenewal`.** A frozen pin has no
+  `nextRetryAt`, so a store falling back to `currentPeriodEnd` returned it first on every
+  call, and a full batch of them, which one PSP incident can produce, held back every other
+  due record. The cron does nothing for a frozen pin or a pending renewal (no polling), so
+  `InMemorySubscriptionStore.listDue` leaves both out and the `listDue` contract asks host
+  stores to do the same.
+- **`subscription.past_due` fires when a pin changes the status**, not on every replay;
+  `subscription.charge_failed` fires once per uncertain answer, with its error. A failed
+  attempt under dunning still emits `subscription.past_due` each time, as before, since it
+  starts a new retry schedule.
+
+## PayPal: captures after a reauthorization (2026-09-25)
+
+Doc-verified 2026-09-25 against the Payments v2 (2.12) and Orders v2 (2.36) schemas under
+developer.paypal.com/api/, the Authorize and capture page (`/v5/checkout/auth-capture`,
+where `/docs/checkout/standard/customize/authorization/` now redirects), the Authorization
+and honor period page (`/payment-methods/auth-honor`), the Extend an authorization guide
+(`/checkout/extend-authorization`) and the webhook event names page.
+
+- **The newest authorization that was not denied carries the hold, and captures go to it.**
+  Reauthorize "Reauthorizes an authorized PayPal account payment", and its example answers
+  with an authorization id different from the one reauthorized; the Extend guide says it
+  generates "a new authorization with a refreshed expiration date". The capture target is
+  guide-only: the Authorize and capture page ("A reauthorization generates a new
+  authorization ID and restarts the 3-day honor period. Use the new authorization ID on
+  subsequent captures") and the honor period page ("Perform any subsequent capture against
+  the new authorization ID, not the original"); the Authorize and capture page's capture step
+  also reads "The authorization ID is either the original authorization ID or the ID from
+  reauthorizing the transaction". The adapter captures and reports against the newest
+  authorization by `create_time`, then list position, and treats an older one as superseded
+  whatever its status. One reporting no `create_time` sorts as the oldest, so the list's
+  arrangement decides ties only: with A undated, B five days in and C one day in, listed B,
+  A, C, the former comparator took C, and B is taken now. A denied newer authorization is
+  skipped, since it replaced nothing. The adapter never reauthorizes itself; this covers a
+  host that reauthorizes through PayPal.
+- **Voids go to the original.** `CANNOT_BE_VOIDED`: "A reauthorization cannot be voided.
+  Please void the original parent authorization." / "You cannot void a reauthorized payment.
+  You must void the original parent authorized payment." `cancelPayment` voids the oldest
+  authorization unless the one holding the funds already reports `VOIDED`. No documented field
+  ties a reauthorization to its parent (an order's authorization links to itself, its capture,
+  void and reauthorize operations and the order), so age decides. AMBIGUOUS: the reauthorize
+  200 and 201 examples, and the Authorize and capture page's sample, show a `void` link on the
+  new authorization, and no page says what either authorization reports once the original is
+  voided. The fake voids both and answers `CANNOT_BE_VOIDED` for a reauthorization. An original
+  that already reads `VOIDED` next to a live reauthorization gets the void anyway, and PayPal's
+  refusal (`PREVIOUSLY_VOIDED`, "Authorization has been previously voided and hence cannot be
+  voided again.") surfaces instead of a `canceled` the adapter cannot confirm.
+  `CANNOT_BE_VOIDED` and `PREVIOUSLY_VOIDED` map to `invalid_request`, not retryable, as
+  `PREVIOUSLY_CAPTURED` does.
+- **Capturing the rest never reaches past the order.** An empty-body reauthorization
+  reauthorizes "the full amount" (the schema's "Reauthorize with empty request body" flow; the
+  Extend guide's "Reauthorize for the same amount" sends `{}`), so after a partial capture the
+  new authorization can hold again what was taken. The remainder, and `amountCapturable`, is
+  the lesser of the holding authorization's amount less the captures taken from it and the
+  order amount less every capture on the order that took money, in integer minor units and
+  never below zero. When captures name their authorization it is exact whether the
+  reauthorization is for the full amount or for what was left. An order read reporting no
+  amount (the Orders v2 response schema does not require one) is measured by the original
+  authorization's amount, which is the order amount: the Orders v2 authorize request takes no
+  amount, and an order "with the `COMPLETED` status" cannot be updated. It was measured by the
+  holding authorization before, and a reauthorization can hold "up to 115% of original" (the
+  Extend guide), so a 23.00 reauthorization after 2.00 was taken from a 20.00 order read
+  21.00 left where 18.00 is. When neither the order read nor the original reports an amount,
+  capturing the rest of a reauthorization needs an explicit amount (without one PayPal takes
+  the reauthorization's full amount), and `amountCapturable` is left out.
+  Capturing the rest answers with the payment once the order's captures cover the order
+  amount. A holding authorization that reports no amount gets what the order has left as an
+  explicit amount while nothing is captured, where it went out with no amount before (PayPal:
+  "If amount is not specified, the full authorized amount is captured"), and needs an explicit
+  amount once any capture on the order took money, not only one of its own; an explicit amount
+  then closes it only when it takes all the order has left. `MAX_CAPTURE_AMOUNT_EXCEEDED` caps
+  "the sum of all captures to be up to 115% of the order amount" (its example says "You can
+  only capture up to the original authorization amount"), and the honor period page caps
+  captures at "up to 115% or $75 USD more than the original authorized amount, whichever is
+  less", so an explicit amount still goes to PayPal as it is. The fake enforces both, the
+  second against each authorization's own amount (USD 75 applied in USD only). AMBIGUOUS:
+  which cap PayPal applies to the captures from a reauthorization, its own amount, the
+  original's or only the order's; no page says.
+- **Captures count against the authorization they name, else by time (AMBIGUOUS on the order
+  read).** `supplementary_data.related_ids.authorization_id` is a Payments v2 capture field,
+  and a Payments v2 capture's `up` link points to its authorization. The Orders v2 capture
+  schema has no `supplementary_data` or `related_ids`, and its examples link `up` to the
+  order, so an order read may name no authorization at all. A capture naming none counts
+  against every authorization created no later than it, by `create_time`, since an
+  authorization cannot give a capture taken before it existed. The former rule counted every
+  capture against the new authorization once one named none: on a 20.00 order with 7.00
+  taken and a reauthorization of the 13.00 left, the rest read 6.00 and its capture went out
+  final, closing the reauthorization with 7.00 still on it (an explicit 10.00 went out final
+  too, leaving 3.00), so the next capture met `AUTHORIZATION_ALREADY_CAPTURED`. A missing
+  `create_time`, on the capture or on an authorization, rules nothing out, which errs low;
+  the order clamp still bounds the result. AMBIGUOUS: the Orders v2 capture schema defines
+  `create_time` (through `activity_timestamps`, "The date and time when the transaction
+  occurred") and the Orders v2 capture examples carry it, but no example shows the captures
+  of an AUTHORIZE order's read. An estimate never closes a hold: when a capture naming no
+  authorization took money and another authorization could have given it, the capture goes
+  out with `final_capture: false`, even when it takes the whole estimate, and only a capture
+  of all the order has left closes the authorization. That holds even when the holding
+  authorization still covers what the order has left: a final capture the count relies on,
+  taken from the superseded original outside the adapter, may not have closed this one
+  (review of 2026-09-25). The hold stays open for whatever the
+  estimate missed, which a capture with an explicit amount can take; once the estimate
+  reaches zero, capturing the rest answers with the payment, as when captures cover the
+  authorization, and `amountCapturable` reads 0. What is never captured is left to expire:
+  `cancelPayment` voids only an authorization with no capture yet, so it releases nothing
+  here. The fake's order reads carry no attribution unless a test opts in, which makes the
+  time rule the default path, and its reauthorizations are stamped by its own clock, moved
+  on four days first; it refuses to reauthorize an original that is voided
+  (`AUTHORIZATION_VOIDED`, "A voided authorization cannot be captured or reauthorized") or
+  fully captured (the Extend guide lists "authorization already captured or voided" among
+  the failures). The `up` link is parsed as the order link is: one path segment, no
+  decoding.
+- **Repeatability (AMBIGUOUS).** The sources conflict. Once: `reauthorize_request` ("You can
+  reauthorize a payment only once from days four to 29", "You can reauthorize an authorized
+  payment once"), `REAUTHORIZATION_NOT_SUPPORTED` ("cannot be attempted on an authorization_id
+  that is the result of a prior reauthorization"), `REAUTHORIZATION_TOO_SOON` ("only allowed
+  once from Day 4 to Day 29") and the Extend guide ("Each authorization can be reauthorized a
+  single time"). Several: the reauthorize operation ("you can issue multiple
+  re-authorizations after the honor period expires"), the Authorize and capture page, and the
+  honor period page, whose table shows a "Reauthorization 2" on day 8. The adapter reads any
+  number of authorizations and reauthorizes none.
+- **The original's status after a reauthorization (AMBIGUOUS).** No page says it. The tests
+  cover it staying `CREATED` and turning `VOIDED`; capturing and reporting behave the same
+  either way.
+- **Webhooks (AMBIGUOUS).** `PAYMENT.AUTHORIZATION.VOIDED` still maps to `payment.canceled`.
+  The event names page gives its causes as the authorization "reaching its 30 day validity
+  period" or being "manually voided using the Void Authorized Payment API", and neither it nor
+  the Payments v2 callbacks name a reauthorization event. A `VOIDED` event for a superseded
+  original would contradict `retrievePayment`, which follows the newest authorization; the
+  guide tells hosts to re-read the payment before acting on the event.
+- **Sandbox check outstanding.** Reauthorization is refused within the honor period, so every
+  order needs an authorization at least four days old. On a first AUTHORIZE order, capture
+  part, reauthorize with an empty body, and record in an order GET the new authorization's
+  amount, both authorizations' statuses, and whether the captures carry `create_time`,
+  `related_ids.authorization_id` or an `up` link to their authorization. GET the
+  reauthorization itself (`GET /v2/payments/authorizations/{id}`) and record whether its
+  Payments v2 `supplementary_data.related_ids.authorization_id` names the parent; then
+  reauthorize a second time, from the original and from the reauthorization. On a second
+  order, capture part, reauthorize for less than what is left, and capture more than that
+  reauthorization's own amount but less than the order has left, to learn which cap applies.
+  On a third order with no capture, reauthorize, void the reauthorization (expected
+  `CANNOT_BE_VOIDED`), void the original, and record both statuses. On the first order,
+  also capture from the original after the reauthorization and record whether PayPal
+  accepts it. Record every webhook PayPal sends for all three orders.
 
 ## Worldline: completions after a decline (2026-09-25)
 

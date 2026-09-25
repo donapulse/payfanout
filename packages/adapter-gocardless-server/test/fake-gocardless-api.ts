@@ -45,9 +45,10 @@ const BASE_TIME = Date.parse("2026-07-07T10:00:00.000Z");
  * until enabled), total_amount_confirmation checking, at most 5 refunds per
  * payment (number_of_refunds_exceeded), the metadata limits on refunds (3
  * keys, 50-character names, 500-character values), the ?payment= filter on
- * GET /refunds, and cursor pagination over lists ordered newest first. Actions ignore the Idempotency-Key — GoCardless
- * documents keys for creates only — so a repeated cancel answers
- * cancellation_failed. Where the docs leave a refund rule open, a flag
+ * GET /refunds, and cursor pagination over lists ordered newest first.
+ * Actions ignore the Idempotency-Key — GoCardless documents keys for creates
+ * only — so a repeated cancel answers cancellation_failed. Where the docs
+ * leave a refund rule open, a flag
  * selects the reading (refundCapEnforced, totalAmountConfirmationChecked,
  * keyCheckedBeforeBody).
  */
@@ -104,6 +105,11 @@ export class FakeGoCardlessApi {
   /** Rejects the next `times` requests at the transport layer (fetch throws) — the psp_unavailable path. */
   failNextWithNetworkError(times = 1): void {
     this.networkFailure = times;
+  }
+
+  /** GoCardless honours keys for at least 30 days: past that, a used key reads as new. */
+  forgetIdempotencyKeys(): void {
+    this.idempotencyKeys.clear();
   }
 
   readonly fetch: typeof fetch = async (input, init) => {
@@ -370,20 +376,11 @@ export class FakeGoCardlessApi {
       this.totalAmountConfirmationChecked &&
       request.total_amount_confirmation !== alreadyRefunded + request.amount
     ) {
-      return json(422, {
-        error: {
-          message: "Validation failed",
-          type: "validation_failed",
-          code: 422,
-          errors: [
-            {
-              reason: "total_amount_confirmation_invalid",
-              field: "total_amount_confirmation",
-              message: "does not match the total amount refunded",
-            },
-          ],
-        },
-      });
+      // An invalid_state reason on the Responses and Errors page, not a field validation.
+      return invalidState(
+        "Total amount refunded does not match the confirmation value",
+        "total_amount_confirmation_invalid",
+      );
     }
     if (replay) return replay;
     const refund: GoCardlessRefundLike = {

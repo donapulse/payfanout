@@ -79,6 +79,32 @@ describe("PayFanoutError", () => {
       pspName: "stripe",
     });
   });
+
+  it("records outcomeUnknown only when true, serializes it, and lets wrap() carry it", () => {
+    const doubtful = new PayFanoutError({
+      code: "processing_error",
+      message: "The answer was lost.",
+      outcomeUnknown: true,
+      pspName: "paysafe",
+    });
+    expect(doubtful.outcomeUnknown).toBe(true);
+    expect(doubtful.toJSON()).toEqual({
+      name: "PayFanoutError",
+      code: "processing_error",
+      message: "The answer was lost.",
+      retryable: false,
+      pspName: "paysafe",
+      outcomeUnknown: true,
+    });
+
+    const plain = new PayFanoutError({ code: "card_declined", message: "no", outcomeUnknown: false });
+    expect(plain.outcomeUnknown).toBeUndefined();
+    expect("outcomeUnknown" in plain.toJSON()).toBe(false);
+
+    const wrapped = PayFanoutError.wrap(new Error("socket hang up"), { code: "psp_unavailable", outcomeUnknown: true });
+    expect(wrapped.outcomeUnknown).toBe(true);
+    expect(PayFanoutError.wrap(new Error("x")).outcomeUnknown).toBeUndefined();
+  });
 });
 
 describe("isPayFanoutError", () => {

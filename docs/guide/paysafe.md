@@ -440,6 +440,11 @@ retries, for every write it makes:
   held or completed there is live: a new key while it is out of the lookup's sight would
   debit twice. Retire the replaced key for good: sent again once the 90 days lapse, it
   would start a new debit.
+- Each of these errors that cannot say whether money moved, the refusals of a key holding
+  several or 50 or more records included, carries `outcomeUnknown: true`. Nothing
+  automatic then moves it to a new key: the subscription manager replays such a renewal
+  under its key, and only someone who has checked the Paysafe portal starts again under a
+  new one.
 - Two card completions with different cards under one key can both be charged when the
   second is sent before the first shows in Paysafe's lookup, because nothing at Paysafe
   spans them. Two bank-debit attempts are held apart by `dupCheck` instead, while no

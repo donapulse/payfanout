@@ -56,6 +56,8 @@ const ISSUE_MAP: Record<string, UnifiedErrorCode> = {
   AUTHORIZATION_VOIDED: "invalid_request",
   AUTHORIZATION_EXPIRED: "invalid_request",
   PREVIOUSLY_CAPTURED: "invalid_request",
+  PREVIOUSLY_VOIDED: "invalid_request",
+  CANNOT_BE_VOIDED: "invalid_request",
   MAX_CAPTURE_COUNT_EXCEEDED: "invalid_request",
   MAX_CAPTURE_AMOUNT_EXCEEDED: "invalid_request",
   AUTH_CAPTURE_CURRENCY_MISMATCH: "invalid_request",

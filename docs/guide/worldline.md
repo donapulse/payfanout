@@ -303,6 +303,39 @@ host id round-trips via `order.references.merchantReference` (`PaymentInfo.id`).
 hand-write the route? Call `completePayment` directly, both forms are in
 [Server usage](/guide/server#server-completion-tokenize-first).
 
+### Declines
+
+`completePayment` rejects with a `PayFanoutError` when Worldline refuses the payment, whether
+Worldline answers with HTTP 402 or with a 2xx whose payment is `REJECTED`. The first error's
+`errorCode` decides the `code`, read from `error.raw.errors` for a 402 and from
+`error.raw.payment.statusOutput.errors` for a `REJECTED` payment (the deprecated `code` field
+stands in when there is no `errorCode`), following Worldline's
+[API troubleshooting guide](https://docs.direct.worldline-solutions.com/en/integration/api-developer-guide/api-troubleshooting):
+
+| Worldline `errorCode` | `code` |
+| --- | --- |
+| `30431001` (stolen card), `30411001` (lost card), `30071001` (fraud account), `30591001` (used for fraud) | `fraud_suspected` |
+| `30001100`, `30001101`, `30001102`, `30001104`, `30001105`, `30001106`, `30001120`, `30001130`, `30001140`, `30001141`, `30001142`, `30001143`, `30001158`, `30001180` (rejected by your Fraud Prevention module) | `fraud_suspected` |
+| `30141001` (invalid card number), `30151001` (no such issuer) | `invalid_card_data` |
+| `30331001`, `30541001` (expired) | `expired_card` |
+| `30511001` | `insufficient_funds` |
+| `40001134` (failed 3-D Secure check), `40001139` (the issuer insists on 3-D Secure) | `authentication_required` |
+| `40001135`, `50001081`, `40001137`, `40001138`, `40001146` (3-D Secure failed outside the customer's control), `30031001` (the acquirer refused your merchant id) | `processing_error` |
+| `50001087` (3-D Secure failed on a technical issue with the request) | `invalid_request` |
+| Any other code, or none | `card_declined` |
+
+On a `REJECTED` payment, an error with no code from this table whose `httpStatusCode` is a
+4xx other than 402 means Worldline refused the request rather than the card, and comes back
+as `invalid_request`.
+
+None of them is `retryable`: Worldline answers a request sent again under the same
+idempotency key with the original outcome, even with a different payload, for at least
+24 hours, so retrying under the same key only returns the same decline. The `message` is
+PayFanout's text for the `code`, never Worldline's own, which Worldline marks as not meant
+for customers; Worldline's whole answer stays on `error.raw`. A 429 or a 5xx is never read
+as a decline: it stays `rate_limited` or `psp_unavailable`, retryable, whatever code it
+carries.
+
 ## 8. Register the webhook endpoint
 
 In the Merchant Portal, under **Developer → Webhooks**, add

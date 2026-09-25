@@ -214,6 +214,12 @@ A repeated completion succeeds under any key, so `onCompleted` can run more than
 one payment; hosts should make it idempotent on `info.pspPaymentId` and check `info.id` and
 `info.amount` against their own record.
 
+A `409` from PayPal (the Payments API documents `RESOURCE_CONFLICT` with
+`PREVIOUS_REQUEST_IN_PROGRESS` on captures, voids and refunds) rejects with a retryable
+`processing_error` marked `outcomeUnknown: true`: the request still in progress can be your
+call's own first one under the same `PayPal-Request-Id`, which PayPal processes while it
+"might fail the second request". Retry under the same idempotency key, never a new one.
+
 ### Declines: `INSTRUMENT_DECLINED` recovery
 
 When the buyer's funding source fails, capture rejects with `card_declined`

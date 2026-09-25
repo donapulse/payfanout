@@ -1092,8 +1092,9 @@ const WORLDLINE_CODE_MAP: Record<string, UnifiedErrorCode> = {
  * deprecated `code`) decides; failing that, a 402 is `card_declined`, a 409 a
  * retryable `processing_error`, and any other status `invalid_request`. A 409
  * is usually the original request under this idempotence key still in
- * flight, but on a cancel it can also mean the payment is closed, which
- * cancelPayment tells apart by reading the payment. The message is the
+ * flight, which may yet go through, so it carries `outcomeUnknown`; on a
+ * cancel it can also mean the payment is closed, which cancelPayment tells
+ * apart by reading the payment. The message is the
  * catalog's, never Worldline's own, which is "not meant to be relayed to
  * customer"; the body stays untouched on `raw`.
  */
@@ -1101,6 +1102,7 @@ export function mapWorldlineError(httpStatus: number, body: unknown): PayFanoutE
   const mapped = unifiedCodeFor(firstErrorCode((body as { errors?: unknown } | null | undefined)?.errors));
   let code: UnifiedErrorCode;
   let retryable = false;
+  let outcomeUnknown = false;
   if (httpStatus === 429 || httpStatus >= 500) {
     // Transient by status alone: no code may turn it into a final answer.
     ({ code, retryable } = classifyHttpFallback(httpStatus));
@@ -1113,6 +1115,7 @@ export function mapWorldlineError(httpStatus: number, body: unknown): PayFanoutE
     // whose outcome exists moments later, so a raced replay is retryable.
     code = "processing_error";
     retryable = true;
+    outcomeUnknown = true;
   } else {
     ({ code, retryable } = classifyHttpFallback(httpStatus));
   }
@@ -1122,6 +1125,7 @@ export function mapWorldlineError(httpStatus: number, body: unknown): PayFanoutE
     retryable,
     raw: body,
     pspName: WORLDLINE_PSP_NAME,
+    outcomeUnknown,
   });
 }
 

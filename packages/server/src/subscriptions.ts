@@ -340,11 +340,12 @@ export interface SubscriptionManagerOptions {
   catchUpLimit?: number;
   /**
    * Observability: fired on every lifecycle transition. Errors are swallowed.
-   * Delivery is at-least-once: concurrent chargeDueSubscriptions runs converge
-   * on charges at the PSP (deterministic idempotency keys) but may each emit
-   * the same transition — dedupe on (subscription.id, type, currentPeriodEnd),
-   * never on occurredAt (it differs per delivery), if exactly-once matters to
-   * the host.
+   * Delivery is at-least-once: overlapping chargeDueSubscriptions runs that
+   * send the same renewal converge on one PSP charge (deterministic
+   * idempotency keys; see chargeDueSubscriptions for runs that send another
+   * request under the same key) but may each emit the same transition —
+   * dedupe on (subscription.id, type, currentPeriodEnd), never on occurredAt
+   * (it differs per delivery), if exactly-once matters to the host.
    */
   onEvent?: (event: SubscriptionEvent) => void | Promise<void>;
   /** Injected clock (ms since epoch) for tests. */
@@ -740,9 +741,14 @@ export class SubscriptionManager {
    * back to per-status list() scans (active, trialing, past_due); either way
    * every candidate's due-ness is re-checked here before any charge.
    *
-   * Concurrent runs are safe for MONEY (charges converge at the PSP) but not
-   * for events (at-least-once, see onEvent) — hosts wanting single-run
-   * semantics should hold a lock around this call.
+   * Overlapping runs that send the same renewal converge on one PSP charge.
+   * When one sends another request under the same key (a card or plan set
+   * between their reads), the charge is pinned rather than moved to a new key
+   * wherever the PSP's refusal leaves the outcome open, as the Stripe and
+   * Paysafe adapters' refusals do while the key's charge may have gone
+   * through; two such requests reaching Paysafe before either is filed can
+   * both be charged. Events are at-least-once (see onEvent). Hosts wanting
+   * single-run semantics should hold a lock around this call.
    */
   async chargeDueSubscriptions(at?: string | Date): Promise<ChargeDueResult> {
     const nowMs = at === undefined ? this.now() : toEpochMs(at, "at");
@@ -835,11 +841,15 @@ export class SubscriptionManager {
    *   failure webhook without that key cannot settle a pin: the payment it
    *   names may be an earlier attempt's.
    *
-   * Replay-safe: re-resolving an already-applied outcome is a no-op. A settled
-   * failure counts as a failed attempt for dunning. Resolving never
-   * reactivates: a record paused (or canceled) in the meantime keeps its
-   * status — a success still advances the paid-through window (the money
-   * moved), a failure is recorded without entering dunning.
+   * Replay-safe for re-delivered webhooks: a success whose payment is still
+   * lastPaymentId is a no-op, and so is a failure whose idempotencyKey names
+   * an attempt of the current period that already failed. Anything else that
+   * settles nothing, a failure re-delivered without its key included, is
+   * refused with invalid_request. A settled failure counts as a failed
+   * attempt for dunning. Resolving never reactivates: a record paused (or
+   * canceled) in the meantime keeps its status — a success still advances the
+   * paid-through window (the money moved), a failure is recorded without
+   * entering dunning.
    */
   async resolvePendingRenewal(
     id: string,
@@ -1204,10 +1214,11 @@ export class SubscriptionManager {
    * failure moves the period on to its next attempt number and into dunning.
    * An uncertain one pins the request for replay (see RenewalReplay), or
    * freezes it once no replay can safely follow; it never counts for dunning,
-   * except on a store that drops the pin. `settled` marks an outcome the host
-   * applied, which is authoritative for its attempt; any other answer that an
-   * overlapping run or a settlement has overtaken is dropped, and so is an
-   * answer to another request sent under the pinned key.
+   * except on a store that drops the pin. A failure of a card replaced since
+   * never counts. `settled` marks an outcome the host applied, which is
+   * authoritative for its attempt; any other answer that an overlapping run
+   * or a settlement has overtaken is dropped, and so is an answer to another
+   * request sent under the pinned key.
    */
   private async recordRenewalFailure(
     record: SubscriptionRecord,
@@ -1278,8 +1289,15 @@ export class SubscriptionManager {
       if (kept && droppedPin(kept, updated)) {
         // The store does not persist renewalAttempt, so no pin can bound the
         // replays: the attempt counts for dunning under a new key, as it did
-        // before pins existed.
-        return this.enterDunning(record, kept, nowMs, error, result, { periodEnd: tried.periodEnd, attempt: nextAttempt });
+        // before pins existed, unless its card has been replaced since.
+        const moved: RenewalAttempt = { periodEnd: tried.periodEnd, attempt: nextAttempt };
+        if (chargedReplacedCard(tried, kept)) {
+          // The store kept the pin's write without the pin; the status it set is undone.
+          const base: SubscriptionRecord = { ...kept, status: fresh.status };
+          delete base.nextRetryAt;
+          return this.recordReplacedCardFailure(base, nowMs, error, result, moved);
+        }
+        return this.enterDunning(record, kept, nowMs, error, result, moved);
       }
       await this.emit({ type: "subscription.charge_failed", subscription: updated, error });
       if (fresh.status !== "past_due") await this.emit({ type: "subscription.past_due", subscription: updated, error });
@@ -1293,22 +1311,36 @@ export class SubscriptionManager {
     }
 
     const renewalAttempt: RenewalAttempt = { periodEnd: tried.periodEnd, attempt: nextAttempt };
-    if (tried.token !== undefined && tried.token !== fresh.savedPaymentMethodToken) {
-      // The charge used a card the host has since replaced: its failure costs
-      // the new card nothing, which is charged on the next run.
-      const updated: SubscriptionRecord = {
-        ...fresh,
-        lastError,
-        renewalAttempt,
-        ...(fresh.status === "past_due" ? { nextRetryAt: new Date(nowMs).toISOString() } : {}),
-      };
-      delete updated.pendingRenewal;
-      await this.store.save(updated);
-      await this.emit({ type: "subscription.charge_failed", subscription: updated, error });
-      result.failed.push(updated);
-      return updated;
+    if (chargedReplacedCard(tried, fresh)) {
+      return this.recordReplacedCardFailure(fresh, nowMs, error, result, renewalAttempt);
     }
     return this.enterDunning(record, fresh, nowMs, error, result, renewalAttempt);
+  }
+
+  /**
+   * The charge used a card the host has since replaced: its failure costs the
+   * new card nothing, which goes out on the next run. On a store that drops
+   * renewalAttempt it goes out under the attempt number failedAttempts gives,
+   * which the period may already have used.
+   */
+  private async recordReplacedCardFailure(
+    base: SubscriptionRecord,
+    nowMs: number,
+    error: PayFanoutError,
+    result: ChargeDueResult,
+    renewalAttempt: RenewalAttempt,
+  ): Promise<SubscriptionRecord> {
+    const updated: SubscriptionRecord = {
+      ...base,
+      lastError: { code: error.code, message: error.message },
+      renewalAttempt,
+      ...(base.status === "past_due" ? { nextRetryAt: new Date(nowMs).toISOString() } : {}),
+    };
+    delete updated.pendingRenewal;
+    await this.store.save(updated);
+    await this.emit({ type: "subscription.charge_failed", subscription: updated, error });
+    result.failed.push(updated);
+    return updated;
   }
 
   /**
@@ -1467,8 +1499,8 @@ function pinFor(
  * Whether a record read back right after `saved` was written with its pin is
  * that write without the pin, as a store that does not persist
  * renewalAttempt returns it. Only fields older than renewalAttempt are
- * compared. Any other write landing in between proves nothing, and keeps the
- * pin's key.
+ * compared, and a store may drop lastError too. Any other write landing in
+ * between proves nothing, and keeps the pin's key.
  */
 function droppedPin(kept: SubscriptionRecord, saved: SubscriptionRecord): boolean {
   return (
@@ -1477,8 +1509,13 @@ function droppedPin(kept: SubscriptionRecord, saved: SubscriptionRecord): boolea
     kept.status === saved.status &&
     kept.currentPeriodEnd === saved.currentPeriodEnd &&
     kept.failedAttempts === saved.failedAttempts &&
-    kept.lastError?.code === saved.lastError?.code
+    (kept.lastError === undefined || kept.lastError.code === saved.lastError?.code)
   );
+}
+
+/** A failed charge of a card the record no longer holds. */
+function chargedReplacedCard(tried: RenewalTry, record: SubscriptionRecord): boolean {
+  return tried.token !== undefined && tried.token !== record.savedPaymentMethodToken;
 }
 
 /** Whether two renewal requests are the same charge, however a store orders their fields. */
@@ -1492,12 +1529,17 @@ function sameRequest(a: RenewalRequest, b: RenewalRequest): boolean {
   );
 }
 
+/** An absent value compares like {}: a store may drop an empty object or write one. */
 function sameValue(a: unknown, b: unknown): boolean {
-  if (a === b || ((a === null || a === undefined) && (b === null || b === undefined))) return true;
-  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
-  const left = a as Record<string, unknown>;
-  const right = b as Record<string, unknown>;
-  return [...new Set([...Object.keys(left), ...Object.keys(right)])].every((key) => sameValue(left[key], right[key]));
+  if (a === b) return true;
+  const left = a ?? {};
+  const right = b ?? {};
+  if (typeof left !== "object" || typeof right !== "object") return false;
+  const leftFields = left as Record<string, unknown>;
+  const rightFields = right as Record<string, unknown>;
+  return [...new Set([...Object.keys(leftFields), ...Object.keys(rightFields)])].every((key) =>
+    sameValue(leftFields[key], rightFields[key]),
+  );
 }
 
 /** A key of this period's attempts that already ended, so a failure naming it is old news. */

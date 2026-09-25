@@ -73,8 +73,8 @@ persists.
 ### Pause & resume
 
 `pauseSubscription(id)` (from active, trialing, or past_due) halts everything: the cron
-skips paused records and dunning stops (`nextRetryAt` is cleared; `failedAttempts` and any
-`pendingRenewal` survive — an unresolved renewal still resolves via
+skips paused records and dunning stops (`nextRetryAt` is cleared; `failedAttempts`, any
+`pendingRenewal` and any `renewalAttempt` survive — an unresolved renewal still resolves via
 `resolvePendingRenewal`, but a paused record is never re-charged).
 `resumeSubscription(id, { idempotencyKey })` reactivates: still paid through → just
 `"active"` again, no charge; lapsed → one immediate charge re-anchors the billing cycle at
@@ -97,11 +97,15 @@ until you apply the real outcome from your payment-webhook ingress:
 await subs.resolvePendingRenewal(subscriptionId, {
   status: "succeeded",              // or "failed" -> enters the normal dunning schedule
   pspPaymentId: event.pspPaymentId, // guards against resolving the wrong payment
+  ...(renewalKey ? { idempotencyKey: renewalKey } : {}), // the charge's key, read as shown below
 });
 ```
 
-Resolving is replay-safe (a re-delivered webhook is a no-op) and a pending renewal that you
-never resolve stays frozen — the safe default is to not charge twice, never to assume.
+Resolving is replay-safe for re-delivered webhooks: a re-delivered success is a no-op, and so
+is a re-delivered failure that names the charge's key. An event that settles nothing, such as
+a failure without its key or an event that arrives once a later charge has collected, is
+refused with `invalid_request`: log it, as the handler below does. A pending renewal that
+you never resolve stays frozen — the safe default is to not charge twice, never to assume.
 
 ### Renewals without a definitive answer
 
@@ -171,12 +175,23 @@ failure counts for dunning like any declined attempt. A canceled subscription ke
 pin, and a paused one cannot resume until the pin is settled, so a charge that may have
 gone through never drops out of sight.
 
+On Stripe, a renewal that a release before pins charged but never recorded is sent again
+after the upgrade under its key, now with `payfanout_renewal_key` in its metadata. Within
+the 24 hours Stripe keeps the key, it refuses the changed parameters with
+`idempotency_error`, marked `outcomeUnknown`, so no money moves twice and the pin ends
+frozen. The original payment carries no `payfanout_renewal_key` for a webhook to settle the
+pin with: find it in Stripe by its `payfanout_subscription_id` and call
+`resolvePendingRenewal` with its payment id and the pinned key.
+
 ::: warning Persist `renewalAttempt` before upgrading
 `renewalAttempt` is money-safety state, like `pendingRenewal`: stores must persist it
 verbatim. After saving a pin the manager reads the record back, and when the pin did not
 survive, it counts that failure for dunning at once: nothing is replayed under the same key,
 and the retry follows `retryDelaysHours` under the next attempt number, a new key, as in
-releases before pins. A charge whose answer was lost can then be charged twice.
+releases before pins. A charge whose answer was lost can then be charged twice. Such a store
+also loses the period's attempt numbers when the card changes, since the change resets
+`failedAttempts`: the new card goes out under the number that gives, which the period may
+already have used, and a PSP still holding that key refuses it.
 :::
 
 ### Scaling the cron: `listDue`
@@ -194,9 +209,9 @@ optimization, not a trust boundary.
 
 ### Concurrency & delivery semantics
 
-Concurrent `chargeDueSubscriptions` runs are safe for **money** — renewal idempotency keys
-are deterministic per (subscription, period, attempt), so overlapping runs converge on one
-PSP charge. They are at-least-once for **events**: dedupe `onEvent` deliveries on
+Overlapping `chargeDueSubscriptions` runs that send the same renewal converge on one PSP
+charge: renewal idempotency keys are deterministic per (subscription, period, attempt).
+They are at-least-once for **events**: dedupe `onEvent` deliveries on
 `(subscription.id, type, currentPeriodEnd)` — never on `occurredAt`, which is stamped from
 the manager clock per delivery — if exactly-once matters, or hold a lock around the cron
 call. `updateSubscription` and the `cancelSubscription({ atPeriodEnd: true })` flag-set
@@ -209,7 +224,16 @@ renewal charge is in flight can make an overlapping run send another request und
 same key. The PSP holds whichever request reached it first, so the answer to a request
 other than the pinned one is dropped too, and the pin is marked `contested`: from then on
 a failure may be the PSP refusing the other request, so it freezes the pin, which waits for
-`resolvePendingRenewal`, while a success still settles it.
+`resolvePendingRenewal`, while a success still settles it. A refusal that comes back before
+any pin exists pins the charge instead of moving it to a new key, because the adapter
+leaves its outcome open: Stripe answers a request that conflicts with one still executing
+with a `409`, reported as `psp_unavailable`, and a key reused with other parameters with
+`idempotency_error`, marked `outcomeUnknown`; the Paysafe adapter marks its refusal of a
+key whose payment may have moved money `outcomeUnknown` as well. Two cases remain outside this: a
+store that drops `renewalAttempt` (see the warning above), and two requests under one key
+that both reach Paysafe before either is filed, since Paysafe does not document whether its
+duplicate check covers a payment still in flight. A lock around the cron call rules out the
+second.
 
 ::: info Where PSP-native billing fits
 This engine bills from **your** cron with identical behavior on every vaulting-capable

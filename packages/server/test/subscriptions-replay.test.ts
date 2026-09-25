@@ -1103,14 +1103,98 @@ describe("records written by the previous release", () => {
 });
 
 describe("stores that drop renewalAttempt", () => {
-  /** Persists everything but renewalAttempt, as a schema from before the field would. */
-  function dropRenewalAttempt(h: Harness): void {
+  /** Persists everything but renewalAttempt, as a schema from before the field would, and lastError too when asked. */
+  function dropRenewalAttempt(h: Harness, options: { lastError?: boolean } = {}): void {
     const save = h.store.save.bind(h.store);
     h.store.save = async (record) => {
       const { renewalAttempt: _dropped, ...rest } = record;
+      if (options.lastError) delete rest.lastError;
       return save(rest as SubscriptionRecord);
     };
   }
+
+  it("bound the replays when lastError is dropped too", async () => {
+    const h = pspHarness({ retryDelaysHours: [24] });
+    dropRenewalAttempt(h, { lastError: true });
+    await create(h);
+    h.script.push("down", "down");
+    await runAt(h, DUE);
+    expect(await record(h)).toMatchObject({
+      status: "past_due",
+      failedAttempts: 1,
+      nextRetryAt: new Date(DUE + 24 * HOUR).toISOString(),
+    });
+    await runAt(h, DUE + 5 * MINUTE); // nothing is re-sent under the same key
+    expect(h.renewalKeys()).toEqual([renewalKey(0)]);
+    await runAt(h, DUE + 24 * HOUR);
+    expect((await record(h)).status).toBe("canceled");
+    expect(h.renewalKeys()).toEqual([renewalKey(0), renewalKey(1)]);
+  });
+
+  it("never count the failure of a card replaced mid-charge, though the new card may meet a key the period used", async () => {
+    const h = pspHarness({ retryDelaysHours: [24] });
+    dropRenewalAttempt(h);
+    await create(h);
+    h.script.push("lost");
+    await runAt(h, DUE); // counted at once: one more counted failure ends the subscription
+    expect(await record(h)).toMatchObject({ status: "past_due", failedAttempts: 1 });
+    h.adapter.chargeSavedPaymentMethod = async (input) => {
+      h.charges.push(input);
+      await h.manager.updateSubscription("sub_1", { savedPaymentMethodToken: "tok_new" });
+      throw new PayFanoutError({ code: "psp_unavailable", message: "Timed out.", retryable: true });
+    };
+    const retriedAt = DUE + 24 * HOUR;
+    const run = await runAt(h, retriedAt);
+    expect(run.canceled).toHaveLength(0);
+    expect(await record(h)).toMatchObject({
+      status: "past_due",
+      failedAttempts: 0,
+      savedPaymentMethodToken: "tok_new",
+      nextRetryAt: new Date(retriedAt).toISOString(), // the new card is due at once
+      lastError: { code: "psp_unavailable" },
+    });
+    h.adapter.chargeSavedPaymentMethod = h.psp;
+    // The card change reset failedAttempts, the only attempt count such a store keeps, so the new
+    // card goes out under -a0, which the old card's lost charge used: the PSP refuses it, and that counts.
+    expect((await h.manager.chargeDueSubscriptions()).charged).toHaveLength(0);
+    expect(h.renewalKeys()).toEqual([renewalKey(0), renewalKey(1), renewalKey(0)]);
+    expect(h.charges.at(-1)).toMatchObject({ savedPaymentMethodToken: "tok_new" });
+    expect(await record(h)).toMatchObject({ status: "past_due", failedAttempts: 1, lastError: { code: "invalid_request" } });
+    // The next dunning retry charges it under -a1. The lost -a0 was counted at once, as it must be
+    // without the pin, so this period is charged twice: the warning in the recurring guide.
+    expect((await runAt(h, retriedAt + 24 * HOUR)).charged).toHaveLength(1);
+    expect(h.renewalKeys()).toEqual([renewalKey(0), renewalKey(1), renewalKey(0), renewalKey(1)]);
+    expect(h.charges.at(-1)).toMatchObject({ savedPaymentMethodToken: "tok_new" });
+    expect(h.collected()).toBe(3);
+  });
+
+  it("restore the status the pin set aside when a card replaced mid-charge on an active record fails", async () => {
+    const h = pspHarness();
+    dropRenewalAttempt(h);
+    await create(h);
+    h.adapter.chargeSavedPaymentMethod = async (input) => {
+      h.charges.push(input);
+      await h.manager.updateSubscription("sub_1", { savedPaymentMethodToken: "tok_new" });
+      throw new PayFanoutError({ code: "psp_unavailable", message: "Timed out.", retryable: true });
+    };
+    h.events.length = 0;
+    expect((await runAt(h, DUE)).failed).toHaveLength(1);
+    // The pin's write set past_due, and the store kept that write without the pin.
+    const kept = await record(h);
+    expect(kept).toMatchObject({
+      status: "active",
+      failedAttempts: 0,
+      savedPaymentMethodToken: "tok_new",
+      lastError: { code: "psp_unavailable" },
+    });
+    expect(kept.nextRetryAt).toBeUndefined();
+    expect(h.events.map((e) => e.type)).toEqual(["subscription.updated", "subscription.charge_failed"]);
+    h.adapter.chargeSavedPaymentMethod = h.psp;
+    // Due at its period end still, the new card goes out under -a0 again: failedAttempts gives no other number.
+    expect((await h.manager.chargeDueSubscriptions()).charged).toHaveLength(1);
+    expect(h.renewalKeys()).toEqual([renewalKey(0), renewalKey(0)]);
+    expect(h.charges.at(-1)).toMatchObject({ savedPaymentMethodToken: "tok_new" });
+  });
 
   it("count each uncertain failure for dunning at once, under the next attempt number", async () => {
     const h = pspHarness({ retryDelaysHours: [24] });
@@ -1172,6 +1256,36 @@ describe("stores that drop renewalAttempt", () => {
     expect((await record(h)).failedAttempts).toBe(0); // not counted for dunning
     await runAt(h, DUE + 5 * MINUTE);
     expect(h.renewalKeys()).toEqual([renewalKey(0), renewalKey(0)]); // the next charge reuses the key
+    expect(h.collected()).toBe(2);
+  });
+
+  const hostChanges: Array<[string, (read: SubscriptionRecord) => Partial<SubscriptionRecord>]> = [
+    ["failedAttempts", (read) => ({ failedAttempts: read.failedAttempts + 1 })],
+    ["lastError", () => ({ lastError: { code: "card_declined", message: "Declined." } })],
+  ];
+  it.each(hostChanges)("a pin a store keeps is never taken for a dropped one when a host write changes only %s", async (_field, change) => {
+    const h = pspHarness();
+    await create(h);
+    const get = h.store.get.bind(h.store);
+    let raced = false;
+    h.store.get = async (id) => {
+      const read = await get(id);
+      const tracked = read?.renewalAttempt;
+      if (!raced && read && tracked?.replay) {
+        // A host write landing after the pin, which it lacks, and otherwise differing in this field alone.
+        raced = true;
+        const { replay: _pin, ...attempt } = tracked;
+        await h.store.save({ ...read, renewalAttempt: attempt, ...change(read) });
+        return get(id);
+      }
+      return read;
+    };
+    h.script.push("lost");
+    await runAt(h, DUE);
+    // Not counted for dunning: the attempt number stays the pin's.
+    expect((await record(h)).renewalAttempt).toEqual({ periodEnd: PERIOD_END, attempt: 0 });
+    await runAt(h, DUE + 5 * MINUTE);
+    expect(h.renewalKeys()).toEqual([renewalKey(0), renewalKey(0)]);
     expect(h.collected()).toBe(2);
   });
 });
@@ -1360,6 +1474,39 @@ describe("another request under the pinned key", () => {
       id: "sub_1",
       billingDetails: { name: "Ada", address: { postalCode: "75001", country: "FR" } },
       metadata: { tier: "pro", region: "eu" },
+      idempotencyKey: "first-charge-key",
+    });
+    h.adapter.chargeSavedPaymentMethod = async (input) => {
+      h.charges.push(input);
+      throw new PayFanoutError({ code: "psp_unavailable", message: "Down.", retryable: true });
+    };
+    await runAt(h, DUE);
+    await runAt(h, DUE + 5 * MINUTE);
+    const pinned = await record(h);
+    expect(pinned.renewalAttempt?.replay).toMatchObject({ uncertainAnswers: 2 });
+    expect(pinned.renewalAttempt?.replay?.contested).toBeUndefined();
+  });
+
+  it("a replay is the pinned request when the store leaves out its empty objects", async () => {
+    const h = pspHarness();
+    const get = h.store.get.bind(h.store);
+    const withoutEmptyObjects = (value: unknown): unknown => {
+      if (typeof value !== "object" || value === null) return value;
+      const fields = Object.entries(value)
+        .map(([key, field]) => [key, withoutEmptyObjects(field)] as const)
+        .filter(([, field]) => !(typeof field === "object" && field !== null && Object.keys(field).length === 0));
+      return Object.fromEntries(fields);
+    };
+    // A store whose reads leave out empty objects, while its due-list query returns them.
+    h.store.get = async (id) => withoutEmptyObjects(await get(id)) as SubscriptionRecord | undefined;
+    await h.manager.createSubscription({
+      pspName: "fake",
+      pspCustomerId: "cust_1",
+      savedPaymentMethodToken: "tok_saved",
+      plan: { amount: 2500, currency: "usd", interval: "month" },
+      id: "sub_1",
+      billingDetails: { name: "Ada", address: {} },
+      metadata: {},
       idempotencyKey: "first-charge-key",
     });
     h.adapter.chargeSavedPaymentMethod = async (input) => {

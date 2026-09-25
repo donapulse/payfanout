@@ -533,6 +533,57 @@ describe("PayPalServerAdapter specifics", () => {
     expect(polled.createdAt).toBeDefined();
   });
 
+  it("ends a refund PayPal refuses while a request on the capture is in progress outcomeUnknown, sent once", async () => {
+    const fake = new FakePayPalApi({ webhookId: WEBHOOK_ID });
+    let conflicts = 1;
+    let refundPosts = 0;
+    const adapter = new PayPalServerAdapter({
+      clientId: fake.clientId,
+      clientSecret: fake.clientSecret,
+      environment: "sandbox",
+      webhookId: WEBHOOK_ID,
+      sleep: async () => {},
+      fetch: async (input, init) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+        if (init?.method === "POST" && /^\/v2\/payments\/captures\/[^/]+\/refund$/.test(new URL(url).pathname)) {
+          refundPosts += 1;
+          if (conflicts > 0) {
+            conflicts -= 1;
+            // The Payments v2 reference's 409 example for this call.
+            return new Response(
+              JSON.stringify({
+                name: "RESOURCE_CONFLICT",
+                debug_id: "b1d1f06c7246c",
+                message: "The server has detected a conflict while processing this request.",
+                details: [
+                  {
+                    issue: "PREVIOUS_REQUEST_IN_PROGRESS",
+                    description:
+                      "A previous request on this resource is currently in progress. Please wait for some time and try again. It is best to space out the initial and the subsequent request(s) to avoid receiving this error.",
+                  },
+                ],
+              }),
+              { status: 409, headers: { "content-type": "application/json" } },
+            );
+          }
+        }
+        return fake.fetch(input, init);
+      },
+    });
+    const session = await adapter.createPaymentSession({ amount: 5000, currency: "USD", idempotencyKey: "k" });
+    fake.approveOrder(session.pspSessionId);
+    await adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken: session.pspSessionId, idempotencyKey: "k-c" });
+    const input = { pspPaymentId: session.pspSessionId, amount: 1500, idempotencyKey: "r1" };
+    // The request in progress may be this refund's own, sent under the same key: only that key may follow.
+    await expect(adapter.refundPayment(input)).rejects.toMatchObject({
+      code: "processing_error",
+      retryable: true,
+      outcomeUnknown: true,
+    });
+    expect(refundPosts).toBe(1);
+    expect((await adapter.refundPayment(input)).amount).toBe(1500);
+  });
+
   it("never sends a refund reason code to the payer as note_to_payer", async () => {
     const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession({ amount: 3000, currency: "USD", idempotencyKey: "k" });

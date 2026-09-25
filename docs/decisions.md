@@ -2273,7 +2273,8 @@ description of what v2 changes is what the migration then had to implement.
 - **Server half only, and only for hosts pinned to 2026-08-26.dahlia or later.**
   `mapStripeError` sees the errors of the adapter's own calls, which carry the host's pinned
   `apiVersion`. The browser adapter follows the account's default API version through
-  Stripe.js and maps none of these codes (nor `incorrect_zip`); aligning it is a follow-up.
+  Stripe.js and maps none of these codes (nor `incorrect_zip`) except `authentication_failure`
+  (decided 2026-09-25, below); aligning the rest is a follow-up (#213).
 - **The checks live in the `StripeCardError` branch only.** Neither page states which error
   `type` the new codes arrive with, so the conservative reading extends the branch that
   already handles `expired_card` and `incorrect_zip`; under any other type they fall through
@@ -2282,10 +2283,12 @@ description of what v2 changes is what the migration then had to implement.
   show which codes those cards return on this version and, where a new code appears, its
   `type` and `decline_code`. The integration suite pins an older version, so this needs a new
   case, not a re-run. Seeing `authentication_failure` needs a failed 3-D Secure challenge
-  instead, a browser step on Stripe's mock authentication page; its mapping stays a sign-off
-  decision either way.
-- **`authentication_failure` is left unmapped (default, unconfirmed).** It falls through to
-  `card_declined`. Its docs.stripe.com/error-codes entry states no remedy; the changelog
+  instead, a browser step on Stripe's mock authentication page; its mapping was decided on
+  2026-09-25 (below) without one.
+- **`authentication_failure` maps to `authentication_required` (decided 2026-09-25; until
+  then it fell through to `card_declined`).** Its docs.stripe.com/error-codes entry reads "The
+  payment was declined because the payment method failed to pass authentication." and states no
+  remedy; the changelog
   presents it as the general form of `payment_intent_authentication_failure` and
   `setup_intent_authentication_failure`, whose documented remedy is a new payment method.
   The Stripe browser adapter maps those two codes to `authentication_required`, as Worldline
@@ -2294,8 +2297,18 @@ description of what v2 changes is what the migration then had to implement.
   code and message the host shows. Stripe's 3-D Secure guide
   (docs.stripe.com/payments/3d-secure/authentication-flow) gives both remedies after a failed
   authentication: try a different payment method, or retry 3-D Secure by reconfirming. Which
-  way the Stripe server half should go is an open decision; a unit test records the current
-  fall-through so that a change is deliberate.
+  way the Stripe server half should go was left open. Decided for consistency: the browser
+  adapter's intent-specific codes and every other adapter's failed 3-D Secure already surface as
+  `authentication_required`, and retrying 3-D Secure is one of the two remedies Stripe's guide
+  gives. Both halves now map `authentication_failure` that way, and the server half also maps
+  the two intent-specific codes, which hosts pinned before dahlia still receive. On the server
+  a fraud decline code on the same error still takes precedence. The browser half maps no
+  fraud decline codes at all (`fraudulent`, `stolen_card`, `lost_card`,
+  `merchant_blacklist`); that gap and the dahlia codes above are tracked in #213. Left
+  unmapped, an account moving to dahlia could see a failed browser 3-D Secure change quietly
+  from `authentication_required` to `card_declined` or `unknown`, if Stripe.js reports the
+  general code there. Would be wrong if Stripe used the code for failures where no new
+  authentication can succeed, where `card_declined`'s "use another card" is the only remedy.
 - **`payment_method_restricted` stays `card_declined`.** Stripe's example is a card reported
   lost or stolen; the existing `restricted_card` decline code ("it's possible it was reported
   lost or stolen") already falls through to `card_declined`, and a `lost_card` or

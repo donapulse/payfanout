@@ -179,6 +179,19 @@ describe("PaymentService error normalization", () => {
     }
   });
 
+  it("keeps outcomeUnknown when it backfills pspName", async () => {
+    const adapter = new FakeAdapter({ pspName: "flaky" });
+    adapter.retrievePayment = async () => {
+      throw new PayFanoutError({ code: "processing_error", message: "Lost.", outcomeUnknown: true });
+    };
+    const service = new PaymentService({ adapters: [adapter] });
+    await expect(service.retrievePayment("flaky", "p1")).rejects.toMatchObject({
+      pspName: "flaky",
+      code: "processing_error",
+      outcomeUnknown: true,
+    });
+  });
+
   it("backfills pspName when an adapter throws a PayFanoutError without one", async () => {
     const adapter = new FakeAdapter({ pspName: "flaky" });
     const anonymous = new PayFanoutError({

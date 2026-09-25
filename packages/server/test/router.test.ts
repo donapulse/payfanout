@@ -172,6 +172,20 @@ describe("PaymentRouter failover cascade", () => {
     }
   });
 
+  it("keeps outcomeUnknown on the error that carries the attempts trail", async () => {
+    const { service, a, b } = twoPspService();
+    failWith(a, new PayFanoutError({ code: "rate_limited", message: "slow down", retryable: true, pspName: "psp-a" }));
+    failWith(
+      b,
+      new PayFanoutError({ code: "psp_unavailable", message: "lost", retryable: true, pspName: "psp-b", outcomeUnknown: true }),
+    );
+    const router = new PaymentRouter({ service });
+    await expect(router.createPaymentSession(input())).rejects.toMatchObject({
+      code: "psp_unavailable",
+      outcomeUnknown: true,
+    });
+  });
+
   it("a failure with no earlier attempts rethrows the adapter error untouched", async () => {
     const { service, a } = twoPspService();
     const declined = new PayFanoutError({

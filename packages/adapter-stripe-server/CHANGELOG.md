@@ -1,5 +1,15 @@
 # @payfanout/adapter-stripe-server
 
+## 2.0.5
+
+### Patch Changes
+
+- 1d66371: Mark Stripe's refusal of a reused idempotency key (`idempotency_error`) `outcomeUnknown`: the key's first request ran and may have succeeded, so only the same key may follow.
+- d8debd2: Reject a `maxNetworkRetries` that is not an integer >= 0 at construction, as the other server adapters do, instead of letting the Stripe SDK silently fall back to its default of 2 retries.
+- 70e9679: Map Stripe's `authentication_failure` (a payment method that failed authentication), and the intent-specific `payment_intent_authentication_failure` and `setup_intent_authentication_failure` that earlier API versions return, to `authentication_required` instead of `card_declined`, as the browser adapter maps them. A fraud decline code on the same error still yields `fraud_suspected`.
+- Updated dependencies [1d66371]
+  - @payfanout/core@4.2.0
+
 ## 2.0.4
 
 ### Patch Changes

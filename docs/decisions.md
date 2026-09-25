@@ -2963,3 +2963,136 @@ description of what v2 changes is what the migration then had to implement.
   `subscription.charge_failed` fires once per uncertain answer, with its error. A failed
   attempt under dunning still emits `subscription.past_due` each time, as before, since it
   starts a new retry schedule.
+
+## PayPal: captures after a reauthorization (2026-09-25)
+
+Doc-verified 2026-09-25 against the Payments v2 (2.12) and Orders v2 (2.36) schemas under
+developer.paypal.com/api/, the Authorize and capture page (`/v5/checkout/auth-capture`,
+where `/docs/checkout/standard/customize/authorization/` now redirects), the Authorization
+and honor period page (`/payment-methods/auth-honor`), the Extend an authorization guide
+(`/checkout/extend-authorization`) and the webhook event names page.
+
+- **The newest authorization that was not denied carries the hold, and captures go to it.**
+  Reauthorize "Reauthorizes an authorized PayPal account payment", and its example answers
+  with an authorization id different from the one reauthorized; the Extend guide says it
+  generates "a new authorization with a refreshed expiration date". The capture target is
+  guide-only: the Authorize and capture page ("A reauthorization generates a new
+  authorization ID and restarts the 3-day honor period. Use the new authorization ID on
+  subsequent captures") and the honor period page ("Perform any subsequent capture against
+  the new authorization ID, not the original"); the Authorize and capture page's capture step
+  also reads "The authorization ID is either the original authorization ID or the ID from
+  reauthorizing the transaction". The adapter captures and reports against the newest
+  authorization by `create_time`, then list position, and treats an older one as superseded
+  whatever its status. One reporting no `create_time` sorts as the oldest, so the list's
+  arrangement decides ties only: with A undated, B five days in and C one day in, listed B,
+  A, C, the former comparator took C, and B is taken now. A denied newer authorization is
+  skipped, since it replaced nothing. The adapter never reauthorizes itself; this covers a
+  host that reauthorizes through PayPal.
+- **Voids go to the original.** `CANNOT_BE_VOIDED`: "A reauthorization cannot be voided.
+  Please void the original parent authorization." / "You cannot void a reauthorized payment.
+  You must void the original parent authorized payment." `cancelPayment` voids the oldest
+  authorization unless the one holding the funds already reports `VOIDED`. No documented field
+  ties a reauthorization to its parent (an order's authorization links to itself, its capture,
+  void and reauthorize operations and the order), so age decides. AMBIGUOUS: the reauthorize
+  200 and 201 examples, and the Authorize and capture page's sample, show a `void` link on the
+  new authorization, and no page says what either authorization reports once the original is
+  voided. The fake voids both and answers `CANNOT_BE_VOIDED` for a reauthorization. An original
+  that already reads `VOIDED` next to a live reauthorization gets the void anyway, and PayPal's
+  refusal (`PREVIOUSLY_VOIDED`, "Authorization has been previously voided and hence cannot be
+  voided again.") surfaces instead of a `canceled` the adapter cannot confirm.
+  `CANNOT_BE_VOIDED` and `PREVIOUSLY_VOIDED` map to `invalid_request`, not retryable, as
+  `PREVIOUSLY_CAPTURED` does.
+- **Capturing the rest never reaches past the order.** An empty-body reauthorization
+  reauthorizes "the full amount" (the schema's "Reauthorize with empty request body" flow; the
+  Extend guide's "Reauthorize for the same amount" sends `{}`), so after a partial capture the
+  new authorization can hold again what was taken. The remainder, and `amountCapturable`, is
+  the lesser of the holding authorization's amount less the captures taken from it and the
+  order amount less every capture on the order that took money, in integer minor units and
+  never below zero. When captures name their authorization it is exact whether the
+  reauthorization is for the full amount or for what was left. An order read reporting no
+  amount (the Orders v2 response schema does not require one) is measured by the original
+  authorization's amount, which is the order amount: the Orders v2 authorize request takes no
+  amount, and an order "with the `COMPLETED` status" cannot be updated. It was measured by the
+  holding authorization before, and a reauthorization can hold "up to 115% of original" (the
+  Extend guide), so a 23.00 reauthorization after 2.00 was taken from a 20.00 order read
+  21.00 left where 18.00 is. When neither the order read nor the original reports an amount,
+  capturing the rest of a reauthorization needs an explicit amount (without one PayPal takes
+  the reauthorization's full amount), and `amountCapturable` is left out.
+  Capturing the rest answers with the payment once the order's captures cover the order
+  amount. A holding authorization that reports no amount gets what the order has left as an
+  explicit amount while nothing is captured, where it went out with no amount before (PayPal:
+  "If amount is not specified, the full authorized amount is captured"), and needs an explicit
+  amount once any capture on the order took money, not only one of its own; an explicit amount
+  then closes it only when it takes all the order has left. `MAX_CAPTURE_AMOUNT_EXCEEDED` caps
+  "the sum of all captures to be up to 115% of the order amount" (its example says "You can
+  only capture up to the original authorization amount"), and the honor period page caps
+  captures at "up to 115% or $75 USD more than the original authorized amount, whichever is
+  less", so an explicit amount still goes to PayPal as it is. The fake enforces both, the
+  second against each authorization's own amount (USD 75 applied in USD only). AMBIGUOUS:
+  which cap PayPal applies to the captures from a reauthorization, its own amount, the
+  original's or only the order's; no page says.
+- **Captures count against the authorization they name, else by time (AMBIGUOUS on the order
+  read).** `supplementary_data.related_ids.authorization_id` is a Payments v2 capture field,
+  and a Payments v2 capture's `up` link points to its authorization. The Orders v2 capture
+  schema has no `supplementary_data` or `related_ids`, and its examples link `up` to the
+  order, so an order read may name no authorization at all. A capture naming none counts
+  against every authorization created no later than it, by `create_time`, since an
+  authorization cannot give a capture taken before it existed. The former rule counted every
+  capture against the new authorization once one named none: on a 20.00 order with 7.00
+  taken and a reauthorization of the 13.00 left, the rest read 6.00 and its capture went out
+  final, closing the reauthorization with 7.00 still on it (an explicit 10.00 went out final
+  too, leaving 3.00), so the next capture met `AUTHORIZATION_ALREADY_CAPTURED`. A missing
+  `create_time`, on the capture or on an authorization, rules nothing out, which errs low;
+  the order clamp still bounds the result. AMBIGUOUS: the Orders v2 capture schema defines
+  `create_time` (through `activity_timestamps`, "The date and time when the transaction
+  occurred") and the Orders v2 capture examples carry it, but no example shows the captures
+  of an AUTHORIZE order's read. An estimate never closes a hold: when a capture naming no
+  authorization took money and another authorization could have given it, the capture goes
+  out with `final_capture: false`, even when it takes the whole estimate, and only a capture
+  of all the order has left closes the authorization. That holds even when the holding
+  authorization still covers what the order has left: a final capture the count relies on,
+  taken from the superseded original outside the adapter, may not have closed this one
+  (review of 2026-09-25). The hold stays open for whatever the
+  estimate missed, which a capture with an explicit amount can take; once the estimate
+  reaches zero, capturing the rest answers with the payment, as when captures cover the
+  authorization, and `amountCapturable` reads 0. What is never captured is left to expire:
+  `cancelPayment` voids only an authorization with no capture yet, so it releases nothing
+  here. The fake's order reads carry no attribution unless a test opts in, which makes the
+  time rule the default path, and its reauthorizations are stamped by its own clock, moved
+  on four days first; it refuses to reauthorize an original that is voided
+  (`AUTHORIZATION_VOIDED`, "A voided authorization cannot be captured or reauthorized") or
+  fully captured (the Extend guide lists "authorization already captured or voided" among
+  the failures). The `up` link is parsed as the order link is: one path segment, no
+  decoding.
+- **Repeatability (AMBIGUOUS).** The sources conflict. Once: `reauthorize_request` ("You can
+  reauthorize a payment only once from days four to 29", "You can reauthorize an authorized
+  payment once"), `REAUTHORIZATION_NOT_SUPPORTED` ("cannot be attempted on an authorization_id
+  that is the result of a prior reauthorization"), `REAUTHORIZATION_TOO_SOON` ("only allowed
+  once from Day 4 to Day 29") and the Extend guide ("Each authorization can be reauthorized a
+  single time"). Several: the reauthorize operation ("you can issue multiple
+  re-authorizations after the honor period expires"), the Authorize and capture page, and the
+  honor period page, whose table shows a "Reauthorization 2" on day 8. The adapter reads any
+  number of authorizations and reauthorizes none.
+- **The original's status after a reauthorization (AMBIGUOUS).** No page says it. The tests
+  cover it staying `CREATED` and turning `VOIDED`; capturing and reporting behave the same
+  either way.
+- **Webhooks (AMBIGUOUS).** `PAYMENT.AUTHORIZATION.VOIDED` still maps to `payment.canceled`.
+  The event names page gives its causes as the authorization "reaching its 30 day validity
+  period" or being "manually voided using the Void Authorized Payment API", and neither it nor
+  the Payments v2 callbacks name a reauthorization event. A `VOIDED` event for a superseded
+  original would contradict `retrievePayment`, which follows the newest authorization; the
+  guide tells hosts to re-read the payment before acting on the event.
+- **Sandbox check outstanding.** Reauthorization is refused within the honor period, so every
+  order needs an authorization at least four days old. On a first AUTHORIZE order, capture
+  part, reauthorize with an empty body, and record in an order GET the new authorization's
+  amount, both authorizations' statuses, and whether the captures carry `create_time`,
+  `related_ids.authorization_id` or an `up` link to their authorization. GET the
+  reauthorization itself (`GET /v2/payments/authorizations/{id}`) and record whether its
+  Payments v2 `supplementary_data.related_ids.authorization_id` names the parent; then
+  reauthorize a second time, from the original and from the reauthorization. On a second
+  order, capture part, reauthorize for less than what is left, and capture more than that
+  reauthorization's own amount but less than the order has left, to learn which cap applies.
+  On a third order with no capture, reauthorize, void the reauthorization (expected
+  `CANNOT_BE_VOIDED`), void the original, and record both statuses. On the first order,
+  also capture from the original after the reauthorization and record whether PayPal
+  accepts it. Record every webhook PayPal sends for all three orders.

@@ -64,6 +64,11 @@ function classify(e: StripeErrorLike): { code: UnifiedErrorCode; retryable: bool
     if (e.decline_code && FRAUD_DECLINE_CODES.has(e.decline_code)) {
       return { code: "fraud_suspected", retryable: false, message: "Your card was declined." };
     }
+    if (e.code === "authentication_failure") {
+      // A failed 3-D Secure, mapped as the browser adapter maps the intent-specific
+      // failure codes and the other adapters map theirs.
+      return { code: "authentication_required", retryable: false, message: userMessage };
+    }
     if (e.code === "processing_error") {
       return { code: "processing_error", retryable: true, message: userMessage };
     }

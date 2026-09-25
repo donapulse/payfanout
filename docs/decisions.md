@@ -2258,7 +2258,17 @@ description of what v2 changes is what the migration then had to implement.
   port 443 is supported". The Configure Webhooks page words the retry as "retry the webhook
   up to three times" after a 4XX or 5XX; the docs use the reference's count of three
   attempts in all. "Retries effectively forever" is gone from the guide, the webhooks page,
-  the server README and `webhook.ts`. The server handler answers 200, which Paysafe accepts.
+  the server README, the root README, `@payfanout/server`'s `WebhookRequest` comment and
+  `webhook.ts`. The server handler answers 200, which Paysafe accepts.
+- **Bank returns cannot be recovered by a read (AMBIGUOUS whether any read reflects them).**
+  The spec defines no return resource, and its Direct Debit Return Codes section says
+  "Because Direct Debit requests can take up to 7 days to clear, you cannot be notified of
+  errors such as these via the API response", pointing to Merchant Back Office reports. The
+  adapter's `retrievePayment` has no return state, so a returned debit keeps reading
+  `succeeded`. The guides therefore tell hosts to act on the return webhook, reconcile bank
+  debits against the Back Office return reports, and never let a read override a return.
+  Sandbox check: on an EUR (SEPA) or GBP (Bacs) account with `PAYSAFE_WEBHOOK_HMAC_KEY`,
+  trigger a return and read the payment afterwards.
 - **Signature, doc-verified.** Configure Webhooks: digest = HMAC_SHA256(hmacKey, UTF-8
   JSON body), signature = base64(digest), example header `Signature`; the official PHP
   SDK's `SignatureVerifier` computes the same and compares with `hash_equals`. The exported

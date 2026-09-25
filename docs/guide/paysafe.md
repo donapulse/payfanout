@@ -387,11 +387,15 @@ app.use(express.json()); // AFTER the webhook route
 
 ::: warning Three attempts, then nothing
 Paysafe counts only a `200` or `202` as received. Anything else, a timeout or a `500` from a
-failing `onEvent` included, gets at most two more attempts (three in all), and Paysafe sends
-no alert when all three fail. So `onEvent` must enqueue and return fast, and a delivery that
-never landed does not come back: Paysafe has no public events-polling API
-(`supportsEventPolling: false`), so reconcile open orders with `retrievePayment` on a
-schedule. See [Webhooks](/guide/webhooks).
+failing `onEvent` included, is retried, three attempts in all per Paysafe's webhook notes,
+and Paysafe sends no alert when they all fail. So `onEvent` must enqueue and return fast,
+and a delivery that never landed does not come back: Paysafe has no public events-polling
+API (`supportsEventPolling: false`), so reconcile open orders with `retrievePayment` on a
+schedule. A bank-debit return is the exception: "Because Direct Debit requests can take up
+to 7 days to clear, you cannot be notified of errors such as these via the API response",
+so a read keeps saying `succeeded`. Reconcile bank debits against the Merchant Back Office
+return reports, and never let a read override a return you received. See
+[Webhooks](/guide/webhooks).
 :::
 
 ### Event ids and correlation
@@ -402,9 +406,11 @@ name, the resource id, the resource's status, and its status time (`statusTime`,
 `txnTime`, else the envelope's `eventDate`). Every attempt of one notification gets the same
 id, so deduping by `event.id` drops the retries. Two different notifications can share an id
 as well: one resource reporting the same event twice without a new status time does, and
-card and refund payloads carry no `statusTime`. So don't let dedupe alone decide an outcome:
-re-read with `retrievePayment` for payment events and `retrieveRefund` for refund events,
-even for an id you have already seen. Both reads are idempotent.
+Paysafe's documented card and refund examples carry no `statusTime`. So don't let dedupe
+alone decide an outcome: re-read with `retrievePayment` for payment events and
+`retrieveRefund` for refund events, even for an id you have already seen (both reads are
+idempotent). A bank return is the exception: no read reflects it, so act on the return
+event itself.
 
 `event.pspPaymentId` names a payment, never another resource:
 
@@ -413,7 +419,7 @@ even for an id you have already seen. Both reads are idempotent.
 | Payment events (`PAYMENT_COMPLETED`, `PAYMENT_FAILED`, `PAYMENT_PROCESSING`, …) | the payment (`payload.id`) | |
 | Bank returns (`PAYMENT_RETURN_COMPLETED` / `PAYMENT_RETURNED_COMPLETED`) | the **returned payment** (`payload.paymentId`), not the return's own id | `payment.failed` |
 | Refund events (`REFUND_COMPLETED`; `REFUND_FAILED`, `REFUND_CANCELLED`, `REFUND_ERRORED` as `payment.refund_failed`) | unset: the refund payload names no payment | `event.refundId` is the `refundId` that `refundPayment` returned |
-| Handle and settlement events (`PAYMENT_HANDLE_*`, `SETTLEMENT_*`) | unset | delivered as `unknown`; correlate by the payload's `merchantRefNum` on `event.raw` |
+| Handle and settlement events (`PAYMENT_HANDLE_*`, `SETTLEMENT_*`) | unset | delivered as `unknown`; correlate by the payload's `merchantRefNum` on `event.raw` (`raw.payload`, or `raw.variables.payload` in the nested form) |
 
 Paysafe's Bacs page shows the envelope nested under `variables`, where every other page has
 it at the top level. The adapter reads both, and gives the same event the same id either way.

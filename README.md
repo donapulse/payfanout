@@ -396,8 +396,9 @@ The conformance suite includes a test that **fails any adapter which re-serializ
 parsed body before verifying** (same JSON value, different bytes ⇒ must reject).
 
 **Ack fast, process async.** The handler verifies, parses, hands the event to your
-`onEvent`, and expects a 2xx immediately, `onEvent` must *enqueue*, not process. Paysafe
-retries effectively forever until it sees success. **Dedupe is yours:** `event.id` is a
+`onEvent`, and expects a 2xx immediately, `onEvent` must *enqueue*, not process.
+Redelivery is limited: Paysafe, for one, counts only a `200` or `202` as received and makes
+at most three attempts, with no alert when they fail. **Dedupe is yours:** `event.id` is a
 stable key; keep the seen-set in your store. **Ordering is not guaranteed** by any PSP,
 treat events as unordered facts and reconcile with `retrievePayment` when sequence matters.
 

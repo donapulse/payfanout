@@ -66,7 +66,8 @@ exported for advanced use.
   name, resource id, status and status time, the same for every redelivery; `pspPaymentId`
   names the returned payment on a bank return and is unset on refund events, which carry
   `refundId`. Paysafe counts only a 200 or 202 as received and makes at most three attempts,
-  so reconcile with `retrievePayment` for anything missed.
+  so reconcile with `retrievePayment` for anything missed, except bank-debit returns, which
+  no read reflects: reconcile those against the Merchant Back Office return reports.
 - **`mapPaysafeError`**, unifies Paysafe errors into `PayFanoutError` (business errors like
   declines or `3406` are never replayed), and **`PAYSAFE_PSP_NAME`**.
 

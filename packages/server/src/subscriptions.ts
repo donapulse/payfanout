@@ -105,6 +105,14 @@ export interface RenewalReplay {
    * alone until resolvePendingRenewal settles the charge.
    */
   frozen?: boolean;
+  /**
+   * An overlapping run sent another request under this key (a card or plan
+   * set while this charge was in flight). The PSP holds whichever reached it
+   * first, and a failure may be its refusal of the other one, so a failure
+   * freezes the pin instead of settling the attempt; a success still settles
+   * it.
+   */
+  contested?: boolean;
 }
 
 /**
@@ -184,9 +192,13 @@ export interface SubscriptionStore {
    * Optional scale path for chargeDueSubscriptions: return records that are
    * due — active/trialing with `currentPeriodEnd <= dueBefore`, or past_due
    * with `nextRetryAt <= dueBefore` — never canceled or paused ones, in a
-   * stable order, at most `limit` of them. Push the predicate into a database
-   * index; the manager pages until a short batch and still re-checks due-ness
-   * per record, so this filter is an optimization, not a trust boundary.
+   * stable order, at most `limit` of them. Leave out records that only
+   * resolvePendingRenewal moves on: those with a `pendingRenewal`, or whose
+   * `renewalAttempt` for the current period holds a `frozen` replay. The cron
+   * does nothing for them, and a full batch of them would hold back every due
+   * record after it. Push the predicate into a database index; the manager
+   * pages until a short batch and still re-checks due-ness per record, so
+   * this filter is an optimization, not a trust boundary.
    * Without it the manager falls back to per-status list() scans.
    */
   listDue?(input: { dueBefore: string; limit?: number }): Promise<SubscriptionRecord[]>;
@@ -216,6 +228,7 @@ export class InMemorySubscriptionStore implements SubscriptionStore {
     const cutoff = Date.parse(input.dueBefore);
     const due = [...this.records.values()]
       .filter((r) => {
+        if (r.pendingRenewal || pinnedReplay(r)?.frozen) return false; // waits for resolvePendingRenewal
         if (r.status === "past_due") return Date.parse(r.nextRetryAt ?? r.currentPeriodEnd) <= cutoff;
         return (r.status === "active" || r.status === "trialing") && Date.parse(r.currentPeriodEnd) <= cutoff;
       })
@@ -301,7 +314,7 @@ export interface SubscriptionManagerOptions {
    * schedule exhausted cancels the subscription. Default [24, 72] (3 attempts
    * total). Only definitive failures count: a charge without a definitive
    * answer is replayed (replayDelaysMinutes) and counts once it is settled
-   * as failed.
+   * as failed, or at once on a store that does not persist renewalAttempt.
    */
   retryDelaysHours?: number[];
   /**
@@ -1022,7 +1035,7 @@ export class SubscriptionManager {
       if (nowMs - Date.parse(next.replay.firstSentAt) > this.replayWindowMs) {
         // A late run: the PSP may no longer hold the key, so a replay could
         // charge again. Nothing is sent.
-        return this.freezeReplay(record, next, next.replay, result);
+        return this.freezeReplay(record, next.replay, result);
       }
       // A replay the service cannot send says nothing about the original.
       const blocked = this.replayBlocker(record.pspName);
@@ -1158,14 +1171,27 @@ export class SubscriptionManager {
     });
   }
 
-  /** Leaves a pinned charge to its settlement: the cron sends nothing more for it. */
+  /**
+   * Leaves a pinned charge to its settlement: the cron sends nothing more for
+   * it. The record is read again first, so a cancel, pause, card change or
+   * settlement since the batch read stands; only the pin changes.
+   */
   private async freezeReplay(
     record: SubscriptionRecord,
-    tracked: RenewalAttempt,
     replay: RenewalReplay,
     result: ChargeDueResult,
   ): Promise<SubscriptionRecord> {
-    const updated: SubscriptionRecord = { ...record, renewalAttempt: { ...tracked, replay: { ...replay, frozen: true } } };
+    const fresh = (await this.store.get(record.id)) ?? record;
+    const tracked = fresh.renewalAttempt;
+    if (
+      fresh.currentPeriodEnd !== record.currentPeriodEnd ||
+      tracked?.periodEnd !== fresh.currentPeriodEnd ||
+      tracked.replay?.idempotencyKey !== replay.idempotencyKey ||
+      tracked.replay.frozen === true
+    ) {
+      return fresh; // settled, overtaken, or frozen by an overlapping run meanwhile
+    }
+    const updated: SubscriptionRecord = { ...fresh, renewalAttempt: { ...tracked, replay: { ...tracked.replay, frozen: true } } };
     delete updated.nextRetryAt;
     await this.store.save(updated);
     await this.emit({ type: "subscription.charge_pending", subscription: updated });
@@ -1177,10 +1203,11 @@ export class SubscriptionManager {
    * Bookkeeping for a renewal attempt that did not collect. A definitive
    * failure moves the period on to its next attempt number and into dunning.
    * An uncertain one pins the request for replay (see RenewalReplay), or
-   * freezes it once no replay can safely follow; it never counts for dunning.
-   * `settled` marks an outcome the host applied, which is authoritative for
-   * its attempt; any other answer that an overlapping run or a settlement
-   * has overtaken is dropped.
+   * freezes it once no replay can safely follow; it never counts for dunning,
+   * except on a store that drops the pin. `settled` marks an outcome the host
+   * applied, which is authoritative for its attempt; any other answer that an
+   * overlapping run or a settlement has overtaken is dropped, and so is an
+   * answer to another request sent under the pinned key.
    */
   private async recordRenewalFailure(
     record: SubscriptionRecord,
@@ -1196,9 +1223,20 @@ export class SubscriptionManager {
     if (options.settled !== true && (fresh.pendingRenewal || (tracked && tracked.attempt > tried.attempt))) {
       return fresh; // an overlapping run or a settlement got further with this attempt
     }
-    const replayed = tracked?.replay ?? tried.sent?.replayed;
     const sent = tried.sent;
-    const uncertain = sent !== undefined && (options.verdict ?? classifyRenewalFailure(error, replayed)) === "uncertain";
+    if (
+      tracked?.replay &&
+      sent?.idempotencyKey === tracked.replay.idempotencyKey &&
+      !sameRequest(tracked.replay.request, sent.request)
+    ) {
+      return this.contest(fresh, tracked, tracked.replay);
+    }
+    const replayed = tracked?.replay ?? sent?.replayed;
+    const verdict = options.verdict ?? classifyRenewalFailure(error, replayed);
+    // A contested pin settles only by a success or by the host: the failure
+    // may be the PSP refusing the other request sent under its key.
+    const doubted = sent !== undefined && replayed?.contested === true && verdict === "definitive";
+    const pinned = sent !== undefined && (verdict === "uncertain" || doubted);
     const nextAttempt = Math.max(tried.attempt + 1, tracked?.attempt ?? 0);
     const lastError = { code: error.code, message: error.message };
 
@@ -1207,8 +1245,8 @@ export class SubscriptionManager {
       // a past_due ghost, but the attempt state stays — a pin must survive
       // to be settled, and resume refuses to start a period over it.
       const renewalAttempt: RenewalAttempt =
-        uncertain && sent
-          ? { periodEnd: tried.periodEnd, attempt: tried.attempt, replay: pinFor(sent, replayed, error, undefined) }
+        pinned && sent
+          ? { periodEnd: tried.periodEnd, attempt: tried.attempt, replay: pinFor(sent, replayed, error, doubted || undefined) }
           : { periodEnd: tried.periodEnd, attempt: nextAttempt };
       const updated: SubscriptionRecord = { ...fresh, renewalAttempt, lastError };
       delete updated.pendingRenewal;
@@ -1217,19 +1255,14 @@ export class SubscriptionManager {
       return updated;
     }
 
-    if (uncertain && sent) {
-      if (!replayed && fresh.status === "past_due" && !tracked && isUncertainCode(fresh.lastError?.code)) {
-        // The last answer was uncertain too, yet no pin survived: the store
-        // does not persist renewalAttempt. Pinning again would replay every
-        // few minutes forever, so the attempt counts for dunning instead, as
-        // it did before pins existed.
-        return this.enterDunning(record, fresh, nowMs, error, result, { periodEnd: tried.periodEnd, attempt: nextAttempt });
-      }
+    if (pinned && sent) {
       const answers = (replayed?.uncertainAnswers ?? 0) + 1;
       const delayMinutes = this.replayDelaysMinutes[answers - 1];
       const replayAtMs = delayMinutes === undefined ? undefined : nowMs + delayMinutes * 60_000;
       const withinWindow =
-        replayAtMs !== undefined && replayAtMs - Date.parse(replayed?.firstSentAt ?? sent.firstSentAt) <= this.replayWindowMs;
+        !doubted &&
+        replayAtMs !== undefined &&
+        replayAtMs - Date.parse(replayed?.firstSentAt ?? sent.firstSentAt) <= this.replayWindowMs;
       const pin = pinFor(sent, replayed, error, withinWindow ? undefined : true);
       const updated: SubscriptionRecord = {
         ...fresh,
@@ -1241,9 +1274,16 @@ export class SubscriptionManager {
       if (withinWindow && replayAtMs !== undefined) updated.nextRetryAt = new Date(replayAtMs).toISOString();
       else delete updated.nextRetryAt;
       await this.store.save(updated);
+      const kept = await this.store.get(record.id);
+      if (kept && droppedPin(kept, updated)) {
+        // The store does not persist renewalAttempt, so no pin can bound the
+        // replays: the attempt counts for dunning under a new key, as it did
+        // before pins existed.
+        return this.enterDunning(record, kept, nowMs, error, result, { periodEnd: tried.periodEnd, attempt: nextAttempt });
+      }
       await this.emit({ type: "subscription.charge_failed", subscription: updated, error });
+      if (fresh.status !== "past_due") await this.emit({ type: "subscription.past_due", subscription: updated, error });
       if (withinWindow) {
-        await this.emit({ type: "subscription.past_due", subscription: updated, error });
         result.failed.push(updated);
       } else {
         await this.emit({ type: "subscription.charge_pending", subscription: updated, error });
@@ -1269,6 +1309,18 @@ export class SubscriptionManager {
       return updated;
     }
     return this.enterDunning(record, fresh, nowMs, error, result, renewalAttempt);
+  }
+
+  /**
+   * An answer to another request than the pinned one under the same key: an
+   * overlapping run charged a card or plan set while the pinned charge was in
+   * flight. It says nothing of the pinned charge, but its failures are no
+   * longer trusted from now on (see RenewalReplay.contested).
+   */
+  private async contest(fresh: SubscriptionRecord, tracked: RenewalAttempt, replay: RenewalReplay): Promise<SubscriptionRecord> {
+    const updated: SubscriptionRecord = { ...fresh, renewalAttempt: { ...tracked, replay: { ...replay, contested: true } } };
+    await this.store.save(updated);
+    return updated;
   }
 
   /** A failed attempt for dunning: past_due with the next retry scheduled, or canceled once exhausted. */
@@ -1400,17 +1452,52 @@ function pinFor(
 ): RenewalReplay {
   return {
     idempotencyKey: sent.idempotencyKey,
-    request: sent.request,
+    // A replay repeats the request first pinned under the key, whatever the record says now.
+    request: replayed?.request ?? sent.request,
     firstSentAt: replayed?.firstSentAt ?? sent.firstSentAt,
     uncertainAnswers: (replayed?.uncertainAnswers ?? 0) + 1,
     afterProcessingError:
       replayed?.afterProcessingError === true || (error.code === "processing_error" && error.outcomeUnknown !== true),
+    ...(replayed?.contested === true ? { contested: true } : {}),
     ...(frozen ? { frozen } : {}),
   };
 }
 
-function isUncertainCode(code: string | undefined): boolean {
-  return code !== undefined && !DEFINITIVE_FAILURE_CODES.has(code as UnifiedErrorCode);
+/**
+ * Whether a record read back right after `saved` was written with its pin is
+ * that write without the pin, as a store that does not persist
+ * renewalAttempt returns it. Only fields older than renewalAttempt are
+ * compared. Any other write landing in between proves nothing, and keeps the
+ * pin's key.
+ */
+function droppedPin(kept: SubscriptionRecord, saved: SubscriptionRecord): boolean {
+  return (
+    kept.renewalAttempt?.replay === undefined &&
+    kept.pendingRenewal === undefined &&
+    kept.status === saved.status &&
+    kept.currentPeriodEnd === saved.currentPeriodEnd &&
+    kept.failedAttempts === saved.failedAttempts &&
+    kept.lastError?.code === saved.lastError?.code
+  );
+}
+
+/** Whether two renewal requests are the same charge, however a store orders their fields. */
+function sameRequest(a: RenewalRequest, b: RenewalRequest): boolean {
+  return (
+    a.savedPaymentMethodToken === b.savedPaymentMethodToken &&
+    a.amount === b.amount &&
+    a.currency === b.currency &&
+    sameValue(a.billingDetails, b.billingDetails) &&
+    sameValue(a.metadata, b.metadata)
+  );
+}
+
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a === b || ((a === null || a === undefined) && (b === null || b === undefined))) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  return [...new Set([...Object.keys(left), ...Object.keys(right)])].every((key) => sameValue(left[key], right[key]));
 }
 
 /** A key of this period's attempts that already ended, so a failure naming it is old news. */

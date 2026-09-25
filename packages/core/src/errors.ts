@@ -35,10 +35,13 @@ export interface UnifiedError {
   /** Untouched original PSP error, for logs/support — never dropped. */
   raw: unknown;
   /**
-   * True when the call may have taken effect at the PSP although it failed
-   * here: the answer was lost, or the PSP could not say. Retry it only under
-   * the SAME idempotencyKey, which reads the original back — a new key can
-   * repeat the operation. Absent means the adapter reported no such doubt.
+   * True when the call may have taken effect at the PSP although its code
+   * would otherwise read as definitive — e.g. a processing_error for an
+   * answer the adapter could not read back, or a refusal of a reused
+   * idempotencyKey. psp_unavailable, rate_limited and unknown already leave
+   * the outcome open without it. Retry any of these only under the SAME
+   * idempotencyKey — a new key can repeat the operation. Absent means the
+   * code alone tells.
    */
   outcomeUnknown?: boolean;
 }

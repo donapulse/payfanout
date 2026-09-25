@@ -363,6 +363,92 @@ describe("renewal charges without a definitive answer are replayed under their k
     expect((await record(h)).renewalAttempt?.replay).toMatchObject({ frozen: true, uncertainAnswers: 1 });
   });
 
+  it("a late freeze keeps a cancel that landed after the batch read", async () => {
+    const h = pspHarness();
+    await create(h);
+    h.script.push("down");
+    await runAt(h, DUE);
+    const listDue = h.store.listDue.bind(h.store);
+    let cancelNext = true;
+    h.store.listDue = async (input) => {
+      const batch = await listDue(input);
+      if (cancelNext) {
+        cancelNext = false;
+        await h.manager.cancelSubscription("sub_1"); // after the batch read, before the freeze
+      }
+      return batch;
+    };
+    h.events.length = 0;
+    const late = await runAt(h, DUE + 25 * HOUR);
+    expect(late.pending).toHaveLength(1);
+    const frozen = await record(h);
+    expect(frozen).toMatchObject({
+      status: "canceled",
+      renewalAttempt: { attempt: 0, replay: { idempotencyKey: renewalKey(0), frozen: true } },
+    });
+    expect(frozen.canceledAt).toBeDefined();
+    expect(h.events.map((e) => e.type)).toEqual(["subscription.canceled", "subscription.charge_pending"]);
+
+    // Settled as paid, the charge pays its period, and the canceled customer is not billed again.
+    const settled = await h.manager.resolvePendingRenewal("sub_1", {
+      status: "succeeded",
+      pspPaymentId: "pay_found",
+      idempotencyKey: renewalKey(0),
+    });
+    expect(settled).toMatchObject({ status: "canceled", currentPeriodEnd: NEXT_PERIOD_END });
+    await runAt(h, Date.parse(NEXT_PERIOD_END) + HOUR);
+    expect(h.renewalKeys()).toEqual([renewalKey(0)]);
+  });
+
+  it("a late freeze leaves alone a pin settled after the batch read", async () => {
+    const h = pspHarness();
+    await create(h);
+    h.script.push("down");
+    await runAt(h, DUE);
+    const listDue = h.store.listDue.bind(h.store);
+    let settleNext = true;
+    h.store.listDue = async (input) => {
+      const batch = await listDue(input);
+      if (settleNext) {
+        settleNext = false;
+        await h.manager.resolvePendingRenewal("sub_1", { status: "failed", idempotencyKey: renewalKey(0) });
+      }
+      return batch;
+    };
+    h.events.length = 0;
+    const late = await runAt(h, DUE + 25 * HOUR);
+    expect(late.pending).toHaveLength(0);
+    const settled = await record(h);
+    expect(settled).toMatchObject({ status: "past_due", failedAttempts: 1, renewalAttempt: { attempt: 1 } });
+    expect(settled.renewalAttempt?.replay).toBeUndefined();
+    expect(h.events.map((e) => e.type)).toEqual(["subscription.charge_failed", "subscription.past_due"]);
+  });
+
+  it("emits past_due only when a pin changes the status: a replay's uncertain answer is charge_failed alone", async () => {
+    const h = pspHarness();
+    await create(h);
+    h.events.length = 0;
+    h.script.push("down", "rate_limited");
+    await runAt(h, DUE);
+    await runAt(h, DUE + 5 * MINUTE);
+    expect(h.events.map((e) => [e.type, e.error?.code])).toEqual([
+      ["subscription.charge_failed", "psp_unavailable"],
+      ["subscription.past_due", "psp_unavailable"],
+      ["subscription.charge_failed", "rate_limited"],
+    ]);
+
+    const frozenAtOnce = pspHarness({ replayDelaysMinutes: [] });
+    await create(frozenAtOnce);
+    frozenAtOnce.events.length = 0;
+    frozenAtOnce.script.push("down");
+    await runAt(frozenAtOnce, DUE);
+    expect(frozenAtOnce.events.map((e) => e.type)).toEqual([
+      "subscription.charge_failed",
+      "subscription.past_due",
+      "subscription.charge_pending",
+    ]);
+  });
+
   it("settling a frozen pin as failed is a failed attempt: dunning resumes under a new key, and exhaustion still cancels", async () => {
     const h = pspHarness({ retryDelaysHours: [24], replayDelaysMinutes: [] });
     await create(h);
@@ -981,23 +1067,364 @@ describe("answers that arrive after the period moved on", () => {
   });
 });
 
+describe("records written by the previous release", () => {
+  it("a retry of a record left past_due after a timeout is pinned, not counted: the period is charged once", async () => {
+    const h = pspHarness();
+    // What the previous release left after -a0 timed out: one failed attempt, no renewalAttempt.
+    await h.store.save({
+      id: "sub_1",
+      pspName: "fake",
+      pspCustomerId: "cust_1",
+      savedPaymentMethodToken: "tok_saved",
+      plan: { amount: 2500, currency: "USD", interval: "month", intervalCount: 1 },
+      status: "past_due",
+      currentPeriodStart: "2026-01-31T10:00:00.000Z",
+      currentPeriodEnd: PERIOD_END,
+      anchorDay: 31,
+      cancelAtPeriodEnd: false,
+      failedAttempts: 1,
+      nextRetryAt: new Date(DUE).toISOString(),
+      lastError: { code: "psp_unavailable", message: "Timed out." },
+      createdAt: "2026-01-31T10:00:00.000Z",
+    });
+    h.script.push("lost");
+    await runAt(h, DUE); // -a1 is charged, and its answer lost
+    expect(await record(h)).toMatchObject({
+      failedAttempts: 1,
+      nextRetryAt: new Date(DUE + 5 * MINUTE).toISOString(),
+      renewalAttempt: { attempt: 1, replay: { idempotencyKey: renewalKey(1) } },
+    });
+    await runAt(h, DUE + 5 * MINUTE);
+    await runAt(h, DUE + 72 * HOUR);
+    expect(h.charges.map((c) => c.idempotencyKey)).toEqual([renewalKey(1), renewalKey(1)]);
+    expect(h.collected()).toBe(1);
+    expect(await record(h)).toMatchObject({ status: "active", currentPeriodEnd: NEXT_PERIOD_END });
+  });
+});
+
 describe("stores that drop renewalAttempt", () => {
-  it("fall back to counting uncertain failures for dunning instead of replaying forever", async () => {
-    const h = pspHarness({ retryDelaysHours: [24] });
+  /** Persists everything but renewalAttempt, as a schema from before the field would. */
+  function dropRenewalAttempt(h: Harness): void {
     const save = h.store.save.bind(h.store);
     h.store.save = async (record) => {
       const { renewalAttempt: _dropped, ...rest } = record;
       return save(rest as SubscriptionRecord);
     };
+  }
+
+  it("count each uncertain failure for dunning at once, under the next attempt number", async () => {
+    const h = pspHarness({ retryDelaysHours: [24] });
+    dropRenewalAttempt(h);
     await create(h);
-    h.script.push("down", "down", "down");
-    await runAt(h, DUE); // pinned in memory, dropped by the store
-    await runAt(h, DUE + 5 * MINUTE); // the last answer was uncertain, no pin survived
-    expect(await record(h)).toMatchObject({ status: "past_due", failedAttempts: 1 });
-    await runAt(h, DUE + 5 * MINUTE + 24 * HOUR);
+    h.events.length = 0;
+    h.script.push("down", "down");
+    const first = await runAt(h, DUE);
+    expect(first.failed).toHaveLength(1);
+    expect(await record(h)).toMatchObject({
+      status: "past_due",
+      failedAttempts: 1,
+      nextRetryAt: new Date(DUE + 24 * HOUR).toISOString(),
+    });
+    expect(h.events.map((e) => e.type)).toEqual(["subscription.charge_failed", "subscription.past_due"]);
+    await runAt(h, DUE + 5 * MINUTE); // nothing is re-sent under the same key
+    expect(h.renewalKeys()).toEqual([renewalKey(0)]);
+    await runAt(h, DUE + 24 * HOUR);
     expect((await record(h)).status).toBe("canceled");
-    expect(h.charges.length - 1).toBe(3); // bounded, as before pins existed
+    expect(h.renewalKeys()).toEqual([renewalKey(0), renewalKey(1)]); // bounded, as before pins existed
   });
+
+  it("bound an error marked outcomeUnknown whose code reads as definitive", async () => {
+    const h = pspHarness();
+    dropRenewalAttempt(h);
+    await create(h);
+    h.adapter.chargeSavedPaymentMethod = async (input) => {
+      h.charges.push(input);
+      throw new PayFanoutError({ code: "invalid_request", message: "Key already used.", outcomeUnknown: true });
+    };
+    for (let run = 0; run < 40; run++) await runAt(h, DUE + run * 5 * MINUTE);
+    expect(h.renewalKeys()).toEqual([renewalKey(0)]);
+    expect(await record(h)).toMatchObject({ status: "past_due", failedAttempts: 1 });
+    await runAt(h, DUE + 24 * HOUR);
+    await runAt(h, DUE + 96 * HOUR);
+    expect((await record(h)).status).toBe("canceled");
+    expect(h.renewalKeys()).toEqual([renewalKey(0), renewalKey(1), renewalKey(2)]);
+  });
+
+  it("a pin a store keeps is never taken for a dropped one when a host write lands in between", async () => {
+    const h = pspHarness();
+    await create(h);
+    const get = h.store.get.bind(h.store);
+    let raced = false;
+    h.store.get = async (id) => {
+      const read = await get(id);
+      const pinned = read?.renewalAttempt?.replay;
+      if (!raced && read && pinned) {
+        // A host write that read the record before the pin was saved lands after it.
+        raced = true;
+        const { renewalAttempt: _pin, lastError: _error, nextRetryAt: _retry, ...before } = read;
+        await h.store.save({ ...before, status: "active" });
+        return get(id);
+      }
+      return read;
+    };
+    h.script.push("lost");
+    await runAt(h, DUE);
+    expect((await record(h)).failedAttempts).toBe(0); // not counted for dunning
+    await runAt(h, DUE + 5 * MINUTE);
+    expect(h.renewalKeys()).toEqual([renewalKey(0), renewalKey(0)]); // the next charge reuses the key
+    expect(h.collected()).toBe(2);
+  });
+});
+
+describe("another request under the pinned key", () => {
+  /** Resolves once `open()` is called. */
+  function gate(): { opened: Promise<void>; open: () => void } {
+    let open: () => void = () => undefined;
+    const opened = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    return { opened, open };
+  }
+
+  it("an overlapping run's answer for a card set meanwhile never settles the pinned charge", async () => {
+    const h = pspHarness();
+    await create(h);
+    const bSent = gate();
+    const bAnswered = gate();
+    let runB: Promise<unknown> | undefined;
+    let calls = 0;
+    h.adapter.chargeSavedPaymentMethod = async (input) => {
+      calls += 1;
+      if (calls === 1) {
+        // Run A's -a0 is charged on the old card and its answer lost, while the
+        // card changes and an overlapping run B sends -a0 with the new one.
+        h.script.push("lost");
+        const lost = await h.psp(input).catch((err: unknown) => err);
+        await h.manager.updateSubscription("sub_1", { savedPaymentMethodToken: "tok_new" });
+        runB = h.manager.chargeDueSubscriptions();
+        await bSent.opened;
+        throw lost;
+      }
+      if (calls === 2) {
+        bSent.open();
+        await bAnswered.opened; // B's refusal comes back after A has pinned -a0
+      }
+      return h.psp(input);
+    };
+    await runAt(h, DUE);
+    bAnswered.open();
+    await runB;
+    expect(await record(h)).toMatchObject({
+      failedAttempts: 0,
+      savedPaymentMethodToken: "tok_new",
+      renewalAttempt: {
+        attempt: 0,
+        replay: { idempotencyKey: renewalKey(0), request: { savedPaymentMethodToken: "tok_saved" } },
+      },
+    });
+
+    h.adapter.chargeSavedPaymentMethod = h.psp;
+    const replay = await runAt(h, DUE + 5 * MINUTE);
+    expect(replay.charged).toHaveLength(1);
+    await runAt(h, DUE + 48 * HOUR);
+    expect(h.charges.slice(1).map((c) => [c.idempotencyKey, c.savedPaymentMethodToken])).toEqual([
+      [renewalKey(0), "tok_saved"],
+      [renewalKey(0), "tok_new"],
+      [renewalKey(0), "tok_saved"], // the pinned request, which the PSP answers with the lost charge
+    ]);
+    expect(h.collected()).toBe(2);
+  });
+
+  it("a pin whose key another request contests freezes on a failure instead of moving on to a new key", async () => {
+    const h = pspHarness();
+    await create(h);
+    const aSent = gate();
+    const aAnswered = gate();
+    let calls = 0;
+    h.adapter.chargeSavedPaymentMethod = async (input) => {
+      calls += 1;
+      if (calls === 1) {
+        aSent.open();
+        await aAnswered.opened; // run A's -a0 on the old card hangs, then is charged and its answer lost
+        h.script.push("lost");
+        return h.psp(input);
+      }
+      if (calls === 2) {
+        h.charges.push(input);
+        throw new PayFanoutError({ code: "psp_unavailable", message: "Down.", retryable: true });
+      }
+      return h.psp(input);
+    };
+    h.clock.now = DUE;
+    const runA = h.manager.chargeDueSubscriptions();
+    await aSent.opened;
+    await h.manager.updateSubscription("sub_1", { savedPaymentMethodToken: "tok_new" });
+    await h.manager.chargeDueSubscriptions(); // run B's -a0 with the new card fails first, and is pinned
+    aAnswered.open();
+    await runA; // A's answer, about the old card, comes second
+    expect(await record(h)).toMatchObject({
+      renewalAttempt: { replay: { request: { savedPaymentMethodToken: "tok_new" }, contested: true } },
+    });
+
+    // The PSP holds A's request, so B's, replayed, is refused as a reused key.
+    const refused = await runAt(h, DUE + 5 * MINUTE);
+    expect(refused.pending).toHaveLength(1);
+    expect(await record(h)).toMatchObject({
+      failedAttempts: 0,
+      lastError: { code: "invalid_request" },
+      renewalAttempt: { attempt: 0, replay: { idempotencyKey: renewalKey(0), frozen: true, contested: true } },
+    });
+    await runAt(h, DUE + 48 * HOUR);
+    expect(h.charges.slice(1).map((c) => c.idempotencyKey)).toEqual([renewalKey(0), renewalKey(0), renewalKey(0)]);
+    expect(h.collected()).toBe(2);
+
+    // The lost charge's webhook settles it.
+    const settled = await h.manager.resolvePendingRenewal("sub_1", {
+      status: "succeeded",
+      pspPaymentId: "pay_2",
+      idempotencyKey: renewalKey(0),
+    });
+    expect(settled).toMatchObject({ status: "active", currentPeriodEnd: NEXT_PERIOD_END, lastPaymentId: "pay_2" });
+  });
+
+  /** A pin marked contested, as an answer to another request under its key leaves it. */
+  async function contested(): Promise<Harness> {
+    const h = pspHarness();
+    await create(h);
+    h.script.push("down");
+    await runAt(h, DUE);
+    const pinned = await record(h);
+    await h.store.save({
+      ...pinned,
+      renewalAttempt: { ...pinned.renewalAttempt!, replay: { ...pinned.renewalAttempt!.replay!, contested: true } },
+    });
+    return h;
+  }
+
+  it("a contested pin still settles on a success", async () => {
+    const h = await contested();
+    const replay = await runAt(h, DUE + 5 * MINUTE);
+    expect(replay.charged).toHaveLength(1);
+    expect(await record(h)).toMatchObject({ status: "active", currentPeriodEnd: NEXT_PERIOD_END });
+  });
+
+  it("a contested pin keeps its key when a failure lands on the record paused meanwhile", async () => {
+    const h = await contested();
+    h.adapter.chargeSavedPaymentMethod = async (input) => {
+      h.charges.push(input);
+      await h.manager.pauseSubscription("sub_1");
+      throw new PayFanoutError({ code: "invalid_request", message: "Key reused with other parameters." });
+    };
+    await runAt(h, DUE + 5 * MINUTE);
+    expect(await record(h)).toMatchObject({
+      status: "paused",
+      failedAttempts: 0,
+      renewalAttempt: { attempt: 0, replay: { idempotencyKey: renewalKey(0), contested: true, frozen: true } },
+    });
+    await expect(h.manager.resumeSubscription("sub_1", { idempotencyKey: "resume-key" })).rejects.toThrowError(
+      /definitive answer/,
+    );
+  });
+
+  it("a replay is the pinned request however the store orders its fields", async () => {
+    const h = pspHarness();
+    const get = h.store.get.bind(h.store);
+    // A store whose reads return object keys in another order than they were written.
+    h.store.get = async (id) => {
+      const read = await get(id);
+      const reorder = <T extends object>(value: T | undefined): T | undefined =>
+        value && (Object.fromEntries(Object.entries(value).reverse()) as T);
+      const replay = read?.renewalAttempt?.replay;
+      return read && replay
+        ? {
+            ...read,
+            renewalAttempt: {
+              ...read.renewalAttempt!,
+              replay: {
+                ...replay,
+                request: {
+                  ...replay.request,
+                  metadata: reorder(replay.request.metadata),
+                  billingDetails: reorder(replay.request.billingDetails),
+                },
+              },
+            },
+          }
+        : read;
+    };
+    await h.manager.createSubscription({
+      pspName: "fake",
+      pspCustomerId: "cust_1",
+      savedPaymentMethodToken: "tok_saved",
+      plan: { amount: 2500, currency: "usd", interval: "month" },
+      id: "sub_1",
+      billingDetails: { name: "Ada", address: { postalCode: "75001", country: "FR" } },
+      metadata: { tier: "pro", region: "eu" },
+      idempotencyKey: "first-charge-key",
+    });
+    h.adapter.chargeSavedPaymentMethod = async (input) => {
+      h.charges.push(input);
+      throw new PayFanoutError({ code: "psp_unavailable", message: "Down.", retryable: true });
+    };
+    await runAt(h, DUE);
+    await runAt(h, DUE + 5 * MINUTE);
+    const pinned = await record(h);
+    expect(pinned.renewalAttempt?.replay).toMatchObject({ uncertainAnswers: 2 });
+    expect(pinned.renewalAttempt?.replay?.contested).toBeUndefined();
+  });
+});
+
+describe("records waiting for resolvePendingRenewal", () => {
+  const waiting = (id: string, kind: "frozen pin" | "pending renewal"): SubscriptionRecord => ({
+    id,
+    pspName: "fake",
+    pspCustomerId: "cust_1",
+    savedPaymentMethodToken: "tok_saved",
+    plan: { amount: 2500, currency: "USD", interval: "month", intervalCount: 1 },
+    status: kind === "frozen pin" ? "past_due" : "active",
+    currentPeriodStart: "2026-01-01T10:00:00.000Z",
+    currentPeriodEnd: "2026-02-01T10:00:00.000Z", // due before sub_1, so first in the store's order
+    cancelAtPeriodEnd: false,
+    failedAttempts: 0,
+    createdAt: "2026-01-01T10:00:00.000Z",
+    ...(kind === "frozen pin"
+      ? {
+          renewalAttempt: {
+            periodEnd: "2026-02-01T10:00:00.000Z",
+            attempt: 0,
+            replay: {
+              idempotencyKey: `payfanout-sub-${id}-2026-02-01T10:00:00.000Z-a0`,
+              request: { savedPaymentMethodToken: "tok_saved", amount: 2500, currency: "USD" },
+              firstSentAt: "2026-02-01T10:00:01.000Z",
+              uncertainAnswers: 6,
+              afterProcessingError: false,
+              frozen: true,
+            },
+          },
+        }
+      : {
+          pendingRenewal: {
+            pspPaymentId: `pay_${id}`,
+            periodEnd: "2026-02-01T10:00:00.000Z",
+            attempt: 0,
+            startedAt: "2026-02-01T10:00:01.000Z",
+          },
+        }),
+  });
+
+  it.each(["frozen pin", "pending renewal"] as const)(
+    "a full batch of them (%s) never holds back a due record",
+    async (kind) => {
+      const h = pspHarness();
+      await create(h);
+      // As many as one listDue batch holds.
+      for (let i = 0; i < 100; i++) await h.store.save(waiting(`waiting_${String(i).padStart(3, "0")}`, kind));
+      const dueBefore = new Date(DUE).toISOString();
+      expect((await h.store.listDue({ dueBefore, limit: 100 })).map((r) => r.id)).toEqual(["sub_1"]);
+      const run = await runAt(h, DUE);
+      expect(run.charged.map((r) => r.id)).toEqual(["sub_1"]);
+    },
+  );
 });
 
 describe("cancelAtPeriodEnd over an unsettled charge", () => {

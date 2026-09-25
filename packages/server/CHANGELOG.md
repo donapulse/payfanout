@@ -1,5 +1,17 @@
 # @payfanout/server
 
+## 2.1.0
+
+### Minor Changes
+
+- 1d66371: Stores must persist the new `SubscriptionRecord.renewalAttempt` field verbatim, like `pendingRenewal`, since it is money-safety state, and a `listDue` implementation should now leave out records waiting for `resolvePendingRenewal` (a `pendingRenewal`, or a frozen `renewalAttempt.replay`), as `InMemorySubscriptionStore` does. A renewal charge that ends without a definitive answer (an unreachable or rate-limiting provider, an unknown error, an error marked `outcomeUnknown`, or a first `processing_error`) is now replayed under the same idempotency key and request on the new `replayDelaysMinutes` schedule, within the new `replayWindowHours`, and otherwise frozen until `resolvePendingRenewal` settles it with the key every renewal charge carries as `payfanout_renewal_key` metadata (`parseRenewalIdempotencyKey` reads it back). A card change no longer restarts the period's attempt numbers and a replaced card's decline no longer counts against the new one, a charge failing on a paused or canceled record now records `lastError` and emits `subscription.charge_failed`, `resumeSubscription` refuses while such a charge is unsettled, `retryDelaysHours` rejects non-finite values, and `PaymentService` and `PaymentRouter` keep `outcomeUnknown` on the errors they rebuild.
+
+### Patch Changes
+
+- 8a36429: On a store that drops `lastError` as well as `renewalAttempt`, a renewal without a definitive answer now counts for dunning at once instead of being replayed under its key without end. On a store that drops `renewalAttempt`, the failure of a card replaced while its charge was in flight no longer counts against the new card, which is sent on the next run under the attempt number `failedAttempts` gives: the period may already have used that number, and a provider still holding its key refuses the new card. A pinned renewal request is no longer taken for another request when a store drops or adds an empty `metadata` or `billingDetails` object.
+- Updated dependencies [1d66371]
+  - @payfanout/core@4.2.0
+
 ## 2.0.1
 
 ### Patch Changes

@@ -1,5 +1,13 @@
 # @payfanout/adapter-paypal
 
+## 0.2.11
+
+### Patch Changes
+
+- 659bc82: Report a failed PayPal button render to the `onError` option once. PayPal's SDK hands the failure to the buttons' `onError` and then rejects the render, which reached the host twice, with conflicting `retryable` flags. Every other error PayPal reports while the buttons render is passed on once too, and a host `onError` or `onReady` that throws after a successful render no longer removes the buttons: its exception is reported as uncaught instead.
+- Updated dependencies [1d66371]
+  - @payfanout/core@4.2.0
+
 ## 0.2.10
 
 ### Patch Changes

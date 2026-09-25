@@ -1,5 +1,14 @@
 # @payfanout/adapter-paypal-server
 
+## 2.0.4
+
+### Patch Changes
+
+- 8a36429: Mark `outcomeUnknown` on the retryable `processing_error` of a 409, which PayPal's Payments API returns on an authorization's capture or void and on a capture's refund while a previous request on it is in progress: that request can be the call's own first one under the same `PayPal-Request-Id`, so retry only under the same idempotency key. The Orders API's 409 on an order's authorize or capture, which PayPal documents as a conflict with the order's state, is marked the same way through the shared error mapper.
+- 780a70c: Capture and report a manual-capture payment against its newest authorization, so a reauthorization made through PayPal is honoured, while `cancelPayment` still voids the original authorization, as PayPal requires. Capturing the rest, and `amountCapturable`, never exceed what the order has left, even when the reauthorization holds the full amount again, and a capture PayPal ties to no authorization counts only against the authorizations that existed when it was taken. When what is left can only be estimated, the capture keeps the authorization open rather than closing it.
+- Updated dependencies [1d66371]
+  - @payfanout/core@4.2.0
+
 ## 2.0.3
 
 ### Patch Changes

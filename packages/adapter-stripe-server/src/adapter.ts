@@ -126,10 +126,19 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       config.requestTimeoutMs !== undefined &&
       (!Number.isInteger(config.requestTimeoutMs) || config.requestTimeoutMs <= 0)
     ) {
-      // The SDK's timeout option takes whole milliseconds and rejects fractions.
+      // The SDK takes whole milliseconds and silently swaps any non-integer
+      // for its 80000 default, so a bad setting would go unnoticed; zero and
+      // negative integers it would pass through.
       throw PayFanoutError.invalidRequest(
         "StripeServerAdapter config.requestTimeoutMs must be a positive integer (milliseconds)",
       );
+    }
+    if (
+      config.maxNetworkRetries !== undefined &&
+      (!Number.isInteger(config.maxNetworkRetries) || config.maxNetworkRetries < 0)
+    ) {
+      // A non-integer would silently become the SDK's default of 2 retries.
+      throw PayFanoutError.invalidRequest("StripeServerAdapter config.maxNetworkRetries must be an integer >= 0");
     }
     this.config = config;
   }

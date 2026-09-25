@@ -406,7 +406,7 @@ describe("updates, retrieval, listing", () => {
     expect(charges[0]!.amount).toBe(4900); // updated plan already billed
     const updated = await manager.updateSubscription("sub_1", { savedPaymentMethodToken: "tok_new_card" });
     expect(updated.failedAttempts).toBe(0);
-    expect(updated.nextRetryAt).toBeUndefined();
+    expect(updated.nextRetryAt).toBe(new Date(clock.now).toISOString()); // due at once
 
     const run = await manager.chargeDueSubscriptions(); // no backoff left — retries immediately
     expect(run.charged).toHaveLength(1);

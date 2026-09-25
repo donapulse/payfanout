@@ -108,42 +108,68 @@ never resolve stays frozen — the safe default is to not charge twice, never to
 Some failed charges do not say whether money moved: the PSP was unreachable or rate
 limiting, the error was unknown, the adapter marked it `outcomeUnknown`, or a first
 `processing_error` came back. The manager then **pins** the attempt. `renewalAttempt.replay`
-holds the idempotency key and the request exactly as sent, and every later charge for the
-period repeats that request under that key, so a charge whose answer was lost is read back
-from the PSP instead of being made twice. Nothing counts as failed yet: the record goes
-`past_due` and the replays follow `replayDelaysMinutes` (default 5, 30 and 120 minutes),
-well inside the time a PSP keeps a key (Stripe may prune one once it is 24 hours old). A
-replay run that ends without an answer counts as one failed attempt, and the replays go on
-at the dunning pace until the schedule ends the subscription.
+holds the idempotency key and the request exactly as sent, and later charges for the period
+repeat that request under that key. Where the PSP keeps a key's result (Stripe does for a
+request that began executing) the replay reads the original back instead of charging again;
+where it refuses a reused key, the adapter reads the original back itself and marks what it
+cannot read back `outcomeUnknown`. Nothing counts as failed meanwhile: the record goes
+`past_due` and the replays follow `replayDelaysMinutes` (default 5, 30, 120, 360 and 720
+minutes).
+
+A replay dedupes only while the PSP still holds the key: Stripe lets clients retry "within
+24 hours", and a key reused after it is pruned starts a new request. So replays go out only
+within `replayWindowHours` of the first send (default 24). Once the schedule is spent, or
+the next replay would fall outside the window, the charge is **frozen**: the cron sends
+nothing more for the period, emits `subscription.charge_pending`, and waits for
+`resolvePendingRenewal`, as it does for a renewal on async rails. Stripe answers a `500`
+with the same cached `500` for as long as it keeps the key and may still complete the
+charge afterwards, notifying you by webhook, so such a charge usually ends frozen and is
+settled from that webhook.
 
 A definitive answer settles the pin. A success pays the period. A decline, an
-authentication demand or a request error moves on to a new attempt number, and a second
-`processing_error` for the same request counts as that attempt's own failure. Attempt
-numbers are never reused, so a card set with `updateSubscription` is charged under a key the
-period has not used, but only after the pinned charge of the old card has been replayed,
-because it may already have paid the period. If that replay is declined, the new card is
-charged on the next run without waiting for a dunning delay; plan and metadata changes wait
-for the pin in the same way.
+authentication demand or a request error is a failed attempt for dunning and moves on to a
+new attempt number; a second `processing_error` for the same request counts as that
+attempt's own failure. Attempt numbers are never reused, so a card set with
+`updateSubscription` is charged under a key the period has not used, but only after the
+pinned charge of the old card has been replayed, because it may already have paid the
+period. If that replay is declined, the new card is charged on the next run, and the old
+card's decline does not count against it. Plan and metadata changes wait for the pin in the
+same way, and a subscription set to cancel at period end replays the pin before it ends: a
+charge that went through moves the period end.
 
-When the PSP shows what became of a pinned charge, in its dashboard or through a webhook,
-settle it with the pinned key:
+Every renewal charge carries its key in its metadata as `payfanout_renewal_key` (next to
+`payfanout_subscription_id`), so a payment webhook names the attempt it belongs to. One webhook
+handler then settles both kinds, pinned charges by their key and pending ones by their
+payment id:
 
 ```ts
-const pinned = record.renewalAttempt?.replay;
-if (pinned) {
-  await subs.resolvePendingRenewal(record.id, {
-    status: "succeeded",              // the charge went through: it pays the period
-    pspPaymentId: foundPaymentId,     // becomes lastPaymentId
-    idempotencyKey: pinned.idempotencyKey,
-  });
-  // or { status: "failed", idempotencyKey } once the PSP shows no such charge
+// in your payment.succeeded / payment.failed webhook handler:
+if ((event.type === "payment.succeeded" || event.type === "payment.failed") && event.pspPaymentId) {
+  const info = await payments.retrievePayment(event.pspName, event.pspPaymentId);
+  const subscriptionId = info.metadata?.payfanout_subscription_id;
+  if (subscriptionId) {
+    const renewalKey = info.metadata?.payfanout_renewal_key;
+    await subs.resolvePendingRenewal(subscriptionId, {
+      status: event.type === "payment.succeeded" ? "succeeded" : "failed",
+      pspPaymentId: info.pspPaymentId, // becomes lastPaymentId, taken on trust
+      ...(renewalKey ? { idempotencyKey: renewalKey } : {}),
+    }); // an event that settles nothing is refused with invalid_request: log it
+  }
 }
 ```
 
-The key is required because a failure webhook alone cannot settle a pin: the payment it
-names may belong to an earlier attempt. A canceled subscription keeps its pin, so a charge
-that may have gone through never drops out of sight. Stores must persist `renewalAttempt`
-verbatim, like `pendingRenewal`.
+Settling with the key is what ties an outcome to the pinned charge: a failure that names an
+earlier attempt's key is a no-op, and a key that matches no attempt is refused. A PSP that
+stores no metadata carries the key elsewhere: on Paysafe the charge's `merchantRefNum` is
+the key itself, and `parseRenewalIdempotencyKey` reads the subscription id back from it. A settled failure counts for dunning like any declined attempt. A canceled
+subscription keeps its pin, and a paused one cannot resume until the pin is settled, so a
+charge that may have gone through never drops out of sight.
+
+::: warning Persist `renewalAttempt` before upgrading
+`renewalAttempt` is money-safety state, like `pendingRenewal`: stores must persist it
+verbatim. A store that drops it cannot keep a pin, so the manager falls back to counting
+each uncertain failure for dunning under a new key, as releases before pins did.
+:::
 
 ### Scaling the cron: `listDue`
 

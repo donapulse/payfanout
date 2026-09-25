@@ -17,6 +17,7 @@ export {
 export {
   addInterval,
   InMemorySubscriptionStore,
+  parseRenewalIdempotencyKey,
   SubscriptionManager,
   type ChargeDueResult,
   type CreateSubscriptionInput,

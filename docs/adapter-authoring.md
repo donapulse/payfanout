@@ -92,7 +92,9 @@ and `PaymentService` will hold you to:
   conformance suite asserts both. When a money-moving call may have taken effect although
   it failed here (the answer was lost, or the PSP could not say), set `outcomeUnknown:
   true`: callers then retry only under the same `idempotencyKey`, and the subscription
-  engine never moves such a renewal to a new key.
+  engine never moves such a renewal to a new key. A PSP's refusal of a reused key (Stripe's
+  `idempotency_error`, a duplicate `merchantRefNum`) proves the key's first request ran, so
+  it carries the flag too unless the adapter has read that request's outcome back.
 - **Idempotency:** `idempotencyKey` is REQUIRED on every mutating call — session
   creation, completion, refunds, **capture, cancel, and verification included**.
   Forward it through your PSP's mechanism (Stripe: `Idempotency-Key` request option;

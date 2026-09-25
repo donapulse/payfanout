@@ -2277,3 +2277,21 @@ description of what v2 changes is what the migration then had to implement.
   the adapter, reads `signature` first and still tolerates `x-signature` /
   `x-paysafe-signature`; raw-body hashing, constant-time comparison and key rotation are
   unchanged.
+
+## PayPal: captures after a reauthorization (2026-09-25)
+
+- **The newest authorization that was not denied carries the hold.** Payments v2 (doc-verified
+  2026-09-25, `/api/payments/v2/schema.json`): a reauthorization "Reauthorizes an authorized
+  PayPal account payment", may be repeated within the 29-day period, and its example answers
+  with an authorization id different from the one reauthorized; the Extend an authorization
+  guide (`/checkout/extend-authorization`) says it generates "a new authorization with a
+  refreshed expiration date". Neither says what status the original then reports, so the
+  adapter takes the newest authorization, by `create_time` and then list order, as the one
+  to capture, void and report, and an older one as superseded whatever its status. A denied
+  newer authorization is skipped, since it replaced nothing. The adapter never reauthorizes
+  itself; this covers a host that reauthorizes through PayPal. AMBIGUOUS, sandbox check:
+  reauthorize past the honor period, then GET the order and record both authorizations' status.
+- **Captures count against the authorization they name.** The remainder counts the captures
+  whose `supplementary_data.related_ids.authorization_id` (Payments v2 `related_ids`) or `up`
+  link names that authorization. When a capture names none, every capture counts, so the
+  remainder errs low and a capture never reaches past the hold.

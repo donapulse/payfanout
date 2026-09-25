@@ -459,7 +459,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     if (amount !== undefined) assertPositiveAmount(amount, "capture amount");
     const order = await this.resolveOrder(pspPaymentId);
     const unit = order.purchase_units?.[0];
-    const authorization = unit?.payments?.authorizations?.[0];
+    const authorization = holdingAuthorization(unit?.payments?.authorizations);
     if (!authorization) {
       throw PayFanoutError.invalidRequest(
         `Payment "${pspPaymentId}" has no authorization to capture — only manual-capture (AUTHORIZE) orders support capturePayment`,
@@ -468,7 +468,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     }
     // PayPal requires the capture in the authorization's own currency.
     const currency = (authorization.amount?.currency_code ?? unit?.amount?.currency_code ?? "USD").toUpperCase();
-    const captures = unit?.payments?.captures ?? [];
+    const captures = capturesAgainst(authorization, unit?.payments?.captures ?? []);
     const held = heldCaptureTotal(captures, currency);
     const authorized = authorizedAmount(authorization, currency);
     let captureAmount = amount;
@@ -539,7 +539,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
         order,
       );
     }
-    const authorization = unit?.payments?.authorizations?.[0];
+    const authorization = holdingAuthorization(unit?.payments?.authorizations);
     if (authorization) {
       if ((authorization.status ?? "").toUpperCase() !== "VOIDED") {
         await this.request<undefined>(
@@ -948,11 +948,12 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       activeCaptures.filter((c) => isSettledCaptureStatus(c.status)).map((c) => c.amount),
       currency,
     );
-    const authorization = unit?.payments?.authorizations?.[0];
+    const authorization = holdingAuthorization(unit?.payments?.authorizations);
     const authorized = authorization ? authorizedAmount(authorization, currency) : undefined;
+    const held = authorization ? capturesAgainst(authorization, captures) : [];
     const amountCapturable =
       authorization && authorized !== undefined
-        ? capturableRemainder(authorization, captures, captured, authorized)
+        ? capturableRemainder(authorization, held, heldCaptureTotal(held, currency), authorized)
         : undefined;
     return {
       id: unit?.custom_id ?? order.id,
@@ -1208,7 +1209,7 @@ function completedOrderStatus(
     if (states.some((s) => s === "PENDING")) return "processing";
     return "failed"; // every capture DECLINED/FAILED
   }
-  const authorization = authorizations[0];
+  const authorization = holdingAuthorization(authorizations);
   if (authorization) {
     const state = (authorization.status ?? "").toUpperCase();
     if (state === "VOIDED") return "canceled";
@@ -1217,6 +1218,44 @@ function completedOrderStatus(
     return "requires_capture"; // CREATED / PENDING / PARTIALLY_CAPTURED
   }
   return "processing"; // COMPLETED with no money object yet — still settling
+}
+
+/**
+ * The authorization that carries the hold. A reauthorization creates a new
+ * authorization, with its own id, beside the original; captures and voids go
+ * against it, and what becomes of the original is undocumented. So the newest
+ * authorization decides, unless it was denied (a denied one replaced nothing),
+ * and an older one counts as superseded whatever status it still reports. The
+ * adapter never reauthorizes itself: a host may, through PayPal.
+ */
+function holdingAuthorization(
+  authorizations: PayPalAuthorizationLike[] | undefined,
+): PayPalAuthorizationLike | undefined {
+  if (!authorizations?.length) return undefined;
+  const newestFirst = authorizations
+    .map((authorization, index) => ({ authorization, index, created: Date.parse(authorization.create_time ?? "") }))
+    .sort((a, b) => (Number.isNaN(a.created) || Number.isNaN(b.created) ? 0 : b.created - a.created) || b.index - a.index)
+    .map((entry) => entry.authorization);
+  return newestFirst.find((a) => (a.status ?? "").toUpperCase() !== "DENIED") ?? newestFirst[0];
+}
+
+/**
+ * The captures taken from one authorization, told by the capture's
+ * related_ids.authorization_id or its `up` link. When a capture names no
+ * authorization every capture counts, so the remainder errs low and a
+ * capture never reaches past the hold.
+ */
+function capturesAgainst(authorization: PayPalAuthorizationLike, captures: PayPalCaptureLike[]): PayPalCaptureLike[] {
+  const owners = captures.map(capturedAuthorizationId);
+  if (owners.some((owner) => owner === undefined)) return captures;
+  return captures.filter((_, index) => owners[index] === authorization.id);
+}
+
+function capturedAuthorizationId(capture: PayPalCaptureLike): string | undefined {
+  const related = capture.supplementary_data?.related_ids?.authorization_id;
+  if (related) return related;
+  const up = capture.links?.find((link) => link.rel === "up" && (link.href ?? "").includes("/v2/payments/authorizations/"));
+  return up?.href ? decodeURIComponent(up.href.slice(up.href.lastIndexOf("/") + 1)) : undefined;
 }
 
 /** Money moved and stayed (or was later refunded — refund state is separate). */

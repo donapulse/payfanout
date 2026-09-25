@@ -165,6 +165,8 @@ export class FakePayPalApi {
   requestCount = 0;
   lastRequestBody: unknown;
   lastRequestHeaders: Record<string, string> = {};
+  /** Every authenticated request, as "METHOD path". */
+  readonly requestLog: string[] = [];
 
   constructor(options: { clientId?: string; clientSecret?: string; webhookId?: string; now?: () => number; tokenTtlSeconds?: number } = {}) {
     this.clientId = options.clientId ?? "fake-client-id";
@@ -193,6 +195,41 @@ export class FakePayPalApi {
         address: { country_code: "US" },
       },
     };
+  }
+
+  /**
+   * What a host's own POST /v2/payments/authorizations/{id}/reauthorize leaves
+   * on the order: a new authorization, with its own id and a later
+   * create_time, beside the original. What becomes of the original is
+   * undocumented, so the test decides (`original`: its status afterwards).
+   */
+  reauthorize(
+    orderId: string,
+    options: { original?: string; amount?: FakeMoney; laterByMs?: number; status?: string } = {},
+  ): string {
+    const order = this.orders.get(orderId);
+    const unit = order?.purchase_units[0];
+    const first = unit?.payments?.authorizations?.[0];
+    if (!order || !unit || !first) throw new Error(`FakePayPalApi.reauthorize: no authorization on ${orderId}`);
+    const auth: FakeAuthorization = {
+      id: `8AA831015G51${String(++this.seq).padStart(5, "0")}`,
+      status: options.status ?? "CREATED",
+      amount: options.amount ?? { ...first.amount },
+      expiration_time: new Date(this.now() + 29 * 24 * 3600 * 1000).toISOString(),
+      create_time: new Date(Date.parse(first.create_time) + (options.laterByMs ?? 4 * 24 * 3600 * 1000)).toISOString(),
+    };
+    if (options.original !== undefined) first.status = options.original;
+    unit.payments = { ...(unit.payments ?? {}), authorizations: [...(unit.payments?.authorizations ?? []), auth] };
+    this.authorizations.set(auth.id, { auth, orderId, captured: 0, closed: false });
+    return auth.id;
+  }
+
+  /** Drops what ties the order's captures to their authorization (related_ids and the `up` link). */
+  stripCaptureAttribution(orderId: string): void {
+    for (const capture of this.orders.get(orderId)?.purchase_units[0]?.payments?.captures ?? []) {
+      delete capture.supplementary_data.related_ids.authorization_id;
+      capture.links = capture.links.filter((link) => link.rel !== "up");
+    }
   }
 
   registerWebhookFixture(rawBody: string, headers: Record<string, string>): void {
@@ -310,6 +347,7 @@ export class FakePayPalApi {
     }
 
     this.lastRequestHeaders = headers;
+    this.requestLog.push(`${method} ${path}`);
     const body = rawBody !== undefined && isJson(rawBody) ? (JSON.parse(rawBody) as unknown) : undefined;
     // Tracks the last request that CARRIED a body (bodiless GETs don't erase it).
     if (body !== undefined && path !== "/v1/notifications/verify-webhook-signature") this.lastRequestBody = body;

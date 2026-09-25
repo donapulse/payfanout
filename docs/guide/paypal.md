@@ -269,6 +269,13 @@ and never adds an overage itself. Authorizations last 29 days, and captures succ
 within the first three days. A remainder you will not capture is left to expire;
 `cancelPayment` voids only an authorization with no capture yet.
 
+If you reauthorize through PayPal (the adapter never does), PayPal creates a new
+authorization, with its own id, beside the original. The adapter then captures, voids and
+reports against the newest authorization, unless it was denied; an older one counts as
+superseded whatever status it still reports. The remainder counts the captures PayPal ties
+to that authorization (`related_ids.authorization_id` or the capture's `up` link); when a
+capture names none, every capture counts, so the remainder errs low.
+
 ### `amountRefunded` caveat
 
 PayPal's capture object carries no cumulative refunded total. `retrievePayment` reports

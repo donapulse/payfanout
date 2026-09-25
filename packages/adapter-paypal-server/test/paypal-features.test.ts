@@ -199,6 +199,56 @@ describe("PayPal manual capture (intent AUTHORIZE)", () => {
     return { adapter, fake, orderId: session.pspSessionId };
   }
 
+  it.each([
+    ["stays CREATED", "CREATED"],
+    ["is voided", "VOIDED"],
+  ])("after a reauthorization whose original %s, captures and reports against the new authorization", async (_label, original) => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    const reauthorized = fake.reauthorize(orderId, { original });
+    const before = await adapter.retrievePayment(orderId);
+    expect(before).toMatchObject({ status: "requires_capture", amountCapturable: 2000 });
+
+    const captured = await adapter.capturePayment(orderId, 700, "k-cap-reauth");
+    expect(fake.requestLog).toContain(`POST /v2/payments/authorizations/${reauthorized}/capture`);
+    expect(captured).toMatchObject({ amountCaptured: 700, amountCapturable: 1300 });
+    const rest = await adapter.capturePayment(orderId, undefined, "k-cap-reauth-rest");
+    expect(fake.lastRequestBody).toEqual({ amount: { currency_code: "USD", value: "13.00" }, final_capture: true });
+    expect(rest).toMatchObject({ status: "succeeded", amountCaptured: 2000, amountCapturable: 0 });
+  });
+
+  it("voids the reauthorized hold, not the original, on cancel", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    const reauthorized = fake.reauthorize(orderId, { original: "CREATED" });
+    const canceled = await adapter.cancelPayment(orderId, "k-void-reauth");
+    expect(fake.requestLog).toContain(`POST /v2/payments/authorizations/${reauthorized}/void`);
+    expect(canceled.status).toBe("canceled");
+  });
+
+  it("takes the later authorization when both report the same create_time", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    const reauthorized = fake.reauthorize(orderId, { original: "CREATED", laterByMs: 0 });
+    await adapter.capturePayment(orderId, 500, "k-cap-order");
+    expect(fake.requestLog).toContain(`POST /v2/payments/authorizations/${reauthorized}/capture`);
+  });
+
+  it("keeps the original authorization in charge when the newer one was denied", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    fake.reauthorize(orderId, { status: "DENIED" });
+    expect(await adapter.retrievePayment(orderId)).toMatchObject({ status: "requires_capture", amountCapturable: 2000 });
+    await adapter.capturePayment(orderId, 500, "k-cap-denied");
+    const original = fake.requestLog.find((line) => line.endsWith("/capture"));
+    expect(original).not.toContain("8AA831015G51");
+  });
+
+  it("counts every capture against the hold when captures name no authorization", async () => {
+    const { adapter, fake, orderId } = await authorizedPayment();
+    await adapter.capturePayment(orderId, 700, "k-cap-first");
+    fake.reauthorize(orderId, { original: "PARTIALLY_CAPTURED" });
+    expect((await adapter.retrievePayment(orderId)).amountCapturable).toBe(2000); // the new hold, attributed
+    fake.stripCaptureAttribution(orderId);
+    expect((await adapter.retrievePayment(orderId)).amountCapturable).toBe(1300); // unattributed: errs low
+  });
+
   it("authorizes on completePayment, then captures via the authorization", async () => {
     const { adapter, fake, orderId } = await authorizedPayment();
     const captured = await adapter.capturePayment(orderId, undefined, "k-cap");

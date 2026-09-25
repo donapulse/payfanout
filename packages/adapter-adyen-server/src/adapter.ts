@@ -461,7 +461,9 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
    * Every answer is compared with the session it completes. A /payments
    * answer naming another merchant reference or amount is refused: the
    * request named the session's own, so the answer belongs to another request
-   * (an idempotencyKey reused across sessions replays the first answer). A
+   * (an idempotencyKey reused across sessions replays the first answer), and
+   * unless it is Refused, Error or Cancelled the refusal carries
+   * outcomeUnknown (see anotherRequestsAnswer). A
    * /payments/details answer stands for the session only when it names the
    * session's merchant reference and amount (see detailsBelongToSession); one
    * that does not carries no pspPaymentId and reads "processing". The
@@ -496,16 +498,7 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
       );
       // Checked before the refusal: an answer to another request says nothing
       // about this card, a refusal included.
-      if (compareWithSession(response, context).differs) {
-        throw new PayFanoutError({
-          code: "invalid_request",
-          message:
-            "This Adyen answer belongs to another request: an idempotencyKey reused across sessions replays the first answer.",
-          retryable: false,
-          raw: response,
-          pspName: this.pspName,
-        });
-      }
+      if (compareWithSession(response, context).differs) throw this.anotherRequestsAnswer(response, context);
       throwIfRefused(response);
       // The request carried the session's own reference and amount.
       ownAnswer = true;
@@ -621,6 +614,31 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
   }
 
   // --- internals ------------------------------------------------------------
+
+  /**
+   * A /payments answer naming another reference or amount: Adyen answered
+   * the key with its first request's stored response. Unless that payment was
+   * refused, failed or cancelled, it may be the payment this call was meant
+   * to make, so the refusal carries outcomeUnknown and no new key follows
+   * until that payment is known to be another one.
+   */
+  private anotherRequestsAnswer(response: AdyenPaymentResponse, context: AdyenSessionContextV1): PayFanoutError {
+    const outcome = mapAdyenResultCode(response.resultCode ?? "", context.captureMethod);
+    const live = outcome !== "failed" && outcome !== "canceled";
+    const reused =
+      "This Adyen answer belongs to another request: an idempotencyKey reused across sessions replays the first answer";
+    return new PayFanoutError({
+      code: "invalid_request",
+      message: live
+        ? `${reused}, a payment that has not failed. It may be the payment this request was meant to make, so use a ` +
+          "new idempotencyKey only once that payment is known to be another one."
+        : `${reused}.`,
+      retryable: false,
+      outcomeUnknown: live,
+      raw: response,
+      pspName: this.pspName,
+    });
+  }
 
   /**
    * Completion correctness: /payments/details finishes whichever payment the
@@ -754,8 +772,10 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
    * response, so a capture or refund acknowledgement echoing a different amount
    * or currency is the answer to an earlier request under the same key: it is
    * rejected, since reporting the requested amount as accepted would be false.
-   * One echoing no amount is accepted, and a malformed echo confirms nothing
-   * (retryable, like a missing pspReference).
+   * That request is only received, its outcome known from the webhook alone,
+   * and it may be the one this call was meant to make, so the refusal always
+   * carries outcomeUnknown. One echoing no amount is accepted, and a malformed
+   * echo confirms nothing (retryable, like a missing pspReference).
    */
   private readAcknowledgement(
     operation: "capture" | "cancel" | "refund",
@@ -782,10 +802,12 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
         throw new PayFanoutError({
           code: "invalid_request",
           message:
-            `Adyen already accepted a ${operation} of ${echoed.value} ${echoed.currency} under this idempotencyKey ` +
-            `(pspReference ${response.pspReference}). If that is the ${operation} you meant, do not send it ` +
-            `again; a further ${operation} needs a new idempotencyKey.`,
+            `Adyen already received a ${operation} of ${echoed.value} ${echoed.currency} under this idempotencyKey ` +
+            `(pspReference ${response.pspReference}), whose outcome only its webhook reports. It may be the ` +
+            `${operation} this request was meant to make, so send a further ${operation} under a new ` +
+            `idempotencyKey only once that ${operation} is known to be another one.`,
           retryable: false,
+          outcomeUnknown: true,
           raw: response,
           pspName: this.pspName,
         });

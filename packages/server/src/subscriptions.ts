@@ -340,11 +340,12 @@ export interface SubscriptionManagerOptions {
   catchUpLimit?: number;
   /**
    * Observability: fired on every lifecycle transition. Errors are swallowed.
-   * Delivery is at-least-once: concurrent chargeDueSubscriptions runs converge
-   * on charges at the PSP (deterministic idempotency keys) but may each emit
-   * the same transition — dedupe on (subscription.id, type, currentPeriodEnd),
-   * never on occurredAt (it differs per delivery), if exactly-once matters to
-   * the host.
+   * Delivery is at-least-once: overlapping chargeDueSubscriptions runs that
+   * send the same renewal converge on one PSP charge (deterministic
+   * idempotency keys; see chargeDueSubscriptions for runs that send another
+   * request under the same key) but may each emit the same transition —
+   * dedupe on (subscription.id, type, currentPeriodEnd), never on occurredAt
+   * (it differs per delivery), if exactly-once matters to the host.
    */
   onEvent?: (event: SubscriptionEvent) => void | Promise<void>;
   /** Injected clock (ms since epoch) for tests. */
@@ -1318,7 +1319,9 @@ export class SubscriptionManager {
 
   /**
    * The charge used a card the host has since replaced: its failure costs the
-   * new card nothing, which is charged on the next run.
+   * new card nothing, which goes out on the next run. On a store that drops
+   * renewalAttempt it goes out under the attempt number failedAttempts gives,
+   * which the period may already have used.
    */
   private async recordReplacedCardFailure(
     base: SubscriptionRecord,

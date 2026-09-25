@@ -505,6 +505,28 @@ describe("Paysafe card completion replays", () => {
     });
   });
 
+  it("refuses another amount under a key whose payment was voided without leaving the outcome open", async () => {
+    const { adapter, fake } = makePair();
+    const authorized = await adapter.completePayment({
+      pspSessionId: await cardSession(adapter, { captureMethod: "manual" }),
+      clientToken: "tok_a",
+      idempotencyKey: "order-9",
+    });
+    expect((await adapter.cancelPayment(authorized.pspPaymentId, "k-void")).status).toBe("canceled");
+    const err = await rejection(
+      adapter.completePayment({
+        pspSessionId: await cardSession(adapter, { amount: 2500 }),
+        clientToken: "tok_b",
+        idempotencyKey: "order-9",
+      }),
+    );
+    // A voided authorization moved no money, so it cannot be the one this call was meant to make.
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false, raw: { found: [{ status: "CANCELLED" }] } });
+    expect(err.outcomeUnknown).toBeUndefined();
+    expect(err.message).toContain("every new request needs its own idempotency key");
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
   it("only counts lookup records filed under this very reference", async () => {
     let posts = 0;
     let reads = 0;
@@ -940,6 +962,48 @@ describe("Paysafe modification replays", () => {
     });
     expect(err.message).toContain("different Paysafe settlement");
     expect(sent(fake, SETTLE)).toHaveLength(2);
+  });
+
+  it("leaves a capture or refund key's outcome open only while its record there may have moved money", async () => {
+    const statuses: Array<[string, boolean]> = [
+      ["PENDING", true],
+      ["COMPLETED", true],
+      ["CANCELLED", false],
+      ["EXPIRED", false],
+    ];
+    for (const [status, live] of statuses) {
+      const fake = new FakePaysafeApi();
+      // What each key already holds at Paysafe: another request's record, for another amount.
+      const held: Record<string, { collection: string; record: Record<string, unknown> }> = {
+        "k-capture": { collection: "settlements", record: { id: "stl_held", merchantRefNum: "k-capture", amount: 500, status } },
+        "k-refund": {
+          collection: "refunds",
+          record: { id: "ref_held", merchantRefNum: "k-refund", amount: 400, currencyCode: "USD", status },
+        },
+      };
+      const { adapter } = makePair({
+        fetch: async (input, init) => {
+          const body = init?.body ? (JSON.parse(String(init.body)) as { merchantRefNum?: string }) : undefined;
+          const key = new URL(urlOf(input)).searchParams.get("merchantRefNum") ?? body?.merchantRefNum;
+          const holding = key === undefined ? undefined : held[key];
+          if (!holding) return fake.fetch(input, init);
+          if (init?.method === "POST") {
+            const duplicate = { error: { code: "5031", message: "The transaction you have submitted has already been processed." } };
+            return new Response(JSON.stringify(duplicate), { status: 409 });
+          }
+          return new Response(JSON.stringify({ [holding.collection]: [holding.record] }));
+        },
+      });
+      const errors = [
+        await rejection(adapter.capturePayment(await authorize(adapter), 700, "k-capture")),
+        await rejection(adapter.refundPayment({ pspPaymentId: await settle(adapter), amount: 500, idempotencyKey: "k-refund" })),
+      ];
+      for (const err of errors) {
+        expect(err, status).toMatchObject({ code: "invalid_request", retryable: false, raw: { found: [{ status }] } });
+        expect(err.outcomeUnknown, status).toBe(live ? true : undefined);
+        expect(err.message, status).toContain(live ? "known to be another one" : "every new request needs its own idempotency key");
+      }
+    }
   });
 
   it("surfaces a capture Paysafe refuses on state with nothing to read back: the documented 402 stands", async () => {
@@ -1492,23 +1556,24 @@ describe("Paysafe payment-handle replays", () => {
         idempotencyKey: "k-eft",
       }),
     );
-    expect(err).toMatchObject({ code: "invalid_request" });
+    // The handle was never charged, so nothing under the key moved money.
+    expect(err).toMatchObject({ code: "invalid_request", raw: { found: [{ status: "PAYABLE" }] } });
+    expect(err.outcomeUnknown).toBeUndefined();
     expect(err.message).toContain("different Paysafe payment handle");
+    expect(err.message).toContain("every new request needs its own idempotency key");
     expect(fake.uniqueHandleCreations).toBe(1);
     expect(fake.uniquePaymentCreations).toBe(0);
   });
 
-  it("rejects another amount under a bank-debit key whose failed attempt left its handle", async () => {
-    // Unlike a card key, the failed attempt's handle states the amount it was minted for.
+  it("leaves the outcome open on a bank-debit key whose spent handle for another amount shows no payment", async () => {
     const { adapter, fake } = makePair();
-    fake.recordFailure(CREATE_PAYMENT, DECLINED_BY_ISSUER);
-    await rejection(
-      adapter.completePayment({
-        pspSessionId: await cardSession(adapter, eftSession(12_50)),
-        clientToken: eftEnvelope,
-        idempotencyKey: "k-eft",
-      }),
-    );
+    await adapter.completePayment({
+      pspSessionId: await cardSession(adapter, eftSession(12_50)),
+      clientToken: eftEnvelope,
+      idempotencyKey: "k-eft",
+    });
+    // The lookup does not show the payment that spent the key's handle yet.
+    fake.hideFromLookups("payments", "k-eft");
     const err = await rejection(
       adapter.completePayment({
         pspSessionId: await cardSession(adapter, eftSession(13_00)),
@@ -1516,9 +1581,47 @@ describe("Paysafe payment-handle replays", () => {
         idempotencyKey: "k-eft",
       }),
     );
-    expect(err).toMatchObject({ code: "invalid_request" });
+    expect(err).toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      outcomeUnknown: true,
+      raw: { expected: { amount: 13_00 }, found: [{ amount: 12_50, status: "COMPLETED" }] },
+    });
     expect(err.message).toContain("different Paysafe payment handle");
-    expect(fake.uniquePaymentCreations).toBe(0);
+    expect(err.message).toContain("a payment handle under it is spent");
+    expect(err.message).toContain("known to be another one");
+    expect(fake.uniqueHandleCreations).toBe(1);
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
+  it("rejects another amount under a bank-debit key whose failed attempt left its handle", async () => {
+    // Unlike a card key, the failed attempt's handle states the amount it was minted for.
+    for (const likeDeclineExample of [false, true]) {
+      const { adapter, fake } = makePair();
+      fake.failedPaymentsLikeDeclineExample = likeDeclineExample;
+      fake.recordFailure(CREATE_PAYMENT, DECLINED_BY_ISSUER);
+      await rejection(
+        adapter.completePayment({
+          pspSessionId: await cardSession(adapter, eftSession(12_50)),
+          clientToken: eftEnvelope,
+          idempotencyKey: "k-eft",
+        }),
+      );
+      const err = await rejection(
+        adapter.completePayment({
+          pspSessionId: await cardSession(adapter, eftSession(13_00)),
+          clientToken: eftEnvelope,
+          idempotencyKey: "k-eft",
+        }),
+      );
+      // The spent handle is the declined payment's, filed with or without it: nothing moved money.
+      const label = `filed like the decline example: ${likeDeclineExample}`;
+      expect(err, label).toMatchObject({ code: "invalid_request", raw: { found: [{ status: "COMPLETED" }] } });
+      expect(err.outcomeUnknown, label).toBeUndefined();
+      expect(err.message, label).toContain("different Paysafe payment handle");
+      expect(err.message, label).toContain("every new request needs its own idempotency key");
+      expect(fake.uniquePaymentCreations).toBe(0);
+    }
   });
 
   it("debits once when two identical bank completions race under one key", async () => {

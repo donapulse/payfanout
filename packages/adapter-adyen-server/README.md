@@ -63,8 +63,11 @@ with `invalid_request`, and an answer that does not name the session's merchant 
 amount reads `processing` with no `pspPaymentId`, until the `AUTHORISATION` webhook supplies
 the reference. A `/payments` answer naming another merchant reference or amount is refused
 too: it belongs to another request, since an `idempotencyKey` reused across sessions replays
-the first answer. An empty `pspPaymentId` is not a reference — capture, cancel and refund
-refuse it — so correlate such a payment by `PaymentInfo.id`, the merchant reference.
+the first answer. Unless that answer is `Refused`, `Error` or `Cancelled`, the refusal carries
+`outcomeUnknown`: that payment may be the one the call was meant to make, so use a new key
+only once it is known to be another. An empty `pspPaymentId` is not a reference — capture,
+cancel and refund refuse it — so correlate such a payment by `PaymentInfo.id`, the merchant
+reference.
 
 The shopper email Adyen asks for on Visa and JCB 3-D Secure 2 payments is the session's
 `receiptEmail`, or its `billingDetails.email`. Both ride the signed session context, whose
@@ -89,11 +92,12 @@ not confirmed; the confirmation is the webhook.
 They resolve only on a real acknowledgement: one carrying the modification's own
 `pspReference`. An answer without it rejects with a retryable `processing_error` (a replay
 under the same key cannot repeat the modification). A capture or refund acknowledgement that
-echoes another amount or currency rejects with `invalid_request`: it is Adyen's stored answer
-to an earlier capture or refund under the same idempotency key, which Adyen already accepted,
-and the error names its amount and `pspReference`. If that is the one you meant, do not send
-it again; a further capture or refund needs a new key. One that echoes no amount is accepted,
-as Adyen's refund guide shows acknowledgements without it.
+echoes another amount or currency rejects with `invalid_request` marked `outcomeUnknown`: it
+is Adyen's stored answer to an earlier capture or refund under the same idempotency key, which
+Adyen has received and whose outcome only its webhook reports, and the error names its amount
+and `pspReference`. It may be the one you meant: send a further capture or refund under a new
+key only once that one is known to be another. One that echoes no amount is accepted, as
+Adyen's refund guide shows acknowledgements without it.
 
 Consequences worth designing around:
 
@@ -205,10 +209,10 @@ Customer Area settings it relies on.
   typed `validation`/`configuration`/`security` (those, and 501, reject as `invalid_request`),
   a 2xx that is not a JSON object, and anything Adyen sends with `transient-error: true` (in
   any letter case). The 5xx retry needs no `transient-error` header, deliberately: Adyen does
-  not store a request an internal error stopped, and the retry carries the same key. A 704,
-  any other 409 or a transient 4xx that outlives the retries rejects with a
-  `processing_error` marked `outcomeUnknown`: the request under the same key may still go
-  through, so retry only under that key.
+  not store a request an internal error stopped, and the retry carries the same key. A 704
+  or a transient 4xx that outlives the retries, and any other 409, which is not retried,
+  rejects with a `processing_error` marked `outcomeUnknown`: the request under the same key
+  may still go through, so retry only under that key.
 - **`returnUrl` is required on every payment.** Pass it per session, or set
   `defaultReturnUrl` once; a session with neither is refused with `invalid_request` instead
   of reaching Adyen, and so is one whose URL Adyen would reject: not absolute with a scheme

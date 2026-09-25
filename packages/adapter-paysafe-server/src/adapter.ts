@@ -1031,6 +1031,37 @@ function isFailedRecord(record: RefNumRecord): boolean {
 }
 
 /**
+ * Voided, cancelled or expired: a payment, settlement or refund in one of
+ * these moved no money, as the Payments API describes them, and as
+ * RETRY_OR_START_AGAIN and refundPayment's settlement filter already read
+ * CANCELLED.
+ */
+const NO_MONEY_STATUSES = new Set(["CANCELLED", "EXPIRED"]);
+
+/** A payment, settlement or refund record that failed, or otherwise moved no money. */
+function movedNoMoney(record: RefNumRecord): boolean {
+  return isFailedRecord(record) || NO_MONEY_STATUSES.has((record.status ?? "").toUpperCase());
+}
+
+/**
+ * A spent handle under a bank-debit key that none of the key's failed
+ * payments accounts for, so a payment the lookup may not show yet. Paysafe
+ * marks a handle COMPLETED "regardless of the payments call response status",
+ * and a failed payment that names no handle accounts for one spent handle.
+ */
+function hiddenSpend(
+  handles: PaysafePaymentHandleLike[],
+  failed: PaysafePaymentLike[],
+): PaysafePaymentHandleLike | undefined {
+  const charged = new Set(failed.map((p) => p.paymentHandleToken).filter((t) => t !== undefined));
+  const unattributed = failed.filter((p) => p.paymentHandleToken === undefined).length;
+  const spent = handles.filter(
+    (h) => (h.status ?? "").toUpperCase() === "COMPLETED" && !charged.has(h.paymentHandleToken),
+  );
+  return spent[unattributed];
+}
+
+/**
  * A record Paysafe filed with its error is that failure, read back: a
  * declined payment stays a decline, never a pending payment. The record
  * carries no HTTP status, so its code and status decide: a mapped code maps
@@ -1535,8 +1566,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * with no payment of its own in the lookup is a payment the lookup does not
    * show yet, or an attempt Paysafe refused, whose call spent the handle all
    * the same. The payments are read again patiently, and the call ends rather
-   * than debit again while no payment shows. `failed` holds the key's failed
-   * attempts, which switch the duplicate check off.
+   * than debit again while no payment shows. A key holding another request's
+   * handle is refused, with outcomeUnknown while such a spent handle is under
+   * it. `failed` holds the key's failed attempts, which switch the duplicate
+   * check off.
    */
   private async bankDebitKey(
     keyed: ReplayableWrite<PaysafePaymentLike>,
@@ -1546,15 +1579,11 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     if (read.live[0]) return { payment: read.live[0], failed: read.failed };
     const handles = await this.recordsByRefNum<PaysafePaymentHandleLike>(minted, false);
     const foreign = handles.filter((h) => !agreesWith(h, minted));
-    if (foreign.length > 0) throw this.differentRequest(minted, foreign);
+    if (foreign.length > 0) {
+      throw this.differentRequest(minted, foreign, hiddenSpend(handles, read.failed) !== undefined);
+    }
     for (let attempt = 1; ; attempt += 1) {
-      const charged = new Set(read.failed.map((p) => p.paymentHandleToken).filter((t) => t !== undefined));
-      // A failed payment that names no handle accounts for one spent handle.
-      const unattributed = read.failed.filter((p) => p.paymentHandleToken === undefined).length;
-      const spent = handles.filter(
-        (h) => (h.status ?? "").toUpperCase() === "COMPLETED" && !charged.has(h.paymentHandleToken),
-      );
-      const hidden = spent[unattributed];
+      const hidden = hiddenSpend(handles, read.failed);
       if (!hidden) break;
       if (attempt >= REPLAY_READ_ATTEMPTS) throw this.spentWithoutPayment(keyed, hidden);
       await this.backoff(attempt);
@@ -2580,25 +2609,35 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
 
   /**
    * A key another request holds. On a payment, settlement or refund, a record
-   * under it that has not failed may be the money this call was meant to move
-   * (the same renewal sent by an overlapping run with a card set meanwhile,
-   * say): the refusal then carries outcomeUnknown, so no new key follows until
-   * that record is known to be another one.
+   * under it that may have moved money (not failed, voided, cancelled or
+   * expired) may be the money this call was meant to move (the same renewal
+   * sent by an overlapping run with a card set meanwhile, say): the refusal
+   * then carries outcomeUnknown, so no new key follows until that record is
+   * known to be another one. `hiddenPayment` marks a bank-debit key holding a
+   * spent handle whose payment the lookup does not show (see hiddenSpend).
    */
-  private differentRequest<T>(write: ReplayableWrite<T>, foreign: RefNumRecord[]): PayFanoutError {
+  private differentRequest<T>(
+    write: ReplayableWrite<T>,
+    foreign: RefNumRecord[],
+    hiddenPayment = false,
+  ): PayFanoutError {
     const { noun } = REF_NUM_LOOKUPS[write.lookup];
-    const live = write.movesMoney === true && foreign.some((record) => !isFailedRecord(record));
+    const live = write.movesMoney === true && foreign.some((record) => !movedNoMoney(record));
+    const refused =
+      `merchantRefNum "${write.merchantRefNum}" already belongs to a different Paysafe ${noun} ` +
+      "(amount, currency, type or payment handle differ)";
     return new PayFanoutError({
       code: "invalid_request",
-      message:
-        `merchantRefNum "${write.merchantRefNum}" already belongs to a different Paysafe ${noun} ` +
-        "(amount, currency, type or payment handle differ)" +
-        (live
-          ? ` that has not failed: it may be the ${noun} this request was meant to make, so use a new ` +
+      message: hiddenPayment
+        ? `${refused}, and a payment handle under it is spent while no payment made with it shows in the ` +
+          "lookup: that payment may be the one this request was meant to make, so use a new idempotency key " +
+          "only once it is known to be another one"
+        : live
+          ? `${refused} that has not failed: it may be the ${noun} this request was meant to make, so use a new ` +
             `idempotency key only once that ${noun} is known to be another one`
-          : " — every new request needs its own idempotency key"),
+          : `${refused} — every new request needs its own idempotency key`,
       retryable: false,
-      outcomeUnknown: live,
+      outcomeUnknown: live || hiddenPayment,
       raw: {
         merchantRefNum: write.merchantRefNum,
         expected: { amount: write.amount, currency: write.currency, paymentType: write.paymentType },

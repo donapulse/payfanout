@@ -1767,7 +1767,10 @@ sandbox round-trip before production use, and the setup guide carries that warni
     says only "After a payment has been captured, you can no longer cancel it."). Error 906
     ("Invalid Request: Original pspReference is invalid for this environment", cause
     "LIVE/TEST PSP mismatch") is an error response, so a modification on an unknown reference
-    is acknowledged only within one environment.
+    is acknowledged only within one environment. Since 2026-09-25 the refusal of an echo
+    naming another amount carries `outcomeUnknown` and advises a new key only once the
+    earlier one is known to be another: that request is only received (see "Renewal re-key
+    paths").
   - **Classification, 2026-09-23**, from the same pages: `transient-error: true` (the value
     read case-insensitively) is retryable at any status (`processing_error` below 500,
     `psp_unavailable` from 500), `errorCode` 705 is `rate_limited`, 408 ("You can retry the
@@ -2025,7 +2028,9 @@ sandbox round-trip before production use, and the setup guide carries that warni
     reference — Adyen's example details answer names neither. A `/payments` answer naming
     another `merchantReference` or `amount` is refused the same way, before any refusal in it
     is mapped: the request named the session's own, so the answer belongs to another request
-    (an `idempotencyKey` reused across sessions replays the first answer).
+    (an `idempotencyKey` reused across sessions replays the first answer). Since 2026-09-25
+    that refusal carries `outcomeUnknown` unless the answer is `Refused`, `Error` or
+    `Cancelled` (see "Renewal re-key paths").
     `returnUrl`/`defaultReturnUrl` are checked where they enter (absolute with a scheme, no
     whitespace, at most 1024 characters once serialized, no `//` after the domain) and sent
     WHATWG-serialized, since Adyen asks for non-ASCII characters to be URL-encoded.
@@ -2559,8 +2564,8 @@ description of what v2 changes is what the migration then had to implement.
   else a decline. Recorded settlement, refund and verification failures are rethrown the
   same way as payments. Chosen outcomes: a record under the same reference that disagrees
   means the key was reused and gives `invalid_request` (marked `outcomeUnknown` on a
-  payment, settlement or refund while that record has not failed, since 2026-09-25; see
-  "Renewal re-key paths"); several agreeing records give a
+  payment, settlement or refund while that record may have moved money, since 2026-09-25;
+  see "Renewal re-key paths"); several agreeing records give a
   non-retryable `processing_error`. Non-retryable is the conservative choice, because
   `withRetry` acts on `retryable` and must not act while it is unknown whether money moved.
   `PaymentRouter` fails over on any `processing_error` whatever `retryable` says. That is
@@ -2880,11 +2885,12 @@ description of what v2 changes is what the migration then had to implement.
   full lookup page, where it cannot tell which record is the call's own. A PSP that neither
   keeps results nor has an adapter doing so gains nothing from the replay, which is why
   core gained `PayFanoutError.outcomeUnknown` and why every refusal of a reused key must
-  carry it unless the adapter has read the key's first request back: Stripe's
+  carry it unless the adapter has read the key's first request back as the call's own, or as
+  one that finally moved no money (narrowed 2026-09-25 from any read-back): Stripe's
   `idempotency_error` now does, since it proves the key's first request ran, and so does
   Paysafe's refusal of a key another request holds (`invalid_request`) while that request's
-  payment, settlement or refund has not failed (corrected 2026-09-25: it carried none; see
-  "Renewal re-key paths").
+  payment, settlement or refund may have moved money (corrected 2026-09-25: it carried none;
+  see "Renewal re-key paths").
 - **`processing_error` is replayed once.** Stripe's adapter maps the card-error code
   `processing_error` to it, and Stripe's decline-codes page says "Ask the customer to
   attempt the payment again"; Stripe answers a reused key with the saved result of the
@@ -2984,15 +2990,25 @@ description of what v2 changes is what the migration then had to implement.
   pin: the attempt moved on to 1, B's uncertain answer was dropped as overtaken, and `-a1`
   charged the new card again. On a payment, settlement or refund, the refusal of a key whose
   records disagree with the call (another amount, currency, type or handle) now carries
-  `outcomeUnknown` while any of those records has not failed, since it may be the money the
-  call was meant to move, and its message says to start again under a new key only once that
-  record is known to be another one. When every one of them failed, nothing under the key
-  moved money and the call's own request was refused (the duplicate check counts failed
-  requests, and a failed payment spent its single-use handle), so the refusal keeps no flag;
-  two requests in flight together remain the first open item of the Paysafe replay entry.
-  Payment handles, verifications and voids move no money and are unchanged. A
-  manager-over-Paysafe test runs that exact order and ends with one renewal payment and the
-  pin `contested`, then frozen; the same run without the flag charges `-a1`.
+  `outcomeUnknown` while any of those records may have moved money, since it may be the money
+  the call was meant to move, and its message says to start again under a new key only once
+  that record is known to be another one. A record that failed moved none, and nor did one
+  voided, cancelled or expired: the Payments API spec gives a payment's `CANCELLED` as "The
+  request has been fully voided (reversed)", and its settlement and refund statuses add
+  `CANCELLED` ("The transaction request is cancelled.") and `EXPIRED` ("The transaction
+  request is expired."); the adapter's portal advice and its refund's settlement filter
+  already read `CANCELLED` as no money. When every record is one of those, nothing
+  under the key moved money and the call's own request was refused (the duplicate check
+  counts failed requests, and a failed payment spent its single-use handle), so the refusal
+  keeps no flag; two requests in flight together remain the first open item of the Paysafe
+  replay entry. Payment handles, verifications and voids move no money and are unchanged,
+  except in a bank-debit completion, whose key's handles are read before the handle is
+  minted: a handle spent (`COMPLETED`, "The Payment request was initiated successfully using
+  the Payment Handle.") that no failed payment of the key accounts for may be a payment the
+  lookup does not show yet, so the refusal of another request's handle carries the flag while
+  one is under the key. A manager-over-Paysafe test runs that exact order and ends with one
+  renewal payment and the pin `contested`, then frozen; the same run without the flag charges
+  `-a1`.
 - **A store that drops `lastError` along with `renewalAttempt` no longer replays without
   bound.** The dropped-pin check compared `lastError.code`, so on such a store it never
   matched, and `-a0` went out every 5 minutes. A `lastError` missing from the read-back now
@@ -3004,7 +3020,13 @@ description of what v2 changes is what the migration then had to implement.
   was ever charged. That failure is now recorded as a replaced card's decline is: not
   counted, the status as it was before the pin, and the new card due on the next run. On
   such a store the next attempt number still comes from `failedAttempts`, as releases before
-  pins derived it.
+  pins derived it, and the card change resets `failedAttempts` to 0, so the new card is sent
+  under a number the period may already have used. A PSP still holding that key refuses it
+  (Stripe removes keys only "after they're at least 24 hours old", and answers other
+  parameters with `idempotency_error`; Paysafe's duplicate check covers "the past 90 days",
+  5031), that refusal counts for dunning, and the next retry charges the new card under the
+  following number. Nothing such a store keeps can carry the period's used numbers past a
+  card change, so this stays open with the dropped pin itself; a test pins the sequence.
 - **An empty object compares like an absent field.** A pinned request and the one sent are
   the same charge when one side has `{}` (as `metadata`, or inside `billingDetails`) where
   the other has nothing: a store that drops empty objects, or writes them, made a replay look
@@ -3033,24 +3055,48 @@ description of what v2 changes is what the migration then had to implement.
   `retryable`. A cancel's conflict gets it too, since the flag only says that the call may
   have taken effect. None of these adapters supports saved payment methods, so the
   subscription engine does not reach them: the flag is for hosts.
-- **Left unmarked.** GoCardless answers a consumed key with "a `409
-  idempotent_creation_conflict` error with a `links.conflicting_resource_id` pointing to the
-  existing resource" (limits page, doc-verified 2026-09-25), which the adapter reads back
-  and compares with the call, refunds also by their key stamp: the read-back the
-  adapter-authoring rule exempts. PayZen has no idempotency channel, so no refusal of a
-  reused key exists to mark, and its unanswered writes stay `psp_unavailable`. An Adyen
-  answer replayed for another session, and a capture or refund acknowledgement echoing
-  another amount, are the key's first request read back. Stripe does not save a request
+- **A request read back under the key keeps the flag while it may be the call's money, on
+  Adyen and GoCardless too.** Reading the key's first request back lifts the flag only when
+  it shows the call's own request, which then answers the call, or one that finally moved no
+  money; the adapter-authoring rule now says so. Doc-verified 2026-09-25. Adyen answers a
+  reused key with "the response to the first attempt" (API idempotency guide), and a capture
+  or refund answer is only an acknowledgement, `status` `received`: "Your capture request
+  will be processed asynchronously. You will receive the result in a webhook." (capture
+  guide; "The refund process is asynchronous.", refund guide). A capture or refund
+  acknowledgement echoing another amount therefore always carries `outcomeUnknown`, and a
+  completion answered with another request's stored payment carries it unless that answer's
+  `resultCode` is `Refused`, `Error` or `Cancelled`: the result-codes page lists them among
+  its "Final state result codes" with `Authorised`, and `Cancelled` is "The payment was
+  cancelled (by either the shopper or your own system) before processing was completed".
+  GoCardless answers a consumed key with "a `409 idempotent_creation_conflict` error with a
+  `links.conflicting_resource_id` pointing to the existing resource" (limits page), which the
+  adapter reads back and compares with the call, refunds also by their key stamp. The
+  refusal now carries the flag unless that billing request is `cancelled` ("the billing
+  request has been cancelled and cannot be used"), the payment it created `failed` or
+  `cancelled` (the adapter reads `customer_approval_denied` and `charged_back` as failed
+  too), or the refund `cancelled`, `bounced` ("the refund has failed to be paid") or
+  `funds_returned` ("the refund has had its funds returned"), per the OpenAPI spec's status
+  enums. A failed GoCardless payment can be retried, but only by an explicit
+  `POST /payments/{id}/actions/retry`, so it counts as final. The messages follow Paysafe's:
+  use a new key only once that record is known to be another one.
+- **Left unmarked.** PayZen has no idempotency channel, so no refusal of a reused key exists
+  to mark, and its unanswered writes stay `psp_unavailable`. Stripe does not save a request
   that "conflicts with another request that's executing concurrently" (idempotent-requests
   reference, doc-verified 2026-09-25); stripe-node 22.6.2 retries a 409 and raises one that
-  persists as `StripeAPIError`, which the adapter maps to `psp_unavailable`, already open.
+  persists as `StripeAPIError`, which the adapter maps to `psp_unavailable`, already open. An
+  Adyen `/payments/details` answer naming another payment is no reused key's answer, since
+  that endpoint's key also covers the details: they finished the payment they were issued
+  for, and the refusal stays unmarked. A Paysafe Interac session refuses another request's
+  handle under the session key, while the payment goes under the completion key, which the
+  session cannot read, and a session moves no money.
 - **Stripe renewals charged by a release before pins.** Sent again after the upgrade under
   the same key, now with `payfanout_renewal_key` in the metadata, such a renewal is refused
   as a key reused with other parameters (`idempotency_error`, marked `outcomeUnknown`) while
   Stripe keeps the key, so it is pinned and ends frozen, and the host settles it by hand:
   the original carries only `payfanout_subscription_id`. The recurring guide says so.
 - **What stays uncovered.** A store that drops `renewalAttempt` counts an uncertain failure
-  at once and retries under a new key. Two requests under one key that both reach Paysafe
+  at once and retries under a new key, and sends a card set meanwhile under a number the
+  period may have used. Two requests under one key that both reach Paysafe
   before either is filed can both be charged. A replay is never sent past
   `replayWindowHours`, and a lock around `chargeDueSubscriptions` removes overlapping runs
   altogether. The recurring guide and the `chargeDueSubscriptions` JSDoc now say this

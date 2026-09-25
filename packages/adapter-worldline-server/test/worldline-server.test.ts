@@ -386,7 +386,7 @@ describe("WorldlineServerAdapter specifics", () => {
       fetch: async (input, init) => {
         if (conflicts > 0 && init?.method === "POST" && String(input).endsWith("/payments")) {
           conflicts--;
-          return new Response(JSON.stringify({ errorId: "dup", errors: [{ code: "1409", message: "request in progress", httpStatusCode: 409 }] }), { status: 409 });
+          return new Response(JSON.stringify({ errorId: "dup", errors: [{ message: "request in progress", httpStatusCode: 409 }] }), { status: 409 });
         }
         return fake.fetch(input, init);
       },

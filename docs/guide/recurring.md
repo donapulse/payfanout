@@ -188,7 +188,10 @@ pin with: find it in Stripe by its `payfanout_subscription_id` and call
 verbatim. After saving a pin the manager reads the record back, and when the pin did not
 survive, it counts that failure for dunning at once: nothing is replayed under the same key,
 and the retry follows `retryDelaysHours` under the next attempt number, a new key, as in
-releases before pins. A charge whose answer was lost can then be charged twice.
+releases before pins. A charge whose answer was lost can then be charged twice. Such a store
+also loses the period's attempt numbers when the card changes, since the change resets
+`failedAttempts`: the new card goes out under the number that gives, which the period may
+already have used, and a PSP still holding that key refuses it.
 :::
 
 ### Scaling the cron: `listDue`
@@ -226,7 +229,7 @@ any pin exists pins the charge instead of moving it to a new key, because the ad
 leaves its outcome open: Stripe answers a request that conflicts with one still executing
 with a `409`, reported as `psp_unavailable`, and a key reused with other parameters with
 `idempotency_error`, marked `outcomeUnknown`; the Paysafe adapter marks its refusal of a
-key whose payment has not failed `outcomeUnknown` as well. Two cases remain outside this: a
+key whose payment may have moved money `outcomeUnknown` as well. Two cases remain outside this: a
 store that drops `renewalAttempt` (see the warning above), and two requests under one key
 that both reach Paysafe before either is filed, since Paysafe does not document whether its
 duplicate check covers a payment still in flight. A lock around the cron call rules out the

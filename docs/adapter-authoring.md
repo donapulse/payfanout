@@ -97,7 +97,11 @@ and `PaymentService` will hold you to:
   read back, a refusal you cannot resolve), set `outcomeUnknown: true`, which callers
   treat the same way. A PSP's refusal of a reused key (Stripe's `idempotency_error`, a
   duplicate `merchantRefNum`) proves the key's first request ran, so it carries the flag
-  too unless the adapter has read that request's outcome back.
+  too. Reading that request back lifts the flag only when it shows the call's own request,
+  which then answers the call, or one that finally moved no money (failed, voided,
+  cancelled, expired). Anything else read back, a payment that went through, one still in
+  progress, a modification the PSP has only acknowledged, may be the money the call was
+  meant to move, and a caller told to use a new key would move it twice.
 - **Idempotency:** `idempotencyKey` is REQUIRED on every mutating call — session
   creation, completion, refunds, **capture, cancel, and verification included**.
   Forward it through your PSP's mechanism (Stripe: `Idempotency-Key` request option;

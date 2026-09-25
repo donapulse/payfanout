@@ -1070,9 +1070,11 @@ describe("GoCardless session replays", () => {
     ];
     for (const [change, mismatched] of cases) {
       const rejection = await adapter.createPaymentSession({ ...original, ...change }).catch((err: unknown) => err);
+      // The key's billing request can still be paid, and may be the payment this request was meant to make.
       expect(rejection, JSON.stringify(change)).toMatchObject({
         code: "invalid_request",
         retryable: false,
+        outcomeUnknown: true,
         pspName: "gocardless",
         message: expect.stringMatching(/^Idempotency key reused for a different payment/),
         raw: { billing_request: { id: first.pspSessionId }, mismatched },
@@ -1082,11 +1084,52 @@ describe("GoCardless session replays", () => {
     }
     await expect(adapter.createPaymentSession({ ...original, amount: 2600 })).rejects.toThrowError(
       "Idempotency key reused for a different payment: the billing request created with it does not match " +
-        "this request's amount. Use a fresh key for a new payment.",
+        "this request's amount, and has not failed or been cancelled. It may be the payment this request was " +
+        "meant to make, so use a fresh key only once that billing request is known to be another one.",
     );
     // Nothing was created for the mismatches, and nobody got an authorisation URL for them.
     expect(fake.uniqueBillingRequestCreations).toBe(1);
     expect(flowCreates(fake)).toBe(1);
+  });
+
+  it("leaves the outcome open on a reused key only while its billing request may still collect", async () => {
+    let paymentsDown = false;
+    const { adapter, fake } = makeInterceptedPair((request, forward) =>
+      paymentsDown && request.method === "GET" && request.path.startsWith("/payments/") ? gocardlessDown() : forward(),
+    );
+    const cases: Array<[string, (billingRequestId: string) => Promise<unknown> | void, boolean]> = [
+      ["pending", () => undefined, true],
+      [
+        "fulfilled",
+        (id) => {
+          fake.fulfilBillingRequest(id);
+        },
+        true,
+      ],
+      ["confirmed", (id) => fake.confirmPayment(fake.fulfilBillingRequest(id).paymentId), true],
+      // An unreadable payment leaves the billing request's own status, which does not tell.
+      [
+        "payment unreadable",
+        (id) => {
+          fake.failPayment(fake.fulfilBillingRequest(id).paymentId);
+          paymentsDown = true;
+        },
+        true,
+      ],
+      ["payment failed", (id) => fake.failPayment(fake.fulfilBillingRequest(id).paymentId), false],
+      ["payment cancelled", (id) => fake.setPaymentStatus(fake.fulfilBillingRequest(id).paymentId, "cancelled"), false],
+      ["cancelled", (id) => adapter.cancelPayment(id, `k-cancel-${id}`), false],
+    ];
+    for (const [label, settle, live] of cases) {
+      paymentsDown = false;
+      const original = { ...input, idempotencyKey: `k-${label}` };
+      const first = await adapter.createPaymentSession(original);
+      await settle(first.pspSessionId);
+      const rejection = await adapter.createPaymentSession({ ...original, amount: 2600 }).catch((err: unknown) => err);
+      expect(rejection, label).toMatchObject({ code: "invalid_request", raw: { mismatched: ["amount"] } });
+      expect((rejection as { outcomeUnknown?: boolean }).outcomeUnknown, label).toBe(live ? true : undefined);
+      expect((rejection as Error).message, label).toContain(live ? "known to be another one" : "Use a fresh key");
+    }
   });
 
   it("compares amounts across GoCardless's wire encodings and checks a mandate request's currency", async () => {
@@ -1296,16 +1339,44 @@ describe("GoCardless refund replays", () => {
     const rejection = await adapter
       .refundPayment({ pspPaymentId: paymentId, amount: 400, idempotencyKey: "r-shared" })
       .catch((err: unknown) => err);
+    // The key's refund has not failed, so it may be the refund this request was meant to make.
     expect(rejection).toMatchObject({
       code: "invalid_request",
       retryable: false,
+      outcomeUnknown: true,
       pspName: "gocardless",
       message:
         "Idempotency key reused for a different refund: the refund created with it does not match this " +
-        "request's amount. Use a fresh key for a new refund.",
+        "request's amount, and has not failed or been cancelled. It may be the refund this request was meant to " +
+        "make, so use a fresh key only once that refund is known to be another one.",
       raw: { refund: { id: original.refundId }, mismatched: ["amount"] },
     });
     expect(refundCreates(fake)).toHaveLength(1);
+  });
+
+  it("leaves the outcome open on a reused refund key only while its refund may still pay out", async () => {
+    const { adapter, fake } = makePair();
+    const statuses: Array<[string, boolean]> = [
+      ["created", true],
+      ["pending_submission", true],
+      ["submitted", true],
+      ["paid", true],
+      ["cancelled", false],
+      ["bounced", false],
+      ["funds_returned", false],
+    ];
+    for (const [status, live] of statuses) {
+      const paymentId = await confirmedPayment(adapter, fake, 1000);
+      const original = await adapter.refundPayment({ pspPaymentId: paymentId, amount: 700, idempotencyKey: `r-${status}` });
+      fake.setRefundStatus(original.refundId, status);
+      const rejection = await adapter
+        .refundPayment({ pspPaymentId: paymentId, amount: 400, idempotencyKey: `r-${status}` })
+        .catch((err: unknown) => err);
+      expect(rejection, status).toMatchObject({ code: "invalid_request", raw: { mismatched: ["amount"] } });
+      expect((rejection as { outcomeUnknown?: boolean }).outcomeUnknown, status).toBe(live ? true : undefined);
+      expect((rejection as Error).message, status).toContain(live ? "known to be another one" : "Use a fresh key for a new refund.");
+    }
+    expect(fake.uniqueRefundCreations).toBe(statuses.length);
   });
 
   it("rejects a stamped refund of another payment", async () => {

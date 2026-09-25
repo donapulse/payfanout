@@ -376,7 +376,9 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * A reused idempotencyKey resolves to the billing request GoCardless already
    * holds under it. GoCardless documents no parameter comparison, so the
    * adapter compares: its amount, currency and host `id` must match this
-   * input, or the call rejects with `invalid_request`. The replayed session
+   * input, or the call rejects with `invalid_request`, marked outcomeUnknown
+   * unless that billing request was cancelled or its payment failed or was
+   * cancelled (see idempotencyKeyReused). The replayed session
    * reports the status of the payment the billing request created, as
    * `retrievePayment` does, except that a payment awaiting the customer's
    * approval reads `processing` where `retrievePayment` reports
@@ -450,13 +452,17 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
         currency,
         id: metadata?.["payfanout_id"],
       });
+      const state = await this.replayedSessionState(billingRequest);
       if (mismatched.length > 0) {
-        throw idempotencyKeyReused("payment", "billing request", mismatched, {
-          billing_request: billingRequest,
+        throw idempotencyKeyReused(
+          "payment",
+          "billing request",
           mismatched,
-        });
+          { billing_request: billingRequest, mismatched },
+          state.status !== "failed" && state.status !== "canceled",
+        );
       }
-      ({ status, authorisable } = await this.replayedSessionState(billingRequest));
+      ({ status, authorisable } = state);
     }
     // Past `pending` the payer has authorised, or nothing can be paid any
     // more: a new authorisation URL would only invite a second authorisation.
@@ -477,9 +483,9 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
   /**
    * Once the billing request names its payment, the payment's status stands,
    * so a replay never reports a failed payment as `processing`. That read
-   * happens on replays only, and if it fails the billing request's own status
-   * stands instead: failing the replay would let a router fail over to
-   * another PSP for a payment that already exists.
+   * happens on replays only, a mismatched one included, and if it fails the
+   * billing request's own status stands instead: failing the replay would let
+   * a router fail over to another PSP for a payment that already exists.
    */
   private async replayedSessionState(
     billingRequest: GoCardlessBillingRequestLike,
@@ -666,10 +672,12 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * replay is recognised from the refund itself. A reused key resolves to the
    * refund created with it, which must belong to this payment and, when an
    * amount is given, be for that amount, or the call rejects with
-   * `invalid_request`. A request the remainder check refuses, such as the
-   * replay of a refund that used up the payment, is never sent: the payment's
-   * refunds are read and the one stamped with this key is returned, or the
-   * refusal stands. A create GoCardless rejects is settled by the same read.
+   * `invalid_request`, marked outcomeUnknown unless that refund was cancelled,
+   * bounced or had its funds returned. A request the remainder check refuses,
+   * such as the replay of a refund that used up the payment, is never sent:
+   * the payment's refunds are read and the one stamped with this key is
+   * returned, or the refusal stands. A create GoCardless rejects is settled by
+   * the same read.
    * GoCardless lets accounts opt out of the total_amount_confirmation check,
    * so none of this relies on it, nor on whether GoCardless checks the key
    * before the request body. Refunds created by adapter versions without the
@@ -735,11 +743,13 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
     if (replayed) {
       const mismatched = refundReplayMismatches(refund, req);
       if (mismatched.length > 0) {
-        throw idempotencyKeyReused("refund", "refund", mismatched, {
-          refund,
+        throw idempotencyKeyReused(
+          "refund",
+          "refund",
           mismatched,
-          ...(rejection !== undefined ? { rejection } : {}),
-        });
+          { refund, mismatched, ...(rejection !== undefined ? { rejection } : {}) },
+          mapGoCardlessRefundStatus(refund.status) !== "failed",
+        );
       }
     }
     return {
@@ -1572,20 +1582,29 @@ function refundReplayMismatches(refund: GoCardlessRefundLike, req: RefundRequest
 
 /**
  * Hosts show `message` to payers, so it names no GoCardless id: the resource
- * belongs to another request. The resource itself rides `raw`.
+ * belongs to another request. The resource itself rides `raw`. While it has
+ * not failed or been cancelled (`live`) it may be the one this request was
+ * meant to make, so the refusal carries outcomeUnknown, and a fresh key
+ * waits until the resource is known to be another one.
  */
 function idempotencyKeyReused(
   kind: "payment" | "refund",
   resource: "billing request" | "refund",
   mismatched: string[],
   raw: unknown,
+  live: boolean,
 ): PayFanoutError {
+  const differs =
+    `Idempotency key reused for a different ${kind}: the ${resource} created with it does not match this ` +
+    `request's ${mismatched.join(", ")}`;
   return new PayFanoutError({
     code: "invalid_request",
-    message:
-      `Idempotency key reused for a different ${kind}: the ${resource} created with it does not match this ` +
-      `request's ${mismatched.join(", ")}. Use a fresh key for a new ${kind}.`,
+    message: live
+      ? `${differs}, and has not failed or been cancelled. It may be the ${kind} this request was meant to make, so ` +
+        `use a fresh key only once that ${resource} is known to be another one.`
+      : `${differs}. Use a fresh key for a new ${kind}.`,
     retryable: false,
+    outcomeUnknown: live,
     raw,
     pspName: GOCARDLESS_PSP_NAME,
   });

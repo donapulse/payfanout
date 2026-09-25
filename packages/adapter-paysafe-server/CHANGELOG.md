@@ -1,5 +1,15 @@
 # @payfanout/adapter-paysafe-server
 
+## 2.0.3
+
+### Patch Changes
+
+- 8a36429: Mark `outcomeUnknown` on the `invalid_request` a payment, capture or refund gets when its idempotency key already holds another request's payment, settlement or refund that may have moved money (one not failed, voided, cancelled or expired), since that record may be the money the call was meant to move, and on a bank-debit completion whose key holds another request's spent payment handle while no payment made with it shows. The subscription manager then keeps such a renewal on its key instead of charging again under a new one, and a key whose earlier records moved no money still rejects without the flag.
+- 1d66371: Mark the errors that cannot say whether money moved `outcomeUnknown`: the retry-later endings of a replayed write, and the refusals of a key holding several records or a full lookup page. Callers and the subscription manager then retry them only under the same idempotency key.
+- 1ba71ec: Paysafe writes are no longer re-sent blindly: a call whose answer was lost (timeout, dropped connection, server error), or that Paysafe rejects as a duplicate or as already in progress, is answered with the original read back by its reference, and a payment, capture or refund that cannot be read back fails with a non-retryable `processing_error`, to retry later with the same idempotency key. Card and Interac completions now send `dupCheck: false`, so a customer can pay with another card after a decline under the same completion key. Bank-debit completions send `dupCheck: true`, so a repeated completion is refused instead of debiting twice while no failed attempt shows under the key, and corrected bank details can still follow a decline; section 10 of the [Paysafe guide](https://donapulse.github.io/payfanout/guide/paysafe#_10-replays-lost-answers-and-timeouts) covers the timings in which a replay can still debit twice, and when a bank-debit key needs replacing. Saved-card charges, captures, refunds and verifications keep Paysafe's duplicate check. A key reused for a different amount or currency, or a different saved card or verification card, rejects with `invalid_request`, unless every earlier attempt under a card or Interac completion key failed. Capture, refund and void state rejections (3203, 3204, 3402, 3404, 3501, 3502, 3506) now map to `invalid_request` instead of `card_declined`. The default `requestTimeoutMs` is now 60 seconds per exchange, matching Paysafe's own SDKs.
+- Updated dependencies [1d66371]
+  - @payfanout/core@4.2.0
+
 ## 2.0.2
 
 ### Patch Changes

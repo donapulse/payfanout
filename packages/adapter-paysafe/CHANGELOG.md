@@ -1,5 +1,13 @@
 # @payfanout/adapter-paysafe
 
+## 0.3.5
+
+### Patch Changes
+
+- f84dd58: Stop sending `colorBackground` as `background-color` and `locale` as a setup option to Paysafe.js: its hosted inputs accept no background property and setup has no locale option, so neither had any effect. `colorBackground` is now recognized and not applied, like `colorPrimary`.
+- Updated dependencies [1d66371]
+  - @payfanout/core@4.2.0
+
 ## 0.3.4
 
 ### Patch Changes

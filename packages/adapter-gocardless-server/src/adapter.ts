@@ -215,6 +215,13 @@ interface RequestOptions {
   envelope?: string;
 }
 
+/** The refund a refundPayment call settles on; `rejection` is GoCardless's answer to a create the stamp settled. */
+interface RefundOutcome {
+  refund: GoCardlessRefundLike;
+  replayed: boolean;
+  rejection?: unknown;
+}
+
 /**
  * One-off billing request payments (Instant Bank Pay / "Pay by Bank") are
  * GBP/EUR only; the classic debit schemes list what the fulfilled payment can
@@ -371,10 +378,14 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * adapter compares: its amount, currency and host `id` must match this
    * input, or the call rejects with `invalid_request`. The replayed session
    * reports the status of the payment the billing request created, as
-   * `retrievePayment` does, or the billing request's own status while it has
-   * none. Only a `pending` billing request gets a fresh authorisation URL;
-   * once the payer has authorised, or the request is fulfilled or cancelled,
-   * the session carries no `clientSecret`.
+   * `retrievePayment` does, except that a payment awaiting the customer's
+   * approval reads `processing` where `retrievePayment` reports
+   * `requires_action`: a replay of a billing request that has a payment
+   * carries no `clientSecret`. While the billing request has no payment, the
+   * session reports the billing request's own status. Only a `pending`
+   * billing request gets a fresh authorisation URL; once the payer has
+   * authorised, or the request is fulfilled or cancelled, the session carries
+   * no `clientSecret`.
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertMinorUnitAmount(input.amount, "amount");
@@ -482,7 +493,10 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
         `/payments/${encodeURIComponent(paymentId)}`,
         { envelope: "payments" },
       );
-      return { status: mapGoCardlessPaymentStatus(payment.status), authorisable: false };
+      const status = mapGoCardlessPaymentStatus(payment.status);
+      // A replay carries no flow, so a payment awaiting the customer's approval
+      // is something to wait for, not to act on.
+      return { status: status === "requires_action" ? "processing" : status, authorisable: false };
     } catch {
       // Best effort, like the mandate lookup: the payment exists either way.
       return { status, authorisable: false };
@@ -660,9 +674,25 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * so none of this relies on it, nor on whether GoCardless checks the key
    * before the request body. Refunds created by adapter versions without the
    * stamp are not recognised: a replay of one that the remainder check
-   * refuses rejects, as it did before.
+   * refuses rejects, as it did before. While GoCardless reports an amount
+   * already refunded on the payment, the stamp is also checked before any
+   * create, so a key GoCardless no longer honours (it promises at least 30
+   * days) is still read back instead of refunding again.
+   *
+   * A read of the payment's refunds that fails sends nothing further. A
+   * transient failure rejects retryable (`psp_unavailable`, or
+   * `rate_limited`), with GoCardless's answer to a failed create on
+   * `raw.rejection`; retry with the same key, as a new one can refund twice.
+   * Any other failure leaves open whether this key already refunded, so the
+   * error is marked `outcomeUnknown`: before a create it is a final
+   * `invalid_request` and the refund is not sent, and after a rejected
+   * create GoCardless's rejection stands.
    */
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
+    // A blank key gives GoCardless nothing to dedupe on, while every such refund would share one stamp.
+    if (typeof req.idempotencyKey !== "string" || req.idempotencyKey.trim() === "") {
+      throw PayFanoutError.invalidRequest("refundPayment requires a non-empty idempotencyKey");
+    }
     if (req.amount !== undefined) {
       assertMinorUnitAmount(req.amount, "refund amount");
       if (req.amount === 0) {
@@ -691,16 +721,25 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
           ? `Refund of ${amount} exceeds the remaining refundable amount on payment ${req.pspPaymentId}`
           : undefined;
     const stamp = await sha256Hex(req.idempotencyKey);
-    const { refund, replayed } =
-      refusal === undefined
-        ? await this.createRefund(req, amount, alreadyRefunded + amount, stamp)
-        : { refund: await this.resolveRefusedRefund(req, stamp, refusal, payment), replayed: true };
+    let outcome: RefundOutcome | undefined;
+    if (refusal !== undefined) {
+      outcome = { refund: await this.resolveRefusedRefund(req, stamp, refusal, payment), replayed: true };
+    } else {
+      // GoCardless honours keys for at least 30 days, not forever, so a refund it already counts may be this key's.
+      if (alreadyRefunded > 0) outcome = await this.stampedRefundBeforeCreate(req, stamp, payment);
+      outcome ??= await this.createRefund(req, amount, alreadyRefunded + amount, stamp);
+    }
+    const { refund, replayed, rejection } = outcome;
     const refundedAmount = wireAmount(refund.amount);
     if (refundedAmount === undefined) throw unreadableAmount("refund", refund);
     if (replayed) {
       const mismatched = refundReplayMismatches(refund, req);
       if (mismatched.length > 0) {
-        throw idempotencyKeyReused("refund", "refund", mismatched, { refund, mismatched });
+        throw idempotencyKeyReused("refund", "refund", mismatched, {
+          refund,
+          mismatched,
+          ...(rejection !== undefined ? { rejection } : {}),
+        });
       }
     }
     return {
@@ -722,7 +761,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
     amount: number,
     totalAmountConfirmation: number,
     stamp: string,
-  ): Promise<{ refund: GoCardlessRefundLike; replayed: boolean }> {
+  ): Promise<RefundOutcome> {
     try {
       const { resource, replayed } = await this.createWithIdempotencyReplay<GoCardlessRefundLike>(
         "refunds",
@@ -731,23 +770,75 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       );
       return { refund: resource, replayed };
     } catch (err) {
+      const rejection = PayFanoutError.wrap(err, { pspName: this.pspName });
       let original: GoCardlessRefundLike | undefined;
       try {
         original = await this.stampedRefund(req.pspPaymentId, stamp);
-      } catch {
-        // The read failing must not mask the rejection.
-        throw err;
+      } catch (lookupErr) {
+        const lookup = PayFanoutError.wrap(lookupErr, { pspName: this.pspName });
+        // Without the read, whether this key already made a refund GoCardless
+        // refused to repeat stays open: an outage is retried, and any other
+        // failure leaves the rejection standing for the same key only.
+        const raw = { rejection: rejection.raw, lookup: lookup.raw };
+        if (rejection.retryable || lookup.retryable) {
+          // GoCardless's own transient failure names the wait, else the read's.
+          const transient = rejection.retryable ? rejection : lookup;
+          throw new PayFanoutError({ code: transient.code, message: transient.message, retryable: true, raw, pspName: this.pspName });
+        }
+        throw new PayFanoutError({
+          code: rejection.code,
+          message: rejection.message,
+          retryable: false,
+          outcomeUnknown: true,
+          raw,
+          pspName: this.pspName,
+        });
       }
       if (!original) throw err;
-      return { refund: original, replayed: true };
+      return { refund: original, replayed: true, rejection: rejection.raw };
     }
+  }
+
+  /**
+   * The refund this key already made, read before a create while GoCardless
+   * reports an amount refunded on the payment: a key GoCardless has stopped
+   * honouring would otherwise be refunded afresh. The read exists only to
+   * prevent that second refund, so a failed read sends nothing: a transient
+   * failure stays retryable, and any other is a final refusal.
+   */
+  private async stampedRefundBeforeCreate(
+    req: RefundRequest,
+    stamp: string,
+    payment: GoCardlessPaymentLike,
+  ): Promise<RefundOutcome | undefined> {
+    let original: GoCardlessRefundLike | undefined;
+    try {
+      original = await this.stampedRefund(req.pspPaymentId, stamp);
+    } catch (err) {
+      const lookup = PayFanoutError.wrap(err, { pspName: this.pspName });
+      if (lookup.retryable) throw lookup;
+      // Whether this key already refunded stays open, so only the same key may follow.
+      throw new PayFanoutError({
+        code: "invalid_request",
+        message:
+          "Could not read GoCardless's refund list to check for a refund already made with this idempotency key, " +
+          `so the refund was not sent. Check the refunds of payment ${req.pspPaymentId} in the GoCardless dashboard, ` +
+          "then retry with the same idempotency key once the list can be read.",
+        retryable: false,
+        outcomeUnknown: true,
+        raw: { payment, lookup: lookup.raw },
+        pspName: this.pspName,
+      });
+    }
+    return original ? { refund: original, replayed: true } : undefined;
   }
 
   /**
    * A request the remainder check refuses is sent nowhere. It can still be
    * the replay of a refund that used up the payment, and only the stamp tells:
    * the refund of this payment stamped with this key is returned, anything
-   * else keeps the refusal.
+   * else keeps the refusal, whose `raw` holds the payment and, when the read
+   * was refused, its answer as `lookup`.
    */
   private async resolveRefusedRefund(
     req: RefundRequest,
@@ -759,11 +850,12 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
     try {
       original = await this.stampedRefund(req.pspPaymentId, stamp);
     } catch (err) {
-      const rejection = PayFanoutError.wrap(err, { pspName: this.pspName });
+      const lookup = PayFanoutError.wrap(err, { pspName: this.pspName });
       // A transient failure leaves open whether this is a replay: a retry with the same key settles it.
-      if (rejection.retryable) throw rejection;
+      if (lookup.retryable) throw lookup;
+      throw PayFanoutError.invalidRequest(refusal, { payment, lookup: lookup.raw });
     }
-    if (!original) throw PayFanoutError.invalidRequest(refusal, payment);
+    if (!original) throw PayFanoutError.invalidRequest(refusal, { payment });
     return original;
   }
 
@@ -776,10 +868,20 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
   private async stampedRefund(pspPaymentId: string, stamp: string): Promise<GoCardlessRefundLike | undefined> {
     const page = await this.request<{ refunds?: GoCardlessRefundLike[] }>(
       "GET",
-      withQuery("/refunds", new URLSearchParams({ payment: pspPaymentId })),
+      withQuery("/refunds", new URLSearchParams({ payment: pspPaymentId, limit: "500" })),
     );
+    if (!Array.isArray(page.refunds)) {
+      // An answer without the list says nothing about this key: it counts as a failed read.
+      throw new PayFanoutError({
+        code: "processing_error",
+        message: "GoCardless answered the refund list without its refunds.",
+        retryable: false,
+        raw: page,
+        pspName: this.pspName,
+      });
+    }
     let match: GoCardlessRefundLike | undefined;
-    for (const refund of page.refunds ?? []) {
+    for (const refund of page.refunds) {
       if (refund.metadata?.[REFUND_KEY_STAMP] !== stamp) continue;
       if (!match || (refund.created_at ?? "") > (match.created_at ?? "")) match = refund;
     }

@@ -2161,7 +2161,8 @@ description of what v2 changes is what the migration then had to implement.
 - **Server half only, and only for hosts pinned to 2026-08-26.dahlia or later.**
   `mapStripeError` sees the errors of the adapter's own calls, which carry the host's pinned
   `apiVersion`. The browser adapter follows the account's default API version through
-  Stripe.js and maps none of these codes (nor `incorrect_zip`); aligning it is a follow-up.
+  Stripe.js and maps none of these codes (nor `incorrect_zip`) except `authentication_failure`
+  (decided 2026-09-25, below); aligning the rest is a follow-up.
 - **The checks live in the `StripeCardError` branch only.** Neither page states which error
   `type` the new codes arrive with, so the conservative reading extends the branch that
   already handles `expired_card` and `incorrect_zip`; under any other type they fall through
@@ -2170,8 +2171,8 @@ description of what v2 changes is what the migration then had to implement.
   show which codes those cards return on this version and, where a new code appears, its
   `type` and `decline_code`. The integration suite pins an older version, so this needs a new
   case, not a re-run. Seeing `authentication_failure` needs a failed 3-D Secure challenge
-  instead, a browser step on Stripe's mock authentication page; its mapping stays a sign-off
-  decision either way.
+  instead, a browser step on Stripe's mock authentication page; its mapping was decided on
+  2026-09-25 (below) without one.
 - **`authentication_failure` maps to `authentication_required` (decided 2026-09-25; until
   then it fell through to `card_declined`).** Its docs.stripe.com/error-codes entry reads "The
   payment was declined because the payment method failed to pass authentication." and states no
@@ -2187,9 +2188,13 @@ description of what v2 changes is what the migration then had to implement.
   way the Stripe server half should go was left open. Decided for consistency: the browser
   adapter's intent-specific codes and every other adapter's failed 3-D Secure already surface as
   `authentication_required`, and retrying 3-D Secure is one of the two remedies Stripe's guide
-  gives. Both halves now map `authentication_failure` that way, with a fraud decline code still
-  taking precedence. Would be wrong if Stripe used the code for failures where no new
-  authentication can succeed, where `card_declined`'s "use another card" is the only remedy.
+  gives. Both halves now map `authentication_failure` that way. On the server a fraud decline
+  code on the same error still takes precedence; the browser half maps no fraud decline codes
+  at all, a gap the follow-up above covers. Left unmapped, an account moving to dahlia would
+  see a failed browser 3-D Secure change quietly from `authentication_required` to
+  `card_declined` or `unknown`. Would be wrong if Stripe used the code for failures where no
+  new authentication can succeed, where `card_declined`'s "use another card" is the only
+  remedy.
 - **`payment_method_restricted` stays `card_declined`.** Stripe's example is a card reported
   lost or stolen; the existing `restricted_card` decline code ("it's possible it was reported
   lost or stolen") already falls through to `card_declined`, and a `lost_card` or

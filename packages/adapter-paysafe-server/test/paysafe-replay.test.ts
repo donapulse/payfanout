@@ -283,7 +283,7 @@ describe("Paysafe card completion replays", () => {
       adapter.completePayment({ pspSessionId, clientToken: "tok_once", idempotencyKey: "k-second" }),
     );
     expect(err).toMatchObject({ code: "processing_error", retryable: false, raw: { cause: { error: { code: "5283" } } } });
-    expect(err.message).toContain("payment handle as already used");
+    expect(err.message).toContain("payment handle as no longer payable");
     expect(err.message).toContain('merchantRefNum "k-second"');
     expect(err.message).toContain("can never be read back");
     expect(fake.uniquePaymentCreations).toBe(1);
@@ -1069,7 +1069,7 @@ describe("Paysafe payment-handle replays", () => {
     fake.hideFromLookups("payments", "k-eft");
     const err = await rejection(adapter.completePayment(input));
     expect(err).toMatchObject({ code: "processing_error", retryable: false, raw: { cause: { status: "COMPLETED" } } });
-    expect(err.message).toContain("payment handle as already used");
+    expect(err.message).toContain("payment handle as no longer payable");
     expect(fake.uniqueHandleCreations).toBe(1);
     expect(sent(fake, CREATE_PAYMENT)).toHaveLength(1);
   });

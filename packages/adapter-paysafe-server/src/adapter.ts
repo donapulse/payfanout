@@ -2527,7 +2527,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     const ref = `merchantRefNum "${replay.merchantRefNum}"`;
     const answer =
       pspCode === HANDLE_NOT_PAYABLE_CODE
-        ? `Paysafe reports the payment handle as already used, but no ${noun} made with it under ${ref} can be read back`
+        ? `Paysafe reports the payment handle as no longer payable (spent, expired or failed), but no ${noun} made with it under ${ref} can be read back`
         : pspCode === IN_PROGRESS_CODE
           ? `Paysafe is still processing another request on this transaction, and no ${noun} under ${ref} can be read back`
           : `Paysafe reports the ${noun} with ${ref} as already processed, but it cannot be read back`;

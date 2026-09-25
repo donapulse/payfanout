@@ -42,12 +42,14 @@ const BASE_TIME = Date.parse("2026-07-07T10:00:00.000Z");
  * requests, refunds, and subscriptions — flow creates never dedupe, matching
  * the sandbox), invalid_state on bad transitions (including cancelling an
  * already-cancelled/finished subscription), the refunds feature gate (403
- * until enabled), total_amount_confirmation checking, the ?payment= filter on
- * GET /refunds, and cursor pagination. Actions ignore the Idempotency-Key —
- * GoCardless documents keys for creates only — so a repeated cancel answers
- * cancellation_failed. The key is checked before the body: the docs do not
- * state that order, and a refund replayed after it used up the payment can
- * only be recovered if it holds.
+ * until enabled), total_amount_confirmation checking, at most 5 refunds per
+ * payment (number_of_refunds_exceeded), the metadata limits on refunds (3
+ * keys, 50-character names, 500-character values), the ?payment= filter on
+ * GET /refunds, and cursor pagination over lists ordered newest first. Actions ignore the Idempotency-Key — GoCardless
+ * documents keys for creates only — so a repeated cancel answers
+ * cancellation_failed. Where the docs leave a refund rule open, a flag
+ * selects the reading (refundCapEnforced, totalAmountConfirmationChecked,
+ * keyCheckedBeforeBody).
  */
 export class FakeGoCardlessApi {
   private readonly billingRequests = new Map<string, FakeBillingRequest>();
@@ -64,8 +66,19 @@ export class FakeGoCardlessApi {
   private networkFailure = 0;
 
   refundsEnabled = true;
-  /** Off leaves total_amount_confirmation as the only guard against a refund past the payment's amount. */
+  /**
+   * The API reference names no cap on a refund's amount (the support centre's
+   * "up to the full amount of that payment" describes the Dashboard). Off
+   * refunds past the payment's amount, as an API without one would.
+   */
   refundCapEnforced = true;
+  /**
+   * Accounts can opt out of requiring total_amount_confirmation, and the spec
+   * does not say whether a value still supplied is then checked. Off ignores it.
+   */
+  totalAmountConfirmationChecked = true;
+  /** The docs do not say whether a consumed key or an invalid body answers first. Off checks a refund's body first. */
+  keyCheckedBeforeBody = true;
   mandateLookupFails = false;
   uniqueBillingRequestCreations = 0;
   uniqueRefundCreations = 0;
@@ -175,6 +188,8 @@ export class FakeGoCardlessApi {
     if (method === "POST" && brCancelMatch) {
       const br = this.billingRequests.get(decodeURIComponent(brCancelMatch[1]!));
       if (!br) return notFound("billing request");
+      // The spec documents no error for this action; cancellation_failed, as
+      // payments document it, is assumed (sandbox check S2).
       if (br.status === "fulfilled" || br.status === "cancelled") {
         return invalidState("Billing request cannot be cancelled in its current state");
       }
@@ -330,7 +345,7 @@ export class FakeGoCardlessApi {
       });
     }
     const replay = this.idempotentReplay("refunds", idempotencyKey);
-    if (replay) return replay;
+    if (replay && this.keyCheckedBeforeBody) return replay;
     const request = body["refunds"] as {
       amount?: number;
       total_amount_confirmation?: number;
@@ -340,13 +355,21 @@ export class FakeGoCardlessApi {
     const payment = request?.links?.payment ? this.payments.get(request.links.payment) : undefined;
     if (!payment) return validationFailed("links.payment", "must exist");
     if (typeof request.amount !== "number") return validationFailed("amount", "is required");
+    const metadataError = metadataViolation(request.metadata);
+    if (metadataError) return validationFailed("metadata", metadataError);
     const alreadyRefunded = payment.amount_refunded ?? 0;
-    // GoCardless refunds "up to the full amount of that payment" (support
-    // centre); the API reference names no error for it, so the shape is assumed.
+    const refundCount = [...this.refunds.values()].filter((refund) => refund.links?.payment === payment.id).length;
+    if (refundCount >= 5) {
+      return invalidState("Maximum of 5 refunds per payment already reached", "number_of_refunds_exceeded");
+    }
+    // No documented error shape: the API reference names no cap at all.
     if (this.refundCapEnforced && alreadyRefunded + request.amount > (payment.amount ?? 0)) {
       return validationFailed("amount", "exceeds the refundable amount");
     }
-    if (request.total_amount_confirmation !== alreadyRefunded + request.amount) {
+    if (
+      this.totalAmountConfirmationChecked &&
+      request.total_amount_confirmation !== alreadyRefunded + request.amount
+    ) {
       return json(422, {
         error: {
           message: "Validation failed",
@@ -362,6 +385,7 @@ export class FakeGoCardlessApi {
         },
       });
     }
+    if (replay) return replay;
     const refund: GoCardlessRefundLike = {
       id: `RF${String(++this.seq).padStart(6, "0")}`,
       created_at: this.nextTimestamp(),
@@ -515,6 +539,13 @@ export class FakeGoCardlessApi {
     refund.status = status;
   }
 
+  /** Overwrites stored refund fields (refunds an earlier adapter version created, wire variations). */
+  setRefundFields(refundId: string, fields: Partial<GoCardlessRefundLike>): void {
+    const refund = this.refunds.get(refundId);
+    if (!refund) throw new Error(`no refund ${refundId}`);
+    Object.assign(refund, fields);
+  }
+
   /** Seeds an active mandate directly — the charging handle subscriptions require. */
   seedMandate(fields: Partial<FakeMandate> = {}): { id: string } {
     const mandate: FakeMandate = {
@@ -590,14 +621,21 @@ export class FakeGoCardlessApi {
     return new Date(BASE_TIME + this.seq * 1000).toISOString();
   }
 
-  /** Cursor pagination over insertion order with created_at range filters. */
+  /**
+   * Cursor pagination with created_at range filters, newest first: "All list
+   * endpoints are ordered and paginated reverse-chronologically by default."
+   * Equal timestamps keep the later insertion first.
+   */
   private paginate<T extends { id?: string; created_at?: string }>(
     items: T[],
     params: URLSearchParams,
   ): { page: T[]; after: string | null } {
     const gte = params.get("created_at[gte]");
     const lte = params.get("created_at[lte]");
-    let filtered = items;
+    const createdAt = (item: T): string => item.created_at ?? "";
+    let filtered = [...items]
+      .reverse()
+      .sort((a, b) => (createdAt(a) === createdAt(b) ? 0 : createdAt(a) < createdAt(b) ? 1 : -1));
     if (gte) filtered = filtered.filter((item) => (item.created_at ?? "") >= gte);
     if (lte) filtered = filtered.filter((item) => (item.created_at ?? "") <= lte);
     const after = params.get("after");
@@ -673,14 +711,24 @@ function validationFailed(field: string, message: string, requestPointer?: strin
   });
 }
 
-function invalidState(message: string): Response {
+function invalidState(message: string, reason = "cancellation_failed"): Response {
   return json(422, {
     error: {
       message,
       type: "invalid_state",
       code: 422,
       documentation_url: "https://developer.gocardless.com/api-reference#invalid_state",
-      errors: [{ reason: "cancellation_failed", message }],
+      errors: [{ reason, message }],
     },
   });
+}
+
+/** "Up to 3 keys are permitted, with key names up to 50 characters and values up to 500 characters." */
+function metadataViolation(metadata: Record<string, string> | undefined): string | undefined {
+  if (!metadata) return undefined;
+  const entries = Object.entries(metadata);
+  if (entries.length > 3) return "must have at most 3 keys";
+  if (entries.some(([key]) => key.length > 50)) return "key names must not exceed 50 characters";
+  if (entries.some(([, value]) => String(value).length > 500)) return "values must not exceed 500 characters";
+  return undefined;
 }

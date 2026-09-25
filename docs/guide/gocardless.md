@@ -110,28 +110,42 @@ Two checkout-field mappings to know:
 
 ### Replays and idempotency keys
 
-GoCardless honours an `Idempotency-Key` on creates for at least 30 days. A key it has
-already used answers `409 idempotent_creation_conflict` with the id of the resource it
-created, and the adapter returns that resource. GoCardless documents no comparison of
-the new request with the original, so the adapter makes one: a key reused for a
-different payment or refund rejects with `invalid_request`.
+GoCardless honours an `Idempotency-Key` on creates for at least 30 days; after that, a
+replay under the same key may be treated as a new request. A key it has already used
+answers `409 idempotent_creation_conflict` with the id of the resource it created, and
+the adapter returns that resource. GoCardless documents no comparison of the new
+request with the original, so the adapter makes one: a key reused for a different
+payment or refund rejects with `invalid_request`.
 
 - **Sessions.** A replayed `createPaymentSession` returns the same billing request, and
   its amount, currency and session `id` must match the new input. The session reports
-  the billing request's own status. While it is `pending` the payer gets a fresh
-  `clientSecret`: GoCardless does not deduplicate flow creates, flows cannot be read
-  back, and every flow authorises the one billing request. Once the payer has
-  authorised, or the billing request is fulfilled or cancelled, the replay creates no
-  flow and carries no `clientSecret`: it reports `processing` or `canceled`, so the
-  payer is never sent to authorise the same payment twice. Follow the payment itself
-  with `retrievePayment`.
-- **Refunds.** A replayed `refundPayment` returns the original refund, even when that
-  refund used up what was left to refund. The original must belong to the same payment
-  and, when you pass an `amount`, be for that amount.
-- **Cancels.** GoCardless documents idempotency keys for creates only, and cancelling a
-  payment or billing request that is already cancelled answers `cancellation_failed`.
-  `cancelPayment` then re-reads it and resolves `canceled`. Any other state rejects
-  with the original error.
+  the status of the payment the billing request created, as `retrievePayment` does, or
+  the billing request's own status while there is no payment yet. While the billing
+  request is `pending` the payer gets a fresh `clientSecret`: GoCardless does not
+  deduplicate flow creates, flows cannot be read back, and every flow authorises the one
+  billing request. Once the payer has authorised, or the billing request is fulfilled or
+  cancelled, the replay creates no flow and carries no `clientSecret`, so the payer is
+  never sent to authorise the same payment twice.
+- **Refunds.** A replayed `refundPayment` returns the original refund, which must belong
+  to the same payment and, when you pass an `amount`, be for that amount. Every refund
+  the adapter creates carries the SHA-256 of its idempotency key in its GoCardless
+  metadata, as `payfanout_key_sha256` next to `reason`, so a replay is recognised from
+  the refund itself. A request larger than what is left to refund, such as the replay of
+  a refund that used up the payment, is never sent: the adapter reads the payment's
+  refunds, returns the one stamped with the key, and otherwise rejects with
+  `invalid_request`. When GoCardless rejects a refund, the same read decides whether it
+  was a replay. GoCardless lets accounts opt out of the `total_amount_confirmation`
+  check, so the adapter does not rely on it, nor on whether GoCardless checks the key
+  before the rest of the request. This holds for every refund that carries the stamp.
+  Refunds created by adapter versions before the stamp carry none, and a replay of one
+  that exceeds what is left rejects with `invalid_request`, as it did then. If you
+  update a refund's metadata yourself, keep `payfanout_key_sha256`.
+- **Cancels.** GoCardless documents idempotency keys for creates only, and documents
+  `cancellation_failed` for cancelling a payment that is already cancelled. What it
+  answers for a billing request that is already cancelled is not documented. When a
+  cancel is refused, `cancelPayment` re-reads the payment or billing request and
+  resolves `canceled` if it is already cancelled. Any other state rejects with the
+  original error.
 
 Use a fresh key for every new payment or refund, including the session you create
 after cancelling one.
@@ -265,9 +279,10 @@ them from GoCardless support. Until then, `refundPayment` rejects with an
 partial refunds work, the adapter computes GoCardless's required
 `total_amount_confirmation` safety check from a fresh read, and refunds report
 `pending` until the money moves — poll `retrieveRefund` to a terminal state. A refund
-larger than what is left rejects with `invalid_request`, while a replay of a refund
-GoCardless already made returns that refund (see
-[Replays and idempotency keys](#replays-and-idempotency-keys)).
+larger than what is left rejects with `invalid_request` without reaching GoCardless,
+unless it replays a refund the adapter stamped with the same key, which is then
+returned (see [Replays and idempotency keys](#replays-and-idempotency-keys)). An
+`amount` of 0 rejects the same way.
 
 ## 9. Supported currencies & schemes
 

@@ -47,8 +47,8 @@ const BASE_TIME = Date.parse("2026-07-07T10:00:00.000Z");
  * keys, 50-character names, 500-character values), the ?payment= filter on
  * GET /refunds, and cursor pagination over lists ordered newest first.
  * Actions ignore the Idempotency-Key — GoCardless documents keys for creates
- * only — so a repeated cancel answers
- * cancellation_failed. Where the docs leave a refund rule open, a flag
+ * only — so a repeated cancel answers cancellation_failed. Where the docs
+ * leave a refund rule open, a flag
  * selects the reading (refundCapEnforced, totalAmountConfirmationChecked,
  * keyCheckedBeforeBody).
  */

@@ -136,7 +136,8 @@ payment or refund rejects with `invalid_request`.
   the refund itself. A request larger than what is left to refund, such as the replay of
   a refund that used up the payment, is never sent: the adapter reads the payment's
   refunds, returns the one stamped with the key, and otherwise rejects with
-  `invalid_request`. When GoCardless rejects a refund, the same read decides whether it
+  `invalid_request`, whose `raw` carries the payment as `raw.payment` and, when the
+  read was refused, GoCardless's answer as `raw.lookup`. When GoCardless rejects a refund, the same read decides whether it
   was a replay. While GoCardless reports an amount already refunded on the payment
   (`amount_refunded` above 0), the adapter also makes that read before it creates a
   refund, so a key GoCardless no longer honours is still read back instead of refunding
@@ -147,18 +148,21 @@ payment or refund rejects with `invalid_request`.
   exceeds what is left rejects with `invalid_request`, as it did then. The stamp
   and `reason` take two of the three metadata keys GoCardless allows on a refund, leaving
   one for you; if you update a refund's metadata yourself, keep `payfanout_key_sha256`.
-  Use random idempotency keys, as GoCardless recommends ("Use UUIDv4"): each refund
-  stores the SHA-256 of its key.
+  Use random idempotency keys; GoCardless suggests UUIDv4 ("any non-repeating unique
+  identifier is sufficient"). Each refund stores the SHA-256 of its key.
 
   When GoCardless cannot answer the read of the payment's refunds (a timeout, a network
   or server error, rate limiting), whether before a create, after GoCardless rejected
   one, or for a request larger than what is left, `refundPayment` sends nothing further
   and rejects with a retryable `psp_unavailable` (`rate_limited` when GoCardless
-  rate-limits it). After a rejected create, GoCardless's answer to it is on
+  rate-limits it). After a failed create, GoCardless's answer to it is on
   `raw.rejection` and the read's own on `raw.lookup`. Retry with the same key: a new key
-  can refund twice. If the read before a create fails for any other reason, the refund
-  is not sent and the call rejects with a final `invalid_request`, whatever the key,
-  until the read works again; check the payment's refunds in the GoCardless dashboard.
+  can refund twice. If the read fails for any other reason, the error is marked
+  `outcomeUnknown`, since whether the key already refunded stays open. Before a create,
+  the refund is not sent and the call rejects with a final `invalid_request`, whatever
+  the key, until the read works again: check the payment's refunds in the GoCardless
+  dashboard, then retry with the same key. After a rejected create, GoCardless's
+  rejection stands; retry that refund only with the same key.
   On an account that opted out of the confirmation check, make refunds of one payment
   one at a time, and wait until `retrievePayment` shows the previous refund in
   `amountRefunded`: two refunds under different keys that read the same

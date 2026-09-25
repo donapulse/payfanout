@@ -356,13 +356,17 @@ choices they forced:
     refund is the original, and anything else rethrows the rejection. A transient failure
     of the read stays retryable, after a refusal and after a rejected POST alike (a
     rejection that reads as final could hide the original); after a rejected POST, the
-    rejection rides `raw.rejection` and the read's answer `raw.lookup`. Any other failure
-    keeps the refusal, or the rejection. While GoCardless reports an amount already
+    rejection rides `raw.rejection` and the read's answer `raw.lookup`, whether GoCardless
+    rejected the POST or failed to answer it. Any other failure keeps the refusal, or the
+    rejection marked `outcomeUnknown` (2026-09-25): whether the key already refunded
+    stays open, so only the same key may follow. An answer without a `refunds` array
+    counts as a failed read. While GoCardless reports an amount already
     refunded (`amount_refunded` above 0), the read also runs before the create
     (2026-09-25), so a key past the window GoCardless honours keys for is read back too.
     That read exists only to prevent a second refund, so it fails closed: the refund is
     not sent, and the call rejects retryable when the failure is transient and with a
-    final `invalid_request` otherwise. Replays of stamped refunds therefore depend
+    final `invalid_request` marked `outcomeUnknown` otherwise, whose message sends the
+    host to the dashboard and back to the same key. Replays of stamped refunds therefore depend
     neither on `total_amount_confirmation` nor on whether GoCardless checks the key before
     the body (AMBIGUOUS: the docs do not state the order). Refunds created before the
     stamp carry none: a replay of one that the remainder check refuses rejects, as it

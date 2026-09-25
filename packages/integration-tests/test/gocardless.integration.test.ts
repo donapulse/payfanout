@@ -251,8 +251,8 @@ describeIf("GoCardless sandbox integration", () => {
     const adapter = makeAdapter();
     // Sandbox-verified: GET /refunds?payment=<id> answers 200 with an empty
     // list for a payment without refunds — the server honors the filter
-    // instead of rejecting the parameter.
-    const result = await adapter.listRefunds({ pspPaymentId: "PM000000000000" });
+    // instead of rejecting the parameter. limit=500 is the query the refund stamp read sends.
+    const result = await adapter.listRefunds({ pspPaymentId: "PM000000000000", limit: 500 });
     expect(result.refunds).toEqual([]);
   });
 

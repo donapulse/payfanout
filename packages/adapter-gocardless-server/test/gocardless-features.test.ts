@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   isPayFanoutError,
   type CreatePaymentSessionInput,
+  type PayFanoutError,
   type RefundResult,
   type UnifiedWebhookEventType,
 } from "@payfanout/core";
@@ -944,6 +945,10 @@ const gocardlessDown = (): Promise<Response> =>
     new Response(JSON.stringify({ error: { message: "down", type: "gocardless", code: 503 } }), { status: 503 }),
   );
 
+const RATE_LIMITED = { error: { message: "Too many requests", type: "invalid_api_usage", code: 429, errors: [] } };
+const gocardlessRateLimits = (): Promise<Response> =>
+  Promise.resolve(new Response(JSON.stringify(RATE_LIMITED), { status: 429 }));
+
 const FORBIDDEN = { error: { message: "Forbidden", type: "invalid_api_usage", code: 403, errors: [] } };
 const gocardlessForbids = (): Promise<Response> =>
   Promise.resolve(new Response(JSON.stringify(FORBIDDEN), { status: 403 }));
@@ -1138,6 +1143,8 @@ function makeListingPair(): {
 interface RefundLevers {
   /** Answers GET /refunds while set. */
   listAnswer?: () => Promise<Response>;
+  /** Answers POST /refunds while set, without GoCardless handling it. */
+  createAnswer?: () => Promise<Response>;
   /** Loses the answer to the next POST /refunds after GoCardless has handled it. */
   loseNextCreateAnswer: boolean;
   /** What GoCardless answered each POST /refunds, lost or not. */
@@ -1148,6 +1155,7 @@ function makeFlakyRefundPair(): { adapter: GoCardlessServerAdapter; fake: FakeGo
   const levers: RefundLevers = { loseNextCreateAnswer: false, creates: [] };
   const { adapter, fake } = makeInterceptedPair(async (request, forward) => {
     if (levers.listAnswer && request.method === "GET" && request.path === "/refunds") return levers.listAnswer();
+    if (levers.createAnswer && request.method === "POST" && request.path === "/refunds") return levers.createAnswer();
     const response = await forward();
     if (request.method !== "POST" || request.path !== "/refunds") return response;
     const body = (await response.clone().json()) as { error?: { errors?: Array<{ reason?: string }> } };
@@ -1537,18 +1545,47 @@ describe("GoCardless refund replays", () => {
     expect(fake.uniqueRefundCreations).toBe(5);
   });
 
-  it("rethrows GoCardless's rejection when the stamp lookup after it is refused for good", async () => {
+  it("keeps GoCardless's rejection, for the same key only, when the stamp lookup after it is refused for good", async () => {
     const { adapter, fake, levers } = makeFlakyRefundPair();
     const paymentId = await confirmedPayment(adapter, fake, 1000);
     fake.refundsEnabled = false;
     levers.listAnswer = gocardlessForbids;
-    // The create's own 403, not the lookup's: only the create's names a reason.
-    await expect(adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: "r-off" })).rejects.toMatchObject({
+    // The create's own 403 decides the code and message: only the create's names a reason.
+    const refusal = await adapter
+      .refundPayment({ pspPaymentId: paymentId, idempotencyKey: "r-off" })
+      .catch((err: unknown) => err);
+    expect(refusal).toMatchObject({
       code: "invalid_request",
       retryable: false,
+      outcomeUnknown: true,
+      pspName: "gocardless",
       message: expect.stringMatching(/Refunds are not enabled/),
-      raw: { error: { code: 403, errors: [{ reason: "forbidden" }] } },
     });
+    expect((refusal as { raw: unknown }).raw).toEqual({
+      rejection: expect.objectContaining({ error: expect.objectContaining({ code: 403 }) }),
+      lookup: FORBIDDEN,
+    });
+  });
+
+  it("keeps a create GoCardless failed to answer and the lookup's outage in one shape", async () => {
+    const { adapter, fake, levers } = makeFlakyRefundPair();
+    const paymentId = await confirmedPayment(adapter, fake, 1000);
+    levers.listAnswer = gocardlessDown;
+    // GoCardless's own transient failure names the wait: rate limiting here, an outage there.
+    const cases = [
+      { createAnswer: gocardlessRateLimits, code: "rate_limited", rejection: RATE_LIMITED },
+      { createAnswer: gocardlessDown, code: "psp_unavailable", rejection: { error: { type: "gocardless", code: 503 } } },
+    ];
+    for (const { createAnswer, code, rejection } of cases) {
+      levers.createAnswer = createAnswer;
+      const err = (await adapter
+        .refundPayment({ pspPaymentId: paymentId, amount: 400, idempotencyKey: "r-outage" })
+        .catch((error: unknown) => error)) as PayFanoutError;
+      expect(err, code).toMatchObject({ code, retryable: true, pspName: "gocardless" });
+      expect(err.outcomeUnknown, code).toBeUndefined();
+      expect(err.raw, code).toMatchObject({ rejection, lookup: { error: { type: "gocardless", code: 503 } } });
+    }
+    expect(fake.uniqueRefundCreations).toBe(0);
   });
 
   it("keeps a rejected create retryable while the stamp lookup after it is down", async () => {
@@ -1615,9 +1652,12 @@ describe("GoCardless refund replays", () => {
       expect(refusal, idempotencyKey).toMatchObject({
         code: "invalid_request",
         retryable: false,
+        outcomeUnknown: true,
+        pspName: "gocardless",
         message:
           "Could not read GoCardless's refund list to check for a refund already made with this idempotency key, " +
-          `so the refund was not sent. Check the refunds of payment ${paymentId} in the GoCardless dashboard.`,
+          `so the refund was not sent. Check the refunds of payment ${paymentId} in the GoCardless dashboard, ` +
+          "then retry with the same idempotency key once the list can be read.",
       });
       expect((refusal as { raw: unknown }).raw, idempotencyKey).toEqual({ payment, lookup: FORBIDDEN });
     }
@@ -1689,7 +1729,13 @@ describe("GoCardless refund replays", () => {
     // One shape either way: the payment, plus the lookup's answer when the lookup was refused.
     const answers = [
       { status: 403, body: FORBIDDEN, raw: { payment, lookup: FORBIDDEN } },
-      { status: 200, body: { meta: { cursors: {}, limit: 50 } }, raw: { payment } },
+      { status: 200, body: { refunds: [], meta: { cursors: {}, limit: 50 } }, raw: { payment } },
+      // An answer without the list is a failed read, not an empty one.
+      {
+        status: 200,
+        body: { meta: { cursors: {}, limit: 50 } },
+        raw: { payment, lookup: { meta: { cursors: {}, limit: 50 } } },
+      },
     ];
     for (const answer of answers) {
       listAnswer = answer;

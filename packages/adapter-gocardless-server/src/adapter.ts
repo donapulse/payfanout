@@ -7,6 +7,7 @@ import {
   PayFanoutError,
   requestWithTimeout,
   safeJson,
+  sha256Hex,
   withTransportRetries,
   type AdapterCapabilities,
   type CancelNativeSubscriptionInput,
@@ -51,6 +52,14 @@ const DEFAULT_GOCARDLESS_VERSION = "2015-07-06";
 
 const EPOCH = "1970-01-01T00:00:00.000Z";
 
+/**
+ * Refund metadata key holding the SHA-256 (hex) of the idempotencyKey the
+ * refund was created with: how a replay is recognised from GoCardless's own
+ * data. The hash keeps the host's key out of the dashboard at a fixed 64
+ * characters (metadata values allow 500).
+ */
+const REFUND_KEY_STAMP = "payfanout_key_sha256";
+
 export interface GoCardlessServerAdapterConfig {
   /** Read-write access token from the GoCardless dashboard (server-side only). */
   accessToken: string;
@@ -87,10 +96,12 @@ export interface GoCardlessServerAdapterConfig {
   /**
    * Automatic retries for transport-level trouble only (network failure,
    * timeout, HTTP 5xx, 429) with exponential backoff. Default 2. Safe for
-   * mutating calls: billing-request/refund creates and cancel actions carry
-   * an Idempotency-Key, and a replayed flow create only re-issues an
-   * authorisation URL for the same billing request. Business errors
-   * (validation, invalid_state, permissions) are NEVER retried here.
+   * mutating calls: a retried create carries the same Idempotency-Key and
+   * resolves to the resource GoCardless already created, a retried cancel
+   * that finds the resource cancelled is resolved by re-reading it, and a
+   * retried flow create only issues another authorisation URL for the same
+   * billing request. Business errors (validation, invalid_state,
+   * permissions) are NEVER retried here.
    */
   maxNetworkRetries?: number;
   /** Injected backoff sleep for retry tests; defaults to real setTimeout. */
@@ -354,6 +365,16 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * the flow's authorisation_url — the client adapter redirects the payer to
    * it, GoCardless fulfils the billing request on completion (auto_fulfil is
    * always on), and the outcome is confirmed via webhooks or retrievePayment.
+   *
+   * A reused idempotencyKey resolves to the billing request GoCardless already
+   * holds under it. GoCardless documents no parameter comparison, so the
+   * adapter compares: its amount, currency and host `id` must match this
+   * input, or the call rejects with `invalid_request`. The replayed session
+   * reports the status of the payment the billing request created, as
+   * `retrievePayment` does, or the billing request's own status while it has
+   * none. Only a `pending` billing request gets a fresh authorisation URL;
+   * once the payer has authorised, or the request is fulfilled or cancelled,
+   * the session carries no `clientSecret`.
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertMinorUnitAmount(input.amount, "amount");
@@ -380,7 +401,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
     }
 
     const metadata = toStampedMetadata(input);
-    const billingRequest = await this.createWithIdempotencyReplay<GoCardlessBillingRequestLike>(
+    const { resource: billingRequest, replayed } = await this.createWithIdempotencyReplay<GoCardlessBillingRequestLike>(
       "billing_requests",
       {
         billing_requests: {
@@ -410,19 +431,79 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       input.idempotencyKey,
     );
 
-    // GoCardless does not dedupe flow creates — two POSTs with the same
-    // Idempotency-Key return two different flows (sandbox-verified
-    // 2026-07-07) — so the flow goes out plain. A replayed session therefore
-    // returns the same billing request with a fresh authorisation_url; every
-    // flow authorises that one billing request, so there is no
-    // duplicate-payment risk.
+    let status: UnifiedPaymentStatus = "requires_action";
+    let authorisable = true;
+    if (replayed) {
+      const mismatched = sessionReplayMismatches(billingRequest, {
+        amount: input.amount,
+        currency,
+        id: metadata?.["payfanout_id"],
+      });
+      if (mismatched.length > 0) {
+        throw idempotencyKeyReused("payment", "billing request", mismatched, {
+          billing_request: billingRequest,
+          mismatched,
+        });
+      }
+      ({ status, authorisable } = await this.replayedSessionState(billingRequest));
+    }
+    // Past `pending` the payer has authorised, or nothing can be paid any
+    // more: a new authorisation URL would only invite a second authorisation.
+    const clientSecret = authorisable ? await this.createFlow(input, billingRequest.id) : undefined;
+
+    return {
+      id: input.id ?? billingRequest.id,
+      pspName: this.pspName,
+      pspSessionId: billingRequest.id,
+      ...(clientSecret ? { clientSecret } : {}),
+      amount: input.amount,
+      currency,
+      status,
+      ...(input.metadata ? { metadata: input.metadata } : {}),
+    };
+  }
+
+  /**
+   * Once the billing request names its payment, the payment's status stands,
+   * so a replay never reports a failed payment as `processing`. That read
+   * happens on replays only, and if it fails the billing request's own status
+   * stands instead: failing the replay would let a router fail over to
+   * another PSP for a payment that already exists.
+   */
+  private async replayedSessionState(
+    billingRequest: GoCardlessBillingRequestLike,
+  ): Promise<{ status: UnifiedPaymentStatus; authorisable: boolean }> {
+    const status = mapBillingRequestStatus(billingRequest.status);
+    const paymentId = billingRequest.links?.payment_request_payment;
+    if (!paymentId) return { status, authorisable: status === "requires_action" };
+    try {
+      const payment = await this.request<GoCardlessPaymentLike>(
+        "GET",
+        `/payments/${encodeURIComponent(paymentId)}`,
+        { envelope: "payments" },
+      );
+      return { status: mapGoCardlessPaymentStatus(payment.status), authorisable: false };
+    } catch {
+      // Best effort, like the mandate lookup: the payment exists either way.
+      return { status, authorisable: false };
+    }
+  }
+
+  /**
+   * GoCardless does not dedupe flow creates — two POSTs with the same
+   * Idempotency-Key return two different flows (sandbox-verified 2026-07-07)
+   * — so the flow goes out plain, and a replay of a pending session mints a
+   * new one. Every flow authorises the one billing request, so a second flow
+   * cannot duplicate the payment.
+   */
+  private async createFlow(input: CreatePaymentSessionInput, billingRequestId: string): Promise<string> {
     const flow = await this.request<GoCardlessBillingRequestFlowLike>("POST", "/billing_request_flows", {
       body: {
         billing_request_flows: {
           redirect_uri: input.returnUrl,
           ...(this.config.exitUri ? { exit_uri: this.config.exitUri } : {}),
           ...(toPrefilledCustomer(input) ?? {}),
-          links: { billing_request: billingRequest.id },
+          links: { billing_request: billingRequestId },
         },
       },
       envelope: "billing_request_flows",
@@ -436,17 +517,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
         pspName: this.pspName,
       });
     }
-
-    return {
-      id: input.id ?? billingRequest.id,
-      pspName: this.pspName,
-      pspSessionId: billingRequest.id,
-      clientSecret: flow.authorisation_url,
-      amount: input.amount,
-      currency,
-      status: "requires_action",
-      ...(input.metadata ? { metadata: input.metadata } : {}),
-    };
+    return flow.authorisation_url;
   }
 
   /**
@@ -504,28 +575,103 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * Cancels whichever stage the id names: a billing request pre-fulfilment
    * (expires its flows), or a payment — GoCardless only cancels
    * pending_submission payments, anything later rejects with invalid_state
-   * (cancellation_failed) -> invalid_request, never retried. The caller's key
-   * rides the Idempotency-Key header (GoCardless accepts it on POST actions).
+   * (cancellation_failed) -> invalid_request, never retried.
+   *
+   * Verified-idempotent. GoCardless documents Idempotency-Key for creates
+   * only, and documents cancellation_failed for cancelling a payment that is
+   * already cancelled (what it answers for an already-cancelled billing
+   * request is undocumented), so a repeated cancel can be refused although
+   * the cancel it repeats went through. On any rejection the payment or
+   * billing request is re-read, and one that is already cancelled resolves as
+   * `canceled`; any other state rethrows the original error. The caller's key
+   * still rides the Idempotency-Key header.
    */
   async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
+    const id = encodeURIComponent(pspPaymentId);
     if (pspPaymentId.startsWith("BRQ")) {
-      const billingRequest = await this.request<GoCardlessBillingRequestLike>(
-        "POST",
-        `/billing_requests/${encodeURIComponent(pspPaymentId)}/actions/cancel`,
-        { body: {}, idempotencyKey, envelope: "billing_requests" },
+      const toInfo = (billingRequest: GoCardlessBillingRequestLike): PaymentInfo =>
+        this.billingRequestToPaymentInfo(billingRequest);
+      return this.verifiedCancel(
+        async () =>
+          toInfo(
+            await this.request<GoCardlessBillingRequestLike>("POST", `/billing_requests/${id}/actions/cancel`, {
+              body: {},
+              idempotencyKey,
+              envelope: "billing_requests",
+            }),
+          ),
+        async () =>
+          toInfo(
+            await this.request<GoCardlessBillingRequestLike>("GET", `/billing_requests/${id}`, {
+              envelope: "billing_requests",
+            }),
+          ),
       );
-      return this.billingRequestToPaymentInfo(billingRequest);
     }
-    const payment = await this.request<GoCardlessPaymentLike>(
-      "POST",
-      `/payments/${encodeURIComponent(pspPaymentId)}/actions/cancel`,
-      { body: {}, idempotencyKey, envelope: "payments" },
+    return this.verifiedCancel(
+      async () => {
+        const payment = await this.request<GoCardlessPaymentLike>("POST", `/payments/${id}/actions/cancel`, {
+          body: {},
+          idempotencyKey,
+          envelope: "payments",
+        });
+        return this.toPaymentInfo(payment, { mandateReference: await this.mandateReference(payment) });
+      },
+      () => this.retrievePayment(pspPaymentId),
     );
-    return this.toPaymentInfo(payment, { mandateReference: await this.mandateReference(payment) });
   }
 
+  /** The resource state decides, never the error shape: an already-cancelled re-read is the success. */
+  private async verifiedCancel(
+    cancel: () => Promise<PaymentInfo>,
+    reread: () => Promise<PaymentInfo>,
+  ): Promise<PaymentInfo> {
+    try {
+      return await cancel();
+    } catch (err) {
+      let info: PaymentInfo;
+      try {
+        info = await reread();
+      } catch {
+        // The re-read failing must not mask the original rejection.
+        throw err;
+      }
+      if (info.status === "canceled") return info;
+      throw err;
+    }
+  }
+
+  /**
+   * Refunds against a fresh read of the payment; omit `amount` to refund the
+   * remainder. More than the remainder, or an explicit `amount` of 0, rejects
+   * locally with `invalid_request`, and a payment or refund amount GoCardless
+   * sends that is not a whole number rejects with `unknown`.
+   *
+   * Each refund is created with the SHA-256 of its idempotencyKey in its
+   * GoCardless metadata (`payfanout_key_sha256`, next to `reason`), so a
+   * replay is recognised from the refund itself. A reused key resolves to the
+   * refund created with it, which must belong to this payment and, when an
+   * amount is given, be for that amount, or the call rejects with
+   * `invalid_request`. A request the remainder check refuses, such as the
+   * replay of a refund that used up the payment, is never sent: the payment's
+   * refunds are read and the one stamped with this key is returned, or the
+   * refusal stands. A create GoCardless rejects is settled by the same read.
+   * GoCardless lets accounts opt out of the total_amount_confirmation check,
+   * so none of this relies on it, nor on whether GoCardless checks the key
+   * before the request body. Refunds created by adapter versions without the
+   * stamp are not recognised: a replay of one that the remainder check
+   * refuses rejects, as it did before.
+   */
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
-    if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
+    if (req.amount !== undefined) {
+      assertMinorUnitAmount(req.amount, "refund amount");
+      if (req.amount === 0) {
+        throw PayFanoutError.invalidRequest(
+          "A refund amount must be greater than 0 — omit amount to refund what is left",
+          { amount: req.amount },
+        );
+      }
+    }
     // A fresh read anchors total_amount_confirmation — GoCardless's guard
     // against concurrent double refunds. `amount` is mandatory on POST
     // /refunds, so "full refund" is resolved here as the unrefunded remainder.
@@ -534,35 +680,110 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       `/payments/${encodeURIComponent(req.pspPaymentId)}`,
       { envelope: "payments" },
     );
-    const alreadyRefunded = payment.amount_refunded ?? 0;
-    const amount = req.amount ?? Math.max(0, (payment.amount ?? 0) - alreadyRefunded);
-    if (amount <= 0) {
-      throw PayFanoutError.invalidRequest(`Payment ${req.pspPaymentId} has nothing left to refund`, payment);
+    const paymentAmount = wireAmount(payment.amount);
+    const alreadyRefunded = wireAmount(payment.amount_refunded);
+    if (paymentAmount === undefined || alreadyRefunded === undefined) throw unreadableAmount("payment", payment);
+    const amount = req.amount ?? Math.max(0, paymentAmount - alreadyRefunded);
+    const refusal =
+      amount === 0
+        ? `Payment ${req.pspPaymentId} has nothing left to refund`
+        : alreadyRefunded + amount > paymentAmount
+          ? `Refund of ${amount} exceeds the remaining refundable amount on payment ${req.pspPaymentId}`
+          : undefined;
+    const stamp = await sha256Hex(req.idempotencyKey);
+    const { refund, replayed } =
+      refusal === undefined
+        ? await this.createRefund(req, amount, alreadyRefunded + amount, stamp)
+        : { refund: await this.resolveRefusedRefund(req, stamp, refusal, payment), replayed: true };
+    const refundedAmount = wireAmount(refund.amount);
+    if (refundedAmount === undefined) throw unreadableAmount("refund", refund);
+    if (replayed) {
+      const mismatched = refundReplayMismatches(refund, req);
+      if (mismatched.length > 0) {
+        throw idempotencyKeyReused("refund", "refund", mismatched, { refund, mismatched });
+      }
     }
-    if (alreadyRefunded + amount > (payment.amount ?? 0)) {
-      throw PayFanoutError.invalidRequest(
-        `Refund of ${amount} exceeds the remaining refundable amount on payment ${req.pspPaymentId}`,
-        payment,
-      );
-    }
-    const refund = await this.createWithIdempotencyReplay<GoCardlessRefundLike>(
-      "refunds",
-      {
-        refunds: {
-          amount,
-          total_amount_confirmation: alreadyRefunded + amount,
-          links: { payment: req.pspPaymentId },
-          ...(req.reason ? { metadata: { reason: req.reason } } : {}),
-        },
-      },
-      req.idempotencyKey,
-    );
     return {
       refundId: refund.id,
       status: mapGoCardlessRefundStatus(refund.status),
-      amount: refund.amount ?? amount,
+      amount: refundedAmount,
       raw: refund,
     };
+  }
+
+  /**
+   * POST /refunds under the caller's key; a consumed key resolves to the
+   * refund created with it. Any other rejection is checked against the
+   * payment's refunds: one stamped with this key means the POST was a replay
+   * GoCardless refused on its body, and that refund is the answer.
+   */
+  private async createRefund(
+    req: RefundRequest,
+    amount: number,
+    totalAmountConfirmation: number,
+    stamp: string,
+  ): Promise<{ refund: GoCardlessRefundLike; replayed: boolean }> {
+    try {
+      const { resource, replayed } = await this.createWithIdempotencyReplay<GoCardlessRefundLike>(
+        "refunds",
+        toRefundBody(req, amount, totalAmountConfirmation, stamp),
+        req.idempotencyKey,
+      );
+      return { refund: resource, replayed };
+    } catch (err) {
+      let original: GoCardlessRefundLike | undefined;
+      try {
+        original = await this.stampedRefund(req.pspPaymentId, stamp);
+      } catch {
+        // The read failing must not mask the rejection.
+        throw err;
+      }
+      if (!original) throw err;
+      return { refund: original, replayed: true };
+    }
+  }
+
+  /**
+   * A request the remainder check refuses is sent nowhere. It can still be
+   * the replay of a refund that used up the payment, and only the stamp tells:
+   * the refund of this payment stamped with this key is returned, anything
+   * else keeps the refusal.
+   */
+  private async resolveRefusedRefund(
+    req: RefundRequest,
+    stamp: string,
+    refusal: string,
+    payment: GoCardlessPaymentLike,
+  ): Promise<GoCardlessRefundLike> {
+    let original: GoCardlessRefundLike | undefined;
+    try {
+      original = await this.stampedRefund(req.pspPaymentId, stamp);
+    } catch (err) {
+      const rejection = PayFanoutError.wrap(err, { pspName: this.pspName });
+      // A transient failure leaves open whether this is a replay: a retry with the same key settles it.
+      if (rejection.retryable) throw rejection;
+    }
+    if (!original) throw PayFanoutError.invalidRequest(refusal, payment);
+    return original;
+  }
+
+  /**
+   * The refund of this payment created with the key behind `stamp`, if any.
+   * One page holds every refund of a payment: GoCardless allows at most five.
+   * Should two carry the stamp (a key reused after GoCardless stopped
+   * honouring it), the newest was created by the latest request.
+   */
+  private async stampedRefund(pspPaymentId: string, stamp: string): Promise<GoCardlessRefundLike | undefined> {
+    const page = await this.request<{ refunds?: GoCardlessRefundLike[] }>(
+      "GET",
+      withQuery("/refunds", new URLSearchParams({ payment: pspPaymentId })),
+    );
+    let match: GoCardlessRefundLike | undefined;
+    for (const refund of page.refunds ?? []) {
+      if (refund.metadata?.[REFUND_KEY_STAMP] !== stamp) continue;
+      if (!match || (refund.created_at ?? "") > (match.created_at ?? "")) match = refund;
+    }
+    return match;
   }
 
   /** Polls an async refund to a terminal state — bank refunds submit on debit-scheme timing. */
@@ -706,7 +927,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
     }
     const startDate = input.startAt === undefined ? undefined : toStartDate(input.startAt);
     const metadata = toStampedMetadata(input);
-    const subscription = await this.createWithIdempotencyReplay<GoCardlessSubscriptionLike>(
+    const { resource: subscription } = await this.createWithIdempotencyReplay<GoCardlessSubscriptionLike>(
       "subscriptions",
       {
         subscriptions: {
@@ -914,23 +1135,31 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * POST-create with GoCardless's native Idempotency-Key semantics: a consumed
    * key answers 409 idempotent_creation_conflict naming the existing resource
    * in links.conflicting_resource_id. The official client libraries fetch that
-   * resource and return it as the create result, and so does this helper.
-   * Billing requests and refunds only — GoCardless does not dedupe flow
-   * creates (sandbox-verified), those go through request() plain.
+   * resource and return it as the create result, and so does this helper,
+   * flagged `replayed` — GoCardless documents no parameter comparison, so
+   * callers check the resource against their input. Billing requests, refunds
+   * and subscriptions only — GoCardless does not dedupe flow creates
+   * (sandbox-verified), those go out plain.
    */
   private async createWithIdempotencyReplay<T>(
     collection: string,
     body: unknown,
     idempotencyKey: string,
-  ): Promise<T> {
+  ): Promise<{ resource: T; replayed: boolean }> {
     try {
-      return await this.request<T>("POST", `/${collection}`, { body, idempotencyKey, envelope: collection });
+      const resource = await this.request<T>("POST", `/${collection}`, {
+        body,
+        idempotencyKey,
+        envelope: collection,
+      });
+      return { resource, replayed: false };
     } catch (err) {
       const conflictId = idempotentConflictResourceId(err);
       if (!conflictId) throw err;
-      return this.request<T>("GET", `/${collection}/${encodeURIComponent(conflictId)}`, {
+      const resource = await this.request<T>("GET", `/${collection}/${encodeURIComponent(conflictId)}`, {
         envelope: collection,
       });
+      return { resource, replayed: true };
     }
   }
 
@@ -943,9 +1172,9 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
 
   /**
    * Transport with timeout + transient-only retries. Safe to retry mutating
-   * calls: billing-request/refund creates and cancel actions carry an
-   * Idempotency-Key (a consumed create key 409s and the create helper
-   * resolves it), and a replayed flow create only re-issues an authorisation
+   * calls: creates carry an Idempotency-Key (a consumed key 409s and the
+   * create helper resolves it), cancels are verified by re-reading the
+   * resource, and a replayed flow create only issues another authorisation
    * URL for the same billing request.
    */
   private request<T>(method: "GET" | "POST", path: string, options: RequestOptions = {}): Promise<T> {
@@ -1207,6 +1436,91 @@ function idempotentConflictResourceId(err: unknown): string | undefined {
     }
   }
   return undefined;
+}
+
+/**
+ * What makes a replayed billing request this session's payment: the amount
+ * and currency of its payment_request, and the stamped host id. Sessions send
+ * no mandate_request and choose no scheme, so a mandate_request that is
+ * present only has to share the payment's currency.
+ */
+function sessionReplayMismatches(
+  billingRequest: GoCardlessBillingRequestLike,
+  expected: { amount: number; currency: string; id: string | undefined },
+): string[] {
+  const paymentRequest = billingRequest.payment_request;
+  const mandateCurrency = billingRequest.mandate_request?.currency;
+  return [
+    ...(wireAmount(paymentRequest?.amount) !== expected.amount ? ["amount"] : []),
+    ...((paymentRequest?.currency ?? "").toUpperCase() !== expected.currency ? ["currency"] : []),
+    ...(mandateCurrency !== undefined && mandateCurrency.toUpperCase() !== expected.currency
+      ? ["mandate currency"]
+      : []),
+    ...(billingRequest.metadata?.["payfanout_id"] !== expected.id ? ["id"] : []),
+  ];
+}
+
+/** A full refund's amount was the remainder at the time, so only a given amount is compared. */
+function refundReplayMismatches(refund: GoCardlessRefundLike, req: RefundRequest): string[] {
+  return [
+    ...(refund.links?.payment !== req.pspPaymentId ? ["payment"] : []),
+    ...(req.amount !== undefined && wireAmount(refund.amount) !== req.amount ? ["amount"] : []),
+  ];
+}
+
+/**
+ * Hosts show `message` to payers, so it names no GoCardless id: the resource
+ * belongs to another request. The resource itself rides `raw`.
+ */
+function idempotencyKeyReused(
+  kind: "payment" | "refund",
+  resource: "billing request" | "refund",
+  mismatched: string[],
+  raw: unknown,
+): PayFanoutError {
+  return new PayFanoutError({
+    code: "invalid_request",
+    message:
+      `Idempotency key reused for a different ${kind}: the ${resource} created with it does not match this ` +
+      `request's ${mismatched.join(", ")}. Use a fresh key for a new ${kind}.`,
+    retryable: false,
+    raw,
+    pspName: GOCARDLESS_PSP_NAME,
+  });
+}
+
+/** GoCardless types amounts as integer or string; only a non-negative whole number reads. */
+function wireAmount(value: unknown): number | undefined {
+  const amount = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
+  return typeof amount === "number" && Number.isSafeInteger(amount) && amount >= 0 ? amount : undefined;
+}
+
+/** Fails closed: no refund arithmetic, and no RefundResult, rests on an amount that does not read. */
+function unreadableAmount(resource: "payment" | "refund", raw: unknown): PayFanoutError {
+  return new PayFanoutError({
+    code: "unknown",
+    message: `GoCardless returned a ${resource} whose amount is not a whole number of minor units.`,
+    retryable: false,
+    raw,
+    pspName: GOCARDLESS_PSP_NAME,
+  });
+}
+
+/** `reason` and the key stamp take two of GoCardless's three metadata keys. */
+function toRefundBody(
+  req: RefundRequest,
+  amount: number,
+  totalAmountConfirmation: number,
+  stamp: string,
+): unknown {
+  return {
+    refunds: {
+      amount,
+      total_amount_confirmation: totalAmountConfirmation,
+      links: { payment: req.pspPaymentId },
+      metadata: { ...(req.reason ? { reason: req.reason } : {}), [REFUND_KEY_STAMP]: stamp },
+    },
+  };
 }
 
 /**

@@ -89,7 +89,15 @@ and `PaymentService` will hold you to:
   `invalid_request` (core's `classifyHttpFallback` is that tail). Retryable semantics
   are contract, not taste: `rate_limited`/`psp_unavailable` are always retryable,
   `authentication_required` NEVER is (the customer comes back on-session) — the
-  conformance suite asserts both.
+  conformance suite asserts both. `psp_unavailable`, `rate_limited` and `unknown` already
+  mean the call may have taken effect: callers retry them only under the same
+  `idempotencyKey`, and the subscription engine never moves such a renewal to a new key.
+  When a money-moving call may have taken effect although you report it with a code that
+  would otherwise read as definitive (a `processing_error` for an answer you could not
+  read back, a refusal you cannot resolve), set `outcomeUnknown: true`, which callers
+  treat the same way. A PSP's refusal of a reused key (Stripe's `idempotency_error`, a
+  duplicate `merchantRefNum`) proves the key's first request ran, so it carries the flag
+  too unless the adapter has read that request's outcome back.
 - **Idempotency:** `idempotencyKey` is REQUIRED on every mutating call — session
   creation, completion, refunds, **capture, cancel, and verification included**.
   Forward it through your PSP's mechanism (Stripe: `Idempotency-Key` request option;

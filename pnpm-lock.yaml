@@ -208,6 +208,9 @@ importers:
       '@payfanout/conformance':
         specifier: workspace:*
         version: link:../conformance
+      '@payfanout/server':
+        specifier: workspace:*
+        version: link:../server
 
   packages/adapter-payzen:
     dependencies:

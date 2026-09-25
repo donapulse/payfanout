@@ -202,6 +202,8 @@ export interface PaysafePaymentHandleLike {
   bacs?: PaysafeBankAccountLike;
   ach?: PaysafeBankAccountLike;
   eft?: PaysafeBankAccountLike;
+  /** Interac: the alias Paysafe collects from, echoed as the handle was minted. */
+  interacEtransfer?: { consumerId?: string; type?: string };
   links?: Array<{ rel?: string; href?: string }>;
 }
 
@@ -793,6 +795,13 @@ interface ReplayableWrite<T> extends ReplayKey {
    * have no duplicate rejection at all (voidauths).
    */
   readBackOnRejection?: boolean;
+  /**
+   * A single-use spend sent with dupCheck: true. A duplicate or in-progress
+   * rejection then means an earlier payment under the key was processed
+   * instead of this one, so that payment answers the call whichever handle it
+   * spent.
+   */
+  duplicateChecked?: boolean;
   /** Turns a record read back into this call's answer; may throw. Defaults to recordedFailure. */
   recovered?: (record: T) => T;
   /** Payment handles: which one the key minted to reuse; none mints a new one. */
@@ -867,9 +876,12 @@ function paymentWrite(
  * /paymenthandles accepts dupCheck (Paysafe's handle examples send it true
  * and false), but the adapter sends none: an attempt that follows a failed,
  * expired or spent handle under the same key needs a new handle, which a
- * duplicate check could refuse. Nothing at Paysafe is relied on to reject a
- * second handle under one merchantRefNum, so the handle a replay already
- * minted is looked up first, and `choose` picks the one to reuse.
+ * duplicate check could refuse, and the schema gives the field no meaning
+ * (only the EFT instrument defines it). A handle moves no money, so a
+ * bank-debit replay is guarded at its payment instead. Nothing at Paysafe is
+ * relied on to reject a second handle under one merchantRefNum, so the
+ * handle a replay already minted is looked up first, and `choose` picks the
+ * one to reuse.
  */
 function handleWrite(
   merchantRefNum: string,
@@ -889,16 +901,26 @@ function handleWrite(
 const USABLE_INTERAC_HANDLE_STATUSES = ["COMPLETED", "PAYABLE", "PROCESSING", "INITIATED"];
 
 /**
- * A replayed Interac session reuses the handle its first attempt minted, the
- * most advanced one when there are several. A failed or expired handle is
- * minted anew.
+ * A replayed Interac session reuses the handle its first attempt minted for
+ * the same customer email, the most advanced one when there are several. A
+ * failed or expired handle is minted anew, and so is one minted for another
+ * email: its redirect would collect from someone else's alias.
  */
-function usableInteracHandle(handles: PaysafePaymentHandleLike[]): PaysafePaymentHandleLike | undefined {
+function usableInteracHandle(
+  handles: PaysafePaymentHandleLike[],
+  consumerId: string,
+): PaysafePaymentHandleLike | undefined {
+  const same = handles.filter((h) => sameInteracConsumer(h.interacEtransfer?.consumerId, consumerId));
   for (const status of USABLE_INTERAC_HANDLE_STATUSES) {
-    const handle = handles.find((h) => (h.status ?? "").toUpperCase() === status);
+    const handle = same.find((h) => (h.status ?? "").toUpperCase() === status);
     if (handle) return handle;
   }
   return undefined;
+}
+
+/** An echo that states no alias cannot contradict; addresses compare trimmed and case-insensitively. */
+function sameInteracConsumer(echo: string | undefined, consumerId: string): boolean {
+  return echo === undefined || echo.trim().toLowerCase() === consumerId.trim().toLowerCase();
 }
 
 /** Where a handle echoes its bank object: the paymentType in lowercase, as sent. */
@@ -1186,7 +1208,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       context.amount,
       context.currency,
       INTERAC_PAYMENT_TYPE,
-      usableInteracHandle,
+      (handles) => usableInteracHandle(handles, consumerId),
     );
     const handle = await this.sendWrite(minted, "/paymenthub/v1/paymenthandles", {
       merchantRefNum: input.idempotencyKey,
@@ -1384,9 +1406,14 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * payment the key already made answers a replayed completion before any
    * handle is touched; otherwise a handle an earlier attempt minted from the
    * same details and never charged is reused, and a new one is minted when
-   * there is none. The payment spends that single-use handle like every other
-   * single-use charge, so a key whose earlier attempts all failed takes a new
-   * attempt (other bank details after a decline), and none is charged twice.
+   * there is none. Attempts that each mint a handle slip past the
+   * spent-handle refusal that guards a card replay, so while the key shows no
+   * failed attempt the payment carries dupCheck: Paysafe refuses a later
+   * payment under the key (5031), and the one it already holds answers the
+   * call once the lookup shows it. Once a failed attempt shows, dupCheck
+   * would refuse other bank details for 90 days, so it is off, and an attempt
+   * resubmitted while the lookup shows the failure but neither the later
+   * payment nor its handle is debited again.
    */
   private async completeBankDebitPayment(
     context: PaysafeSessionContextV1,
@@ -1431,11 +1458,16 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
         pspName: this.pspName,
       });
     }
-    const replay = paymentWrite(input.idempotencyKey, context.amount, context.currency, handle.paymentHandleToken, true);
+    const dupCheck = earlier.failed.length === 0;
+    const replay: ReplayableWrite<PaysafePaymentLike> = {
+      ...paymentWrite(input.idempotencyKey, context.amount, context.currency, handle.paymentHandleToken, true),
+      duplicateChecked: dupCheck,
+    };
     const payment = await this.sendWrite(replay, "/paymenthub/v1/payments", {
       merchantRefNum: input.idempotencyKey,
-      // Single-use like a card token: the handle guards its own replay (5283).
-      dupCheck: false,
+      // The handle's use of the key does not count: Paysafe's EFT examples mint
+      // the handle and send this payment under one merchantRefNum, dupCheck true.
+      dupCheck,
       amount: context.amount,
       currencyCode: context.currency,
       paymentHandleToken: handle.paymentHandleToken,
@@ -1451,8 +1483,11 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       ...(context.receiptEmail ? { profile: { email: context.receiptEmail } } : {}),
     });
     // The scheme mandate (SEPA/BACS) rides the payment's bank object — or, when
-    // the payment echo omits it, the freshly minted handle's.
-    return this.toPaymentInfo(payment, context.id, undefined, bankMandateReference(handle));
+    // the payment echo omits it, the handle's, unless the key's earlier payment
+    // answered and this handle was never charged.
+    const ownHandle =
+      payment.paymentHandleToken === undefined || payment.paymentHandleToken === handle.paymentHandleToken;
+    return this.toPaymentInfo(payment, context.id, undefined, ownHandle ? bankMandateReference(handle) : undefined);
   }
 
   /**
@@ -1475,14 +1510,15 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * marks it COMPLETED "regardless of the payments call response status")
    * with no payment of its own in the lookup means that payment exists but
    * the lookup trails it: the payments are read again patiently, and the call
-   * ends rather than debit again while that payment stays hidden.
+   * ends rather than debit again while that payment stays hidden. `failed`
+   * holds the key's failed attempts, which switch the duplicate check off.
    */
   private async bankDebitKey(
     keyed: ReplayableWrite<PaysafePaymentLike>,
     minted: ReplayableWrite<PaysafePaymentHandleLike>,
-  ): Promise<{ payment?: PaysafePaymentLike; handle?: PaysafePaymentHandleLike }> {
+  ): Promise<{ payment?: PaysafePaymentLike; handle?: PaysafePaymentHandleLike; failed: PaysafePaymentLike[] }> {
     let read = this.classify(await this.recordsByRefNum<PaysafePaymentLike>(keyed, false), keyed);
-    if (read.live[0]) return { payment: read.live[0] };
+    if (read.live[0]) return { payment: read.live[0], failed: read.failed };
     const handles = await this.recordsByRefNum<PaysafePaymentHandleLike>(minted, false);
     const foreign = handles.filter((h) => !agreesWith(h, minted));
     if (foreign.length > 0) throw this.differentRequest(minted, foreign);
@@ -1498,10 +1534,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       if (attempt >= REPLAY_READ_ATTEMPTS) throw this.unreadableOriginal(keyed, HANDLE_NOT_PAYABLE_CODE, hidden);
       await this.backoff(attempt);
       read = await this.readBack<PaysafePaymentLike>(keyed);
-      if (read.live[0]) return { payment: read.live[0] };
+      if (read.live[0]) return { payment: read.live[0], failed: read.failed };
     }
     const handle = minted.choose?.(handles);
-    return handle ? { handle } : {};
+    return handle ? { handle, failed: read.failed } : { failed: read.failed };
   }
 
   /** Signature + TTL verification with the adapter's clock. */
@@ -2364,8 +2400,9 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
         pspCode !== undefined &&
         (REPLAY_CODES.has(pspCode) || (write.singleUse === true && pspCode === HANDLE_NOT_PAYABLE_CODE))
       ) {
-        const { found } = await this.readBackPatiently<T>(write);
-        if (found) return recovered(found);
+        const keyPayment = write.duplicateChecked === true && REPLAY_CODES.has(pspCode);
+        const original = await this.readBackPatiently<T>(write, keyPayment);
+        if (original) return recovered(original);
         throw this.unreadableOriginal(write, pspCode, (failure as PayFanoutError).raw);
       }
       if (isOutcomeUnknown(failure)) {
@@ -2383,8 +2420,8 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
         // An earlier attempt whose outcome is unknown may be what this rejection is about.
         if (outcomeUnknown) return this.settleUnknownOutcome(write, failure, recovered);
         if (write.readBackOnRejection) {
-          const { found } = await this.readBackPatiently<T>(write);
-          if (found) return recovered(found);
+          const original = await this.readBackPatiently<T>(write);
+          if (original) return recovered(original);
         }
         throw failure;
       }
@@ -2396,15 +2433,17 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   /**
    * An attempt of this call may have been processed and nothing says whether
    * it was: only the lookup can tell, and without the original the call ends
-   * instead of repeating the write.
+   * instead of repeating the write. Only this call's own record settles it:
+   * a payment another handle made under the key does not say whether this
+   * one was processed too.
    */
   private async settleUnknownOutcome<T extends RefNumRecord>(
     write: ReplayableWrite<T>,
     failure: unknown,
     recovered: (record: T) => T,
   ): Promise<T> {
-    const { found } = await this.readBackPatiently<T>(write);
-    if (found) return recovered(found);
+    const original = await this.readBackPatiently<T>(write);
+    if (original) return recovered(original);
     throw this.unknownOutcome(write, (failure as PayFanoutError).raw);
   }
 
@@ -2428,11 +2467,19 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     return this.classify(records, write);
   }
 
-  /** The lookup can trail the write it indexes, so an original is read up to three times. */
-  private async readBackPatiently<T extends RefNumRecord>(write: ReplayableWrite<T>): Promise<ReadBack<T>> {
+  /**
+   * The lookup can trail the write it indexes, so an original is read up to
+   * three times. `keyPayment` also takes the key's live payment made with
+   * another handle.
+   */
+  private async readBackPatiently<T extends RefNumRecord>(
+    write: ReplayableWrite<T>,
+    keyPayment = false,
+  ): Promise<T | undefined> {
     for (let read = 1; ; read += 1) {
-      const result = await this.readBack<T>(write);
-      if (result.found !== undefined || read >= REPLAY_READ_ATTEMPTS) return result;
+      const { found, live } = await this.readBack<T>(write);
+      const original = found ?? (keyPayment ? live[0] : undefined);
+      if (original !== undefined || read >= REPLAY_READ_ATTEMPTS) return original;
       await this.backoff(read);
     }
   }
@@ -2468,7 +2515,9 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * for a different request. For a single-use spend, a record made with
    * another handle is an earlier attempt instead: a failed one, or a live one
    * that is the key's payment. A record that omits its handle is taken as
-   * the call's own.
+   * the call's own, except a failed one on a single-use spend: Paysafe's
+   * decline example names no handle, so such a failure is taken as an
+   * earlier attempt's and never as this call's answer.
    */
   private classify<T extends RefNumRecord>(records: T[], write: ReplayableWrite<T>): ReadBack<T> {
     const mine: T[] = [];

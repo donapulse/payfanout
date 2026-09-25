@@ -214,8 +214,8 @@ directly; both forms are in [Server usage](/guide/server#server-completion-token
 the client side is [React usage](/guide/react#built-in-completion-transport).
 
 Keep the completion key stable per order, as above: a retried POST, a customer who pays
-again after a lost answer, or a new card after a decline all reuse it, and §10 explains how
-each one is answered.
+again after a lost answer, or a new card after a decline all reuse it. §10 explains how
+each one is answered, and the timings in which a replay can still be charged twice.
 
 ## 8. Interac e-Transfer (Canada)
 
@@ -380,11 +380,15 @@ retries, for every write it makes:
   the `merchantRefNum` you pass (or the key), and deleting a saved card carries no key: the
   vault is checked instead.
 - `dupCheck` is `true` on saved-card charges, captures, refunds and verifications, and
-  `false` on card, Interac and bank-debit completions, whose single-use handle already
-  refuses a second charge. With `dupCheck: true`, a card declined under your completion key
-  would block every later card for that order. Payment handles accept `dupCheck`, but the
-  adapter does not rely on it: it looks the key's handle up before minting one. Authorization
-  voids take no `dupCheck`.
+  `false` on card and Interac completions, whose single-use handle already refuses a second
+  charge. With `dupCheck: true`, a card declined under your completion key would block every
+  later card for that order. A bank-debit completion can mint a new handle on each attempt,
+  so no spent handle stands between two attempts: its payment carries `dupCheck: true` until
+  a failed attempt shows under the key, and `false` after that, so corrected bank details
+  can follow a decline. Payment handles accept `dupCheck`, but the adapter does not rely on
+  it: it looks the key's handle up before minting one, and reuses it only when it was
+  minted for the same Interac email or the same bank details. Authorization voids take no
+  `dupCheck`.
 - A completion reads its key before it sends anything. Completing again with the same key
   and card returns the original, including a decline whose record names its card, which
   comes back as the same decline; a decline filed without its card (as Paysafe's example
@@ -404,18 +408,27 @@ retries, for every write it makes:
   nothing. A 429 is re-sent after backoff, because Paysafe refused it unprocessed.
 - A key already used for a **different** amount or currency, or for a different saved card
   or verification card, rejects with `invalid_request`: give every new payment its own
-  key. On a card, Interac or bank-debit completion a new card is a new attempt under the
-  same key; a payment the key already made is returned instead, and a fully voided one
-  comes back `canceled` (start a new attempt after a void under a new key). Capture,
-  cancel and refund keys must be unique across the merchant account, because Paysafe's
-  lookups for them are account-wide.
+  key. The exception is a card or Interac completion key whose earlier attempts all
+  failed: a failed attempt is set aside before any amount is compared, so the next attempt
+  goes through at its own amount and currency. A bank-debit key still rejects it, because
+  the failed attempt's payment handle states its amount. On a card, Interac or bank-debit
+  completion a new card is a new attempt under the same key; a payment the key already
+  made is returned instead, and a fully voided one comes back `canceled` (start a new
+  attempt after a void under a new key). Capture, cancel and refund keys must be unique
+  across the merchant account, because Paysafe's lookups for them are account-wide.
 - A duplicate whose original cannot be read back rejects with the same non-retryable
   `processing_error`. A fresh write can take a moment to appear, and the lookup only
   covers the last 30 days, so an original older than that can never be read back:
   reconcile it in the Paysafe portal.
-- Two completions with different cards under one key can both be charged when the second
-  is sent before the first shows in Paysafe's lookup, because nothing at Paysafe spans
-  them. Keep one completion in flight per order.
+- Two card completions with different cards under one key can both be charged when the
+  second is sent before the first shows in Paysafe's lookup, because nothing at Paysafe
+  spans them. Two bank-debit attempts are held apart by `dupCheck` instead: Paysafe refuses
+  the later payment (`5031`), and the adapter answers it with the first one, or with the
+  non-retryable `processing_error` while the lookup does not show it yet. Whether the check
+  also catches a payment Paysafe is still processing is undocumented. Once a failed attempt
+  shows under the key the check is off, and an attempt resubmitted after a lost answer,
+  before Paysafe's lookup shows its payment or its handle, can be debited twice. Keep one
+  completion in flight per order.
 
 ::: warning A timeout bounds one exchange, not a call
 `requestTimeoutMs` (default `60000`, the response timeout of Paysafe's own SDKs) applies to
@@ -428,8 +441,10 @@ plus `(1 + maxNetworkRetries) × requestTimeoutMs` for each read before it: minu
 defaults. On a platform that ends requests sooner (serverless functions often allow 25-30
 seconds), lower `requestTimeoutMs` and `maxNetworkRetries` until a call fits, and replay a
 call the platform ended with the same key: the replay reads back what the ended call did
-once Paysafe shows it. A browser completion replays with a fresh tokenization, so it is
-charged if the first payment is not visible yet; keep one completion in flight per order.
+once Paysafe shows it. A card completion replayed from the browser carries a fresh
+tokenization, so it is charged again if the first payment is not visible yet. A bank-debit
+replay is refused by `dupCheck` instead, unless an earlier attempt under the key failed
+(see above). Keep one completion in flight per order.
 :::
 
 ## 11. Register the webhook endpoint

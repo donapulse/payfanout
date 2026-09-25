@@ -122,6 +122,8 @@ export class FakePaysafeApi {
   private readonly recordedFailures: Array<{ matcher: RequestMatcher; failure: RecordedFailure }> = [];
   /** `${collection} ${merchantRefNum}` -> lookups still to answer empty. */
   private readonly lookupLag = new Map<string, number>();
+  /** Records of one handle still to leave out of a collection's lookups. */
+  private readonly trailingHandles: Array<{ collection: string; paymentHandleToken: string; remaining: number }> = [];
   /** The recordFailure lever that applies to the request being routed. */
   private activeFailure: RecordedFailure | undefined;
   private seq = 0;
@@ -198,6 +200,15 @@ export class FakePaysafeApi {
    */
   hideFromLookups(collection: string, merchantRefNum: string, count = Number.POSITIVE_INFINITY): void {
     this.lookupLag.set(`${collection} ${merchantRefNum}`, count);
+  }
+
+  /**
+   * The next `count` `collection` lookups that would show records made with
+   * this payment handle leave them out, while everything else filed under the
+   * reference stays visible: one record trailing the write that filed it.
+   */
+  hideHandleRecords(collection: string, paymentHandleToken: string, count = Number.POSITIVE_INFINITY): void {
+    this.trailingHandles.push({ collection, paymentHandleToken, remaining: count });
   }
 
   /** Requests of one method and exact path — the attempts a call made. */
@@ -391,19 +402,28 @@ export class FakePaysafeApi {
       this.lookupLag.set(lagKey, lag - 1);
       return json(200, { meta: { numberOfRecords: 0 }, [collection]: [] });
     }
+    let filed = index.get(refNum) ?? [];
+    for (const trailing of this.trailingHandles) {
+      if (trailing.collection !== collection || trailing.remaining <= 0) continue;
+      const shown = filed.filter((record) => handleTokenOf(record) !== trailing.paymentHandleToken);
+      if (shown.length === filed.length) continue;
+      filed = shown;
+      trailing.remaining -= 1;
+    }
     // Paysafe pages every lookup: limit defaults to 10, at most 50, from `offset`.
     const limit = Math.min(Number(params.get("limit") ?? 10), 50);
     const offset = Number(params.get("offset") ?? 0);
-    const records = (index.get(refNum) ?? []).map(view).slice(offset, offset + limit);
+    const records = filed.map(view).slice(offset, offset + limit);
     return json(200, { meta: { numberOfRecords: records.length }, [collection]: records });
   }
 
   /**
    * POST /paymenthandles for redirect and bank-debit rails. Redirect (Interac)
    * mirrors the documented response: INITIATED + action REDIRECT + the
-   * redirect_payment link. Bank rails come back immediately PAYABLE. The
+   * redirect_payment link, echoing the interacEtransfer alias as the Interac
+   * guide's handle response does. Bank rails come back immediately PAYABLE. The
    * request takes a top-level dupCheck (the EFT schema defines it, and
-   * Paysafe's ACH, EFT and wallet examples send it); without `dupCheck: true`
+   * Paysafe's ACH, wallet and Safetypay examples send it); without `dupCheck: true`
    * a reused merchantRefNum mints again, its default being undocumented.
    */
   private createPaymentHandle(body: Record<string, unknown>): Response {
@@ -414,7 +434,7 @@ export class FakePaysafeApi {
     if (["SEPA", "ACH", "BACS", "EFT"].includes(paymentType)) {
       return this.createBankHandle(refNum, paymentType, body);
     }
-    const interac = body["interacEtransfer"] as { consumerId?: string } | undefined;
+    const interac = body["interacEtransfer"] as { consumerId?: string; type?: string } | undefined;
     if (paymentType === "INTERAC_ETRANSFER" && !interac?.consumerId) {
       return json(400, {
         error: { code: "5068", message: "Field error(s)", fieldErrors: [{ field: "interacEtransfer.consumerId", error: "Either invalid or no value provided" }] },
@@ -438,6 +458,7 @@ export class FakePaysafeApi {
       usage: "SINGLE_USE",
       txnTime: "2026-07-04T10:00:00Z",
       links: [{ rel: "redirect_payment", href: `https://api.test.paysafe.com/alternatepayments/v1/redirect?paymentHandleId=${id}` }],
+      ...(interac ? { interacEtransfer: { consumerId: interac.consumerId, type: interac.type ?? "EMAIL" } } : {}),
     };
     this.fileHandle(refNum, handle, { paymentType });
     return json(201, handle);
@@ -527,7 +548,9 @@ export class FakePaysafeApi {
       return json(400, { error: { code: "5068", message: "Missing paymentHandleToken" } });
     }
     // A spent handle is refused first; which check Paysafe runs first is
-    // undocumented, and the adapter never sends dupCheck with a single-use one.
+    // undocumented, and a bank-debit completion, which sends dupCheck with its
+    // single-use handle, reads either answer back. Neither refusal spends the
+    // handle here; whether Paysafe's do is undocumented (docs/decisions.md).
     if (this.spentHandles.has(token)) return handleNotPayable();
     if (body["dupCheck"] === true && isFiled(this.paymentsByRef, refNum)) {
       return this.duplicateCode === "3044" ? duplicateRequest() : duplicateRefNum();
@@ -1057,6 +1080,10 @@ function publicSubscription(sub: PaysafeSubscriptionLike, fields: string | null)
   if (!requested.has("customerProfile")) delete copy.customerProfile;
   if (!requested.has("paymentsInformation")) delete copy.paymentsInformation;
   return copy;
+}
+
+function handleTokenOf(record: unknown): unknown {
+  return (record as { paymentHandleToken?: unknown }).paymentHandleToken;
 }
 
 function matches(matcher: RequestMatcher, method: string, path: string): boolean {

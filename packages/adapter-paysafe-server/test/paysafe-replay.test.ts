@@ -98,6 +98,22 @@ async function rejection(promise: Promise<unknown>): Promise<PayFanoutError> {
   throw new Error("expected the call to reject");
 }
 
+/** Holds each call until `parties` have arrived, then lets them all through in arrival order. */
+function rendezvous(parties: number): () => Promise<void> {
+  let arrived = 0;
+  let open: () => void = () => undefined;
+  const opened = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return () => {
+    arrived += 1;
+    if (arrived >= parties) open();
+    return opened;
+  };
+}
+
+const DECLINED_BY_ISSUER = { status: 402, code: "3009", message: "Your request has been declined by the issuing bank." };
+
 const EFT_DETAILS = {
   v: 1,
   paymentType: "EFT",
@@ -114,6 +130,20 @@ const eftSession = (amount = 12_50): Partial<CreatePaymentSessionInput> => ({
   currency: "CAD",
   country: "CA",
   paymentMethodTypes: ["pad"],
+});
+// Paysafe's EFT simulation of an account in INVALID state (400/2019), filed here as a failed debit.
+const invalidEftEnvelope = bankEnvelope({ ...EFT_DETAILS, transitNumber: "00109" });
+const INVALID_EFT_ACCOUNT = {
+  status: 400,
+  code: "2019",
+  message: "The specified bank and account information is currently under INVALID state.",
+};
+const sepaEnvelope = bankEnvelope({
+  v: 1,
+  paymentType: "SEPA",
+  accountHolderName: "Erik van Houten",
+  iban: "NL77ABNA0492122466", // Paysafe's documented SEPA test IBAN
+  mandateConsent: true,
 });
 
 const interacInput: CreatePaymentSessionInput = {
@@ -300,19 +330,38 @@ describe("Paysafe card completion replays", () => {
     const { adapter, fake } = makePair();
     fake.failedPaymentsLikeDeclineExample = true;
     const pspSessionId = await cardSession(adapter);
-    fake.recordFailure(CREATE_PAYMENT, { status: 402, code: "3009", message: "Your request has been declined by the issuing bank." });
+    fake.recordFailure(CREATE_PAYMENT, DECLINED_BY_ISSUER);
     await rejection(adapter.completePayment({ pspSessionId, clientToken: "tok_card_a", idempotencyKey: "order-lost" }));
-    // Card B is charged, its answer is lost, and its record trails the lookup.
+    // Card B is charged and its answer is lost. The lookup trails B's payment
+    // alone: card A's decline, which names no card, stays in sight throughout.
     fake.loseAnswer(CREATE_PAYMENT);
-    fake.hideFromLookups("payments", "order-lost", 4);
+    fake.hideHandleRecords("payments", "tok_card_b", 3);
     const lost = await rejection(
       adapter.completePayment({ pspSessionId, clientToken: "tok_card_b", idempotencyKey: "order-lost" }),
     );
     expect(lost).toMatchObject({ code: "processing_error", retryable: false });
+    expect(lost.message).toContain("went unanswered");
     expect(fake.uniquePaymentCreations).toBe(1);
     // Replayed with the same key and card once B is visible: B's own payment comes back.
     const replay = await adapter.completePayment({ pspSessionId, clientToken: "tok_card_b", idempotencyKey: "order-lost" });
     expect(replay.status).toBe("succeeded");
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
+  it("never reads a handleless decline back as the answer of a card Paysafe refused unprocessed", async () => {
+    const { adapter, fake } = makePair();
+    fake.failedPaymentsLikeDeclineExample = true;
+    const pspSessionId = await cardSession(adapter);
+    fake.recordFailure(CREATE_PAYMENT, DECLINED_BY_ISSUER);
+    await rejection(adapter.completePayment({ pspSessionId, clientToken: "tok_card_a", idempotencyKey: "order-503" }));
+    fake.refuse(CREATE_PAYMENT, 503); // card B never reaches the transaction, which nothing tells the adapter
+    const unknown = await rejection(
+      adapter.completePayment({ pspSessionId, clientToken: "tok_card_b", idempotencyKey: "order-503" }),
+    );
+    expect(unknown).toMatchObject({ code: "processing_error", retryable: false });
+    expect(unknown.message).toContain("went unanswered");
+    const paid = await adapter.completePayment({ pspSessionId, clientToken: "tok_card_b", idempotencyKey: "order-503" });
+    expect(paid.status).toBe("succeeded");
     expect(fake.uniquePaymentCreations).toBe(1);
   });
 
@@ -402,6 +451,17 @@ describe("Paysafe card completion replays", () => {
     expect(err).toMatchObject({ code: "invalid_request", retryable: false });
     expect(err.message).toContain('merchantRefNum "order-7"');
     expect(err.raw).toMatchObject({ expected: { amount: 1235, currency: "BHD" }, found: [{ amount: 1234 }] });
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
+  it("takes another amount under a card completion key whose earlier attempts all failed", async () => {
+    // A failed attempt is set aside before any amount is compared.
+    const { adapter, fake } = makePair();
+    const first = await cardSession(adapter, { amount: 2000 });
+    await rejection(adapter.completePayment({ pspSessionId: first, clientToken: "tok_declined", idempotencyKey: "order-9" }));
+    const second = await cardSession(adapter, { amount: 2500 });
+    const info = await adapter.completePayment({ pspSessionId: second, clientToken: "tok_new", idempotencyKey: "order-9" });
+    expect(info).toMatchObject({ status: "succeeded", amount: 2500 });
     expect(fake.uniquePaymentCreations).toBe(1);
   });
 
@@ -714,7 +774,7 @@ describe("Paysafe write transport", () => {
     }
   });
 
-  it("sends dupCheck false on single-use completions, true on saved-card charges, captures, refunds and verifications, and none on handles or voids", async () => {
+  it("sends dupCheck false on card and Interac completions, true on a first bank debit, saved-card charges, captures, refunds and verifications, and none on handles or voids", async () => {
     const { adapter, fake } = makePair();
     const paid = await adapter.completePayment({
       pspSessionId: await cardSession(adapter),
@@ -751,7 +811,7 @@ describe("Paysafe write transport", () => {
     const dupChecks = Object.fromEntries(
       sent(fake, CREATE_PAYMENT).map((r) => [r.body?.["merchantRefNum"], r.body?.["dupCheck"]]),
     );
-    expect(dupChecks).toEqual({ "k-card": false, "k-auth": false, "k-saved": true, "k-eft": false, "k-interac-pay": false });
+    expect(dupChecks).toEqual({ "k-card": false, "k-auth": false, "k-saved": true, "k-eft": true, "k-interac-pay": false });
     for (const endpoint of [SETTLE, REFUND, VERIFY]) {
       const bodies = sent(fake, endpoint).map((r) => r.body);
       expect(bodies.length, String(endpoint.path)).toBeGreaterThan(0);
@@ -1115,6 +1175,23 @@ describe("Paysafe payment-handle replays", () => {
     expect(fake.uniqueHandleCreations).toBe(1);
   });
 
+  it("never reuses an Interac handle minted for another customer email", async () => {
+    const { adapter, fake } = makePair();
+    const first = await adapter.createPaymentSession(interacInput);
+    const other = await adapter.createPaymentSession({ ...interacInput, receiptEmail: "someone.else@example.com" });
+    // The key's handle would collect from the first customer's alias: a new one is minted.
+    expect(fake.uniqueHandleCreations).toBe(2);
+    expect(fake.lastHandleRequestBody?.["interacEtransfer"]).toMatchObject({ consumerId: "someone.else@example.com" });
+    const [a, b] = await Promise.all(
+      [first, other].map((s) => decodeSessionContext(s.pspSessionId, SIGNING_KEY)),
+    );
+    expect(b!.paymentHandleToken).not.toBe(a!.paymentHandleToken);
+    // The first customer's replay still finds their own handle, whatever the address's case.
+    const again = await adapter.createPaymentSession({ ...interacInput, receiptEmail: "Payer@Example.com" });
+    expect((await decodeSessionContext(again.pspSessionId, SIGNING_KEY)).paymentHandleToken).toBe(a!.paymentHandleToken);
+    expect(fake.uniqueHandleCreations).toBe(2);
+  });
+
   it("answers a replayed Interac completion with the payment it made", async () => {
     const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession(interacInput);
@@ -1185,7 +1262,8 @@ describe("Paysafe payment-handle replays", () => {
     expect(info.status).toBe("processing");
     expect(fake.uniqueHandleCreations).toBe(2); // the declined attempt spent its handle
     expect(fake.uniquePaymentCreations).toBe(1);
-    expect(sent(fake, CREATE_PAYMENT).map((r) => r.body?.["dupCheck"])).toEqual([false, false]);
+    // The first attempt found nothing under the key; the second found the decline.
+    expect(sent(fake, CREATE_PAYMENT).map((r) => r.body?.["dupCheck"])).toEqual([true, false]);
   });
 
   it("reuses the uncharged handle an earlier attempt minted from the same bank details", async () => {
@@ -1237,7 +1315,8 @@ describe("Paysafe payment-handle replays", () => {
     const pspSessionId = await cardSession(adapter, eftSession());
     await adapter.completePayment({ pspSessionId, clientToken: eftEnvelope, idempotencyKey: "k-eft" });
     expect(fake.uniqueHandleCreations).toBe(0);
-    expect(sent(fake, CREATE_PAYMENT)[0]!.body).toMatchObject({ paymentHandleToken: "PHxToken", dupCheck: false });
+    // No failed attempt shows under the key, so the duplicate check stays on.
+    expect(sent(fake, CREATE_PAYMENT)[0]!.body).toMatchObject({ paymentHandleToken: "PHxToken", dupCheck: true });
   });
 
   it("rejects a bank completion whose key already paid another amount", async () => {
@@ -1281,6 +1360,147 @@ describe("Paysafe payment-handle replays", () => {
     expect(err.message).toContain("different Paysafe payment handle");
     expect(fake.uniqueHandleCreations).toBe(1);
     expect(fake.uniquePaymentCreations).toBe(0);
+  });
+
+  it("rejects another amount under a bank-debit key whose failed attempt left its handle", async () => {
+    // Unlike a card key, the failed attempt's handle states the amount it was minted for.
+    const { adapter, fake } = makePair();
+    fake.recordFailure(CREATE_PAYMENT, DECLINED_BY_ISSUER);
+    await rejection(
+      adapter.completePayment({
+        pspSessionId: await cardSession(adapter, eftSession(12_50)),
+        clientToken: eftEnvelope,
+        idempotencyKey: "k-eft",
+      }),
+    );
+    const err = await rejection(
+      adapter.completePayment({
+        pspSessionId: await cardSession(adapter, eftSession(13_00)),
+        clientToken: eftEnvelope,
+        idempotencyKey: "k-eft",
+      }),
+    );
+    expect(err).toMatchObject({ code: "invalid_request" });
+    expect(err.message).toContain("different Paysafe payment handle");
+    expect(fake.uniquePaymentCreations).toBe(0);
+  });
+
+  it("debits once when two identical bank completions race under one key", async () => {
+    const fake = new FakePaysafeApi();
+    const mintTogether = rendezvous(2);
+    const payTogether = rendezvous(2);
+    const { adapter } = makePair({
+      fetch: async (input, init) => {
+        const path = new URL(urlOf(input)).pathname;
+        // Both read the key before either mints a handle, and both mint before either pays.
+        if (init?.method === "POST" && path === HANDLES) await mintTogether();
+        if (init?.method === "POST" && path === PAYMENTS) await payTogether();
+        return fake.fetch(input, init);
+      },
+    });
+    const pspSessionId = await cardSession(adapter, eftSession());
+    const input = { pspSessionId, clientToken: eftEnvelope, idempotencyKey: "k-eft" };
+    const [a, b] = await Promise.all([adapter.completePayment(input), adapter.completePayment(input)]);
+    expect(b.pspPaymentId).toBe(a.pspPaymentId);
+    expect(fake.uniqueHandleCreations).toBe(2);
+    expect(fake.uniquePaymentCreations).toBe(1);
+    // Paysafe refused the later payment as a duplicate (5031), and the first one answered it.
+    expect(sent(fake, CREATE_PAYMENT).map((r) => r.body?.["dupCheck"])).toEqual([true, true]);
+  });
+
+  it("debits once when an identical bank completion is resubmitted while both lookups trail the first", async () => {
+    const { adapter, fake } = makePair();
+    const pspSessionId = await cardSession(adapter, eftSession());
+    const input = { pspSessionId, clientToken: eftEnvelope, idempotencyKey: "k-eft" };
+    const first = await adapter.completePayment(input);
+    fake.hideFromLookups("payments", "k-eft", 1);
+    fake.hideFromLookups("paymentHandles", "k-eft", 1);
+    const again = await adapter.completePayment(input);
+    expect(again.pspPaymentId).toBe(first.pspPaymentId);
+    expect(fake.uniquePaymentCreations).toBe(1);
+    // With nothing in sight the resubmission minted a handle of its own, which it never charged.
+    expect(fake.uniqueHandleCreations).toBe(2);
+    expect(sent(fake, CREATE_PAYMENT).map((r) => r.body?.["dupCheck"])).toEqual([true, true]);
+  });
+
+  it("lets corrected bank details follow a failed debit, with the duplicate check off", async () => {
+    const { adapter, fake } = makePair();
+    const pspSessionId = await cardSession(adapter, eftSession());
+    fake.recordFailure(CREATE_PAYMENT, INVALID_EFT_ACCOUNT);
+    const failed = await rejection(
+      adapter.completePayment({ pspSessionId, clientToken: invalidEftEnvelope, idempotencyKey: "k-eft" }),
+    );
+    expect(failed).toMatchObject({ code: "invalid_request", raw: { error: { code: "2019" } } });
+    const info = await adapter.completePayment({ pspSessionId, clientToken: eftEnvelope, idempotencyKey: "k-eft" });
+    expect(info.status).toBe("processing");
+    expect(fake.uniquePaymentCreations).toBe(1);
+    expect(fake.uniqueHandleCreations).toBe(2);
+    expect(fake.lastHandleRequestBody?.["eft"]).toMatchObject({ transitNumber: "22446" });
+    // With dupCheck the failed attempt's use of the key would refuse this one for 90 days.
+    expect(sent(fake, CREATE_PAYMENT).map((r) => r.body?.["dupCheck"])).toEqual([true, false]);
+  });
+
+  it("never debits twice when a resubmission cannot see the failed attempt that came before the debit", async () => {
+    const { adapter, fake } = makePair();
+    const pspSessionId = await cardSession(adapter, eftSession());
+    fake.recordFailure(CREATE_PAYMENT, INVALID_EFT_ACCOUNT);
+    await rejection(adapter.completePayment({ pspSessionId, clientToken: invalidEftEnvelope, idempotencyKey: "k-eft" }));
+    const input = { pspSessionId, clientToken: eftEnvelope, idempotencyKey: "k-eft" };
+    const paid = await adapter.completePayment(input);
+    // The corrected debit is resubmitted while the lookups trail every record under
+    // the key, the failure included: the duplicate check is on again, and holds.
+    fake.hideFromLookups("payments", "k-eft", 1);
+    fake.hideFromLookups("paymentHandles", "k-eft", 1);
+    const again = await adapter.completePayment(input);
+    expect(again.pspPaymentId).toBe(paid.pspPaymentId);
+    expect(fake.uniquePaymentCreations).toBe(1);
+    expect(sent(fake, CREATE_PAYMENT).map((r) => r.body?.["dupCheck"])).toEqual([true, false, true]);
+  });
+
+  it("ends as retry-later when Paysafe refuses a debit as the duplicate of a failure the lookup does not show yet", async () => {
+    const { adapter, fake } = makePair();
+    const pspSessionId = await cardSession(adapter, eftSession());
+    fake.recordFailure(CREATE_PAYMENT, INVALID_EFT_ACCOUNT);
+    await rejection(adapter.completePayment({ pspSessionId, clientToken: invalidEftEnvelope, idempotencyKey: "k-eft" }));
+    // The key's read, then the three reads after Paysafe's refusal, all miss the failure.
+    fake.hideFromLookups("payments", "k-eft", 4);
+    fake.hideFromLookups("paymentHandles", "k-eft", 1);
+    const input = { pspSessionId, clientToken: eftEnvelope, idempotencyKey: "k-eft" };
+    const err = await rejection(adapter.completePayment(input));
+    expect(err).toMatchObject({ code: "processing_error", retryable: false, raw: { cause: { error: { code: "5031" } } } });
+    expect(err.message).toContain("retry later with the same idempotency key, never a new one");
+    expect(fake.uniquePaymentCreations).toBe(0);
+    // Once the failure shows, the same key debits once, charging the handle the refused attempt minted.
+    const info = await adapter.completePayment(input);
+    expect(info.status).toBe("processing");
+    expect(fake.uniquePaymentCreations).toBe(1);
+    expect(fake.uniqueHandleCreations).toBe(2);
+    expect(sent(fake, CREATE_PAYMENT).map((r) => r.body?.["dupCheck"])).toEqual([true, true, false]);
+  });
+
+  it("never reports the mandate of a handle the payment did not spend", async () => {
+    // The payment echo omits its bank object here, so the minted handle's mandate is the fallback.
+    const fake = new FakePaysafeApi();
+    const { adapter } = makePair({
+      fetch: async (input, init) => {
+        const response = await fake.fetch(input, init);
+        if (new URL(urlOf(input)).pathname !== PAYMENTS || !response.ok) return response;
+        const body = (await response.json()) as { sepa?: unknown; payments?: Array<{ sepa?: unknown }> };
+        delete body.sepa;
+        for (const payment of body.payments ?? []) delete payment.sepa;
+        return new Response(JSON.stringify(body), { status: response.status });
+      },
+    });
+    const pspSessionId = await cardSession(adapter, { amount: 12_50, currency: "EUR", country: "NL", paymentMethodTypes: ["sepa_debit"] });
+    const input = { pspSessionId, clientToken: sepaEnvelope, idempotencyKey: "k-sepa" };
+    const first = await adapter.completePayment(input);
+    expect(first.mandateReference).toMatch(/^MND\d+REF$/);
+    fake.hideFromLookups("payments", "k-sepa", 1);
+    fake.hideFromLookups("paymentHandles", "k-sepa", 1);
+    const again = await adapter.completePayment(input);
+    expect(again.pspPaymentId).toBe(first.pspPaymentId);
+    // The key's payment answered, and the handle this attempt minted was never charged.
+    expect(again.mandateReference).toBeUndefined();
   });
 
   it("models /paymenthandles as accepting dupCheck, which Paysafe's handle examples send true and false", async () => {

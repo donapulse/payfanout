@@ -2310,15 +2310,17 @@ description of what v2 changes is what the migration then had to implement.
   the documented behaviour a lost answer became an `invalid_request` for a payment that
   existed, and a re-sent saved-card charge (a MULTI_USE token is never spent) could charge
   twice.
-- **Single-use completions send `dupCheck: false`; the spent handle guards their replay.**
+- **Card and Interac completions send `dupCheck: false`; the spent handle guards their
+  replay.**
   Doc-verified 2026-09-25: the spec's "Card - with Settlement" request example and the
   Paysafe.js "Transaction with Payment Handle" payment example both send `"dupCheck": false`
   with a single-use token, and the Interac guide's payment request omits the field while its
   response echoes `"dupCheck": true`, so false is sent explicitly. With `dupCheck: true` and
   a stable per-order completion key (the server guide's `complete-${order.id}`), a declined
   card left its record under the key and every later card for that order was refused as a
-  duplicate. Card, Interac and bank-debit completions therefore send false, and a replay of
-  the same handle is answered 5283 and read back. Saved-method charges (a MULTI_USE token is
+  duplicate. Card and Interac completions therefore send false, and a replay of the same
+  handle is answered 5283 and read back. Bank debits, whose attempts can each mint a
+  handle, follow the next entry. Saved-method charges (a MULTI_USE token is
   never spent), settlements, refunds and verifications keep `dupCheck: true`. Payment and
   verification records carry `paymentHandleToken` (the `payment` and `verification`
   schemas, and both lookup examples), so recovery matches on it: a record made with the
@@ -2329,9 +2331,37 @@ description of what v2 changes is what the migration then had to implement.
   payment. That last rule goes beyond "a new token is a new attempt", deliberately: the
   client adapter tokenizes on every Pay click, so a customer whose completion answer was
   lost and who pays again arrives with a new token under the same key, and processing it
-  would charge the order twice. What remains open is concurrency: two completions with
-  different cards sent under one key before either record is visible in the lookup can both
-  be charged, since no duplicate check spans them.
+  would charge the order twice. What remains open for cards is concurrency: two completions
+  with different cards sent under one key before either record is visible in the lookup can
+  both be charged, since no duplicate check spans them.
+- **Bank-debit completions send `dupCheck: true` until a failed attempt shows under the
+  key** (2026-09-25). A bank-debit attempt mints its own handle unless the lookup shows an
+  uncharged one minted from the same details, so the spent-handle refusal did not span two
+  attempts: two identical completions sent together, or one resubmitted while both lookups
+  trailed the first, each minted a handle and debited it. Doc-verified 2026-09-25 against
+  the spec: the ACH, EFT, SEPA and BACS payment request examples all send
+  `"dupCheck": true`. The EFT pair mints the handle and charges it under one
+  `merchantRefNum` ("4533863971"); the handle request carries no `dupCheck` (it sends a
+  `"dupcheck"` the schema does not define), and the payment, sent with `dupCheck: true`,
+  answers `COMPLETED`, so a handle minted under the key does not trip the payment's check.
+  The payment therefore carries `dupCheck: true` while the key's read shows no failed
+  payment, whatever handles it shows: no handle stops another attempt from debiting.
+  Paysafe then refuses a later payment under the key (5031, or 3044/3417), which says that
+  request was not processed, so the read-back takes the key's live payment as the answer
+  whichever handle made it, and ends in the non-retryable `processing_error` while none
+  shows. After an unknown
+  outcome only the call's own record settles it: another handle's payment does not say
+  whether this one went through too. Once a failed payment shows, the check is off, because
+  it would refuse corrected bank details for 90 days. What remains: after a visible
+  failure, a later attempt whose answer is lost, and whose payment and handle the lookup
+  does not show yet, is debited again if resubmitted; and whether the check catches a
+  payment Paysafe is still processing is the first open item below. The handle mint still
+  sends no `dupCheck`: among the handle instruments only `eftObject` defines it (a boolean
+  with no description and no default), `achObject`, `sepaObject` and `bacsObject` do not,
+  the ACH handle example sends `false`, and a handle moves no money, so a handle-level
+  refusal would only add a path that reads back a handle rather than the payment that
+  answers the call. A handle's mandate reference now stands in only for the payment that
+  spent it.
 - **Writes are never re-sent blindly, and payments, settlements and refunds are not re-sent
   after an unknown outcome.** Paysafe's Java and PHP SDK pages say "The client can be
   configured to automatically retry GET requests that have failed due to network problems
@@ -2390,7 +2420,12 @@ description of what v2 changes is what the migration then had to implement.
   undocumented, and an attempt that follows a failed, expired or spent handle needs a new
   handle under the same key, which a duplicate check could refuse. Handles are looked up
   before one is minted and reused when found; an Interac session with several reuses the
-  most advanced (COMPLETED, then PAYABLE, PROCESSING, INITIATED). A bank-debit completion
+  most advanced (COMPLETED, then PAYABLE, PROCESSING, INITIATED) among those minted for its
+  customer's email. The Interac guide's handle response echoes `interacEtransfer.consumerId`
+  (doc-verified 2026-09-25), and a handle minted for another email would collect from
+  another alias, so, like a bank handle minted from other details, it is left alone and a
+  new one is minted; the addresses compare trimmed and case-insensitively, and an echo that
+  states none cannot contradict. A bank-debit completion
   reads its key's payments first, and a live one answers the replay whichever handle it
   spent. It then reads the key's handles and reuses an uncharged one minted from the same
   bank details. A COMPLETED handle with no payment of its own in the lookup means a payment
@@ -2421,7 +2456,8 @@ description of what v2 changes is what the migration then had to implement.
   (or 402/3044), spends single-use handles (5283 on reuse), records declined payments and
   verifications with their handle tokens, answers the capture, refund and void state checks
   with the documented 402 codes (3203/3204, 3402/3404, 3501/3502) and an unknown settlement
-  with 400/3407, serves the six lookups, accepts `dupCheck` on handles, and takes the
+  with 400/3407, serves the six lookups, accepts `dupCheck` on handles, echoes the Interac
+  alias on its handles, and takes the
   dangerous reading wherever Paysafe documents nothing: a repeated reference without
   `dupCheck` is processed again. Against it the previous adapter failed the conformance
   "same key twice, same result" case, which it had only passed because the old fake echoed
@@ -2459,11 +2495,14 @@ description of what v2 changes is what the migration then had to implement.
     undocumented), and a full page is refused with the non-retryable `processing_error`
     instead of being paged through or read as complete: a key holding that many records
     in the 30-day window is reconciled in the portal.
-  - **Whether a `/payments` rejection that files no payment (a 400 such as 5068) still
-    spends the handle**, as "regardless of the payments call response status" suggests.
-    If it does, a bank-debit key whose handle is spent with no payment under it ends every
-    retry in `processing_error`: when the Paysafe portal shows no payment under the key,
-    the host starts a new attempt under a new key.
-  - **Follow-up, not built:** sending `dupCheck: true` on a completion whose key holds no
-    records yet would stop the second of two first attempts sent together. It waits on the
-    in-flight and decline-shape answers above.
+  - **Whether a `/payments` rejection that files no payment (a 400 such as 5068, or the
+    409/5031 that refuses a second bank debit under `dupCheck`) still spends the handle**,
+    as "regardless of the payments call response status" suggests. If it does, a
+    bank-debit key whose handle is spent with no payment under it ends every retry in
+    `processing_error` unless the key's payment shows: when the Paysafe portal shows no
+    payment under the key, the host starts a new attempt under a new key.
+  - **Card and Interac completions, not built:** the bank-debit rule above, `dupCheck: true`
+    until a failed attempt shows, would also refuse a card completion retried with a fresh
+    tokenization while the first payment trails the lookup, and the second of two sent
+    together. It waits on the in-flight answer above; the bank-debit case was built first
+    because an identical resubmission, the common retry, debited twice there.

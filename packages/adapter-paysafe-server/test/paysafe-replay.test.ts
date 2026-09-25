@@ -126,7 +126,8 @@ function inPairs(fake: FakePaysafeApi): typeof fetch {
 
 /** How every bank-debit ending that may need a new key tells the host so. */
 const START_AGAIN =
-  "once the Paysafe portal shows no successful payment under that key, start again under a new idempotency key";
+  "Start again under a new idempotency key only once the Paysafe portal shows every payment under that key as " +
+  "failed or cancelled, or none at all: a payment received, pending, processing, held or completed there is live";
 
 const DECLINED_BY_ISSUER = { status: 402, code: "3009", message: "Your request has been declined by the issuing bank." };
 
@@ -1519,7 +1520,7 @@ describe("Paysafe payment-handle replays", () => {
     expect(again.message).toContain(START_AGAIN);
     expect(fake.uniquePaymentCreations).toBe(0);
     expect(sent(fake, CREATE_PAYMENT).map((r) => r.body?.["dupCheck"])).toEqual([true, true]);
-    // The portal shows no successful payment under the key, so the host starts again under a new one.
+    // The portal shows every payment under the key failed, so the host starts again under a new one.
     const fresh = await adapter.completePayment({ ...input, idempotencyKey: "k-eft-2" });
     expect(fresh.status).toBe("processing");
     expect(fake.uniquePaymentCreations).toBe(1);
@@ -1615,8 +1616,8 @@ describe("Paysafe payment-handle replays", () => {
       const label = `refusalSpendsHandle ${refusalSpendsHandle}`;
       expect(endings[0], label).toMatchObject({ raw: { merchantRefNum: "k-eft", cause: { error: { code: "5031" } } } });
       expect(endings[0]!.message, label).toContain(
-        "Paysafe's duplicate check covers 90 days, while its lookup reaches only 30, so a failed attempt older " +
-          "than the lookup can refuse the key",
+        "may be a payment the lookup does not show yet, or a failed attempt older than the lookup: Paysafe's " +
+          "duplicate check covers 90 days, while its lookup reaches only 30",
       );
       for (const ending of endings) {
         expect(ending, label).toMatchObject({ code: "processing_error", retryable: false, pspName: "paysafe" });
@@ -1627,6 +1628,34 @@ describe("Paysafe payment-handle replays", () => {
       const fresh = await adapter.completePayment({ ...input, idempotencyKey: "k-eft-2" });
       expect(fresh.status, label).toBe("processing");
       expect(fake.uniquePaymentCreations, label).toBe(1);
+      // Past 90 days the duplicate check no longer counts the failure: the key debits again.
+      fake.passDays(60);
+      expect((await adapter.completePayment(input)).status, label).toBe("processing");
+      expect(fake.uniquePaymentCreations, label).toBe(2);
+    }
+  });
+
+  it("keeps \"never a new one\" when Paysafe says another request under a bank-debit key is in progress", async () => {
+    for (const refusalSpendsHandle of [true, false]) {
+      const { adapter, fake } = makePair();
+      fake.refusalSpendsHandle = refusalSpendsHandle;
+      const pspSessionId = await cardSession(adapter, eftSession());
+      fake.rejectAs(CREATE_PAYMENT, "3417");
+      const input = { pspSessionId, clientToken: eftEnvelope, idempotencyKey: "k-eft" };
+      const label = `refusalSpendsHandle ${refusalSpendsHandle}`;
+      const refused = await rejection(adapter.completePayment(input));
+      expect(refused.message, label).toContain("still processing another request");
+      expect(refused.message, label).toContain("never a new one");
+      expect(refused.message, label).not.toContain(START_AGAIN);
+      if (refusalSpendsHandle) {
+        // The refusal spent the handle: the retry cannot tell it from a payment still out of sight.
+        const retry = await rejection(adapter.completePayment(input));
+        expect(retry.message, label).toContain(START_AGAIN);
+        expect(fake.uniquePaymentCreations, label).toBe(0);
+      } else {
+        expect((await adapter.completePayment(input)).status, label).toBe("processing");
+        expect(fake.uniquePaymentCreations, label).toBe(1);
+      }
     }
   });
 

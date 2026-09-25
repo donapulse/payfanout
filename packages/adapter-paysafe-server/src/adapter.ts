@@ -742,12 +742,15 @@ const REPLAY_READ_ATTEMPTS = 3;
 
 /**
  * The way out of a bank-debit key Paysafe refuses with nothing to read back:
- * its payment may still show, and when the portal shows none, no retry under
- * that key gets past the refusal.
+ * its payment may still show, and when the portal shows no live payment, no
+ * retry under that key gets past the refusal. A debit still in progress is
+ * live: only failed or cancelled payments, or none, let a new key follow.
  */
 const RETRY_OR_START_AGAIN =
-  "Retry later with the same idempotency key, which returns the payment once the lookup shows it; once the " +
-  "Paysafe portal shows no successful payment under that key, start again under a new idempotency key";
+  "Retry later with the same idempotency key, which returns the payment once the lookup shows it. Start again " +
+  "under a new idempotency key only once the Paysafe portal shows every payment under that key as failed or " +
+  "cancelled, or none at all: a payment received, pending, processing, held or completed there is live, and a " +
+  "new key would debit again";
 
 /**
  * Paysafe's internal and gateway failures (the 500, 502 and 504 rows of its
@@ -2653,8 +2656,9 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     const { noun } = REF_NUM_LOOKUPS[replay.lookup];
     return this.retryLater(
       `Paysafe refused the ${noun} under merchantRefNum "${replay.merchantRefNum}" as a duplicate, and no ${noun} ` +
-        "under that key other than a failed attempt can be read back. Paysafe's duplicate check covers 90 days, " +
-        "while its lookup reaches only 30, so a failed attempt older than the lookup can refuse the key. " +
+        "under that key other than a failed attempt can be read back. What stands in the way may be a payment " +
+        "the lookup does not show yet, or a failed attempt older than the lookup: Paysafe's duplicate check covers " +
+        "90 days, while its lookup reaches only 30. " +
         RETRY_OR_START_AGAIN,
       replay,
       cause,

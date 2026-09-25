@@ -217,7 +217,7 @@ Keep the completion key stable per order, as above: a retried POST, a customer w
 again after a lost answer, or a new card after a decline all reuse it. §10 explains how
 each one is answered, the timings in which a replay can still be charged twice, and the
 bank-debit errors after which you start again under a new key, once the Paysafe portal
-shows no successful payment under the old one.
+shows every payment under the old one as failed or cancelled, or none at all.
 
 ## 8. Interac e-Transfer (Canada)
 
@@ -429,11 +429,12 @@ retries, for every write it makes:
   key. When the key holds a spent payment handle with no payment of its own, the error
   says that a refused attempt can leave one, since Paysafe marks a handle `COMPLETED`
   whatever its payments call answers. Both are the non-retryable `processing_error`.
-  Retry later with the same key, which returns the payment once the lookup shows it, and
-  once the Paysafe portal shows no successful payment under the key, start again under a
-  new idempotency key (a key derived from the order, like `complete-${order.id}`, needs a
-  suffix you can bump). Check the portal first: a new key while a payment under the old
-  one is still out of sight would debit twice.
+  Retry later with the same key, which returns the payment once the lookup shows it. Start
+  again under a new idempotency key (a key derived from the order, like
+  `complete-${order.id}`, needs a suffix you can bump) only once the Paysafe portal shows
+  every payment under the key as failed or cancelled, or none at all. A payment received,
+  pending, processing, held or completed there is live: a new key while it is out of the
+  lookup's sight would debit twice.
 - Two card completions with different cards under one key can both be charged when the
   second is sent before the first shows in Paysafe's lookup, because nothing at Paysafe
   spans them. Two bank-debit attempts are held apart by `dupCheck` instead, while no

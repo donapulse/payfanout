@@ -2418,10 +2418,13 @@ description of what v2 changes is what the migration then had to implement.
   sight but still trips `dupCheck`, so every attempt under the key is refused, and retrying
   under it cannot get past that. The refusal's error therefore does not say "never a new
   one": it states the 90- and 30-day windows, that a failed attempt older than the lookup
-  can refuse the key, and that once the Paysafe portal shows no successful payment under
-  it, the host starts again under a new idempotency key. "Never a new one" stays where it
-  holds, where the attempt may have been processed and the lookup can still show it: after
-  an unknown outcome, and on the other rejections that stand for this call's own original.
+  can refuse the key, and that only once the Paysafe portal shows every payment under it as
+  failed or cancelled, or none at all, does the host start again under a new idempotency
+  key; a payment received, pending, processing, held or completed is live (corrected
+  2026-09-25: "no successful payment" also matched a debit still processing). "Never a
+  new one" stays where it holds, where the attempt may have been processed and the lookup
+  can still show it: after an unknown outcome, and on the other rejections that stand for
+  this call's own original.
 - **How recovery reads.** An original is read back up to three times, 250 and 500 ms apart,
   each read a single attempt, which bounds a hung Paysafe to three more exchanges. The reads
   a call makes before it writes use the usual GET retries: a completion's key, a payment
@@ -2457,7 +2460,8 @@ description of what v2 changes is what the migration then had to implement.
   changes to COMPLETED when a payments call is made." The payments are read again, and the
   call ends with the non-retryable `processing_error` rather than debit again. Its message
   says that a refused attempt can leave a spent handle, and that once the Paysafe portal
-  shows no successful payment under the key, the host may start again under a new key: on
+  shows every payment under the key as failed or cancelled, or none at all, the host may
+  start again under a new key: on
   the plain reading, retrying under the key never gets past such a handle. Sharing one key
   across the handle and the payment follows Paysafe's own EFT examples: the handle and the
   payment both carry `merchantRefNum` "4533863971", the payment is sent with

@@ -205,7 +205,10 @@ Customer Area settings it relies on.
   typed `validation`/`configuration`/`security` (those, and 501, reject as `invalid_request`),
   a 2xx that is not a JSON object, and anything Adyen sends with `transient-error: true` (in
   any letter case). The 5xx retry needs no `transient-error` header, deliberately: Adyen does
-  not store a request an internal error stopped, and the retry carries the same key.
+  not store a request an internal error stopped, and the retry carries the same key. A 704,
+  any other 409 or a transient 4xx that outlives the retries rejects with a
+  `processing_error` marked `outcomeUnknown`: the request under the same key may still go
+  through, so retry only under that key.
 - **`returnUrl` is required on every payment.** Pass it per session, or set
   `defaultReturnUrl` once; a session with neither is refused with `invalid_request` instead
   of reaching Adyen, and so is one whose URL Adyen would reject: not absolute with a scheme

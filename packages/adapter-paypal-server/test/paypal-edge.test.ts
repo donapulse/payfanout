@@ -150,6 +150,8 @@ describe("mapPayPalError", () => {
       expect(mapped.retryable).toBe(retryable);
       expect(mapped.raw).toBe(body);
       expect(mapped.pspName).toBe("paypal");
+      // A conflict with a request still in progress, which can be this call's own first one.
+      expect(mapped.outcomeUnknown).toBe(status === 409 ? true : undefined);
     });
   }
 

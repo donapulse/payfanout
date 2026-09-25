@@ -196,7 +196,10 @@ new key. A capture or refund whose acknowledgement echoes a different amount or 
 rejected with `invalid_request`, because Adyen already accepted an earlier capture or refund
 under that key — the error names its amount and `pspReference`. If that is the one you meant,
 do not send it again; a further capture or refund needs a new key. A duplicate racing the
-still in-flight original (Adyen `errorCode` 704) is retried automatically.
+still in-flight original (Adyen `errorCode` 704) is retried automatically. When the retries
+run out, its `processing_error` carries `outcomeUnknown: true`, like any 409 or transient
+error Adyen answers, since the original may still go through: retry it under the same key,
+never a new one.
 :::
 
 ::: warning Upgrading from 0.1.0

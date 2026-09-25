@@ -371,6 +371,37 @@ describe("WorldlineServerAdapter specifics", () => {
     expect(conflicts).toBe(0);
   });
 
+  it("ends a completion whose in-flight original outlives the retries outcomeUnknown, to retry under the same key", async () => {
+    const fake = new FakeWorldlineApi();
+    let conflicts = 3; // every attempt the default retry budget allows
+    const adapter = new WorldlineServerAdapter({
+      apiKeyId: "api-key-id",
+      secretApiKey: "secret-api-key",
+      merchantId: "mid-1",
+      environment: "sandbox",
+      sessionSigningKey: SIGNING_KEY,
+      webhookKeys: [{ keyId: WEBHOOK_KEY_ID, secretKey: WEBHOOK_SECRET }],
+      defaultReturnUrl: "https://host.example/default-return",
+      sleep: async () => {},
+      fetch: async (input, init) => {
+        if (conflicts > 0 && init?.method === "POST" && String(input).endsWith("/payments")) {
+          conflicts--;
+          return new Response(JSON.stringify({ errorId: "dup", errors: [{ code: "1409", message: "request in progress", httpStatusCode: 409 }] }), { status: 409 });
+        }
+        return fake.fetch(input, init);
+      },
+    });
+    const session = await adapter.createPaymentSession({ amount: 2000, currency: "EUR", idempotencyKey: "k" });
+    const input = { pspSessionId: session.pspSessionId, clientToken: "htp_1", idempotencyKey: "c1" };
+    await expect(adapter.completePayment(input)).rejects.toMatchObject({
+      code: "processing_error",
+      retryable: true,
+      outcomeUnknown: true,
+    });
+    expect(conflicts).toBe(0);
+    expect((await adapter.completePayment(input)).status).toBe("succeeded");
+  });
+
   it("verifyCredentials classifies auth, network, and success", async () => {
     const ok = makePair();
     await expect(ok.adapter.verifyCredentials!()).resolves.toEqual({ ok: true });

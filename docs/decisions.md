@@ -779,6 +779,8 @@ docs.direct.worldline-solutions.com unless noted):
   money-side safety comes from CreatePayment idempotency). A 409 means the request with
   this idempotence key is still being processed, so it maps to a retryable
   `processing_error` and the transport loop replays it instead of surfacing a hard error.
+  Since 2026-09-25 one that outlives the retries carries `outcomeUnknown` (see "Renewal
+  re-key paths").
 - **Stateless session = signed context** (same pattern as Paysafe): createPaymentSession
   calls `POST /hostedtokenizations` (no amount) and encodes amount/currency/captureMethod/
   returnUrl/billing/hostedTokenizationId + enforced `expiresAt` into `pspSessionId`;
@@ -1687,7 +1689,8 @@ sandbox round-trip before production use, and the setup guide carries that warni
   authorise; a host reusing one key for a capture and a refund hits the same wall.
   `errorCode` 704 (a duplicate racing the still in-flight original) maps to a retryable
   `processing_error` and the transport loop replays it; a 409 is retried only when Adyen
-  sends `transient-error: true`.
+  sends `transient-error: true`. Since 2026-09-25 both, and a transient 4xx, carry
+  `outcomeUnknown` (see "Renewal re-key paths").
   - **Rescoped 2026-09-23**, doc-verified against the API idempotency guide, the HTTP status
     codes and error codes pages, the capture/cancel/refund guides, the Checkout v72 release
     note and the v72 OpenAPI contract (`github.com/Adyen/adyen-openapi`,
@@ -2528,7 +2531,9 @@ description of what v2 changes is what the migration then had to implement.
   `ERROR` and Paysafe's internal and gateway codes give `processing_error`, and anything
   else a decline. Recorded settlement, refund and verification failures are rethrown the
   same way as payments. Chosen outcomes: a record under the same reference that disagrees
-  means the key was reused and gives `invalid_request`; several agreeing records give a
+  means the key was reused and gives `invalid_request` (marked `outcomeUnknown` on a
+  payment, settlement or refund while that record has not failed, since 2026-09-25; see
+  "Renewal re-key paths"); several agreeing records give a
   non-retryable `processing_error`. Non-retryable is the conservative choice, because
   `withRetry` acts on `retryable` and must not act while it is unknown whether money moved.
   `PaymentRouter` fails over on any `processing_error` whatever `retryable` says. That is
@@ -2849,9 +2854,10 @@ description of what v2 changes is what the migration then had to implement.
   keeps results nor has an adapter doing so gains nothing from the replay, which is why
   core gained `PayFanoutError.outcomeUnknown` and why every refusal of a reused key must
   carry it unless the adapter has read the key's first request back: Stripe's
-  `idempotency_error` now does, since it proves the key's first request ran, while
-  Paysafe's refusal of a key another request holds (`invalid_request`) is read back first
-  and carries none.
+  `idempotency_error` now does, since it proves the key's first request ran, and so does
+  Paysafe's refusal of a key another request holds (`invalid_request`) while that request's
+  payment, settlement or refund has not failed (corrected 2026-09-25: it carried none; see
+  "Renewal re-key paths").
 - **`processing_error` is replayed once.** Stripe's adapter maps the card-error code
   `processing_error` to it, and Stripe's decline-codes page says "Ask the customer to
   attempt the payment again"; Stripe answers a reused key with the saved result of the
@@ -2925,7 +2931,10 @@ description of what v2 changes is what the migration then had to implement.
   the other payment, and `-a1` would charge the period again. A contested pin still settles
   on a success. Neither keeping the first pinned request nor taking the latest answer's, as
   an earlier draft did, is safe alone: each leaves one arrival order charging the period
-  twice on Paysafe.
+  twice on Paysafe. Together they cover the orders in which a pin exists before the other
+  request's answer arrives, not every order: when the refusal of the pinned run's request
+  lands before any pin, only the adapter marking that refusal `outcomeUnknown` keeps the
+  period on its key (corrected 2026-09-25; see "Renewal re-key paths").
 - **`listDue` leaves out records waiting for `resolvePendingRenewal`.** A frozen pin has no
   `nextRetryAt`, so a store falling back to `currentPeriodEnd` returned it first on every
   call, and a full batch of them, which one PSP incident can produce, held back every other
@@ -2936,3 +2945,86 @@ description of what v2 changes is what the migration then had to implement.
   `subscription.charge_failed` fires once per uncertain answer, with its error. A failed
   attempt under dunning still emits `subscription.past_due` each time, as before, since it
   starts a new retry schedule.
+
+## Renewal re-key paths (2026-09-25)
+
+- **Paysafe marks its refusal of a key another live request holds `outcomeUnknown`.** The
+  final review of the renewal replays found an arrival order the `contested` mark misses.
+  Run A reads a subscription with the old card; the host sets a new one, and run B reads it.
+  B sends `-a0` with the new card, which Paysafe charges while the answer and every
+  read-back are lost. A's `-a0` with the old card is refused (5031), the lookup shows B's
+  payment, and A's `invalid_request`, a definitive code, reached the store first, before any
+  pin: the attempt moved on to 1, B's uncertain answer was dropped as overtaken, and `-a1`
+  charged the new card again. On a payment, settlement or refund, the refusal of a key whose
+  records disagree with the call (another amount, currency, type or handle) now carries
+  `outcomeUnknown` while any of those records has not failed, since it may be the money the
+  call was meant to move, and its message says to start again under a new key only once that
+  record is known to be another one. When every one of them failed, nothing under the key
+  moved money and the call's own request was refused (the duplicate check counts failed
+  requests, and a failed payment spent its single-use handle), so the refusal keeps no flag;
+  two requests in flight together remain the first open item of the Paysafe replay entry.
+  Payment handles, verifications and voids move no money and are unchanged. A
+  manager-over-Paysafe test runs that exact order and ends with one renewal payment and the
+  pin `contested`, then frozen; the same run without the flag charges `-a1`.
+- **A store that drops `lastError` along with `renewalAttempt` no longer replays without
+  bound.** The dropped-pin check compared `lastError.code`, so on such a store it never
+  matched, and `-a0` went out every 5 minutes. A `lastError` missing from the read-back now
+  matches; a present one must still hold the saved code, and status, period and
+  `failedAttempts` still tell a host write that landed in between apart.
+- **On a store that drops the pin, a replaced card's failure no longer counts.** The
+  fallback counted every uncertain failure, so a card replaced while its charge was in
+  flight, with `failedAttempts` at the limit, canceled the subscription before the new card
+  was ever charged. That failure is now recorded as a replaced card's decline is: not
+  counted, the status as it was before the pin, and the new card due on the next run. On
+  such a store the next attempt number still comes from `failedAttempts`, as releases before
+  pins derived it.
+- **An empty object compares like an absent field.** A pinned request and the one sent are
+  the same charge when one side has `{}` (as `metadata`, or inside `billingDetails`) where
+  the other has nothing: a store that drops empty objects, or writes them, made a replay look
+  like another request, and its own pin was marked `contested`.
+- **Conflicts with a request still in progress under the same key carry `outcomeUnknown` on
+  Adyen, PayPal and Worldline.** Doc-verified 2026-09-25. Adyen's API idempotency guide: "If
+  you submit a duplicate request before the first request has completed, the API returns an
+  HTTP 422 – Unprocessable Entity or HTTP 409 - Conflict status with the error code 704:
+  "request already processed or in progress"", and a transient error "could come from a race
+  condition of sending two payment requests with the same idempotency key at the same time.
+  One will end up being processed while the other will return a transient error." Its
+  response-handling page gives 409 as "A conflict occurred because the request was already
+  processed or is in progress." Worldline's idempotent-requests guide: "For requests in
+  progress: A response with an HTTP status code of 409 (Conflict) will indicate that the
+  request is currently being processed", and its API troubleshooting page: "Either you
+  submitted a duplicate request or you are trying to create something with a duplicate
+  key." PayPal's idempotency reference: "When you send two simultaneous API requests with
+  same `PayPal-Request-Id` header, PayPal processes the first request and might fail the
+  second request", and its Payments v2 schema documents the 409 `RESOURCE_CONFLICT` with
+  `PREVIOUS_REQUEST_IN_PROGRESS` ("A previous request on this resource is currently in
+  progress") on authorization capture and void and on capture refund. Each can be the
+  refusal of a request whose key's first request is still running and may go through, which
+  the adapter cannot read back, so a caller moving to a new key could repeat the payment,
+  capture or refund. The mappers now set `outcomeUnknown` on them (Adyen's 704, its other
+  409s and its transient 4xx; Worldline's 409; PayPal's 409), keeping their codes and
+  `retryable`. A cancel's conflict gets it too, since the flag only says that the call may
+  have taken effect. None of these adapters supports saved payment methods, so the
+  subscription engine does not reach them: the flag is for hosts.
+- **Left unmarked.** GoCardless answers a consumed key with "a `409
+  idempotent_creation_conflict` error with a `links.conflicting_resource_id` pointing to the
+  existing resource" (limits page, doc-verified 2026-09-25), which the adapter reads back
+  and compares with the call, refunds also by their key stamp: the read-back the
+  adapter-authoring rule exempts. PayZen has no idempotency channel, so no refusal of a
+  reused key exists to mark, and its unanswered writes stay `psp_unavailable`. An Adyen
+  answer replayed for another session, and a capture or refund acknowledgement echoing
+  another amount, are the key's first request read back. Stripe does not save a request
+  that "conflicts with another request that's executing concurrently" (idempotent-requests
+  reference, doc-verified 2026-09-25); stripe-node 22.6.2 retries a 409 and raises one that
+  persists as `StripeAPIError`, which the adapter maps to `psp_unavailable`, already open.
+- **Stripe renewals charged by a release before pins.** Sent again after the upgrade under
+  the same key, now with `payfanout_renewal_key` in the metadata, such a renewal is refused
+  as a key reused with other parameters (`idempotency_error`, marked `outcomeUnknown`) while
+  Stripe keeps the key, so it is pinned and ends frozen, and the host settles it by hand:
+  the original carries only `payfanout_subscription_id`. The recurring guide says so.
+- **What stays uncovered.** A store that drops `renewalAttempt` counts an uncertain failure
+  at once and retries under a new key. Two requests under one key that both reach Paysafe
+  before either is filed can both be charged. A replay is never sent past
+  `replayWindowHours`, and a lock around `chargeDueSubscriptions` removes overlapping runs
+  altogether. The recurring guide and the `chargeDueSubscriptions` JSDoc now say this
+  instead of calling concurrent runs safe for money.

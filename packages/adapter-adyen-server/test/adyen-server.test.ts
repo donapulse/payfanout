@@ -710,6 +710,20 @@ describe("AdyenServerAdapter specifics", () => {
     expect(fake.transientConflicts).toBe(0);
   });
 
+  it("ends a completion whose in-flight original outlives the retries outcomeUnknown, to retry under the same key", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({ amount: 2000, currency: "EUR", idempotencyKey: "k" });
+    const input = { pspSessionId: session.pspSessionId, clientToken: CLIENT_TOKEN, idempotencyKey: "c1" };
+    fake.transientConflicts = 3; // every attempt the default retry budget allows
+    await expect(adapter.completePayment(input)).rejects.toMatchObject({
+      code: "processing_error",
+      retryable: true,
+      outcomeUnknown: true,
+      raw: { errorCode: "704" },
+    });
+    expect((await adapter.completePayment(input)).status).toBe("succeeded");
+  });
+
   it("rejects metadata Adyen would refuse", async () => {
     const { adapter } = makePair();
     const base = { amount: 100, currency: "EUR", idempotencyKey: "k" } as const;

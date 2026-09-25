@@ -200,8 +200,9 @@ reject with `unsupported_operation`; an expired stateless session token is
 retryable — bring the customer back on-session. `psp_unavailable` (timeouts, network
 errors, 5xx), `rate_limited` and `unknown` already mean the call may have taken effect at
 the PSP; `outcomeUnknown: true` adds that doubt to a code that would otherwise read as
-definitive, such as a Paysafe `processing_error` whose original cannot be read back, or
-Stripe's refusal of a reused idempotency key. Retry all of them only under the same
+definitive, such as a Paysafe `processing_error` whose original cannot be read back,
+Stripe's refusal of a reused idempotency key, or the `processing_error` of a request refused
+while another under the same key is still in progress. Retry all of them only under the same
 `idempotencyKey`, never under a new one.
 
 Amounts are **integer minor units, always**, and minor units are currency-dependent, JPY

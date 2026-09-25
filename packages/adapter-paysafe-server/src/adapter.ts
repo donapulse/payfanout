@@ -794,7 +794,8 @@ interface ReplayableWrite<T> extends ReplayKey {
    * Payments, settlements and refunds are never re-sent while an attempt's
    * outcome is unknown: only Paysafe's duplicate check would stop a second
    * one, and Paysafe does not document that check for a request still in
-   * flight.
+   * flight. Their key held by a live record of another request is refused
+   * outcomeUnknown (see differentRequest).
    */
   movesMoney?: boolean;
   /**
@@ -2577,17 +2578,34 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     return { live, failed };
   }
 
-  private differentRequest(replay: ReplayKey, foreign: RefNumRecord[]): PayFanoutError {
-    const { noun } = REF_NUM_LOOKUPS[replay.lookup];
-    return PayFanoutError.invalidRequest(
-      `merchantRefNum "${replay.merchantRefNum}" already belongs to a different Paysafe ${noun} ` +
-        "(amount, currency, type or payment handle differ) — every new request needs its own idempotency key",
-      {
-        merchantRefNum: replay.merchantRefNum,
-        expected: { amount: replay.amount, currency: replay.currency, paymentType: replay.paymentType },
+  /**
+   * A key another request holds. On a payment, settlement or refund, a record
+   * under it that has not failed may be the money this call was meant to move
+   * (the same renewal sent by an overlapping run with a card set meanwhile,
+   * say): the refusal then carries outcomeUnknown, so no new key follows until
+   * that record is known to be another one.
+   */
+  private differentRequest<T>(write: ReplayableWrite<T>, foreign: RefNumRecord[]): PayFanoutError {
+    const { noun } = REF_NUM_LOOKUPS[write.lookup];
+    const live = write.movesMoney === true && foreign.some((record) => !isFailedRecord(record));
+    return new PayFanoutError({
+      code: "invalid_request",
+      message:
+        `merchantRefNum "${write.merchantRefNum}" already belongs to a different Paysafe ${noun} ` +
+        "(amount, currency, type or payment handle differ)" +
+        (live
+          ? ` that has not failed: it may be the ${noun} this request was meant to make, so use a new ` +
+            `idempotency key only once that ${noun} is known to be another one`
+          : " — every new request needs its own idempotency key"),
+      retryable: false,
+      outcomeUnknown: live,
+      raw: {
+        merchantRefNum: write.merchantRefNum,
+        expected: { amount: write.amount, currency: write.currency, paymentType: write.paymentType },
         found: foreign,
       },
-    );
+      pspName: this.pspName,
+    });
   }
 
   /** A key holding a full lookup page may hold more than this call can see. */

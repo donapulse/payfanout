@@ -473,9 +473,10 @@ describe("Paysafe card completion replays", () => {
     const err = await rejection(
       adapter.completePayment({ pspSessionId: second, clientToken: "tok_b", idempotencyKey: "order-7" }),
     );
-    expect(err).toMatchObject({ code: "invalid_request", retryable: false });
-    expect(err.outcomeUnknown).toBeUndefined(); // the key's records were read back: nothing is unknown
+    // The key's payment has not failed, so it may be the one this call was meant to make.
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false, outcomeUnknown: true });
     expect(err.message).toContain('merchantRefNum "order-7"');
+    expect(err.message).toContain("that has not failed");
     expect(err.raw).toMatchObject({ expected: { amount: 1235, currency: "BHD" }, found: [{ amount: 1234 }] });
     expect(fake.uniquePaymentCreations).toBe(1);
   });
@@ -497,8 +498,11 @@ describe("Paysafe card completion replays", () => {
     await adapter.completePayment({ pspSessionId: usd, clientToken: "tok_usd", idempotencyKey: "order-8" });
     const cad = await cardSession(adapter, { currency: "CAD", country: "CA" });
     const err = await rejection(adapter.completePayment({ pspSessionId: cad, clientToken: "tok_cad", idempotencyKey: "order-8" }));
-    expect(err).toMatchObject({ code: "invalid_request", raw: { expected: { currency: "CAD" }, found: [{ currencyCode: "USD" }] } });
-    expect(err.outcomeUnknown).toBeUndefined();
+    expect(err).toMatchObject({
+      code: "invalid_request",
+      outcomeUnknown: true,
+      raw: { expected: { currency: "CAD" }, found: [{ currencyCode: "USD" }] },
+    });
   });
 
   it("only counts lookup records filed under this very reference", async () => {
@@ -604,10 +608,25 @@ describe("Paysafe saved-method charge replays", () => {
     const saved = await adapter.savePaymentMethod({ pspCustomerId, clientToken: "tok_single_vault", idempotencyKey: "k-save" });
     await charge(adapter, "k-renewal");
     const err = await rejection(charge(adapter, "k-renewal", 1500, saved.token));
+    // The key's charge may be the money this one was meant to move: only the same key may follow.
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false, outcomeUnknown: true, pspName: "paysafe" });
+    expect(err.message).toContain("payment handle");
+    expect(err.message).toContain("known to be another one");
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
+  it("rejects another saved card under a key whose charge failed as a definitive answer", async () => {
+    const { adapter, fake } = makePair();
+    const { pspCustomerId } = await adapter.createCustomer({ idempotencyKey: "k-cust" });
+    const saved = await adapter.savePaymentMethod({ pspCustomerId, clientToken: "tok_single_vault", idempotencyKey: "k-save" });
+    fake.recordFailure(CREATE_PAYMENT, DECLINED_BY_ISSUER);
+    expect((await rejection(charge(adapter, "k-renewal"))).code).toBe("card_declined");
+    const err = await rejection(charge(adapter, "k-renewal", 1500, saved.token));
+    // Nothing under the key moved money, and Paysafe refused this charge (5031) unprocessed.
     expect(err).toMatchObject({ code: "invalid_request", retryable: false });
     expect(err.outcomeUnknown).toBeUndefined();
-    expect(err.message).toContain("payment handle");
-    expect(fake.uniquePaymentCreations).toBe(1);
+    expect(err.message).toContain("every new request needs its own idempotency key");
+    expect(fake.uniquePaymentCreations).toBe(0);
   });
 
   it("will not pick one of several payments filed under the same reference", async () => {
@@ -906,6 +925,21 @@ describe("Paysafe modification replays", () => {
       expect(again.amountCaptured, `stateCheckFirst ${stateCheckFirst}`).toBe(2000);
       expect(sent(fake, SETTLE)).toHaveLength(2);
     }
+  });
+
+  it("refuses a capture key reused for another amount with outcomeUnknown while its settlement stands", async () => {
+    const { adapter, fake } = makePair();
+    const id = await authorize(adapter);
+    await adapter.capturePayment(id, 500, "k-capture");
+    const err = await rejection(adapter.capturePayment(id, 700, "k-capture"));
+    expect(err).toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      outcomeUnknown: true,
+      raw: { expected: { amount: 700 }, found: [{ amount: 500 }] },
+    });
+    expect(err.message).toContain("different Paysafe settlement");
+    expect(sent(fake, SETTLE)).toHaveLength(2);
   });
 
   it("surfaces a capture Paysafe refuses on state with nothing to read back: the documented 402 stands", async () => {
@@ -1431,8 +1465,11 @@ describe("Paysafe payment-handle replays", () => {
         idempotencyKey: "k-eft",
       }),
     );
-    expect(err).toMatchObject({ code: "invalid_request", raw: { expected: { amount: 13_00 }, found: [{ amount: 12_50 }] } });
-    expect(err.outcomeUnknown).toBeUndefined();
+    expect(err).toMatchObject({
+      code: "invalid_request",
+      outcomeUnknown: true,
+      raw: { expected: { amount: 13_00 }, found: [{ amount: 12_50 }] },
+    });
     expect(err.message).toContain("different Paysafe payment");
     expect(fake.uniqueHandleCreations).toBe(1);
     expect(fake.uniquePaymentCreations).toBe(1);
@@ -1996,6 +2033,120 @@ describe("SubscriptionManager renewals over Paysafe", () => {
   it("would charge the period again under -a1 if the adapter did not mark the ending outcomeUnknown", async () => {
     const { fake, renewals } = await lostRenewal(true);
     expect(renewals).toEqual([renewalKey(0), renewalKey(0), renewalKey(1)]);
+    expect(fake.uniquePaymentCreations).toBe(3);
+  });
+
+  /** Resolves once `open()` is called. */
+  function gate(): { opened: Promise<void>; open: () => void } {
+    let open: () => void = () => undefined;
+    const opened = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    return { opened, open };
+  }
+
+  /**
+   * Two overlapping cron runs send -a0: run A with the card it read, run B
+   * with the card the host set right after. Paysafe charges B's, whose answer
+   * and read-backs are lost, then refuses A's (5031) with B's payment in its
+   * lookup, and A's refusal reaches the store before B's answer. The runs
+   * then go on through every scheduled replay and on for a week.
+   * `stripRefusalFlag` rebuilds A's refusal without outcomeUnknown.
+   */
+  async function overlappingRenewal(stripRefusalFlag: boolean) {
+    const { adapter, fake } = makePair();
+    const { pspCustomerId } = await adapter.createCustomer({ idempotencyKey: "k-cust" });
+    const newCard = (await adapter.savePaymentMethod({ pspCustomerId, clientToken: "tok_single_vault", idempotencyKey: "k-save" }))
+      .token;
+    const clock = { now: Date.parse("2026-01-31T10:00:00.000Z") };
+    const manager = new SubscriptionManager({
+      service: new PaymentService({ adapters: [adapter] }),
+      store: new InMemorySubscriptionStore(),
+      now: () => clock.now,
+    });
+    await manager.createSubscription({
+      pspName: "paysafe",
+      pspCustomerId,
+      savedPaymentMethodToken: SEEDED_MULTI_USE_TOKEN,
+      plan: { amount: 2500, currency: "USD", interval: "month" },
+      id: "sub_1",
+      idempotencyKey: "first-charge-key",
+    });
+    const charge = adapter.chargeSavedPaymentMethod.bind(adapter);
+    const bCharged = gate();
+    const aRecorded = gate();
+    let runB: Promise<unknown> | undefined;
+    let calls = 0;
+    adapter.chargeSavedPaymentMethod = async (input) => {
+      calls += 1;
+      if (calls === 1) {
+        await manager.updateSubscription("sub_1", { savedPaymentMethodToken: newCard });
+        runB = manager.chargeDueSubscriptions();
+        await bCharged.opened;
+        try {
+          return await charge(input);
+        } catch (err) {
+          if (!stripRefusalFlag || !isPayFanoutError(err) || err.code !== "invalid_request") throw err;
+          throw new PayFanoutError({ code: err.code, message: err.message, retryable: err.retryable, raw: err.raw, pspName: err.pspName });
+        }
+      }
+      if (calls === 2) {
+        fake.loseAnswer(CREATE_PAYMENT);
+        fake.hideFromLookups("payments", renewalKey(0), 3);
+        const lost = await charge(input).catch((err: unknown) => err);
+        bCharged.open();
+        await aRecorded.opened;
+        throw lost;
+      }
+      return charge(input);
+    };
+    for (const minutes of [0, 5, 35, 155, 515, 1235, 24 * 60 + 5, 7 * 24 * 60]) {
+      clock.now = Date.parse(PERIOD_END) + 1000 + minutes * MINUTE;
+      await manager.chargeDueSubscriptions();
+      if (minutes === 0) {
+        aRecorded.open();
+        await runB;
+      }
+    }
+    const renewals = sent(fake, CREATE_PAYMENT)
+      .filter((r) => r.body?.["merchantRefNum"] !== "first-charge-key")
+      .map((r) => [r.body?.["merchantRefNum"], r.body?.["paymentHandleToken"]]);
+    return { fake, newCard, renewals, subscription: await manager.retrieveSubscription("sub_1") };
+  }
+
+  it("never charges twice when an overlapping run's refusal of the old card lands before its own lost charge", async () => {
+    const { fake, newCard, renewals, subscription } = await overlappingRenewal(false);
+    expect(fake.uniquePaymentCreations).toBe(2); // the first charge, and run B's renewal
+    expect(renewals.slice(0, 2)).toEqual([
+      [renewalKey(0), newCard],
+      [renewalKey(0), SEEDED_MULTI_USE_TOKEN],
+    ]);
+    // Every later charge replays the pinned request, which Paysafe refuses as a duplicate.
+    expect(renewals.slice(2)).toEqual(Array.from({ length: 5 }, () => [renewalKey(0), SEEDED_MULTI_USE_TOKEN]));
+    expect(subscription).toMatchObject({
+      status: "past_due",
+      failedAttempts: 0,
+      savedPaymentMethodToken: newCard,
+      lastError: { code: "invalid_request" },
+      renewalAttempt: {
+        attempt: 0,
+        replay: {
+          idempotencyKey: renewalKey(0),
+          request: { savedPaymentMethodToken: SEEDED_MULTI_USE_TOKEN },
+          contested: true,
+          frozen: true,
+        },
+      },
+    });
+  });
+
+  it("would charge the new card again under -a1 if that refusal carried no outcomeUnknown", async () => {
+    const { fake, newCard, renewals } = await overlappingRenewal(true);
+    expect(renewals).toEqual([
+      [renewalKey(0), newCard],
+      [renewalKey(0), SEEDED_MULTI_USE_TOKEN],
+      [renewalKey(1), newCard],
+    ]);
     expect(fake.uniquePaymentCreations).toBe(3);
   });
 });

@@ -1089,6 +1089,12 @@ export interface MapAdyenErrorOptions {
  *    itself: non-retryable invalid_request. Other 5xx are psp_unavailable and
  *    other 4xx (401/403 bad key, 422 validation) invalid_request.
  *
+ * The processing_errors of the transient, 704 and 409 branches carry
+ * outcomeUnknown: Adyen answers a request sent while another under the same
+ * key is in flight with 704 or a transient error, and a 409 means "the request
+ * was already processed or is in progress", so the key's request may still go
+ * through.
+ *
  * Those other 5xx stay retryable without the transient header, and under
  * `transient-error: false`, deliberately, although Adyen's idempotency guide
  * advises against retrying then: its HTTP status codes page says Adyen neither
@@ -1101,12 +1107,14 @@ export function mapAdyenError(httpStatus: number, body: unknown, options: MapAdy
   const errorCode = typeof error?.errorCode === "string" ? error.errorCode : undefined;
   const errorType = typeof error?.errorType === "string" ? error.errorType.toLowerCase() : undefined;
   const raw = body ?? { status: httpStatus };
-  const reject = (code: UnifiedErrorCode, retryable: boolean) =>
-    new PayFanoutError({ code, message: getUserMessage(code), retryable, raw, pspName: ADYEN_PSP_NAME });
+  const reject = (code: UnifiedErrorCode, retryable: boolean, outcomeUnknown = false) =>
+    new PayFanoutError({ code, message: getUserMessage(code), retryable, raw, pspName: ADYEN_PSP_NAME, outcomeUnknown });
   if (httpStatus === 429 || errorCode === RATE_LIMITED_ERROR_CODE) return reject("rate_limited", true);
-  if (options.transient === true) return reject(httpStatus >= 500 ? "psp_unavailable" : "processing_error", true);
-  if (errorCode === IN_FLIGHT_DUPLICATE_ERROR_CODE) return reject("processing_error", true);
-  if (httpStatus === 409) return reject("processing_error", false);
+  if (options.transient === true) {
+    return httpStatus >= 500 ? reject("psp_unavailable", true) : reject("processing_error", true, true);
+  }
+  if (errorCode === IN_FLIGHT_DUPLICATE_ERROR_CODE) return reject("processing_error", true, true);
+  if (httpStatus === 409) return reject("processing_error", false, true);
   // Core's shared tail reads 408 as a client error and 501 as an outage.
   if (httpStatus === 408) return reject("psp_unavailable", true);
   if (httpStatus === 501) return reject("invalid_request", false);

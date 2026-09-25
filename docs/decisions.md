@@ -2665,10 +2665,12 @@ description of what v2 changes is what the migration then had to implement.
   same key return the same result, including 500 errors" (idempotent-requests reference).
   Paysafe refuses a reused `merchantRefNum` under `dupCheck` (409/5031) rather than
   replaying it; its adapter reads the original back by `merchantRefNum` (PR #198) and marks
-  what it cannot read back `outcomeUnknown`. A PSP that neither keeps results nor has an
-  adapter doing so gains nothing from the replay, which is why core gained
-  `PayFanoutError.outcomeUnknown` and why every refusal of a reused key must carry it:
-  Stripe's `idempotency_error` now does, since it proves the key's first request ran.
+  what it cannot read back `outcomeUnknown`, as it does a key holding several records or a
+  full lookup page, where it cannot tell which record is the call's own. A PSP that neither
+  keeps results nor has an adapter doing so gains nothing from the replay, which is why
+  core gained `PayFanoutError.outcomeUnknown` and why every refusal of a reused key must
+  carry it: Stripe's `idempotency_error` now does, since it proves the key's first request
+  ran.
 - **`processing_error` is replayed once.** Stripe's adapter maps the card-error code
   `processing_error` to it, and Stripe's decline-codes page says "Ask the customer to
   attempt the payment again"; Stripe answers a reused key with the saved result of the

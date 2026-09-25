@@ -208,7 +208,7 @@ describe("Paysafe card completion replays", () => {
     fake.loseAnswer(CREATE_PAYMENT);
     fake.hideFromLookups("payments", "k-complete");
     const err = await rejection(adapter.completePayment(input));
-    expect(err).toMatchObject({ code: "processing_error", retryable: false, pspName: "paysafe" });
+    expect(err).toMatchObject({ code: "processing_error", retryable: false, outcomeUnknown: true, pspName: "paysafe" });
     expect(err.message).toContain('merchantRefNum "k-complete" went unanswered');
     expect(err.message).toContain("same idempotency key");
     expect(sent(fake, CREATE_PAYMENT)).toHaveLength(1); // money-moving: never re-sent after an unknown outcome
@@ -315,7 +315,7 @@ describe("Paysafe card completion replays", () => {
     const err = await rejection(
       adapter.completePayment({ pspSessionId, clientToken: "tok_good", idempotencyKey: "order-full" }),
     );
-    expect(err).toMatchObject({ code: "processing_error", retryable: false });
+    expect(err).toMatchObject({ code: "processing_error", retryable: false, outcomeUnknown: true });
     expect(sent(fake, CREATE_PAYMENT)).toHaveLength(50);
   });
 
@@ -328,6 +328,7 @@ describe("Paysafe card completion replays", () => {
       adapter.completePayment({ pspSessionId, clientToken: "tok_card_a", idempotencyKey: "order-tokenless" }),
     );
     expect(declined.code).toBe("card_declined");
+    expect(declined.outcomeUnknown).toBeUndefined(); // a decline is a definitive answer
     // The same card again: its handle is spent (5283), and no record under the key
     // names it, so the outcome stays unknown rather than borrowing another's decline.
     const replayed = await rejection(
@@ -437,7 +438,7 @@ describe("Paysafe card completion replays", () => {
     }
     const pspSessionId = await cardSession(adapter);
     const err = await rejection(adapter.completePayment({ pspSessionId, clientToken: "tok_z", idempotencyKey: "order-3" }));
-    expect(err).toMatchObject({ code: "processing_error", retryable: false });
+    expect(err).toMatchObject({ code: "processing_error", retryable: false, outcomeUnknown: true });
     expect(err.message).toContain("2 payments");
     expect(fake.uniquePaymentCreations).toBe(2);
   });
@@ -617,7 +618,7 @@ describe("Paysafe saved-method charge replays", () => {
       });
     }
     const err = await rejection(charge(adapter, "legacy-7", 900));
-    expect(err).toMatchObject({ code: "processing_error", retryable: false });
+    expect(err).toMatchObject({ code: "processing_error", retryable: false, outcomeUnknown: true });
     expect(err.message).toContain("2 payments");
     expect(fake.uniquePaymentCreations).toBe(2);
   });
@@ -1028,7 +1029,12 @@ describe("Paysafe modification replays", () => {
     const id = await settle(adapter);
     fake.rejectAs(REFUND, "3417");
     const err = await rejection(adapter.refundPayment({ pspPaymentId: id, amount: 500, idempotencyKey: "k-refund" }));
-    expect(err).toMatchObject({ code: "processing_error", retryable: false, raw: { cause: { error: { code: "3417" } } } });
+    expect(err).toMatchObject({
+      code: "processing_error",
+      retryable: false,
+      outcomeUnknown: true,
+      raw: { cause: { error: { code: "3417" } } },
+    });
     expect(err.message).toContain("still processing another request");
     expect(lookups(fake, "refunds", "k-refund")).toHaveLength(3);
   });
@@ -1038,7 +1044,12 @@ describe("Paysafe modification replays", () => {
     const id = await authorize(adapter);
     fake.rejectAs(SETTLE, "3044");
     const err = await rejection(adapter.capturePayment(id, 2000, "k-capture"));
-    expect(err).toMatchObject({ code: "processing_error", retryable: false, raw: { cause: { error: { code: "3044" } } } });
+    expect(err).toMatchObject({
+      code: "processing_error",
+      retryable: false,
+      outcomeUnknown: true,
+      raw: { cause: { error: { code: "3044" } } },
+    });
     expect(err.message).toContain("as already processed");
   });
 
@@ -1294,7 +1305,12 @@ describe("Paysafe payment-handle replays", () => {
     await adapter.completePayment(input);
     fake.hideFromLookups("payments", "k-eft");
     const err = await rejection(adapter.completePayment(input));
-    expect(err).toMatchObject({ code: "processing_error", retryable: false, raw: { cause: { status: "COMPLETED" } } });
+    expect(err).toMatchObject({
+      code: "processing_error",
+      retryable: false,
+      outcomeUnknown: true,
+      raw: { cause: { status: "COMPLETED" } },
+    });
     expect(err.message).toContain('A payment handle under merchantRefNum "k-eft" is spent');
     expect(err.message).toContain("a refused attempt can leave a spent handle");
     expect(err.message).toContain(START_AGAIN);
@@ -1622,7 +1638,12 @@ describe("Paysafe payment-handle replays", () => {
           "duplicate check covers 90 days, while its lookup reaches only 30",
       );
       for (const ending of endings) {
-        expect(ending, label).toMatchObject({ code: "processing_error", retryable: false, pspName: "paysafe" });
+        expect(ending, label).toMatchObject({
+          code: "processing_error",
+          retryable: false,
+          outcomeUnknown: true,
+          pspName: "paysafe",
+        });
         expect(ending.message, label).toContain(START_AGAIN);
         expect(ending.message, label).not.toContain("never a new one");
       }

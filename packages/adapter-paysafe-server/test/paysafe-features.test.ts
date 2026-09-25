@@ -818,10 +818,18 @@ describe("Paysafe webhook rotation + refund_failed mapping", () => {
   const signWith = (rawBody: string, key: string): Record<string, string> => ({
     signature: createHmac("sha256", key).update(rawBody, "utf8").digest("base64"),
   });
+  const completedBody = JSON.stringify({
+    payload: { id: "pay_1", status: "COMPLETED", amount: 450, currencyCode: "USD", txnTime: "2026-07-04T10:00:00Z" },
+    attemptNumber: "1",
+    type: "PAYMENT",
+    resourceId: "pay_1",
+    eventDate: "2026-07-04T10:00:00Z",
+    eventName: "PAYMENT_COMPLETED",
+  });
 
   it("accepts signatures from any configured HMAC key during rotation", async () => {
     const { adapter } = makePair({ webhookHmacKey: ["old-key", "new-key"] });
-    const rawBody = JSON.stringify({ id: "evt", eventType: "PAYMENT_COMPLETED" });
+    const rawBody = completedBody;
     await expect(adapter.verifyWebhookSignature(rawBody, signWith(rawBody, "old-key"))).resolves.toBe(true);
     await expect(adapter.verifyWebhookSignature(rawBody, signWith(rawBody, "new-key"))).resolves.toBe(true);
     await expect(adapter.verifyWebhookSignature(rawBody, signWith(rawBody, "other"))).resolves.toBe(false);
@@ -829,7 +837,7 @@ describe("Paysafe webhook rotation + refund_failed mapping", () => {
 
   it("verifies with mixed-case header names (proxies rewrite casing)", async () => {
     const { adapter } = makePair();
-    const rawBody = JSON.stringify({ id: "evt", eventType: "PAYMENT_COMPLETED" });
+    const rawBody = completedBody;
     const value = signWith(rawBody, WEBHOOK_KEY)["signature"]!;
     await expect(adapter.verifyWebhookSignature(rawBody, { Signature: value })).resolves.toBe(true);
     await expect(
@@ -843,28 +851,37 @@ describe("Paysafe webhook rotation + refund_failed mapping", () => {
 
   it("maps refund failure events to payment.refund_failed, carrying the refund's money facts", async () => {
     const { adapter } = makePair();
-    for (const eventType of ["REFUND_FAILED", "REFUND.DECLINED", "refund_error"]) {
-      const event = await adapter.parseWebhookEvent(
-        JSON.stringify({ id: `evt-${eventType}`, eventType, payload: { id: "ref_1", amount: 450, currencyCode: "usd" } }),
-      );
-      expect(event.type, eventType).toBe("payment.refund_failed");
-      expect(event.pspPaymentId).toBe("ref_1");
+    const refundBody = (eventName: string, status: string) =>
+      JSON.stringify({
+        payload: { id: "ref_1", status, amount: 450, currencyCode: "usd", txnTime: "2026-07-04T11:00:00Z" },
+        eventType: eventName,
+        attemptNumber: "1",
+        resourceId: "ref_1",
+        eventDate: "2026-07-04T11:00:00Z",
+        links: [{ rel: "refund" }],
+        eventName,
+      });
+    // The first three are documented; the dotted and lower-case spellings are tolerated.
+    for (const eventName of ["REFUND_FAILED", "REFUND_CANCELLED", "REFUND_ERRORED", "REFUND.DECLINED", "refund_error"]) {
+      const event = await adapter.parseWebhookEvent(refundBody(eventName, "FAILED"));
+      expect(event.type, eventName).toBe("payment.refund_failed");
+      // The refund payload names no payment, so none is reported.
+      expect(event.pspPaymentId, eventName).toBeUndefined();
       expect(event.refundId).toBe("ref_1");
       expect(event.amount).toBe(450);
       expect(event.currency).toBe("USD");
     }
-    const completed = await adapter.parseWebhookEvent(
-      JSON.stringify({ id: "evt-ok", eventType: "REFUND_COMPLETED", payload: { id: "ref_1", amount: 450 } }),
-    );
+    const completed = await adapter.parseWebhookEvent(refundBody("REFUND_COMPLETED", "COMPLETED"));
     expect(completed.type).toBe("payment.refunded");
     expect(completed.refundId).toBe("ref_1");
+    expect(completed.pspPaymentId).toBeUndefined();
     expect(completed.amount).toBe(450);
   });
 
   it("keeps money facts off events whose payloads do not carry them (never fabricated)", async () => {
     const { adapter } = makePair();
     const event = await adapter.parseWebhookEvent(
-      JSON.stringify({ id: "evt-bare", eventType: "PAYMENT_COMPLETED", payload: { id: "pay_1", amount: 10.5 } }),
+      JSON.stringify({ eventName: "PAYMENT_COMPLETED", type: "PAYMENT", payload: { id: "pay_1", amount: 10.5 } }),
     );
     expect(event.amount).toBeUndefined(); // non-integer amounts are dropped, not rounded
     expect(event.currency).toBeUndefined();

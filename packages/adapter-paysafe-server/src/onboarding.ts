@@ -1,12 +1,14 @@
 import type { AdapterOnboardingDescriptor } from "@payfanout/core";
+import { PAYSAFE_DOCUMENTED_WEBHOOK_EVENTS } from "./webhook.js";
 
 /**
  * Declarative onboarding metadata for the Paysafe adapter pair: the credentials a
  * host collects, the provider event-type strings the webhook parser recognizes,
  * and the CSP hosts Paysafe.js touches. The credential keys mirror
  * `PaysafeServerAdapterConfig` (plus the client-scope `apiKey` Paysafe.js needs to
- * tokenize) and the event list mirrors `webhook.ts`'s EVENT_TYPE_MAP — keep the
- * three in step. `merchantAccount` is descriptive: the runtime config takes a
+ * tokenize) — keep the two in step. The event list is the documented part of
+ * `webhook.ts`'s event map, so hosts never subscribe to a name Paysafe does not
+ * publish. `merchantAccount` is descriptive: the runtime config takes a
  * `merchantAccountResolver` function instead, since Paysafe routes per currency.
  */
 export const paysafeOnboarding: AdapterOnboardingDescriptor = {
@@ -42,24 +44,7 @@ export const paysafeOnboarding: AdapterOnboardingDescriptor = {
   ],
   webhook: {
     signature: "hmac-sha256-base64",
-    events: [
-      "PAYMENT_COMPLETED",
-      "PAYMENT_FAILED",
-      "PAYMENT_DECLINED",
-      "PAYMENT_CANCELLED",
-      "PAYMENT_EXPIRED",
-      "PAYMENT_AUTHENTICATION_REQUIRED",
-      "PAYMENT_PROCESSING",
-      "PAYMENT_PENDING",
-      "PAYMENT_RECEIVED",
-      "PAYMENT_HELD",
-      "PAYMENT_RETURN_COMPLETED",
-      "PAYMENT_RETURNED_COMPLETED",
-      "REFUND_COMPLETED",
-      "REFUND_FAILED",
-      "REFUND_DECLINED",
-      "REFUND_ERROR",
-    ],
+    events: [...PAYSAFE_DOCUMENTED_WEBHOOK_EVENTS],
   },
   csp: {
     script: ["https://hosted.paysafe.com"],

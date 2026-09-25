@@ -164,60 +164,84 @@ describe("session context edge cases", () => {
 
 describe("webhook edge cases", () => {
   it("rejects JSON that is not an object", async () => {
-    try {
-      await parsePaysafeWebhookEvent("null");
-      expect.unreachable();
-    } catch (err) {
-      expect(isPayFanoutError(err)).toBe(true);
-      if (isPayFanoutError(err)) expect(err.code).toBe("invalid_request");
+    for (const rawBody of ["null", "42", '"PAYMENT_COMPLETED"']) {
+      try {
+        await parsePaysafeWebhookEvent(rawBody);
+        expect.unreachable();
+      } catch (err) {
+        expect(isPayFanoutError(err), rawBody).toBe(true);
+        if (isPayFanoutError(err)) expect(err.code).toBe("invalid_request");
+      }
     }
   });
 
   it("falls back deterministically when timestamps are missing or garbage", async () => {
-    const noTime = await parsePaysafeWebhookEvent(JSON.stringify({ id: "e1", eventType: "PAYMENT_COMPLETED" }));
+    const noTime = await parsePaysafeWebhookEvent(JSON.stringify({ eventName: "PAYMENT_COMPLETED" }));
     expect(noTime.occurredAt).toBe("1970-01-01T00:00:00.000Z");
     const badTime = await parsePaysafeWebhookEvent(
-      JSON.stringify({ id: "e2", eventType: "PAYMENT_COMPLETED", txnTime: "not-a-date" }),
+      JSON.stringify({ eventName: "PAYMENT_COMPLETED", txnTime: "not-a-date" }),
     );
     expect(badTime.occurredAt).toBe("1970-01-01T00:00:00.000Z");
     const eventDate = await parsePaysafeWebhookEvent(
-      JSON.stringify({ id: "e3", eventType: "PAYMENT_COMPLETED", eventDate: "2026-07-04T10:00:00Z" }),
+      JSON.stringify({ eventName: "PAYMENT_COMPLETED", eventDate: "2026-07-04T10:00:00Z" }),
     );
     expect(eventDate.occurredAt).toBe("2026-07-04T10:00:00.000Z");
   });
 
-  it("maps the documented event-type variants", async () => {
-    const variants: Array<[string, string]> = [
-      ["PAYMENT.COMPLETED", "payment.succeeded"],
-      ["payment_completed", "payment.succeeded"],
-      ["PAYMENT-DECLINED", "payment.failed"],
-      ["PAYMENT_EXPIRED", "payment.canceled"],
-      ["PAYMENT_AUTHENTICATION_REQUIRED", "payment.requires_action"],
+  it("maps the documented event names", async () => {
+    const documented: Array<[string, string]> = [
+      ["PAYMENT_COMPLETED", "payment.succeeded"],
+      ["PAYMENT_FAILED", "payment.failed"],
+      ["PAYMENT_ERRORED", "payment.failed"],
+      ["PAYMENT_CANCELLED", "payment.canceled"],
       ["PAYMENT_PROCESSING", "payment.processing"],
+      ["PAYMENT_RECEIVED", "payment.processing"],
+      ["PAYMENT_PENDING", "payment.processing"],
       ["PAYMENT_HELD", "payment.processing"],
-      ["REFUND_COMPLETED", "payment.refunded"],
-      ["CHARGEBACK_OPENED", "payment.chargeback"],
-      ["DISPUTE_WON", "payment.chargeback_won"],
-      ["CHARGEBACK_LOST", "payment.chargeback_lost"],
       // A bank return arrives under BOTH spellings — Paysafe's event tables say
       // RETURNED, its payload examples say RETURN. Either wire value must
       // finalize the debit as failed, never land as unknown.
       ["PAYMENT_RETURNED_COMPLETED", "payment.failed"],
       ["PAYMENT_RETURN_COMPLETED", "payment.failed"],
-      // Settlement-lifecycle payloads carry settlement ids, not payment ids —
-      // deliberately unmapped so a settlement id is never served as a payment id.
+      ["REFUND_COMPLETED", "payment.refunded"],
+      ["REFUND_FAILED", "payment.refund_failed"],
+      ["REFUND_CANCELLED", "payment.refund_failed"],
+      ["REFUND_ERRORED", "payment.refund_failed"],
+      // Settlement and handle events describe those resources, not the payment —
+      // deliberately unmapped so their ids are never served as payment ids.
       ["SETTLEMENT_COMPLETED", "unknown"],
+      ["PAYMENT_HANDLE_PAYABLE", "unknown"],
+      // In-flight refund states have no unified type.
+      ["REFUND_PENDING", "unknown"],
       ["SOMETHING_ELSE", "unknown"],
     ];
-    for (const [eventType, expected] of variants) {
-      expect((await parsePaysafeWebhookEvent(JSON.stringify({ id: "e", eventType }))).type, eventType).toBe(expected);
+    for (const [eventName, expected] of documented) {
+      expect((await parsePaysafeWebhookEvent(JSON.stringify({ eventName }))).type, eventName).toBe(expected);
+    }
+  });
+
+  it("tolerates spellings and names no Paysafe page documents", async () => {
+    const tolerated: Array<[string, string]> = [
+      ["PAYMENT.COMPLETED", "payment.succeeded"],
+      ["payment_completed", "payment.succeeded"],
+      ["PAYMENT-DECLINED", "payment.failed"],
+      ["PAYMENT_EXPIRED", "payment.canceled"],
+      ["PAYMENT_AUTHENTICATION_REQUIRED", "payment.requires_action"],
+      ["REFUND_DECLINED", "payment.refund_failed"],
+      ["REFUND_ERROR", "payment.refund_failed"],
+      ["CHARGEBACK_OPENED", "payment.chargeback"],
+      ["DISPUTE_WON", "payment.chargeback_won"],
+      ["CHARGEBACK_LOST", "payment.chargeback_lost"],
+    ];
+    for (const [eventName, expected] of tolerated) {
+      expect((await parsePaysafeWebhookEvent(JSON.stringify({ eventName }))).type, eventName).toBe(expected);
     }
   });
 
   it("reads the event name from eventName, as real Payments-API deliveries send it", async () => {
     // Verbatim shape of a real sandbox delivery (values sanitized): the event name lives in
     // `eventName`; top-level `type` is the resource CATEGORY ("PAYMENT"), not the event; and
-    // there is no top-level `id`, so the dedupe id must fall back to the raw-body hash.
+    // there is no top-level `id`, so the adapter derives the dedupe id.
     const rawBody = JSON.stringify({
       payload: {
         id: "cfdd12b1-0000-0000-0000-000000000000",
@@ -240,23 +264,25 @@ describe("webhook edge cases", () => {
     expect(event.amount).toBe(1000);
     expect(event.currency).toBe("CAD");
     expect(event.occurredAt).toBe("2026-07-10T15:07:39.000Z");
-    expect(event.id).toMatch(/^paysafe_/); // no top-level id -> stable raw-body hash
+    expect(event.id).toMatch(/^paysafe_[0-9a-f]{64}$/);
   });
 
-  it("finalizes a bank return delivered in the eventName form, payment id intact", async () => {
-    // The late-failure event for a returned debit, in the Payments-API delivery
-    // shape (eventName + payload; docs show the RETURN spelling in payloads).
+  it("finalizes a bank return against the returned payment, not the return", async () => {
+    // The late-failure event for a returned debit, in the documented shape: the
+    // payload is the RETURN (its own id), and `paymentId` names the payment.
     const rawBody = JSON.stringify({
       payload: {
-        id: "9f01ab23-0000-0000-0000-000000000000",
+        id: "0a7c2e91-0000-0000-0000-000000000000",
         merchantRefNum: "sepa-ref-1",
         amount: 677,
         currencyCode: "EUR",
-        status: "FAILED",
+        status: "COMPLETED",
         txnTime: "2026-07-20T09:00:00Z",
+        paymentId: "9f01ab23-0000-0000-0000-000000000000",
+        settlementId: "9f01ab23-0000-0000-0000-000000000000",
       },
-      type: "PAYMENT",
-      resourceId: "9f01ab23-0000-0000-0000-000000000000",
+      attemptNumber: "1",
+      type: "PAYMENT_RETURN",
       eventDate: "2026-07-20T09:00:00Z",
       eventName: "PAYMENT_RETURN_COMPLETED",
     });

@@ -8,8 +8,9 @@ import { PayFanoutError, type ServerPaymentAdapter, type UnifiedWebhookEvent } f
  *
  * Ack-fast contract: the handler only verifies the signature, parses the event,
  * and hands it to `onEvent`. `onEvent` must ENQUEUE and return — respond 2xx
- * immediately and defer heavy processing. Paysafe in particular retries
- * effectively forever until it sees a success response.
+ * immediately and defer heavy processing. Redelivery is limited: Paysafe, for
+ * one, counts only a 200 or 202 as received and makes at most three attempts,
+ * with no alert when they fail.
  */
 export interface WebhookRequest {
   rawBody: string;

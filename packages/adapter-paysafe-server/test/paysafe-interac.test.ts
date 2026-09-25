@@ -153,8 +153,8 @@ describe("Paysafe Interac e-Transfer sessions", () => {
   });
 
   it("reuses its handle when the session is replayed under the same key", async () => {
-    // /paymenthandles takes no dupCheck, so nothing at Paysafe would stop a
-    // second handle under the same merchantRefNum — the adapter looks first.
+    // The adapter sends no dupCheck on /paymenthandles, so nothing at Paysafe
+    // stops a second handle under the same merchantRefNum — it looks first.
     const { adapter, fake } = makePair();
     const first = await adapter.createPaymentSession({ ...interacInput });
     const again = await adapter.createPaymentSession({ ...interacInput });

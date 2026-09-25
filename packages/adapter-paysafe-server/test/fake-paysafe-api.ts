@@ -44,11 +44,17 @@ const REPLAY_REJECTION_MESSAGES: Record<ReplayRejectionCode, string> = {
   "3417": "There is already another request being processed on the transaction referenced for this request.",
 };
 
-/** A write Paysafe processes into a FAILED record filed with this error, answered with `status`. */
+/**
+ * A write Paysafe processes into a record filed with this error, answered
+ * with `status`. The record's own status is FAILED unless `recordStatus`
+ * says otherwise (verifications also document ERROR, a failure "for
+ * non-business reason").
+ */
 export interface RecordedFailure {
   status: number;
   code: string;
   message: string;
+  recordStatus?: "FAILED" | "ERROR";
 }
 
 export interface RecordedRequest {
@@ -68,7 +74,7 @@ type RefNumIndex<T> = Map<string, T[]>;
  *   processed.") and the original is never replayed. Settlements, refunds
  *   and verifications default dupCheck to true; /payments and
  *   /paymenthandles document no default (both accept the field, as Paysafe's
- *   own examples send it), and /voidauths takes none at all;
+ *   own examples send it true and false), and /voidauths takes none at all;
  * - a payments call spends a single-use handle whatever its outcome ("the
  *   payment handle status always changes to COMPLETED"), so a second call
  *   with it answers 400/5283. Verifications do not spend one;
@@ -76,7 +82,8 @@ type RefNumIndex<T> = Map<string, T[]>;
  *   other, and payment and verification records carry their
  *   paymentHandleToken;
  * - capture, refund and void state checks answer the documented 402 codes
- *   (3203/3204, 3402/3404, 3501/3502);
+ *   (3203/3204, 3402/3404, 3501/3502), and a refund of an unknown
+ *   settlement 400/3407;
  * - the GET ?merchantRefNum= lookups answer the documented collections.
  * Where Paysafe documents nothing — a reused merchantRefNum without dupCheck
  * on /payments, /paymenthandles or /voidauths — the fake takes the dangerous
@@ -134,12 +141,6 @@ export class FakePaysafeApi {
   /** Test levers for the verifyCredentials probe (bad key / transient outage). */
   authFailure = false;
   networkFailure = false;
-  /**
-   * Which rejection a /payments call carrying both a spent handle and a
-   * reused merchantRefNum gets — undocumented, so tests pin both orders.
-   * Default: the spent handle (5283) first.
-   */
-  duplicateCheckFirst = false;
   /**
    * Settlements and refunds: run the state check (remaining authorization,
    * remaining settlement) before the merchantRefNum check, the other
@@ -516,10 +517,12 @@ export class FakePaysafeApi {
     if (typeof token !== "string" || !token) {
       return json(400, { error: { code: "5068", message: "Missing paymentHandleToken" } });
     }
-    const reused = body["dupCheck"] === true && isFiled(this.paymentsByRef, refNum);
-    if (reused && this.duplicateCheckFirst) return duplicateRefNum();
+    // A spent handle is refused first; which check Paysafe runs first is
+    // undocumented, and the adapter never sends dupCheck with a single-use one.
     if (this.spentHandles.has(token)) return handleNotPayable();
-    if (reused) return duplicateRefNum();
+    if (body["dupCheck"] === true && isFiled(this.paymentsByRef, refNum)) {
+      return this.duplicateCode === "3044" ? duplicateRequest() : duplicateRefNum();
+    }
     // Deleted/unknown MULTI_USE tokens die exactly like the real API (5068).
     if (token.startsWith("MU") && !this.multiUseTokens.has(token)) {
       return json(400, {
@@ -530,26 +533,31 @@ export class FakePaysafeApi {
     const settleWithAuth = body["settleWithAuth"] as boolean;
     const amount = body["amount"] as number;
     const currencyCode = body["currencyCode"] as string;
-    if (token === "tok_declined") {
-      // Paysafe records the declined payment too; it answers the call with the error alone.
-      const declined: PaysafePaymentLike = {
+    const failure =
+      this.activeFailure ??
+      (token === "tok_declined" ? { status: 402, code: "3022", message: "Insufficient funds" } : undefined);
+    if (failure) {
+      // Paysafe records the failed payment too; it answers the call with the error alone.
+      const failed: PaysafePaymentLike = {
         id: `pay_${++this.seq}`,
         merchantRefNum: refNum,
-        status: "FAILED",
+        paymentHandleToken: token,
+        status: failure.recordStatus ?? "FAILED",
         amount,
         currencyCode,
         settleWithAuth,
         txnTime: "2026-07-04T10:00:00Z",
-        paymentType: "CARD",
-        error: { code: "3022", message: "Insufficient funds" },
+        paymentType: this.railHandles.get(token)?.paymentType ?? "CARD",
+        error: { code: failure.code, message: failure.message },
       };
-      this.payments.set(declined.id, declined);
-      file(this.paymentsByRef, refNum, declined);
-      return json(402, { error: declined.error });
+      this.payments.set(failed.id, failed);
+      file(this.paymentsByRef, refNum, failed);
+      return json(failure.status, { error: failed.error });
     }
     const payment: PaysafePaymentLike = {
       id: `pay_${++this.seq}`,
       merchantRefNum: refNum,
+      paymentHandleToken: token,
       status: "COMPLETED",
       amount,
       availableToSettle: settleWithAuth ? 0 : amount,
@@ -634,10 +642,18 @@ export class FakePaysafeApi {
     const settleAmount = body["amount"] as number;
     // Real API allows MULTIPLE partial settlements while availableToSettle covers them.
     const remaining = payment.availableToSettle ?? payment.amount ?? 0;
-    if (payment.status !== "COMPLETED" || payment.settleWithAuth || settleAmount > remaining) {
-      return json(400, { error: { code: "5050", message: "Payment is not in a settleable state" } });
+    if (payment.status !== "COMPLETED" || payment.settleWithAuth || remaining <= 0) {
+      return stateRejection("3203", "The Authorization is either fully settled or cancelled.");
+    }
+    if (settleAmount > remaining) {
+      return stateRejection("3204", "The requested Settlement amount exceeds the remaining Authorization amount.");
     }
     if (reused) return duplicateRefNum();
+    if (this.activeFailure) {
+      const failed = { id: `stl_${++this.seq}`, merchantRefNum: refNum, ...failedRecord(this.activeFailure), amount: settleAmount };
+      file(this.settlementsByRef, refNum, failed);
+      return json(this.activeFailure.status, { error: failed.error });
+    }
     const settlement = {
       id: `stl_${++this.seq}`,
       merchantRefNum: refNum,
@@ -665,8 +681,17 @@ export class FakePaysafeApi {
       });
     }
     const remaining = payment.availableToSettle ?? 0;
-    if (payment.settleWithAuth || remaining <= 0 || (body["amount"] as number) > remaining) {
-      return json(400, { error: { code: "5050", message: "Nothing voidable on this payment" } });
+    if (payment.settleWithAuth) {
+      return stateRejection(
+        "3502",
+        "You cannot process a void (Authorization Reversal) transaction against an Authorization that has been settled.",
+      );
+    }
+    if (remaining <= 0 || (body["amount"] as number) > remaining) {
+      return stateRejection(
+        "3501",
+        "The requested void (Authorization Reversal) amount exceeds the remaining Authorization amount.",
+      );
     }
     // Voiding the remainder AFTER a partial
     // settlement works — settled funds stay settled, payment stays COMPLETED.
@@ -692,12 +717,27 @@ export class FakePaysafeApi {
     for (const payment of this.payments.values()) {
       const settlement = (payment.settlements ?? []).find((s) => s.id === settlementId);
       if (settlement) {
-        const amount = (body["amount"] as number | undefined) ?? (settlement.amount ?? 0) - (settlement.refundedAmount ?? 0);
-        if ((settlement.refundedAmount ?? 0) + amount > (settlement.amount ?? 0)) {
-          return json(400, { error: { code: "3407", message: "Refund exceeds settled amount" } });
+        const refunded = settlement.refundedAmount ?? 0;
+        if (refunded >= (settlement.amount ?? 0)) {
+          return stateRejection("3404", "The Settlement has already been fully refunded.");
+        }
+        const amount = (body["amount"] as number | undefined) ?? (settlement.amount ?? 0) - refunded;
+        if (refunded + amount > (settlement.amount ?? 0)) {
+          return stateRejection("3402", "The requested Refund amount exceeds the remaining Settlement amount.");
         }
         if (reused) return duplicateRefNum();
-        settlement.refundedAmount = (settlement.refundedAmount ?? 0) + amount;
+        if (this.activeFailure) {
+          const failed = {
+            id: `ref_${++this.seq}`,
+            merchantRefNum: refNum,
+            ...failedRecord(this.activeFailure),
+            amount,
+            currencyCode: payment.currencyCode,
+          };
+          file(this.refundsByRef, refNum, failed);
+          return json(this.activeFailure.status, { error: failed.error });
+        }
+        settlement.refundedAmount = refunded + amount;
         settlement.availableToRefund = (settlement.amount ?? 0) - settlement.refundedAmount;
         const refund = {
           id: `ref_${++this.seq}`,
@@ -713,33 +753,46 @@ export class FakePaysafeApi {
         return json(200, refund);
       }
     }
-    return json(404, { error: { code: "5269", message: "No such settlement" } });
+    return json(400, {
+      error: { code: "3407", message: "The Settlement referred to by the transaction response ID you provided cannot be found." },
+    });
   }
 
-  /** Verifications default dupCheck to true and do not spend the handle. */
+  /** Verifications default dupCheck to true and do not spend the handle; a declined one is recorded too. */
   private verify(body: Record<string, unknown>): Response {
     const refNum = body["merchantRefNum"] as string;
     if (body["dupCheck"] !== false && isFiled(this.verificationsByRef, refNum)) return duplicateRefNum();
-    if (body["paymentHandleToken"] === "tok_declined") {
-      return json(402, { error: { code: "3022", message: "Insufficient funds" } });
-    }
-    const verification = {
+    const token = body["paymentHandleToken"] as string;
+    const base = {
       id: `ver_${++this.seq}`,
       merchantRefNum: refNum,
-      status: "COMPLETED",
+      paymentHandleToken: token,
       currencyCode: body["currencyCode"] as string,
       txnTime: "2026-07-04T10:00:00Z",
     };
+    const failure =
+      this.activeFailure ??
+      (token === "tok_declined" ? { status: 402, code: "3022", message: "Insufficient funds" } : undefined);
+    if (failure) {
+      const failed = { ...base, ...failedRecord(failure) };
+      file(this.verificationsByRef, refNum, failed);
+      return json(failure.status, { error: failed.error });
+    }
+    const verification = { ...base, status: "COMPLETED" };
     file(this.verificationsByRef, refNum, verification);
     return json(200, verification);
   }
 
   /**
    * POST /customers/{id}/paymenthandles: single-use → MULTI_USE. Vault
-   * handles carry the merchantRefNum they were created under. Converting a
-   * token that was already converted vaults the same card again, which the
-   * real API refuses with 7503 naming the existing handle; the special token
-   * simulates re-saving a card this customer already holds.
+   * handles carry the merchantRefNum they were created under. Re-saving a
+   * card this customer already holds answers 409/7503 (Customer Vault
+   * errors: "The card number you are trying to add to this profile is
+   * already used by this profile."), and the error names the existing handle
+   * (probe-verified 2026-07-04, see docs/decisions.md). What Paysafe answers
+   * when the same single-use token is converted twice is undocumented; the
+   * fake reads it as the same card saved again. The special token simulates
+   * re-saving a card this customer already holds.
    */
   private convertToMultiUse(customerId: string, body: Record<string, unknown>): Response {
     const customer = this.customers.get(customerId);
@@ -1008,6 +1061,24 @@ function isFiled<T>(index: RefNumIndex<T>, refNum: string): boolean {
 
 function duplicateRefNum(): Response {
   return json(409, { error: { code: "5031", message: "The transaction you have submitted has already been processed." } });
+}
+
+function duplicateRequest(): Response {
+  return json(402, { error: { code: "3044", message: REPLAY_REJECTION_MESSAGES["3044"] } });
+}
+
+/** Capture, refund and void state checks: Paysafe answers them 402. */
+function stateRejection(code: string, message: string): Response {
+  return json(402, { error: { code, message } });
+}
+
+/** The fields a write processed into a failure is filed with. */
+function failedRecord(failure: RecordedFailure): { status: string; txnTime: string; error: { code: string; message: string } } {
+  return {
+    status: failure.recordStatus ?? "FAILED",
+    txnTime: "2026-07-04T10:00:00Z",
+    error: { code: failure.code, message: failure.message },
+  };
 }
 
 function handleNotPayable(): Response {

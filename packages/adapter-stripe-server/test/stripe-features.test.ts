@@ -366,6 +366,13 @@ describe("Stripe webhook refund mapping + secret rotation", () => {
     expect(() => makePair({ requestTimeoutMs: 0 })).toThrowError(/requestTimeoutMs/);
     expect(() => makePair({ requestTimeoutMs: 500.5 })).toThrowError(/requestTimeoutMs/);
   });
+
+  it("rejects a retry count the SDK would silently replace", () => {
+    expect(() => makePair({ maxNetworkRetries: -1 })).toThrowError(/maxNetworkRetries must be an integer >= 0/);
+    expect(() => makePair({ maxNetworkRetries: 1.5 })).toThrowError(/maxNetworkRetries/);
+    expect(() => makePair({ maxNetworkRetries: Number.NaN })).toThrowError(/maxNetworkRetries/);
+    expect(() => makePair({ maxNetworkRetries: 0 })).not.toThrow();
+  });
 });
 
 describe("Stripe capability declaration", () => {

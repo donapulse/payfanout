@@ -1,9 +1,11 @@
 /**
  * Real Paysafe sandbox integration. Skipped (green) unless credentials are set.
  * This suite's main job is validating the assumptions the adapter was written
- * from (REST paths, auth format, merchantRefNum dedupe, settlement model) —
- * failures here mean "adjust the adapter", which is exactly what we want to
- * learn before production.
+ * from (REST paths, auth format, replay recovery, settlement model). Paysafe
+ * rejects a reused merchantRefNum instead of replaying the original, so the
+ * adapter reads originals back by reference, and the replay cases below check
+ * that against the real API. Failures here mean "adjust the adapter", which is
+ * exactly what we want to learn before production.
  *
  *   $env:PAYSAFE_USERNAME   = "..."     # sandbox API key username
  *   $env:PAYSAFE_PASSWORD   = "..."     # sandbox API key password
@@ -42,7 +44,7 @@ const BILLING: Record<string, { country: string; zip: string }> = {
 };
 const billing = BILLING[CURRENCY] ?? BILLING["USD"]!;
 
-function makeAdapter(): PaysafeServerAdapter {
+function makeAdapter(fetchImpl?: typeof fetch): PaysafeServerAdapter {
   return new PaysafeServerAdapter({
     username: USERNAME!,
     password: PASSWORD!,
@@ -51,16 +53,23 @@ function makeAdapter(): PaysafeServerAdapter {
     merchantAccountResolver: () => ACCOUNT_ID,
     sessionSigningKey: "integration-session-signing-key",
     webhookHmacKey: process.env.PAYSAFE_WEBHOOK_HMAC_KEY || "not-used-in-these-tests",
+    ...(fetchImpl ? { fetch: fetchImpl } : {}),
   });
 }
 
 const key = (): string => `payfanout-int-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+/** Visa credit (CA), from Paysafe's Test Cards page (Payments API > Cards > Test Cards). */
+const LISTED_TEST_CARD = "4530910000012345";
+
+const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Sandbox-only: creates a Payment Handle server-to-server with a Paysafe test card. */
 async function createTestPaymentHandle(
   amount: number,
   currency: string,
   transactionType: "PAYMENT" | "VERIFICATION" = "PAYMENT",
+  cardNum = "4111111111111111", // Paysafe sandbox test card
 ): Promise<string> {
   const response = await fetch(`${BASE_URL}/paymenthub/v1/paymenthandles`, {
     method: "POST",
@@ -76,7 +85,7 @@ async function createTestPaymentHandle(
       currencyCode: currency,
       ...(ACCOUNT_ID ? { accountId: ACCOUNT_ID } : {}),
       card: {
-        cardNum: "4111111111111111", // Paysafe sandbox test card
+        cardNum,
         cardExpiry: { month: 12, year: 2030 },
         cvv: "111",
         holderName: "PayFanout Integration",
@@ -93,6 +102,52 @@ async function createTestPaymentHandle(
     );
   }
   return body.paymentHandleToken;
+}
+
+interface PaysafeAnswer {
+  status: number;
+  body: { error?: { code?: string }; payments?: unknown[] } | undefined;
+}
+
+/** Sandbox-only raw call, for probes that must see Paysafe's own answer. */
+async function paysafeRequest(method: "GET" | "POST", path: string, body?: unknown): Promise<PaysafeAnswer> {
+  const response = await fetch(`${BASE_URL}${path}`, {
+    method,
+    headers: {
+      authorization: `Basic ${Buffer.from(`${USERNAME}:${PASSWORD}`).toString("base64")}`,
+      "content-type": "application/json",
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+  const text = await response.text();
+  return { status: response.status, body: text ? (JSON.parse(text) as PaysafeAnswer["body"]) : undefined };
+}
+
+/** The payments Paysafe filed under a reference, read until the lookup shows one: it can trail the write. */
+async function paymentsUnder(merchantRefNum: string): Promise<unknown[]> {
+  for (let read = 1; ; read += 1) {
+    const { body } = await paysafeRequest("GET", `/paymenthub/v1/payments?merchantRefNum=${encodeURIComponent(merchantRefNum)}`);
+    const payments = body?.payments ?? [];
+    if (payments.length > 0 || read >= 5) return payments;
+    await pause(2_000);
+  }
+}
+
+/** A MULTI_USE token vaulted from a listed test card, as the vault suite does. */
+async function vaultedTestCard(adapter: PaysafeServerAdapter, amount: number): Promise<{ pspCustomerId: string; token: string }> {
+  const customer = await adapter.createCustomer({
+    id: key(),
+    name: "Replay Integration",
+    email: "replay-int@payfanout.example",
+    idempotencyKey: key(),
+  });
+  const singleUse = await createTestPaymentHandle(amount, CURRENCY, "PAYMENT", LISTED_TEST_CARD);
+  const saved = await adapter.savePaymentMethod({
+    pspCustomerId: customer.pspCustomerId,
+    clientToken: singleUse,
+    idempotencyKey: key(),
+  });
+  return { pspCustomerId: customer.pspCustomerId, token: saved.token };
 }
 
 describeIf("Paysafe sandbox integration", () => {
@@ -130,7 +185,7 @@ describeIf("Paysafe sandbox integration", () => {
     expect(retrieved.paymentMethodDetails?.brand).toBe("visa");
   });
 
-  it("merchantRefNum dedupe = real idempotency: same key twice -> same payment", async () => {
+  it("a same-key completion replay returns the same payment and charges once", async () => {
     const adapter = makeAdapter();
     const session = await adapter.createPaymentSession({
       amount: 555,
@@ -138,18 +193,138 @@ describeIf("Paysafe sandbox integration", () => {
       country: billing.country,
       idempotencyKey: key(),
     });
-    const token = await createTestPaymentHandle(555, CURRENCY);
+    const token = await createTestPaymentHandle(555, CURRENCY, "PAYMENT", LISTED_TEST_CARD);
     const completionKey = key();
     const input = { pspSessionId: session.pspSessionId, clientToken: token, idempotencyKey: completionKey };
     const first = await adapter.completePayment(input);
-    const second = await adapter.completePayment(input).catch((err: unknown) => {
-      // Some Paysafe products answer a replayed merchantRefNum with a duplicate
-      // error instead of echoing the original — both prove no double charge.
-      expect(isPayFanoutError(err)).toBe(true);
-      return null;
+    const second = await adapter.completePayment(input);
+    expect(second.pspPaymentId).toBe(first.pspPaymentId);
+    expect(await paymentsUnder(completionKey)).toHaveLength(1);
+  }, 120_000);
+
+  it("a same-key saved-card charge replay returns the same payment and charges once", async () => {
+    const adapter = makeAdapter();
+    const vaulted = await vaultedTestCard(adapter, 1250);
+    const chargeKey = key();
+    const charge = () =>
+      adapter.chargeSavedPaymentMethod({
+        pspCustomerId: vaulted.pspCustomerId,
+        savedPaymentMethodToken: vaulted.token,
+        amount: 1250,
+        currency: CURRENCY,
+        occurrence: "initial",
+        idempotencyKey: chargeKey,
+      });
+    const first = await charge();
+    // Sent with dupCheck: Paysafe refuses the repeat, and the adapter reads the first back.
+    const second = await charge();
+    expect(second.pspPaymentId).toBe(first.pspPaymentId);
+    expect(await paymentsUnder(chargeKey)).toHaveLength(1);
+    await adapter.deleteSavedPaymentMethod(vaulted.pspCustomerId, vaulted.token);
+  }, 120_000);
+
+  it("a second card under the key of a declined attempt is processed, not refused as a duplicate", async () => {
+    // Simulator amount 5: "402 | 3009 | Your request has been declined by the issuing bank."
+    // Both attempts decline by amount; the second answering 3009 rather than 5031 is the
+    // proof that dupCheck: false lets a new attempt through under the same reference, and
+    // both attempts must reach POST /payments: the first decline's record may name no handle.
+    let paymentPosts = 0;
+    const counting: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const path = new URL(url).pathname;
+      if (init?.method === "POST" && path.endsWith("/paymenthub/v1/payments")) paymentPosts += 1;
+      const response = await fetch(input, init);
+      if ((init?.method ?? "GET") === "GET" && path.endsWith("/paymenthub/v1/payments")) {
+        // Field names only, never values: which fields a declined record carries is an
+        // open question recorded in docs/decisions.md.
+        const body = (await response.clone().json()) as { payments?: Array<Record<string, unknown>> };
+        console.log("[paysafe] payments lookup record fields:", (body.payments ?? []).map((p) => Object.keys(p).sort()));
+      }
+      return response;
+    };
+    const adapter = makeAdapter(counting);
+    const session = await adapter.createPaymentSession({
+      amount: 5,
+      currency: CURRENCY,
+      country: billing.country,
+      idempotencyKey: key(),
     });
-    if (second) expect(second.pspPaymentId).toBe(first.pspPaymentId);
-  });
+    const completionKey = key();
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      const token = await createTestPaymentHandle(5, CURRENCY, "PAYMENT", LISTED_TEST_CARD);
+      const err = await adapter
+        .completePayment({ pspSessionId: session.pspSessionId, clientToken: token, idempotencyKey: completionKey })
+        .then(() => undefined, (e: unknown) => e);
+      expect(isPayFanoutError(err), `attempt ${attempt}`).toBe(true);
+      if (isPayFanoutError(err)) {
+        expect((err.raw as { error?: { code?: string } } | undefined)?.error?.code, `attempt ${attempt}`).toBe("3009");
+      }
+    }
+    expect(paymentPosts).toBe(2);
+  }, 120_000);
+
+  it("in-flight probe: a second same-key saved-card charge while the first is still processing", async () => {
+    // Simulator amount 95: "Approved with 30-second delay". What Paysafe answers a
+    // same-key request during that delay is undocumented, and it decides whether the
+    // adapter could ever re-send a payment whose outcome is unknown (it does not).
+    // Recorded, not assumed: 5031, 3044, 3417, or processed as a second payment.
+    const adapter = makeAdapter();
+    const vaulted = await vaultedTestCard(adapter, 95);
+    const refNum = key();
+    const body = {
+      merchantRefNum: refNum,
+      amount: 95,
+      currencyCode: CURRENCY,
+      dupCheck: true,
+      settleWithAuth: true,
+      paymentHandleToken: vaulted.token,
+      storedCredential: { type: "RECURRING", occurrence: "INITIAL" },
+      ...(ACCOUNT_ID ? { accountId: ACCOUNT_ID } : {}),
+    };
+    const first = paysafeRequest("POST", "/paymenthub/v1/payments", body);
+    await pause(5_000);
+    const second = await paysafeRequest("POST", "/paymenthub/v1/payments", body);
+    const firstAnswer = await first;
+    const payments = await paymentsUnder(refNum);
+    const outcome = second.status < 300 ? "processed" : (second.body?.error?.code ?? `HTTP ${second.status}`);
+    console.warn(
+      `[paysafe-integration] in-flight same-key charge answered ${outcome} (HTTP ${second.status}); ` +
+        `first answered HTTP ${firstAnswer.status}; payments under the key: ${payments.length}`,
+    );
+    expect(firstAnswer.status).toBeLessThan(300);
+    expect(["5031", "3044", "3417", "processed"]).toContain(outcome);
+    await adapter.deleteSavedPaymentMethod(vaulted.pspCustomerId, vaulted.token);
+  }, 180_000);
+
+  it("in-flight probe: a second payment with the same single-use handle while the first is still processing", async () => {
+    // Same simulator amount. A payments call spends a single-use handle "regardless of
+    // the payments call response status"; this records whether a request arriving
+    // during the first one's delay already answers 5283, or is processed again.
+    const token = await createTestPaymentHandle(95, CURRENCY, "PAYMENT", LISTED_TEST_CARD);
+    const refNum = key();
+    const body = {
+      merchantRefNum: refNum,
+      amount: 95,
+      currencyCode: CURRENCY,
+      dupCheck: false,
+      settleWithAuth: true,
+      paymentHandleToken: token,
+      billingDetails: { country: billing.country, zip: billing.zip },
+      ...(ACCOUNT_ID ? { accountId: ACCOUNT_ID } : {}),
+    };
+    const first = paysafeRequest("POST", "/paymenthub/v1/payments", body);
+    await pause(5_000);
+    const second = await paysafeRequest("POST", "/paymenthub/v1/payments", body);
+    const firstAnswer = await first;
+    const payments = await paymentsUnder(refNum);
+    const outcome = second.status < 300 ? "processed" : (second.body?.error?.code ?? `HTTP ${second.status}`);
+    console.warn(
+      `[paysafe-integration] in-flight same-handle payment answered ${outcome} (HTTP ${second.status}); ` +
+        `first answered HTTP ${firstAnswer.status}; payments under the key: ${payments.length}`,
+    );
+    expect(firstAnswer.status).toBeLessThan(300);
+    expect(["5283", "processed"]).toContain(outcome);
+  }, 180_000);
 
   it("manual flow: authorize -> requires_capture -> capture (settlement)", async () => {
     const adapter = makeAdapter();
@@ -712,6 +887,8 @@ describeIf("Paysafe bank-debit rails (real sandbox)", () => {
   const itIfCad = CURRENCY === "CAD" ? it : it.skip;
 
   itIfCad("EFT: completes a payment from the documented simulation values", async () => {
+    // Several exchanges (the key's payments and handles, the handle, the payment, the
+    // read back), each allowed the adapter's 60-second request timeout.
     const adapter = makeAdapter();
     const session = await adapter.createPaymentSession({
       amount: 5_66,
@@ -761,7 +938,7 @@ describeIf("Paysafe bank-debit rails (real sandbox)", () => {
     const retrieved = await adapter.retrievePayment(info.pspPaymentId);
     expect(retrieved.pspPaymentId).toBe(info.pspPaymentId);
     expect(retrieved.amount).toBe(5_66);
-  }, 30_000);
+  }, 180_000);
 
   const railProbes = [
     {

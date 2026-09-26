@@ -30,6 +30,7 @@ import {
   type VerifyCredentialsResult,
 } from "@payfanout/core";
 import { decodeWorldlineClientToken, type WorldlineCustomerDevice } from "./client-token.js";
+import { assertMerchantParametersFit, readMerchantParameters, toMerchantParameters } from "./merchant-parameters.js";
 import { buildV1HmacAuthorization, deriveIdempotenceKey } from "./signing.js";
 import {
   decodeSessionContext,
@@ -137,8 +138,13 @@ export interface WorldlinePaymentLike {
   };
   paymentOutput?: {
     amountOfMoney?: { amount?: number; currencyCode?: string };
-    references?: { merchantReference?: string };
+    /** `merchantParameters` echoes the session metadata the adapter sent, JSON-encoded. */
+    references?: { merchantReference?: string; merchantParameters?: string | null };
+    /** @deprecated Replaced by `references.merchantParameters` (API contract); read only when that is absent. */
+    merchantParameters?: string | null;
     cardPaymentMethodSpecificOutput?: WorldlineCardOutput;
+    /** "The server-side processing date and time of the transaction" (API contract). */
+    transactionDate?: string | null;
   };
 }
 
@@ -333,19 +339,30 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
   /**
    * Creates the Hosted Tokenization session (POST /hostedtokenizations — no
    * amount at this step) and encodes amount/currency/capture-method, the return
-   * URL, the SCA preference and the returned hostedTokenizationId into a
-   * signed, self-contained context that completePayment later verifies and
-   * trusts. The client mounts the iframe from the returned
+   * URL, the SCA preference, the metadata and the returned hostedTokenizationId
+   * into a signed, self-contained context that completePayment later verifies
+   * and trusts. The client mounts the iframe from the returned
    * hostedTokenizationUrl (the session's clientSecret).
+   *
+   * `metadata` goes to Worldline JSON-encoded, as the payment's
+   * `order.references.merchantParameters`, which Worldline echoes on reads and
+   * in webhooks: retrievePayment reports it as `PaymentInfo.metadata`, and
+   * readWorldlineWebhookMetadata reads it from a webhook. Worldline's API
+   * contract says of that field: "This field must not contain any personal
+   * data." Keep personal data out of a Worldline session's metadata; the
+   * adapter sends what it is given.
    *
    * Refused with invalid_request before anything reaches Worldline when the
    * session has no return URL (neither a non-empty `returnUrl` nor the
    * adapter's `defaultReturnUrl`) or one Worldline rejects (over 200
    * characters, or without a protocol such as `https://` or an app scheme),
    * when `id` is longer than the 40 characters
-   * `order.references.merchantReference` accepts, or when
+   * `order.references.merchantReference` accepts, when
    * `statementDescriptor` is longer than the 256 characters
-   * `order.references.softDescriptor` accepts.
+   * `order.references.softDescriptor` accepts, or when `metadata` has a value
+   * that is not a string or, JSON-encoded, is longer than the 1000 characters
+   * `order.references.merchantParameters` accepts (UTF-16 code units, so an
+   * emoji counts two).
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertMinorUnitAmount(input.amount, "amount");
@@ -384,6 +401,8 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       receiptEmail: input.receiptEmail,
       shippingDetails: input.shippingDetails,
       sca: input.sca,
+      // Carried only when there is something to send as merchantParameters.
+      ...(toMerchantParameters(input.metadata) ? { metadata: input.metadata } : {}),
     };
     const token = await encodeSessionContext(context, this.config.sessionSigningKey);
     return {
@@ -403,7 +422,9 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
    * confirm() produced, the hostedTokenizationId plus the browser's device data
    * (see decodeWorldlineClientToken; a bare hostedTokenizationId is accepted
    * too). The signed context is the only trusted source of
-   * amount/currency/capture-method.
+   * amount/currency/capture-method. The session's metadata, when it has
+   * entries, is sent JSON-encoded as `order.references.merchantParameters`; a
+   * context signed before metadata was carried sends none.
    *
    * Every payment carries the mandatory 3-D Secure properties the adapter can
    * supply: the return URL in both documented forms,
@@ -467,11 +488,13 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     if (!returnUrl) throw missingReturnUrl();
     const billing = mergeBillingDetails(context.billingDetails, input.billingDetails);
     const email = context.receiptEmail ?? billing?.email;
+    const merchantParameters = toMerchantParameters(context.metadata);
     const references: Record<string, string> = {
       ...(context.id ? { merchantReference: context.id } : {}),
       // descriptor is deprecated in favor of merchantReconciliationReference, a
       // reconciliation field; softDescriptor is the cardholder-statement text.
       ...(context.statementDescriptor ? { softDescriptor: context.statementDescriptor } : {}),
+      ...(merchantParameters ? { merchantParameters } : {}),
     };
     const request = {
       order: {
@@ -658,6 +681,15 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     }
   }
 
+  /**
+   * Reads the payment, its captures and its refunds. `metadata` is the
+   * session's as Worldline echoes it in `merchantParameters` (see
+   * createPaymentSession). `createdAt` is the payment's
+   * `paymentOutput.transactionDate`, which Worldline describes as "the
+   * server-side processing date and time of the transaction" without saying
+   * whether a later capture or refund moves it; a value without a zone is read
+   * as UTC. Without a readable one it is 1970-01-01T00:00:00.000Z.
+   */
   async retrievePayment(pspPaymentId: string, payfanoutId?: string): Promise<PaymentInfo> {
     const payment = await this.fetchPayment(pspPaymentId);
     // Captures and refunds are separate sub-resources — query them so the
@@ -922,6 +954,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       opts.statusOverride ??
       mapWorldlineStatus(payment.status, payment.statusOutput?.statusCode, payment.statusOutput?.statusCategory);
     const methodDetails = toPaymentMethodDetails(output.cardPaymentMethodSpecificOutput);
+    const metadata = readMerchantParameters(output);
     return {
       id: opts.payfanoutId ?? merchantReference ?? payment.id,
       pspName: this.pspName,
@@ -933,10 +966,9 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       ...(opts.amountCapturable !== undefined ? { amountCapturable: opts.amountCapturable } : {}),
       currency: (money.currencyCode ?? opts.currencyFallback ?? "").toUpperCase() || "XXX",
       paymentMethodType: "card",
+      ...(metadata ? { metadata } : {}),
       ...(methodDetails ? { paymentMethodDetails: methodDetails } : {}),
-      // Worldline's payment object carries no stable creation timestamp; hosts
-      // that need one read it from the webhook `created` or their own record.
-      createdAt: "1970-01-01T00:00:00.000Z",
+      createdAt: readTransactionDate(output.transactionDate) ?? UNKNOWN_CREATED_AT,
       raw: opts.raw ?? payment,
     };
   }
@@ -1131,6 +1163,44 @@ function parseExpiry(expiryDate: string | undefined): { month?: number; year?: n
   const month = Number(expiryDate.slice(0, 2));
   const year = 2000 + Number(expiryDate.slice(2, 4));
   return { ...(month >= 1 && month <= 12 ? { month } : {}), year };
+}
+
+/** PaymentInfo.createdAt for a payment that reports no readable transactionDate. */
+const UNKNOWN_CREATED_AT = "1970-01-01T00:00:00.000Z";
+
+/**
+ * The API contract's pattern for paymentOutput.transactionDate, whose trailing
+ * Z is optional, extended to the explicit offset a date-time may carry, as the
+ * webhooks guide's envelope examples do on `created`.
+ */
+const TRANSACTION_DATE =
+  /^([12]\d{3})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):([0-5]\d):([0-5]\d)(?:\.(\d+))?(?:Z|([+-])([01]\d|2[0-3]):([0-5]\d))?$/;
+
+/**
+ * A transactionDate as ISO 8601 UTC, or undefined when it is not one. A value
+ * without a zone is UTC, as the contract gives GetPaymentsReport's
+ * transactionDate ("in UTC"), never the server's local time; fractional
+ * seconds are truncated to milliseconds, and a day the month does not have
+ * (February 30) is no date.
+ */
+function readTransactionDate(value: unknown): string | undefined {
+  const match = typeof value === "string" ? TRANSACTION_DATE.exec(value) : null;
+  if (!match) return undefined;
+  const [, year, month, day, hours, minutes, seconds, fraction = "", sign, offsetHours, offsetMinutes] = match;
+  const milliseconds = Number(fraction.slice(0, 3).padEnd(3, "0"));
+  const wallClock = Date.UTC(
+    Number(year),
+    Number(month) - 1,
+    Number(day),
+    Number(hours),
+    Number(minutes),
+    Number(seconds),
+    milliseconds,
+  );
+  // Date.UTC carries a day past the end of the month into the next one.
+  if (new Date(wallClock).getUTCDate() !== Number(day)) return undefined;
+  const offset = sign ? (sign === "-" ? -1 : 1) * (Number(offsetHours) * 60 + Number(offsetMinutes)) : 0;
+  return new Date(wallClock - offset * 60_000).toISOString();
 }
 
 /** The status fields a Worldline payment, capture or refund object may carry. */
@@ -1692,6 +1762,7 @@ function assertReferenceLimits(input: CreatePaymentSessionInput): void {
       { statementDescriptor: input.statementDescriptor },
     );
   }
+  assertMerchantParametersFit(input.metadata);
 }
 
 function toWorldlineShipping(

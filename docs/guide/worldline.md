@@ -311,6 +311,29 @@ host id round-trips via `order.references.merchantReference` (`PaymentInfo.id`).
 hand-write the route? Call `completePayment` directly, both forms are in
 [Server usage](/guide/server#server-completion-tokenize-first).
 
+The session's `metadata` travels with the payment as `order.references.merchantParameters`,
+JSON-encoded, and Worldline echoes it "back to you in API GET calls and Webhook
+notifications": `retrievePayment` reports it as `PaymentInfo.metadata`, and
+`readWorldlineWebhookMetadata(event)` reads it from a webhook's payment, since the unified
+event carries no metadata. Both read it only when the echo is a JSON object of string values,
+as the adapter writes it, so a value another integration stored there reads as no metadata.
+Worldline accepts at most 1000 characters in the field: a session whose metadata, JSON-encoded,
+is longer is refused with `invalid_request` before anything reaches Worldline, as is a
+metadata value that is not a string. The adapter counts UTF-16 code units, in which an emoji
+counts two.
+
+::: warning No personal data in Worldline metadata
+Worldline's API contract says of `merchantParameters`: "This field must not contain any
+personal data." Keep personal data, such as names and email addresses, out of the `metadata`
+of a Worldline session. The adapter cannot tell it apart and sends what it is given.
+:::
+
+`PaymentInfo.createdAt` is the payment's `paymentOutput.transactionDate`, which the API
+contract describes as "the server-side processing date and time of the transaction"; a value
+without a zone is read as UTC. Worldline does not say whether a later capture or refund moves
+it, and no sandbox run has checked yet, so keep your own record of when an order was placed.
+A payment that reports none, or one that is not a date, gets `1970-01-01T00:00:00.000Z`.
+
 ### Paying again under the same key
 
 Worldline answers a request sent again under an idempotency key it has seen with that key's
@@ -553,7 +576,9 @@ only part of it:
   show it at `event.raw.payment.paymentOutput.references.merchantReference` on the events of
   a sale (`payment.created`, `payment.authorization_requested`, `payment.captured`). No
   documented example is a maintenance event, so the echo on capture, cancellation, and refund
-  events is unverified: check it in your sandbox before you rely on it.
+  events is unverified: check it in your sandbox before you rely on it. The session's
+  `metadata` rides the same `references` object as `merchantParameters`
+  (`readWorldlineWebhookMetadata`); no example shows it at all, so check its echo too.
 - **The refund id (refunds made through `refundPayment` only).** `refundPayment` returns the
   composite `refundId` `{paymentId}:{refundId}`, and the part after the last `:` is the
   refund's own id. In the `payment.id` column of the Status Changes table, that is the id
@@ -653,6 +678,8 @@ current list there** rather than assuming.
       feature enabled on your account, and asks you to "Meet the PCI DSS certification SAQ
       C-VT": check all three for your API account. Card details your staff key in bring their
       workstations into PCI DSS scope, so confirm your SAQ with your acquirer.
+- [ ] Sending session `metadata`? Keep personal data out of it (§7), and check in sandbox that
+      `retrievePayment` and your webhooks read it back.
 - [ ] Swap in the **live** API key id + secret and the **live** merchant id.
 - [ ] Plan the live API key renewal ahead of its *Expiration date* (Developer → Payment API):
       the old pair expires within four hours of creating a new one, so deploy the new pair

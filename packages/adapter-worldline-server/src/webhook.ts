@@ -9,6 +9,7 @@ import {
   type UnifiedWebhookEvent,
   type UnifiedWebhookEventType,
 } from "@payfanout/core";
+import { readMerchantParameters } from "./merchant-parameters.js";
 
 /**
  * Worldline Direct webhook verification: `X-GCS-Signature` carries
@@ -212,6 +213,22 @@ export async function parseWorldlineWebhookEvent(rawBody: string): Promise<Unifi
     occurredAt: normalizeTime(body.created),
     raw: body,
   };
+}
+
+/**
+ * The session metadata a Worldline webhook's payment echoes, read by the rules
+ * `PaymentInfo.metadata` follows (see WorldlineServerAdapter.retrievePayment):
+ * `payment.paymentOutput.references.merchantParameters`, else the deprecated
+ * `payment.paymentOutput.merchantParameters`, as the JSON object of strings
+ * the adapter sent. `UnifiedWebhookEvent` has no metadata field, so this reads
+ * the event's `raw` delivery. Undefined for another PSP's event, a delivery
+ * without a payment resource (a refund resource alone, a payment link), or an
+ * echo that is not metadata the adapter wrote.
+ */
+export function readWorldlineWebhookMetadata(event: UnifiedWebhookEvent): Record<string, string> | undefined {
+  if (event.pspName !== "worldline") return undefined;
+  const payment = (event.raw as { payment?: { paymentOutput?: unknown } | null } | null | undefined)?.payment;
+  return readMerchantParameters(payment?.paymentOutput);
 }
 
 function mapEventType(rawType: string, statusCode: number | undefined): UnifiedWebhookEventType {

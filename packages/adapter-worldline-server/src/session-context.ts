@@ -64,6 +64,11 @@ export interface WorldlineSessionContextV1 {
    * telephone order channel, and leaves the 3-D Secure data unchanged.
    */
   sca?: CreatePaymentSessionInput["sca"];
+  /**
+   * The session's metadata, when it has entries: order.references.merchantParameters on
+   * the payment, JSON-encoded. Contexts signed before it was carried have none.
+   */
+  metadata?: Record<string, string>;
 }
 
 export interface DecodeSessionContextOptions {

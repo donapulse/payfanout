@@ -123,8 +123,8 @@ runServerAdapterConformanceTests(
       authorizedPayment: (adapter, input) => completedPayment(adapter, { amount: input.amount, captureMethod: "manual" }),
       cancelablePayment: (adapter) => completedPayment(adapter, { amount: 1500, captureMethod: "manual" }),
       // The host id round-trips via order.references.merchantReference (idRoundTrip),
-      // but Worldline has no arbitrary metadata map (metadataEcho false).
-      expectations: { idRoundTrip: true, metadataEcho: false },
+      // the metadata via order.references.merchantParameters (metadataEcho).
+      expectations: { idRoundTrip: true, metadataEcho: true },
     },
     failingCalls: [
       {

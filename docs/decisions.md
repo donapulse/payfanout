@@ -70,9 +70,10 @@ were taken autonomously from the brief's own recommended defaults (§10/§11) du
   settled amount — with custom capture keys the settled amount is not statelessly
   rediscoverable (known limitation; default capture keys are).
   *(Superseded in part 2026-09-26: no capture has had a default key since 2026-07-08. A full
-  capture now settles under `payfanout-capture-<payment id>`, which later reads find, and only
-  a partial capture's settlement, under the caller's key, stays out of their sight; a void
-  can only follow partial captures. See "Paysafe: settlements a refund can find
+  capture now settles under `payfanout-capture-<payment id>`, or the next of its `-a2` to
+  `-a10` references once a full capture there moved no money, which later reads find, and
+  only a partial capture's settlement, under the caller's key, stays out of their sight; a
+  void can only follow partial captures. See "Paysafe: settlements a refund can find
   (2026-09-26)".)*
 - **Ops:** typedoc API reference (`pnpm run docs:api` → docs/api, gitignored; note —
   typedoc's glob handling breaks on paths containing parentheses, so run it from a
@@ -2596,9 +2597,9 @@ description of what v2 changes is what the migration then had to implement.
   2026-09-25 on the `payments` and `paymenthandles` lookups: a date with that default and
   no stated limit); the sandbox check is an open item below. *(Amended 2026-09-26: these
   replay reads keep the default window, but the lookups that find a payment's settlements
-  for a read, a cancel or a refund now start the day before the payment, and fall back to
-  the default window when Paysafe refuses the range. See "Paysafe: settlements a refund can
-  find (2026-09-26)".)* For a bank debit the gap has a
+  for a read, a cancel, a refund or a full capture now start the day before the payment, and
+  are sent again over the default window when Paysafe refuses the range as a request error.
+  See "Paysafe: settlements a refund can find (2026-09-26)".)* For a bank debit the gap has a
   second effect (2026-09-25): a failed attempt 31 to 90 days old is out of the lookup's
   sight but still trips `dupCheck`, so every attempt under the key is refused, and retrying
   under it cannot get past that. The refusal's error therefore does not say "never a new
@@ -4619,97 +4620,220 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   looked only under the payment's own `merchantRefNum` and `payfanout-capture-<payment id>`,
   the default capture key of earlier releases. A manually captured payment's settlement was
   never found again: every refund of it failed with "has no refundable settlement", and
-  `retrievePayment` reported `amountRefunded: 0` and no `capturedAt`. Doc-verified 2026-09-26
-  against the Payments API OpenAPI spec
+  `retrievePayment` reported `amountRefunded: 0` and no `capturedAt`. Doc-verified
+  2026-09-26 against the Payments API OpenAPI spec
   (developer.paysafe.com/fileadmin/openapi-spec/payments-api/apis/paysafe-ph-payments-api.yaml).
   `GET /v1/settlements` takes `merchantRefNum` (required, "This is the merchant reference
   number created by the merchant and submitted as part of the Process Settlement request"),
   `limit`, `offset`, `startDate` and `endDate`, and no filter by payment: a settlement is
   found by its reference or not at all. The Process Settlement body holds `merchantRefNum`
   (required, maxLength 255, "It must be unique for each request."), `amount`, `dupCheck` ("A
-  request is considered a duplicate if the merchantRefNum has already been used in a previous
-  request within the past 90 days. **Note:** This value defaults to true"), `splitpay` and the
-  airline, cruise line, lodging and car rental details. No field could carry the caller's key
-  beside another reference. A capture with no `amount` (everything that remains) or with the
-  payment's authorized `amount` now settles under `payfanout-capture-<payment id>`: 54
-  characters for an id at the spec's `maxLength` of 36. Neither test changes between a call
-  and its replay, so a replay settles under the same reference, and `dupCheck` and the
-  read-back resolve it as before: the lookup first when nothing is left, the read-back after a
-  rejection, the amount compared when one was given. A payment is captured in full only once,
-  so two calls under different keys, or sent together, meet one settlement. The key stays
-  required, and a capture with an explicit amount now reads the payment first.
+  request is considered a duplicate if the merchantRefNum has already been used in a
+  previous request within the past 90 days. **Note:** This value defaults to true"),
+  `splitpay` and the airline, cruise line, lodging and car rental details. No field could
+  carry the caller's key beside another reference. A capture with no `amount` (everything
+  that remains) or with the payment's authorized `amount` now settles under a reference
+  derived from the payment, and the portal shows that reference for it, not the caller's
+  key; the changeset says so. Whether a call is a full capture cannot change on its replay:
+  the amount is the caller's and the authorized amount is fixed.
+- **A full capture walks a bounded sequence of references** (changed in review, 2026-09-26).
+  The first version settled every full capture of a payment under
+  `payfanout-capture-<payment id>` with `dupCheck: true`, so after one full capture that
+  failed, errored or was cancelled, every later one, under any key, met that record: 5031,
+  then the read-back, then the old failure rethrown. In the test double a recorded 402/3206
+  or 500/1000 made every retry fail with the original error, 30 days later too, where the
+  previous release's retry under a new key settled, and after a pending settlement cancelled
+  outside the adapter a recapture answered `requires_capture` with nothing settled. "Retries
+  never replay a PSP-cached failure" is the renewal keys' rule above; the captures now
+  follow it. A payment's references are `payfanout-capture-<payment id>`, then `-a2` to
+  `-a10`, at most 58 characters for an id at the spec's `maxLength` of 36. A full capture
+  reads them in order, over the payment's range (below). A reference holding a settlement
+  that moved money means the payment is captured in full, and the call answers with the
+  payment's state and that settlement, whatever its key. One whose records all moved no
+  money (failed, cancelled or expired, the rule the settlement sums already apply) is spent,
+  and the walk goes on. The first holding no record is the one to settle under, with
+  `dupCheck: true` through the usual write path, reading back after a rejection. Two full
+  captures sent together find the same free reference: one settles, and the other is refused
+  (5031, or 3203/3204 when Paysafe checks the state first) and reads that settlement back. A
+  lost answer reads back the same way. The read-back compares no amount, as a reference
+  holds one full capture whichever call made it. When every reference is spent, the capture
+  is refused with a non-retryable `invalid_request` naming them and sending the host to the
+  Paysafe portal, which settles an authorization ("Apply Settlement" on its details page,
+  Paysafe Back Office User's Guide, June 2022,
+  developer.paysafe.com/fileadmin/content/pdfs/Back_Office_June_2022.pdf); PayFanout does
+  not find a settlement made there, so it is refunded there too. The bound is 10: every read
+  of a manually captured payment walks the references, one lookup each, and ten spent
+  captures are far more than one authorization plausibly survives; Paysafe caps the
+  settlements of an authorization at a number it does not state (3202, "You have exceeded
+  the maximum number of Settlements allowed."). A capture with no amount when nothing is
+  left and no reference holds a live settlement is refused as nothing left to capture, a
+  plain `invalid_request`, and never sends a zero settlement. A capture of the authorized
+  amount that meets a live settlement of another amount (the rest, after partial captures)
+  is refused as already captured in full, a plain `invalid_request` without
+  `outcomeUnknown`; it had answered `invalid_request` with `outcomeUnknown` and the advice
+  to use a new key, as for a key reused by another request. A capture with no amount that
+  meets one answers with it: it was the remainder then. Reads walk the same references and
+  stop at the first live settlement or the first empty reference. A lookup that fails fails
+  the capture, and nothing is settled after it (see the lookups below).
 - **A partial capture still settles under the caller's key, which no read can find.** Any
-  other amount keeps the key as its `merchantRefNum`, and that key must stay unique across the
-  account. Its amount shows in `amountCaptured`, derived from `availableToSettle`, but no
-  `capturedAt` does, and `refundPayment` cannot refund it. Its refusal, the method docs, the
-  guide and the README say so and send the host to the Paysafe portal, whose features include
-  "Process refunds" (Merchant Back Office page,
-  developer.paysafe.com/en/support/reference-information/merchant-back-office/). The spec's
-  `GET /v1/payments/{paymentId}` answer lists `settlements` beside `availableToSettle`,
-  `availableToRefund`, `txnTime` and `merchantRefNum`, but its only example carries none, and
-  the 2026-07-04 notes above record settlements as query-only. Settlements a payment carries
-  are used as they are, which would reach a partial capture too (open item below).
+  other amount keeps the key as its `merchantRefNum`, and that key must stay unique across
+  the account. A key starting with `payfanout-capture-` is refused with `invalid_request`
+  before any settlement request: filed under a payment's reference, the partial settlement
+  would read as that payment's full capture. Only the payment read comes first, since only
+  it tells a partial capture from a full one, and a full capture sends no key, so any key
+  does for it. The partial capture's amount shows in `amountCaptured`, derived from
+  `availableToSettle`, but no `capturedAt` does, and `refundPayment` cannot refund it. Every
+  capture's answer now carries the settlement it made, read back or met, on
+  `raw.captureSettlement`, beside the payment's fields as `retrievePayment` reports them;
+  none of those fields changed. The host keeps a partial capture's settlement id and refunds
+  it in the portal. The Merchant Back Office page lists "Process refunds" and "Search for a
+  transaction, based on a range of search criteria, such as ID, billing status, amount,
+  date, and payment type"
+  (developer.paysafe.com/en/support/reference-information/merchant-back-office/, re-verified
+  2026-09-26), which names no merchant reference. Paysafe's fuller guides do: the Back
+  Office User's Guide lists a transaction Lookup by "Merchant Trans. ID" ("the number you
+  assigned to the original transaction request"), which it gives as "The merchantRefNum
+  submitted with the original transaction when using the Web Services API", and the Business
+  Portal WebHelp (merchant.paysafe.com/portal/assets/portal-assets/business_portal.pdf) says
+  "You can search for a particular transaction using the transaction ID or the merchant
+  transaction ID, or the Mandate Reference Number." The guide sends hosts to the id first
+  and names the merchant transaction ID as the other search; the README names the id.
+  Captures made by earlier releases with an idempotency key, which every capture has had
+  since 1.0.0, settled under that key, full ones included, so they stay out of reach here;
+  the refusal, the changeset, the guide and the README say to refund those in the portal.
+  The spec's `GET /v1/payments/{paymentId}` answer lists `settlements` beside
+  `availableToSettle`, `availableToRefund`, `txnTime` and `merchantRefNum`, but its only
+  example carries none, and the 2026-07-04 notes above record settlements as query-only.
+  Settlements a payment carries are used as they are, which would reach a partial capture
+  too (open item below).
 - **Once a full capture's settlement shows, `availableToSettle` still counts the partial
-  captures before it.** Capturing the rest after partial captures settles the remainder under
-  the derived reference. Read alone, that settlement would have made `amountCaptured` the
-  remainder, where the old reads, finding no settlement, derived the whole authorization. A
-  full capture takes all that remains, and `cancelPayment` voids all that remains, so no void
-  of the adapter's comes before or after one. While a full capture's settlement shows and has
-  moved money, the larger of the settlements' sum and `amount - availableToSettle` is
-  reported. Refunds still come out of that settlement only. A void made outside the adapter,
-  or a partial capture an earlier release filed under that reference as its default key, then
-  counts as captured, as later reads of a voided payment already counted it.
-- **Every settlement read starts the day before the payment.** Doc-verified 2026-09-26 against
-  the same spec: `startDate` is "This is the start date in UTC. Default = 30 days before the
-  endDate." (`format: date`, example `2022-11-18`) and `endDate` "This is the end date in UTC.
-  Default = current date and time.", so a payment settled more than 30 days earlier had no
-  refundable settlement either. The reads of `retrievePayment`, `cancelPayment` and
-  `refundPayment`, which all go through `findSettlements`, now send `startDate`: the UTC date
-  of the payment's `txnTime` less one day, a margin for a settlement timed just before its
-  payment. They send no `endDate`. A payment without a readable `txnTime` sends no
-  `startDate`. The widest range Paysafe accepts is undocumented, so a ranged lookup that fails
-  for any reason but the not-found answer (404/5269, read as no settlement) is sent once more
-  without `startDate`, over the default window. A failure of that one reads as no
-  settlement, as every lookup failure did before. The settle-with-auth examples of
-  `POST /v1/payments` ("Card - with Settlement" among them) embed a settlement under the
-  payment's own `merchantRefNum`, which is why that reference is read first. The replay
-  lookups keep the default window: they look for a write made moments before.
-- **A payment that moved no money is given no settlement.** A settlement names no payment, and a
-  card completion keyed by order files a declined attempt and the payment that went through
-  under the same reference. The lookup for the declined attempt therefore found the other
-  payment's settlement: its read reported that settlement, and `refundPayment` on it refunded
-  the other payment. That was already so within the default window, and the wider window would
-  have reached further back. A failed, cancelled or expired payment (the "moved no money" rule
-  the settlement sums already apply; "FAILED – The transaction failed, due to either an error or
-  being declined" and "CANCELLED – The request has been fully voided (reversed)" in the spec's
-  payment statuses) settled nothing, so its reads look nothing up and a refund of it is refused.
-  Two payments that both moved money under one reference would still share their settlements;
-  the adapter never makes that pair, as a completion under a key that already made a payment
-  returns that payment or is refused.
-- **The test double** files and times its records on its own date, which `passDays` moves on,
-  and serves the lookups from `startDate` to `endDate` as the spec words them, the default
-  window unchanged. A malformed date, or a range past an optional limit
-  (`lookupRangeLimitDays`, none by default), is refused as a field error (400/5068). It counts
-  the settlements captures make. Against it the previous adapter failed fifteen of the new
-  tests, among them a refund after a manual capture, the capture time of a captured payment, a
-  refund of a payment settled 45 days before and a second full capture under another key. The
-  conformance suite passes unchanged.
+  captures before it.** Capturing the rest after partial captures settles the remainder
+  under a full-capture reference. Read alone, that settlement would have made
+  `amountCaptured` the remainder, where the old reads, finding no settlement, derived the
+  whole authorization. A full capture takes all that remains, and `cancelPayment` voids all
+  that remains, so no void of the adapter's comes before or after one. While a full
+  capture's settlement shows and has moved money, the larger of the settlements' sum and
+  `amount - availableToSettle` is reported, and `amountCapturable` is 0: the payment read
+  can trail the settlement it has just taken, and a test pins a read whose
+  `availableToSettle` still shows the whole authorization. Refunds still come out of that
+  settlement only. A void made outside the adapter before the full capture, or a partial
+  capture an earlier release filed under the first reference as its default key, then counts
+  as captured, as later reads of a voided payment already counted it. For the second, a
+  capture of the rest answers with that settlement instead of settling, but it needs an
+  authorization from before 2026-07-08, when the default keys ended: the Business Portal
+  WebHelp gives a pre-authorised transaction "between three and five days".
+- **Settlement reads start the day before the payment.** Doc-verified 2026-09-26 against the
+  same spec: `startDate` is "This is the start date in UTC. Default = 30 days before the
+  endDate." (`format: date`, example `2022-11-18`) and `endDate` "This is the end date in
+  UTC. Default = current date and time.", so a payment settled more than 30 days earlier had
+  no refundable settlement either. The lookups that find a payment's settlements, for
+  `retrievePayment`, `cancelPayment`, `refundPayment` and a full capture's walk, now send
+  `startDate`: the UTC date of the payment's `txnTime` less one day, a margin for a
+  settlement timed just before its payment. They send no `endDate`, and ask for `limit=50`,
+  the spec's maximum for `limit` ("This is the total number of records to return.", default
+  10, maximum 50), so a reused completion key's records are not cut at ten. A payment
+  without a readable `txnTime` sends no `startDate`. The replay reads keep the default
+  window: they look for a write made moments before. The widest range Paysafe accepts is
+  undocumented, so a ranged lookup Paysafe refuses as a request error (a 4xx mapped to
+  `invalid_request`, as a 400/5068 field error is) is sent once more without `startDate`,
+  over the default window. A not-found answer (404/5269) reads as no settlement under the
+  reference. Any other failure of either lookup, an outage, a rate limit or a 5xx, is thrown
+  as it maps, retryable where core says so (changed in review, 2026-09-26: the first version
+  read every lookup failure as no settlement, so a settlements outage made `refundPayment`
+  throw a non-retryable "no refundable settlement" and `retrievePayment` report
+  `amountRefunded: 0`). A cancel whose read fails after its void rejects retryable, and its
+  replay under the same key answers with that void. Only records filed under the reference
+  looked up are read as its own. The settle-with-auth examples of `POST /v1/payments` ("Card
+  - with Settlement" among them) embed a settlement under the payment's own
+    `merchantRefNum`.
+- **Which references a payment reads.** A payment that moved no money is given no
+  settlement: a settlement names no payment, and a card completion keyed by order files a
+  declined attempt and the payment that went through under the same reference. The lookup
+  for the declined attempt therefore found the other payment's settlement: its read reported
+  that settlement, and `refundPayment` on it refunded the other payment. That was already so
+  within the default window, and the wider window would have reached further back. A failed,
+  cancelled or expired payment ("FAILED – The transaction failed, due to either an error or
+  being declined" and "CANCELLED – The request has been fully voided (reversed)" in the
+  spec's payment statuses) settled nothing, so its reads look nothing up and a refund of it
+  is refused. Two payments that both went through under one key can exist: "Paysafe replay
+  safety (2026-09-24)" leaves open two card completions with different cards sent under one
+  key before either shows in the lookup, and both are charged. Since a review on 2026-09-26,
+  a payment with `settleWithAuth: false` never looks its own `merchantRefNum` up, only its
+  full-capture references, which are its own; one with `settleWithAuth: true` looks up only
+  its `merchantRefNum`, where its settlement is filed; and one that states neither looks up
+  its `merchantRefNum` first, then its references when that holds no settlement that moved
+  money. The gap stays open for settle-with-auth payments: two that went through under one
+  key each report both settlements, and a refund of either can come out of the other's. A
+  narrower filter is in sight but not built: the Settlement Flow Diagrams page says that for
+  one-step payment integrations the payment and its settlement "utilize the same unique GUID
+  as are created from the same request"
+  (developer.paysafe.com/en/api-docs/payments-api/settlement-flow-diagrams/), and every
+  settle-with-auth example in the spec gives the embedded settlement its payment's id, among
+  them "Card - with PartialAuth 1" to "3", three payments under one `merchantRefNum`
+  ("6407c51806902eef7d67"), each settlement carrying its own payment's id. Reading only the
+  settlement that carries the payment's id would separate the two; it waits on the sandbox
+  item below.
+- **The refusal of a refund says why, from the payment's state.** A failed, cancelled or
+  expired payment is named as such ("it failed, so it settled nothing"). Otherwise the
+  message lists what applies: a settlement not refundable yet or refunded in full, found
+  settlements that all moved no money, a payment not completed yet, "it is only authorized
+  (cancel it instead)" or "part of it is still only authorized (cancel that part instead)"
+  only while some of a manual capture's authorization is left to settle, money captured
+  beyond the settlements found (a partial capture, or a capture by an earlier release, both
+  under keys PayFanout cannot find, with the portal advice), and a lookup that does not show
+  the settlement or does not reach back to it.
+- **The test double** files and times its records on its own date, which `passDays` moves
+  on, and serves the lookups from `startDate` to `endDate` as the spec words them, the
+  default window unchanged. A malformed date, or a range past an optional limit
+  (`lookupRangeLimitDays`, none by default), is refused as a field error (400/5068). It
+  counts the settlements captures make, and `cancelSettlement` cancels a pending card
+  settlement as the spec's Cancel Settlement does ("You can cancel a Settlement only if the
+  payment type is CARD and the status is PENDING."), returning its amount to
+  `availableToSettle`, the reading under which the authorization can be captured again
+  (undocumented, open item below). Against it the previous adapter (develop 4116001) failed
+  36 of the 39 tests in the settlements test file and 3 of the capture replay tests this
+  change adjusted, among them a refund after a manual capture, the capture time of a
+  captured payment, a refund of a payment settled 45 days before, a full capture retried
+  after a failed one, a lookup outage read as no settlement and a manually captured payment
+  reading another payment's settlement. The conformance suite passes unchanged.
 - **Doc-derived only; to settle in the sandbox:**
   - **Whether `GET /payments/{id}` lists settlements.** Authorize a card with
     `settleWithAuth: false`, settle part of it under one reference and the rest with no
     amount, read the payment, and record whether `settlements` appears and which settlements
     it lists; read a settle-with-auth payment the same way. If it lists them, partial
     captures are refundable through the payment read, and the lookup is its fallback.
-  - **The widest range the settlement lookup accepts, and how it refuses one.** Look a recent
-    settlement up with `startDate` 31, 90, 180, 365 and 730 days back, and record which ranges
-    answer with it and what a refused one answers (status and code). A refusal answered
-    404/5269 would read as no settlement and skip the fallback. The same question for the
-    `payments` and `paymenthandles` lookups is open in "Paysafe replay safety (2026-09-24)".
-  - **That `startDate` reaches a settlement filed more than 30 days earlier, and which time it
-    compares.** Look such a settlement up with and without a `startDate` before it, record
-    that only the first shows it, and whether the dates compare `txnTime`, `updatedTime` or
-    `statusTime`.
-  - **A full capture under the derived reference.** Capture a payment in full, confirm the
-    lookup under `payfanout-capture-<payment id>` lists its settlement and that a refund comes
-    out of it, then capture it in full again under another key and record whether Paysafe
-    refuses it as a duplicate (5031) or on state (3203).
+  - **The widest range the settlement lookup accepts, and how it refuses one.** Look a
+    recent settlement up with `startDate` 31, 90, 180, 365 and 730 days back, and record
+    which ranges answer with it and what a refused one answers (status and code). A refusal
+    answered 404/5269 would read as no settlement and skip the fallback; one answered 5xx
+    would fail every read of an older payment. While the range is refused, the walk sees
+    only the default window, so a reference spent 31 to 90 days earlier looks free: its
+    settlement is refused as a duplicate with nothing to read back, and the capture ends in
+    the retry-later `processing_error`. The same question for the `payments` and
+    `paymenthandles` lookups is open in "Paysafe replay safety (2026-09-24)".
+  - **That `startDate` reaches a settlement filed more than 30 days earlier, and which time
+    it compares.** Look such a settlement up with and without a `startDate` before it,
+    record that only the first shows it, and whether the dates compare `txnTime`,
+    `updatedTime` or `statusTime`.
+  - **A full capture under the derived references.** Capture a payment in full, confirm the
+    lookup under `payfanout-capture-<payment id>` lists its settlement and that a refund
+    comes out of it, then capture it in full again under another key and confirm nothing is
+    sent.
+  - **What a failed settlement leaves behind.** Settle a card authorization so that it is
+    declined (a simulator amount that fails the settlement), look its reference up, and
+    record whether a FAILED record with its error shows, and whether a new settlement under
+    the same reference is refused as a duplicate. The walk takes such a record as spending
+    the reference. If Paysafe files none but its duplicate check still counts the reference,
+    a full capture retried after a failure is refused with nothing to read back and ends in
+    the retry-later `processing_error` until the 90 days pass.
+  - **Whether cancelling a pending settlement returns its amount to the authorization.**
+    Settle a card authorization in full, cancel the settlement (`PUT /settlements/{id}`,
+    `status: CANCELLED`), read the payment, and record `availableToSettle`; then capture it
+    in full again and confirm it settles under `-a2`.
+  - **Whether a settle-with-auth settlement always carries its payment's id**, as the spec's
+    examples show. Pay two cards under one `merchantRefNum` with `dupCheck: false` and
+    `settleWithAuth: true`, look the reference up, and record each settlement's id against
+    its payment's.
+  - **Whether the portals' merchant transaction ID is the Payments API's `merchantRefNum`.**
+    Search the Business Portal for a settlement by the reference it was made under, and
+    record whether it finds it.

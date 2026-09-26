@@ -94,7 +94,8 @@ export interface PaysafeServerAdapterConfig {
    * up to 1 + maxNetworkRetries attempts, a write up to 1 + maxNetworkRetries
    * attempts with up to three lookups after an unanswered or duplicate one,
    * and many calls read before they write (a card completion looks its key
-   * up, a refund reads the payment and its settlements). If Paysafe hangs on
+   * up, a refund reads the payment and its settlements, a full capture the
+   * payment and its settlement references). If Paysafe hangs on
    * every exchange, a write can therefore take about
    * (1 + maxNetworkRetries) × 4 × requestTimeoutMs, plus
    * (1 + maxNetworkRetries) × requestTimeoutMs for each read before it:
@@ -195,6 +196,13 @@ export interface PaysafePaymentLike {
    */
   settlements?: PaysafeSettlementLike[];
   error?: { code?: string; message?: string };
+  /**
+   * Not a Paysafe field: capturePayment's answer sets it on `raw`, beside the
+   * payment's own fields, to the settlement the capture made, or the one it
+   * read back or met. A partial capture's settlement is found by no read, so
+   * keep its `id` to refund it in the Paysafe portal.
+   */
+  captureSettlement?: PaysafeSettlementLike;
 }
 
 /** Payment handle as POST /paymenthandles returns it for redirect and bank-debit rails. */
@@ -737,8 +745,8 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 
 /**
  * Lookups page ("limit" defaults to 10, at most 50) in an undocumented
- * order, so each asks for the maximum and a full page is refused rather than
- * read as everything the key holds.
+ * order, so each asks for the maximum. A replay's lookup refuses a full page
+ * rather than read it as everything the key holds.
  */
 const REF_NUM_LOOKUP_LIMIT = 50;
 
@@ -1654,17 +1662,33 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   }
 
   /**
-   * Settles an authorization, in full or in part. Paysafe finds a settlement
-   * again only by its merchantRefNum, and refunds come out of settlements, so
-   * the reference decides what refundPayment can reach later. A full capture,
-   * `amount` omitted (everything that remains) or equal to the authorized
-   * amount, settles under a reference derived from the payment, which
-   * retrievePayment and refundPayment look up. It happens once per payment:
-   * a replay under the same key or another one meets that settlement. A
-   * partial capture, any other amount, settles under `idempotencyKey`, which
-   * no read can find from the payment: its amount counts in amountCaptured,
-   * but refundPayment cannot refund it, so a host refunding it keeps its own
-   * record of the key and refunds that settlement in the Paysafe portal.
+   * Settles an authorization, in full or in part. Refunds come out of
+   * settlements, and Paysafe finds a settlement again only by its
+   * merchantRefNum, so the reference decides what refundPayment can reach
+   * later.
+   *
+   * A full capture, `amount` omitted (everything that remains) or equal to
+   * the authorized amount, settles under a reference derived from the
+   * payment, never under `idempotencyKey`: `payfanout-capture-<payment id>`,
+   * or, once the settlements there have moved no money (failed, cancelled or
+   * expired), the next of `-a2` to `-a10`. Those references are read
+   * first: a settlement there that moved money means the payment is captured
+   * in full, and the call answers with it whatever its key, unless it asks
+   * for the authorized amount and that settlement settled another (the rest,
+   * after partial captures), which is refused as already captured in full.
+   * With nothing left to settle and no such settlement, it is refused as
+   * nothing left to capture. retrievePayment and refundPayment read the same
+   * references.
+   *
+   * A partial capture, any other amount, settles under `idempotencyKey`,
+   * which must be unique across the account and may not start with
+   * `payfanout-capture-`. No read finds its settlement from the payment: its
+   * amount counts in amountCaptured, but refundPayment cannot refund it.
+   *
+   * The answer's `raw` is the payment, as retrievePayment reports it, with
+   * one more property, `captureSettlement`: the settlement this capture
+   * made, or the one it read back or met. Keep a partial capture's `id` to
+   * find that settlement in the Paysafe portal and refund it there.
    */
   async capturePayment(
     pspPaymentId: string,
@@ -1673,32 +1697,114 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   ): Promise<PaymentInfo> {
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
     const payment = await this.fetchPayment(pspPaymentId);
-    // Paysafe requires an explicit amount on settlements (error 5068 without one)
-    // — resolve "capture everything" ourselves.
-    const captureAmount = amount ?? remainingToSettle(payment);
     // Whether this is a full capture cannot change on a replay: `amount` is
-    // the caller's, and the authorized amount is fixed. A partial capture's
-    // key must be unique across the account: the lookup is account-wide, and
-    // settlements name no payment.
-    const merchantRefNum =
-      amount === undefined || amount === payment.amount ? fullCaptureRef(payment.id) : idempotencyKey;
-    // Nothing left to settle may be this very capture's work, replayed: its
-    // settlement is looked up before a zero settlement is sent. "Capture
-    // everything" leaves the amount unchecked — it was the remainder then.
+    // the caller's, and the authorized amount is fixed.
+    if (amount === undefined || amount === payment.amount) return this.captureInFull(pspPaymentId, payment, amount);
+    if (idempotencyKey.startsWith(FULL_CAPTURE_PREFIX)) {
+      throw PayFanoutError.invalidRequest(
+        `idempotencyKey "${idempotencyKey}" starts with "${FULL_CAPTURE_PREFIX}", which the adapter reserves for ` +
+          "the settlements of full captures: a partial capture settles under its key, and one filed under such a " +
+          "reference would read as a full capture. Give it another key",
+        { idempotencyKey },
+      );
+    }
+    // The settlement lookup is account-wide and settlements name no payment,
+    // so a partial capture's key must be unique across the account.
     const replay: ReplayableWrite<PaysafeSettlementLike> = {
       lookup: "settlement",
-      merchantRefNum,
+      merchantRefNum: idempotencyKey,
       amount,
       movesMoney: true,
-      lookupFirst: captureAmount === 0,
       readBackOnRejection: true,
     };
-    await this.sendWrite(replay, `/paymenthub/v1/payments/${encodeURIComponent(pspPaymentId)}/settlements`, {
-      merchantRefNum, // one settlement per reference: a replay is rejected (5031) and read back
+    const settlement = await this.sendWrite(replay, settlementsPath(pspPaymentId), {
+      merchantRefNum: idempotencyKey, // one settlement per key: a replay is rejected (5031) and read back
       dupCheck: true,
-      amount: captureAmount,
+      amount,
     });
-    return this.retrievePayment(pspPaymentId);
+    return withCaptureSettlement(await this.retrievePayment(pspPaymentId), settlement);
+  }
+
+  /**
+   * A full capture (see capturePayment). Two sent together find the same
+   * free reference: one settles, and dupCheck refuses the other (5031),
+   * which reads that settlement back. A lost answer reads back the same way.
+   * A lookup that fails fails the call, and nothing is settled after it.
+   */
+  private async captureInFull(
+    pspPaymentId: string,
+    payment: PaysafePaymentLike,
+    amount: number | undefined,
+  ): Promise<PaymentInfo> {
+    const walk = await this.walkFullCaptures(payment.id, settlementLookupStart(payment.txnTime));
+    let capture: { settlement: PaysafeSettlementLike; settlements: PaysafeSettlementLike[] };
+    if (walk.captured) {
+      capture = walk.captured;
+    } else if (walk.free !== undefined) {
+      // Paysafe requires an explicit amount on settlements (error 5068 without
+      // one), so "capture everything" settles what remains.
+      const captureAmount = amount ?? remainingToSettle(payment);
+      if (captureAmount === 0) {
+        throw PayFanoutError.invalidRequest(
+          `Payment ${pspPaymentId} has nothing left to capture: Paysafe shows none of its authorization left to ` +
+            "settle, and no full capture of it",
+          payment,
+        );
+      }
+      // No amount is compared on a read-back: a reference holds one full
+      // capture, whichever call made it, and the amount is checked below.
+      const replay: ReplayableWrite<PaysafeSettlementLike> = {
+        lookup: "settlement",
+        merchantRefNum: walk.free,
+        movesMoney: true,
+        readBackOnRejection: true,
+      };
+      const settlement = await this.sendWrite(replay, settlementsPath(pspPaymentId), {
+        merchantRefNum: walk.free,
+        dupCheck: true,
+        amount: captureAmount,
+      });
+      capture = { settlement, settlements: [settlement] };
+    } else {
+      throw PayFanoutError.invalidRequest(
+        `Payment ${pspPaymentId} cannot be captured in full here: every reference its full captures settle under ` +
+          `moved no money: ${walk.spent.join(", ")}. PayFanout settles a payment under at most ` +
+          `${FULL_CAPTURE_REFERENCES} of them, so capture it in the Paysafe portal, and refund it there too: ` +
+          "PayFanout does not find a settlement made there",
+        { merchantRefNums: walk.spent },
+      );
+    }
+    const { settlement, settlements } = capture;
+    if (amount !== undefined && typeof settlement.amount === "number" && settlement.amount !== amount) {
+      throw PayFanoutError.invalidRequest(
+        `Payment ${pspPaymentId} is already captured in full: its settlement under merchantRefNum ` +
+          `"${settlement.merchantRefNum ?? ""}" settled ${settlement.amount}, so a capture of ${amount} has nothing ` +
+          "left to settle",
+        settlement,
+      );
+    }
+    const fresh = await this.fetchPayment(pspPaymentId);
+    const info = this.toPaymentInfo({ ...fresh, settlements: fresh.settlements?.length ? fresh.settlements : settlements });
+    return withCaptureSettlement(info, settlement);
+  }
+
+  /**
+   * Reads a payment's full-capture references in order and stops at the
+   * first that holds a settlement that moved money, the payment's full
+   * capture, or that holds no record at all, where the next one settles. A
+   * reference whose records all moved no money is spent: dupCheck refuses it
+   * for 90 days, so the walk goes on to the next.
+   */
+  private async walkFullCaptures(paymentId: string, startDate: string | undefined): Promise<FullCaptureWalk> {
+    const spent: string[] = [];
+    for (const merchantRefNum of fullCaptureRefs(paymentId)) {
+      const settlements = await this.settlementsUnder(merchantRefNum, startDate);
+      const settlement = settlements.find((s) => !movedNoMoney(s));
+      if (settlement) return { captured: { merchantRefNum, settlement, settlements }, spent };
+      if (settlements.length === 0) return { free: merchantRefNum, spent };
+      spent.push(merchantRefNum);
+    }
+    return { spent };
   }
 
   /**
@@ -1749,14 +1855,17 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   /**
    * A payment's settlements, for retrievePayment, cancelPayment and
    * refundPayment: those the payment carries, or else those filed under a
-   * reference derived from it, since Paysafe lists settlements by
-   * merchantRefNum alone. A settle-with-auth payment's settlement shares the
-   * payment's merchantRefNum, and a full capture's is filed under
-   * fullCaptureRef, as earlier releases' default capture keys were. A partial
-   * capture's, under the caller's key, is not found. A payment that moved no
-   * money is given none. The lookup covers only the last 30 days unless told
-   * otherwise ("Default = 30 days before the endDate"), so it starts the day
-   * before the payment.
+   * reference of its own, since Paysafe lists settlements by merchantRefNum
+   * alone. A settle-with-auth payment's settlement shares the payment's
+   * merchantRefNum, which is all it looks up. A manually captured payment
+   * never looks that up, as another payment made under the same completion
+   * key files its settlement there: it reads its full-capture references
+   * instead (see walkFullCaptures), where earlier releases' default capture
+   * keys also sit. A payment that states neither reads its merchantRefNum
+   * first. A partial capture's settlement, under the caller's key, is not
+   * found, and a payment that moved no money is given none. The lookup covers
+   * only the last 30 days unless told otherwise ("Default = 30 days before
+   * the endDate"), so it starts the day before the payment.
    */
   private async findSettlements(payment: PaysafePaymentLike): Promise<PaysafeSettlementLike[]> {
     if (payment.settlements?.length) return payment.settlements;
@@ -1765,34 +1874,43 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     // reused by the payment that went through.
     if (movedNoMoney(payment)) return [];
     const startDate = settlementLookupStart(payment.txnTime);
-    for (const refNum of [payment.merchantRefNum, fullCaptureRef(payment.id)]) {
-      if (!refNum) continue;
-      const settlements = await this.settlementsUnder(refNum, startDate);
-      if (settlements.length > 0) return settlements;
-    }
-    return [];
+    const own =
+      payment.settleWithAuth !== false && payment.merchantRefNum
+        ? await this.settlementsUnder(payment.merchantRefNum, startDate)
+        : [];
+    if (payment.settleWithAuth === true || own.some((s) => !movedNoMoney(s))) return own;
+    return (await this.walkFullCaptures(payment.id, startDate)).captured?.settlements ?? own;
   }
 
   /**
-   * One settlement lookup. The widest range Paysafe accepts is undocumented,
-   * so a lookup with a startDate that fails for any reason but not-found
-   * (5269) is sent once more without one, over the default window. A
-   * not-found answer, or the failure of a lookup without a startDate, reads
-   * as no settlement under the reference.
+   * The settlements filed under one reference, from `startDate` when there
+   * is one, 50 at most (the documented page maximum). The widest range
+   * Paysafe accepts is undocumented, so a ranged lookup refused as a request
+   * error (`invalid_request`, as a 400/5068 field error maps) is sent once
+   * more without startDate, over the default window. A not-found answer
+   * (5269) reads as none. Any other failure, an outage or a rate limit among
+   * them, is thrown as it maps: read as none, it would refuse a refund, or
+   * report no capture, for a payment that has one.
    */
-  private async settlementsUnder(refNum: string, startDate: string | undefined): Promise<PaysafeSettlementLike[]> {
-    const path = `/paymenthub/v1/settlements?merchantRefNum=${encodeURIComponent(refNum)}`;
+  private async settlementsUnder(merchantRefNum: string, startDate: string | undefined): Promise<PaysafeSettlementLike[]> {
+    const path = `/paymenthub/v1/settlements?merchantRefNum=${encodeURIComponent(merchantRefNum)}&limit=${REF_NUM_LOOKUP_LIMIT}`;
+    let result: { settlements?: unknown } | undefined;
     try {
-      const result = await this.request<{ settlements?: unknown } | undefined>(
-        "GET",
-        startDate === undefined ? path : `${path}&startDate=${startDate}`,
-      );
-      const settlements = result?.settlements;
-      return Array.isArray(settlements) ? (settlements as PaysafeSettlementLike[]) : [];
+      result = await this.request("GET", startDate === undefined ? path : `${path}&startDate=${startDate}`);
     } catch (err) {
-      if (startDate === undefined || paysafeErrorCode(err) === NOT_FOUND_CODE) return [];
-      return this.settlementsUnder(refNum, undefined);
+      if (paysafeErrorCode(err) === NOT_FOUND_CODE) return [];
+      if (startDate !== undefined && isPayFanoutError(err) && err.code === "invalid_request") {
+        return this.settlementsUnder(merchantRefNum, undefined);
+      }
+      throw err;
     }
+    const settlements = result?.settlements;
+    if (!Array.isArray(settlements)) return [];
+    // Only records filed under this very reference are its own.
+    return settlements.filter(
+      (s): s is PaysafeSettlementLike =>
+        typeof s === "object" && s !== null && ((s as RefNumRecord).merchantRefNum ?? merchantRefNum) === merchantRefNum,
+    );
   }
 
   /**
@@ -1800,9 +1918,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * here so callers keep one API. The settlement is the first with money left
    * that findSettlements finds: a settle-with-auth payment's, or a full
    * capture's. A partial capture's settlement, under the capture's own key,
-   * cannot be found from the payment, so it is not refunded here. A SEPA or
-   * Bacs payment is refused once the payment read shows its type, before
-   * anything else is sent: Paysafe refunds neither rail.
+   * cannot be found from the payment, so it is not refunded here, and nor is
+   * a capture an earlier release settled under its key. A SEPA or Bacs
+   * payment is refused once the payment read shows its type, before anything
+   * else is sent: Paysafe refunds neither rail.
    */
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
     if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
@@ -1842,16 +1961,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
           raw: refund,
         };
       }
-      throw PayFanoutError.invalidRequest(
-        `Payment ${req.pspPaymentId} has no refundable settlement — either it is only authorized (cancel it ` +
-          "instead), its settlement is not refundable yet (still in flight, or the sandbox settlement batch has " +
-          "not run) or already refunded in full, Paysafe's settlement lookup does not reach back to it, or it " +
-          "was captured in part. A partial capture settles under the capture's idempotency key, which " +
-          "PayFanout cannot find from the payment: refund that settlement in the Paysafe portal, where the key " +
-          "is its merchantRefNum. Capturing in one call, with no amount or the authorized amount, keeps a " +
-          "payment refundable here",
-        payment,
-      );
+      throw noRefundableSettlement(req.pspPaymentId, payment, settlements);
     }
     const refund = await this.sendWrite(
       replay,
@@ -2445,8 +2555,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     let settled = settlements.reduce((sum, s) => sum + (s.amount ?? 0), 0);
     // A full capture took all that remained, and cancelPayment voids all that
     // remains, so no void of the adapter's comes before or after one: partial
-    // captures before it, which no lookup finds, count too.
-    const fullyCaptured = settlements.some((s) => s.merchantRefNum === fullCaptureRef(payment.id));
+    // captures before it, which no lookup finds, count too, and nothing is
+    // left to capture even while the payment read still shows the
+    // authorization it has just taken.
+    const fullyCaptured = settlements.some((s) => isFullCaptureRef(s.merchantRefNum, payment.id));
     if (settled === 0 && knownSettled !== undefined) {
       settled = knownSettled;
     } else if (
@@ -2484,7 +2596,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       amountRefunded: refunded,
       ...(amountCaptured !== undefined ? { amountCaptured } : {}),
       ...(typeof payment.availableToSettle === "number"
-        ? { amountCapturable: payment.availableToSettle }
+        ? { amountCapturable: fullyCaptured ? 0 : payment.availableToSettle }
         : {}),
       currency: (payment.currencyCode ?? "").toUpperCase() || "USD",
       paymentMethodType: toUnifiedMethodType(payment.paymentType),
@@ -3037,13 +3149,120 @@ function remainingToSettle(payment: PaysafePaymentLike): number {
   return payment.availableToSettle ?? payment.amount ?? 0;
 }
 
+/** How every reference a full capture settles under begins; partial-capture keys may not. */
+const FULL_CAPTURE_PREFIX = "payfanout-capture-";
+
 /**
- * The merchantRefNum a full capture settles under: derived from the payment,
- * so a read can find it again, and unique to it, as the settlement lookup is
- * account-wide. Earlier releases also used it as the default capture key.
+ * How many references a payment's full captures can use. Each capture that
+ * moves no money spends one, and every read of a manually captured payment
+ * looks them up in order, one lookup each, so the bound caps those reads.
+ * Paysafe caps the settlements of one authorization too, at a number it does
+ * not state (3202, "You have exceeded the maximum number of Settlements
+ * allowed.").
  */
-function fullCaptureRef(paymentId: string): string {
-  return `payfanout-capture-${paymentId}`;
+const FULL_CAPTURE_REFERENCES = 10;
+
+/**
+ * The merchantRefNums a payment's full captures settle under, in the order
+ * they are used: payfanout-capture-<payment id>, earlier releases' default
+ * capture key, then -a2 to -a10. Derived from the payment, so a read finds
+ * them again, and unique to it, as the settlement lookup is account-wide:
+ * 58 characters at most for an id at the spec's maxLength of 36, within the
+ * 255 a merchantRefNum takes.
+ */
+function fullCaptureRefs(paymentId: string): string[] {
+  const first = `${FULL_CAPTURE_PREFIX}${paymentId}`;
+  return Array.from({ length: FULL_CAPTURE_REFERENCES }, (_, i) => (i === 0 ? first : `${first}-a${i + 1}`));
+}
+
+function isFullCaptureRef(merchantRefNum: string | undefined, paymentId: string): boolean {
+  return merchantRefNum !== undefined && fullCaptureRefs(paymentId).includes(merchantRefNum);
+}
+
+/** What a payment's full-capture references hold, read in order (see walkFullCaptures). */
+interface FullCaptureWalk {
+  /**
+   * The first reference holding a settlement that moved money: that
+   * settlement, and every record filed under the reference.
+   */
+  captured?: { merchantRefNum: string; settlement: PaysafeSettlementLike; settlements: PaysafeSettlementLike[] };
+  /** Otherwise the first reference holding no record: the one a full capture settles under. */
+  free?: string;
+  /** The references before it, whose records all moved no money. */
+  spent: string[];
+}
+
+function settlementsPath(pspPaymentId: string): string {
+  return `/paymenthub/v1/payments/${encodeURIComponent(pspPaymentId)}/settlements`;
+}
+
+/** capturePayment's answer: the payment as a read reports it, with the capture's settlement beside its fields. */
+function withCaptureSettlement(info: PaymentInfo, captureSettlement: PaysafeSettlementLike): PaymentInfo {
+  return { ...info, raw: { ...(info.raw as PaysafePaymentLike), captureSettlement } };
+}
+
+const LOOKUP_MISSES = "Paysafe's settlement lookup does not show its settlement yet, or does not reach back to it";
+
+/**
+ * Why refundPayment finds nothing to refund, as far as the payment and the
+ * settlements found say. A payment that moved no money is named as such; the
+ * cancel advice is given only while some of the authorization is left to
+ * settle; and money captured beyond the settlements found sits under capture
+ * keys PayFanout cannot find: a partial capture's, or a capture an earlier
+ * release made.
+ */
+function noRefundableSettlement(
+  pspPaymentId: string,
+  payment: PaysafePaymentLike,
+  settlements: PaysafeSettlementLike[],
+): PayFanoutError {
+  const lead = `Payment ${pspPaymentId} has no refundable settlement`;
+  const status = (payment.status ?? "").toUpperCase();
+  if (movedNoMoney(payment)) {
+    const outcome = isFailedRecord(payment) ? "it failed" : status === "EXPIRED" ? "it expired" : "it was cancelled";
+    return PayFanoutError.invalidRequest(`${lead}: ${outcome}, so it settled nothing`, payment);
+  }
+  const live = settlements.filter((s) => !movedNoMoney(s));
+  const causes: string[] = [];
+  if (live.length > 0) {
+    causes.push(
+      "the settlement it has is not refundable yet (still in flight, or the sandbox settlement batch has not run) " +
+        "or already refunded in full",
+    );
+  } else if (settlements.length > 0) {
+    causes.push("its settlements moved no money (failed, cancelled or expired)");
+  }
+  let unfound = false;
+  if (status !== "COMPLETED") {
+    if (live.length === 0) causes.push("it has not completed yet");
+  } else if (payment.settleWithAuth === false && typeof payment.availableToSettle === "number") {
+    const remaining = live.some((s) => isFullCaptureRef(s.merchantRefNum, payment.id)) ? 0 : payment.availableToSettle;
+    const captured = Math.max(0, (payment.amount ?? 0) - remaining);
+    if (remaining > 0) {
+      causes.push(
+        captured === 0
+          ? "it is only authorized (cancel it instead)"
+          : "part of it is still only authorized (cancel that part instead)",
+      );
+    }
+    unfound = captured > live.reduce((sum, s) => sum + (s.amount ?? 0), 0);
+    if (unfound) {
+      causes.push(
+        "it was captured in part, or by an earlier release of this adapter, and such a capture settles under its " +
+          "idempotency key, which PayFanout cannot find from the payment",
+      );
+    }
+    if (live.length === 0 && remaining === 0 && captured > 0) causes.push(LOOKUP_MISSES);
+  } else if (live.length === 0) {
+    causes.push(LOOKUP_MISSES);
+  }
+  const reasons = causes.length > 0 ? `: ${causes.join("; ")}` : "";
+  const advice = unfound
+    ? ". Refund such a settlement in the Paysafe portal, which finds it by its id (a capture's answer carries it " +
+      "on raw.captureSettlement) or by its merchant transaction ID, the capture's idempotency key. Capturing in " +
+      "one call, with no amount or the authorized amount, keeps a payment refundable here"
+    : "";
+  return PayFanoutError.invalidRequest(`${lead}${reasons}${advice}`, payment);
 }
 
 const DAY_MS = 86_400_000;

@@ -9,6 +9,7 @@ export {
   type PaysafePlanLike,
   type PaysafeScheduledPaymentLike,
   type PaysafeServerAdapterConfig,
+  type PaysafeSettlementLike,
   type PaysafeStoredHandleLike,
   type PaysafeSubscriptionLike,
 } from "./adapter.js";

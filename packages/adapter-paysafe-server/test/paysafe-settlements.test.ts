@@ -1,18 +1,29 @@
 import { describe, expect, it } from "vitest";
-import { getRefundState, isPayFanoutError, type PayFanoutError } from "@payfanout/core";
+import { getRefundState, isPayFanoutError, type PayFanoutError, type PaymentInfo } from "@payfanout/core";
 import { PaysafeServerAdapter, type PaysafeServerAdapterConfig } from "../src/index.js";
-import { FakePaysafeApi, type RecordedRequest, type RequestMatcher } from "./fake-paysafe-api.js";
+import { FakePaysafeApi, type RecordedFailure, type RecordedRequest, type RequestMatcher } from "./fake-paysafe-api.js";
 
 /**
  * How reads and refunds find a payment's settlements. Paysafe lists them by
  * merchantRefNum alone (GET /v1/settlements), over the last 30 days unless a
- * startDate says otherwise, so a full capture settles under a reference
- * derived from the payment and every lookup starts the day before it.
+ * startDate says otherwise, so a full capture settles under references
+ * derived from the payment, and the lookups start the day before it.
  */
 
 const SETTLEMENTS = "/paymenthub/v1/settlements";
+const PAYMENT_PATH = /^\/paymenthub\/v1\/payments\/[^/]+$/;
 const SETTLE_PATH = /^\/paymenthub\/v1\/payments\/[^/]+\/settlements$/;
 const SETTLE: RequestMatcher = { method: "POST", path: SETTLE_PATH };
+const VOID: RequestMatcher = { method: "POST", path: /^\/paymenthub\/v1\/payments\/[^/]+\/voidauths$/ };
+const REFUND: RequestMatcher = { method: "POST", path: /^\/paymenthub\/v1\/settlements\/[^/]+\/refunds$/ };
+
+/** Settlement failures from the spec's error tables: a gateway rejection (402) and an internal error (500). */
+const GATEWAY_REJECTION: RecordedFailure = {
+  status: 402,
+  code: "3206",
+  message: "The external processing gateway has rejected the transaction.",
+};
+const INTERNAL_ERROR: RecordedFailure = { status: 500, code: "1000", message: "An internal error occurred." };
 
 function makePair(config: Partial<PaysafeServerAdapterConfig> = {}): {
   adapter: PaysafeServerAdapter;
@@ -33,18 +44,19 @@ function makePair(config: Partial<PaysafeServerAdapterConfig> = {}): {
   return { adapter, fake };
 }
 
-/** A card payment completed on the fake's current day, captured with its authorization or not. */
+/** A card payment completed on the fake's current day under `key`, captured with its authorization or not. */
 async function complete(
   adapter: PaysafeServerAdapter,
   captureMethod: "automatic" | "manual",
   amount = 2000,
   currency = "USD",
+  key = `k-${captureMethod}`,
 ): Promise<string> {
-  const session = await adapter.createPaymentSession({ amount, currency, captureMethod, idempotencyKey: "k-session" });
+  const session = await adapter.createPaymentSession({ amount, currency, captureMethod, idempotencyKey: `${key}-session` });
   const info = await adapter.completePayment({
     pspSessionId: session.pspSessionId,
-    clientToken: `tok_${captureMethod}`,
-    idempotencyKey: `k-${captureMethod}`,
+    clientToken: `tok_${key}`,
+    idempotencyKey: key,
   });
   return info.pspPaymentId;
 }
@@ -67,10 +79,24 @@ function sent(fake: FakePaysafeApi, matcher: RequestMatcher): RecordedRequest[] 
 
 /** The settlement lookups the fake received, all or those under one reference, as their query parameters. */
 function settlementLookups(fake: FakePaysafeApi, merchantRefNum?: string): URLSearchParams[] {
-  return fake.requests
+  return lookupsIn(fake.requests, merchantRefNum);
+}
+
+function lookupsIn(requests: RecordedRequest[], merchantRefNum?: string): URLSearchParams[] {
+  return requests
     .filter((r) => r.method === "GET" && r.path === SETTLEMENTS)
     .map((r) => new URLSearchParams(r.search))
     .filter((params) => merchantRefNum === undefined || params.get("merchantRefNum") === merchantRefNum);
+}
+
+/** The references a payment's full captures settle under, in the order they are used. */
+function fullCaptureRefs(id: string): string[] {
+  return Array.from({ length: 10 }, (_, i) => (i === 0 ? `payfanout-capture-${id}` : `payfanout-capture-${id}-a${i + 1}`));
+}
+
+/** The settlement a capture's answer carries beside the payment. */
+function captureSettlementOf(info: PaymentInfo): Record<string, unknown> {
+  return (info.raw as { captureSettlement: Record<string, unknown> }).captureSettlement;
 }
 
 function urlOf(input: Parameters<typeof fetch>[0]): string {
@@ -89,6 +115,33 @@ function rendezvous(parties: number): () => Promise<void> {
     if (arrived >= parties) open();
     return opened;
   };
+}
+
+/**
+ * A Paysafe stand-in serving one payment, and `settlements(merchantRefNum)`
+ * to the settlement lookups; it records the references looked up.
+ */
+function oneParkedPayment(
+  payment: Record<string, unknown>,
+  settlements: (merchantRefNum: string) => Array<Record<string, unknown>> = () => [],
+): { fetch: typeof fetch; lookedUp: string[]; posts: string[] } {
+  const lookedUp: string[] = [];
+  const posts: string[] = [];
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const url = new URL(urlOf(input));
+    if (init?.method === "POST") {
+      posts.push(url.pathname);
+      return new Response(JSON.stringify({ id: "ref_1", merchantRefNum: "k-refund", status: "COMPLETED", amount: 100 }));
+    }
+    if (url.pathname === SETTLEMENTS) {
+      const merchantRefNum = url.searchParams.get("merchantRefNum")!;
+      lookedUp.push(merchantRefNum);
+      return new Response(JSON.stringify({ settlements: settlements(merchantRefNum) }));
+    }
+    if (url.pathname === "/paymenthub/v1/refunds") return new Response(JSON.stringify({ refunds: [] }));
+    return new Response(JSON.stringify(payment));
+  };
+  return { fetch, lookedUp, posts };
 }
 
 describe("Paysafe captures a refund can find", () => {
@@ -142,11 +195,10 @@ describe("Paysafe captures a refund can find", () => {
     expect(captured.capturedAt).toBeUndefined();
     const err = await rejection(adapter.refundPayment({ pspPaymentId: id, idempotencyKey: "k-refund" }));
     expect(err).toMatchObject({ code: "invalid_request", retryable: false, raw: { id } });
-    expect(err.message).toContain("or it was captured in part");
-    expect(err.message).toContain(
-      "A partial capture settles under the capture's idempotency key, which PayFanout cannot find from the payment: " +
-        "refund that settlement in the Paysafe portal, where the key is its merchantRefNum",
-    );
+    expect(err.message).toContain(`Payment ${id} has no refundable settlement: part of it is still only authorized`);
+    expect(err.message).toContain("it was captured in part, or by an earlier release of this adapter");
+    expect(err.message).toContain("Refund such a settlement in the Paysafe portal");
+    expect(err.message).toContain("raw.captureSettlement");
     expect(fake.uniqueRefundCreations).toBe(0);
   });
 
@@ -164,9 +216,11 @@ describe("Paysafe captures a refund can find", () => {
     const info = await adapter.retrievePayment(id);
     expect(info).toMatchObject({ amount: 2000, amountCaptured: 2000, amountRefunded: 1300 });
     expect(getRefundState(info)).toBe("partial");
-    await expect(
-      adapter.refundPayment({ pspPaymentId: id, amount: 100, idempotencyKey: "k-refund-more" }),
-    ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringMatching(/no refundable settlement/) });
+    const err = await rejection(adapter.refundPayment({ pspPaymentId: id, amount: 100, idempotencyKey: "k-refund-more" }));
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false });
+    expect(err.message).toContain("no refundable settlement: the settlement it has is not refundable yet");
+    expect(err.message).toContain("it was captured in part");
+    expect(err.message).not.toContain("only authorized");
   });
 
   it("refunds from settlements the payment carries, without a lookup", async () => {
@@ -223,7 +277,8 @@ describe("Paysafe captures a refund can find", () => {
     const paid = filed.find((p) => p.status === "COMPLETED")!;
     expect(await adapter.retrievePayment(declined.id)).toMatchObject({ status: "failed", amount: 2000, amountRefunded: 0 });
     const refused = await rejection(adapter.refundPayment({ pspPaymentId: declined.id, idempotencyKey: "k-refund-1" }));
-    expect(refused).toMatchObject({ code: "invalid_request" });
+    expect(refused).toMatchObject({ code: "invalid_request", retryable: false });
+    expect(refused.message).toBe(`Payment ${declined.id} has no refundable settlement: it failed, so it settled nothing`);
     expect(fake.uniqueRefundCreations).toBe(0);
     expect(settlementLookups(fake, "order-1")).toHaveLength(0);
     // The payment that went through still finds and refunds its own settlement.
@@ -240,15 +295,15 @@ describe("Paysafe full-capture replays", () => {
       const id = await complete(adapter, "manual");
       const reference = `payfanout-capture-${id}`;
       fake.loseAnswer(SETTLE);
-      // The three reads after the lost answer trail the write.
-      fake.hideFromLookups("settlements", reference, 3);
+      // The check before the write and the three reads after the lost answer all trail it.
+      fake.hideFromLookups("settlements", reference, 4);
       const err = await rejection(adapter.capturePayment(id, amount, "k-capture"));
       expect(err, label).toMatchObject({ code: "processing_error", retryable: false, outcomeUnknown: true });
       expect(err.message).toContain(`merchantRefNum "${reference}" went unanswered`);
       const retried = await adapter.capturePayment(id, amount, "k-capture");
       expect(retried, label).toMatchObject({ status: "succeeded", amountCaptured: 2000, amountCapturable: 0 });
-      // With nothing left to settle the retry reads its settlement first; with an amount it is refused, then read back.
-      expect(sent(fake, SETTLE), label).toHaveLength(amount === undefined ? 1 : 2);
+      // The retry finds the settlement before sending anything.
+      expect(sent(fake, SETTLE), label).toHaveLength(1);
       expect(fake.uniqueSettlementCreations, label).toBe(1);
     }
   });
@@ -264,6 +319,7 @@ describe("Paysafe full-capture replays", () => {
         const again = await adapter.capturePayment(id, second, "k-capture-2");
         expect(again, label).toMatchObject({ status: "succeeded", amountCaptured: 2000, amountCapturable: 0 });
         expect(fake.uniqueSettlementCreations, label).toBe(1);
+        expect(sent(fake, SETTLE), label).toHaveLength(1);
         expect(await adapter.refundPayment({ pspPaymentId: id, idempotencyKey: "k-refund" }), label).toMatchObject({
           status: "succeeded",
           amount: 2000,
@@ -296,6 +352,470 @@ describe("Paysafe full-capture replays", () => {
       expect(sent(fake, SETTLE)).toHaveLength(2);
     }
   });
+
+  it("answers a capture of the authorized amount once the rest is captured with 'already captured in full', settling nothing", async () => {
+    const { adapter, fake } = makePair();
+    const id = await complete(adapter, "manual");
+    await adapter.capturePayment(id, 700, "k-capture-part");
+    await adapter.capturePayment(id, undefined, "k-capture-rest");
+    const err = await rejection(adapter.capturePayment(id, 2000, "k-capture-all"));
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false, raw: { merchantRefNum: `payfanout-capture-${id}`, amount: 1300 } });
+    expect(err.outcomeUnknown).toBeUndefined();
+    expect(err.message).toBe(
+      `Payment ${id} is already captured in full: its settlement under merchantRefNum "payfanout-capture-${id}" ` +
+        "settled 1300, so a capture of 2000 has nothing left to settle",
+    );
+    expect(sent(fake, SETTLE)).toHaveLength(2);
+    // Capturing everything again still answers with the payment.
+    expect(await adapter.capturePayment(id, undefined, "k-capture-rest")).toMatchObject({ status: "succeeded", amountCaptured: 2000 });
+    expect(sent(fake, SETTLE)).toHaveLength(2);
+  });
+
+  it("answers 'already captured in full' when the authorized amount meets the rest sent together with it", async () => {
+    for (const stateCheckFirst of [false, true]) {
+      const fake = new FakePaysafeApi();
+      fake.stateCheckFirst = stateCheckFirst;
+      // Open until the calls to hold together are sent.
+      let together = async (): Promise<void> => undefined;
+      const { adapter } = makePair({
+        fetch: async (input, init) => {
+          if (init?.method === "POST" && SETTLE_PATH.test(new URL(urlOf(input)).pathname)) await together();
+          return fake.fetch(input, init);
+        },
+      });
+      const id = await complete(adapter, "manual");
+      await adapter.capturePayment(id, 700, "k-capture-part");
+      together = rendezvous(2);
+      const [rest, all] = await Promise.allSettled([
+        adapter.capturePayment(id, undefined, "k-capture-rest"),
+        adapter.capturePayment(id, 2000, "k-capture-all"),
+      ]);
+      const label = `stateCheckFirst ${stateCheckFirst}`;
+      expect(rest, label).toMatchObject({ status: "fulfilled", value: { status: "succeeded", amountCaptured: 2000 } });
+      expect(all, label).toMatchObject({ status: "rejected", reason: { code: "invalid_request", retryable: false } });
+      const reason = (all as PromiseRejectedResult).reason as PayFanoutError;
+      expect(reason.outcomeUnknown, label).toBeUndefined();
+      expect(reason.message, label).toContain("is already captured in full");
+      expect(fake.uniqueSettlementCreations, label).toBe(2);
+    }
+  });
+
+  it("refuses to capture everything when nothing is left and no full capture shows, sending no settlement", async () => {
+    const { adapter, fake } = makePair();
+    const id = await complete(adapter, "manual");
+    await adapter.capturePayment(id, 700, "k-capture-part");
+    await adapter.cancelPayment(id, "k-void");
+    const err = await rejection(adapter.capturePayment(id, undefined, "k-capture-rest"));
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false, raw: { id } });
+    expect(err.outcomeUnknown).toBeUndefined();
+    expect(err.message).toContain(`Payment ${id} has nothing left to capture`);
+    expect(sent(fake, SETTLE)).toHaveLength(1);
+  });
+});
+
+describe("Paysafe full captures after one that moved no money", () => {
+  it("settles a full capture retried after a recorded failure under the next reference, whatever the key", async () => {
+    const expected = { "3206": "card_declined", "1000": "processing_error" } as const;
+    for (const failure of [GATEWAY_REJECTION, INTERNAL_ERROR]) {
+      for (const retryKey of ["k-capture", "k-capture-2"]) {
+        for (const amount of [undefined, 2000]) {
+          const label = `${failure.code} ${retryKey} ${String(amount)}`;
+          const { adapter, fake } = makePair();
+          const id = await complete(adapter, "manual");
+          fake.recordFailure(SETTLE, failure);
+          const err = await rejection(adapter.capturePayment(id, amount, "k-capture"));
+          expect(err, label).toMatchObject({ code: expected[failure.code as "3206" | "1000"], retryable: false });
+          // The failed record still stands in dupCheck's 90 days.
+          fake.passDays(30);
+          const captured = await adapter.capturePayment(id, amount, retryKey);
+          expect(captured, label).toMatchObject({ status: "succeeded", amountCaptured: 2000, amountCapturable: 0 });
+          const [first, second] = fullCaptureRefs(id);
+          expect(sent(fake, SETTLE).map((r) => r.body), label).toEqual([
+            { merchantRefNum: first, dupCheck: true, amount: 2000 },
+            { merchantRefNum: second, dupCheck: true, amount: 2000 },
+          ]);
+          expect(fake.uniqueSettlementCreations, label).toBe(1);
+        }
+      }
+    }
+  });
+
+  it("captures again under the next reference once the full capture's settlement is cancelled while pending", async () => {
+    for (const retryKey of ["k-capture", "k-capture-2"]) {
+      const { adapter, fake } = makePair();
+      const id = await complete(adapter, "manual");
+      const first = await adapter.capturePayment(id, undefined, "k-capture");
+      fake.cancelSettlement(captureSettlementOf(first)["id"] as string);
+      expect(await adapter.retrievePayment(id), retryKey).toMatchObject({
+        status: "requires_capture",
+        amountCaptured: 0,
+        amountCapturable: 2000,
+      });
+      const again = await adapter.capturePayment(id, undefined, retryKey);
+      expect(again, retryKey).toMatchObject({ status: "succeeded", amountCaptured: 2000, amountCapturable: 0 });
+      expect(sent(fake, SETTLE).map((r) => r.body?.["merchantRefNum"]), retryKey).toEqual(fullCaptureRefs(id).slice(0, 2));
+      const refund = await adapter.refundPayment({ pspPaymentId: id, idempotencyKey: "k-refund" });
+      expect(refund, retryKey).toMatchObject({ status: "succeeded", amount: 2000 });
+    }
+  });
+
+  it("settles once when two full captures are retried together after a failure", async () => {
+    for (const stateCheckFirst of [false, true]) {
+      const fake = new FakePaysafeApi();
+      fake.stateCheckFirst = stateCheckFirst;
+      // Open until the calls to hold together are sent.
+      let together = async (): Promise<void> => undefined;
+      const { adapter } = makePair({
+        fetch: async (input, init) => {
+          if (init?.method === "POST" && SETTLE_PATH.test(new URL(urlOf(input)).pathname)) await together();
+          return fake.fetch(input, init);
+        },
+      });
+      const id = await complete(adapter, "manual");
+      fake.recordFailure(SETTLE, GATEWAY_REJECTION);
+      await rejection(adapter.capturePayment(id, undefined, "k-capture"));
+      together = rendezvous(2);
+      const answers = await Promise.all([
+        adapter.capturePayment(id, undefined, "k-capture"),
+        adapter.capturePayment(id, 2000, "k-capture-2"),
+      ]);
+      const label = `stateCheckFirst ${stateCheckFirst}`;
+      for (const captured of answers) expect(captured, label).toMatchObject({ status: "succeeded", amountCaptured: 2000 });
+      expect(fake.uniqueSettlementCreations, label).toBe(1);
+      const [first, second] = fullCaptureRefs(id);
+      expect(sent(fake, SETTLE).map((r) => r.body?.["merchantRefNum"]), label).toEqual([first, second, second]);
+    }
+  });
+
+  it("reads back a lost answer on the next reference, and ends as retry-later under it when it cannot", async () => {
+    for (const readable of [true, false]) {
+      const { adapter, fake } = makePair();
+      const id = await complete(adapter, "manual");
+      const second = fullCaptureRefs(id)[1]!;
+      fake.recordFailure(SETTLE, GATEWAY_REJECTION);
+      await rejection(adapter.capturePayment(id, undefined, "k-capture"));
+      fake.loseAnswer(SETTLE);
+      if (!readable) fake.hideFromLookups("settlements", second);
+      const outcome = adapter.capturePayment(id, undefined, "k-capture");
+      if (readable) {
+        await expect(outcome).resolves.toMatchObject({ status: "succeeded", amountCaptured: 2000 });
+      } else {
+        const err = await rejection(outcome);
+        expect(err).toMatchObject({ code: "processing_error", retryable: false, outcomeUnknown: true });
+        expect(err.message).toContain(`merchantRefNum "${second}" went unanswered`);
+      }
+      expect(sent(fake, SETTLE).map((r) => r.body?.["merchantRefNum"]), String(readable)).toEqual(fullCaptureRefs(id).slice(0, 2));
+      expect(fake.uniqueSettlementCreations, String(readable)).toBe(1);
+    }
+  });
+
+  it("refuses a full capture once every reference is spent, naming them, and sends nothing more", async () => {
+    const { adapter, fake } = makePair();
+    const id = await complete(adapter, "manual");
+    const refs = fullCaptureRefs(id);
+    for (const attempt of refs.keys()) {
+      fake.recordFailure(SETTLE, GATEWAY_REJECTION);
+      await expect(adapter.capturePayment(id, undefined, `k-capture-${attempt}`)).rejects.toMatchObject({ code: "card_declined" });
+    }
+    expect(sent(fake, SETTLE).map((r) => r.body?.["merchantRefNum"])).toEqual(refs);
+    const err = await rejection(adapter.capturePayment(id, 2000, "k-capture-again"));
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false, raw: { merchantRefNums: refs } });
+    expect(err.outcomeUnknown).toBeUndefined();
+    expect(err.message).toContain(`every reference its full captures settle under moved no money: ${refs.join(", ")}`);
+    expect(err.message).toContain("capture it in the Paysafe portal");
+    expect(sent(fake, SETTLE)).toHaveLength(10);
+    // Reads walk the same references and find nothing captured.
+    expect(await adapter.retrievePayment(id)).toMatchObject({ status: "requires_capture", amountCaptured: 0, amountCapturable: 2000 });
+  });
+
+  it("reads and refunds a full capture filed under the next reference", async () => {
+    const { adapter, fake } = makePair();
+    const id = await complete(adapter, "manual");
+    fake.recordFailure(SETTLE, INTERNAL_ERROR);
+    await rejection(adapter.capturePayment(id, undefined, "k-capture"));
+    const captured = await adapter.capturePayment(id, undefined, "k-capture");
+    const settlement = captureSettlementOf(captured);
+    expect(settlement).toMatchObject({ merchantRefNum: fullCaptureRefs(id)[1], amount: 2000 });
+    expect(await adapter.retrievePayment(id)).toMatchObject({
+      status: "succeeded",
+      amountCaptured: 2000,
+      amountCapturable: 0,
+      capturedAt: "2026-07-04T10:05:00.000Z",
+    });
+    const refund = await adapter.refundPayment({ pspPaymentId: id, amount: 500, idempotencyKey: "k-refund" });
+    expect(refund).toMatchObject({ status: "succeeded", amount: 500 });
+    expect(sent(fake, REFUND).map((r) => r.path)).toEqual([`/paymenthub/v1/settlements/${String(settlement["id"])}/refunds`]);
+    expect(await adapter.retrievePayment(id)).toMatchObject({ amountRefunded: 500 });
+  });
+
+  it("counts partial captures before a rest captured under the next reference", async () => {
+    const { adapter, fake } = makePair();
+    const id = await complete(adapter, "manual");
+    await adapter.capturePayment(id, 700, "k-capture-part");
+    fake.recordFailure(SETTLE, GATEWAY_REJECTION);
+    await rejection(adapter.capturePayment(id, undefined, "k-capture-rest"));
+    const rest = await adapter.capturePayment(id, undefined, "k-capture-rest");
+    expect(captureSettlementOf(rest)).toMatchObject({ merchantRefNum: fullCaptureRefs(id)[1], amount: 1300 });
+    const expected = { status: "succeeded", amount: 2000, amountCaptured: 2000, amountCapturable: 0 };
+    expect(rest).toMatchObject(expected);
+    expect(await adapter.retrievePayment(id)).toMatchObject(expected);
+    const err = await rejection(adapter.refundPayment({ pspPaymentId: id, amount: 1500, idempotencyKey: "k-refund" }));
+    expect(err).toMatchObject({ code: "invalid_request", raw: { error: { code: "3402" } } });
+  });
+});
+
+describe("Paysafe capture answers", () => {
+  it("carries the settlement a capture made or met on raw.captureSettlement, the payment's fields left as a read shows them", async () => {
+    const { adapter, fake } = makePair();
+    const id = await complete(adapter, "manual");
+    const part = await adapter.capturePayment(id, 700, "k-capture-part");
+    const raw = part.raw as Record<string, unknown>;
+    expect(raw).toMatchObject({ id, merchantRefNum: "k-manual", amount: 2000, availableToSettle: 1300, settlements: [] });
+    expect(raw["captureSettlement"]).toMatchObject({ merchantRefNum: "k-capture-part", amount: 700, status: "PENDING" });
+    const read = await adapter.retrievePayment(id);
+    expect(read.raw).not.toHaveProperty("captureSettlement");
+    expect({ ...raw, captureSettlement: undefined }).toEqual({ ...(read.raw as Record<string, unknown>), captureSettlement: undefined });
+    // A replay carries the settlement it read back.
+    const replay = await adapter.capturePayment(id, 700, "k-capture-part");
+    expect(captureSettlementOf(replay)["id"]).toBe((raw["captureSettlement"] as { id: string }).id);
+    const rest = await adapter.capturePayment(id, undefined, "k-capture-rest");
+    expect(captureSettlementOf(rest)).toMatchObject({ merchantRefNum: `payfanout-capture-${id}`, amount: 1300 });
+    const again = await adapter.capturePayment(id, undefined, "k-capture-again");
+    expect(captureSettlementOf(again)["id"]).toBe(captureSettlementOf(rest)["id"]);
+    expect(fake.uniqueSettlementCreations).toBe(2);
+  });
+
+  it("refuses a partial capture under a key the adapter reserves for full captures, before any settlement request", async () => {
+    const { adapter, fake } = makePair();
+    const id = await complete(adapter, "manual");
+    for (const key of [`payfanout-capture-${id}`, `payfanout-capture-${id}-a2`, "payfanout-capture-pay_other"]) {
+      const before = fake.requests.length;
+      const err = await rejection(adapter.capturePayment(id, 700, key));
+      expect(err, key).toMatchObject({ code: "invalid_request", retryable: false, raw: { idempotencyKey: key } });
+      expect(err.message, key).toContain(`idempotencyKey "${key}" starts with "payfanout-capture-"`);
+      // Only the payment read, which tells a partial capture from a full one.
+      expect(fake.requests.slice(before).map((r) => `${r.method} ${r.path}`), key).toEqual([`GET /paymenthub/v1/payments/${id}`]);
+    }
+    // A full capture sends no key, so any key does.
+    expect(await adapter.capturePayment(id, 2000, `payfanout-capture-${id}`)).toMatchObject({ status: "succeeded" });
+    expect(sent(fake, SETTLE).map((r) => r.body?.["merchantRefNum"])).toEqual([`payfanout-capture-${id}`]);
+  });
+
+  it("answers a full capture from the settlements the payment carries, when its read lists them", async () => {
+    const payment = { id: "pay_1", merchantRefNum: "k-pay", status: "COMPLETED", amount: 1000, availableToSettle: 1000, currencyCode: "USD", settleWithAuth: false, txnTime: "2026-07-04T10:00:00Z" };
+    const settled = { id: "stl_1", merchantRefNum: "payfanout-capture-pay_1", status: "PENDING", amount: 1000, availableToRefund: 1000, txnTime: "2026-07-04T10:05:00Z" };
+    let captured = false;
+    const { adapter } = makePair({
+      fetch: async (input, init) => {
+        const url = new URL(urlOf(input));
+        if (init?.method === "POST") {
+          captured = true;
+          return new Response(JSON.stringify(settled));
+        }
+        if (url.pathname === SETTLEMENTS) return new Response(JSON.stringify({ settlements: [] }));
+        const read = captured ? { ...payment, availableToSettle: 0, settlements: [{ ...settled, status: "COMPLETED" }] } : payment;
+        return new Response(JSON.stringify(read));
+      },
+    });
+    const info = await adapter.capturePayment("pay_1", undefined, "k-capture");
+    expect(info).toMatchObject({ status: "succeeded", amountCaptured: 1000, amountCapturable: 0, capturedAt: "2026-07-04T10:05:00.000Z" });
+    expect(info.raw).toMatchObject({ settlements: [{ id: "stl_1", status: "COMPLETED" }], captureSettlement: { id: "stl_1", status: "PENDING" } });
+  });
+
+  it("reports a full capture whose payment read still shows the authorization untouched", async () => {
+    // The payment read can trail the settlement it has just taken: availableToSettle not reduced yet.
+    const fake = new FakePaysafeApi();
+    let trailing = false;
+    const { adapter } = makePair({
+      fetch: async (input, init) => {
+        const response = await fake.fetch(input, init);
+        if (!trailing || (init?.method ?? "GET") !== "GET" || !PAYMENT_PATH.test(new URL(urlOf(input)).pathname)) {
+          return response;
+        }
+        const payment = (await response.json()) as Record<string, unknown>;
+        return new Response(JSON.stringify({ ...payment, availableToSettle: payment["amount"] }), { status: response.status });
+      },
+    });
+    const id = await complete(adapter, "manual");
+    trailing = true;
+    const expected = { status: "succeeded", amount: 2000, amountCaptured: 2000, amountCapturable: 0, capturedAt: "2026-07-04T10:05:00.000Z" };
+    expect(await adapter.capturePayment(id, undefined, "k-capture")).toMatchObject(expected);
+    expect(await adapter.retrievePayment(id)).toMatchObject(expected);
+    expect(await adapter.capturePayment(id, 2000, "k-capture-again")).toMatchObject(expected);
+    expect(fake.uniqueSettlementCreations).toBe(1);
+  });
+});
+
+describe("Paysafe settlements under a completion key two payments share", () => {
+  /**
+   * Two completions under one key, the second sent before the first shows in
+   * the lookup: the concurrency gap "Paysafe replay safety (2026-09-24)" leaves open.
+   */
+  async function twoPaymentsUnderOneKey(): Promise<{
+    adapter: PaysafeServerAdapter;
+    fake: FakePaysafeApi;
+    authorized: string;
+    paid: string;
+  }> {
+    const { adapter, fake } = makePair();
+    const manual = await adapter.createPaymentSession({ amount: 2000, currency: "USD", captureMethod: "manual", idempotencyKey: "s-1" });
+    const automatic = await adapter.createPaymentSession({ amount: 2000, currency: "USD", idempotencyKey: "s-2" });
+    const first = await adapter.completePayment({ pspSessionId: manual.pspSessionId, clientToken: "tok_a", idempotencyKey: "order-1" });
+    fake.hideFromLookups("payments", "order-1", 1);
+    const second = await adapter.completePayment({ pspSessionId: automatic.pspSessionId, clientToken: "tok_b", idempotencyKey: "order-1" });
+    expect(second.pspPaymentId).not.toBe(first.pspPaymentId);
+    return { adapter, fake, authorized: first.pspPaymentId, paid: second.pspPaymentId };
+  }
+
+  it("never looks a manually captured payment's settlements up under its completion key", async () => {
+    const { adapter, fake, authorized } = await twoPaymentsUnderOneKey();
+    const before = fake.requests.length;
+    expect(await adapter.retrievePayment(authorized)).toMatchObject({
+      status: "requires_capture",
+      amount: 2000,
+      amountCaptured: 0,
+      amountRefunded: 0,
+    });
+    const refused = await rejection(adapter.refundPayment({ pspPaymentId: authorized, idempotencyKey: "k-refund" }));
+    expect(refused.message).toBe(`Payment ${authorized} has no refundable settlement: it is only authorized (cancel it instead)`);
+    expect(fake.uniqueRefundCreations).toBe(0);
+    expect(lookupsIn(fake.requests.slice(before)).map((params) => params.get("merchantRefNum"))).toEqual([
+      `payfanout-capture-${authorized}`,
+      `payfanout-capture-${authorized}`,
+    ]);
+  });
+
+  it("looks an automatically captured payment's settlements up under its completion key alone", async () => {
+    const { adapter, fake, paid } = await twoPaymentsUnderOneKey();
+    const before = fake.requests.length;
+    expect(await adapter.retrievePayment(paid)).toMatchObject({ status: "succeeded", amountCaptured: 2000 });
+    expect(await adapter.refundPayment({ pspPaymentId: paid, amount: 500, idempotencyKey: "k-refund" })).toMatchObject({
+      status: "succeeded",
+      amount: 500,
+    });
+    expect(lookupsIn(fake.requests.slice(before)).map((params) => params.get("merchantRefNum"))).toEqual(["order-1", "order-1"]);
+  });
+
+  it("looks a payment that states no settleWithAuth up under its key first, then its own references", async () => {
+    const payment = { id: "pay_1", merchantRefNum: "k-pay", status: "COMPLETED", amount: 1000, currencyCode: "USD", txnTime: "2026-07-04T10:00:00Z" };
+    const live = (merchantRefNum: string): Record<string, unknown> => ({
+      id: `stl_${merchantRefNum}`,
+      merchantRefNum,
+      status: "COMPLETED",
+      amount: 1000,
+      availableToRefund: 1000,
+    });
+    const cases: Array<[string, (merchantRefNum: string) => Array<Record<string, unknown>>, string[], string | undefined]> = [
+      ["a settlement under its key", (ref) => (ref === "k-pay" ? [live(ref)] : []), ["k-pay"], "stl_k-pay"],
+      ["none under its key", (ref) => (ref === "payfanout-capture-pay_1" ? [live(ref)] : []), ["k-pay", "payfanout-capture-pay_1"], "stl_payfanout-capture-pay_1"],
+      [
+        "only a cancelled one under its key",
+        (ref) => (ref === "k-pay" ? [{ ...live(ref), status: "CANCELLED" }] : [live(ref)]),
+        ["k-pay", "payfanout-capture-pay_1"],
+        "stl_payfanout-capture-pay_1",
+      ],
+      ["nothing anywhere", () => [], ["k-pay", "payfanout-capture-pay_1"], undefined],
+    ];
+    for (const [label, settlements, lookedUp, refundedFrom] of cases) {
+      const stub = oneParkedPayment(payment, settlements);
+      const { adapter } = makePair({ fetch: stub.fetch });
+      const outcome = adapter.refundPayment({ pspPaymentId: "pay_1", amount: 100, idempotencyKey: "k-refund" });
+      if (refundedFrom === undefined) await expect(outcome, label).rejects.toMatchObject({ code: "invalid_request" });
+      else await expect(outcome, label).resolves.toMatchObject({ status: "succeeded" });
+      expect(stub.lookedUp, label).toEqual(lookedUp);
+      expect(stub.posts, label).toEqual(refundedFrom === undefined ? [] : [`/paymenthub/v1/settlements/${refundedFrom}/refunds`]);
+    }
+    // With nothing under its own references either, what its key holds is what it reports.
+    const cancelledOnly = oneParkedPayment(payment, (ref) => (ref === "k-pay" ? [{ ...live(ref), status: "CANCELLED" }] : []));
+    const { adapter } = makePair({ fetch: cancelledOnly.fetch });
+    expect(((await adapter.retrievePayment("pay_1")).raw as { settlements: unknown[] }).settlements).toEqual([
+      expect.objectContaining({ id: "stl_k-pay", status: "CANCELLED" }),
+    ]);
+    const err = await rejection(adapter.refundPayment({ pspPaymentId: "pay_1", idempotencyKey: "k-refund" }));
+    expect(err.message).toContain("its settlements moved no money (failed, cancelled or expired)");
+  });
+
+  it("reads only the records filed under the reference it looked up", async () => {
+    const payment = { id: "pay_1", merchantRefNum: "k-pay", status: "COMPLETED", amount: 1000, currencyCode: "USD", settleWithAuth: true };
+    const stub = oneParkedPayment(payment, () => [
+      { id: "stl_other", merchantRefNum: "k-pay-2", status: "COMPLETED", amount: 1000, availableToRefund: 1000 },
+    ]);
+    const { adapter } = makePair({ fetch: stub.fetch });
+    expect(await adapter.retrievePayment("pay_1")).toMatchObject({ amountCaptured: 1000, amountRefunded: 0 });
+    expect(((await adapter.retrievePayment("pay_1")).raw as { settlements: unknown[] }).settlements).toEqual([]);
+    await expect(adapter.refundPayment({ pspPaymentId: "pay_1", idempotencyKey: "k-refund" })).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+    expect(stub.posts).toEqual([]);
+  });
+});
+
+describe("Paysafe refund refusals", () => {
+  it("names a payment that failed, was cancelled or expired, and offers a cancel only while something is left to capture", async () => {
+    for (const [status, outcome] of [
+      ["FAILED", "it failed"],
+      ["ERROR", "it failed"],
+      ["CANCELLED", "it was cancelled"],
+      ["EXPIRED", "it expired"],
+    ] as const) {
+      const stub = oneParkedPayment({ id: "pay_1", merchantRefNum: "k-pay", status, amount: 1000, currencyCode: "USD", settleWithAuth: false, availableToSettle: 1000 });
+      const err = await rejection(makePair({ fetch: stub.fetch }).adapter.refundPayment({ pspPaymentId: "pay_1", idempotencyKey: "k-refund" }));
+      expect(err.message, status).toBe(`Payment pay_1 has no refundable settlement: ${outcome}, so it settled nothing`);
+      expect(stub.lookedUp, status).toEqual([]);
+    }
+  });
+
+  it("says what the payment's state leaves as causes", async () => {
+    const base = { id: "pay_1", merchantRefNum: "k-pay", status: "COMPLETED", amount: 1000, currencyCode: "USD" };
+    const cases: Array<[string, Record<string, unknown>, Array<Record<string, unknown>>, string[], string[]]> = [
+      ["authorized", { settleWithAuth: false, availableToSettle: 1000 }, [], ["it is only authorized (cancel it instead)"], ["captured in part", "lookup"]],
+      [
+        "captured by an earlier release",
+        { settleWithAuth: false, availableToSettle: 0 },
+        [],
+        ["it was captured in part, or by an earlier release of this adapter", "does not show its settlement yet", "Refund such a settlement in the Paysafe portal"],
+        ["only authorized"],
+      ],
+      [
+        "settled with its authorization, out of the lookup's sight",
+        { settleWithAuth: true, availableToSettle: 0 },
+        [],
+        ["Paysafe's settlement lookup does not show its settlement yet, or does not reach back to it"],
+        ["only authorized", "captured in part", "Paysafe portal"],
+      ],
+      [
+        "settled with its authorization, every settlement expired",
+        { settleWithAuth: true, availableToSettle: 0 },
+        [{ id: "stl_1", merchantRefNum: "k-pay", status: "EXPIRED", amount: 1000, availableToRefund: 1000 }],
+        ["its settlements moved no money (failed, cancelled or expired)", "does not show its settlement yet"],
+        ["only authorized", "captured in part"],
+      ],
+      [
+        "settled with its authorization, refunded in full",
+        { settleWithAuth: true, availableToSettle: 0 },
+        [{ id: "stl_1", merchantRefNum: "k-pay", status: "COMPLETED", amount: 1000, availableToRefund: 0, refundedAmount: 1000 }],
+        ["the settlement it has is not refundable yet (still in flight, or the sandbox settlement batch has not run) or already refunded in full"],
+        ["only authorized", "lookup", "captured in part", ";"],
+      ],
+      [
+        "still processing, its settlement in flight",
+        { status: "PROCESSING", settleWithAuth: true },
+        [{ id: "stl_1", merchantRefNum: "k-pay", status: "PROCESSING", amount: 1000, availableToRefund: 0 }],
+        ["the settlement it has is not refundable yet (still in flight, or the sandbox settlement batch has not run)"],
+        ["only authorized", "lookup", "has not completed"],
+      ],
+      ["still processing, no settlement yet", { status: "HELD", settleWithAuth: true }, [], ["it has not completed yet"], ["lookup", "only authorized"]],
+      ["authorized for nothing", { amount: 0, settleWithAuth: false, availableToSettle: 0 }, [], [], [":"]],
+    ];
+    for (const [label, fields, settlements, present, absent] of cases) {
+      const stub = oneParkedPayment({ ...base, ...fields }, (ref) => (ref === "k-pay" ? settlements : []));
+      const err = await rejection(makePair({ fetch: stub.fetch }).adapter.refundPayment({ pspPaymentId: "pay_1", idempotencyKey: "k-refund" }));
+      expect(err, label).toMatchObject({ code: "invalid_request", retryable: false });
+      expect(err.message, label).toMatch(/^Payment pay_1 has no refundable settlement/);
+      for (const text of present) expect(err.message, label).toContain(text);
+      for (const text of absent) expect(err.message, label).not.toContain(text);
+    }
+  });
 });
 
 describe("Paysafe settlement lookups", () => {
@@ -313,10 +833,11 @@ describe("Paysafe settlement lookups", () => {
     }
   });
 
-  it("starts every settlement read the day before the payment, and leaves the replay reads on the default window", async () => {
+  it("starts every settlement read the day before the payment, asks for 50 records, and leaves the replay reads on the default window", async () => {
     const { adapter, fake } = makePair();
     const paid = await complete(adapter, "automatic");
     const authorized = await complete(adapter, "manual");
+    const another = await complete(adapter, "manual", 2000, "USD", "k-manual-2");
     // The capture's answer is lost, so it is read back under its key.
     fake.loseAnswer(SETTLE);
     await adapter.capturePayment(authorized, 700, "k-capture");
@@ -324,14 +845,18 @@ describe("Paysafe settlement lookups", () => {
       retrievePayment: () => adapter.retrievePayment(paid),
       refundPayment: () => adapter.refundPayment({ pspPaymentId: paid, amount: 100, idempotencyKey: "k-refund" }),
       cancelPayment: () => adapter.cancelPayment(authorized, "k-void"),
+      capturePayment: () => adapter.capturePayment(another, undefined, "k-capture-full"),
     };
     for (const [name, read] of Object.entries(reads)) {
       const before = fake.requests.length;
       await read();
-      const lookups = fake.requests.slice(before).filter((r) => r.method === "GET" && r.path === SETTLEMENTS);
+      const lookups = lookupsIn(fake.requests.slice(before));
       expect(lookups.length, name).toBeGreaterThan(0);
-      // Both payments were made on 2026-07-04, at 10:00 UTC.
-      for (const lookup of lookups) expect(new URLSearchParams(lookup.search).get("startDate"), name).toBe("2026-07-03");
+      // The payments were made on 2026-07-04, at 10:00 UTC.
+      for (const lookup of lookups) {
+        expect(lookup.get("startDate"), name).toBe("2026-07-03");
+        expect(lookup.get("limit"), name).toBe("50");
+      }
     }
     // That read-back looks for a write made moments before, over the default window.
     const readBack = settlementLookups(fake, "k-capture");
@@ -368,7 +893,7 @@ describe("Paysafe settlement lookups", () => {
         },
       });
       await adapter.retrievePayment("pay_1");
-      expect(starts, String(txnTime)).toEqual([expected, expected]);
+      expect(starts, String(txnTime)).toEqual([expected]);
     }
   });
 
@@ -379,9 +904,7 @@ describe("Paysafe settlement lookups", () => {
       const { adapter } = makePair({
         fetch: async (input, init) => {
           const response = await fake.fetch(input, init);
-          if ((init?.method ?? "GET") !== "GET" || !/^\/paymenthub\/v1\/payments\/[^/]+$/.test(new URL(urlOf(input)).pathname)) {
-            return response;
-          }
+          if ((init?.method ?? "GET") !== "GET" || !PAYMENT_PATH.test(new URL(urlOf(input)).pathname)) return response;
           const payment = (await response.json()) as Record<string, unknown>;
           return new Response(JSON.stringify({ ...payment, txnTime }), { status: response.status });
         },
@@ -410,71 +933,104 @@ describe("Paysafe settlement lookups", () => {
     expect(lookups.map((params) => params.get("startDate"))).toEqual(["2026-07-03", null]);
   });
 
-  it("leaves a settlement the default window no longer shows out of reach when Paysafe refuses the range, as before", async () => {
+  it("leaves a settlement the default window no longer shows out of reach when Paysafe refuses the range", async () => {
     const { adapter, fake } = makePair();
     fake.lookupRangeLimitDays = 40;
     const id = await complete(adapter, "automatic");
     fake.passDays(45);
     const err = await rejection(adapter.refundPayment({ pspPaymentId: id, idempotencyKey: "k-refund" }));
     expect(err).toMatchObject({ code: "invalid_request", message: expect.stringMatching(/no refundable settlement/) });
-    // Each reference is asked with the range, then without it.
+    // The reference is asked with the range, then without it.
     expect(settlementLookups(fake).map((params) => [params.get("merchantRefNum"), params.get("startDate")])).toEqual([
       ["k-automatic", "2026-07-03"],
       ["k-automatic", null],
-      [`payfanout-capture-${id}`, "2026-07-03"],
-      [`payfanout-capture-${id}`, null],
     ]);
     expect(fake.uniqueRefundCreations).toBe(0);
   });
 
-  it("asks again without a start date when a ranged lookup fails for any reason but not-found", async () => {
+  it("fails a read, a refund and a full capture when a lookup fails, instead of reading it as no settlement", async () => {
+    for (const [status, code] of [[503, "psp_unavailable"], [429, "rate_limited"]] as const) {
+      const { adapter, fake } = makePair();
+      const paid = await complete(adapter, "automatic");
+      const authorized = await complete(adapter, "manual");
+      const calls = {
+        retrievePayment: () => adapter.retrievePayment(paid),
+        refundPayment: () => adapter.refundPayment({ pspPaymentId: paid, amount: 100, idempotencyKey: "k-refund" }),
+        capturePayment: () => adapter.capturePayment(authorized, undefined, "k-capture"),
+      };
+      for (const [name, call] of Object.entries(calls)) {
+        const before = fake.requests.length;
+        // Every attempt of the lookup fails (1 + maxNetworkRetries).
+        fake.refuse({ method: "GET", path: SETTLEMENTS }, status, 3);
+        const err = await rejection(call());
+        const label = `${status} ${name}`;
+        expect(err, label).toMatchObject({ code, retryable: true });
+        // The lookup is not sent again without its start date, and nothing is written.
+        const lookups = lookupsIn(fake.requests.slice(before));
+        expect(lookups.map((params) => params.get("startDate")), label).toEqual(["2026-07-03", "2026-07-03", "2026-07-03"]);
+        expect(fake.requests.slice(before).filter((r) => r.method === "POST"), label).toEqual([]);
+      }
+    }
+  });
+
+  it("fails a cancel's answer when the lookup after its void fails, and its replay answers with that void", async () => {
     const { adapter, fake } = makePair();
-    const id = await complete(adapter, "automatic");
-    // Every attempt of the ranged lookup fails (1 + maxNetworkRetries); the one without a start date goes through.
+    const id = await complete(adapter, "manual");
+    await adapter.capturePayment(id, 700, "k-capture-part");
     fake.refuse({ method: "GET", path: SETTLEMENTS }, 503, 3);
-    const refund = await adapter.refundPayment({ pspPaymentId: id, amount: 500, idempotencyKey: "k-refund" });
-    expect(refund).toMatchObject({ status: "succeeded", amount: 500 });
-    expect(settlementLookups(fake).map((params) => params.get("startDate"))).toEqual([
-      "2026-07-03",
-      "2026-07-03",
-      "2026-07-03",
-      null,
-    ]);
+    await expect(adapter.cancelPayment(id, "k-void")).rejects.toMatchObject({ code: "psp_unavailable", retryable: true });
+    expect(await adapter.cancelPayment(id, "k-void")).toMatchObject({
+      status: "succeeded",
+      amount: 700,
+      amountCaptured: 700,
+      amountCapturable: 0,
+    });
+    expect(sent(fake, VOID)).toHaveLength(1);
   });
 
-  it("asks once more at most, and reads a reference whose lookups all fail as holding no settlement, as before", async () => {
-    const { adapter, fake } = makePair();
-    const id = await complete(adapter, "automatic");
-    // Three attempts with the start date, then three without it, for each of the two references.
-    fake.refuse({ method: "GET", path: SETTLEMENTS }, 503, 12);
-    const err = await rejection(adapter.refundPayment({ pspPaymentId: id, idempotencyKey: "k-refund" }));
-    expect(err).toMatchObject({ code: "invalid_request", message: expect.stringMatching(/no refundable settlement/) });
-    const perReference = ["2026-07-03", "2026-07-03", "2026-07-03", null, null, null];
-    expect(settlementLookups(fake).map((params) => [params.get("merchantRefNum"), params.get("startDate")])).toEqual([
-      ...perReference.map((start) => ["k-automatic", start]),
-      ...perReference.map((start) => [`payfanout-capture-${id}`, start]),
-    ]);
-    expect(fake.uniqueRefundCreations).toBe(0);
+  it("throws the failure of the lookup sent again without a start date after a refused range", async () => {
+    for (const [unranged, code] of [[400, "invalid_request"], [503, "psp_unavailable"]] as const) {
+      const fake = new FakePaysafeApi();
+      const starts: Array<string | null> = [];
+      const { adapter } = makePair({
+        fetch: async (input, init) => {
+          const url = new URL(urlOf(input));
+          if (url.pathname !== SETTLEMENTS) return fake.fetch(input, init);
+          starts.push(url.searchParams.get("startDate"));
+          // Past what the adapter may send, a not-found answer ends any loop of lookups.
+          if (starts.length > 10) return new Response(JSON.stringify({ error: { code: "5269" } }), { status: 404 });
+          const status = url.searchParams.has("startDate") ? 400 : unranged;
+          const error = status === 400 ? { code: "5068", message: "Field error(s)" } : { code: "1000", message: "An internal error occurred." };
+          return new Response(JSON.stringify({ error }), { status });
+        },
+      });
+      const id = await complete(adapter, "automatic");
+      const err = await rejection(adapter.refundPayment({ pspPaymentId: id, idempotencyKey: "k-refund" }));
+      expect(err, String(unranged)).toMatchObject({ code, raw: { error: { code: unranged === 400 ? "5068" : "1000" } } });
+      // One ranged attempt, refused; then the unranged lookup, with its GET retries on a 5xx.
+      expect(starts, String(unranged)).toEqual(unranged === 400 ? ["2026-07-03", null] : ["2026-07-03", null, null, null]);
+      expect(fake.uniqueRefundCreations).toBe(0);
+    }
   });
 
   it("reads a not-found answer to a ranged lookup as no settlement under that reference, without asking again", async () => {
-    const fake = new FakePaysafeApi();
-    const lookups: Array<[string | null, string | null]> = [];
-    const { adapter } = makePair({
-      fetch: async (input, init) => {
-        const url = new URL(urlOf(input));
-        if (url.pathname !== SETTLEMENTS) return fake.fetch(input, init);
-        lookups.push([url.searchParams.get("merchantRefNum"), url.searchParams.get("startDate")]);
-        if (url.searchParams.get("merchantRefNum") !== "k-automatic") return fake.fetch(input, init);
-        return new Response(JSON.stringify({ error: { code: "5269", message: "Entity not found" } }), { status: 404 });
-      },
-    });
-    const id = await complete(adapter, "automatic");
-    const err = await rejection(adapter.refundPayment({ pspPaymentId: id, idempotencyKey: "k-refund" }));
-    expect(err.message).toMatch(/no refundable settlement/);
-    expect(lookups).toEqual([
-      ["k-automatic", "2026-07-03"],
-      [`payfanout-capture-${id}`, "2026-07-03"],
-    ]);
+    for (const captureMethod of ["automatic", "manual"] as const) {
+      const fake = new FakePaysafeApi();
+      const lookups: Array<[string | null, string | null]> = [];
+      const { adapter } = makePair({
+        fetch: async (input, init) => {
+          const url = new URL(urlOf(input));
+          if (url.pathname !== SETTLEMENTS) return fake.fetch(input, init);
+          lookups.push([url.searchParams.get("merchantRefNum"), url.searchParams.get("startDate")]);
+          return new Response(JSON.stringify({ error: { code: "5269", message: "Entity not found" } }), { status: 404 });
+        },
+      });
+      const id = await complete(adapter, captureMethod);
+      const err = await rejection(adapter.refundPayment({ pspPaymentId: id, idempotencyKey: "k-refund" }));
+      expect(err.message, captureMethod).toMatch(/no refundable settlement/);
+      expect(lookups, captureMethod).toEqual([
+        [captureMethod === "automatic" ? "k-automatic" : `payfanout-capture-${id}`, "2026-07-03"],
+      ]);
+    }
   });
 });

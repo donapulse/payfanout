@@ -566,7 +566,7 @@ describeIf("Paysafe sandbox integration", () => {
       clientToken: token,
       idempotencyKey: key(),
     });
-    // Default capture key keeps the settlement statelessly rediscoverable.
+    // A partial capture settles under its key, which no read finds: the void's answer reports the split.
     const captured = await adapter.capturePayment(authorized.pspPaymentId, 1000, key());
     expect(["succeeded", "processing"]).toContain(captured.status);
 

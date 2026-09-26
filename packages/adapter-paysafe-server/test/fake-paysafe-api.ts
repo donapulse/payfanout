@@ -246,6 +246,29 @@ export class FakePaysafeApi {
     this.today += days;
   }
 
+  /**
+   * A settlement cancelled outside the adapter, in the portal or with Cancel
+   * Settlement (`PUT /settlements/{id}`, status CANCELLED), which Paysafe
+   * allows "only if the payment type is CARD and the status is PENDING". What
+   * the authorization has left to settle afterwards is undocumented: the fake
+   * takes the reading under which it can be captured again, and returns the
+   * amount to availableToSettle.
+   */
+  cancelSettlement(settlementId: string): void {
+    for (const payment of this.payments.values()) {
+      const settlement = payment.settlements?.find((s) => s.id === settlementId);
+      if (!settlement) continue;
+      if (settlement.status !== "PENDING" || payment.paymentType !== "CARD") {
+        throw new Error(`Settlement ${settlementId} is not a pending card settlement`);
+      }
+      settlement.status = "CANCELLED";
+      settlement.availableToRefund = 0;
+      payment.availableToSettle = (payment.availableToSettle ?? 0) + (settlement.amount ?? 0);
+      return;
+    }
+    throw new Error(`No settlement ${settlementId} to cancel`);
+  }
+
   /** A payment answered PROCESSING fails afterwards, as a bank debit can: its record turns FAILED with this error. */
   failLater(paymentId: string, error: { code: string; message: string }): void {
     const payment = this.payments.get(paymentId);

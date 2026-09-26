@@ -217,6 +217,10 @@ describe("StripeClientAdapter edge cases", () => {
       [{ type: "card_error", code: "payment_intent_authentication_failure" }, "authentication_required", false],
       [{ type: "card_error", code: "setup_intent_authentication_failure" }, "authentication_required", false],
       [{ type: "card_error", code: "processing_error" }, "processing_error", true],
+      // Every Stripe.js field code, as the other card-detail codes.
+      [{ type: "validation_error", code: "incomplete_number" }, "invalid_card_data", false],
+      [{ type: "validation_error", code: "incomplete_cvc" }, "invalid_card_data", false],
+      [{ type: "validation_error", code: "incomplete_expiry" }, "invalid_card_data", false],
       // Only the lists' own entries count.
       [{ type: "card_error", code: "card_declined", decline_code: "constructor" }, "card_declined", false],
       [{ type: "api_error", code: "constructor" }, "unknown", false],
@@ -224,11 +228,49 @@ describe("StripeClientAdapter edge cases", () => {
     for (const [error, code, retryable] of cases) {
       expect(await confirmWith(error), JSON.stringify(error)).toMatchObject({ code, retryable });
     }
+    vi.stubGlobal("navigator", { language: "es-ES" });
     const fraud = await confirmWith({ type: "card_error", code: "card_declined", decline_code: "stolen_card", message: "Card reported stolen." });
-    expect(fraud?.message).toBe(getUserMessage("fraud_suspected", navigator.language));
+    expect(fraud?.message).toBe(getUserMessage("fraud_suspected", "es"));
     // Every other message is Stripe.js's own, which it localizes.
     const funds = await confirmWith({ type: "card_error", code: "card_declined", decline_code: "insufficient_funds", message: "Fonds insuffisants." });
     expect(funds?.message).toBe("Fonds insuffisants.");
+  });
+
+  it("writes the generic fraud message in the browser's locale under \"auto\", without one, or with an empty one", async () => {
+    stubBrowser();
+    vi.stubGlobal("navigator", { language: "es-ES" });
+    const stolen = { type: "card_error", code: "card_declined", decline_code: "stolen_card", message: "Card reported stolen." };
+    const factory = () => ({
+      elements: () => ({ create: () => ({ mount: () => {}, unmount: () => {}, destroy: () => {}, on: () => {} }) }),
+      confirmPayment: async () => ({ error: stolen }),
+      confirmSetup: async () => ({ error: stolen }),
+      retrievePaymentIntent: async () => ({ error: stolen }),
+      retrieveSetupIntent: async () => ({ error: stolen }),
+    });
+    const spanish = getUserMessage("fraud_suspected", "es");
+    expect(spanish).not.toBe(getUserMessage("fraud_suspected", "en"));
+    for (const locale of ["auto", undefined, ""]) {
+      const adapter = new StripeClientAdapter({
+        publishableKey: "pk",
+        environment: "sandbox",
+        ...(locale === undefined ? {} : { locale }),
+        getStripeGlobal: () => factory,
+        loadScript: async () => {},
+      });
+      const confirmed = await adapter.confirm(await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret" }));
+      expect(confirmed.error?.message, String(locale)).toBe(spanish);
+      const returned = await adapter.handleRedirectReturn({ search: "?payment_intent_client_secret=pi_1_secret" });
+      expect(returned?.error?.message, String(locale)).toBe(spanish);
+    }
+    vi.stubGlobal("navigator", undefined);
+    const noBrowserLocale = new StripeClientAdapter({
+      publishableKey: "pk",
+      environment: "sandbox",
+      getStripeGlobal: () => factory,
+      loadScript: async () => {},
+    });
+    const english = await noBrowserLocale.confirm(await noBrowserLocale.mount({} as HTMLElement, { clientSecret: "pi_1_secret" }));
+    expect(english.error?.message).toBe(getUserMessage("fraud_suspected", "en"));
   });
 
   it("writes the generic fraud message in the locale Stripe.js was given", async () => {

@@ -2312,8 +2312,8 @@ description of what v2 changes is what the migration then had to implement.
   card-specific `expired_card` and region-specific `incorrect_zip`, but it never says card
   declines changed, so which code a card decline now carries is not stated. The mapping only
   makes sure that one which does arrive lands where its counterpart does.
-- **Server half only, and only for hosts pinned to 2026-08-26.dahlia or later (the browser
-  half maps them too since 2026-09-26).**
+- **Mapped on the server for hosts pinned to 2026-08-26.dahlia or later, and in the browser
+  since 2026-09-26.**
   `mapStripeError` sees the errors of the adapter's own calls, which carry the host's pinned
   `apiVersion`. The browser adapter follows the account's default API version through
   Stripe.js; since 2026-09-26 it maps these codes and `incorrect_zip` the same way (see
@@ -2353,8 +2353,9 @@ description of what v2 changes is what the migration then had to implement.
   classification on both halves (2026-09-26)"). Had the browser left `authentication_failure`
   unmapped, an account moving to dahlia could have seen a failed browser 3-D Secure change
   quietly from `authentication_required` to `card_declined` or `unknown`, if Stripe.js
-  reports the general code there. Would be wrong if Stripe used the code for failures where no new
-  authentication can succeed, where `card_declined`'s "use another card" is the only remedy.
+  reports the general code there. Would be wrong if Stripe used the code for failures where
+  no new authentication can succeed, where `card_declined`'s "use another card" is the only
+  remedy.
   (Clarified 2026-09-25: this holds for a failed cardholder authentication. A 3-D Secure that
   fails outside the customer's control is `processing_error` on Worldline, and Adyen's refusal
   42 is such a failure, which maps to `processing_error` since 2026-09-26; see "Worldline
@@ -3895,7 +3896,8 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `insufficient_funds`, `invalid_cvc`, `invalid_expiry_month`, `invalid_expiry_year`,
   `invalid_number`, `processing_error` and `authentication_required` as decline codes. Each
   describes the failure its error-code namesake does (for `incorrect_cvc`: "The CVC number
-  is incorrect.", remedy "The customer needs to try again using the correct CVC."). The error-codes page (docs.stripe.com/error-codes) gives
+  is incorrect.", remedy "The customer needs to try again using the correct CVC."). The
+  error-codes page (docs.stripe.com/error-codes) gives
   `expired_payment_method` "The payment method expired", `incorrect_postal_code` "The
   payment method’s postal code is incorrect" and `incorrect_zip` "The card’s postal code is
   incorrect".

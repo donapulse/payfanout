@@ -352,7 +352,8 @@ function classifyStripeJsError(error: StripeJsErrorLike | undefined): UnifiedErr
  * browser's under "auto" or when none was given.
  */
 function customerLocale(locale: string | undefined): string | undefined {
-  if (locale !== undefined && locale !== "auto") return locale;
+  // An empty locale gives Stripe.js none, so it detects the browser's, as under "auto".
+  if (locale && locale !== "auto") return locale;
   return typeof navigator === "undefined" ? undefined : navigator.language;
 }
 

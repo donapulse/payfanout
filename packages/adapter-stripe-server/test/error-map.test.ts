@@ -165,6 +165,12 @@ describe("mapStripeError", () => {
       retryable: false,
     },
     {
+      name: "issuer decline requiring authentication",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "authentication_required", message: "…" },
+      code: "authentication_required",
+      retryable: false,
+    },
+    {
       name: "a local payment method reported lost or stolen",
       err: { type: "StripeCardError", code: "card_declined", decline_code: "lost_or_stolen_card", message: "…" },
       code: "fraud_suspected",

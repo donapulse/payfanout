@@ -1,5 +1,11 @@
 # @payfanout/react
 
+## 0.3.8
+
+### Patch Changes
+
+- caf3bec: `<PaymentFields>` now calls `onError` once instead of twice under React StrictMode when it rejects a mount before loading the PSP's SDK: no PSP to mount, no client adapter registered for the PSP, or another `<PaymentFields>` already mounted. Production builds were not affected.
+
 ## 0.3.7
 
 ### Patch Changes

@@ -4385,16 +4385,18 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   with no failover. The metadata is sent by default, as every other adapter that echoes
   metadata sends it, with no switch to turn it off; the changeset and the guide's "Upgrading
   from 2.x" note ask hosts to remove personal data and keep within the limit before upgrading.
-- **What is sent, and what is checked, is the JSON.** The adapter serializes the metadata once
-  with `JSON.stringify` and checks the parse of that exact string, never the object's own
-  entries, so what is sent is what reads back: an object's `toJSON` decides what is sent, an
-  entry JSON leaves out (an `undefined` value) is not sent, and a `Map`, whose JSON is `{}`,
-  sends nothing, as an empty object does. The signed session context carries that parse, as an
-  optional field, so a token signed before it was carried still decodes and completes, sending
-  none; a hand-minted context whose metadata's JSON is not an object with entries sends none
-  either. The host id stays on `merchantReference` alone and is not copied into the metadata
-  as `payfanout_id`, which would spend the 1000 characters on a value that already
-  round-trips. Replays are unaffected: the idempotence key replays by key, not by payload.
+- **What is sent, and what is checked, is the JSON.** The adapter serializes the metadata once,
+  before any call to Worldline, with `JSON.stringify` and checks the parse of that exact string,
+  never the object's own entries, so what is sent is what reads back: an object's `toJSON`
+  decides what is sent, an entry JSON leaves out (an `undefined` value) is not sent, and a
+  `Map`, whose JSON is `{}`, sends nothing, as an empty object does. The signed session context
+  carries that parse, not the object, which the host may change while the session is being
+  created. It is an optional field, so a token signed before it was carried still decodes and
+  completes, sending none; a hand-minted context whose metadata's JSON is not an object with
+  entries sends none either. The host id stays on `merchantReference` alone and is not copied
+  into the metadata as `payfanout_id`, which would spend the 1000 characters on a value that
+  already round-trips. Replays are unaffected: the idempotence key replays by key, not by
+  payload.
 - **Refused at session creation, before any call to Worldline,** each as a non-retryable
   `invalid_request`: metadata whose JSON is longer than 1000 characters; JSON that is not an
   object (a string's, an array's, a `Date`'s), or no JSON at all (a function, and a `BigInt`
@@ -4436,7 +4438,11 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `refundOutput.merchantParameters`): in the contract, RefundPayment takes references of its
   own (`refundRequest.references`, the same `paymentReferences` schema), so that value is the
   refund's, which the adapter never sends (its RefundPayment body is `amountOfMoney` alone),
-  and nothing says it repeats the payment's. The webhooks guide's examples
+  and nothing says it repeats the payment's. The contract also marks `refundRequest.references`
+  and `refundOutput.references` deprecated ("**Deprecated for capture/refund**: Use
+  operationReferences instead."), and `refundOutput.merchantParameters` deprecated by
+  `references/merchantParameters`; the schema of `operationReferences`,
+  `operationPaymentReferences`, has no `merchantParameters`. The webhooks guide's examples
   (docs.direct.worldline-solutions.com/en/integration/api-developer-guide/webhooks) carry
   `references.merchantReference` and no `merchantParameters`, so the webhook echo rests on the
   contract's description.
@@ -4445,11 +4451,15 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   encrypted, so whoever holds `pspSessionId` can read the metadata in it.
   `createCompletionHandler` resolves `pspSessionId` on the server from the `sessionRef` the
   browser sends (the session's `clientSecret`, for Worldline the `hostedTokenizationUrl`), so it
-  never has to reach the browser. Measured 2026-09-26 with the adapter and the fake: a minimal
-  session's `pspSessionId` is 264 characters, and metadata at the limit adds 1,350 characters
-  when it is ASCII, 2,672 when every character takes two UTF-8 bytes (`é`) or is an emoji, and
-  3,995 when every character takes three (`€`, `中`), the most it can add, as the JSON's UTF-8
-  bytes grow by base64url's four characters per three bytes.
+  never has to reach the browser. The metadata does: the completion route answers the browser
+  with the whole `PaymentInfo` (`packages/server/src/completion.ts`), `metadata` included, and
+  after a read-back `raw` holds Worldline's echo, so the guide and the README say to treat
+  Worldline metadata as visible to the customer; in 2.x a Worldline completion carried neither.
+  Measured 2026-09-26 with the adapter and the fake: a minimal session's `pspSessionId` is 264
+  characters, and metadata at the limit adds 1,350 characters when it is ASCII, 2,672 when every
+  character takes two UTF-8 bytes (`é`) or is an emoji, and 3,995 when every character takes
+  three (`€`, `中`), the most it can add, as the JSON's UTF-8 bytes grow by base64url's four
+  characters per three bytes.
 - **`PaymentInfo.createdAt` comes from `paymentOutput.transactionDate`, when it carries a time
   zone.** This supersedes the note in the same 2026-07-14 entry that it falls back to epoch.
   The contract types it `format: date-time`, "It is the server-side processing date and time

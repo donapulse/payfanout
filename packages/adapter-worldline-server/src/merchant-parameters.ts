@@ -30,12 +30,15 @@ export function metadataAsSent(metadata: unknown): Record<string, string> | unde
 }
 
 /**
- * Refuses session metadata whose merchantParameters would not read back as
- * that metadata, judged on the JSON that is sent rather than on the object
- * (whose toJSON, say, decides what is sent): JSON that is not an object (a
- * string's, an array's, a Date's), none at all (a function, a BigInt, a
- * cycle), an entry whose value is not a string, or JSON longer than the
- * contract's 1000 characters. The contract's
+ * The session metadata as the merchantParameters sent for it read back, or
+ * undefined when that JSON has no entries and nothing is sent. It serializes
+ * the metadata once, so what it checks is what the session carries, whatever
+ * the object holds afterwards. It refuses metadata whose merchantParameters
+ * would not read back as that metadata, judged on the JSON that is sent rather
+ * than on the object (whose toJSON, say, decides what is sent): JSON that is
+ * not an object (a string's, an array's, a Date's), none at all (a function, a
+ * BigInt, a cycle), an entry whose value is not a string, or JSON longer than
+ * the contract's 1000 characters. The contract's
  * maxLength counts characters, which JSON Schema defines as Unicode code
  * points, and Worldline may count UTF-16 code units or UTF-8 bytes instead.
  * This counts UTF-16 code units, one for every character of the Basic
@@ -43,8 +46,8 @@ export function metadataAsSent(metadata: unknown): Record<string, string> | unde
  * accepts is over 1000 code points or code units; it can be over 1000 UTF-8
  * bytes, which any character outside ASCII takes more than one of.
  */
-export function assertMerchantParametersFit(metadata: unknown): void {
-  if (metadata === undefined || metadata === null) return;
+export function checkedMetadata(metadata: unknown): Record<string, string> | undefined {
+  if (metadata === undefined || metadata === null) return undefined;
   const sent = serialize(metadata);
   const parsed: unknown = sent === undefined ? undefined : JSON.parse(sent);
   if (sent === undefined || !isJsonObject(parsed)) {
@@ -68,6 +71,7 @@ export function assertMerchantParametersFit(metadata: unknown): void {
       { propertyName: PROPERTY_NAME, length: sent.length },
     );
   }
+  return Object.keys(parsed).length > 0 ? (parsed as Record<string, string>) : undefined;
 }
 
 /**

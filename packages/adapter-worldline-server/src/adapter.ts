@@ -31,7 +31,7 @@ import {
 } from "@payfanout/core";
 import { decodeWorldlineClientToken, type WorldlineCustomerDevice } from "./client-token.js";
 import {
-  assertMerchantParametersFit,
+  checkedMetadata,
   metadataAsSent,
   readMerchantParameters,
   toMerchantParameters,
@@ -383,6 +383,8 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     if (!returnUrl) throw missingReturnUrl();
     assertReturnUrlFormat(returnUrl);
     assertReferenceLimits(input);
+    // Serialized once, before any call: what is checked is what the context carries.
+    const metadata = checkedMetadata(input.metadata);
     // CreateHostedTokenization is not on Worldline's documented idempotent
     // operations: the key is sent (harmless) but never relied on for dedupe.
     // Tokenization is amountless — money-side safety comes from CreatePayment
@@ -393,7 +395,6 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       {},
       input.idempotencyKey,
     );
-    const metadata = metadataAsSent(input.metadata);
     const context: WorldlineSessionContextV1 = {
       v: 1,
       amount: input.amount,
@@ -1784,7 +1785,6 @@ function assertReferenceLimits(input: CreatePaymentSessionInput): void {
       { statementDescriptor: input.statementDescriptor },
     );
   }
-  assertMerchantParametersFit(input.metadata);
 }
 
 function toWorldlineShipping(

@@ -359,6 +359,47 @@ describe("merchantParameters holds at most 1000 characters", () => {
     expect((await decodeSessionContext(session.pspSessionId, SIGNING_KEY)).metadata).toStrictEqual({ plan: "pro" });
   });
 
+  it("checks the JSON that is sent, so an object's toJSON decides what is sent and a Map, whose JSON is {}, sends nothing", async () => {
+    class Subscription {
+      readonly internalTier = 3;
+      toJSON(): Record<string, string> {
+        return { plan: "pro" };
+      }
+    }
+    const withToJson = makePair();
+    const { info } = await complete(withToJson.adapter, { metadata: new Subscription() as unknown as Record<string, string> });
+    expect(sentReferences(withToJson.fake)?.["merchantParameters"]).toBe('{"plan":"pro"}');
+    expect(info.metadata).toStrictEqual({ plan: "pro" });
+
+    const withMap = makePair();
+    const mapped = await complete(withMap.adapter, {
+      id: "order-7",
+      metadata: new Map([["plan", "pro"]]) as unknown as Record<string, string>,
+    });
+    expect(sentReferences(withMap.fake)).toEqual({ merchantReference: "order-7" });
+    expect(mapped.info).not.toHaveProperty("metadata");
+    expect(await decodeSessionContext(mapped.session.pspSessionId, SIGNING_KEY)).not.toHaveProperty("metadata");
+  });
+
+  it("carries the metadata it checked, whatever the object holds once Worldline has answered the tokenization", async () => {
+    const fake = new FakeWorldlineApi();
+    const metadata: Record<string, unknown> = { plan: "pro" };
+    const { adapter } = makePair({
+      fetch: async (input, init) => {
+        const response = await fake.fetch(input, init);
+        if (new URL(String(input)).pathname.endsWith("/hostedtokenizations")) {
+          // The host changes the object while the session is being created.
+          Object.assign(metadata, { plan: "x".repeat(1200), seats: 3 });
+        }
+        return response;
+      },
+    });
+    const { session, info } = await complete(adapter, { metadata: metadata as Record<string, string> });
+    expect(sentReferences(fake)?.["merchantParameters"]).toBe('{"plan":"pro"}');
+    expect(info.metadata).toStrictEqual({ plan: "pro" });
+    expect((await decodeSessionContext(session.pspSessionId, SIGNING_KEY)).metadata).toStrictEqual({ plan: "pro" });
+  });
+
   it("the fake rejects merchantParameters over 1000 characters that a hand-minted context carries to it", async () => {
     const { adapter, fake, fetchSpy } = makePair();
     const context = await encodeSessionContext(
@@ -538,14 +579,14 @@ describe("createdAt comes from paymentOutput.transactionDate", () => {
 
   it("reads a transactionDate with a zone alike whatever the server's time zone, and one without a zone as none", async () => {
     const previous = process.env.TZ;
-    const systemZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     process.env.TZ = "Asia/Kolkata";
     try {
       expect(new Date(2026, 8, 26).getTimezoneOffset()).toBe(-330);
       expect((await readBack(captured({ transactionDate: "2026-09-26T10:15:30Z" }))).createdAt).toBe("2026-09-26T10:15:30.000Z");
       expect((await readBack(captured({ transactionDate: "2026-09-26T10:15:30" }))).createdAt).toBe(EPOCH);
     } finally {
-      process.env.TZ = previous ?? systemZone;
+      if (previous === undefined) delete process.env.TZ;
+      else process.env.TZ = previous;
     }
   });
 
@@ -556,9 +597,12 @@ describe("createdAt comes from paymentOutput.transactionDate", () => {
     ["a February 29 outside a leap year", "2026-02-29T10:15:30Z"],
     ["a September 31", "2026-09-31T10:15:30Z"],
     ["a 13th month", "2026-13-01T10:15:30Z"],
+    ["month 00", "2026-00-15T10:15:30Z"],
     ["year 0099, which Date.UTC would take for 1999", "0099-09-26T10:15:30Z"],
     ["hour 24", "2026-09-26T24:00:00Z"],
+    ["minute 60", "2026-09-26T10:60:30Z"],
     ["a leap second", "2026-06-30T23:59:60Z"],
+    ["second 60 mid-month, which the day check alone would let through", "2026-09-26T10:15:60Z"],
     ["a space instead of the T", "2026-09-26 10:15:30Z"],
     ["a date without a time", "2026-09-26"],
     ["text before the date", "x2026-09-26T10:15:30Z"],

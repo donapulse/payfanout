@@ -354,16 +354,20 @@ of a Worldline session. The adapter cannot tell it apart and sends what it is gi
 `pspSessionId` is signed, not encrypted: whoever holds it can read the session context it
 carries, `metadata` included, so keep secrets as well as personal data out of it and keep
 `pspSessionId` on your server (`createCompletionHandler` never needs it in the browser).
-Metadata at the limit adds up to about 4 KB to `pspSessionId`: 1,350 characters when it is
-ASCII, and 3,995 when every character takes three UTF-8 bytes, as `€` does.
+That keeps the token out of the browser, not the metadata: the completion route answers the
+browser with the whole `PaymentInfo`, `metadata` (and after a read-back, Worldline's echo in
+`raw`) included, so treat Worldline metadata as visible to the customer. Metadata at the limit
+adds up to about 4 KB to `pspSessionId`: 1,350 characters when it is ASCII, and 3,995 when
+every character takes three UTF-8 bytes, as `€` does.
 
 ::: warning Upgrading from 2.x
-Up to 2.x the adapter ignored a Worldline session's `metadata`; it now reaches Worldline.
-Before upgrading, remove personal data from the metadata of your Worldline sessions and keep it
-within the limit above: session creation now refuses metadata whose JSON is longer than 1000
-characters or is not an object of string values, with a non-retryable `invalid_request`.
-`PaymentRouter` does not fail over on that code, so behind the router such a session is
-refused instead of being routed to another provider.
+Up to 2.x the adapter ignored a Worldline session's `metadata`; it now reaches Worldline and
+comes back on `PaymentInfo`, which the completion route returns to the browser. Before
+upgrading, remove personal data and anything the customer should not see from the metadata of
+your Worldline sessions, and keep it within the limit above: session creation now refuses
+metadata whose JSON is longer than 1000 characters or is not an object of string values, with a
+non-retryable `invalid_request`. `PaymentRouter` does not fail over on that code, so behind the
+router such a session is refused instead of being routed to another provider.
 :::
 
 `PaymentInfo.createdAt` is the payment's `paymentOutput.transactionDate`, which the API

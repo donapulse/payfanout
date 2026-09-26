@@ -62,9 +62,12 @@ exported for advanced use.
 
 The context is signed, not encrypted: whoever holds `pspSessionId` can read it, `metadata`
 included, so keep secrets as well as personal data out of it and keep `pspSessionId` on your
-server (`createCompletionHandler` never needs it in the browser). Metadata at Worldline's
-1000-character limit (below) adds up to about 4 KB to `pspSessionId`: 1,350 characters when it
-is ASCII, and 3,995 when every character takes three UTF-8 bytes, as `€` does.
+server (`createCompletionHandler` never needs it in the browser). That keeps the token out of
+the browser, not the metadata: the completion route answers the browser with the whole
+`PaymentInfo`, `metadata` (and after a read-back, Worldline's echo in `raw`) included, so treat
+Worldline metadata as visible to the customer. Metadata at Worldline's 1000-character limit
+(below) adds up to about 4 KB to `pspSessionId`: 1,350 characters when it is ASCII, and 3,995
+when every character takes three UTF-8 bytes, as `€` does.
 
 The host id round-trips via `order.references.merchantReference` (`PaymentInfo.id`), and the
 session's `metadata` via `order.references.merchantParameters`, sent JSON-encoded and echoed
@@ -74,9 +77,9 @@ field at 1000 characters, so a session whose metadata, as the JSON sent, is long
 object of string values is refused with `invalid_request` before any call to Worldline.
 Worldline also says the field "must not contain any personal data": keep personal data out of
 a Worldline session's metadata. The adapter cannot tell and sends what it is given. **Before
-upgrading from 2.x**, which ignored session metadata, remove personal data from it and keep it
-within that limit ([Set up Worldline](https://donapulse.github.io/payfanout/guide/worldline),
-step 7).
+upgrading from 2.x**, which ignored session metadata, remove personal data and anything the
+customer should not see from it, and keep it within that limit
+([Set up Worldline](https://donapulse.github.io/payfanout/guide/worldline), step 7).
 
 ## Authentication
 

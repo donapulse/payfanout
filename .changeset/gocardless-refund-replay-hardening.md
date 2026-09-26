@@ -1,5 +1,0 @@
----
-"@payfanout/adapter-gocardless-server": patch
----
-
-While GoCardless reports an amount already refunded on a payment, `refundPayment` now checks the payment's refunds for one made with the same idempotency key before creating a refund, so a key GoCardless no longer honours returns the original refund instead of refunding again. When that check, or the one made after a create fails, cannot be answered, the call sends nothing further: an outage rejects with a retryable `psp_unavailable` or `rate_limited` (GoCardless's answer to the create on `raw.rejection`, the check's on `raw.lookup`), and any other failure rejects with a final error marked `outcomeUnknown`, both to be retried only with the same key. A blank idempotency key is now refused, a replayed session whose payment awaits the customer's approval reports `processing`, and a refund refused for exceeding what is left now carries the payment on `raw.payment` instead of as `raw`, with the check's answer on `raw.lookup` when it was refused.

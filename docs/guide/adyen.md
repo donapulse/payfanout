@@ -193,10 +193,14 @@ operation, and reuse it only to retry that operation — Adyen recommends random
 another API credential of your company account cannot fetch your stored responses. A key is
 bound to its first answer: a refusal is replayed for the same key, so a new attempt needs a
 new key. A capture or refund whose acknowledgement echoes a different amount or currency is
-rejected with `invalid_request`, because Adyen already accepted an earlier capture or refund
-under that key — the error names its amount and `pspReference`. If that is the one you meant,
-do not send it again; a further capture or refund needs a new key. A duplicate racing the
-still in-flight original (Adyen `errorCode` 704) is retried automatically.
+rejected with `invalid_request` marked `outcomeUnknown: true`, because Adyen already received
+an earlier capture or refund under that key, whose outcome only its webhook reports — the
+error names its amount and `pspReference`. It may be the one you meant: send a further capture
+or refund under a new key only once that one is known to be another. A duplicate racing the
+still in-flight original (Adyen `errorCode` 704) is retried automatically. When the retries
+run out, its `processing_error` carries `outcomeUnknown: true`, like any other 409 and a
+transient 4xx Adyen answers, since the original may still go through: retry it under the same
+key, never a new one.
 :::
 
 ::: warning Upgrading from 0.1.0
@@ -442,10 +446,13 @@ the key it sends from your key, the merchant account, the endpoint and, on
 Every answer is checked against the session it completes. A `/payments` answer naming another
 `merchantReference` or `amount` is refused with `invalid_request`, not retryable: the answer
 belongs to another request, since an `idempotencyKey` reused across sessions replays the first
-answer. A `/payments/details` answer finishes whichever payment the details were issued for,
-so one whose `merchantReference` or `amount` differs from the signed session is refused the
-same way. An answer that does not name the session's merchant reference and amount (Adyen's
-own example answer names neither) reads `processing` and carries no `pspPaymentId`, and its
+answer. Unless that answer is `Refused`, `Error` or `Cancelled`, the refusal carries
+`outcomeUnknown: true`: the other request's payment may be the one you meant, so use a new key
+only once it is known to be another. A `/payments/details` answer finishes whichever payment
+the details were issued for, so one whose `merchantReference` or `amount` differs from the
+signed session is refused with `invalid_request` too. An answer that does not name the
+session's merchant reference and amount (Adyen's own example answer names neither) reads
+`processing` and carries no `pspPaymentId`, and its
 `raw` keeps only `resultCode` and `action`; the `AUTHORISATION` webhook (§8), whose
 `merchantReference` is one of the signed values, supplies the reference: match
 `event.raw.merchantReference` to `PaymentInfo.id`, then store

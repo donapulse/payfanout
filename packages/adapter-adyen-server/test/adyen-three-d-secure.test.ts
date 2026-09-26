@@ -611,27 +611,43 @@ describe("Adyen 3-D Secure completion", () => {
     const err = await rejection(
       adapter.completePayment({ pspSessionId: second.pspSessionId, clientToken: envelope(), idempotencyKey: "one-key" }),
     );
-    expect(err).toMatchObject({ code: "invalid_request", retryable: false, pspName: "adyen" });
+    // The first session's payment went through, and may be the one this call was meant to make.
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false, outcomeUnknown: true, pspName: "adyen" });
+    expect((err as Error).message).toContain("use a new idempotencyKey only once that payment is known to be another one");
     expect((err as { raw?: unknown }).raw).toMatchObject({ merchantReference: first.id, amount: { value: 2500 } });
     expect(fake.uniquePaymentCreations).toBe(1);
 
     // Any one differing fact is enough, and a refusal is no exception: it would be another request's.
     const created = await session(adapter);
-    const answers: Array<Record<string, unknown>> = [
-      { pspReference: "8836100000000042", resultCode: "Authorised", merchantReference: "another-order" },
-      { pspReference: "8836100000000042", resultCode: "Authorised", amount: { value: 100, currency: "EUR" } },
-      { pspReference: "8836100000000042", resultCode: "Authorised", amount: { value: 2500, currency: "USD" } },
-      { pspReference: "8836100000000042", resultCode: "Refused", refusalReasonCode: "2", merchantReference: "another-order" },
+    const answers: Array<[Record<string, unknown>, boolean]> = [
+      [{ pspReference: "8836100000000042", resultCode: "Authorised", merchantReference: "another-order" }, true],
+      [{ pspReference: "8836100000000042", resultCode: "Authorised", amount: { value: 100, currency: "EUR" } }, true],
+      [{ pspReference: "8836100000000042", resultCode: "Authorised", amount: { value: 2500, currency: "USD" } }, true],
+      // An action, or no result yet: that payment may still go through.
+      [
+        {
+          resultCode: "RedirectShopper",
+          action: { type: "redirect", url: "https://checkoutshopper-test.adyen.com/checkoutshopper/threeDS/redirect" },
+          merchantReference: "another-order",
+        },
+        true,
+      ],
+      [{ pspReference: "8836100000000042", merchantReference: "another-order" }, true],
+      // Refused, failed or cancelled: that payment moved no money, so a new key may follow.
+      [{ pspReference: "8836100000000042", resultCode: "Refused", refusalReasonCode: "2", merchantReference: "another-order" }, false],
+      [{ pspReference: "8836100000000042", resultCode: "Error", merchantReference: "another-order" }, false],
+      [{ pspReference: "8836100000000042", resultCode: "Cancelled", merchantReference: "another-order" }, false],
     ];
-    for (const answer of answers) {
-      await expect(
+    for (const [answer, live] of answers) {
+      const refused = await rejection(
         answering(answer).completePayment({
           pspSessionId: created.pspSessionId,
           clientToken: envelope(),
           idempotencyKey: "complete-1",
         }),
-        JSON.stringify(answer),
-      ).rejects.toMatchObject({ code: "invalid_request", retryable: false });
+      );
+      expect(refused, JSON.stringify(answer)).toMatchObject({ code: "invalid_request", retryable: false });
+      expect((refused as { outcomeUnknown?: boolean }).outcomeUnknown, JSON.stringify(answer)).toBe(live ? true : undefined);
     }
     // Matching facts, or none at all as in Adyen's native 3-D Secure 2 example, stand.
     for (const answer of [

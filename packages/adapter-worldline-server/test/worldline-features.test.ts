@@ -255,6 +255,8 @@ describe("mapWorldlineError", () => {
       expect(mapped.message).toBe(getUserMessage(expected));
       expect(mapped.raw).toBe(body);
       expect(mapped.pspName).toBe("worldline");
+      // Only the conflict of a request whose original is still in flight leaves the outcome open by a flag.
+      expect(mapped.outcomeUnknown).toBe(status === 409 ? true : undefined);
     });
   }
 

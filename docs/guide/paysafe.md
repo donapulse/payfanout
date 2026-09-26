@@ -412,9 +412,15 @@ retries, for every write it makes:
   nothing. A 429 is re-sent after backoff, because Paysafe refused it unprocessed.
 - A key already used for a **different** amount or currency, or for a different saved card
   or verification card, rejects with `invalid_request`: give every new payment its own
-  key. The exception is a card or Interac completion key whose earlier attempts all
-  failed: a failed attempt is set aside before any amount is compared, so the next attempt
-  goes through at its own amount and currency. A bank-debit key still rejects it, because
+  key. When the payment, capture or refund already under the key may have moved money (it
+  has not failed, been voided, cancelled or expired), or a bank-debit key holds a spent
+  payment handle whose payment the lookup does not show yet, the rejection carries
+  `outcomeUnknown: true`: it may be the money your call was meant to move (the same renewal
+  sent by two overlapping cron runs with the card changed in between, say), so start again
+  under a new key only once the Paysafe portal shows it is another one. The exception is a
+  card or Interac completion key whose earlier attempts all failed: a failed attempt is set
+  aside before any amount is compared, so the next attempt goes through at its own amount
+  and currency. A bank-debit key still rejects it, because
   the failed attempt's payment handle states its amount. On a card, Interac or bank-debit
   completion a new card is a new attempt under the same key; a payment the key already
   made is returned instead, and a fully voided one comes back `canceled` (start a new

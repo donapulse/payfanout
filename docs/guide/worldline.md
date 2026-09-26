@@ -131,7 +131,11 @@ const payments = new PaymentService({ adapters: [worldline] });
 Each request is signed with the `v1HMAC` scheme over a canonical string (method, content-type,
 `Date`, signed `X-GCS-*` headers, path) using WebCrypto. Worldline rejects timestamps older
 than five minutes, so keep the server clock accurate. Every mutating call carries a
-deterministic `X-GCS-Idempotence-Key` derived from your `idempotencyKey`.
+deterministic `X-GCS-Idempotence-Key` derived from your `idempotencyKey`. A `409`,
+Worldline's answer while the original request under that key is still being processed, is
+retried; one that outlives the retries rejects with a retryable `processing_error` marked
+`outcomeUnknown: true`, since the original may still go through: retry it under the same
+key, never a new one.
 :::
 
 ::: tip Capture and cancellation outcomes

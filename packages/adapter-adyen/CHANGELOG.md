@@ -1,5 +1,12 @@
 # @payfanout/adapter-adyen
 
+## 1.0.1
+
+### Patch Changes
+
+- Updated dependencies [1d66371]
+  - @payfanout/core@4.2.0
+
 ## 1.0.0
 
 ### Major Changes

@@ -1,5 +1,13 @@
 # @payfanout/adapter-stripe
 
+## 0.2.6
+
+### Patch Changes
+
+- 70e9679: Map Stripe.js's `authentication_failure` (a payment method that failed authentication) to `authentication_required`, like the intent-specific authentication failures, instead of `card_declined`.
+- Updated dependencies [1d66371]
+  - @payfanout/core@4.2.0
+
 ## 0.2.5
 
 ### Patch Changes

@@ -302,11 +302,13 @@ describe("modification acknowledgements", () => {
     const { pspPaymentId } = await pay(adapter, "complete-1");
     const accepted = await adapter.refundPayment({ pspPaymentId, amount: 500, idempotencyKey: "refund-1" });
     const error = await rejection(adapter.refundPayment({ pspPaymentId, amount: 400, idempotencyKey: "refund-1" }));
-    expect(error).toMatchObject({ code: "invalid_request", retryable: false, pspName: "adyen" });
-    // It states what Adyen holds under the key, and never advises a second refund.
+    // Adyen has only received that refund, which may be the one this call meant: only the same key may follow.
+    expect(error).toMatchObject({ code: "invalid_request", retryable: false, outcomeUnknown: true, pspName: "adyen" });
+    // It states what Adyen holds under the key, and advises a new key only once that refund is known to be another.
     expect(error.message).toBe(
-      `Adyen already accepted a refund of 500 EUR under this idempotencyKey (pspReference ${accepted.refundId}). ` +
-        "If that is the refund you meant, do not send it again; a further refund needs a new idempotencyKey.",
+      `Adyen already received a refund of 500 EUR under this idempotencyKey (pspReference ${accepted.refundId}), ` +
+        "whose outcome only its webhook reports. It may be the refund this request was meant to make, so send a " +
+        "further refund under a new idempotencyKey only once that refund is known to be another one.",
     );
     expect(error.raw).toMatchObject({ status: "received", amount: { value: 500, currency: "EUR" } });
     // Adyen answered from its store: the second refund was never requested.
@@ -320,6 +322,8 @@ describe("modification acknowledgements", () => {
     await expect(adapter.capturePayment(pspPaymentId, 2500, "capture-1")).rejects.toMatchObject({
       code: "invalid_request",
       retryable: false,
+      outcomeUnknown: true,
+      message: expect.stringContaining("It may be the capture this request was meant to make"),
     });
 
     const { adapter: dollars } = answering(
@@ -329,6 +333,7 @@ describe("modification acknowledgements", () => {
     await expect(dollars.capturePayment(UNKNOWN_PAYMENT, 1000, "capture-2")).rejects.toMatchObject({
       code: "invalid_request",
       retryable: false,
+      outcomeUnknown: true,
     });
   });
 

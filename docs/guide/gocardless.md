@@ -115,7 +115,11 @@ replay under the same key may be treated as a new request. A key it has already 
 answers `409 idempotent_creation_conflict` with the id of the resource it created, and
 the adapter returns that resource. GoCardless documents no comparison of the new
 request with the original, so the adapter makes one: a key reused for a different
-payment or refund rejects with `invalid_request`.
+payment or refund rejects with `invalid_request`. Unless the resource under the key is
+known to have moved no money (a cancelled billing request, a payment that failed or was
+cancelled, a refund cancelled, bounced or with its funds returned), the rejection carries
+`outcomeUnknown: true`: it may be the payment or refund you meant to make, so start again
+under a fresh key only once the GoCardless dashboard shows it is another one.
 
 - **Sessions.** A replayed `createPaymentSession` returns the same billing request, and
   its amount, currency and session `id` must match the new input. The session reports

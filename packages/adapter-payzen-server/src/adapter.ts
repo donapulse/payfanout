@@ -1485,11 +1485,26 @@ const ACQUIRER_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "99": "processing_error", // Initiator domain incident
 };
 
-/** Looks an acquirer code up among the map's own keys only. */
-function acquirerCodeFor(detailedErrorCode: string | null | undefined): UnifiedErrorCode | undefined {
-  return typeof detailedErrorCode === "string" && Object.hasOwn(ACQUIRER_CODE_MAP, detailedErrorCode)
-    ? ACQUIRER_CODE_MAP[detailedErrorCode]
-    : undefined;
+/**
+ * AUTH_ codes → the taxonomy. PayZen links the family to "issues with
+ * authentication servers", and none of its codes is a cardholder failing to
+ * authenticate, so none is authentication_required. AUTH_999, the technical
+ * error, is read before the map; a code outside it is a processing_error.
+ * The browser adapter holds the same map.
+ */
+const AUTH_CODE_MAP: Record<string, UnifiedErrorCode> = {
+  // The issuer's or the platform's 3-D Secure failed or answered too late.
+  AUTH_100: "processing_error", // invalid ACS Signature
+  AUTH_101: "processing_error", // technical error 3DS
+  AUTH_149: "processing_error", // 3DS operation timeout
+  // The merchant's request or set-up.
+  AUTH_102: "invalid_request", // wrong Parameter 3DS
+  AUTH_103: "invalid_request", // 3DS Disabled
+};
+
+/** Looks a code up among the map's own keys only. */
+function ownCodeFor(map: Record<string, UnifiedErrorCode>, key: string | null | undefined): UnifiedErrorCode | undefined {
+  return typeof key === "string" && Object.hasOwn(map, key) ? map[key] : undefined;
 }
 
 const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
@@ -1568,15 +1583,15 @@ export function mapPayZenError(answer: PayZenErrorAnswerLike | undefined, raw: u
   if (errorCode === "ACQ_999" || errorCode === "AUTH_999") {
     code = "psp_unavailable";
   } else if (errorCode.startsWith("ACQ_")) {
-    code = acquirerCodeFor(answer?.detailedErrorCode) ?? "card_declined";
+    code = ownCodeFor(ACQUIRER_CODE_MAP, answer?.detailedErrorCode) ?? "card_declined";
   } else if (errorCode === "PSP_101") {
     // Refund refused by the issuer; the acquirer refusal code rides detailedErrorCode.
     // PayZen's remedy is paying the buyer back by other means, so a code read as
     // authentication_required, which a refund cannot act on, is a plain refusal.
-    const acquirerCode = acquirerCodeFor(answer?.detailedErrorCode);
+    const acquirerCode = ownCodeFor(ACQUIRER_CODE_MAP, answer?.detailedErrorCode);
     code = acquirerCode === undefined || acquirerCode === "authentication_required" ? "card_declined" : acquirerCode;
   } else if (errorCode.startsWith("AUTH_")) {
-    code = "authentication_required";
+    code = ownCodeFor(AUTH_CODE_MAP, errorCode) ?? "processing_error";
   } else if (errorCode.startsWith("INT_") || errorCode.startsWith("CLIENT_")) {
     code = "invalid_request";
   } else if (errorCode.startsWith("PSP_")) {

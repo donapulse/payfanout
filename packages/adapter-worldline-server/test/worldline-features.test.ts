@@ -441,6 +441,7 @@ describe("session context edge cases", () => {
       statementDescriptor: "SHOP ORDER1",
       receiptEmail: "buyer@example.com",
       shippingDetails: { name: "Ann Buyer", address: { line1: "1 Way", city: "Brussels", postalCode: "1000", country: "BE" } },
+      metadata: { plan: "pro", cart: "c-1042" },
     };
     await expect(decodeSessionContext(await encodeSessionContext(full, "sk"), "sk")).resolves.toEqual(full);
   });

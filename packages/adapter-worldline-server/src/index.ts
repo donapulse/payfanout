@@ -33,6 +33,7 @@ export {
 export { worldlineOnboarding } from "./onboarding.js";
 export {
   parseWorldlineWebhookEvent,
+  readWorldlineWebhookMetadata,
   verifyWorldlineWebhookSignature,
   type WorldlineWebhookKey,
 } from "./webhook.js";

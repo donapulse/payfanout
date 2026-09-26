@@ -814,7 +814,8 @@ docs.direct.worldline-solutions.com unless noted):
   `clientSecret` is the `hostedTokenizationUrl` the browser iframe mounts from (no client
   key). The host id round-trips via `order.references.merchantReference` only — Worldline has
   no arbitrary metadata map — so conformance `money.expectations` is
-  `{ idRoundTrip: true, metadataEcho: false }`. Doc-verified 2026-09-23 (Hosted Tokenization
+  `{ idRoundTrip: true, metadataEcho: false }` (superseded 2026-09-26 by "Worldline: metadata
+  echo and creation time (2026-09-26)"). Doc-verified 2026-09-23 (Hosted Tokenization
   Page guide and the served `tokenizer.min.js`): the browser `Tokenizer` hides the
   cardholder-name field unless constructed with `hideCardholderName: false`, although the name
   is mandatory, and calls `validationCallback` with `{ valid }` whenever the form's validity
@@ -1124,7 +1125,8 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   consistent with the platform's examples but worth one sandbox observation.
 - **`PaymentInfo.createdAt`** falls back to epoch — the Worldline payment object exposes no
   stable creation timestamp in a documented field; hosts read the timestamp from the webhook
-  `created` or their own record. Revisit if the sandbox payment object carries one.
+  `created` or their own record. Revisit if the sandbox payment object carries one
+  (superseded 2026-09-26 by "Worldline: metadata echo and creation time (2026-09-26)").
 
 ## Paysafe Interac e-Transfer (2026-07-15)
 
@@ -3989,13 +3991,68 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   built-ins (`Object.fromEntries`, `matchAll`, `flat`, `trimStart`, `Object.hasOwn` and
   the like) out of the browser package's source; core's source, which the same bundle ships,
   is not scanned.
-- **Known difference, tracked in #232: AUTH_100 to AUTH_149 stay `authentication_required`.**
+- **Known difference, tracked in #232 and resolved on 2026-09-26 (next item): AUTH_100 to
+  AUTH_149 stayed `authentication_required`.**
   The AUTH error page (payzen.io/en-EN/rest/V4.0/api/errors_auth.html) describes AUTH_100 as
   "invalid ACS Signature", AUTH_101 as "technical error 3DS", AUTH_102 as "wrong Parameter
   3DS", AUTH_103 as "3DS Disabled" and AUTH_149 as "3DS operation timeout": none describes a
   cardholder who failed to authenticate or an issuer asking for authentication, which is what
   the other adapters read as `authentication_required` (see "Worldline decline codes
   (2026-09-25)").
+- **Mapped since 2026-09-26 (#232): each AUTH_ code by its description, none as
+  `authentication_required`.** Re-verified 2026-09-26 on the AUTH page in both editions: the
+  French one (payzen.io/fr-FR/rest/V4.0/api/errors_auth.html) lists the same six codes with the
+  same English definitions and translates only the introduction ("Les erreurs AUTH (pour
+  "authentification") sont généralement dues à un problème sur les serveurs d'authentification
+  (lors de 3D-Secure par exemple)"). `processing_error`, as Worldline maps a 3-D Secure the
+  issuer, the acquirer or the platform could not complete (40001135, 40001137, 40001138,
+  40001146): AUTH_100 ("invalid ACS Signature", the issuer's access control server), AUTH_101
+  ("technical error 3DS") and AUTH_149 ("3DS operation timeout"). `invalid_request`, as
+  Worldline maps 50001087, a request 3-D Secure could not run on: AUTH_102 ("wrong Parameter
+  3DS") and AUTH_103 ("3DS Disabled"). None is retryable, as no refusal is. An AUTH_ code
+  outside the map is a `processing_error` too: the page ties the family to "issues with
+  authentication servers (e.g. during 3D Secure)", the errors reference
+  (payzen.io/en-EN/rest/V4.0/api/errors-reference.html) warns "New error codes can be added in
+  the future", and the server reads an unmapped PSP_ code the same way. AUTH_999 ("technical
+  error") stays the retryable `psp_unavailable`. PayZen's own 3-D Secure scenarios report a
+  cardholder's failed authentication with other codes. The PCI use-case pages answer a failed
+  challenge (payzen.io/en-EN/rest/V4.0/pci/createtoken/3ds2/challenge.html), a challenge "failed
+  or abandoned" under external authentication
+  (payzen.io/en-EN/rest/V4.0/pci/v2/createpayment/external-authentication/3ds2/challenge_failed.html)
+  and a challenge timeout (payzen.io/en-EN/rest/V4.0/pci/v2/createpayment/3ds2/timeout.html)
+  with PSP_539 ("3D Secure refusal for the transaction", `detailedErrorCode` 39), which the
+  server maps to `authentication_required`. The issuer's refusal answers PSP_707
+  ("Authentication refused by the issuer", `detailedErrorCode` 207) on the "Authentication
+  rejected" page (payzen.io/en-EN/rest/V4.0/pci/v2/createpayment/3ds2/rejected.html), and an
+  authentication that cannot run PSP_708 (`detailedErrorCode` 208) on the "Authentification
+  impossible" page
+  (payzen.io/en-EN/rest/V4.0/pci/v2/createpayment/external-authentication/3ds2/challenge_unavailable.html);
+  none shows an AUTH_ code. The browser adapter keeps a copy of the AUTH_ map too, and the
+  parity test compares both maps.
+- **AUTH_103 is `invalid_request`, not `unsupported_operation`.** PayZen's pages use "disabled"
+  for a 3-D Secure the merchant turns off: the PCI "3DS1 - Disengaged authentication" pages
+  (payzen.io/en-EN/rest/V4.0/pci/createpayment/3ds1/disabled.html) send
+  `strongAuthentication: "DISABLED"` and answer a paid order with
+  `effectiveStrongAuthentication: "DISABLED"`, so they show how PayZen uses the word, not an
+  AUTH_103 answer, and the reading rests on an analogy. A 3-D Secure the request or the shop's
+  set-up turned off is the merchant's to change, as a REST API the shop has not enabled is
+  (PSP_100, "REST API not enabled.", `invalid_request`); the server adapter itself asks for a
+  challenge (`strongAuthentication: "CHALLENGE_REQUESTED"`) when a host sets
+  `sca.challenge: "force"`. Core gives `unsupported_operation` to an operation the adapter or
+  the PSP cannot perform, a capability guard or an answer such as Paysafe's 3416 ("does not
+  support partial Settlements"), and PayZen performs 3-D Secure. No page says more about
+  AUTH_103 than its two words, so this is a reading.
+- **Known difference: the PSP_ counterparts stay on the default.** The PSP_ errors page
+  (payzen.io/en-EN/rest/V4.0/api/errors_psp.html) lists PSP_052 "The ACS signature is invalid.",
+  PSP_053 "3DS technical error.", PSP_054 "Incorrect 3DS parameter." and PSP_055 "3DS
+  disabled.", AUTH_100 to AUTH_103's descriptions in other words, and PSP_707 "3D Secure -
+  Refusal of the authentication by the issuer." and PSP_708 "3D Secure - Refusal as
+  authentication by the issuer is impossible.". None is in the server's PSP_ map, so the server
+  reads each as the default `processing_error`. The browser reads a PSP_ code from `KR.onError`
+  as a retryable `processing_error`, and one on an unpaid order's last transaction by its
+  `detailedErrorCode` (PSP_707's 207 is not in the acquirer map, so `card_declined`). "3DS
+  disabled" is therefore `invalid_request` as AUTH_103 and `processing_error` as PSP_055.
+  Mapping them belongs with one PSP_ map for both halves (#247), not with this change.
 - **Doc-derived only.** No sandbox run has produced any of these codes.
 
 ## Stripe: one card-error classification on both halves (2026-09-26)
@@ -4010,8 +4067,10 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   2. `expired_card` (`expired_card`, `expired_payment_method`);
   3. `invalid_card_data` (`incorrect_number`, `invalid_number`, `incorrect_cvc`,
      `invalid_cvc`, `invalid_expiry_month`, `invalid_expiry_year`, `incorrect_zip`,
-     `incorrect_postal_code`, and in the browser Stripe.js's `incomplete_*` field codes);
-  4. `authentication_required`;
+     `incorrect_postal_code`, `incorrect_address` since #235, and in the browser Stripe.js's
+     `incomplete_*` field codes);
+  4. `authentication_required` (and, since #235, the decline code
+     `authentication_not_handled`);
   5. the fraud decline codes (`fraudulent`, `stolen_card`, `lost_card`, `merchant_blacklist`,
      and `lost_or_stolen_card`, a local payment method's), as `fraud_suspected`;
   6. the failed-authentication codes (`authentication_failure` and the intent-specific
@@ -4049,6 +4108,25 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `reenter_transaction` stay declines in both halves. The server reads Stripe's
   `processing_error` as retryable, and whether a retried confirmation of the same intent
   would help after those answers is not documented.
+- **Added 2026-09-26 (#235): `incorrect_address` joins step 3 and `authentication_not_handled`
+  step 4, in both halves.** Both were `card_declined` until then. Doc-verified 2026-09-26:
+  docs.stripe.com/declines/codes lists the decline code `incorrect_address`, "The address
+  entered by the customer is incorrect." (next step "The customer needs to try again using
+  the correct address."), and docs.stripe.com/error-codes the error code, "The card’s address
+  is incorrect. Check the card’s address or use a different card.", so it is read from either
+  code, as `incorrect_zip` is. The decline code `authentication_not_handled` reads "Related to
+  `authentication_required`. The customer tried to proceed without performing the required
+  authentication, so the issuer declined again.", next step "Run the EMV 3D Secure (3DS) or
+  strong customer authentication (SCA) flow. For off-session payments, collect and prepare
+  authentication on-session first, then fall back to on-session if needed.": the customer
+  comes back on-session to authenticate, which is what `authentication_required` stands for,
+  and in step 4 a `processing_error` on the same error cannot make it retryable. It is read
+  from `decline_code` only, as the fraud codes are: the error-codes page lists no error code
+  by that name, and neither does the `last_payment_error.code` enum of the Stripe Node SDK
+  the server adapter uses (22.6.2, generated from Stripe's OpenAPI spec v2442), which does
+  list `incorrect_address`. On the server both sit in the `StripeCardError` branch, with the
+  other card codes. No test card on docs.stripe.com/testing returns either code, so neither
+  is sandbox-verified.
 
 ## Worldline: Cartes Bancaires use case and MOTO (2026-09-26)
 
@@ -4326,3 +4404,199 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   run. Among these providers only PayPal documents a nonce for its SDK, and Adyen for its
   PayPal component alone; none of the adapters has run under a nonce policy against a
   sandbox.
+
+## React: rejected mounts under StrictMode (2026-09-26)
+
+- **`<PaymentFields>` reports a mount it rejects before loading the PSP's SDK once,
+  StrictMode included (#214).** The mount effect rejects three cases synchronously: no PSP to
+  mount, no client adapter registered for the PSP, and another instance holding the mount
+  slot. With
+  StrictMode on, "React will also run one extra setup+cleanup cycle in development for every
+  Effect" (react.dev/reference/react/StrictMode), so each rejection reached `onError` twice in
+  development. The instance now keeps the failure it last reported with the inputs it failed
+  on: the adapter instance, the psp and the clientSecret. A failing setup on the same inputs
+  that runs after the reporting setup's cleanup and before the next microtask is StrictMode's
+  replay: it puts the reported error back into `lastError` and `status` and does not call
+  `onError`. Read in react-dom 18.3.1 and 19.3.0: the replayed cleanup and setup run in one
+  synchronous call at the end of the passive-effects flush (`commitDoubleInvokeEffectsInDEV`,
+  through `doubleInvokeEffectsOnFiber` in 19), so no microtask runs between them. The react
+  suites also pass against React 18.3.1, except the `<Activity>` tests, which need 19.2.
+- **Every other setup reports**: new inputs, a new instance, the same failure after a setup
+  that passed the checks, and an `<Activity>` reveal. A hidden Activity "will also destroy
+  their Effects", and a reveal will "re-create their Effects"
+  (react.dev/reference/react/Activity): the fields mount again on a reveal and an asynchronous
+  mount failure is reported again, so a rejection is too. A hide and a reveal committed in the
+  same task, with no microtask between them, report once, and so does a re-run on unchanged
+  inputs inside one flush, which a Fast Refresh of this module itself makes: it counts as a
+  replay.
+- **Delivery stays synchronous, inside the effect.** Deferring the report until the effect
+  outlives StrictMode's cleanup would move every production report to a later microtask. A
+  host that sets state in `onError` would then do so after `act()` returned, which React flags
+  in tests that set `IS_REACT_ACT_ENVIRONMENT`, and an unmount committed before that microtask
+  would force a choice between a late report and a lost one. Keying on the inputs with no
+  window would drop the reveal's report.
+
+## Worldline: metadata echo and creation time (2026-09-26)
+
+- **Session metadata travels as `order.references.merchantParameters`, JSON-encoded, and
+  reads back as `PaymentInfo.metadata`.** This supersedes the note in "Worldline Direct
+  adapter (2026-07-14)" that Worldline has no arbitrary metadata map: the conformance fixture
+  now runs with `metadataEcho: true`. Doc-verified 2026-09-26 against the API contract
+  (payment.preprod.direct.worldline-solutions.com/v1/public-contract-definition.yaml,
+  v2.507.0): `orderReferences.merchantParameters` is a string with `maxLength: 1000`, "It
+  allows you to store additional parameters for the transaction in the format you prefer
+  (e.g.-> key-value query string, JSON, etc.) These parameters are then echoed back to you in
+  API GET calls and Webhook notifications. This field must not contain any personal data."
+  The echo is `paymentOutput.references.merchantParameters` (`paymentReferences`), and
+  `paymentOutput.merchantParameters` is `deprecated: true` with
+  `x-deprecated-by: references/merchantParameters`. Worldline's Node SDK types both as
+  `string | null` (github.com/wl-online-payments-direct/sdk-nodejs,
+  `src/generated/model/domain/index.ts`).
+- **The release is a major.** Before it the adapter ignored session `metadata`; now it sends
+  it to a field whose contract says it "must not contain any personal data", and session
+  creation refuses metadata it used to accept (below). The 2.0.0 release listed its new
+  session-creation refusals under "Breaking:", and behind `PaymentRouter` the refusal ends the
+  cascade, since `defaultShouldFailover` fails over only on a retryable error or a transient
+  code and `invalid_request` is neither: a session that reached Worldline before is refused
+  with no failover. The metadata is sent by default, as every other adapter that echoes
+  metadata sends it, with no switch to turn it off; the changeset and the guide's "Upgrading
+  from 2.x" note ask hosts to remove personal data and keep within the limit before upgrading.
+- **What is sent, and what is checked, is the JSON.** The adapter serializes the metadata once,
+  before any call to Worldline, with `JSON.stringify` and checks the parse of that exact string,
+  never the object's own entries, so what is sent is what reads back: an object's `toJSON`
+  decides what is sent, an entry JSON leaves out (an `undefined` value) is not sent, and a
+  `Map`, whose JSON is `{}`, sends nothing, as an empty object does. The signed session context
+  carries that parse, not the object, which the host may change while the session is being
+  created. It is an optional field, so a token signed before it was carried still decodes and
+  completes, sending none; a hand-minted context whose metadata's JSON is not an object with
+  entries sends none either. The host id stays on `merchantReference` alone and is not copied
+  into the metadata as `payfanout_id`, which would spend the 1000 characters on a value that
+  already round-trips. Replays are unaffected: the idempotence key replays by key, not by
+  payload.
+- **Refused at session creation, before any call to Worldline,** each as a non-retryable
+  `invalid_request`: metadata whose JSON is longer than 1000 characters; JSON that is not an
+  object (a string's, an array's, a `Date`'s), or no JSON at all (a function, and a `BigInt`
+  or a cycle, which `JSON.stringify` cannot write); and an entry whose value is not a string,
+  which would not read back. The contract is OpenAPI 3.0, whose `maxLength` is JSON Schema's
+  count of characters, defined as Unicode code points, and Worldline may count UTF-16 code
+  units or UTF-8 bytes instead. The adapter counts UTF-16 code units (JavaScript's `length`),
+  as its `merchantReference` and `softDescriptor` checks do: one per character of the Basic
+  Multilingual Plane and two for any other, such as an emoji, so nothing it lets through is
+  over 1000 code points or 1000 code units. The price is refusing metadata that only
+  characters outside that plane take past 1000 code units while it stays within 1000 code
+  points. UTF-8 bytes are not guarded: `JSON.stringify` leaves characters outside ASCII
+  unescaped, and each takes two to four bytes, so if Worldline counts bytes, such metadata can
+  pass the check and be refused by CreatePayment after the customer entered a card.
+- **What is read back.** `references.merchantParameters`, else, only when that is absent
+  (missing or null), the deprecated field. It becomes `metadata` only when it parses to a JSON
+  object with at least one entry, every value a string, as the adapter writes it. Anything else
+  leaves `metadata` unset and never throws, a value in another format among them, such as the
+  contract's own example, `SessionID=126548354&ShopperID=73541312`. A JSON object of strings
+  that another integration on the account stored there would read as metadata.
+- **A 3-D Secure challenge's `requires_action` answer** is built from the CreatePayment answer,
+  not from a read. The contract's schema for that answer's payment includes
+  `paymentOutput.references.merchantParameters`, but its description documents the echo "in
+  API GET calls and Webhook notifications" only. The answer reports the echo whenever it
+  carries the field, read by the rules above, so an echo that is not metadata reports none.
+  Only when it carries none (missing or null) does the metadata of the request that made the
+  payment stand in. For the completion's own payment that is the completion's own, as the JSON
+  it sent reads back: that request made the payment, which stores what was sent, and the Adyen
+  adapter's completion answer reports its context's metadata the same way. For an earlier
+  attempt's payment still open, which may be another session's, it is the metadata that
+  payment reads back with, never this session's, so a completion that returns an earlier
+  session's payment, a challenge or not, reports that payment's metadata. Reporting nothing
+  without an echo was rejected: it would report a payment that carries metadata as having
+  none, which the `retrievePayment` that follows would contradict.
+- **Webhooks.** `UnifiedWebhookEvent` has no metadata field, and the contract stays as it is,
+  so the package exports `readWorldlineWebhookMetadata(event)`, which applies the same rules to
+  the event's raw `payment.paymentOutput`; a refund resource alone yields nothing. It never
+  reads the refund resource's `refundOutput.references.merchantParameters` (nor the deprecated
+  `refundOutput.merchantParameters`): in the contract, RefundPayment takes references of its
+  own (`refundRequest.references`, the same `paymentReferences` schema), so that value is the
+  refund's, which the adapter never sends (its RefundPayment body is `amountOfMoney` alone),
+  and nothing says it repeats the payment's. The contract also marks `refundRequest.references`
+  and `refundOutput.references` deprecated ("**Deprecated for capture/refund**: Use
+  operationReferences instead."), and `refundOutput.merchantParameters` deprecated by
+  `references/merchantParameters`; the schema of `operationReferences`,
+  `operationPaymentReferences`, has no `merchantParameters`. The webhooks guide's examples
+  (docs.direct.worldline-solutions.com/en/integration/api-developer-guide/webhooks) carry
+  `references.merchantReference` and no `merchantParameters`, so the webhook echo rests on the
+  contract's description.
+- **Personal data and secrets** are the host's to keep out, as the JSDoc, the guide and the
+  README say; the adapter does not try to detect them. The session context is signed, not
+  encrypted, so whoever holds `pspSessionId` can read the metadata in it.
+  `createCompletionHandler` resolves `pspSessionId` on the server from the `sessionRef` the
+  browser sends (the session's `clientSecret`, for Worldline the `hostedTokenizationUrl`), so it
+  never has to reach the browser. The metadata does: the completion route answers the browser
+  with the whole `PaymentInfo` (`packages/server/src/completion.ts`), `metadata` included, and
+  after a read-back `raw` holds Worldline's echo, so the guide and the README say to treat
+  Worldline metadata as visible to the customer; in 2.x a Worldline completion carried neither.
+  Measured 2026-09-26 with the adapter and the fake: a minimal session's `pspSessionId` is 264
+  characters, and metadata at the limit adds 1,350 characters when it is ASCII, 2,672 when every
+  character takes two UTF-8 bytes (`é`) or is an emoji, and 3,995 when every character takes
+  three (`€`, `中`), the most it can add, as the JSON's UTF-8 bytes grow by base64url's four
+  characters per three bytes.
+- **`PaymentInfo.createdAt` comes from `paymentOutput.transactionDate`, when it carries a time
+  zone.** This supersedes the note in the same 2026-07-14 entry that it falls back to epoch.
+  The contract types it `format: date-time`, "It is the server-side processing date and time
+  of the transaction.", example `2019-08-24T14:15:22Z`, with the pattern
+  `^([12]\d{3}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01][0-9]|2[0-3]):[0-5]\d:[0-5]\d)(\.\d+)?Z?$`,
+  whose Z is optional. `paymentOutputSummary.transactionDate`, on GetPaymentsReport, is "Date
+  and time the payment was created in UTC", with the Z required. OpenAPI 3.0.0 defines
+  `date-time` "As defined by `date-time` - RFC3339 Section 5.6", whose `full-time` requires a
+  `time-offset`, `"Z" / time-numoffset`, with `time-numoffset = ("+" / "-") time-hour ":"
+  time-minute`. The adapter reads the contract's pattern with the zone made mandatory: Z,
+  `±HH:MM`, as on the webhooks guide's envelope `created`
+  (`2020-12-09T11:20:40.3744722+01:00`), and the hour-only `±HH`, which RFC 3339 does not
+  have but Worldline's Java SDK reads (below), with minutes 00. A value without a zone keeps
+  `1970-01-01T00:00:00.000Z`: the contract names no zone for it and Worldline's own SDKs
+  disagree, and a date that is visibly unknown is safer than one that may be hours out.
+  Fractional seconds are truncated to milliseconds, a day the month does not have is not a
+  date, and anything else, or no value, keeps the placeholder too.
+- **Worldline's SDKs on a `transactionDate` without a zone**, read 2026-09-26 on their default
+  branches:
+  - Java (github.com/wl-online-payments-direct/sdk-java): `PaymentOutput.transactionDate` is
+    a `ZonedDateTime`. `DefaultMarshaller`'s `ZonedDateTimeAdapter.read` tries
+    `DateTimeFormatter.ISO_OFFSET_DATE_TIME`, then `ISO_LOCAL_DATE_TIME` followed by
+    `appendOffset("+HH", "Z")`, and otherwise throws `DateTimeParseException` ("Unable to parse
+    date"). `DefaultMarshallerTest` pins both: `"2026-03-26T12:34:56+01"` parses as `+01:00`,
+    and `"2026-03-10T11:14:15"`, named `withoutOffset`, throws. The short offset came with
+    7.4.1 (2026-03-30): "Fixed deserialization of `ZonedDateTime` in the `DefaultMarshaller`
+    implementation."
+  - .NET (github.com/wl-online-payments-direct/sdk-dotnet): `PaymentOutput.TransactionDate` is
+    a `DateTimeOffset?`, read by Json.NET (`Newtonsoft.Json` 13.0.3 or later), whose
+    `DateTimeUtils.TryParseDateTimeOffsetIso` gives a value without a zone
+    `TimeZoneInfo.Local.GetUtcOffset(d)`, the offset of the machine it runs on
+    (github.com/JamesNK/Newtonsoft.Json, `Src/Newtonsoft.Json/Utilities/DateTimeUtils.cs`). The
+    SDK's `Unmarshal_WithDateTimeWithoutOffset_ParsesDateTime` asserts only the wall-clock
+    `DateTime`, and `Unmarshal_WithShortTimezoneOffset_NormalizesToFullOffset` reads `+01` as
+    `+01:00`.
+  - PHP (github.com/wl-online-payments-direct/sdk-php): `PaymentOutput::fromObject` does
+    `new DateTime($object->transactionDate)`. `DateTime::__construct` (php.net) uses "the
+    current timezone" unless the string specifies one, and `date_default_timezone_get()` takes
+    it from `date_default_timezone_set()`, else the `date.timezone` ini option, else UTC.
+  - Node (sdk-nodejs): `transactionDate` is `string | null`, left to the integrator.
+- **AMBIGUOUS: processing time or creation time.** "The server-side processing date and time
+  of the transaction" does not say whether a later operation moves it. The report schema's
+  "created" supports the creation time, but it describes another schema. Sandbox check: create
+  a payment with manual capture and read `transactionDate` from GetPayment, capture it some
+  minutes later and read it again, then refund it and read it once more; record whether it
+  moves and whether it carries a time zone, and in which form. If it moves, `createdAt`
+  reports a time later than the payment's creation, and the placeholder should come back.
+- **Sandbox checks for the metadata.** Complete one payment with metadata and record whether
+  GetPayment echoes it unchanged under `references`, whether the deprecated field carries it
+  too, whether the CreatePayment answer's payment echoes it (a challenge's answer reports the
+  metadata sent only when it does not), and whether the webhooks of the sale, of a capture and
+  of a refund echo it. Then send metadata whose JSON is 1000 code units of a character such as
+  `é` (1,992 UTF-8 bytes), and metadata within 1000 code points but over 1000 code units, to
+  learn whether Worldline counts code points, UTF-16 code units or UTF-8 bytes.
+- **The fake** stores `merchantParameters` (a string of at most 1000 code units, else a 400 on
+  the property) and echoes it under `references` on GetPayment and webhooks only. It never
+  echoes it on the deprecated field, so the round-trip tests prove the current field is read,
+  nor on the payment a CreatePayment or CancelPayment answer carries, where the contract does
+  not document it, so no test leans on an echo the platform may not send. It stamps
+  `transactionDate` when the payment is created, in the contract example's form
+  (`2019-08-24T14:15:22Z`), and leaves it on later operations: the creation-time reading,
+  unconfirmed. `webhookBody(paymentId, type)` builds a delivery around the payment as
+  GetPayment returns it.
+- **Doc-derived only.** No sandbox run has sent `merchantParameters` or read `transactionDate`.

@@ -263,6 +263,15 @@ interface CreatePaymentAnswer {
 /** What one CreatePayment answer settles: the payment to return, or the failed attempt the next key derives from. */
 type SettledAttempt = { info: PaymentInfo } | { after: string; replayOf: string };
 
+/** What the test-connection probe read (see probeStatus). */
+interface ConnectionProbe {
+  status: number;
+  /** The body carries the service's OK answer, `"result": "OK"`. */
+  answeredOk: boolean;
+  /** The first error's id, when it reads as one (see firstErrorName). */
+  errorName: string | undefined;
+}
+
 export class WorldlineServerAdapter implements ServerPaymentAdapter {
   readonly pspName = WORLDLINE_PSP_NAME;
   private readonly config: WorldlineServerAdapterConfig;
@@ -891,29 +900,63 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
   }
 
   /**
-   * "Test connection" probe: one side-effect-free read against the account's
-   * test-connection service. Authentication is settled before the resource is
-   * resolved, so only 401/403 means bad credentials; any other status proves the
-   * credentials authenticated. A single call, never retried.
+   * "Test connection" probe: one side-effect-free GET against the account's
+   * test-connection service, `/v2/{merchantId}/services/testconnection`. It
+   * reads the RAW HTTP status, so an auth rejection (401/403; Worldline answers
+   * a key, secret or PSPID it cannot match, or keys of the other environment,
+   * with a 403) is told apart from an outage (429/5xx) from the status line
+   * alone. Only a 2xx carrying the service's OK answer, `"result": "OK"`,
+   * passes: "If you receive an OK result you know that your connection with us
+   * is working correctly" (Connect S2S API reference, Test connection). Any
+   * other answer that is neither an auth rejection nor an outage means the
+   * probe did not get that answer: a `baseUrl` override is wrong (Worldline
+   * answers a wrong endpoint with an empty body), names a host that answers 2xx
+   * with something else, or the service answered a result other than OK, which
+   * no Worldline page documents. It reports `internal`, naming the HTTP status
+   * and, on a non-2xx, the first error's id when it reads as one. A single
+   * call, never retried; never mutates PSP state, never puts a credential in
+   * the result.
    */
   async verifyCredentials(): Promise<VerifyCredentialsResult> {
-    let status: number;
+    let probe: ConnectionProbe;
     try {
-      status = await this.probeStatus(`/v2/${this.merchantPath()}/services/testconnection`);
+      probe = await this.probeStatus(`/v2/${this.merchantPath()}/services/testconnection`);
     } catch {
+      // requestWithTimeout rejects only on a network failure or timeout.
       return { ok: false, category: "network", message: "Could not reach Worldline — try again." };
     }
+    const { status, answeredOk, errorName } = probe;
+    if (status >= 200 && status < 300) {
+      if (answeredOk) return { ok: true };
+      return {
+        ok: false,
+        category: "internal",
+        message: `Worldline answered the connectivity check without an OK result (HTTP ${status}) — check baseUrl.`,
+      };
+    }
     if (status === 401 || status === 403) {
+      // A host at a mis-pasted baseUrl, such as a CDN, can answer 403 too.
+      const checked = this.config.baseUrl
+        ? "API key id, secret API key, merchantId, environment and baseUrl"
+        : "API key id, secret API key, merchantId and environment";
+      // A request dated more than five minutes off is refused the same way (manual-authentication guide).
       return {
         ok: false,
         category: "auth",
-        message: "Authentication failed — check the Worldline API key id and secret.",
+        message: `Authentication failed — check the Worldline ${checked}, and the server's clock.`,
       };
     }
     if (status === 429 || status >= 500) {
       return { ok: false, category: "network", message: "Could not reach Worldline — try again." };
     }
-    return { ok: true };
+    // Whatever answers a wrong baseUrl writes the body, and the request named the API key id.
+    const credentials = [this.config.apiKeyId, this.config.secretApiKey];
+    const named = errorName && !repeatsCredential(errorName, credentials) ? `, ${errorName}` : "";
+    return {
+      ok: false,
+      category: "internal",
+      message: `Worldline rejected the connectivity check (HTTP ${status}${named}) — check baseUrl and merchantId.`,
+    };
   }
 
   async verifyWebhookSignature(rawBody: string, headers: Record<string, string>): Promise<boolean> {
@@ -1122,9 +1165,12 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
   /**
    * One read-only exchange returning the RAW HTTP status instead of mapping a
    * non-2xx into a PayFanoutError — verifyCredentials needs the status itself to
-   * tell an auth rejection (401/403) from an outage (5xx/429). No retry loop.
+   * tell an auth rejection (401/403) from an outage (5xx/429). From the body
+   * the exchange already read, it also reports whether that body is the
+   * test-connection service's OK answer, and its first error's id. No retry
+   * loop. A network failure/timeout rejects.
    */
-  private async probeStatus(path: string): Promise<number> {
+  private async probeStatus(path: string): Promise<ConnectionProbe> {
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
     const date = new Date(this.now()).toUTCString();
     const authorization = await buildV1HmacAuthorization({
@@ -1135,7 +1181,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       date,
       gcsHeaders: {},
     });
-    const { response } = await requestWithTimeout(
+    const { response, text } = await requestWithTimeout(
       {
         fetch: this.config.fetch ?? fetch,
         timeoutMs,
@@ -1145,7 +1191,12 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       `${this.baseUrl}${path}`,
       { method: "GET", headers: { authorization, date } },
     );
-    return response.status;
+    const json = safeJson(text) as { result?: unknown; errors?: unknown } | null | undefined;
+    return {
+      status: response.status,
+      answeredOk: json?.result === "OK",
+      errorName: firstErrorName(json?.errors),
+    };
   }
 }
 
@@ -1670,6 +1721,38 @@ function unmappedRejectionCode(status: unknown): UnifiedErrorCode {
 function firstErrorCode(errors: unknown): string | undefined {
   const first: WorldlineApiError | null | undefined = Array.isArray(errors) ? errors[0] : undefined;
   return first?.errorCode || first?.code || undefined;
+}
+
+/**
+ * Worldline's error ids are upper-case snake_case codes ("UNKNOWN_PAYMENT_ID"):
+ * nothing else in the slot is matched or echoed.
+ */
+const ERROR_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
+
+/**
+ * The first error's `id`, "a short human-readable message that briefly
+ * describes the error" (API contract), when it reads as an error id. Only the
+ * first error is read, as for its code.
+ */
+function firstErrorName(errors: unknown): string | undefined {
+  const first: WorldlineApiError | null | undefined = Array.isArray(errors) ? errors[0] : undefined;
+  const id: unknown = first?.id;
+  return typeof id === "string" && ERROR_NAME.test(id) ? id : undefined;
+}
+
+/**
+ * Whether an error id holds a credential, or eight characters or more of one,
+ * in any letter case (an id has no lower-case letters, see ERROR_NAME).
+ */
+function repeatsCredential(errorName: string, credentials: readonly string[]): boolean {
+  return credentials.some((credential) => {
+    const capitals = credential.toUpperCase();
+    const span = Math.min(8, capitals.length);
+    for (let start = 0; start + span <= capitals.length; start++) {
+      if (errorName.includes(capitals.slice(start, start + span))) return true;
+    }
+    return false;
+  });
 }
 
 /** Own keys only: the code is Worldline's text, and "constructor" names no mapping. */

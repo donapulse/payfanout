@@ -572,13 +572,15 @@ describe("GoCardless verifyCredentials (Test connection probe)", () => {
       { accessToken: codeShaped },
     );
     await expect(adapter.verifyCredentials()).resolves.toEqual(statusOnly);
-    // Nor is a stretch of the token that reads as a code.
-    const fragment = answering(
-      404,
-      JSON.stringify({ error: { code: 404, errors: [{ reason: "fragmenttoken", message: "x" }] } }),
-      { accessToken: "sandbox_fragmenttoken_1234" },
-    );
-    await expect(fragment.adapter.verifyCredentials()).resolves.toEqual(statusOnly);
+    // Nor is a stretch of the token that reads as a code, from eight characters up.
+    for (const stretch of ["fragmenttoken", "fragment"]) {
+      const fragment = answering(
+        404,
+        JSON.stringify({ error: { code: 404, errors: [{ reason: stretch, message: "x" }] } }),
+        { accessToken: "sandbox_fragmenttoken_1234" },
+      );
+      await expect(fragment.adapter.verifyCredentials(), stretch).resolves.toEqual(statusOnly);
+    }
     // A code at the 64-character limit is named.
     const longest = "a".repeat(64);
     const atLimit = answering(404, JSON.stringify({ error: { code: 404, errors: [{ reason: longest, message: "x" }] } }));

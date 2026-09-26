@@ -341,8 +341,9 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * the RAW HTTP status so an auth rejection (401/403) is told apart from an
    * outage (429/5xx) directly from the status line, never from a body that a
    * proxy or edge error page may not carry. Only a 2xx answer carrying the
-   * payment list (`{ payments: [...] }`) passes. Any other answer means the
-   * probe never reached that list, as when a `baseUrl` or `goCardlessVersion`
+   * payment list (`{ payments: [...] }`) passes. Any other answer that is
+   * neither an auth rejection nor an outage means the probe never reached
+   * that list, as when a `baseUrl` or `goCardlessVersion`
    * override is wrong (GoCardless documents `path_not_found` and
    * `version_not_found`), or a `baseUrl` names a host that answers 200 with
    * something else: it reports `internal`, naming the HTTP status and, when

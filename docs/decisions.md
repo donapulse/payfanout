@@ -5001,3 +5001,95 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   - **Whether the portals' merchant transaction ID is the Payments API's `merchantRefNum`.**
     Search the Business Portal for a settlement by the reference it was made under, and
     record whether it finds it.
+
+## Paysafe: CLP, ISK and BYR excluded (2026-09-27)
+
+- **Paysafe's minor units are those of its own currency table.** Doc-verified 2026-09-26. The
+  Payments API spec
+  (developer.paysafe.com/fileadmin/openapi-spec/payments-api/apis/paysafe-ph-payments-api.yaml)
+  gives `amount` on `POST /v1/payments` as "This is the amount of the request, in minor units.
+  For example, to process US $10.99, this value should be 1099. See [Currency
+  Codes](https://developer.paysafe.com/en/support/reference-information/codes/#currency-codes).",
+  and links the same table from `amount` on voidauths and payment handles and from
+  `currencyCode`. The Payment Scheduler spec
+  (developer.paysafe.com/fileadmin/openapi-spec/subscriptionsplans-api/apis/paysafe-psp-subscriptionsplans-api.yaml)
+  gives the plan `amount` "in minor units" and links the table from the plan's `currencyCode`.
+  The table (developer.paysafe.com/en/support/reference-information/codes/#currency-codes;
+  columns Currency, ISO Code, Exponent Number) has 81 rows. Its introduction reads "The
+  currencies listed in the table below are those in which transaction requests are
+  processed.", "Before going live, ensure to test the end-to-end payment flow, from
+  transaction request to settlement, to verify the right exponent is applied to the
+  currencies." and "If the currency you need for the merchant account is not included in this
+  table, speak to your Account Manager." One `currencyCode` in the spec links an
+  `iso-standards` page instead, which answers 404.
+- **The table against core, row by row.** Compared programmatically on 2026-09-26 with core's
+  `getCurrencyExponent` and with the ISO 4217 lists SIX publishes (list one of 2026-09-17, list
+  three of 2026-01-01): 79 rows agree with core, two do not.
+  - **CLP** has the exponent 2 at Paysafe and 0 in ISO 4217 and core. Sent unchanged, CLP 10,000
+    (`amount: 10000`) was charged as CLP 100.00, a hundredth of the price.
+  - **BYR** has 0 at Paysafe and 2 in core, which does not list the code: list three gives it as
+    withdrawn in 2017-01. A BYR amount in core minor units would be charged a hundred times
+    over. A check against ISO 4217 alone misses the row, as list one no longer carries BYR, but
+    the adapter's amounts are core's minor units, so it is refused on the same grounds as CLP.
+  - HRK, LVL and VEF, also withdrawn, and BGN, withdrawn in 2026-01, have 2 on both sides, as do
+    the table's other two-exponent rows. Its other zero-exponent rows (JPY, KRW, PYG, RWF, VND)
+    and every three-exponent row (BHD, JOD, KWD, LYD, OMR, TND) match core.
+- **ISK is a processing currency with no documented exponent.** The card payments page
+  (developer.paysafe.com/en/api-docs/payments-api/add-payment-methods/cards/about-card-payments/)
+  lists "Processing currencies USD, CAD, AUD, EUR, GBP, NOK, ISK, PLN, …, and many more.
+  Please contact your Relationship/ Account manager." ISK is the one currency there, of 31
+  processing and 15 settlement currencies, that the table has no row for, which contradicts
+  the table's own introduction. ISO 4217 gives ISK 0; Adyen prices it with 2 (see the Adyen
+  exclusion above), so an exponent of 2 at Paysafe is plausible, and ISK 10,000 sent as 10000
+  would then be charged as ISK 100.00. It is refused until the sandbox check below settles it.
+- **Refused, never converted.** A conversion would rest on a table no sandbox run has
+  confirmed, and a wrong entry would charge a hundred times the price. Every call that would
+  send an amount in these currencies, or sign one for sending, refuses with a non-retryable
+  `invalid_request` before any request: `createPaymentSession` on every rail,
+  `updatePaymentSession` (the new currency, or the context's), `completePayment` for a context
+  an earlier release signed or one made with the exported `encodeSessionContext` (card and
+  bank-debit paths), `chargeSavedPaymentMethod` and `createNativeSubscription` (inline plan or
+  `planId`). `capturePayment`, `cancelPayment` and `refundPayment` read the payment and refuse
+  one Paysafe holds in these currencies before any settlement, void or refund request, sending
+  the host to the Paysafe portal. Reads refuse with `unsupported_operation`: `retrievePayment`
+  (before its settlement lookups), `retrieveRefund` (from the refund's `currencyCode`, which
+  the spec's "Look Up Refund" example carries), `retrieveNativeSubscription`, and
+  `listNativeSubscriptions`, which fails the whole page and names each subscription in such a
+  currency. `cancelNativeSubscription` sends no amount but answers with the record: it now
+  reads the subscription before its PATCH, and refuses such a one with `unsupported_operation`,
+  since a cancel that went through and then failed to report would fail every retry too. Every
+  cancel pays that read. Webhook events in these currencies carry no `amount` and keep
+  `currency`, as the Adyen adapter's do. `verifyPaymentMethod` sends no amount and reports 0,
+  so it is left alone. One constant, `src/currency-exponents.ts`, drives every refusal and the
+  webhook omission.
+- **`supportedCurrencies` stays undeclared**, as for Adyen: the capability is an allowlist, and
+  the table does not list every currency Paysafe processes ("and many more", and the Account
+  Manager line), so a declared list would refuse currencies Paysafe takes. The router therefore
+  cannot pre-screen these three: a Paysafe candidate asked for one refuses with
+  `invalid_request`, which ends the cascade, and hosts route them elsewhere with a currency
+  rule (setup guide). A core capability listing the currencies an adapter refuses would let the
+  router skip it; that is a contract change, and a follow-up of its own.
+- **A subscription list holding such a subscription fails whole.** The scheduler lists
+  cancelled subscriptions too, so an account holding one cannot be listed through the adapter,
+  and the others are retrieved by id. Leaving such records off the page was rejected: it would
+  drop them silently.
+- **Tests.** Paysafe's table ships as a fixture and each row goes through
+  `createPaymentSession`: a row whose exponent agrees with core creates its session, the others
+  and ISK are refused, and the refused set is exactly BYR, CLP and ISK. Against develop
+  (8f88c07) the ten exclusion tests and the conformance fixture fail, and JPY, KWD and USD
+  round-trip unchanged before and after. Removing each refusal, each entry of the constant or
+  the webhook omission made a test fail. The conformance suite passes unchanged.
+- **Sandbox checks, not run.** Both need a merchant account provisioned in the currency; the
+  reference sandbox account is CAD-only. The API reads back the integer it was sent in either
+  case, so the witness is the Paysafe portal, which shows the major-unit amount, or the
+  cardholder's 3-D Secure screen.
+  - **ISK.** Pay and settle `amount: 1000` in ISK, then read the transaction in the portal. ISK
+    1,000 means Paysafe uses the exponent 0, and ISK can leave the exclusion. ISK 10.00 means 2:
+    ISK stays refused, as a documented deviation like CLP.
+  - **CLP.** The same with `amount: 1000`: CLP 10.00 confirms the table. CLP stays refused
+    either way unless a conversion is decided.
+- **Open, not changed here.** The scheduler spec's plan `amount`, like the Payments API's
+  `purchaseReturnAuthorization` `amount`, adds "If the merchant account is set up for a currency
+  that has 3 decimal units, our system will half round up the least significant digit.", which
+  the latter completes with "Therefore, a transaction of 10.139 Tunisian dinar would be
+  processed as 10.14." How the scheduler bills a three-decimal plan is a question of its own.

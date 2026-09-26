@@ -47,6 +47,12 @@ import {
   type VerifyPaymentMethodInput,
 } from "@payfanout/core";
 import {
+  assertActionableRecord,
+  assertReportableRecord,
+  assertReportableRecords,
+  assertSendableCurrency,
+} from "./currency-exponents.js";
+import {
   decodeSessionContext,
   encodeSessionContext,
   type PaysafeSessionContextV1,
@@ -1252,10 +1258,15 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * account, webhookUrl, ...) that completePayment later verifies and trusts.
    * Paysafe's per-session webhook registration requirement is honored by
    * carrying webhookUrl in this context into the /payments request.
+   *
+   * CLP, ISK and BYR are refused with `invalid_request`: Paysafe's minor
+   * units for them are not the ISO 4217 ones PayFanout amounts are in, and
+   * the adapter does not convert.
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertMinorUnitAmount(input.amount, "amount");
     const currency = normalizeCurrency(input.currency);
+    assertSendableCurrency(currency);
     if (input.paymentMethodTypes?.some((t) => !this.isKnownMethodType(t))) {
       throw PayFanoutError.invalidRequest(
         `Paysafe adapter does not support one of the requested payment method types: ${input.paymentMethodTypes.join(", ")}`,
@@ -1413,6 +1424,9 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     }
     if (input.amount !== undefined) assertMinorUnitAmount(input.amount, "amount");
     const currency = input.currency !== undefined ? normalizeCurrency(input.currency) : context.currency;
+    // The context's own currency too: an earlier release may have signed
+    // one the adapter now refuses.
+    assertSendableCurrency(currency);
     // A bank-debit session keeps its rail across updates, so the rail's
     // currency guard must hold for the NEW currency too — otherwise an update
     // slips past the creation guard and dies at Paysafe instead of here.
@@ -1472,6 +1486,9 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    */
   async completePayment(input: CompletePaymentInput): Promise<PaymentInfo> {
     const context = await this.decodeContext(input.pspSessionId);
+    // A context signed by an earlier release, or with encodeSessionContext,
+    // can still carry an excluded currency.
+    assertSendableCurrency(context.currency);
     // Bank-debit sessions have no handle yet at all: it is minted here, from
     // the bank details the client's envelope carries.
     const bankPaymentType = context.paymentType;
@@ -1670,8 +1687,13 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     return (this.config.sessionTtlSeconds ?? 3600) * 1000;
   }
 
+  /**
+   * A payment in CLP, ISK or BYR is refused with `unsupported_operation`:
+   * its Paysafe amounts cannot be reported in ISO 4217 minor units.
+   */
   async retrievePayment(pspPaymentId: string): Promise<PaymentInfo> {
     const payment = await this.fetchPayment(pspPaymentId);
+    assertReportableRecord(payment.currencyCode, `Payment ${pspPaymentId}`, payment);
     return this.toPaymentInfo({ ...payment, settlements: await this.findSettlements(payment) });
   }
 
@@ -1715,6 +1737,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   ): Promise<PaymentInfo> {
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
     const payment = await this.fetchPayment(pspPaymentId);
+    assertActionableRecord(payment.currencyCode, `Payment ${pspPaymentId}`, "Capture", payment);
     // Whether this is a full capture cannot change on a replay: `amount` is
     // the caller's, and the authorized amount is fixed.
     if (amount === undefined || amount === payment.amount) return this.captureInFull(pspPaymentId, payment, amount);
@@ -1877,6 +1900,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    */
   async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
     const payment = await this.fetchPayment(pspPaymentId);
+    assertActionableRecord(payment.currencyCode, `Payment ${pspPaymentId}`, "Void", payment);
     // Voidauths also require an explicit amount (full remaining authorization).
     const remaining = remainingToSettle(payment);
     // Voidauths take no dupCheck, so a replay is caught by lookup alone: an
@@ -1987,6 +2011,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
     if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
     const payment = await this.fetchPayment(req.pspPaymentId);
+    assertActionableRecord(payment.currencyCode, `Payment ${req.pspPaymentId}`, "Refund", payment);
     const rail = NON_REFUNDABLE_RAILS[(payment.paymentType ?? "").toUpperCase()];
     if (rail) {
       throw new PayFanoutError({
@@ -2053,9 +2078,11 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       id: string;
       status?: string;
       amount?: number;
+      currencyCode?: string;
       txnTime?: string;
       paymentId?: string;
     }>("GET", `/paymenthub/v1/refunds/${encodeURIComponent(refundId)}`);
+    assertReportableRecord(refund.currencyCode, `Refund ${refundId}`, refund);
     const createdAt = paysafeTime(refund.txnTime);
     return {
       refundId: refund.id,
@@ -2226,6 +2253,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   async chargeSavedPaymentMethod(input: ChargeSavedPaymentMethodInput): Promise<PaymentInfo> {
     assertMinorUnitAmount(input.amount, "amount");
     const currency = normalizeCurrency(input.currency);
+    assertSendableCurrency(currency);
     const merchantAccountId = this.config.merchantAccountResolver(currency, undefined) || undefined;
     const occurrence = input.occurrence ?? "recurring";
     const replay = paymentWrite(input.idempotencyKey, input.amount, currency, input.savedPaymentMethodToken, false);
@@ -2286,6 +2314,11 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       `${SCHEDULER_BASE}/subscriptions?limit=${limit}&offset=${offset}&${SUBSCRIPTION_FIELDS}`,
     );
     const records = result.subscriptions ?? [];
+    assertReportableRecords(
+      records.map((s) => ({ id: s.id, currency: s.plan?.currencyCode })),
+      "subscription",
+      result,
+    );
     return {
       subscriptions: records.map((s) => this.toNativeSubscription(s)),
       ...(records.length === limit ? { nextCursor: String(offset + records.length) } : {}),
@@ -2334,6 +2367,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       throw PayFanoutError.invalidRequest("Paysafe subscription installments must be at least 1 minor unit");
     }
     const currency = normalizeCurrency(input.currency);
+    assertSendableCurrency(currency);
     if (!input.savedPaymentMethodToken) {
       throw PayFanoutError.invalidRequest(
         "createNativeSubscription requires savedPaymentMethodToken — the MULTI_USE token savePaymentMethod returned",
@@ -2403,7 +2437,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * already stopped can never fail a replayed cancel. The PATCH carries no
    * merchantRefNum (the scheduler has none there); replay safety comes from
    * CANCELLED being absorbing plus that re-fetch, which is why the required
-   * idempotencyKey has no wire mapping on this call.
+   * idempotencyKey has no wire mapping on this call. The subscription is
+   * read first, and one billing in CLP, ISK or BYR is refused with
+   * `unsupported_operation` before the PATCH: the answer could not report
+   * its amounts.
    */
   async cancelNativeSubscription(
     input: CancelNativeSubscriptionInput,
@@ -2411,6 +2448,16 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     if (!input.subscriptionId) {
       throw PayFanoutError.invalidRequest("cancelNativeSubscription requires subscriptionId");
     }
+    // The cancel sends no amount, but its answer reports them: a subscription
+    // in an excluded currency is refused before it is cancelled, not after.
+    const current = await this.fetchSubscription(input.subscriptionId);
+    assertActionableRecord(
+      current.plan?.currencyCode,
+      `Subscription ${input.subscriptionId}`,
+      "Cancel",
+      current,
+      "unsupported_operation",
+    );
     try {
       const patched = await this.request<PaysafeSubscriptionLike>(
         "PATCH",
@@ -2515,6 +2562,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     fallbackPlan?: PaysafePlanLike,
   ): NativeSubscriptionRecord {
     const plan = sub.plan ?? fallbackPlan;
+    assertReportableRecord(plan?.currencyCode, `Subscription ${sub.id}`, sub);
     const interval = FREQUENCY_TO_INTERVAL[(plan?.billingCycle?.frequency ?? "").toUpperCase()];
     const planInterval = plan?.billingCycle?.interval;
     const intervalCount =

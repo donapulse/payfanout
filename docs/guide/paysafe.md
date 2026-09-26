@@ -115,6 +115,45 @@ everything completion needs, signed. Interac e-Transfer is the exception: Paysaf
 tokenize it, so the handle is minted server-side at session creation (§8).
 :::
 
+### Currencies the adapter refuses
+
+PayFanout amounts are ISO 4217 minor units, and the adapter sends them to Paysafe unchanged.
+Paysafe reads `amount` in the minor units of its own
+[currency table](https://developer.paysafe.com/en/support/reference-information/codes/#currency-codes),
+which disagrees on three currencies:
+
+| Currency | Paysafe's exponent | PayFanout's exponent (ISO 4217) |
+| --- | --- | --- |
+| CLP | 2 | 0 |
+| ISK | none documented: the card payments page lists ISK as a processing currency, the table has no row for it | 0 |
+| BYR | 0 | 2: ISO 4217 withdrew BYR in 2017, and PayFanout reads a code it does not list as 2 |
+
+Sent unchanged, CLP 10,000 (`amount: 10000`) would be charged as CLP 100.00. Nor does the
+adapter convert: no sandbox run has confirmed Paysafe's table, and a conversion built on a
+wrong entry would charge a hundred times too much. So, in these three currencies:
+
+- `createPaymentSession`, `updatePaymentSession`, `chargeSavedPaymentMethod` and
+  `createNativeSubscription` reject with a non-retryable `invalid_request` before calling
+  Paysafe, and so does `completePayment` for a session an earlier release signed in one.
+- `capturePayment`, `cancelPayment` and `refundPayment` on a payment Paysafe holds in one (made
+  by an earlier release, or by another integration on the account) read the payment, then
+  reject with `invalid_request` before sending anything: capture, void or refund it in the
+  Paysafe portal.
+- `retrievePayment`, `retrieveRefund` and `retrieveNativeSubscription` reject with
+  `unsupported_operation`, since the amounts cannot be reported in ISO 4217 minor units: read
+  them in the Paysafe portal. `cancelNativeSubscription` reads the subscription first and
+  rejects the same way before cancelling it. `listNativeSubscriptions` fails the whole page,
+  naming each subscription it cannot report, and the scheduler lists cancelled subscriptions
+  too, so an account holding one cannot be listed through the adapter: retrieve the others by
+  id.
+- Webhook events for them carry no `amount`; `currency` and every other field stay.
+
+The adapter declares no `supportedCurrencies`, because Paysafe's table does not list every
+currency it processes, so the router cannot skip Paysafe for these three on its own. Route them
+to another provider with a rule of their own,
+`{ when: { currency: ["CLP", "ISK", "BYR"] }, use: ["<psp>"] }`
+([routing and failover](/guide/server#routing-failover)).
+
 ## 5. Wire the client adapter
 
 ```tsx
@@ -671,6 +710,8 @@ your Paysafe portal** rather than assuming.
 - [ ] Set `environment: "live"` on **both** adapters (host flips to `api.paysafe.com`).
 - [ ] Confirm your **live** merchant account ids per currency/country and that
       `merchantAccountResolver` returns them.
+- [ ] Route CLP, ISK and BYR payments to another provider: the adapter refuses them (§4,
+      "Currencies the adapter refuses").
 - [ ] Register the **live** notification endpoint in the portal and use its **live** HMAC
       key.
 - [ ] Keep `PAYSAFE_SESSION_KEY` stable and secret in production, rotate it deliberately

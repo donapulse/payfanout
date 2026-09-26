@@ -241,6 +241,12 @@ runServerAdapterConformanceTests(
         expectedCode: "unsupported_operation",
       },
       {
+        // Paysafe's currency table gives CLP the exponent 2, ISO 4217 gives 0.
+        name: "createPaymentSession in a currency the adapter excludes",
+        invoke: (a) => a.createPaymentSession({ amount: 10_000, currency: "CLP", idempotencyKey: "k-clp" }),
+        expectedCode: "invalid_request",
+      },
+      {
         name: "completePayment with an expired session context",
         invoke: async (a) => {
           const expired = await encodeSessionContext(

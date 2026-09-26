@@ -50,7 +50,7 @@ const BASE_TIME = Date.parse("2026-07-07T10:00:00.000Z");
  * only — so a repeated cancel answers cancellation_failed. Where the docs
  * leave a refund rule open, a flag
  * selects the reading (refundCapEnforced, totalAmountConfirmationChecked,
- * keyCheckedBeforeBody).
+ * keyCheckedBeforeBody, refundsDisabledReason).
  */
 export class FakeGoCardlessApi {
   private readonly billingRequests = new Map<string, FakeBillingRequest>();
@@ -67,6 +67,12 @@ export class FakeGoCardlessApi {
   private networkFailure = 0;
 
   refundsEnabled = true;
+  /**
+   * The reason the 403 of a disabled refunds endpoint names. The docs do not
+   * say which: `forbidden` ("Authenticated but no permission to access this
+   * resource") or `feature_disabled` ("Feature not enabled on your account").
+   */
+  refundsDisabledReason: "forbidden" | "feature_disabled" = "forbidden";
   /**
    * The API reference names no cap on a refund's amount (the support centre's
    * "up to the full amount of that payment" describes the Dashboard). Off
@@ -346,7 +352,7 @@ export class FakeGoCardlessApi {
           message: "You do not have the correct permissions to make this request",
           type: "invalid_api_usage",
           code: 403,
-          errors: [{ reason: "forbidden", message: "Refunds are not enabled for this account" }],
+          errors: [{ reason: this.refundsDisabledReason, message: "Refunds are not enabled for this account" }],
         },
       });
     }

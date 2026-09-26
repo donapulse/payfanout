@@ -412,6 +412,50 @@ choices they forced:
     billing request and record the answer (the adapter no longer does either); (S4)
     create a refund, read the payment at once, and record whether `amount_refunded`
     includes it.
+- **Doc-verified 2026-09-26: the connection check and 403 messages.** Checked against the
+  Responses and Errors page, the create-a-refund reference and the OpenAPI spec
+  (docs.gocardless.com).
+  - *`verifyCredentials`.* The probe reads the payment list, whose 200 ("Request
+    succeeded.") the spec defines as `{ payments: [...], meta }`, so only a 2xx carrying
+    that list passes; 401/403 stay `auth` and 429/5xx stay `network`. Any other answer
+    reported `ok: true` and now reports `internal`: a wrong `baseUrl` or
+    `goCardlessVersion` override gets an answer that is not the list, and GoCardless
+    documents `path_not_found` ("URL path not recognised. Check spelling and
+    formatting.") and `version_not_found` ("Specified version does not exist.") for them.
+    A `baseUrl` naming a host that is not the API, such as a web page, can answer 200
+    with something else; without the list that is `internal` too.
+    Unlike the Paysafe probe, which looks up an id that does not exist and expects a 404,
+    no other answer shows the credentials working. The message names the status and the
+    first `errors[].reason` of the body the probe already read ("For all other types,
+    each item has a `reason` and `message`"). A reason is echoed only when it reads as a
+    lowercase snake_case code of at most 64 characters (every documented reason does; the
+    longest has 46) and neither contains the access token nor is a stretch of it of eight
+    characters or more: a wrong `baseUrl` sends the token to whatever answers, and that
+    server writes the body. Observed 2026-09-26 without credentials against the sandbox
+    host: `GoCardless-Version: 2030-01-01` answers 400 `version_not_found` before any
+    authentication, which the probe reports as `internal (HTTP 400, version_not_found)`,
+    and an unknown path answers a plain-text 404 with no error envelope.
+  - *403 messages.* A 403 is "Valid credentials but insufficient permissions for this
+    resource", and its message now follows the first reason: `feature_disabled`
+    ("Feature not enabled on your account. Contact support to enable."),
+    `insufficient_permissions` ("Token doesn't have the required scope."; the Set Up page
+    asks for a token with Read-Write access) and
+    `insufficient_permissions_continue_on_dashboard` ("Action can only be performed from
+    the GoCardless dashboard.", shown on a 403 on the Sending Money partner page). On a
+    `/refunds` path, `feature_disabled` reads as refunds not enabled, to be enabled on the
+    Dashboard, as the create-a-refund reference says: "This endpoint is disabled by
+    default. To enable it, you will need to enable refunds on your GoCardless Dashboard."
+    Any other reason there, or none, names both causes: refunds not enabled, or a token
+    without permission. Elsewhere `feature_disabled` keeps the documented advice to
+    contact support. The code stays `invalid_request`, never retryable.
+  - **AMBIGUOUS:** which status and reason a refund gets on an account with refunds disabled
+    (`feature_disabled` or `forbidden`; the spec lists no 403 for `POST /refunds`). The docs
+    also differ on how refunds are switched on: the API reference says the Dashboard, the
+    partner integration guide says refunds are "available for all customers who request this
+    feature", and the partner go-live checklist has the partnerships team enable them in the
+    sandbox. The fake answers the refunds gate with a 403 naming either reason
+    (`refundsDisabledReason`). Sandbox check: create a refund on an account with refunds
+    disabled and record the status and reason.
 
 ## PayPal adapter (2026-07-07)
 

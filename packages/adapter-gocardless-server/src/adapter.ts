@@ -340,25 +340,34 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * connection" button. Makes ONE read-only GET /payments (limit 1) and reads
    * the RAW HTTP status so an auth rejection (401/403) is told apart from an
    * outage (429/5xx) directly from the status line, never from a body that a
-   * proxy or edge error page may not carry. Only a 2xx answer passes. Any
-   * other status means the probe never reached the payment list, as when a
-   * `baseUrl` or `goCardlessVersion` override is wrong (GoCardless documents
-   * `path_not_found` and `version_not_found`): it reports `internal`, naming
-   * the HTTP status and, when the body carries one, GoCardless's error reason.
+   * proxy or edge error page may not carry. Only a 2xx answer carrying the
+   * payment list (`{ payments: [...] }`) passes. Any other answer means the
+   * probe never reached that list, as when a `baseUrl` or `goCardlessVersion`
+   * override is wrong (GoCardless documents `path_not_found` and
+   * `version_not_found`), or a `baseUrl` names a host that answers 200 with
+   * something else: it reports `internal`, naming the HTTP status and, when
+   * the body carries one, GoCardless's error reason.
    * A single shot with no transport retry loop: a "Test connection" click
    * cannot hang on backoff, and a bad key is not replayed. Never mutates PSP
    * state, never puts the token in the result.
    */
   async verifyCredentials(): Promise<VerifyCredentialsResult> {
-    let probe: { status: number; reason?: string };
+    let probe: { status: number; listed: boolean; reason?: string };
     try {
       probe = await this.probeStatus("/payments?limit=1");
     } catch {
       // requestWithTimeout rejects only on a network failure or timeout.
       return { ok: false, category: "network", message: "Could not reach GoCardless — try again." };
     }
-    const { status, reason } = probe;
-    if (status >= 200 && status < 300) return { ok: true };
+    const { status, reason, listed } = probe;
+    if (status >= 200 && status < 300) {
+      if (listed) return { ok: true };
+      return {
+        ok: false,
+        category: "internal",
+        message: `GoCardless answered the connectivity check without a payment list (HTTP ${status}) — check baseUrl.`,
+      };
+    }
     if (status === 401 || status === 403) {
       return {
         ok: false,
@@ -370,7 +379,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       return { ok: false, category: "network", message: "Could not reach GoCardless — try again." };
     }
     // Whatever answers a wrong baseUrl writes the body, and it was sent the token.
-    const named = reason && !reason.includes(this.config.accessToken) ? `, ${reason}` : "";
+    const named = reason && !mentionsToken(reason, this.config.accessToken) ? `, ${reason}` : "";
     return {
       ok: false,
       category: "internal",
@@ -1314,11 +1323,12 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * One read-only exchange returning the RAW HTTP status instead of mapping a
    * non-2xx into a PayFanoutError — verifyCredentials needs the status itself to
    * tell an auth rejection (401/403) apart from an outage (429/5xx), without
-   * depending on the error body carrying a numeric code. A non-2xx also returns
-   * the first error reason of the body the exchange already read. No retry
-   * loop: a single probe is the contract. A network failure/timeout rejects.
+   * depending on the error body carrying a numeric code. It also returns, from
+   * the body the exchange already read, whether a 2xx carries the payment list
+   * and a non-2xx's first error reason. No retry loop: a single probe is the
+   * contract. A network failure/timeout rejects.
    */
-  private async probeStatus(path: string): Promise<{ status: number; reason?: string }> {
+  private async probeStatus(path: string): Promise<{ status: number; listed: boolean; reason?: string }> {
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
     const { response, text } = await requestWithTimeout(
       {
@@ -1336,8 +1346,10 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
         },
       },
     );
-    const reason = response.ok ? undefined : firstErrorReason(safeJson(text));
-    return { status: response.status, ...(reason ? { reason } : {}) };
+    const json = safeJson(text);
+    const reason = response.ok ? undefined : firstErrorReason(json);
+    const listed = response.ok && Array.isArray((json as { payments?: unknown } | null | undefined)?.payments);
+    return { status: response.status, listed, ...(reason ? { reason } : {}) };
   }
 
   private async requestOnce<T>(method: "GET" | "POST", path: string, options: RequestOptions): Promise<T> {
@@ -1580,9 +1592,14 @@ function forbiddenMessage(reason: string | undefined, refunds: boolean): string 
 /** GoCardless's reasons are snake_case codes: nothing else in the slot is matched or echoed. */
 const ERROR_REASON = /^[a-z][a-z0-9_]{0,63}$/;
 
+/** Whether an error reason repeats the access token, or a stretch of it long enough to matter. */
+function mentionsToken(reason: string, accessToken: string): boolean {
+  return reason.includes(accessToken) || (reason.length >= 8 && accessToken.includes(reason));
+}
+
 /**
  * The first reason in `error.errors[]` (the items of a validation_failed
- * error name a field instead), when it reads as a reason code.
+ * error usually name a field instead), when it reads as a reason code.
  */
 function firstErrorReason(body: unknown): string | undefined {
   const errors = (body as { error?: { errors?: unknown } } | null | undefined)?.error?.errors;

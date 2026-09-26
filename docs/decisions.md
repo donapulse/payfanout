@@ -415,19 +415,26 @@ choices they forced:
 - **Doc-verified 2026-09-26: the connection check and 403 messages.** Checked against the
   Responses and Errors page, the create-a-refund reference and the OpenAPI spec
   (docs.gocardless.com).
-  - *`verifyCredentials`.* The probe reads the payment list, which answers 200 ("Request
-    succeeded."), so only a 2xx passes; 401/403 stay `auth` and 429/5xx stay `network`.
-    Any other status reported `ok: true` and now reports `internal`: a wrong `baseUrl` or
+  - *`verifyCredentials`.* The probe reads the payment list, whose 200 ("Request
+    succeeded.") the spec defines as `{ payments: [...], meta }`, so only a 2xx carrying
+    that list passes; 401/403 stay `auth` and 429/5xx stay `network`. Any other answer
+    reported `ok: true` and now reports `internal`: a wrong `baseUrl` or
     `goCardlessVersion` override gets an answer that is not the list, and GoCardless
     documents `path_not_found` ("URL path not recognised. Check spelling and
     formatting.") and `version_not_found` ("Specified version does not exist.") for them.
+    A `baseUrl` naming a host that is not the API, such as a web page, can answer 200
+    with something else; without the list that is `internal` too.
     Unlike the Paysafe probe, which looks up an id that does not exist and expects a 404,
     no other answer shows the credentials working. The message names the status and the
     first `errors[].reason` of the body the probe already read ("For all other types,
     each item has a `reason` and `message`"). A reason is echoed only when it reads as a
     lowercase snake_case code of at most 64 characters (every documented reason does; the
-    longest has 46) and does not contain the access token: a wrong `baseUrl` sends the
-    token to whatever answers, and that server writes the body.
+    longest has 46) and neither contains the access token nor is a stretch of it of eight
+    characters or more: a wrong `baseUrl` sends the token to whatever answers, and that
+    server writes the body. Observed 2026-09-26 without credentials against the sandbox
+    host: `GoCardless-Version: 2030-01-01` answers 400 `version_not_found` before any
+    authentication, which the probe reports as `internal (HTTP 400, version_not_found)`,
+    and an unknown path answers a plain-text 404 with no error envelope.
   - *403 messages.* A 403 is "Valid credentials but insufficient permissions for this
     resource", and its message now follows the first reason: `feature_disabled`
     ("Feature not enabled on your account. Contact support to enable."),
@@ -441,16 +448,14 @@ choices they forced:
     Any other reason there, or none, names both causes: refunds not enabled, or a token
     without permission. Elsewhere `feature_disabled` keeps the documented advice to
     contact support. The code stays `invalid_request`, never retryable.
-  - **AMBIGUOUS:** which status and reason a refund gets on an account with refunds
-    disabled (`feature_disabled` or `forbidden`; the spec lists no 403 for
-    `POST /refunds`), and which status comes with `version_not_found`. The docs also
-    differ on how refunds are switched on: the API reference says the Dashboard, the
-    partner integration guide says refunds are "available for all customers who request
-    this feature", and the partner go-live checklist has the partnerships team enable
-    them in the sandbox. The fake answers the refunds gate with a 403 naming either
-    reason (`refundsDisabledReason`). Sandbox checks: create a refund on an account with
-    refunds disabled and record the status and reason; send `GET /payments?limit=1` with
-    `GoCardless-Version: 2030-01-01` and record the status and reason.
+  - **AMBIGUOUS:** which status and reason a refund gets on an account with refunds disabled
+    (`feature_disabled` or `forbidden`; the spec lists no 403 for `POST /refunds`). The docs
+    also differ on how refunds are switched on: the API reference says the Dashboard, the
+    partner integration guide says refunds are "available for all customers who request this
+    feature", and the partner go-live checklist has the partnerships team enable them in the
+    sandbox. The fake answers the refunds gate with a 403 naming either reason
+    (`refundsDisabledReason`). Sandbox check: create a refund on an account with refunds
+    disabled and record the status and reason.
 
 ## PayPal adapter (2026-07-07)
 

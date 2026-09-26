@@ -328,8 +328,19 @@ describe("GoCardless error mapping", () => {
       },
     };
     expect(mapGoCardlessError(403, several, "/refunds").message).toBe(REFUNDS_NOT_ENABLED);
+    // The first reason decides even when it is not a code: a later valid one is not read instead.
+    const firstInvalid = { error: { code: 403, errors: [{ reason: "Not A Code" }, { reason: "feature_disabled" }] } };
+    expect(mapGoCardlessError(403, firstInvalid, "/refunds").message).toBe(REFUNDS_NOT_ENABLED_OR_NO_PERMISSION);
     // Bodies that are not GoCardless's envelope name no reason.
-    for (const body of ["Forbidden", undefined, null, { error: "Forbidden" }, { error: { errors: [null, 7] } }]) {
+    for (const body of [
+      "Forbidden",
+      undefined,
+      null,
+      { error: "Forbidden" },
+      { error: { errors: [null, 7] } },
+      { error: { errors: {} } },
+      { error: { errors: 7 } },
+    ]) {
       expect(mapGoCardlessError(403, body, "/refunds").message, JSON.stringify(body)).toBe(
         REFUNDS_NOT_ENABLED_OR_NO_PERMISSION,
       );
@@ -464,20 +475,43 @@ describe("GoCardless verifyCredentials (Test connection probe)", () => {
         message: `GoCardless rejected the connectivity check (HTTP ${status}) — check baseUrl and goCardlessVersion.`,
       });
     }
+    // An error body whose errors are not a list names no reason, and still reads as this failure.
+    for (const errors of [{}, 7]) {
+      const { adapter } = answering(404, JSON.stringify({ error: { code: 404, errors } }));
+      await expect(adapter.verifyCredentials(), JSON.stringify(errors)).resolves.toEqual({
+        ok: false,
+        category: "internal",
+        message: "GoCardless rejected the connectivity check (HTTP 404) — check baseUrl and goCardlessVersion.",
+      });
+    }
     // An injected fetch can hand back a network-error Response (status 0) instead of rejecting.
     const { adapter: errored } = makePair({ fetch: async () => Response.error() });
     await expect(errored.verifyCredentials()).resolves.toMatchObject({ ok: false, category: "internal" });
   });
 
-  it("reports ok for a 2xx answer, whatever its body", async () => {
+  it("reports ok only for a 2xx answer carrying the payment list", async () => {
+    // GET /payments answers 200 with { payments: [...], meta }; a list with a payment passes too.
+    for (const payments of [[], [{ id: "PM1", amount: 1000, currency: "GBP", status: "paid_out" }]]) {
+      const body = JSON.stringify({ payments, meta: { cursors: { before: null, after: null }, limit: 1 } });
+      const { adapter, calls } = answering(200, body);
+      await expect(adapter.verifyCredentials(), body).resolves.toEqual({ ok: true });
+      expect(calls(), body).toBe(1);
+    }
+    // A host that is not the API, such as a web page at a mis-pasted baseUrl, answers 2xx with something else.
     for (const [status, body] of [
-      [200, JSON.stringify({ payments: [], meta: { cursors: { before: null, after: null }, limit: 1 } })],
+      [200, "<html><body>Sign in</body></html>"],
+      [200, JSON.stringify({ payments: "none" })],
+      [200, "null"],
       [201, "{}"],
       [204, null],
       [299, ""],
     ] as const) {
       const { adapter, calls } = answering(status, body);
-      await expect(adapter.verifyCredentials(), String(status)).resolves.toEqual({ ok: true });
+      await expect(adapter.verifyCredentials(), `${status} ${String(body)}`).resolves.toEqual({
+        ok: false,
+        category: "internal",
+        message: `GoCardless answered the connectivity check without a payment list (HTTP ${status}) — check baseUrl.`,
+      });
       expect(calls(), String(status)).toBe(1);
     }
   });
@@ -521,6 +555,9 @@ describe("GoCardless verifyCredentials (Test connection probe)", () => {
       "path not found",
       "<b>path_not_found</b>",
       "_path_not_found",
+      "path-not-found",
+      "path.not.found",
+      "4path_not_found",
       "a".repeat(65),
       404,
     ]) {
@@ -535,6 +572,20 @@ describe("GoCardless verifyCredentials (Test connection probe)", () => {
       { accessToken: codeShaped },
     );
     await expect(adapter.verifyCredentials()).resolves.toEqual(statusOnly);
+    // Nor is a stretch of the token that reads as a code.
+    const fragment = answering(
+      404,
+      JSON.stringify({ error: { code: 404, errors: [{ reason: "fragmenttoken", message: "x" }] } }),
+      { accessToken: "sandbox_fragmenttoken_1234" },
+    );
+    await expect(fragment.adapter.verifyCredentials()).resolves.toEqual(statusOnly);
+    // A code at the 64-character limit is named.
+    const longest = "a".repeat(64);
+    const atLimit = answering(404, JSON.stringify({ error: { code: 404, errors: [{ reason: longest, message: "x" }] } }));
+    await expect(atLimit.adapter.verifyCredentials()).resolves.toEqual({
+      ...statusOnly,
+      message: `GoCardless rejected the connectivity check (HTTP 404, ${longest}) — check baseUrl and goCardlessVersion.`,
+    });
   });
 });
 

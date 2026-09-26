@@ -7,7 +7,7 @@ const PROBE_URL = "https://payment.preprod.direct.worldline-solutions.com/v2/mid
 const AUTH_FAILED: VerifyCredentialsResult = {
   ok: false,
   category: "auth",
-  message: "Authentication failed — check the Worldline API key id, secret API key and merchantId.",
+  message: "Authentication failed — check the Worldline API key id, secret API key, merchantId and environment.",
 };
 const UNREACHABLE: VerifyCredentialsResult = {
   ok: false,
@@ -20,7 +20,7 @@ function withoutResult(status: number): VerifyCredentialsResult {
   return {
     ok: false,
     category: "internal",
-    message: `Worldline answered the connectivity check without a test-connection result (HTTP ${status}) — check baseUrl.`,
+    message: `Worldline answered the connectivity check without an OK result (HTTP ${status}) — check baseUrl.`,
   };
 }
 
@@ -104,12 +104,10 @@ function answeringId(id: unknown, config?: Partial<WorldlineServerAdapterConfig>
 }
 
 describe("Worldline verifyCredentials (Test connection probe)", () => {
-  it("reports ok for a 2xx carrying the test-connection result, after one signed GET", async () => {
-    // The API contract types `result` as a string and documents no value, so none is required.
+  it("reports ok for a 2xx carrying the OK result, after one signed GET", async () => {
+    // "If you receive an OK result you know that your connection with us is working correctly" (Connect S2S reference).
     const answers: Array<[number, unknown]> = [
       [200, { result: "OK" }],
-      [200, { result: "any other text" }],
-      [200, { result: "" }],
       // New response fields are a backwards-compatible change (API versioning guide).
       [200, { result: "OK", checkedAt: "2026-09-26T10:00:00Z" }],
       [201, { result: "OK" }],
@@ -127,11 +125,18 @@ describe("Worldline verifyCredentials (Test connection probe)", () => {
     }
   });
 
-  it("reports a 2xx without that result as a failure, never ok", async () => {
+  it("reports a 2xx without the OK result as a failure, never ok", async () => {
     // A baseUrl naming a host that is not the API, such as a web page, answers 2xx with something else.
     const answers: Array<[number, string | null]> = [
       [200, "<html><body>Sign in</body></html>"],
       [200, "{}"],
+      // Any other result is no OK: Worldline's own plugins fail the check on it too.
+      [200, JSON.stringify({ result: "Invalid" })],
+      [200, JSON.stringify({ result: "NOK" })],
+      [200, JSON.stringify({ result: "ok" })],
+      [200, JSON.stringify({ result: "OK " })],
+      [200, JSON.stringify({ result: "any other text" })],
+      [200, JSON.stringify({ result: "" })],
       [200, JSON.stringify({ result: null })],
       [200, JSON.stringify({ result: 1 })],
       [200, JSON.stringify({ result: true })],
@@ -174,6 +179,7 @@ describe("Worldline verifyCredentials (Test connection probe)", () => {
       [401, "Unauthorized", AUTH_FAILED],
       // The status decides, whatever the body carries.
       [403, JSON.stringify({ result: "OK" }), AUTH_FAILED],
+      [403, "<html>Forbidden</html>", AUTH_FAILED],
       [429, null, UNREACHABLE],
       [500, errorBody([{ code: "9999", message: "UNKNOWN_SERVER_ERROR", httpStatusCode: 500 }]), UNREACHABLE],
       [502, "<html>502 Bad Gateway</html>", UNREACHABLE],
@@ -191,6 +197,32 @@ describe("Worldline verifyCredentials (Test connection probe)", () => {
     });
     await expect(adapter.verifyCredentials()).resolves.toEqual(UNREACHABLE);
     expect(requests).toHaveLength(1);
+    // With a baseUrl override, a 403 can also come from whatever host answers there.
+    const overridden = answering(403, null, { baseUrl: "https://payment.preprod.direct.worldline-solutions.com" });
+    await expect(overridden.adapter.verifyCredentials()).resolves.toEqual({
+      ...AUTH_FAILED,
+      message: "Authentication failed — check the Worldline API key id, secret API key, merchantId, environment and baseUrl.",
+    });
+  });
+
+  it("reports a probe that outlives requestTimeoutMs as unreachable", async () => {
+    let aborted = false;
+    const { adapter } = probing(() => new Response(null, { status: 200 }), {
+      requestTimeoutMs: 20,
+      fetch: (_input, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => {
+              aborted = true;
+              reject(new DOMException("The operation was aborted.", "AbortError"));
+            },
+            { once: true },
+          );
+        }),
+    });
+    await expect(adapter.verifyCredentials()).resolves.toEqual(UNREACHABLE);
+    expect(aborted).toBe(true);
   });
 
   it("reports any other status as a failure, naming the status and Worldline's error id", async () => {
@@ -221,7 +253,7 @@ describe("Worldline verifyCredentials (Test connection probe)", () => {
         "HTTP 400, INVALID_VALUE",
       ],
       // Only errorCode is required: an error without an id names none.
-      [422, errorBody([{ errorCode: "50001066", httpStatusCode: 422 }]), "HTTP 422"],
+      [400, errorBody([{ errorCode: "50001066", httpStatusCode: 400 }]), "HTTP 400"],
       [410, errorBody([]), "HTTP 410"],
       [402, errorBody([{ errorCode: "40001134", httpStatusCode: 402, id: "AUTHENTICATION_FAILURE" }]), "HTTP 402, AUTHENTICATION_FAILURE"],
       // The probe sends no idempotence key, so a 409 is no replay still in flight.

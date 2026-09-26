@@ -266,8 +266,8 @@ type SettledAttempt = { info: PaymentInfo } | { after: string; replayOf: string 
 /** What the test-connection probe read (see probeStatus). */
 interface ConnectionProbe {
   status: number;
-  /** The body carries the service's string `result`. */
-  hasResult: boolean;
+  /** The body is the service's OK answer, `{ "result": "OK" }`. */
+  answeredOk: boolean;
   /** The first error's id, when it reads as one (see firstErrorName). */
   errorName: string | undefined;
 }
@@ -903,11 +903,12 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
    * "Test connection" probe: one side-effect-free GET against the account's
    * test-connection service, `/v2/{merchantId}/services/testconnection`. It
    * reads the RAW HTTP status, so an auth rejection (401/403; Worldline answers
-   * a key, secret or PSPID it cannot match with a 403) is told apart from an
-   * outage (429/5xx) from the status line alone. Only a 2xx carrying the
-   * service's answer, an object with a string `result`, passes; the API
-   * contract types `result` as a string and documents no value, so none is
-   * required. Any other answer that is neither an auth rejection nor an outage
+   * a key, secret or PSPID it cannot match, or keys of the other environment,
+   * with a 403) is told apart from an outage (429/5xx) from the status line
+   * alone. Only a 2xx carrying the service's OK answer, `{ "result": "OK" }`,
+   * passes: "If you receive an OK result you know that your connection with us
+   * is working correctly" (Connect S2S API reference, Test connection). Any
+   * other answer that is neither an auth rejection nor an outage
    * means the probe never reached the service, as when a `baseUrl` override is
    * wrong (Worldline answers a wrong endpoint with an empty body) or names a
    * host that answers 2xx with something else: it reports `internal`, naming
@@ -923,21 +924,21 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       // requestWithTimeout rejects only on a network failure or timeout.
       return { ok: false, category: "network", message: "Could not reach Worldline — try again." };
     }
-    const { status, hasResult, errorName } = probe;
+    const { status, answeredOk, errorName } = probe;
     if (status >= 200 && status < 300) {
-      if (hasResult) return { ok: true };
+      if (answeredOk) return { ok: true };
       return {
         ok: false,
         category: "internal",
-        message: `Worldline answered the connectivity check without a test-connection result (HTTP ${status}) — check baseUrl.`,
+        message: `Worldline answered the connectivity check without an OK result (HTTP ${status}) — check baseUrl.`,
       };
     }
     if (status === 401 || status === 403) {
-      return {
-        ok: false,
-        category: "auth",
-        message: "Authentication failed — check the Worldline API key id, secret API key and merchantId.",
-      };
+      // A host at a mis-pasted baseUrl, such as a CDN, can answer 403 too.
+      const checked = this.config.baseUrl
+        ? "API key id, secret API key, merchantId, environment and baseUrl"
+        : "API key id, secret API key, merchantId and environment";
+      return { ok: false, category: "auth", message: `Authentication failed — check the Worldline ${checked}.` };
     }
     if (status === 429 || status >= 500) {
       return { ok: false, category: "network", message: "Could not reach Worldline — try again." };
@@ -1159,9 +1160,9 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
    * One read-only exchange returning the RAW HTTP status instead of mapping a
    * non-2xx into a PayFanoutError — verifyCredentials needs the status itself to
    * tell an auth rejection (401/403) from an outage (5xx/429). From the body
-   * the exchange already read, it also reports whether that body carries the
-   * test-connection service's string `result`, and its first error's id. No
-   * retry loop. A network failure/timeout rejects.
+   * the exchange already read, it also reports whether that body is the
+   * test-connection service's OK answer, and its first error's id. No retry
+   * loop. A network failure/timeout rejects.
    */
   private async probeStatus(path: string): Promise<ConnectionProbe> {
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
@@ -1187,7 +1188,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     const json = safeJson(text) as { result?: unknown; errors?: unknown } | null | undefined;
     return {
       status: response.status,
-      hasResult: typeof json?.result === "string",
+      answeredOk: json?.result === "OK",
       errorName: firstErrorName(json?.errors),
     };
   }

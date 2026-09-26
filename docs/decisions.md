@@ -1151,21 +1151,27 @@ current status (remaining sandbox checks run via the dispatch-only integration w
 - **Doc-verified 2026-09-26: the connection check.** Checked against the API contract
   (payment.preprod.direct.worldline-solutions.com/v1/public-contract-definition.yaml,
   v2.507.0), the API Troubleshooting and manual-authentication guides
-  (docs.direct.worldline-solutions.com), and Worldline's SDKs and plugins
-  (github.com/wl-online-payments-direct).
+  (docs.direct.worldline-solutions.com), the Connect S2S API reference for the same
+  service (apireference.connect.worldline-solutions.com/s2sapi/v1/en_US/json/services/testconnection.html),
+  and Worldline's SDKs and plugins (github.com/wl-online-payments-direct).
   - *What passes.* The contract lists two responses for the probe's
     `GET /v2/{merchantId}/services/testconnection` ("Test your connection and
     credentials"): a 200 with `testConnection`, `{ result }`, and a 403 "Your API
-    authentication failed." with the `errorResponse` envelope. Only a 2xx whose body is an
-    object with a string `result` passes; 401/403 stay `auth` and 429/5xx stay `network`.
+    authentication failed." with the `errorResponse` envelope. Only a 2xx whose body is
+    `{ "result": "OK" }` passes; 401/403 stay `auth` and 429/5xx stay `network`.
     Any other answer reported `ok: true` and now reports `internal`. The troubleshooting
     guide answers a "non-existent/wrong API endpoint" with an empty body
     (`content-length = 0`), which a wrong `baseUrl` override meets, and a `baseUrl` naming
-    a host that is not the API can answer 2xx with something else. No value of `result` is
-    required: the contract gives it no enum, example or description, and the Node, Java
-    and .NET SDKs' integration tests assert only that it is set. Worldline's Magento,
-    PrestaShop and SAP Commerce plugins compare it with `"OK"`, which no reference page
-    documents, so another string still passes.
+    a host that is not the API can answer 2xx with something else, a `result` among it. The
+    Direct contract gives `result` no enum, example or description, and the Node, Java and
+    .NET SDKs' integration tests assert only that it is set, but the Connect S2S reference
+    documents the value: "If you receive an OK result you know that your connection with us
+    is working correctly, your authentication credentials are correct and your account is
+    setup correctly in our system.", `result` "OK result on the connection to the payment
+    engine.", example `{ "result" : "OK" }`. Worldline's Magento, PrestaShop and SAP
+    Commerce plugins fail the check on anything but `"OK"`, and the Direct contract's
+    `validateCredentials` answers a 200 whose `result` is `Valid` or `Invalid`, a failure
+    reported with a 200. So only `"OK"`, exactly, passes.
   - *What the message names.* The status and, on a non-2xx, the first error's `id` ("ID of
     the error. This is a short human-readable message that briefly describes the error."),
     from the body the probe already read. `aPIError` requires only `errorCode`, so an error
@@ -1178,9 +1184,13 @@ current status (remaining sandbox checks run via the dispatch-only integration w
     API key never leaves the server under v1HMAC, only a signature does; it is screened
     all the same.
   - A key, secret or PSPID the platform cannot match answers 403
-    `ACCESS_TO_MERCHANT_NOT_ALLOWED` (code 9007, both guides), so a wrong `merchantId` reads
-    as `auth`, and that message now names the `merchantId` beside the API key id and the
-    secret API key. Not sandbox-verified: the 200 body and the answer to a wrong path.
+    `ACCESS_TO_MERCHANT_NOT_ALLOWED` (code 9007, both guides), and the manual-authentication
+    guide's troubleshooting adds "Use the correct environment: Do not mix up API Keys /
+    Secrets /accounts from the test/prod environment". So a wrong `merchantId` or
+    environment reads as `auth`, and that message now names the `merchantId` and the
+    environment beside the API key id and the secret API key, and the `baseUrl` when one is
+    configured, since a host at a mis-pasted `baseUrl`, such as a CDN, can answer 403 too.
+    Not sandbox-verified: the 200 body and the answer to a wrong path.
     Sandbox check: run the probe with valid credentials, then with a `baseUrl` carrying an
     extra path segment, and record both answers.
 - **Webhook envelope: array vs object.** The webhooks page's example body renders as a JSON

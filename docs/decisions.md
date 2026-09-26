@@ -1819,11 +1819,12 @@ sandbox round-trip before production use, and the setup guide carries that warni
   `AuthenticationNotRequired` → `processing`, `RedirectShopper`/`IdentifyShopper`/
   `ChallengeShopper`/`PresentToShopper`/`PartiallyAuthorised` → `requires_action`,
   `Refused`/`Error` raise a mapped `PayFanoutError` rather than a "failed" PaymentInfo.
-  Refusal codes map 2/5/46 → `card_declined`, 6 → `expired_card`, 8/24 →
-  `invalid_card_data`, 11/38/42 → `authentication_required`, 12 → `insufficient_funds`,
-  14/20/31 → `fraud_suspected` (31, Issuer Suspected Fraud, since 2026-09-23), 9 (Issuer
-  Unavailable) → `processing_error` (42 questioned 2026-09-25: see "Worldline decline codes
-  (2026-09-25)" and #217). None is retryable:
+  Refusal codes map 2/5/46 → `card_declined`, 6 → `expired_card`, 8/24/32 →
+  `invalid_card_data` (32 since 2026-09-26), 11/38 → `authentication_required`, 12 →
+  `insufficient_funds`, 14/20/22/31 → `fraud_suspected` (31, Issuer Suspected Fraud, since
+  2026-09-23; 22 since 2026-09-26), 4/9/21/39/40/42 → `processing_error` (4, 21, 39, 40 and
+  42 since 2026-09-26; 42 was `authentication_required` until then). See "Adyen refusal
+  reasons (2026-09-26)". None is retryable:
   replaying the same idempotency key returns the same refusal, so a fresh attempt is the
   shopper's move, and an unrecognized code is still a decline.
 - **CLP, CVE, IDR and ISK are rejected locally** (`invalid_request`): Adyen prices them with
@@ -2311,12 +2312,14 @@ description of what v2 changes is what the migration then had to implement.
   card-specific `expired_card` and region-specific `incorrect_zip`, but it never says card
   declines changed, so which code a card decline now carries is not stated. The mapping only
   makes sure that one which does arrive lands where its counterpart does.
-- **Server half only, and only for hosts pinned to 2026-08-26.dahlia or later.**
+- **Mapped on the server for hosts pinned to 2026-08-26.dahlia or later, and in the browser
+  since 2026-09-26.**
   `mapStripeError` sees the errors of the adapter's own calls, which carry the host's pinned
   `apiVersion`. The browser adapter follows the account's default API version through
-  Stripe.js and maps none of these codes (nor `incorrect_zip`) except `authentication_failure`
-  (decided 2026-09-25, below); aligning the rest is a follow-up (#213).
-- **The checks live in the `StripeCardError` branch only.** Neither page states which error
+  Stripe.js; since 2026-09-26 it maps these codes and `incorrect_zip` the same way (see
+  "Stripe: one card-error classification on both halves (2026-09-26)").
+- **On the server, the checks live in the `StripeCardError` branch only** (the browser
+  classifies every Stripe.js error type). Neither page states which error
   `type` the new codes arrive with, so the conservative reading extends the branch that
   already handles `expired_card` and `incorrect_zip`; under any other type they fall through
   to that type's existing mapping. A sandbox run pinned to this version with the expired-card
@@ -2333,8 +2336,9 @@ description of what v2 changes is what the migration then had to implement.
   presents it as the general form of `payment_intent_authentication_failure` and
   `setup_intent_authentication_failure`, whose documented remedy is a new payment method.
   The Stripe browser adapter maps those two codes to `authentication_required`, as Worldline
-  does `40001134` ("a failed 3-D Secure check") and Adyen `11` and `42`. Both candidates are
-  non-retryable, so retries and the router cascade are unaffected; the choice decides which
+  does `40001134` ("a failed 3-D Secure check") and Adyen `11` (and `42` until
+  2026-09-26). Both candidates are non-retryable, so retries and the router cascade are
+  unaffected; the choice decides which
   code and message the host shows. Stripe's 3-D Secure guide
   (docs.stripe.com/payments/3d-secure/authentication-flow) gives both remedies after a failed
   authentication: try a different payment method, or retry 3-D Secure by reconfirming. Which
@@ -2343,17 +2347,19 @@ description of what v2 changes is what the migration then had to implement.
   `authentication_required`, and retrying 3-D Secure is one of the two remedies Stripe's guide
   gives. Both halves now map `authentication_failure` that way, and the server half also maps
   the two intent-specific codes, which hosts pinned before dahlia still receive. On the server
-  a fraud decline code on the same error still takes precedence. The browser half maps no
-  fraud decline codes at all (`fraudulent`, `stolen_card`, `lost_card`,
-  `merchant_blacklist`); that gap and the dahlia codes above are tracked in #213. Left
-  unmapped, an account moving to dahlia could see a failed browser 3-D Secure change quietly
-  from `authentication_required` to `card_declined` or `unknown`, if Stripe.js reports the
-  general code there. Would be wrong if Stripe used the code for failures where no new
-  authentication can succeed, where `card_declined`'s "use another card" is the only remedy.
+  a fraud decline code on the same error still takes precedence. The browser half mapped no
+  fraud decline codes (`fraudulent`, `stolen_card`, `lost_card`, `merchant_blacklist`)
+  until 2026-09-26, when it took the server's order (see "Stripe: one card-error
+  classification on both halves (2026-09-26)"). Had the browser left `authentication_failure`
+  unmapped, an account moving to dahlia could have seen a failed browser 3-D Secure change
+  quietly from `authentication_required` to `card_declined` or `unknown`, if Stripe.js
+  reports the general code there. Would be wrong if Stripe used the code for failures where
+  no new authentication can succeed, where `card_declined`'s "use another card" is the only
+  remedy.
   (Clarified 2026-09-25: this holds for a failed cardholder authentication. A 3-D Secure that
   fails outside the customer's control is `processing_error` on Worldline, and Adyen's refusal
-  42 is such a failure, which still maps to `authentication_required` until #217; see
-  "Worldline decline codes (2026-09-25)".)
+  42 is such a failure, which maps to `processing_error` since 2026-09-26; see "Worldline
+  decline codes (2026-09-25)" and "Adyen refusal reasons (2026-09-26)".)
 - **`payment_method_restricted` stays `card_declined`.** Stripe's example is a card reported
   lost or stolen; the existing `restricted_card` decline code ("it's possible it was reported
   lost or stolen") already falls through to `card_declined`, and a `lost_card` or
@@ -2788,12 +2794,12 @@ description of what v2 changes is what the migration then had to implement.
   PIN codes) or fraud attempts". The second is 40001135/50001081, 40001137, 40001138 and
   40001146, where the issuer, the acquirer or the platform could not complete 3-D Secure:
   authenticating again now does not help, and Worldline advises another payment method or a
-  later attempt (for 40001146, contacting it). The Adyen adapter maps its refusal 42 to
-  `authentication_required`, although Adyen's refusal-reasons page
+  later attempt (for 40001146, contacting it). The Adyen adapter mapped its refusal 42 to
+  `authentication_required` until 2026-09-26, although Adyen's refusal-reasons page
   (docs.adyen.com/development-resources/refusal-reasons) reads "The 3D Secure authentication
-  failed due to an issue at the card network or issuer". That is inconsistent with this
-  reading, and it is tracked in #217. The Stripe entry's `authentication_failure`
-  bullet carries the same clarification.
+  failed due to an issue at the card network or issuer"; it now maps it to
+  `processing_error`, as this reading asks (see "Adyen refusal reasons (2026-09-26)"). The
+  Stripe entry's `authentication_failure` bullet carries the same clarification.
 - **The merchant's set-up and request refusals are `invalid_request`.** 30031001 is the
   acquirer refusing the merchant id: Worldline asks the merchant to "Contact us and your
   acquirer to make sure that the MID properly set up on our side and your acquirer's side",
@@ -2804,9 +2810,11 @@ description of what v2 changes is what the migration then had to implement.
   again" cannot help, and `card_declined`'s "use another card" helps only when that card
   goes through another, working MID. The PayZen server adapter maps its merchant-configuration
   refusals the same way (PSP_100, the REST API not enabled on the shop; PSP_109, production
-  mode not activated; PSP_610, no acceptance agreement). Its CB network table does not yet:
-  PayZen's acquirer codes 03, 30, 68 and 91, the Sips codes behind 30031001, 30301001,
-  30681001 and 30911001, stay `card_declined` there, tracked in #218.
+  mode not activated; PSP_610, no acceptance agreement). Its acquirer codes follow in part
+  since 2026-09-26: 68 and 91, the Sips codes behind 30681001 and 30911001, are
+  `processing_error`, but 03 and 30, those behind 30031001 and 30301001, stay `card_declined`,
+  since other acquirers' tables give them other meanings (see "PayZen acquirer codes aligned
+  (2026-09-26)").
 - **A 429 or a 5xx is classified by its status before any code.** Before, a 5xx carrying a
   mapped code (30511001, say) came out as a non-retryable decline and skipped the transport
   retries. The order is now: 429 or 5xx; the code map; 402 → `card_declined`; 409 → the
@@ -3240,3 +3248,798 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `replayWindowHours`, and a lock around `chargeDueSubscriptions` removes overlapping runs
   altogether. The recurring guide and the `chargeDueSubscriptions` JSDoc now say this
   instead of calling concurrent runs safe for money.
+
+## Worldline: completions after a decline (2026-09-25)
+
+- **A completion whose key replays a failed attempt sends the payment again under a key
+  derived from the host key and that attempt (#215).** Doc-verified 2026-09-25 against the
+  idempotent-requests guide
+  (docs.direct.worldline-solutions.com/en/integration/api-developer-guide/idempotent-requests):
+  "For completed requests: Our server will respond with the same outcome as the original
+  request, even with different payloads", "Do not use the same key twice within the
+  idempotence period (at least 24 hours)", and the key "Has a maximum length of 40
+  characters". Both keying patterns the docs recommend hold the host key constant, the
+  Worldline guide's `complete-${order.id}` and `createCompletionHandler`'s "STABLE key per
+  session", so a declined completion answered every later card for that order with the same
+  decline for at least a day. The Statuses page
+  (docs.direct.worldline-solutions.com/en/integration/api-developer-guide/statuses) calls an
+  authorisation declined (2) "a final status" after which "Your customer can retry the
+  authorisation process after selecting another card", and the API contract
+  (payment.preprod.direct.worldline-solutions.com/v1/public-contract-definition.yaml,
+  v2.507.0) describes a retriable error as one where "the same request can safely be sent
+  again with a new idempotence key": a new attempt is a new key. This refines the
+  "Worldline decline codes (2026-09-25)" entry above, whose "a same-key retry only replays
+  the rejection" no longer holds for completions; the decline codes stay non-retryable,
+  since the new attempt is the customer's to make.
+- **How the walk runs.** The first attempt goes out under
+  `deriveIdempotenceKey(idempotencyKey)`, unchanged, so a first attempt is exactly the
+  request sent before and a completion in flight across the upgrade keeps its key. An answer
+  is a replay when it carries `X-GCS-Idempotence-Request-Timestamp` on the first send of its
+  key within the call, or on a re-send with a plausible timestamp more than 15 minutes
+  before that first send (see the re-send item below). The guide says "For any follow-up
+  requests made with the same idempotency key, our response includes an additional header,
+  X-GCS-Idempotence-Request-Timestamp. This header indicates the timestamp of the initial
+  request in milliseconds since January 1st, 1970 00:00:00 UTC." Worldline's SDKs read it
+  before the status code, so it can ride an error answer: the Node SDK's `handleResponse`
+  (github.com/wl-online-payments-direct/sdk-nodejs, src/utils/communicator.ts) takes it
+  before computing `isSuccess`, ignores an empty value and keeps the raw string; the Java
+  SDK's `updateContext` (sdk-java, DefaultCommunicator.java) parses it with `Long.valueOf`
+  before `throwExceptionIfNecessary`, and its `ExceptionFactory` attaches it to the
+  `IdempotenceException` of a 409 whose one error is `1409`. A replay is a failed attempt,
+  walked past, once its payment ended without taking money, as the next items describe. The
+  next attempt goes out under the key `deriveIdempotenceKey` makes of
+  `${idempotencyKey}:after:${attemptId}`, where `attemptId` is the error body's
+  `paymentResult.payment.id`, else the 2xx payment's `id`, else the replay header's value.
+  The contract gives CreatePayment's 400, 402, 403, 404, 409, 502 and 503 bodies as
+  `paymentErrorResponse` (`errorId`, `errors`, and `paymentResult`, "details about the
+  created payment if one has been generated") and its 201 as `createPaymentResponse`
+  (`creationOutput`, `merchantAction`, `payment`), "The payment request was successfully
+  processed and a payment object was created". A 201 that names no payment therefore throws
+  its non-retryable `processing_error` marked `outcomeUnknown`: the key may hold a payment
+  the answer does not name. The walk ends at the call's own answer, handled as before; at a
+  replayed attempt that did not fail, returned as it now reads and never sent again, unless
+  it was made for another amount or currency (see below); at a 409, 429 or 5xx, handled as
+  before; or after 20 attempts. That last refusal is a non-retryable `invalid_request` whose
+  `raw.reason` is `"attempt_limit"`, with core's catalog message rather than a text naming
+  the limit. It carries no `outcomeUnknown`, because every attempt it counts was read back
+  and failed, and no completion sends a 21st, so no payment can exist under the key. Nothing
+  is stored: every completion walks the replays again.
+- **Why 20 attempts (review, 2026-09-26).** The API troubleshooting page's payment retry
+  guidelines, on the retriable errors: "You can retry, but limit to a maximum of 10 attempts
+  within 30 days to stay compliant with card scheme guidelines and avoid potential fees", a
+  limit they tie to "reusing the same PAN (i.e. card numbers) and amount per individual
+  order". A key's chain counts every attempt under it, across cards, so its bound sits above
+  that per-card figure. It also caps the replays each completion walks, one request per
+  earlier attempt.
+- **A replayed 3-D Secure challenge is read back, and only a failed or cancelled one is
+  walked past.** The guide warns "Updates related to the operation, such as payment status,
+  may still occur", so a replayed REDIRECT is followed by `GET /payments/{id}`. Failed or
+  cancelled (1, "a final status"), the walk goes on with that payment's id; still waiting,
+  the challenge comes back as `requires_action` with its redirect URL; anything else,
+  `processing`, Authorised and cancelled (6) and every other cancellation code included, is
+  returned as it now reads. The
+  Statuses page says of 46: "If your customer abandons the 3-D Secure check prematurely
+  (i.e. by closing the browser window), the transaction will remain in
+  statusOutput.statusCode=46 indefinitely." An open challenge may still be authorised, so
+  walking past it could charge twice; an abandoned one therefore holds its key. The guide
+  tells hosts to cancel it with `cancelPayment` while Worldline reports it cancellable (the
+  contract's `statusOutput.isCancellable`, "Flag indicating if the payment can be
+  cancelled") before paying under a new key, and to reconcile one they cannot cancel. Review
+  suggested the guide say instead that the same key walks past the cancelled challenge, so
+  no new key is needed. That holds only if the cancelled challenge reads Cancelled (1):
+  CancelPayment's outcomes on the Statuses page list CANCELLED/UNSUCCESSFUL/6 as the final
+  one, and the walk never passes a 6 (see the Authorised and cancelled item below). So the
+  guide keeps the new key, which is safe either way since the challenge is final and was
+  never walked past, and says the same key works only at 1 (AMBIGUOUS 10).
+- **A replayed payment is walked past only once it ended unpaid, and never after it took
+  money (corrected in review, 2026-09-26).** The Statuses page moves 50 ("Authorised waiting
+  external result", fraud screening), 51 ("Authorisation waiting") and 52 ("Authorisation
+  not known") on to 2, 5 or 9 later, and says of 52 and 92: "As your initial request might
+  have been successful, please do not resend the initial request. This is to avoid double
+  bookings of the same order." A replayed 2xx whose payment was pending when created is read
+  back, walked past once it reads failed or Cancelled (1), and otherwise returned as it now
+  reads, `processing` included. A payment authorised or captured when created, a
+  manual-capture authorisation (5) among them, is returned as it now reads and never walked
+  past, even once a merchant has cancelled it: a completion repeated after that must not
+  authorise again. The tests pin both, a repeated manual-capture completion authorising
+  once, and a challenge handed on to a pending authorisation being returned.
+- **A payment that reads Authorised and cancelled (6) is never walked past (review,
+  2026-09-26).** The Statuses page describes 6 as "You successfully deleted the
+  authorisation of a transaction" and "a final status", so such a payment went through
+  before it was cancelled, whatever its CreatePayment answer showed: a challenge authorised
+  and then cancelled (46, 5, 6), or a sale the platform left authorised after 51, whose
+  entry lists only "statusOutput.statusCode=2 (Authorisation refused)" and
+  "statusOutput.statusCode=5 (Authorised)" as next statuses, and that the merchant then
+  cancelled. Walking past it would let a repeated completion authorise the customer again
+  after the merchant voided the payment. It is returned as it now reads, `canceled`, from a
+  2xx replay and from a refusal's alike, and an answered 6 is read back rather than walked,
+  in case a replay shows the current status (AMBIGUOUS 8). No completion walked past such a
+  payment on its way to 6 (46 and 51 are open, 5 went through, 61 and 62 read
+  `processing`), so none sent an attempt after it, and with 6 final the guide tells hosts
+  that completing under a new key after cancelling an authorisation is safe. The fake used
+  to settle a sale pending at 51 straight to 9; it now settles it to 5, as that entry lists,
+  and lets such a sale be cancelled.
+- **Only Cancelled (1) counts as a failed attempt among the cancellations (review,
+  2026-09-26).** The Statuses page's table of payment statuses lists CANCELLED /
+  UNSUCCESSFUL with "1/6/61/62/64/75/96" and describes none of 64, 75 and 96, and a
+  cancellation read without a code says nothing of how it came about; the page's Hosted
+  Checkout status CANCELLED is "Applicable only for transactions reaching
+  statusOutput.statusCode=1". Walking past a payment cancelled at one of those codes could
+  follow one that took money with a second, so such a payment is held like 6, returned as it
+  now reads, `canceled` (AMBIGUOUS 11). A completion's own answer is also checked against the
+  session's amount and currency: the request named them, so a payment for another is a
+  replay whose header did not arrive.
+- **A replayed refusal that reports a payment is walked past only once that payment ended
+  unpaid (corrected in review, 2026-09-26).** Walking past any replayed 4xx on its status
+  alone would let a 402 carrying a payment at AUTHORIZATION_REQUESTED (52) chain to a new
+  attempt: a second charge once 52 resolved to 9. The contract's `paymentResult` puts no
+  bound on the payment's status, and CreatePayment's description says of a rejected request
+  that "In some cases a payment object was created and you will find all the details in the
+  response as well". So a replayed refusal whose payment reads failed or cancelled, in the
+  body or read back with `GET /payments/{id}`, is walked past; one whose payment has
+  finished otherwise, gone through or been authorised and cancelled since, is returned as
+  that payment now reads; one still pending throws, mapped as before, marked
+  `outcomeUnknown`. A finished payment is returned rather than thrown, because a decline
+  reported for a payment that went through would invite a host to charge again under a new
+  key. As for a 2xx, one whose payment the body reports authorised or captured
+  is never walked past, whatever that payment reads now. The call's own refusal whose
+  payment has not ended is marked `outcomeUnknown` as well. A refusal that reports no
+  payment is walked past as before.
+- **A payment that cannot be read back leaves the outcome open (review, 2026-09-26).** Every
+  read-back of a payment CreatePayment named, the call's own included, goes through one
+  helper: a failure that retrying will not change is re-thrown marked `outcomeUnknown`, and
+  a retryable one as it is. The contract gives GetPayment a 200, "Return the details of the
+  payment", and a 404, "Payment not found"; the API troubleshooting page's example of that
+  404 carries `errorCode` 50001130, `id` UNKNOWN_PAYMENT_ID and `retriable: false`, which
+  maps to a non-retryable `invalid_request`. Unflagged, that reads as a final refusal of a
+  payment that may have gone through, and a host could charge again under a new key. The
+  read-backs of `capturePayment` and `cancelPayment` are not routed through it yet.
+- **A replayed payment must be for the session's amount and currency (review,
+  2026-09-26).** An idempotencyKey reused across sessions (a per-order key serving an order
+  whose amount changed, say) replays the payment an earlier session made. Before returning
+  any replayed or read-back payment that did not end unpaid, the adapter compares its
+  `paymentOutput.amountOfMoney` (contract: "Object containing amount and ISO currency code
+  attributes"; the webhooks guide's payment examples show the order's amount there) with
+  the signed context's amount and currency. On a mismatch it refuses with a non-retryable
+  `invalid_request` and core's catalog message, `raw.reason: "another_sessions_payment"`,
+  `raw.payment` and the session's amount and currency, marked `outcomeUnknown`, since that
+  payment may be the one the host meant. The approach mirrors the Adyen adapter's
+  `compareWithSession`: a field the payment omits is not a mismatch. Failed attempts are
+  still walked past whatever their amount: they took no money, and the next attempt carries
+  this session's. The call's own answer, one without the replay header, is not compared:
+  its request named the session's amount, and the adapter sends neither surcharging's
+  `surchargeSpecificInput` (mode "on-behalf-of") nor eDCC's `currencyConversion`
+  (`acceptedByUser`, `dccSessionId`, "Mandatory for Server-to-server" on the eDCC page),
+  which could change what the payment carries. The guide tells hosts that a changed order
+  starts a new key.
+- **Why nothing is charged twice.** The only new sends are the later attempts, and each goes
+  out only after the previous key answered with a replayed attempt whose payment ended
+  without taking money: a refusal with no payment, or a payment that reads failed or
+  cancelled (for a 2xx, one not authorised or captured when created). Each next key derives
+  from a value Worldline replays unchanged, the failed payment's id or the initial request's
+  timestamp, so every completion derives the same keys in the same order, meets a success at
+  the key that holds it, and returns it. An outcome the adapter cannot know never leads to a
+  new attempt: a 409, a 429 or a 5xx ends the call as before, a pending payment is returned
+  or thrown marked `outcomeUnknown`, and so is a payment that cannot be read back, or a
+  failure on a re-send that may be the call's own. Within one call, the adapter never sends
+  a second attempt with a declined card while the server's clock runs less than 15 minutes
+  ahead of Worldline's; a clock further ahead can read the call's own lost decline as an
+  earlier completion's (see the re-send item below), and the guide states that premise.
+  Across calls it can: a duplicate POST of a completion, arriving after the first was
+  declined, finds that decline replayed and sends the same hosted tokenization, and so the
+  same card, under the next key (AMBIGUOUS 6). The guide tells hosts to deduplicate
+  completion POSTs per `clientToken`, quoting the API troubleshooting page on the
+  non-retriable codes ("We strongly recommend not resubmitting the payment request"), and
+  to open a new session for another card: the Hosted Tokenization Page guide says "Our
+  platform returns a unique hostedTokenizationId for each session", and the clientToken is
+  that id with the browser's device data, so two cards entered in one session can arrive
+  with the same `clientToken`. Two completions racing on one key cannot both send the
+  next one: the second meets the first's 409, and the answer it gets once that clears comes
+  on a re-send within the 15 minutes, so it is taken as that call's own, a failure marked
+  `outcomeUnknown`.
+- **A re-send's replay is an earlier completion's only when it is more than 15 minutes older
+  than the key's first send in the call (corrected in review, 2026-09-26).** When the first
+  send never reached Worldline (a refused connection, or a 429 the platform did not
+  process), the re-send meets an earlier completion's replay. Taking every answer to a
+  re-send as the call's own would throw a decline there as final even when a later attempt
+  under the key had succeeded, and a host that switched keys on it would charge again. The
+  call's own first request, processed but unanswered, is stamped when Worldline received it,
+  which reads as before the adapter's first send only by as much as the server's clock runs
+  ahead of Worldline's. So a replay stamped more than 15 minutes before the first send is an
+  earlier completion's, and walking on from it is exactly what the first send would have
+  done. Anything else may be the call's own: a timestamp within those 15 minutes or ahead
+  of the first send, one that is not decimal milliseconds, or one 23 hours old or more,
+  the plausibility bound the first-attempt check applies (review, 2026-09-26: a value in
+  seconds read as a very old replay, and past the first key, which that check guards, it
+  sent the next attempt with the same card). Such an answer is read back like a replay, a
+  challenge included (review, 2026-09-26: a challenge was returned as `requires_action`
+  unread, whatever it had become), and returned as it now reads, but a failed attempt among
+  them throws marked `outcomeUnknown` rather than walked past: walking past the call's own
+  would send its card again under the next key, and an earlier completion's may have a
+  later key holding a payment. A re-send answered without the header is fresh processing,
+  final as before. The margin assumes the server's clock runs less than 15 minutes ahead of
+  Worldline's: one further ahead would read its own lost decline as an earlier completion's
+  and send the next attempt with the same card. The manual-authentication page
+  (docs.direct.worldline-solutions.com/en/integration/api-developer-guide/manual-authentication)
+  says "Our platform will reject requests with a timestamp older than 5 minutes." and, among
+  its troubleshooting guidelines, "Keep the Date header within 5 minutes and use the same
+  date in the header and the signature." The first bounds only the other direction, and
+  neither says whether a Date ahead of Worldline's clock is refused (AMBIGUOUS 7).
+- **A refusal that created no payment is named by the replay header, not by its
+  `errorId`.** The contract describes `errorId` as "Unique reference, for debugging
+  purposes, of this error response", and the API troubleshooting page
+  (docs.direct.worldline-solutions.com/en/integration/api-developer-guide/api-troubleshooting)
+  as "The unique identifier of your request on our platform". Either reading lets a replay
+  carry a new `errorId`, and then two completions would derive different next keys, the
+  second sending a new attempt past a success. The replay header is documented as the
+  initial request's timestamp, so every replay repeats it, and a replayed failure always
+  carries it.
+- **The first key must outlive the session.** Every walk starts from the host key's own
+  first attempt, and Worldline promises its outcome for at least 24 hours only. A completion
+  that found it forgotten would go out as a new first attempt, and after a later attempt
+  succeeded, charge again. That happens when a per-order key serves a session created about
+  a day after its first attempt. Keys go out in order, so the first is the first Worldline
+  may forget: before sending a second attempt, the adapter requires the first attempt's
+  timestamp plus 23 hours (24 less an hour for drift between Worldline's clock and the one
+  that set the session's expiry) to fall after the signed session's `expiresAt`, and
+  otherwise refuses with a non-retryable `invalid_request` whose `raw.reason` is
+  `"first_attempt_may_expire"`, with core's catalog message. A header value that is not
+  decimal milliseconds, or that lies more than an hour ahead of the server's clock (a value
+  in microseconds, say), fails that check too. The refusal reads no further than the first
+  key, so a success that a later key holds from an earlier session goes unseen: it is a
+  refusal of a reused key whose later attempts may hold a payment it did not read, so it
+  carries `outcomeUnknown`, and the guide tells hosts to switch keys only after their
+  records or webhooks show no payment under the old one succeeded. The cost is a customer
+  who returns about a day after a decline under a per-order key and meets that error, where
+  walking on would have let them pay, against a second charge that walking on would risk.
+  What remains is outside any session's reach: a completion under the key after the
+  idempotence period, in a later session, is a new first attempt at Worldline, as it was
+  before. That period runs from the key's first attempt, not from the success, so it can end
+  hours after a success that came late; the guide says so, and tells hosts to record every
+  completed payment and never complete a paid order again. Worldline gives a Hosted
+  Tokenization session "a maximum life span of 3 hours", and temporary tokens "a lifespan of
+  two hours" (contract), so a `sessionTtlSeconds` beyond those outlives what it completes.
+  The config's documentation says so, and that a session living 23 hours or more gets no
+  further attempt after one that failed at its start or before it: the check above refuses
+  whenever the attempt came within the session's lifetime less 23 hours of its creation, or
+  before it (review, 2026-09-26, restored after an earlier revision dropped it).
+- **#215's hosted tokenization direction was dropped.** The issue proposed reading the
+  session's current token with
+  `GET /v2/{merchantId}/hostedtokenizations/{hostedTokenizationId}` ("When a token has been
+  created or updated during the hosted tokenization session, the details are returned in
+  this object") and deriving the next key from it. That read lasts only while the session
+  does, "a maximum life span of 3 hours", against at least 24 hours for the key's outcome,
+  so a later completion could not derive the key again. Token-derived keys also form no
+  chain: a completion carrying a third card after a success under the second card's key
+  would derive a key no attempt used, and charge again, because nothing the first key
+  replays names the second. The chain derives each next key from what Worldline replays for
+  the key before it, so every completion meets the success.
+- **The attempt-limit test gives each attempt its own session.** Worldline issues one
+  hostedTokenizationId per Hosted Tokenization session, and the contract says temporary
+  tokens "can only be used once". The fake does not enforce that single use, so rather than
+  let one id back 20 declines, the test opens a session per attempt, each with its own
+  hosted tokenization, as a per-order key reused across sessions would.
+- **AMBIGUOUS, each with a sandbox check.** (1) Whether Worldline stores a 5xx or a 429
+  outcome under a key; the `retriable` wording above suggests a technical failure needs a
+  new key. If it does, such a key keeps answering `psp_unavailable` or `rate_limited`, and
+  the adapter still never walks past one, since that attempt's outcome is unknown. Check:
+  replay a key whose first answer was a 5xx or a 429, if the sandbox can produce one. (2)
+  Whether `errorId` is the same on every replay; the adapter does not depend on it. Check:
+  decline a payment and replay its key twice, comparing the bodies. (3) Whether a replayed
+  402 carries the header, and in what format; no page shows a replayed error answer. The
+  guide says milliseconds and the Java SDK parses the value with `Long.valueOf`, but the
+  Node SDK keeps it as a raw string, and its unit test (sdk-nodejs,
+  `__tests__/unit/communication/idempotence.test.ts`) uses the ISO-8601 value
+  "2024-01-01T10:00:00Z". Without the header the adapter reads the replay as the call's own
+  and throws the decline, as before. In ISO-8601, every walk past a first key would be
+  refused as `first_attempt_may_expire`, and every replay on a re-send taken as the call's
+  own: the safe failure, at the price of a customer who cannot pay again under the key.
+  Check: the same replay, inspecting the headers, also confirming that the value is decimal
+  milliseconds. (4) Whether a 400 that created no payment is stored under the key at all;
+  the fake stores it, and either way no payment is at stake. Check: send a CreatePayment the
+  platform refuses with a 400 (an unknown `hostedTokenizationId`, say), then the same key
+  with a valid one, and record whether the second answer replays the 400 with the header or
+  creates a payment. (5) Whether a 4xx `paymentResult` payment is always REJECTED; the
+  adapter reads its status either way. Check: decline payments with each sandbox decline
+  trigger and record `paymentResult.payment.status` and `statusOutput.statusCode` on every
+  4xx that carries one. (6) Whether the single-use temporary token blocks a second payment
+  with the same hosted tokenization, as in the duplicate POST above; the contract says
+  temporary tokens "can only be used once", and does not say whether a declined attempt uses
+  one. Check: decline a payment, then send CreatePayment with the same
+  `hostedTokenizationId` under a new key, and record whether Worldline refuses it, with
+  which error, or authorises the card again. (7) Whether Worldline rejects a `Date` more
+  than 5 minutes ahead of its clock; the manual-authentication page names only timestamps
+  "older than 5 minutes" and asks to "Keep the Date header within 5 minutes". If it does, a
+  server clock that far ahead fails every request, and the 15-minute margin holds with room
+  to spare. Check: send a signed request whose `Date` is 6 minutes ahead and record the
+  answer. (8) Whether a replayed 2xx shows the payment's status when it was created or its
+  current one; the idempotent-requests guide says "Updates related to the operation, such
+  as payment status, may still occur" without saying whether a replay reflects them. The
+  adapter reads the payment back before relying on any answered status but a failed
+  attempt's, which is final, and reads back an answered 6 too. Check: authorise a
+  manual-capture payment, cancel it, replay its CreatePayment key, and compare the replayed
+  status with GetPayment's. (9) Whether
+  GetPayment can answer 404 right after CreatePayment created the payment; the contract
+  lists the 404 without saying when. If it can, the completion throws that 404 marked
+  `outcomeUnknown` and the next one under the key reads the payment again. Check: read
+  every new payment back immediately after its 201, many times over, and record any 404.
+  (10) Which status a challenge cancelled while still at 46 reads. CancelPayment's outcomes
+  list CANCELLED/UNSUCCESSFUL/6 as the final one, while Cancelled (1) is described for
+  Hosted Checkout cancellations and expired sessions. At 6 the walk never passes it and the
+  host completes under a new key; at 1 the same key walks past it too. Check: create a
+  challenge, cancel it before the redirect, and read it back. (11) What a cancellation at
+  64, 75 or 96, or without a code, means; no page describes them, and the adapter holds such
+  a payment rather than walk past it. Check: cancel payments at each stage the sandbox
+  allows (an open challenge, an authorisation, a pending authorisation) and record each
+  CANCELLED payment's `statusOutput.statusCode`. No sandbox run has exercised any of this
+  yet.
+
+## Paysafe answers mapped as documented (2026-09-26)
+
+- **The card error codes Paysafe documents map onto the taxonomy instead of the HTTP
+  fallback.** Doc-verified 2026-09-26 against the card errors page
+  (developer.paysafe.com/en/api-docs/payments-api/add-payment-methods/cards/card-errors/,
+  unchanged from the copy read on 2026-09-24). `authentication_required`, never retryable:
+  "402 | 3060 | Your request has been declined because Strong Customer Authentication is
+  required." and "402 | 3039 | Your request has been declined due to an invalid
+  authentication value."; the customer comes back on-session, and a replay cannot help.
+  `fraud_suspected`: "402 | 3054 | The transaction was declined due to suspected fraud.",
+  "402 | 3016 | The bank has requested that you retrieve the card from the cardholder - it
+  may be a lost or stolen card.", "402 | 4001 | The card number or email address associated
+  with this transaction is in our negative database." and "402 | 4002 | The transaction was
+  declined by our Risk Management department."; the Stripe adapter maps a lost or stolen
+  card the same way. `invalid_card_data`, as 3017 already was: "400 | 3002 | You submitted
+  an invalid card number or brand or combination of card number and brand with your
+  request.", "400 | 3005 | You submitted an incorrect CVV value with your request.", "402 |
+  3012 | Your request has been declined by the issuing bank because the credit card expiry
+  date submitted is invalid.", "402 | 3019 | Your request has failed the CVV check. Please
+  note that the amount may still have been reserved on the customer's card, in which case
+  it will be released in 3-5 business days." and "402 | 3007 | Your request has failed the
+  AVS check. Note that the amount has still been reserved on the customer's card and will
+  be released in 3-5 business days. Please ensure the billing address is accurate before
+  retrying the transaction."; the customer can correct each, and the Stripe adapter maps an
+  incorrect CVC or postal code the same way. The hold 3019 and 3007 describe is released,
+  not captured, so they stay definitive failures. The 402s had fallen to `card_declined`,
+  and 3002 and 3005, the 400s, to `invalid_request`. A failed record read back with one of
+  these codes maps the same way.
+  The card simulator
+  (developer.paysafe.com/en/api-docs/payments-api/add-payment-methods/cards/simulating-card-payments/)
+  returns 4002, 4001, 3007 and 3060 for the amounts 23, 25, 24 and 77 (3060 "Applies for
+  Acquiring (UK/EU)."); no sandbox run has done so yet.
+- **Four more capture and refund state checks are `invalid_request`.** "402 | 3202 | You
+  have exceeded the maximum number of Settlements allowed.", "402 | 3205 | The Authorization
+  you are attempting to settle has expired.", "402 | 3403 | You have already processed the
+  maximum number of refunds allowed for this Settlement." and "402 | 3405 | The Settlement
+  you are attempting to Refund has expired." join 3203, 3204, 3402, 3404, 3501, 3502 and
+  3506: the settlement or the authorization cannot take the request, and the card is not at
+  fault.
+- **An operation the transaction, its card type or the account's gateway does not support
+  is `unsupported_operation`, never retryable.** "402 | 3419 | This type of transaction
+  cannot be refunded." and "402 | 3507 | The Authorization does not support a partial Void
+  (Authorization Reversal)." refuse the operation itself, not the request's amount or the
+  record's state, so they map as `refundPayment` refuses a SEPA or Bacs refund and as
+  `PaymentService`'s capability guards refuse what an adapter lacks. The page's other
+  answers of that kind map with them: "402 | 3416 | The external processing gateway for
+  which your merchant account is configured does not support partial Settlements.", "402 |
+  3418 | The external processing gateway for which your merchant account is configured does
+  not support partial Credits.", "402 | 3503 | The Void (Authorization Reversal) transaction
+  is not supported for the card type used for the Authorization you are attempting to
+  reverse." and "402 | 3504 | The external processing gateway for which your merchant
+  account is configured does not support partial Voids (Authorization Reversals)." The
+  adapter declares partial refunds and multi-capture, and `cancelPayment` voids what is
+  left of an authorization, a partial void once part of it is settled: on an account whose
+  gateway supports none of these, those calls meet 3418, 3416, 3504 or 3507 at run time,
+  while the full operation may still go through.
+- **Every other 402 code on the page stays on the `card_declined` default, deliberately.**
+  The issuer's, the network's and the gateway's refusals of the card or of the transaction
+  are card declines: 3011, 3013, 3014, 3015, 3018, 3020, 3023, 3024, 3027, 3029, 3030,
+  3035, 3036, 3037, 3040, 3041, 3042 and 3057 among the authorization errors, 3206 ("The
+  external processing gateway has rejected the transaction.") and 3207 ("Due to issuer
+  policies, this type of transaction is not allowed") among the settlement errors, 3421
+  ("The purchase return authorization has been declined by the issuing bank.") and 3422
+  ("The purchase return authorization has failed.") among the refund errors, and 5021
+  ("Your transaction request has been declined.") among the common ones. 3018 and 3020
+  ("The bank has requested that you retry the transaction.") and 3041 ("Your request has
+  been declined due to a timeout.") stay non-retryable: Paysafe files the attempt as
+  declined, so a replay under the same key reads that decline back, and only a new attempt,
+  the customer's or the host's call, can follow. 3415 ("You cannot cancel this transaction
+  as it is no longer in a pending state.") answers a cancellation the adapter never sends.
+- **Refunds the merchant account cannot fund are `invalid_request`,** as the state checks
+  are: 3412 ("The Refund transaction you attempted was not permitted because your merchant
+  account is in overdraft.") and 3413 ("The requested Refund amount exceeds the permissible
+  Visa credit ratio."), an amount limit like 3402. The card is not at fault, so a decline
+  would mislead the merchant. Two 400 rows that refuse the card itself are `card_declined`
+  rather than the 400 fallback's `invalid_request`: 3073 ("Your request has been declined
+  due to closed customer account.") and 3008 ("You submitted a card type for which the
+  merchant account is not configured."); the customer can pay with another card. The other
+  400 rows are request errors and stay on the fallback. 3417 is a replay answer (below). The
+  Merchant Advice and ISO response codes the page lists ride `error.additionalDetails`, not
+  `error.code`, and stay on `raw`.
+- **8000 and 8001 stay `fraud_suspected`, although no current Paysafe error table lists
+  them.** Neither code appears on the card errors page, nor on any of the 195 pages linked
+  from the Payments API documentation's navigation (Payments API, Paysafe Checkout, Paysafe
+  JS, 3-D Secure, Payment Scheduler and the rest), read on 2026-09-26. Dropping them would
+  turn an answer an account may still receive into a plain decline, so they stay, with a
+  comment saying so.
+- **The replay answers keep their HTTP fallback.** 5031, 3044, 3417 and 5283 stay out of the
+  map (409 and 400 → `invalid_request`, 402 → `card_declined`): `sendWrite` recognizes them
+  by the Paysafe code on `raw`, so "Paysafe replay safety (2026-09-24)" is unchanged, and a
+  test pins the fallback.
+- **A 429 or a 5xx is classified by its status before its code.** `mapPaysafeError` answers
+  `rate_limited` or `psp_unavailable`, retryable, whatever code the body carries, as
+  `mapWorldlineError` does, and the code map speaks for the other statuses only. A 5xx is
+  how `sendWrite` learns that a write's outcome is unknown and must be looked up: a code
+  mapped to a final answer, a decline on a 502 say, would have ended the call without that
+  lookup although Paysafe may have processed the write. No 429 or 5xx row on the page (1000,
+  1001, 1002, 1003, 1007, 1008, 1020, 1200, 3028, 3420, 3423, 3424, 3505, 5050, 9000)
+  carries a mapped code, so no documented answer changes. `sendWrite` still reads the replay
+  codes and the lookups' 5269 from the body on `raw`, whatever the mapped code. Only the
+  map's own keys count as codes, as in the Worldline adapter, so a code such as
+  "constructor" falls through to the HTTP fallback.
+- **The test double already answered the state checks as documented.** Since #198 it
+  refuses an over-refund with 402/3402 and an over-capture with 402/3204, where it once
+  answered 400/3407 and 400/5050. The card errors page gives 3407 as "400 | 3407 | The
+  Settlement referred to by the transaction response ID you provided cannot be found.",
+  which the double still returns for an unknown settlement, and 5050 as a 500 ("An error
+  occurred with your merchant account configuration."). No test asserted the old answers.
+  Its scheduler rejections still use 400/5050, where the Payment Scheduler errors page
+  (developer.paysafe.com/en/api-docs/payment-scheduler/test-and-go-live/common-api-errors/)
+  documents "400 | PLAN-SUBSCRIPTION-3 | Subscription not modifiable." and "400 |
+  PLAN-SUBSCRIPTION-1 | Plan not modifiable."; the adapter reads no code there.
+- **Terminal refund and verification statuses follow the spec's enums.** Doc-verified
+  2026-09-26 against the Payments API OpenAPI spec
+  (developer.paysafe.com/fileadmin/openapi-spec/payments-api/apis/paysafe-ph-payments-api.yaml).
+  A refund in "EXPIRED - The transaction request is expired." is `failed`: it had fallen to
+  `pending`, a refund that would never settle, while nothing went back to the customer. A
+  verification in "ERROR - The verification has errored - failed for non-business reason
+  (non http status 402 error)." is `failed`, as FAILED is; it had fallen to `processing`.
+  RECEIVED ("A verification request was received from merchant, but it has not yet been
+  sent to downstream gateway.") stays `processing`.
+- **An expired settlement moved no money, like a cancelled or failed one.** The settlement
+  enum is RECEIVED, INITIATED, PENDING, FAILED, CANCELLED, EXPIRED and COMPLETED, EXPIRED
+  reading "The transaction request is expired." Every settlement sum on a `PaymentInfo`
+  (`amount`, `amountCaptured`, `amountRefunded`, `capturedAt`) and the choice of the
+  settlement a refund comes out of now skip it, through the rule the replay logic already
+  uses (failed, cancelled or expired, or filed with an error, in any letter case); the old
+  filters skipped only CANCELLED and FAILED. An expired settlement reporting
+  `availableToRefund: 0` had read as fully refunded, and one still reporting a balance
+  could be refunded against. The payment-level witnesses are unchanged: a completed
+  settle-with-auth payment still reports its full amount captured, and a manual-capture
+  payment with no settlement that moved money still derives it from `availableToSettle`.
+  What Paysafe reports on the payment once its settlement expires is undocumented.
+- **SEPA and Bacs refunds are refused locally with `unsupported_operation`.** Doc-verified
+  2026-09-26: the SEPA Direct Debit page
+  (developer.paysafe.com/en/api-docs/payments-api/add-payment-methods/sepa-direct-debit/)
+  lists "Refunds | Not Supported" and the Bacs Direct Debit page
+  (developer.paysafe.com/en/api-docs/payments-api/add-payment-methods/bacs-direct-debit/)
+  "Refunds | NA". The ACH, EFT and Interac e-Transfer pages say nothing about refunds, and
+  the spec is no firmer: the `refunds` schema's `paymentType` enum lists CARD, PAYSAFECARD,
+  PAYSAFECASH, RAPID_TRANSFER, SKRILL, SKRILL1TAP, MYBANK and EPS, with no bank rail and no
+  Interac, while the refund endpoint's own examples also refund TRUSTLY, MBWAY and
+  MULTIBANCO payments, which the enum leaves out. Whether Paysafe refunds an ACH or EFT
+  payment is therefore uncertain; since the enum is no complete list and no page refuses
+  them, those refunds still go to Paysafe, whose answer stands, and the sandbox check below
+  settles it. Only the payment names its rail, so `refundPayment` reads it first, then
+  refuses a SEPA or BACS payment, non-retryable and with the payment on `raw`, before the
+  settlement lookup or any refund write. `supportsRefunds` stays true: the contract has no
+  per-rail refund flag, so the refusal and the guide carry the limit. This extends the
+  2026-07-15 bank-rails note, which recorded the Bacs case only.
+- **Timestamps come out as ISO 8601 whatever form Paysafe sends them in.** The spec types
+  every `txnTime` as a date-time string, but six of its POST /v1/payments response examples
+  ("Card - with Settlement" among them) carry the embedded settlement's as epoch
+  milliseconds (`"txnTime": 1674814529000`, the instant of the payment's own
+  `"2023-01-27T10:15:29Z"`), which the adapter passed through as `capturedAt`, a number.
+  `createdAt` on payments, verifications and refunds, and `capturedAt`, now go through one
+  reader: a number or a string of digits is epoch milliseconds when it lies between 1e11
+  (1973-03-03) and 8.64e15, the last instant a `Date` holds, any other string goes through
+  core's `normalizeTime`, and an unreadable value is left out of the optional fields, while
+  the required `createdAt` keeps its epoch fallback. An ISO string comes back normalized
+  (`2026-07-04T10:10:00Z` becomes `2026-07-04T10:10:00.000Z`). Epoch seconds are not guessed
+  at, since no Paysafe example sends them: they fall below the range, as a digits-only date
+  such as "20260704" does, so they count as unreadable rather than as an instant in January
+  1970.
+- **Card expiry strings are read.** `cardExpiry.month` and `year` are numbers in the schema
+  (examples 12 and 2022), but 27 of the spec's 28 response examples that carry an expiry
+  send strings (`{"month": "10", "year": "2025"}`), on the payment, verification, payment
+  handle and Customer Vault endpoints among others, and the adapter read numbers only, so
+  those instruments reported no expiry. Both forms are read now; anything but a whole
+  month from 1 to 12 or a four-digit year, the ranges `PaymentMethodDetails` documents, is
+  left out. `PaysafeCardLike.cardExpiry` and the `txnTime` of
+  `PaysafePaymentLike.settlements` entries, both exported, widen to the forms the examples
+  show (`PaysafeSettlementLike`, the entries' type, is not exported itself); TypeScript code
+  reading them as a plain number or string must handle both.
+- **Card brands follow the cardType enum.** The spec's `baseCard.cardType` reads "MD –
+  Maestro" and "SO – Solo" (its internal `cardTypeConfig` also lists "MD - Maestro"). MD
+  had been reported as "mastercard", under a "Debit MasterCard" comment; it is "maestro"
+  now, and SO, which had no mapping and so no brand, is "solo". DC ("DC - Diners Club" in
+  `cardTypeConfig`) and UP, in no current Paysafe enum, keep their earlier brands.
+- **Doc-derived only; to settle in the sandbox:**
+  - **The simulated declines.** Charge a card account the simulator's amounts 23, 25, 24
+    and 77 and record that they answer 4002, 4001, 3007 and 3060 (3060 on UK/EU acquiring
+    only). No
+    sandbox run has returned any code this entry maps.
+  - **The statuses and shapes read here.** Record an expired refund or settlement, an
+    `ERROR` verification, an epoch-millisecond settlement time or a string expiry if a run
+    meets one; none has yet.
+  - **An ACH and an EFT refund.** Refund a completed ACH payment and a completed EFT payment
+    once the settlement batch has run, and record whether Paysafe refunds each, and the code
+    of any refusal. The CAD sandbox account completed an EFT debit on 2026-07-15, so EFT can
+    run first; ACH needs an account provisioned for it. A refusal means refusing that rail
+    locally, as SEPA and Bacs are.
+
+## Adyen refusal reasons (2026-09-26)
+
+- **Refusals Adyen attributes to the acquirer, the network, the issuer or the scheme are
+  `processing_error`, never retryable.** Doc-verified 2026-09-26 against the refusal-reasons
+  page (docs.adyen.com/development-resources/refusal-reasons): 42, "3DS Authentication
+  Error": "The 3D Secure authentication failed due to an issue at the card network or
+  issuer. Retry the transaction, or retry the transaction with a different payment
+  method."; 39, "RReq not received from DS": "The issuer or the scheme wasn't able to
+  communicate the outcome via RReq."; 40, "Current AID is in Penalty Box": "The payment
+  network cannot be reached. Retry the transaction with a different payment method.", whose
+  point-of-sale form, "AID banned", reads "The application is temporarily in our AID penalty
+  box until its payments network can be reached again."
+  (docs.adyen.com/point-of-sale/error-scenarios/refusal-reasons-pos); and 4, "Acquirer
+  Error": "The transaction did not go through due to an error that occurred on the
+  acquirer's end." The card is not at fault. For 40 and 42 Adyen's remedy is a new
+  transaction or another payment method, not a new authentication by the cardholder, as with
+  the issuer-side 3-D Secure failures in "Worldline decline codes (2026-09-25)"; for 39 and
+  4 the page states none. 42 was
+  `authentication_required`, the code of a failed cardholder authentication, which 11 ("3D
+  Secure authentication was not executed, or it did not execute successfully.") and 38 ("The
+  issuer declined the authentication exemption request and requires authentication for the
+  transaction. Retry with 3D Secure.") stay. 39 and 40 had fallen to `card_declined`, as had
+  4 whenever it came with `resultCode` Refused; Adyen's testing page gives 4 with Error, which
+  already read as `processing_error`. A refusal stays non-retryable: a replay of the same
+  idempotency key returns the same refusal, so a new attempt is the shopper's move.
+- **21 ("Not Submitted") is read as a payment that did not reach processing, and is
+  `processing_error` too.** Its description, "The transaction was not submitted correctly
+  for processing.", names no party. The reading rests on that wording and on Adyen
+  answering with a refusal, not a validation error; the point-of-sale page gives the same
+  description. It had fallen to `card_declined`. Would be wrong if Adyen used 21 for a
+  request the merchant must fix, which would call for `invalid_request`, as Worldline's
+  "Format error" (30301001) is.
+- **32 ("AVS Declined": "The address data the shopper entered is incorrect.") is
+  `invalid_card_data`,** as the Paysafe adapter maps its failed AVS check (3007): the
+  customer can correct it. **22 ("FRAUD-CANCELLED") is `fraud_suspected`,** like 20: "the
+  transaction was flagged as fraudulent, and was refused." The testing page gives it with
+  `resultCode` Cancelled, which reports the payment `canceled` without reaching the refusal
+  map, so the entry covers a 22 that comes with Refused.
+- **Left on the default deliberately.** 7 ("Invalid Amount": "An amount mismatch occurred
+  during the transaction process.") states no cause, like Worldline's 30131001 ("Invalid
+  amount"), and stays `card_declined`. The issuer's refusals of the card or the transaction
+  (3, 10, 23, 25, 26, 27, 28, 29 and 50) are declines. 15 and 16 (Cancelled, Shopper
+  Cancelled) are cancellations the taxonomy has no code for; the Worldline adapter reports
+  its customer cancellation (30171001) as a decline too. The PIN, account-type, contactless
+  and chip answers (17 to 19, 33 to 37, 41 and 43 to 45) come from in-person payments, which
+  this adapter does not take.
+- **The lookup reads the map's own keys only**, as the Paysafe adapter's does: a
+  `refusalReasonCode` such as `constructor` falls back like any unknown code.
+- **`createCompletionHandler` answers the refusals now read as `processing_error` with HTTP
+  502 instead of 402** (`completionErrorStatus`); the client rebuilds the error from the body,
+  so the code, not the status, drives the UI.
+- **Doc-derived only.** The testing page
+  (docs.adyen.com/development-resources/testing/result-codes) triggers each of these
+  through the cardholder name: THREED_SECURE_AUTHENTICATION_ERROR (42), RREQ_NOT_RECEIVED
+  (39), BAN_CURRENT_AID (40), ERROR (4), NOT_SUBMITTED (21) and AVS_DECLINED (32).
+  FRAUD_CANCELLED (22) comes with `resultCode` Cancelled there, so `completePayment`
+  resolves with the payment `canceled` rather than rejecting. No sandbox run has done so: the
+  project has no Adyen test account.
+
+## CSP guidance re-verified (2026-09-26)
+
+- **Stripe: `https://*.js.stripe.com` joins `script-src` and `frame-src`.** Stripe's security
+  guide (docs.stripe.com/security/guide, Content Security Policy › Stripe.js) lists
+  "`script-src`, `https://*.js.stripe.com`, `https://js.stripe.com`,
+  `https://maps.googleapis.com`" and "`frame-src`, `https://*.js.stripe.com`,
+  `https://js.stripe.com`, `https://hooks.stripe.com`", and says "Adding `*.js.stripe.com`
+  allows Stripe.js to improve performance by starting frames on different origins, where
+  possible." The onboarding descriptor and the guide now list it. `https://maps.googleapis.com`
+  applies only "If you’re using the Address Element with your own Google Maps API key",
+  which this adapter never mounts, so the descriptor leaves it out and the guide names it.
+  Link's `frame-src` and `connect-src` hosts (`https://link.com`, `https://*.link.com`) are
+  listed: Stripe's Link page (docs.stripe.com/payments/link/payment-element-link) says "The
+  default Payment Element integration includes a Link prompt in the card form.", and the server adapter creates intents with
+  `automatic_payment_methods`, so an account that enables Link shows it; Link's `img-src`
+  host is in the guide, the descriptor having no field for it. The guide's `https://m.stripe.network`
+  note is gone: the security guide does not name that host, and the served
+  `https://js.stripe.com/v3` never references `stripe.network`. So is its advice to self-host:
+  docs.stripe.com/js says Stripe.js "should always be loaded directly from
+  `https://js.stripe.com`, rather than included in a bundle or hosted yourself", and the
+  served script throws "Stripe.js must be loaded from js.stripe.com." when it is not.
+- **PayZen: `connect-src` and `frame-src` name `https://static.payzen.eu`.** PayZen's FAQ "How
+  to configure the CSP (Content Security Policy)"
+  (payzen.io/en-EN/rest/V4.0/javascript/features/reference.html) asks for `connect-src`,
+  `frame-src` and `script-src` `https://static.payzen.eu`, and the same three for
+  `https://secure.payzen.eu` with an external fraud detection engine. The guide had named no
+  `frame-src` host ("hosts vary per platform") and no `connect-src`. The descriptor already
+  listed them. It keeps `https://api.payzen.eu` under `connect`, which PayZen's list does not
+  name but the served krypton-client's platform table carries, since whether the host page
+  contacts it is unverified. The guide now also states two facts from the served files: the
+  theme stylesheet `@import`s its fonts from `https://fonts.googleapis.com` (files from
+  `https://fonts.gstatic.com`), and krypton-client adds an inline `<style>` element, so
+  `style-src` needs `'unsafe-inline'`.
+- **PayPal, Worldline and Adyen match their providers' current guidance; Paysafe publishes
+  none.** Checked on 2026-09-26 against developer.paypal.com/sdk/js/v5/best-practices, the
+  Worldline Hosted Tokenization Page guide and docs.adyen.com's script-security page.
+  Paysafe's Paysafe.js pages name no CSP; the hosts in its guide agree with the environment
+  table in the served paysafe.min.js. That file also adds `<style>` elements of its own
+  (`document.createElement("style")`, used for the 3-D Secure overlay among others), so the
+  guide now says a `style-src` that restricts styles needs `'unsafe-inline'`.
+
+## PayZen acquirer codes aligned (2026-09-26)
+
+- **An acquirer code is mapped only when every acquirer table PayZen documents reads it the
+  same way.** Doc-verified 2026-09-26 against the ACQ error page
+  (payzen.io/en-EN/rest/V4.0/api/errors_acq.html): the acquirer's refusal code "is returned in
+  detailedErrorCode. These codes are returned without modification. They are specific to each
+  acquirer." The page points to the list of detailedErrorCode values
+  (payzen.io/en-EN/rest/V4.0/api/acq_errors/acquirers_response_codes_list.html), which links a
+  table per acquirer or network in the same folder: the CB network (cb.html), CONECS
+  (conecs.html), ALMA (alma.html), American Express Global (amex_global.html), Elavon Europe
+  (gateconex.html) and the GICC network (gicc.html). The error names no network: an ERROR
+  answer carries errorCode, errorMessage, detailedErrorCode and detailedErrorMessage
+  (payzen.io/en-EN/rest/V4.0/api/errors-reference.html), and the error KR.onError reports is
+  documented with the same four plus `children` and `field`
+  (payzen.io/en-EN/rest/V4.0/javascript/features/kr_onError.html). A code another table reads
+  otherwise cannot be read from the CB table alone. The rule covers both editions of the
+  tables, which differ: the English one, which es-ES and pt-BR follow code for code, and the
+  French one (fr-FR). The French CB table adds 84, 86 and 88 and reads 82 as "CVV, dCVV, iCVV
+  incorrect", its CONECS table holds codes the English one lacks and lacks the English 82 and
+  94, and its Elavon Europe table adds 110. No verdict below depends on the edition.
+- **Mapped since 2026-09-26: 15, 20, 68, 90, 91, 96, 97 and 99, none retryable.**
+  `processing_error`: 20 ("Incorrect response (error on the domain server)"; CB only), 68
+  ("Response not received or received too late"; CB, Elavon Europe's "Response Received Too
+  Late", the French CONECS table), 90 ("Temporary shutdown"; CB, CONECS, Elavon Europe's
+  "Cut-Off In Progress"), 91 ("Unable to reach the card issuer"; CB, CONECS, Elavon Europe's
+  "Issuer Or Switch Inoperative", GICC's "Card issuer temporarily not reachable"), 96 ("System
+  malfunction"; CB, CONECS, Elavon Europe's "Communication System Malfunction", GICC's
+  "Processing temporarily not possible"), 97 ("Overall monitoring timeout"; CB, CONECS, Elavon
+  Europe's "Communication Error - Cannot Connect To FNB", and GICC's "Security breach - MAC
+  check indicates error condition", read as a failed check between systems) and 99 ("Initiator
+  domain incident"; CB, CONECS, GICC's "Error in PAC encryption detected", and ALMA's "Unknown
+  error", read as an error apart from ALMA's refusal, 03). Worldline maps the Sips
+  counterparts of 20, 68, 91 and 99 (30201001, 30681001, 30911001 and 30991001) the same way.
+  `invalid_card_data`: 15 ("Unknown issuer"; CB, Elavon Europe's "No Such Issuer", the French
+  CONECS table), as Worldline maps 30151001 ("No such issuer"). PayZen refused the
+  transaction, so none is retryable: a new one is the customer's move.
+- **The codes mapped before meet the rule, except 38 and 1A, which stay until the codes can be
+  read per network.** 51 (CB, Elavon Europe, the French CONECS table), 33 (CB, Elavon Europe,
+  GICC, the French CONECS table), 54 (CB, Elavon Europe, the French CONECS table), 14 (CB,
+  CONECS, Elavon Europe, and GICC's "invalid card"), 34 (CB, Elavon Europe, GICC's "Suspicion
+  of Manipulation", the French CONECS table), 41 (CB, Elavon Europe, the French CONECS table),
+  43 (CB, Elavon Europe, GICC, the French CONECS table) and 59 (CB, CONECS, Elavon Europe)
+  agree. 38 is "Expired card" on the CB table but "PIN Tries Exceeded, Pick-Up" on Elavon
+  Europe's, and stays `expired_card`: kept from before this change so nothing regresses, and
+  Elavon's is a PIN answer, which an online card payment should not receive. 1A, `authentication_required`, is on no table in either
+  edition: the French Elavon Europe table has it only as the label of its code 110 ("1A - Soft
+  Decline requesting 3D Secure Version 2 authentication on an unsecured ecommerce
+  transaction"), and 110 is "Invalid amount." on the American Express Global table.
+- **03, 30, 81 and 98 stay `card_declined`, although the CB table reads them otherwise.** CB
+  and CONECS give 03 as "Invalid acceptor" and 30 as "Format error", the merchant's set-up or
+  request at fault, and GICC's 30 is "Format Error" too, but ALMA's 03 is "Payment refused by
+  Alma." and Elavon Europe's 30 "File Update Failed". CB's 81, "The non-secured payment is not
+  admitted by the issuer", is "Approved Commercial" on Elavon Europe's table and "Message-flow
+  error" on GICC's; 98, "Server not available, new network route requested" on CB and CONECS,
+  is "Exceeds Cash Limit" on Elavon Europe's and "Date and time not plausible" on GICC's. The
+  Worldline adapter maps the Sips counterparts of 03 and 30 (30031001 and 30301001) to
+  `invalid_request`; the PayZen adapters cannot follow until they know the network.
+- **Reading the codes per network is follow-up work.** A transaction's
+  `transactionDetails.acquirerNetwork` names its network: the rendered Transaction reference
+  (payzen.io/en-EN/rest/V4.0/api/playground/answer/Transaction) lists its values, CB, CONECS,
+  ALMA, AMEXGLOBAL, GATECONEX and GICC_VISA among them, where the downloadable schema
+  (payzen.io/files/schema-api-v4.json) gives a free string. No page says which table a value's
+  codes follow, and most of the listed networks, EVO and REDSYS_REST among them, have none. An
+  unpaid order's transactions in the browser answer carry the field, and so does the
+  transaction the server adapter reads before a refund; an ERROR answer and the KR.onError
+  error document none. Elavon Europe and GICC print codes below 10 without a leading zero; no
+  mapped code is below 10.
+- **60 and 94 stay declines.** 60 ("The acceptor of the card must contact the acquirer"; CB,
+  the French CONECS table, and Elavon Europe's "Contact Acquirer") refers the merchant to the
+  acquirer, as 02 ("Contact the card issuer") refers it to the issuer. No table names the
+  merchant's set-up or request as the cause, as 03 and 30 do, and an online payment cannot
+  wait for the call, so it is not `invalid_request`. 94 ("Duplicate transaction."; CONECS's
+  "Duplicate request", Elavon Europe's "Duplicate Transaction") refuses the repeat of a
+  transaction already processed: the repeat moves no money, the original keeps its own
+  outcome, and `processing_error`'s "please try again" would invite one more repeat.
+- **The other CB codes stay on the default deliberately.** 00 approves. 05 ("Do not honor"),
+  12 ("Invalid transaction"), 57 and 58 ("Transaction not allowed for this cardholder"), 61
+  ("Withdrawal limit exceeded") and 63 ("Security rules unfulfilled") refuse the transaction,
+  and so does 19 ("Retry later"), which stays non-retryable like Paysafe's 3018 and 3020. 08
+  ("Confirm after identification") asks for a check an online payment cannot make. 13
+  ("Invalid amount.") and 31 ("Unknown acquirer company ID") state no cause the card or the
+  merchant could act on, as Worldline leaves 30131001 and 30311001. 04 and 07 ("Keep the
+  card", "Keep the card, special conditions") claim no fraud, as Worldline reads its Sips 04
+  and 07. 17 ("Canceled by the buyer") is a decline, as Worldline's 30171001 is. 56 ("Card
+  absent from the file") says a file lacks the card, not that its number is wrong, as 14 does.
+  24 to 29 ("Unsupported file update" to "Unable to update") answer file updates, and 76 ("The
+  cardholder is already blocked, the previous record has been saved") the blocking of a card,
+  requests the adapters never send. 82 and 83 revoke recurring payments, and 55, 75 and 80
+  concern PINs and contactless payments. The French CB table's own entries stay there too: its
+  82 ("CVV, dCVV, iCVV incorrect") contradicts the English one, and 84, 86 and 88 are in that
+  edition alone.
+- **A refund refused with an authentication code is `card_declined`.** PSP_101 ("The
+  transaction cannot be refunded. It is the buyer's bank that opposes the refund request. You
+  must reimburse your buyer by another means of payment (check, transfer ...).",
+  payzen.io/en-EN/rest/V4.0/api/errors_psp.html) carries the refusal code in detailedErrorCode
+  and links the CB table for it, so `refundPayment` reads the same map, with one exception: a
+  code the map reads as `authentication_required` (1A) is `card_declined` there, since a
+  refund has no cardholder authentication to go back to.
+- **Both halves map the codes the same way.** The browser adapter keeps its own copy of the
+  map, since it cannot depend on the server package, and a test compares the two. It builds
+  the error for an unpaid order's last transaction and for an ACQ_ or AUTH_ error from
+  KR.onError in one helper: ACQ_999 and AUTH_999 ("technical error" on both pages) are a
+  `psp_unavailable`, retryable as core requires of that code, and every other answer is a
+  refusal, never retryable. It had read ACQ_999 as a decline and AUTH_999 as
+  `authentication_required` on both paths. These errors take core's catalog messages, as the
+  server adapter's do; the form's own texts, such as "The payment form could not be set up.",
+  stay with the form's CLIENT_ errors, and every other code takes the catalog's message. Lookups read the maps' own keys only, the
+  browser adapter's through `Object.prototype.hasOwnProperty.call`: the ES2022 `Object.hasOwn`
+  is missing from Chrome before 93, Firefox before 92 and Safari before 15.4, and PayZen's
+  JavaScript client reference (payzen.io/en-EN/rest/V4.0/javascript/features/reference.html)
+  supports Chrome from 70, Firefox from 64 and Safari from 11, besides Internet Explorer 10,
+  Edge 17 and the Android 5.0 browser, which this package does not target. A host's bundler
+  lowers syntax such as `??=` but adds no missing built-in, so a test keeps ES2019 and later
+  built-ins (`Object.fromEntries`, `matchAll`, `flat`, `trimStart`, `Object.hasOwn` and
+  the like) out of the browser package's source; core's source, which the same bundle ships,
+  is not scanned.
+- **Known difference, tracked in #232: AUTH_100 to AUTH_149 stay `authentication_required`.**
+  The AUTH error page (payzen.io/en-EN/rest/V4.0/api/errors_auth.html) describes AUTH_100 as
+  "invalid ACS Signature", AUTH_101 as "technical error 3DS", AUTH_102 as "wrong Parameter
+  3DS", AUTH_103 as "3DS Disabled" and AUTH_149 as "3DS operation timeout": none describes a
+  cardholder who failed to authenticate or an issuer asking for authentication, which is what
+  the other adapters read as `authentication_required` (see "Worldline decline codes
+  (2026-09-25)").
+- **Doc-derived only.** No sandbox run has produced any of these codes.
+
+## Stripe: one card-error classification on both halves (2026-09-26)
+
+- **The browser adapter classifies Stripe.js errors in the server adapter's order.** A
+  decline could surface under a different unified code depending on which half reported
+  it. The browser mapped neither `expired_payment_method` nor `incorrect_postal_code`, the
+  2026-08-26.dahlia payment-method codes, nor `incorrect_zip`, nor the fraud decline codes.
+  The server read the issuer's decline codes only for insufficient funds, a required
+  authentication and fraud. Both halves now read, in this order:
+  1. `insufficient_funds`;
+  2. `expired_card` (`expired_card`, `expired_payment_method`);
+  3. `invalid_card_data` (`incorrect_number`, `invalid_number`, `incorrect_cvc`,
+     `invalid_cvc`, `invalid_expiry_month`, `invalid_expiry_year`, `incorrect_zip`,
+     `incorrect_postal_code`, and in the browser Stripe.js's `incomplete_*` field codes);
+  4. `authentication_required`;
+  5. the fraud decline codes (`fraudulent`, `stolen_card`, `lost_card`, `merchant_blacklist`,
+     and `lost_or_stolen_card`, a local payment method's), as `fraud_suspected`;
+  6. the failed-authentication codes (`authentication_failure` and the intent-specific
+     forms), as `authentication_required`;
+  7. `processing_error`, the only retryable one. A `processing_error` decline code on the
+     server is now retryable as the error code already was, so a subscription renewal it ends
+     is replayed once under the same key rather than settled as a decline (see "Subscription
+     renewals without a definitive answer (2026-09-25)");
+  8. a decline.
+
+  An issuer decline code counts like the error code wherever Stripe uses the same word for
+  both. Doc-verified 2026-09-26: the decline-codes page (docs.stripe.com/declines/codes)
+  lists `expired_card`, `incorrect_cvc`, `incorrect_number`, `incorrect_zip`,
+  `insufficient_funds`, `invalid_cvc`, `invalid_expiry_month`, `invalid_expiry_year`,
+  `invalid_number`, `processing_error` and `authentication_required` as decline codes. Each
+  describes the failure its error-code namesake does (for `incorrect_cvc`: "The CVC number
+  is incorrect.", remedy "The customer needs to try again using the correct CVC."). The
+  error-codes page (docs.stripe.com/error-codes) gives `expired_payment_method` "The payment
+  method expired", `incorrect_postal_code` "The payment method’s postal code is incorrect"
+  and `incorrect_zip` "The card’s postal code is incorrect".
+- **A fraud decline shows the generic message in both halves.** For `fraudulent`,
+  `stolen_card` and `merchant_blacklist` Stripe says "Don’t report more detailed information
+  to your customer. Instead, present it in the same manner as `generic_decline`", and for
+  `lost_card` "The specific reason for the decline shouldn’t be reported to the customer"
+  (and for `lost_or_stolen_card`, "present it as `partner_generic_decline`"). The browser now
+  shows core's catalog message for `fraud_suspected` instead of Stripe.js's text, in the
+  locale Stripe.js was given, or the browser's under `"auto"` or when none was: Stripe.js
+  localizes its own error strings (docs.stripe.com/js/initializing: "Setting the locale here
+  will localize error strings for all Stripe.js methods."), so a fixed
+  English text would make a fraud decline stand out. Core ships English, French, German and
+  Spanish and a host can register others (`registerErrorMessages`); any other locale falls
+  back to English. The server hardcodes the same English text. Every other browser error
+  keeps Stripe.js's message.
+- **Left on the default.** `issuer_not_available` ("The card issuer couldn’t be reached") and
+  `reenter_transaction` stay declines in both halves. The server reads Stripe's
+  `processing_error` as retryable, and whether a retried confirmation of the same intent
+  would help after those answers is not documented.

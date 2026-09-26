@@ -176,7 +176,10 @@ connect-src https://hosted.paysafe.com https://hosted.test.paysafe.com
 ```
 
 The `.test` hosts are exercised only by `environment: "sandbox"` and are harmless
-to allow in a production CSP (or gate them per environment). Override the script
+to allow in a production CSP (or gate them per environment). Paysafe.js also adds
+`<style>` elements of its own, for its 3-D Secure overlay among others, so a
+`style-src` that restricts styles needs `'unsafe-inline'`; Paysafe publishes no CSP
+guidance. Override the script
 URL with the `sdkUrl` config field to pin a version or self-host.
 :::
 
@@ -277,6 +280,9 @@ still verifies but whose handle is gone. Set `sessionTtlSeconds` near the handle
 you run Interac.
 :::
 
+Paysafe documents no refunds for Interac e-Transfer; a refund of an Interac payment goes to
+Paysafe like any other and stands or falls on your account's setup.
+
 ::: warning The return trip is a hint — webhooks are the outcome
 Paysafe signals results by *which* return link it uses, PayFanout points them all at your one
 `returnUrl`, and Paysafe's Interac integration notes are explicit that Interac does **not**
@@ -344,10 +350,15 @@ bounced payment) when the bank bounces the debit. Bacs runs a ~10-business-day c
 Never ship the order on `processing`.
 Settlement-lifecycle events (`SETTLEMENT_*`) carry settlement ids, not payment ids, and
 are delivered as `unknown` — correlate by payload `merchantRefNum` (your
-`idempotencyKey`) if you consume them. Paysafe documents **no refunds for Bacs**; refund
-support on the other rails follows your account, and an in-flight settlement reports
-`availableToRefund: 0` ("not refundable yet"), so refunds only open up once settlement
-completes.
+`idempotencyKey`) if you consume them. Paysafe refunds **neither SEPA nor Bacs** (its pages
+list SEPA refunds as "Not Supported" and Bacs refunds as "NA"), so `refundPayment` rejects
+a payment on either rail with a non-retryable `unsupported_operation` once it has read the
+payment, before anything else goes out: refund those customers another way. Whether Paysafe
+refunds ACH and EFT payments is uncertain: their pages say nothing about refunds, and the
+`paymentType` enum of Paysafe's refund schema names no bank rail. The adapter sends those
+refunds and reports Paysafe's answer, so run one in the sandbox before you promise refunds
+on either rail. An in-flight settlement reports `availableToRefund: 0` ("not refundable
+yet"), so refunds only open up once settlement completes.
 :::
 
 Sandbox test values (from Paysafe's pages): SEPA IBAN `NL77ABNA0492122466` (BIC

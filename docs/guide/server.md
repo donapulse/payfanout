@@ -93,7 +93,7 @@ const complete = createCompletionHandler({
       service: payments,
       pspName: order.psp,
       pspSessionId: order.pspSessionId,
-      idempotencyKey: `complete-${order.id}`, // stable -> a retried POST dedupes
+      idempotencyKey: `complete-${order.id}`, // stable across retries of this completion; whether a new card after a decline reuses it depends on the provider (see its guide)
     };
   },
   onCompleted: async (info, ctx) => {

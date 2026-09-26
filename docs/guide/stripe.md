@@ -130,17 +130,23 @@ const stripe = new StripeClientAdapter({
 
 ::: tip Content-Security-Policy
 Stripe.js loads from `https://js.stripe.com/v3` and renders card fields, 3DS, and
-redirect challenges in iframes. A CSP-enforcing page needs:
+redirect challenges in iframes. Stripe's security guide lists these sources for
+Stripe.js, and for Link, which the Payment Element offers when your account enables it:
 
 ```
-script-src  https://js.stripe.com
-frame-src   https://js.stripe.com https://hooks.stripe.com
-connect-src https://api.stripe.com
+script-src  https://js.stripe.com https://*.js.stripe.com
+frame-src   https://js.stripe.com https://*.js.stripe.com https://hooks.stripe.com
+            https://link.com https://*.link.com
+connect-src https://api.stripe.com https://link.com https://*.link.com
+img-src     https://*.link.com
 ```
 
-Stripe's fraud signals (Radar) additionally load `https://m.stripe.network` — allow
-it under `frame-src`/`script-src` if you rely on them. Pin or self-host the script
-via the `sdkUrl` config field if you must.
+`https://*.js.stripe.com` lets Stripe.js start its frames on other origins to load faster.
+The guide also lists `https://maps.googleapis.com`, needed only with the Address Element
+and your own Google Maps key; this adapter mounts the Payment Element alone. Stripe.js
+must load from `https://js.stripe.com`: Stripe asks never to bundle or self-host it, and
+the script refuses to run from another origin. The `sdkUrl` config field only points the
+adapter at another `https://js.stripe.com` URL, such as a versioned build.
 :::
 
 ## 6. Register the webhook endpoint
@@ -189,6 +195,9 @@ In test mode, use Stripe's test cards with any future expiry, any CVC, and any p
 | `4242 4242 4242 4242` | Success |
 | `4000 0000 0000 0002` | Declined (`card_declined`) |
 | `4000 0000 0000 9995` | Declined (`insufficient_funds`) |
+| `4000 0000 0000 9979` | Declined, card reported stolen (`fraud_suspected`) |
+| `4000 0000 0000 0127` | Incorrect CVC (`invalid_card_data`) |
+| `4000 0000 0000 0069` | Expired card (`expired_card`) |
 | `4000 0025 0000 3155` | Requires authentication (3DS challenge, inline) |
 
 The full matrix (per-brand, per-decline-code, wallet, and dispute-trigger cards) is at

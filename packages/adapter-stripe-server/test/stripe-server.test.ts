@@ -526,3 +526,13 @@ describe("StripeServerAdapter specifics", () => {
     });
   });
 });
+
+describe("stripeOnboarding.csp", () => {
+  it("lists the sources Stripe's security guide gives for Stripe.js and Link, without the Address Element's Maps host", () => {
+    expect(stripeOnboarding.csp).toEqual({
+      script: ["https://js.stripe.com", "https://*.js.stripe.com"],
+      frame: ["https://js.stripe.com", "https://*.js.stripe.com", "https://hooks.stripe.com", "https://link.com", "https://*.link.com"],
+      connect: ["https://api.stripe.com", "https://link.com", "https://*.link.com"],
+    });
+  });
+});

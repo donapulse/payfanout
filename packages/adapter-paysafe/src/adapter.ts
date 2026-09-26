@@ -2,6 +2,7 @@ import {
   assertBrowser,
   brandMountedFieldsHandle,
   injectScript,
+  isValidCspNonce,
   PayFanoutError,
   utf8ToBase64Url,
   type ClientPaymentAdapter,
@@ -52,6 +53,18 @@ export interface PaysafeClientAdapterConfig {
   threeDs?: Record<string, unknown>;
   /** Account capabilities vary per merchant account/currency — override the conservative default. */
   paymentMethods?: PaymentMethodCapability[];
+  /**
+   * A Content-Security-Policy nonce for the Paysafe.js `<script>` the adapter
+   * injects, set as its `nonce` attribute before the tag is inserted, so a
+   * `script-src` that allows scripts by nonce without `'strict-dynamic'` runs
+   * it. Paysafe.js reads no nonce itself: the wallet SDKs it loads (Google Pay,
+   * Apple Pay, Paze) and the `<style>` elements it adds (its 3-D Secure and
+   * redirect overlays) carry none. Pass the value alone, as in the policy's
+   * `'nonce-<value>'` source; the constructor refuses anything else. The
+   * adapter never reads a nonce from the page, and a `loadScript` seam loads
+   * the script without it.
+   */
+  cspNonce?: string;
   /**
    * Test seams. `loadScript` is called again by the next loadSdk() after an
    * attempt that rejects or leaves the SDK global missing, so it must be safe to
@@ -274,6 +287,11 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
     if (config.environment !== "sandbox" && config.environment !== "live") {
       throw PayFanoutError.invalidRequest('PaysafeClientAdapter config.environment must be "sandbox" or "live"');
     }
+    if (config.cspNonce !== undefined && !isValidCspNonce(config.cspNonce)) {
+      throw PayFanoutError.invalidRequest(
+        "PaysafeClientAdapter config.cspNonce must be the value of the policy's 'nonce-…' source: base64 or base64url characters",
+      );
+    }
     this.config = config;
   }
 
@@ -281,7 +299,9 @@ export class PaysafeClientAdapter implements ClientPaymentAdapter {
     assertBrowser("PaysafeClientAdapter", "loadSdk");
     if (this.paysafeGlobal()) return;
     const url = this.config.sdkUrl ?? PAYSAFE_JS_URL;
-    this.sdkPromise ??= this.config.loadScript ? this.config.loadScript(url) : injectScript(url, this.pspName);
+    this.sdkPromise ??= this.config.loadScript
+      ? this.config.loadScript(url)
+      : injectScript(url, this.pspName, { nonce: this.config.cspNonce });
     const loading = this.sdkPromise;
     try {
       await loading;

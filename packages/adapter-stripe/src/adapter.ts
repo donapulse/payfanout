@@ -3,6 +3,7 @@ import {
   brandMountedFieldsHandle,
   getUserMessage,
   injectScript,
+  isValidCspNonce,
   PayFanoutError,
   type ClientPaymentAdapter,
   type ConfirmResult,
@@ -63,6 +64,18 @@ export interface StripeClientAdapterConfig {
   /** Override the capability list per account/currency instead of hardcoding. */
   paymentMethods?: PaymentMethodCapability[];
   /**
+   * A Content-Security-Policy nonce for the Stripe.js `<script>` the adapter
+   * injects, set as its `nonce` attribute before the tag is inserted, so a
+   * `script-src` that allows scripts by nonce without `'strict-dynamic'` runs
+   * it. Stripe.js reads no nonce itself: it loads its lazy chunks from
+   * `https://js.stripe.com` without one, which such a policy blocks unless it
+   * also lists that host. Pass the value alone, as in the policy's
+   * `'nonce-<value>'` source; the constructor refuses anything else. The
+   * adapter never reads a nonce from the page, and a `loadScript` seam loads
+   * the script without it.
+   */
+  cspNonce?: string;
+  /**
    * Test seams: script injection + global lookup. `loadScript` is called again by
    * the next loadSdk() after an attempt that rejects or leaves the SDK global
    * missing, so it must be safe to call more than once.
@@ -107,6 +120,11 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
     if (config.environment !== "sandbox" && config.environment !== "live") {
       throw PayFanoutError.invalidRequest('StripeClientAdapter config.environment must be "sandbox" or "live"');
     }
+    if (config.cspNonce !== undefined && !isValidCspNonce(config.cspNonce)) {
+      throw PayFanoutError.invalidRequest(
+        "StripeClientAdapter config.cspNonce must be the value of the policy's 'nonce-…' source: base64 or base64url characters",
+      );
+    }
     this.config = config;
   }
 
@@ -114,7 +132,9 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
     assertBrowser("StripeClientAdapter", "loadSdk");
     if (this.stripeGlobal()) return;
     const url = this.config.sdkUrl ?? STRIPE_JS_URL;
-    this.sdkPromise ??= this.config.loadScript ? this.config.loadScript(url) : injectScript(url, this.pspName);
+    this.sdkPromise ??= this.config.loadScript
+      ? this.config.loadScript(url)
+      : injectScript(url, this.pspName, { nonce: this.config.cspNonce });
     const loading = this.sdkPromise;
     try {
       await loading;

@@ -4013,25 +4013,40 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   reference (payzen.io/en-EN/rest/V4.0/api/errors-reference.html) warns "New error codes can
   be added in the future", and the server reads an unmapped PSP_ code the same way. AUTH_999
   ("technical error") stays the retryable `psp_unavailable`. PayZen's own 3-D Secure
-  scenarios report a cardholder's failed authentication with other codes: the PCI
-  CreatePayment and CreateToken use-case pages (payzen.io/en-EN/rest/V4.0/pci/, 3ds1 and 3ds2
-  folders) answer a failed or abandoned challenge and a challenge timeout with PSP_539 ("3D
-  Secure refusal for the transaction", `detailedErrorCode` 39), which the server maps to
-  `authentication_required`, and the issuer's refusals with PSP_707 and PSP_708; none shows
-  an AUTH_ code. The browser adapter keeps a copy of the AUTH_ map too, and the parity test
+  scenarios report a cardholder's failed authentication with other codes. The PCI
+  CreatePayment use-case pages answer a failed challenge
+  (payzen.io/en-EN/rest/V4.0/pci/createpayment/3ds2/challenge.html) and a challenge timeout
+  (payzen.io/en-EN/rest/V4.0/pci/v2/createpayment/3ds2/timeout.html) with PSP_539 ("3D Secure
+  refusal for the transaction", `detailedErrorCode` 39), which the server maps to
+  `authentication_required`, and the "Authentication rejected" page
+  (payzen.io/en-EN/rest/V4.0/pci/v2/createpayment/3ds2/rejected.html) the issuer's refusal
+  with PSP_707 ("Authentication refused by the issuer", `detailedErrorCode` 207); none shows an
+  AUTH_ code. The browser adapter keeps a copy of the AUTH_ map too, and the parity test
   compares both maps.
-- **AUTH_103 is `invalid_request`, not `unsupported_operation`.** PayZen's pages use
-  "disabled" for a 3-D Secure the merchant turns off: the PCI "3DS1 - Disengaged
-  authentication" pages (payzen.io/en-EN/rest/V4.0/pci/createpayment/3ds1/disabled.html)
-  send `strongAuthentication: "DISABLED"` and answer a paid order with
-  `effectiveStrongAuthentication: "DISABLED"`. A 3-D Secure the request or the shop's set-up
-  turned off is the merchant's to change, as a REST API the shop has not enabled is (PSP_100,
-  "REST API not enabled.", `invalid_request`); the server adapter itself asks for a challenge
-  (`strongAuthentication: "CHALLENGE_REQUESTED"`) when a host sets `sca.challenge: "force"`.
-  Core gives `unsupported_operation` to an operation the adapter or the PSP cannot perform,
-  a capability guard or an answer such as Paysafe's 3416 ("does not support partial
-  Settlements"), and PayZen performs 3-D Secure. No page says more about AUTH_103 than its
-  two words, so this is a reading.
+- **AUTH_103 is `invalid_request`, not `unsupported_operation`.** PayZen's pages use "disabled"
+  for a 3-D Secure the merchant turns off: the PCI "3DS1 - Disengaged authentication" pages
+  (payzen.io/en-EN/rest/V4.0/pci/createpayment/3ds1/disabled.html) send
+  `strongAuthentication: "DISABLED"` and answer a paid order with
+  `effectiveStrongAuthentication: "DISABLED"`, so they show how PayZen uses the word, not an
+  AUTH_103 answer, and the reading rests on an analogy. A 3-D Secure the request or the shop's
+  set-up turned off is the merchant's to change, as a REST API the shop has not enabled is
+  (PSP_100, "REST API not enabled.", `invalid_request`); the server adapter itself asks for a
+  challenge (`strongAuthentication: "CHALLENGE_REQUESTED"`) when a host sets
+  `sca.challenge: "force"`. Core gives `unsupported_operation` to an operation the adapter or
+  the PSP cannot perform, a capability guard or an answer such as Paysafe's 3416 ("does not
+  support partial Settlements"), and PayZen performs 3-D Secure. No page says more about
+  AUTH_103 than its two words, so this is a reading.
+- **Known difference: the PSP_ counterparts stay on the default.** The PSP_ errors page
+  (payzen.io/en-EN/rest/V4.0/api/errors_psp.html) lists PSP_052 "The ACS signature is invalid.",
+  PSP_053 "3DS technical error.", PSP_054 "Incorrect 3DS parameter." and PSP_055 "3DS
+  disabled.", AUTH_100 to AUTH_103's descriptions in other words, and PSP_707 "3D Secure -
+  Refusal of the authentication by the issuer." and PSP_708 "3D Secure - Refusal as
+  authentication by the issuer is impossible.". None is in the server's PSP_ map, so the server
+  reads each as the default `processing_error`. The browser reads a PSP_ code from `KR.onError`
+  as a retryable `processing_error`, and one on an unpaid order's last transaction by its
+  `detailedErrorCode` (PSP_707's 207 is not in the acquirer map, so `card_declined`). "3DS
+  disabled" is therefore `invalid_request` as AUTH_103 and `processing_error` as PSP_055.
+  Mapping them belongs with one PSP_ map for both halves (#247), not with this change.
 - **Doc-derived only.** No sandbox run has produced any of these codes.
 
 ## Stripe: one card-error classification on both halves (2026-09-26)

@@ -17,13 +17,14 @@ import {
  * time. PayFanout is stateless, so `createPaymentSession` encodes that context
  * into the `pspSessionId` itself: `base64url(json) + "." + base64url(hmac)`.
  *
- * The HMAC (sessionSigningKey) makes the context tamper-proof: the token
- * round-trips through the browser, and without the signature a client could
+ * The HMAC (sessionSigningKey) makes the context tamper-proof: the token may
+ * pass through the browser, and without the signature a client could
  * inflate/deflate the amount before server completion. The client adapter never
  * needs this token — the tokenization iframe is addressed by the session's
  * `clientSecret` (the hostedTokenizationUrl), and `confirm()` returns a
  * clientToken carrying the `hostedTokenizationId` and the browser's device
- * data, which completePayment decodes separately (see client-token.ts).
+ * data, which completePayment decodes separately (see client-token.ts). It is
+ * signed, not encrypted: whoever holds the token can read the JSON half.
  *
  * Every context carries an expiry (`expiresAt`, epoch ms): a signed token must
  * not stay completable forever. Enforced at decode time — `completePayment`
@@ -64,6 +65,12 @@ export interface WorldlineSessionContextV1 {
    * telephone order channel, and leaves the 3-D Secure data unchanged.
    */
   sca?: CreatePaymentSessionInput["sca"];
+  /**
+   * The session's metadata as the JSON sent for it reads back, when that has entries:
+   * order.references.merchantParameters on the payment. Contexts signed before it was
+   * carried have none. Signed, not encrypted: whoever holds the token can read it.
+   */
+  metadata?: Record<string, string>;
 }
 
 export interface DecodeSessionContextOptions {

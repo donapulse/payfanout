@@ -4680,45 +4680,74 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   derived from the payment, and the portal shows that reference for it, not the caller's
   key; the changeset says so. Whether a call is a full capture cannot change on its replay:
   the amount is the caller's and the authorized amount is fixed.
-- **A full capture walks a bounded sequence of references** (changed in review, 2026-09-26).
-  The first version settled every full capture of a payment under
-  `payfanout-capture-<payment id>` with `dupCheck: true`, so after one full capture that
-  failed, errored or was cancelled, every later one, under any key, met that record: 5031,
-  then the read-back, then the old failure rethrown. In the test double a recorded 402/3206
-  or 500/1000 made every retry fail with the original error, 30 days later too, where the
-  previous release's retry under a new key settled, and after a pending settlement cancelled
-  outside the adapter a recapture answered `requires_capture` with nothing settled. "Retries
-  never replay a PSP-cached failure" is the renewal keys' rule above; the captures now
-  follow it. A payment's references are `payfanout-capture-<payment id>`, then `-a2` to
-  `-a10`, at most 58 characters for an id at the spec's `maxLength` of 36. A full capture
-  reads them in order, over the payment's range (below). A reference holding a settlement
-  that moved money means the payment is captured in full, and the call answers with the
-  payment's state and that settlement, whatever its key. One whose records all moved no
-  money (failed, cancelled or expired, the rule the settlement sums already apply) is spent,
-  and the walk goes on. The first holding no record is the one to settle under, with
-  `dupCheck: true` through the usual write path, reading back after a rejection. Two full
-  captures sent together find the same free reference: one settles, and the other is refused
-  (5031, or 3203/3204 when Paysafe checks the state first) and reads that settlement back. A
-  lost answer reads back the same way. The read-back compares no amount, as a reference
-  holds one full capture whichever call made it. When every reference is spent, the capture
-  is refused with a non-retryable `invalid_request` naming them and sending the host to the
-  Paysafe portal, which settles an authorization ("Apply Settlement" on its details page,
+- **A full capture walks a bounded sequence of references** (changed in review, 2026-09-26). The
+  first version settled every full capture of a payment under `payfanout-capture-<payment id>`
+  with `dupCheck: true`, so after one full capture that failed, errored or was cancelled, every
+  later one, under any key, met that record: 5031, then the read-back, then the old failure
+  rethrown. In the test double a recorded 402/3206 or 500/1000 made every retry fail with the
+  original error, 30 days later too, where the previous release's retry under a new key settled,
+  and after a pending settlement cancelled outside the adapter a recapture answered
+  `requires_capture` with nothing settled. "Retries never replay a PSP-cached failure" is the
+  renewal keys' rule above; the captures now follow it. A payment's references are
+  `payfanout-capture-<payment id>`, then `-a2` to `-a10`, at most 58 characters for an id at the
+  spec's `maxLength` of 36. A full capture reads them in order, over the payment's range
+  (below). A reference holding a settlement that moved money means the payment is captured in
+  full, and the call answers with the payment's state and that settlement, whatever its key. One
+  whose records all moved no money (failed, cancelled or expired, the rule the settlement sums
+  already apply) is spent, and the walk goes on. The first holding no record is the one to
+  settle under, with `dupCheck: true` through the usual write path, reading back after a
+  rejection. Two full captures sent together find the same free reference: one settles, and the
+  other is refused (5031, or 3203/3204 when Paysafe checks the state first) and reads that
+  settlement back. A lost answer reads back the same way. The read-back compares no amount, as a
+  reference holds one full capture whichever call made it. When every reference is spent, the
+  capture is refused with a non-retryable `invalid_request` naming them and sending the host to
+  the Paysafe portal, which settles an authorization ("Apply Settlement" on its details page,
   Paysafe Back Office User's Guide, June 2022,
-  developer.paysafe.com/fileadmin/content/pdfs/Back_Office_June_2022.pdf); PayFanout does
-  not find a settlement made there, so it is refunded there too. The bound is 10: every read
-  of a manually captured payment walks the references, one lookup each, and ten spent
-  captures are far more than one authorization plausibly survives; Paysafe caps the
-  settlements of an authorization at a number it does not state (3202, "You have exceeded
-  the maximum number of Settlements allowed."). A capture with no amount when nothing is
-  left and no reference holds a live settlement is refused as nothing left to capture, a
-  plain `invalid_request`, and never sends a zero settlement. A capture of the authorized
-  amount that meets a live settlement of another amount (the rest, after partial captures)
-  is refused as already captured in full, a plain `invalid_request` without
-  `outcomeUnknown`; it had answered `invalid_request` with `outcomeUnknown` and the advice
-  to use a new key, as for a key reused by another request. A capture with no amount that
-  meets one answers with it: it was the remainder then. Reads walk the same references and
-  stop at the first live settlement or the first empty reference. A lookup that fails fails
-  the capture, and nothing is settled after it (see the lookups below).
+  developer.paysafe.com/fileadmin/content/pdfs/Back_Office_June_2022.pdf); PayFanout does not
+  find a settlement made there, so it is refunded there too. The bound is 10: every read of a
+  manually captured payment walks the references, one lookup each (one more when the range is
+  refused), and ten spent captures are far more than one authorization plausibly survives;
+  Paysafe caps the settlements of an authorization at a number it does not state (3202, "You
+  have exceeded the maximum number of Settlements allowed."). A capture with no amount when
+  nothing is left and no reference holds a live settlement is refused as nothing left to
+  capture, a plain `invalid_request`, and never sends a zero settlement. A capture of the
+  authorized amount that meets a live settlement of another amount (the rest, after partial
+  captures) is refused as already captured in full, a plain `invalid_request` without
+  `outcomeUnknown`; it had answered `invalid_request` with `outcomeUnknown` and the advice to
+  use a new key, as for a key reused by another request. A capture with no amount that meets one
+  answers with it: it was the remainder then. With no live settlement, a capture of the
+  authorized amount that the payment read shows partial captures have left short is refused
+  before it is sent (below). Reads walk the same references. A walk stops at the first live
+  settlement or the first empty reference, and goes on past empty ones once a lookup has fallen
+  back to the default window (see the lookups below). A lookup that fails fails the capture, and
+  nothing is settled after it.
+- **A capture the payment read shows will fail is not sent** (changed in review,
+  2026-09-26). After partial captures, a capture of the authorized amount sent that amount
+  under `payfanout-capture-<payment id>` with `dupCheck: true` although the payment read
+  showed less left, and Paysafe answers that 402/3204 ("The requested Settlement amount
+  exceeds the remaining Authorization amount.", in the spec's settlement errors). The spec
+  says nothing of what such a refusal leaves under the reference: whether it files a record,
+  and whether its `merchantRefNum` still counts for `dupCheck` ("A request is considered a
+  duplicate if the merchantRefNum has already been used in a previous request within the
+  past 90 days."). Assumed possible: a refusal that files nothing the lookup shows but still
+  counts. The reference is then stranded: the walk sees it empty and settles there again,
+  `dupCheck` refuses that (5031) with nothing to read back, and the capture ends in the
+  retry-later `processing_error` until the 90 days pass. Such a capture is now refused
+  before any settlement request, a non-retryable `invalid_request` that says how much of the
+  authorization is left and to capture the rest with no amount, or the nothing-left refusal
+  when nothing is, whenever no reference holds a live settlement and `availableToSettle`
+  shows less than the authorized amount. What remains: a capture with no amount computes the
+  rest from a payment read, which can trail a partial capture made just before or alongside
+  it, and a capture of the authorized amount whose read comes before a partial capture is
+  sent too, so either can still meet 3204 (or 3203). The test double has a switch for the
+  stranding reading (`stateRefusalHoldsReference`), and a test pins what follows under it.
+  Chosen: an unreadable 5031 never moves a full capture on to the next reference. The lookup
+  may only trail a settlement filed under the reference, and settling under the next one
+  would then capture twice, so the retry-later error stands, as for any write whose original
+  cannot be read back. Its advice changed with it: the retry-later errors told the host to
+  "retry later with the same idempotency key, never a new one", for a full capture too,
+  whose reference does not come from the key. For a full capture's reference they now say
+  "retry the full capture later"; keyed writes keep the wording.
 - **A partial capture still settles under the caller's key, which no read can find.** Any
   other amount keeps the key as its `merchantRefNum`, and that key must stay unique across
   the account. A key starting with `payfanout-capture-` is refused with `invalid_request`
@@ -4780,26 +4809,41 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   window: they look for a write made moments before. The widest range Paysafe accepts is
   undocumented, so a ranged lookup Paysafe refuses as a request error (a 4xx mapped to
   `invalid_request`, as a 400/5068 field error is) is sent once more without `startDate`,
-  over the default window. A not-found answer (404/5269) reads as no settlement under the
-  reference. Any other failure of either lookup, an outage, a rate limit or a 5xx, is thrown
-  as it maps, retryable where core says so (changed in review, 2026-09-26: the first version
-  read every lookup failure as no settlement, so a settlements outage made `refundPayment`
-  throw a non-retryable "no refundable settlement" and `retrievePayment` report
-  `amountRefunded: 0`). A cancel whose read fails after its void rejects retryable, and its
-  replay under the same key answers with that void. Only records filed under the reference
-  looked up are read as its own. The settle-with-auth examples of `POST /v1/payments` ("Card
-  - with Settlement" among them) embed a settlement under the payment's own
-    `merchantRefNum`.
+  over the default window. A reference can look empty over that window while older records
+  under it are out of sight (changed in review, 2026-09-26: with a failure under the first
+  reference on day 0 and the full capture under `-a2` on day 6, a refund on day 34 stopped
+  at the first reference and was refused). Once any lookup of a walk has fallen back, the
+  walk goes on past empty references, still ten at most, and takes the first live
+  settlement; a full capture still settles under the first empty one when none shows. The
+  refused range is not asked for again on the later references, so where nothing shows,
+  such a read makes eleven lookups. A not-found answer
+  (404/5269) reads as no settlement under the reference. Any other failure of either lookup,
+  an outage, a rate limit or a 5xx, is thrown as it maps, retryable where core says so
+  (changed in review, 2026-09-26: the first version read every lookup failure as no
+  settlement, so a settlements outage made `refundPayment` throw a non-retryable "no
+  refundable settlement" and `retrievePayment` report `amountRefunded: 0`). A cancel whose
+  read fails after its void rejects retryable, and its replay under the same key answers
+  with that void. A capture makes no settlement lookup after its write (changed in review,
+  2026-09-26: a partial capture read the payment back through `retrievePayment`, whose walk
+  throws on a failed lookup, so an outage right after the settlement rejected a capture that
+  had settled). Its answer is the payment read afterwards with the settlement in hand, and a
+  partial capture's amounts are the ones `retrievePayment` then reports. Only records filed
+  under the reference looked up are read as its own. Every card example among the
+  settle-with-auth examples of `POST /v1/payments`, "Card - with Settlement" among them,
+  embeds a settlement under the payment's own `merchantRefNum`.
 - **Which references a payment reads.** A payment that moved no money is given no
   settlement: a settlement names no payment, and a card completion keyed by order files a
   declined attempt and the payment that went through under the same reference. The lookup
   for the declined attempt therefore found the other payment's settlement: its read reported
   that settlement, and `refundPayment` on it refunded the other payment. That was already so
-  within the default window, and the wider window would have reached further back. A failed,
-  cancelled or expired payment ("FAILED – The transaction failed, due to either an error or
-  being declined" and "CANCELLED – The request has been fully voided (reversed)" in the
-  spec's payment statuses) settled nothing, so its reads look nothing up and a refund of it
-  is refused. Two payments that both went through under one key can exist: "Paysafe replay
+  within the default window, and the wider window would have reached further back. A failed
+  or cancelled payment ("FAILED – The transaction failed, due to either an error or being
+  declined" and "CANCELLED – The request has been fully voided (reversed)" in the spec's
+  payment statuses) settled nothing, so its reads look nothing up and a refund of it is
+  refused. The payment statuses are RECEIVED, PROCESSING, COMPLETED, HELD, FAILED,
+  CANCELLED and PENDING (re-verified 2026-09-26): EXPIRED is a settlement and refund status,
+  not a payment one, though a payment that reads it is taken as having moved no money all
+  the same. Two payments that both went through under one key can exist: "Paysafe replay
   safety (2026-09-24)" leaves open two card completions with different cards sent under one
   key before either shows in the lookup, and both are charged. Since a review on 2026-09-26,
   a payment with `settleWithAuth: false` never looks its own `merchantRefNum` up, only its
@@ -4811,21 +4855,23 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   narrower filter is in sight but not built: the Settlement Flow Diagrams page says that for
   one-step payment integrations the payment and its settlement "utilize the same unique GUID
   as are created from the same request"
-  (developer.paysafe.com/en/api-docs/payments-api/settlement-flow-diagrams/), and every
-  settle-with-auth example in the spec gives the embedded settlement its payment's id, among
-  them "Card - with PartialAuth 1" to "3", three payments under one `merchantRefNum`
+  (developer.paysafe.com/en/api-docs/payments-api/settlement-flow-diagrams/), and every card
+  example among the spec's 35 settle-with-auth answers of `POST /v1/payments` gives the
+  embedded settlement its payment's id, as all but "MyBank" and "EPS" do, among them
+  "Card - with PartialAuth 1" to "3", three payments under one `merchantRefNum`
   ("6407c51806902eef7d67"), each settlement carrying its own payment's id. Reading only the
   settlement that carries the payment's id would separate the two; it waits on the sandbox
   item below.
-- **The refusal of a refund says why, from the payment's state.** A failed, cancelled or
-  expired payment is named as such ("it failed, so it settled nothing"). Otherwise the
-  message lists what applies: a settlement not refundable yet or refunded in full, found
-  settlements that all moved no money, a payment not completed yet, "it is only authorized
-  (cancel it instead)" or "part of it is still only authorized (cancel that part instead)"
-  only while some of a manual capture's authorization is left to settle, money captured
-  beyond the settlements found (a partial capture, or a capture by an earlier release, both
-  under keys PayFanout cannot find, with the portal advice), and a lookup that does not show
-  the settlement or does not reach back to it.
+- **The refusal of a refund says why, from the payment's state.** A failed or cancelled
+  payment is named as such ("it failed, so it settled nothing"), and so is one that reads
+  EXPIRED, which Paysafe documents for no payment. Otherwise the message lists what applies:
+  a settlement not refundable yet or refunded in full, found settlements that all moved no
+  money, a payment not completed yet, "it is only authorized (cancel it instead)" or "part
+  of it is still only authorized (cancel that part instead)" only while some of a manual
+  capture's authorization is left to settle, money captured beyond the settlements found (a
+  partial capture, or a capture by an earlier release, both under keys PayFanout cannot
+  find, with the portal advice), and a lookup that does not show the settlement or does not
+  reach back to it.
 - **The test double** files and times its records on its own date, which `passDays` moves
   on, and serves the lookups from `startDate` to `endDate` as the spec words them, the
   default window unchanged. A malformed date, or a range past an optional limit
@@ -4834,12 +4880,15 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   settlement as the spec's Cancel Settlement does ("You can cancel a Settlement only if the
   payment type is CARD and the status is PENDING."), returning its amount to
   `availableToSettle`, the reading under which the authorization can be captured again
-  (undocumented, open item below). Against it the previous adapter (develop 4116001) failed
-  36 of the 39 tests in the settlements test file and 3 of the capture replay tests this
-  change adjusted, among them a refund after a manual capture, the capture time of a
-  captured payment, a refund of a payment settled 45 days before, a full capture retried
-  after a failed one, a lookup outage read as no settlement and a manually captured payment
-  reading another payment's settlement. The conformance suite passes unchanged.
+  (undocumented, open item below). With `stateRefusalHoldsReference` on, a settlement
+  refused on state (3203, 3204) files nothing but holds its reference under `dupCheck` for
+  90 days, the stranding reading above; it is off by default. Against it the previous
+  adapter (develop 4116001) failed 43 of the 47 tests in the settlements test file and 3 of
+  the capture replay tests this change adjusted, among them a refund after a manual
+  capture, the capture time of a captured payment, a refund of a payment settled 45 days
+  before, a full capture retried after a failed one, a lookup outage read as no settlement
+  and a manually captured payment reading another payment's settlement. The conformance
+  suite passes unchanged.
 - **Doc-derived only; to settle in the sandbox:**
   - **Whether `GET /payments/{id}` lists settlements.** Authorize a card with
     `settleWithAuth: false`, settle part of it under one reference and the rest with no
@@ -4870,6 +4919,14 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
     the reference. If Paysafe files none but its duplicate check still counts the reference,
     a full capture retried after a failure is refused with nothing to read back and ends in
     the retry-later `processing_error` until the 90 days pass.
+  - **What a settlement refused on state leaves behind.** Settle part of a card
+    authorization, then settle more than its `availableToSettle` under a fresh reference
+    and expect 3204; look the reference up, then settle the right amount under it and
+    record whether it settles or is refused with 5031. Do the same after a 3203: settle an
+    authorization in full, settle it again under a fresh reference (3203), cancel the first
+    settlement while pending, and settle under that reference. A 5031 with nothing to read
+    back confirms the stranding reading the local refusal above guards against, and leaves
+    "the rest" computed from a trailing read as the one way into it.
   - **Whether cancelling a pending settlement returns its amount to the authorization.**
     Settle a card authorization in full, cancel the settlement (`PUT /settlements/{id}`,
     `status: CANCELLED`), read the payment, and record `availableToSettle`; then capture it

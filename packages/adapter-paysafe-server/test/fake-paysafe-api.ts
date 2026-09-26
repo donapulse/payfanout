@@ -187,6 +187,15 @@ export class FakePaysafeApi {
    * as a field error (400/5068), Paysafe's answer to a value it cannot take.
    */
   lookupRangeLimitDays: number | undefined = undefined;
+  /**
+   * A settlement refused on state (3203, 3204) files no record the lookup
+   * shows; whether its merchantRefNum still counts under dupCheck is
+   * undocumented. Set true for the reading where it does: a settlement under
+   * that reference is then refused (5031) for 90 days, with nothing to read back.
+   */
+  stateRefusalHoldsReference = false;
+  /** Settlement references a state refusal holds, and the day it did. */
+  private readonly heldSettlementRefs = new Map<string, number>();
 
   constructor() {
     this.multiUseTokens.add(SEEDED_MULTI_USE_TOKEN);
@@ -657,6 +666,11 @@ export class FakePaysafeApi {
     return (index.get(refNum) ?? []).some((record) => this.ageOf(record) <= DUP_CHECK_DAYS);
   }
 
+  private isHeld(refNum: string): boolean {
+    const day = this.heldSettlementRefs.get(refNum);
+    return day !== undefined && this.today - day <= DUP_CHECK_DAYS;
+  }
+
   private createPayment(body: Record<string, unknown>): Response {
     // Real API strict-parses the body: webhook/returnLinks/shippingDetails are
     // handle-level fields and get rejected here (error 5023).
@@ -792,7 +806,8 @@ export class FakePaysafeApi {
     if (!payment) return json(404, { error: { code: "5269", message: "No such payment" } });
     const refNum = body["merchantRefNum"] as string;
     // Settlements default dupCheck to true.
-    const reused = body["dupCheck"] !== false && this.isFiled(this.settlementsByRef, refNum);
+    const checked = body["dupCheck"] !== false;
+    const reused = checked && (this.isFiled(this.settlementsByRef, refNum) || this.isHeld(refNum));
     if (reused && !this.stateCheckFirst) return duplicateRefNum();
     // Real Paysafe rejects settlements without an explicit amount.
     if (typeof body["amount"] !== "number") {
@@ -803,11 +818,15 @@ export class FakePaysafeApi {
     const settleAmount = body["amount"] as number;
     // Real API allows MULTIPLE partial settlements while availableToSettle covers them.
     const remaining = payment.availableToSettle ?? payment.amount ?? 0;
+    const refusedOnState = (code: string, message: string): Response => {
+      if (checked && this.stateRefusalHoldsReference) this.heldSettlementRefs.set(refNum, this.today);
+      return stateRejection(code, message);
+    };
     if (payment.status !== "COMPLETED" || payment.settleWithAuth || remaining <= 0) {
-      return stateRejection("3203", "The Authorization is either fully settled or cancelled.");
+      return refusedOnState("3203", "The Authorization is either fully settled or cancelled.");
     }
     if (settleAmount > remaining) {
-      return stateRejection("3204", "The requested Settlement amount exceeds the remaining Authorization amount.");
+      return refusedOnState("3204", "The requested Settlement amount exceeds the remaining Authorization amount.");
     }
     if (reused) return duplicateRefNum();
     if (this.activeFailure) {

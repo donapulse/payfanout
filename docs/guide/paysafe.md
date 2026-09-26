@@ -253,11 +253,12 @@ you capture decides what `refundPayment` can reach later:
   shows that reference for the settlement, not your key. `retrievePayment` and
   `refundPayment` look the reference up: the capture time and refunds show, and refunds
   come out of that settlement. A capture that finds the payment already captured there
-  answers with that settlement, under the same key or another, and sends nothing. A
-  capture of the authorized amount after partial captures and a capture of the rest
-  (below) is refused with a non-retryable `invalid_request` as already captured in full,
-  and a capture with no `amount` when nothing is left and no full capture shows is refused
-  the same way as having nothing left to capture.
+  answers with that settlement, under the same key or another, and sends nothing. After
+  partial captures (below), a capture of the authorized amount is refused with a
+  non-retryable `invalid_request` before any settlement request, saying how much is left:
+  capture the rest with no `amount`. Once the rest is captured, the same capture is
+  refused as already captured in full. A capture with no `amount` when nothing is left and
+  no full capture shows is refused as having nothing left to capture.
 - **A full capture that moved no money frees the next reference.** Once a full capture
   failed, or its settlement was cancelled while pending or expired, a new full capture,
   under any key, settles under `payfanout-capture-<pspPaymentId>-a2`, then `-a3`, up to
@@ -290,11 +291,14 @@ you capture decides what `refundPayment` can reach later:
   refund, a cancel or a full capture, start the day before the payment. The reads after a
   lost answer keep the default window: they look for a write made moments before.
   Paysafe documents no longest range. If it refuses the range as a request error, the
-  lookup is sent once more over the default 30 days; any other failure of a lookup, an
-  outage or a rate limit, fails the call as it maps (retryable for those two) instead of
-  reading as no settlement, and a full capture sends nothing after it.
-- **A payment that moved no money has no settlement.** A declined, cancelled or expired
-  payment settled nothing, so `retrievePayment` reports no capture or refund on it and
+  lookup is sent once more over the default 30 days, and since a reference can then look
+  empty while older records under it are out of sight, reads go on past empty references
+  to the payment's later ones, ten at most. Any other failure of a lookup, an outage or a
+  rate limit, fails the call as it maps (retryable for those two) instead of reading as no
+  settlement, and a full capture sends nothing after it. A capture that has settled
+  answers without a settlement lookup, so an outage then cannot fail it.
+- **A payment that moved no money has no settlement.** A declined or cancelled payment
+  settled nothing, so `retrievePayment` reports no capture or refund on it and
   `refundPayment` refuses it, even when another payment carries the same reference, as the
   payment that went through does after a declined card under the same completion key.
 - **Two payments under one completion key.** Two completions sent under one key before
@@ -501,9 +505,11 @@ retries, for every write it makes:
   `merchantRefNum`, and when Paysafe has the record it becomes the call's result. A payment,
   capture or refund is never re-sent after that: when the lookup cannot show it, the call
   fails with a non-retryable `processing_error` that names the `merchantRefNum`. Retry it
-  later with the **same** key, never a new one, which could repeat the payment. A payment
-  handle, verification or void moves no money, so it is re-sent once the lookup shows
-  nothing. A 429 is re-sent after backoff, because Paysafe refused it unprocessed.
+  later with the **same** key, never a new one, which could repeat the payment. A full
+  capture's error says to retry the full capture later instead: its reference comes from
+  the payment, so any key reads the same settlement. A payment handle, verification or
+  void moves no money, so it is re-sent once the lookup shows nothing. A 429 is re-sent
+  after backoff, because Paysafe refused it unprocessed.
 - A key already used for a **different** amount or currency, or for a different saved card
   or verification card, rejects with `invalid_request`: give every new payment its own
   key. When the payment, capture or refund already under the key may have moved money (it

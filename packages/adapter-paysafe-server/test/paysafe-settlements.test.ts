@@ -103,6 +103,35 @@ function urlOf(input: Parameters<typeof fetch>[0]): string {
   return typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
 }
 
+/** The fake's answers, every payment read still showing the whole authorization left: a read trailing the settlements. */
+function trailingPaymentReads(fake: FakePaysafeApi): typeof fetch {
+  return async (input, init) => {
+    const response = await fake.fetch(input, init);
+    if ((init?.method ?? "GET") !== "GET" || !PAYMENT_PATH.test(new URL(urlOf(input)).pathname)) return response;
+    const payment = (await response.json()) as Record<string, unknown>;
+    return new Response(JSON.stringify({ ...payment, availableToSettle: payment["amount"] }), { status: response.status });
+  };
+}
+
+/** What a settlement write that cannot be read back ends with, and the retry advice it gives. */
+function unreadable(merchantRefNum: string, advice: string): string {
+  return (
+    `Paysafe reports the settlement with merchantRefNum "${merchantRefNum}" as already processed, but it cannot be ` +
+    `read back — ${advice}. Paysafe's lookup only reaches 30 days back, so an original older than that can never be ` +
+    "read back: reconcile it in the Paysafe portal"
+  );
+}
+
+function unanswered(merchantRefNum: string, advice: string): string {
+  return (
+    `An attempt of the settlement request with merchantRefNum "${merchantRefNum}" went unanswered and cannot be read ` +
+    `back, so whether Paysafe processed it is unknown — ${advice}`
+  );
+}
+
+const KEYED_RETRY = "retry later with the same idempotency key, never a new one";
+const FULL_CAPTURE_RETRY = "retry the full capture later";
+
 /** Holds each call until `parties` have arrived, then lets them all through in arrival order. */
 function rendezvous(parties: number): () => Promise<void> {
   let arrived = 0;
@@ -261,6 +290,25 @@ describe("Paysafe captures a refund can find", () => {
     ]);
   });
 
+  it("counts a full capture the payment carries only while its settlement moved money", async () => {
+    const payment = { id: "pay_1", merchantRefNum: "k-manual", status: "COMPLETED", amount: 2000, currencyCode: "USD", settleWithAuth: false, txnTime: "2026-07-04T10:00:00Z" };
+    const part = { id: "stl_part", merchantRefNum: "k-capture-part", status: "COMPLETED", amount: 700, availableToRefund: 700, txnTime: "2026-07-04T10:05:00Z" };
+    const full = { id: "stl_full", merchantRefNum: "payfanout-capture-pay_1", amount: 1300, availableToRefund: 1300, txnTime: "2026-07-04T10:06:00Z" };
+    const cases: Array<[string, Record<string, unknown>, Array<Record<string, unknown>>, Record<string, unknown>]> = [
+      // A cancelled settlement returns its amount to the authorization, and leaves it to capture again.
+      ["the full capture cancelled", { availableToSettle: 1300 }, [part, { ...full, status: "CANCELLED" }], { status: "succeeded", amount: 700, amountCaptured: 700, amountCapturable: 1300 }],
+      ["only a cancelled full capture", { availableToSettle: 2000 }, [{ ...full, amount: 2000, status: "CANCELLED" }], { status: "requires_capture", amount: 2000, amountCaptured: 0, amountCapturable: 2000 }],
+      // A read that trails the full capture still counts it, and the partial capture before it.
+      ["the full capture pending", { availableToSettle: 1300 }, [part, { ...full, status: "PENDING" }], { status: "succeeded", amount: 2000, amountCaptured: 2000, amountCapturable: 0 }],
+    ];
+    for (const [label, fields, settlements, expected] of cases) {
+      const stub = oneParkedPayment({ ...payment, ...fields, settlements });
+      const { adapter } = makePair({ fetch: stub.fetch });
+      expect(await adapter.retrievePayment("pay_1"), label).toMatchObject(expected);
+      expect(stub.lookedUp, label).toEqual([]);
+    }
+  });
+
   it("gives a declined attempt none of the settlement its reused key's payment made", async () => {
     // A card completion keyed by order: the declined attempt and the payment that went through share the reference.
     const { adapter, fake } = makePair();
@@ -371,24 +419,54 @@ describe("Paysafe full-capture replays", () => {
     expect(sent(fake, SETTLE)).toHaveLength(2);
   });
 
-  it("answers 'already captured in full' when the authorized amount meets the rest sent together with it", async () => {
+  it("refuses a capture of the authorized amount that partial captures leave short, before sending it", async () => {
+    for (const [parts, left] of [[[700], 1300], [[700, 1300], 0]] as const) {
+      const label = `after ${parts.join(" and ")}`;
+      const { adapter, fake } = makePair();
+      // Were it sent, Paysafe would refuse it on state (3204, 3203), and under this reading hold its reference.
+      fake.stateRefusalHoldsReference = true;
+      const id = await complete(adapter, "manual");
+      for (const [i, part] of parts.entries()) await adapter.capturePayment(id, part, `k-capture-part-${i}`);
+      const before = sent(fake, SETTLE).length;
+      const err = await rejection(adapter.capturePayment(id, 2000, "k-capture-all"));
+      expect(err, label).toMatchObject({ code: "invalid_request", retryable: false, raw: { id, availableToSettle: left } });
+      expect(err.outcomeUnknown, label).toBeUndefined();
+      expect(err.message, label).toBe(
+        left === 0
+          ? `Payment ${id} has nothing left to capture: Paysafe shows none of its authorization left to settle, and no full capture of it`
+          : `Payment ${id} has only 1300 of its authorization left to settle, not the 2000 this capture asks for: capture the rest with no amount`,
+      );
+      expect(sent(fake, SETTLE), label).toHaveLength(before);
+      if (left > 0) {
+        // Nothing went out under the payment's first reference, so the rest settles there.
+        const rest = await adapter.capturePayment(id, undefined, "k-capture-rest");
+        expect(captureSettlementOf(rest), label).toMatchObject({ merchantRefNum: `payfanout-capture-${id}`, amount: 1300 });
+        expect(rest, label).toMatchObject({ status: "succeeded", amountCaptured: 2000, amountCapturable: 0 });
+      }
+    }
+  });
+
+  it("answers 'already captured in full' when the authorized amount, read before a partial capture showed, meets the rest sent together with it", async () => {
     for (const stateCheckFirst of [false, true]) {
       const fake = new FakePaysafeApi();
       fake.stateCheckFirst = stateCheckFirst;
       // Open until the calls to hold together are sent.
       let together = async (): Promise<void> => undefined;
-      const { adapter } = makePair({
-        fetch: async (input, init) => {
+      const held =
+        (base: typeof fetch): typeof fetch =>
+        async (input, init) => {
           if (init?.method === "POST" && SETTLE_PATH.test(new URL(urlOf(input)).pathname)) await together();
-          return fake.fetch(input, init);
-        },
-      });
+          return base(input, init);
+        };
+      const { adapter } = makePair({ fetch: held(fake.fetch) });
+      // Its payment reads trail the partial capture, so its capture of the authorized amount is sent.
+      const { adapter: trailing } = makePair({ fetch: held(trailingPaymentReads(fake)) });
       const id = await complete(adapter, "manual");
       await adapter.capturePayment(id, 700, "k-capture-part");
       together = rendezvous(2);
       const [rest, all] = await Promise.allSettled([
         adapter.capturePayment(id, undefined, "k-capture-rest"),
-        adapter.capturePayment(id, 2000, "k-capture-all"),
+        trailing.capturePayment(id, 2000, "k-capture-all"),
       ]);
       const label = `stateCheckFirst ${stateCheckFirst}`;
       expect(rest, label).toMatchObject({ status: "fulfilled", value: { status: "succeeded", amountCaptured: 2000 } });
@@ -410,6 +488,46 @@ describe("Paysafe full-capture replays", () => {
     expect(err.outcomeUnknown).toBeUndefined();
     expect(err.message).toContain(`Payment ${id} has nothing left to capture`);
     expect(sent(fake, SETTLE)).toHaveLength(1);
+  });
+
+  it("tells the host to retry a full capture later, and a partial capture to keep its key, when the answer cannot be read back", async () => {
+    for (const amount of [undefined, 2000, 700]) {
+      for (const ending of ["unanswered", "duplicate"] as const) {
+        const label = `${String(amount)} ${ending}`;
+        const { adapter, fake } = makePair();
+        const id = await complete(adapter, "manual");
+        const reference = amount === 700 ? "k-capture" : `payfanout-capture-${id}`;
+        if (ending === "unanswered") fake.loseAnswer(SETTLE);
+        else fake.rejectAs(SETTLE, "3044");
+        fake.hideFromLookups("settlements", reference);
+        const err = await rejection(adapter.capturePayment(id, amount, "k-capture"));
+        expect(err, label).toMatchObject({ code: "processing_error", retryable: false, outcomeUnknown: true });
+        // A full capture's reference comes from the payment, so its key plays no part in the retry.
+        const advice = amount === 700 ? KEYED_RETRY : FULL_CAPTURE_RETRY;
+        expect(err.message, label).toBe(ending === "unanswered" ? unanswered(reference, advice) : unreadable(reference, advice));
+      }
+    }
+  });
+
+  it("does not move on to the next reference when the one a refused settlement may hold turns the rest away", async () => {
+    // The undocumented reading where a settlement refused on state still holds its reference under dupCheck.
+    const fake = new FakePaysafeApi();
+    fake.stateRefusalHoldsReference = true;
+    const { adapter } = makePair({ fetch: fake.fetch });
+    const { adapter: trailing } = makePair({ fetch: trailingPaymentReads(fake) });
+    const id = await complete(adapter, "manual");
+    const [first] = fullCaptureRefs(id);
+    await adapter.capturePayment(id, 700, "k-capture-part");
+    // The rest, computed from a read that does not show the partial capture yet: Paysafe refuses it (3204).
+    const refused = await rejection(trailing.capturePayment(id, undefined, "k-capture-rest"));
+    expect(refused).toMatchObject({ code: "invalid_request", retryable: false, raw: { error: { code: "3204" } } });
+    // The reference still looks free, and the right amount under it is refused as a duplicate with nothing to read back.
+    const err = await rejection(adapter.capturePayment(id, undefined, "k-capture-rest"));
+    expect(err).toMatchObject({ code: "processing_error", retryable: false, outcomeUnknown: true });
+    expect(err.message).toBe(unreadable(first!, FULL_CAPTURE_RETRY));
+    // The lookup may only trail a settlement there, so nothing is sent under the next reference.
+    expect(sent(fake, SETTLE).map((r) => r.body?.["merchantRefNum"])).toEqual(["k-capture-part", first, first]);
+    expect(fake.uniqueSettlementCreations).toBe(1);
   });
 });
 
@@ -585,6 +703,64 @@ describe("Paysafe capture answers", () => {
     expect(fake.uniqueSettlementCreations).toBe(2);
   });
 
+  it("answers a partial capture without a settlement lookup, so an outage after it settles cannot fail it", async () => {
+    const fake = new FakePaysafeApi();
+    let down = false;
+    const { adapter } = makePair({
+      fetch: async (input, init) => {
+        const url = new URL(urlOf(input));
+        if (down && url.pathname === SETTLEMENTS) {
+          return new Response(JSON.stringify({ error: { code: "1000", message: "An internal error occurred." } }), { status: 503 });
+        }
+        const response = await fake.fetch(input, init);
+        // The settlement lookups go down once the capture has settled.
+        if (init?.method === "POST" && SETTLE_PATH.test(url.pathname)) down = true;
+        return response;
+      },
+    });
+    const id = await complete(adapter, "manual");
+    const captured = await adapter.capturePayment(id, 700, "k-capture-part");
+    expect(captured).toMatchObject({ status: "succeeded", amount: 700, amountCaptured: 700, amountCapturable: 1300 });
+    expect(captureSettlementOf(captured)).toMatchObject({ merchantRefNum: "k-capture-part", amount: 700, status: "PENDING" });
+    expect(fake.uniqueSettlementCreations).toBe(1);
+    // The outage is real: a read after it fails, retryable.
+    await expect(adapter.retrievePayment(id)).rejects.toMatchObject({ code: "psp_unavailable", retryable: true });
+  });
+
+  it("reports on a partial capture's answer what a read reports afterwards", async () => {
+    const sameAsRead = async (adapter: PaysafeServerAdapter, id: string, amount: number, key: string): Promise<PaymentInfo> => {
+      const answer = await adapter.capturePayment(id, amount, key);
+      const { raw, ...captured } = answer;
+      const { raw: readRaw, ...read } = await adapter.retrievePayment(id);
+      expect(captured, key).toEqual(read);
+      expect({ ...(raw as Record<string, unknown>), captureSettlement: undefined }, key).toEqual({ ...(readRaw as Record<string, unknown>), captureSettlement: undefined });
+      return answer;
+    };
+    const { adapter } = makePair();
+    const id = await complete(adapter, "manual");
+    await sameAsRead(adapter, id, 700, "k-capture-1");
+    expect(await sameAsRead(adapter, id, 500, "k-capture-2")).toMatchObject({ amount: 1200, amountCaptured: 1200, amountCapturable: 800 });
+    // A payment read that lists its settlements reports them, on the answer as on a read.
+    const payment = { id: "pay_1", merchantRefNum: "k-pay", status: "COMPLETED", amount: 2000, availableToSettle: 2000, currencyCode: "USD", settleWithAuth: false, txnTime: "2026-07-04T10:00:00Z" };
+    const settled = { id: "stl_1", merchantRefNum: "k-capture-part", status: "PENDING", amount: 700, availableToRefund: 700, txnTime: "2026-07-04T10:05:00Z" };
+    let captured = false;
+    const listing = makePair({
+      fetch: async (input, init) => {
+        if (init?.method === "POST") {
+          captured = true;
+          return new Response(JSON.stringify(settled));
+        }
+        if (new URL(urlOf(input)).pathname === SETTLEMENTS) return new Response(JSON.stringify({ settlements: [] }));
+        return new Response(JSON.stringify(captured ? { ...payment, availableToSettle: 1300, settlements: [settled] } : payment));
+      },
+    });
+    expect(await sameAsRead(listing.adapter, "pay_1", 700, "k-capture-part")).toMatchObject({
+      amountCaptured: 700,
+      amountCapturable: 1300,
+      capturedAt: "2026-07-04T10:05:00.000Z",
+    });
+  });
+
   it("refuses a partial capture under a key the adapter reserves for full captures, before any settlement request", async () => {
     const { adapter, fake } = makePair();
     const id = await complete(adapter, "manual");
@@ -756,6 +932,7 @@ describe("Paysafe refund refusals", () => {
       ["FAILED", "it failed"],
       ["ERROR", "it failed"],
       ["CANCELLED", "it was cancelled"],
+      // Not a documented payment status (a settlement's and a refund's), read all the same.
       ["EXPIRED", "it expired"],
     ] as const) {
       const stub = oneParkedPayment({ id: "pay_1", merchantRefNum: "k-pay", status, amount: 1000, currencyCode: "USD", settleWithAuth: false, availableToSettle: 1000 });
@@ -806,9 +983,17 @@ describe("Paysafe refund refusals", () => {
       ],
       ["still processing, no settlement yet", { status: "HELD", settleWithAuth: true }, [], ["it has not completed yet"], ["lookup", "only authorized"]],
       ["authorized for nothing", { amount: 0, settleWithAuth: false, availableToSettle: 0 }, [], [], [":"]],
+      [
+        // A full capture takes all that remains, whatever a trailing read still shows left to settle.
+        "captured in full and refunded, the read still showing the authorization",
+        { settleWithAuth: false, availableToSettle: 1000 },
+        [{ id: "stl_1", merchantRefNum: "payfanout-capture-pay_1", status: "COMPLETED", amount: 1000, availableToRefund: 0, refundedAmount: 1000 }],
+        ["the settlement it has is not refundable yet (still in flight, or the sandbox settlement batch has not run) or already refunded in full"],
+        ["only authorized", "captured in part", "lookup", ";"],
+      ],
     ];
     for (const [label, fields, settlements, present, absent] of cases) {
-      const stub = oneParkedPayment({ ...base, ...fields }, (ref) => (ref === "k-pay" ? settlements : []));
+      const stub = oneParkedPayment({ ...base, ...fields }, (ref) => settlements.filter((s) => s["merchantRefNum"] === ref));
       const err = await rejection(makePair({ fetch: stub.fetch }).adapter.refundPayment({ pspPaymentId: "pay_1", idempotencyKey: "k-refund" }));
       expect(err, label).toMatchObject({ code: "invalid_request", retryable: false });
       expect(err.message, label).toMatch(/^Payment pay_1 has no refundable settlement/);
@@ -946,6 +1131,75 @@ describe("Paysafe settlement lookups", () => {
       ["k-automatic", null],
     ]);
     expect(fake.uniqueRefundCreations).toBe(0);
+  });
+
+  it("reads past a reference that only looks empty once Paysafe refuses the range, to the full capture after it", async () => {
+    const { adapter, fake } = makePair();
+    // Paysafe documents no widest range; the double refuses one past 20 days.
+    fake.lookupRangeLimitDays = 20;
+    const id = await complete(adapter, "manual");
+    const idle = await complete(adapter, "manual", 2000, "USD", "k-manual-idle");
+    const refs = fullCaptureRefs(id);
+    // Day 0: a full capture fails under the first reference.
+    fake.recordFailure(SETTLE, GATEWAY_REJECTION);
+    await rejection(adapter.capturePayment(id, undefined, "k-capture"));
+    // Day 6: the ranged walk still shows that failure, so the retry settles under the second.
+    fake.passDays(6);
+    const captured = await adapter.capturePayment(id, undefined, "k-capture");
+    expect(captureSettlementOf(captured)).toMatchObject({ merchantRefNum: refs[1], amount: 2000 });
+    // Day 34: the range is refused, and the default window no longer shows the failure.
+    fake.passDays(28);
+    const lookedUp = async <T>(call: () => Promise<T>): Promise<[T, Array<[string | null, string | null]>]> => {
+      const before = fake.requests.length;
+      const result = await call();
+      return [result, lookupsIn(fake.requests.slice(before)).map((params) => [params.get("merchantRefNum"), params.get("startDate")])];
+    };
+    const [refund, refundLookups] = await lookedUp(() =>
+      adapter.refundPayment({ pspPaymentId: id, amount: 500, idempotencyKey: "k-refund" }),
+    );
+    expect(refund).toMatchObject({ status: "succeeded", amount: 500 });
+    // The refused range is not asked for again on the next reference.
+    expect(refundLookups).toEqual([[refs[0], "2026-07-03"], [refs[0], null], [refs[1], null]]);
+    expect(await adapter.retrievePayment(id)).toMatchObject({
+      status: "succeeded",
+      amountCaptured: 2000,
+      amountRefunded: 500,
+      capturedAt: "2026-07-10T10:05:00.000Z",
+    });
+    // A full capture reads the references the same way, and answers with that settlement, sending nothing.
+    const again = await adapter.capturePayment(id, undefined, "k-capture-again");
+    expect(captureSettlementOf(again)).toMatchObject({ merchantRefNum: refs[1], amount: 2000 });
+    expect(sent(fake, SETTLE).map((r) => r.body?.["merchantRefNum"])).toEqual(refs.slice(0, 2));
+    // Where nothing shows, the read walks all ten references, and no more.
+    const [read, idleLookups] = await lookedUp(() => adapter.retrievePayment(idle));
+    expect(read).toMatchObject({ status: "requires_capture", amountCaptured: 0, amountCapturable: 2000 });
+    const idleRefs = fullCaptureRefs(idle);
+    expect(idleLookups).toEqual([[idleRefs[0], "2026-07-03"], ...idleRefs.map((ref): [string, null] => [ref, null])]);
+    // A full capture then still settles under the first empty reference.
+    await adapter.capturePayment(idle, undefined, "k-capture-idle");
+    expect(sent(fake, SETTLE).at(-1)?.body).toEqual({ merchantRefNum: fullCaptureRefs(idle)[0], dupCheck: true, amount: 2000 });
+  });
+
+  it("reads on past empty references for the rest of a walk once any of its lookups has fallen back", async () => {
+    const payment = { id: "pay_1", merchantRefNum: "k-pay", status: "COMPLETED", amount: 1000, availableToSettle: 0, currencyCode: "USD", settleWithAuth: false, txnTime: "2026-07-04T10:00:00Z" };
+    const [first, second, third] = fullCaptureRefs("pay_1");
+    const live = { id: "stl_3", merchantRefNum: third, status: "COMPLETED", amount: 1000, availableToRefund: 1000, txnTime: "2026-07-05T10:00:00Z" };
+    const lookups: Array<[string | null, string | null]> = [];
+    const { adapter } = makePair({
+      fetch: async (input) => {
+        const url = new URL(urlOf(input));
+        if (url.pathname !== SETTLEMENTS) return new Response(JSON.stringify(payment));
+        const ref = url.searchParams.get("merchantRefNum");
+        const ranged = url.searchParams.has("startDate");
+        lookups.push([ref, url.searchParams.get("startDate")]);
+        // The first refuses the range; the second answers it as an unknown reference; the third holds the capture.
+        if (ranged && ref === first) return new Response(JSON.stringify({ error: { code: "5068", message: "Field error(s)" } }), { status: 400 });
+        if (ref === second) return new Response(JSON.stringify({ error: { code: "5269", message: "Entity not found" } }), { status: 404 });
+        return new Response(JSON.stringify({ settlements: ref === third ? [live] : [] }));
+      },
+    });
+    expect(await adapter.retrievePayment("pay_1")).toMatchObject({ status: "succeeded", amountCaptured: 1000, capturedAt: "2026-07-05T10:00:00.000Z" });
+    expect(lookups).toEqual([[first, "2026-07-03"], [first, null], [second, null], [third, null]]);
   });
 
   it("fails a read, a refund and a full capture when a lookup fails, instead of reading it as no settlement", async () => {

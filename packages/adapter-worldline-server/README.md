@@ -103,6 +103,12 @@ carries the ones it can supply:
 - **A contact detail for Visa**, which Worldline also requires: the adapter sends
   `order.customer.contactDetails.emailAddress` from the session's `receiptEmail` or
   `billingDetails.email`, so pass one of them.
+- **The use case Cartes Bancaires requires**,
+  `cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure.usecase: "single-amount"`,
+  on every payment whatever the card's brand, which the adapter does not learn before paying.
+  Worldline's 3-D Secure guide writes `useCase`; the API contract and Worldline's Node SDK
+  spell it `usecase`. The adapter neither stores cards nor charges them again, so each payment
+  is a single amount.
 
 The rest of the list does not come from this adapter:
 
@@ -114,13 +120,16 @@ The rest of the list does not come from this adapter:
   **`order.customer.device.ipAddress`** come from the customer's HTTP request to your server,
   not from the browser, and neither `CompletePaymentInput` nor `createCompletionHandler`
   carries them to the adapter today, so the adapter cannot send them.
-- **`cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure.useCase`**,
-  which Cartes Bancaires additionally requires, is not sent: Worldline's API contract spells
-  the property `usecase`, so the adapter leaves it out until a sandbox run settles the name.
 
-`sca: { exemption: "moto" }` is not mapped yet. Worldline models MOTO as
-`cardPaymentMethodSpecificInput.transactionChannel: "MOTO"`, not as an exemption, so such a
-payment goes out as an e-commerce payment with 3-D Secure.
+`sca: { exemption: "moto" }` sends `cardPaymentMethodSpecificInput.transactionChannel: "MOTO"`,
+Worldline's channel for mail order and telephone order payments; without it no channel is
+sent, and Worldline applies its `ECOMMERCE` default. The 3-D Secure data above is sent
+unchanged on a MOTO payment: Worldline says its platform detects MOTO as outside the scope of
+SCA, but not what it does with that data, so a MOTO payment it does not treat as excluded
+still goes through 3-D Secure rather than skipping it. A challenge then comes back as
+`requires_action`, and on a telephone order it would open in the browser the card was typed
+into, not the cardholder's, so such a payment stays unfinished instead of being charged
+without authentication. Run one MOTO payment in the sandbox before relying on it.
 
 Session creation also refuses, with `invalid_request` and before any call to Worldline, an
 `id` longer than 40 characters (it travels as `order.references.merchantReference`) and a

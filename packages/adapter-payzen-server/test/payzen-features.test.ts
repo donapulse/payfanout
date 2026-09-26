@@ -204,8 +204,14 @@ describe("mapPayZenError (envelope taxonomy)", () => {
     ["ACQ_001", "05", "card_declined", false],
     ["ACQ_001", null, "card_declined", false],
     ["ACQ_999", null, "psp_unavailable", true],
-    ["AUTH_149", null, "authentication_required", false],
-    ["AUTH_100", null, "authentication_required", false],
+    // No AUTH_ code is a cardholder failing to authenticate.
+    ["AUTH_100", null, "processing_error", false], // invalid ACS Signature
+    ["AUTH_101", null, "processing_error", false], // technical error 3DS
+    ["AUTH_149", null, "processing_error", false], // 3DS operation timeout
+    ["AUTH_102", null, "invalid_request", false], // wrong Parameter 3DS
+    ["AUTH_103", null, "invalid_request", false], // 3DS Disabled
+    ["AUTH_150", null, "processing_error", false], // a code the page does not list
+    ["AUTH_102", "51", "invalid_request", false], // never read as an acquirer code
     ["AUTH_999", null, "psp_unavailable", true],
     ["PSP_042", null, "insufficient_funds", false],
     ["PSP_202", null, "expired_card", false],
@@ -260,18 +266,21 @@ describe("mapPayZenError (envelope taxonomy)", () => {
     expect(mapPayZenError({ errorCode: "INT_905" }, {}).message).toMatch(/shopId, password/);
   });
 
-  it("holds the same acquirer map as the browser adapter", async () => {
+  it("holds the same acquirer and AUTH_ maps as the browser adapter", async () => {
     const { readFile } = await import("node:fs/promises");
     const { fileURLToPath } = await import("node:url");
-    const entries = async (path: string): Promise<string[]> => {
+    const entries = async (path: string, map: string): Promise<string[]> => {
       const source = await readFile(fileURLToPath(new URL(path, import.meta.url)), "utf8");
-      const start = source.indexOf("const ACQUIRER_CODE_MAP");
+      const start = source.indexOf(`const ${map}:`);
+      if (start === -1) return [];
       const block = source.slice(start, source.indexOf("\n};", start));
-      return [...block.matchAll(/^\s*"([^"]+)": "([a-z_]+)",/gm)].map((m) => `${m[1]}=${m[2]}`).sort();
+      return [...block.matchAll(/^\s*"?(\w+)"?: "([a-z_]+)",/gm)].map((m) => `${m[1]}=${m[2]}`).sort();
     };
-    const server = await entries("../src/adapter.ts");
-    expect(server.length).toBeGreaterThan(0);
-    expect(await entries("../../adapter-payzen/src/adapter.ts")).toEqual(server);
+    for (const map of ["ACQUIRER_CODE_MAP", "AUTH_CODE_MAP"]) {
+      const server = await entries("../src/adapter.ts", map);
+      expect(server.length, map).toBeGreaterThan(0);
+      expect(await entries("../../adapter-payzen/src/adapter.ts", map), map).toEqual(server);
+    }
   });
 });
 

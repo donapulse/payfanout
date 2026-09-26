@@ -667,6 +667,20 @@ const ACQUIRER_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "99": "processing_error", // Initiator domain incident
 };
 
+/**
+ * AUTH_ codes → the taxonomy: the server adapter's map, where no code is a
+ * cardholder failing to authenticate. A code outside it is a processing_error.
+ */
+const AUTH_CODE_MAP: Record<string, UnifiedErrorCode> = {
+  // The issuer's or the platform's 3-D Secure failed or answered too late.
+  AUTH_100: "processing_error", // invalid ACS Signature
+  AUTH_101: "processing_error", // technical error 3DS
+  AUTH_149: "processing_error", // 3DS operation timeout
+  // The merchant's request or set-up.
+  AUTH_102: "invalid_request", // wrong Parameter 3DS
+  AUTH_103: "invalid_request", // 3DS Disabled
+};
+
 /** Looks a code up among the map's own keys only. */
 function ownCodeFor(
   map: Record<string, UnifiedErrorCode>,
@@ -696,7 +710,7 @@ function transactionError(
 ): PayFanoutError {
   let code: UnifiedErrorCode;
   if (isTechnicalError(errorCode)) code = "psp_unavailable";
-  else if (errorCode?.startsWith("AUTH_")) code = "authentication_required";
+  else if (errorCode?.startsWith("AUTH_")) code = ownCodeFor(AUTH_CODE_MAP, errorCode) ?? "processing_error";
   else code = ownCodeFor(ACQUIRER_CODE_MAP, detailedErrorCode) ?? "card_declined";
   return new PayFanoutError({
     code,

@@ -1455,19 +1455,42 @@ function toPaymentMethodDetails(
   return Object.keys(details).length > 0 ? details : undefined;
 }
 
-/** Acquirer refusal codes (ACQ_001 / PSP_101 detailedErrorCode) → decline refinement (CB network table). */
-const ACQUIRER_DECLINE_MAP: Record<string, UnifiedErrorCode> = {
+/**
+ * Acquirer codes (ACQ_001 / PSP_101 detailedErrorCode) → the taxonomy. Each
+ * acquirer sends its own codes and the error does not name the network, so a
+ * code is mapped only when every acquirer table PayZen documents reads it the
+ * same way. 38 and 1A do not meet that rule and stay until the codes can be
+ * read per network (see docs/decisions.md). The browser adapter holds the
+ * same map.
+ */
+const ACQUIRER_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "51": "insufficient_funds",
   "33": "expired_card",
   "38": "expired_card",
   "54": "expired_card",
   "14": "invalid_card_data",
+  "15": "invalid_card_data", // Unknown issuer: the card number names none
   "34": "fraud_suspected", // suspected fraud
   "41": "fraud_suspected", // lost card
   "43": "fraud_suspected", // stolen card
   "59": "fraud_suspected", // suspected fraud
   "1A": "authentication_required", // SCA soft decline
+  // The issuer, the network or a system failed or answered too late.
+  "20": "processing_error", // Incorrect response (error on the domain server)
+  "68": "processing_error", // Response not received or received too late
+  "90": "processing_error", // Temporary shutdown
+  "91": "processing_error", // Unable to reach the card issuer
+  "96": "processing_error", // System malfunction
+  "97": "processing_error", // Overall monitoring timeout
+  "99": "processing_error", // Initiator domain incident
 };
+
+/** Looks an acquirer code up among the map's own keys only. */
+function acquirerCodeFor(detailedErrorCode: string | null | undefined): UnifiedErrorCode | undefined {
+  return typeof detailedErrorCode === "string" && Object.hasOwn(ACQUIRER_CODE_MAP, detailedErrorCode)
+    ? ACQUIRER_CODE_MAP[detailedErrorCode]
+    : undefined;
+}
 
 const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
   PSP_042: "insufficient_funds",
@@ -1545,10 +1568,13 @@ export function mapPayZenError(answer: PayZenErrorAnswerLike | undefined, raw: u
   if (errorCode === "ACQ_999" || errorCode === "AUTH_999") {
     code = "psp_unavailable";
   } else if (errorCode.startsWith("ACQ_")) {
-    code = ACQUIRER_DECLINE_MAP[answer?.detailedErrorCode ?? ""] ?? "card_declined";
+    code = acquirerCodeFor(answer?.detailedErrorCode) ?? "card_declined";
   } else if (errorCode === "PSP_101") {
     // Refund refused by the issuer; the acquirer refusal code rides detailedErrorCode.
-    code = ACQUIRER_DECLINE_MAP[answer?.detailedErrorCode ?? ""] ?? "card_declined";
+    // PayZen's remedy is paying the buyer back by other means, so a code read as
+    // authentication_required, which a refund cannot act on, is a plain refusal.
+    const acquirerCode = acquirerCodeFor(answer?.detailedErrorCode);
+    code = acquirerCode === undefined || acquirerCode === "authentication_required" ? "card_declined" : acquirerCode;
   } else if (errorCode.startsWith("AUTH_")) {
     code = "authentication_required";
   } else if (errorCode.startsWith("INT_") || errorCode.startsWith("CLIENT_")) {

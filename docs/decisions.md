@@ -1146,7 +1146,55 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   endpoint confirmed 2026-07-15 (verbatim in the platform's current services surface). The
   status-based classification (401/403 = auth, 5xx/429 = network, else authenticated) stays,
   so the probe remains robust across API evolutions; a live sandbox call is the remaining
-  check.
+  check. Superseded 2026-09-26 by the next item: only the service's documented answer
+  passes.
+- **Doc-verified 2026-09-26: the connection check.** Checked against the API contract
+  (payment.preprod.direct.worldline-solutions.com/v1/public-contract-definition.yaml,
+  v2.507.0), the API Troubleshooting and manual-authentication guides
+  (docs.direct.worldline-solutions.com), the Connect S2S API reference for the same
+  service (apireference.connect.worldline-solutions.com/s2sapi/v1/en_US/json/services/testconnection.html),
+  and Worldline's SDKs and plugins (github.com/wl-online-payments-direct).
+  - *What passes.* The contract lists two responses for the probe's
+    `GET /v2/{merchantId}/services/testconnection` ("Test your connection and
+    credentials"): a 200 with `testConnection`, `{ result }`, and a 403 "Your API
+    authentication failed." with the `errorResponse` envelope. Only a 2xx whose body
+    carries `"result": "OK"` passes; 401/403 stay `auth` and 429/5xx stay `network`.
+    Any other answer reported `ok: true` and now reports `internal`. The troubleshooting
+    guide answers a "non-existent/wrong API endpoint" with an empty body
+    (`content-length = 0`), which a wrong `baseUrl` override meets, and a `baseUrl` naming
+    a host that is not the API can answer 2xx with something else, a `result` among it. The
+    Direct contract gives `result` no enum, example or description, and the Node, Java and
+    .NET SDKs' integration tests assert only that it is set, but the Connect S2S reference
+    documents the value: "If you receive an OK result you know that your connection with us
+    is working correctly, your authentication credentials are correct and your account is
+    setup correctly in our system.", `result` "OK result on the connection to the payment
+    engine.", example `{ "result" : "OK" }`. Worldline's Magento, PrestaShop and SAP
+    Commerce plugins fail the check on anything but `"OK"`, and the Direct contract's
+    webhooks `validateCredentials` answers a 200 whose `result` is `Valid` or `Invalid`, a
+    failure reported with a 200. So only `"OK"`, exactly, passes.
+  - *What the message names.* The status and, on a non-2xx, the first error's `id` ("ID of
+    the error. This is a short human-readable message that briefly describes the error."),
+    from the body the probe already read. `aPIError` requires only `errorCode`, so an error
+    without an `id` names none, and a later error is never read instead. An id is echoed
+    only when it reads as upper-case snake_case of at most 64 characters, a capital first
+    (all 18 ids the troubleshooting guide lists do; the longest,
+    `CARDNUMBER_PAYMENTPRODUCTID_MISMATCH`, has 36), and holds neither credential nor eight
+    characters or more of either, in any letter case: a wrong `baseUrl` receives the API
+    key id in the `Authorization` header, and whatever answers writes the body. The secret
+    API key never leaves the server under v1HMAC, only a signature does; it is screened
+    all the same.
+  - A key, secret or PSPID the platform cannot match answers 403
+    `ACCESS_TO_MERCHANT_NOT_ALLOWED` (code 9007, both guides), and the manual-authentication
+    guide's troubleshooting adds "Use the correct environment: Do not mix up API Keys /
+    Secrets /accounts from the test/prod environment". So a wrong `merchantId` or
+    environment reads as `auth`, and that message now names the `merchantId` and the
+    environment beside the API key id and the secret API key, and the `baseUrl` when one is
+    configured, since a host at a mis-pasted `baseUrl`, such as a CDN, can answer 403 too.
+    It also names the server's clock: the same list says "Keep the Date header within 5
+    minutes", and the adapter dates each request from the server's clock.
+    Not sandbox-verified: the 200 body and the answer to a wrong path.
+    Sandbox check: run the probe with valid credentials, then with a `baseUrl` carrying an
+    extra path segment, and record both answers.
 - **Webhook envelope: array vs object.** The webhooks page's example body renders as a JSON
   ARRAY, while the platform's own webhooks helper JSON-parses a single object. The parser
   accepts both single-event shapes (a one-element array is unwrapped) and rejects

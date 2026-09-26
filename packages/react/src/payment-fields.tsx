@@ -1,6 +1,11 @@
 "use client";
 import { useEffect, useRef, type CSSProperties, type ReactNode } from "react";
-import { PayFanoutError, type FieldsChangeState, type UnifiedError } from "@payfanout/core";
+import {
+  PayFanoutError,
+  type ClientPaymentAdapter,
+  type FieldsChangeState,
+  type UnifiedError,
+} from "@payfanout/core";
 import { usePayFanoutContext } from "./provider.js";
 import { useLatestRef } from "./use-latest-ref.js";
 
@@ -68,6 +73,16 @@ export interface PaymentFieldsProps {
   saveConsent?: SaveConsentOptions;
 }
 
+/** A failure the mount effect reported before mounting anything, with the inputs it failed on. */
+interface ReportedFailure {
+  readonly adapter: ClientPaymentAdapter | undefined;
+  readonly psp: string | undefined;
+  readonly clientSecret: string;
+  readonly error: PayFanoutError;
+  /** Open from the cleanup of the setup that reported it until the next microtask. */
+  replayable: boolean;
+}
+
 /**
  * Thin wrapper around the active ClientPaymentAdapter.mount. Lazily loads the
  * PSP SDK on first mount, unmounts on cleanup. Card data lives exclusively in
@@ -93,6 +108,9 @@ export function PaymentFields({
   // This instance's identity — the token it claims the provider's single
   // mount slot with.
   const instanceRef = useRef<object>({});
+  // The failure this instance's latest setup reported; null once a setup gets
+  // past the checks that run before mounting.
+  const failureRef = useRef<ReportedFailure | null>(null);
   // Latest mount inputs and callbacks: SDK events fire long after the mount
   // effect ran, and appearance/fieldOptions/locale must not be effect
   // dependencies (PSP SDKs handle live option updates poorly; remount by
@@ -110,31 +128,50 @@ export function PaymentFields({
     const instance = instanceRef.current;
     if (!container) return;
 
-    const fail = (err: PayFanoutError): void => {
-      setLastError(err);
+    const fail = (err: PayFanoutError): (() => void) => {
+      const previous = failureRef.current;
+      // StrictMode replays a new mount's setup right after its cleanup, in the
+      // same synchronous pass: the same inputs fail the same way, and onError
+      // already has that failure. A setup with other inputs, or after the
+      // window (an <Activity> reveal), is a new mount and reports.
+      const replay =
+        previous !== null &&
+        previous.replayable &&
+        previous.adapter === adapter &&
+        previous.psp === targetPsp &&
+        previous.clientSecret === clientSecret;
+      const failure: ReportedFailure = replay
+        ? previous
+        : { adapter, psp: targetPsp, clientSecret, error: err, replayable: false };
+      failureRef.current = failure;
+      setLastError(failure.error);
       setStatus("error");
-      latestRef.current.onError?.(err);
+      if (!replay) latestRef.current.onError?.(failure.error);
+      return () => {
+        failure.replayable = true;
+        queueMicrotask(() => {
+          failure.replayable = false;
+        });
+      };
     };
     if (targetPsp === undefined) {
-      fail(
+      return fail(
         PayFanoutError.invalidRequest(
           "No PSP to mount — pass <PaymentFields psp> or register at least one adapter with <PayFanoutProvider>",
         ),
       );
-      return;
     }
     if (!adapter) {
-      fail(PayFanoutError.invalidRequest(`No client adapter registered for psp "${targetPsp}"`));
-      return;
+      return fail(PayFanoutError.invalidRequest(`No client adapter registered for psp "${targetPsp}"`));
     }
     if (fieldsOwnerRef.current !== null && fieldsOwnerRef.current !== instance) {
-      fail(
+      return fail(
         PayFanoutError.invalidRequest(
           "Only one <PaymentFields> may be mounted at a time — unmount the other instance first",
         ),
       );
-      return;
     }
+    failureRef.current = null;
     fieldsOwnerRef.current = instance;
 
     let cancelled = false;

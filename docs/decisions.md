@@ -3823,6 +3823,47 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   resolves with the payment `canceled` rather than rejecting. No sandbox run has done so: the
   project has no Adyen test account.
 
+## CSP guidance re-verified (2026-09-26)
+
+- **Stripe: `https://*.js.stripe.com` joins `script-src` and `frame-src`.** Stripe's security
+  guide (docs.stripe.com/security/guide, Content Security Policy › Stripe.js) lists
+  "`script-src`, `https://*.js.stripe.com`, `https://js.stripe.com`,
+  `https://maps.googleapis.com`" and "`frame-src`, `https://*.js.stripe.com`,
+  `https://js.stripe.com`, `https://hooks.stripe.com`", and says "Adding `*.js.stripe.com`
+  allows Stripe.js to improve performance by starting frames on different origins, where
+  possible." The onboarding descriptor and the guide now list it. `https://maps.googleapis.com`
+  applies only "If you’re using the Address Element with your own Google Maps API key",
+  which this adapter never mounts, so the descriptor leaves it out and the guide names it.
+  Link's `frame-src` and `connect-src` hosts (`https://link.com`, `https://*.link.com`) are
+  listed: Stripe's Link page (docs.stripe.com/payments/link/payment-element-link) says "The
+  default Payment Element integration includes a Link prompt in the card form.", and the server adapter creates intents with
+  `automatic_payment_methods`, so an account that enables Link shows it; Link's `img-src`
+  host is in the guide, the descriptor having no field for it. The guide's `https://m.stripe.network`
+  note is gone: the security guide does not name that host, and the served
+  `https://js.stripe.com/v3` never references `stripe.network`. So is its advice to self-host:
+  docs.stripe.com/js says Stripe.js "should always be loaded directly from
+  `https://js.stripe.com`, rather than included in a bundle or hosted yourself", and the
+  served script throws "Stripe.js must be loaded from js.stripe.com." when it is not.
+- **PayZen: `connect-src` and `frame-src` name `https://static.payzen.eu`.** PayZen's FAQ "How
+  to configure the CSP (Content Security Policy)"
+  (payzen.io/en-EN/rest/V4.0/javascript/features/reference.html) asks for `connect-src`,
+  `frame-src` and `script-src` `https://static.payzen.eu`, and the same three for
+  `https://secure.payzen.eu` with an external fraud detection engine. The guide had named no
+  `frame-src` host ("hosts vary per platform") and no `connect-src`. The descriptor already
+  listed them. It keeps `https://api.payzen.eu` under `connect`, which PayZen's list does not
+  name but the served krypton-client's platform table carries, since whether the host page
+  contacts it is unverified. The guide now also states two facts from the served files: the
+  theme stylesheet `@import`s its fonts from `https://fonts.googleapis.com` (files from
+  `https://fonts.gstatic.com`), and krypton-client adds an inline `<style>` element, so
+  `style-src` needs `'unsafe-inline'`.
+- **PayPal, Worldline and Adyen match their providers' current guidance; Paysafe publishes
+  none.** Checked on 2026-09-26 against developer.paypal.com/sdk/js/v5/best-practices, the
+  Worldline Hosted Tokenization Page guide and docs.adyen.com's script-security page.
+  Paysafe's Paysafe.js pages name no CSP; the hosts in its guide agree with the environment
+  table in the served paysafe.min.js. That file also adds `<style>` elements of its own
+  (`document.createElement("style")`, used for the 3-D Secure overlay among others), so the
+  guide now says a `style-src` that restricts styles needs `'unsafe-inline'`.
+
 ## Stripe: one card-error classification on both halves (2026-09-26)
 
 - **The browser adapter classifies Stripe.js errors in the server adapter's order.** A

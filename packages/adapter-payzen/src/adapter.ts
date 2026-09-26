@@ -619,23 +619,53 @@ function confirmResultFrom(response: KrPaymentResponseLike): ConfirmResult {
   };
 }
 
-/** Acquirer refusal codes (ACQ_001 detailedErrorCode) → decline refinement (CB network table). */
+/**
+ * Acquirer refusal codes (ACQ_001 detailedErrorCode) → the taxonomy, from
+ * PayZen's CB network table, as the server adapter maps them.
+ */
 const ACQUIRER_DECLINE_MAP: Record<string, UnifiedErrorCode> = {
   "51": "insufficient_funds",
   "33": "expired_card",
   "38": "expired_card",
   "54": "expired_card",
   "14": "invalid_card_data",
+  "15": "invalid_card_data", // Unknown issuer: the card number names none
   "34": "fraud_suspected", // suspected fraud
   "41": "fraud_suspected", // lost card
   "43": "fraud_suspected", // stolen card
   "59": "fraud_suspected", // suspected fraud
-  "1A": "authentication_required",
+  "1A": "authentication_required", // SCA soft decline
+  "81": "authentication_required", // the issuer does not admit a non-secured payment
+  // The merchant's set-up or the request is at fault, not the card.
+  "03": "invalid_request", // Invalid acceptor
+  "30": "invalid_request", // Format error
+  // The issuer, the network or a server failed or answered too late.
+  "20": "processing_error", // Incorrect response (error on the domain server)
+  "68": "processing_error", // Response not received or received too late
+  "90": "processing_error", // Temporary shutdown
+  "91": "processing_error", // Unable to reach the card issuer
+  "96": "processing_error", // System malfunction
+  "97": "processing_error", // Overall monitoring timeout
+  "98": "processing_error", // Server not available, new network route requested
+  "99": "processing_error", // Initiator domain incident
 };
 
+/** Looks an acquirer code up among the map's own keys only. */
+function acquirerCodeFor(detailedErrorCode: string | null | undefined): UnifiedErrorCode | undefined {
+  return typeof detailedErrorCode === "string" && Object.hasOwn(ACQUIRER_DECLINE_MAP, detailedErrorCode)
+    ? ACQUIRER_DECLINE_MAP[detailedErrorCode]
+    : undefined;
+}
+
+/** ACQ_999 and AUTH_999 are PayZen's technical errors, not refusals. */
+function isTechnicalError(errorCode: string | null | undefined): boolean {
+  return errorCode === "ACQ_999" || errorCode === "AUTH_999";
+}
+
 function declineCode(errorCode: string | null | undefined, detailedErrorCode: string | null | undefined): UnifiedErrorCode {
+  if (isTechnicalError(errorCode)) return "psp_unavailable";
   if (errorCode?.startsWith("AUTH_")) return "authentication_required";
-  return ACQUIRER_DECLINE_MAP[detailedErrorCode ?? ""] ?? "card_declined";
+  return acquirerCodeFor(detailedErrorCode) ?? "card_declined";
 }
 
 const KR_CLIENT_CODE_MAP: Record<string, UnifiedErrorCode> = {
@@ -658,12 +688,15 @@ function mapKrError(err: unknown): UnifiedError {
   const e = err as KrErrorLike | undefined;
   const rawCode = e?.errorCode ?? "";
   let code: UnifiedErrorCode;
-  if (KR_CLIENT_CODE_MAP[rawCode]) {
-    code = KR_CLIENT_CODE_MAP[rawCode];
-  } else if (rawCode.startsWith("ACQ_")) {
+  // An acquirer's or an authentication server's refusal is final for its
+  // transaction, whatever its code, as the server adapter reads it.
+  let refusal = false;
+  const clientCode = Object.hasOwn(KR_CLIENT_CODE_MAP, rawCode) ? KR_CLIENT_CODE_MAP[rawCode] : undefined;
+  if (clientCode) {
+    code = clientCode;
+  } else if (rawCode.startsWith("ACQ_") || rawCode.startsWith("AUTH_")) {
     code = declineCode(rawCode, e?.detailedErrorCode);
-  } else if (rawCode.startsWith("AUTH_")) {
-    code = "authentication_required";
+    refusal = !isTechnicalError(rawCode);
   } else if (rawCode.startsWith("CLIENT_")) {
     // CLIENT_ = browser-side, pre-transaction by definition (integration
     // errors and warnings included) — retrying cannot help, unlike the
@@ -675,7 +708,7 @@ function mapKrError(err: unknown): UnifiedError {
   return new PayFanoutError({
     code,
     message: userMessageFor(code),
-    retryable: code === "processing_error" || code === "psp_unavailable",
+    retryable: !refusal && (code === "processing_error" || code === "psp_unavailable"),
     raw: err,
     pspName: "payzen",
   });

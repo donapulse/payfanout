@@ -180,6 +180,21 @@ describe("mapPayZenError (envelope taxonomy)", () => {
     ["ACQ_001", "41", "fraud_suspected", false], // lost card
     ["ACQ_001", "38", "expired_card", false],
     ["ACQ_001", "1A", "authentication_required", false],
+    ["ACQ_001", "81", "authentication_required", false], // a non-secured payment the issuer does not admit
+    ["ACQ_001", "15", "invalid_card_data", false], // unknown issuer
+    ["ACQ_001", "03", "invalid_request", false], // invalid acceptor
+    ["ACQ_001", "30", "invalid_request", false], // format error
+    ["ACQ_001", "20", "processing_error", false],
+    ["ACQ_001", "68", "processing_error", false], // no response, or too late
+    ["ACQ_001", "90", "processing_error", false],
+    ["ACQ_001", "91", "processing_error", false], // issuer out of reach
+    ["ACQ_001", "96", "processing_error", false],
+    ["ACQ_001", "97", "processing_error", false],
+    ["ACQ_001", "98", "processing_error", false],
+    ["ACQ_001", "99", "processing_error", false],
+    ["PSP_101", "91", "processing_error", false], // a refund refused the same way
+    ["ACQ_001", "13", "card_declined", false], // invalid amount, left on the default
+    ["ACQ_001", "constructor", "card_declined", false], // the map's own keys only
     ["ACQ_001", "05", "card_declined", false],
     ["ACQ_001", null, "card_declined", false],
     ["ACQ_999", null, "psp_unavailable", true],

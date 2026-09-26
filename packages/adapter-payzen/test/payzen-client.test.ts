@@ -738,6 +738,19 @@ describe("PayZenClientAdapter error mapping", () => {
       [{ errorCode: "ACQ_001", detailedErrorCode: "34" }, "fraud_suspected", false],
       [{ errorCode: "ACQ_001", detailedErrorCode: "41" }, "fraud_suspected", false],
       [{ errorCode: "ACQ_001", detailedErrorCode: "1A" }, "authentication_required", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "81" }, "authentication_required", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "15" }, "invalid_card_data", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "03" }, "invalid_request", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "30" }, "invalid_request", false],
+      // An acquirer refusal is final for its transaction, even when the network failed.
+      [{ errorCode: "ACQ_001", detailedErrorCode: "68" }, "processing_error", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "91" }, "processing_error", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "99" }, "processing_error", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "13" }, "card_declined", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "constructor" }, "card_declined", false],
+      [{ errorCode: "ACQ_999" }, "psp_unavailable", true], // technical error, as the server reads it
+      [{ errorCode: "AUTH_999" }, "psp_unavailable", true],
+      [{ errorCode: "constructor" }, "processing_error", true], // the client map's own keys only
       [{ errorCode: "AUTH_149" }, "authentication_required", false],
       [{ errorCode: "SOMETHING_ELSE" }, "processing_error", true], // shopper may safely retry
       [{}, "processing_error", true],

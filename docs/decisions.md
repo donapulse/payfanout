@@ -2804,9 +2804,10 @@ description of what v2 changes is what the migration then had to implement.
   again" cannot help, and `card_declined`'s "use another card" helps only when that card
   goes through another, working MID. The PayZen server adapter maps its merchant-configuration
   refusals the same way (PSP_100, the REST API not enabled on the shop; PSP_109, production
-  mode not activated; PSP_610, no acceptance agreement). Its CB network table does not yet:
-  PayZen's acquirer codes 03, 30, 68 and 91, the Sips codes behind 30031001, 30301001,
-  30681001 and 30911001, stay `card_declined` there, tracked in #218.
+  mode not activated; PSP_610, no acceptance agreement). Its CB network table does too
+  since 2026-09-26: PayZen's acquirer codes 03 and 30 are `invalid_request` and 68 and 91
+  `processing_error`, as are the Sips codes behind 30031001, 30301001, 30681001 and 30911001
+  here (see "PayZen acquirer codes aligned (2026-09-26)").
 - **A 429 or a 5xx is classified by its status before any code.** Before, a 5xx carrying a
   mapped code (30511001, say) came out as a non-retryable decline and skipped the transport
   retries. The order is now: 429 or 5xx; the code map; 402 → `card_declined`; 409 → the
@@ -3433,3 +3434,39 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
     of any refusal. The CAD sandbox account completed an EFT debit on 2026-07-15, so EFT can
     run first; ACH needs an account provisioned for it. A refusal means refusing that rail
     locally, as SEPA and Bacs are.
+
+## PayZen acquirer codes aligned (2026-09-26)
+
+- **The CB network codes that name the merchant's set-up, the request or a failed network
+  are no longer declines.** Doc-verified 2026-09-26 against PayZen's CB network table
+  (payzen.io/en-EN/rest/V4.0/api/acq_errors/cb.html, "The return codes returned for the CB
+  network (France)", which the ACQ error page, errors_acq.html, names as the source of
+  `detailedErrorCode` on ACQ_001, "returned without modification"). `invalid_request`: 03
+  ("Invalid acceptor") and 30 ("Format error"), as the Worldline adapter maps their Direct
+  codes 30031001 and 30301001. `processing_error`: 68 ("Response not received or received too
+  late") and 91 ("Unable to reach the card issuer"), as Worldline maps 30681001 and
+  30911001, and 20 ("Incorrect response (error on the domain server)") and 99 ("Initiator
+  domain incident"), as Worldline maps 30201001 and 30991001; also 90 ("Temporary
+  shutdown"), 96 ("System malfunction"), 97 ("Overall monitoring timeout") and 98 ("Server
+  not available, new network route requested"), which name a system, not the card.
+  `invalid_card_data`: 15 ("Unknown issuer"), as Worldline maps 30151001 ("No such
+  issuer"). `authentication_required`: 81 ("The non-secured payment is not admitted by the
+  issuer"), the customer authenticating being the way through, as Worldline maps 40001139.
+  All stay non-retryable: PayZen refused the transaction, and a new one is the customer's
+  move. PSP_101, a refund the issuer refused, reads the same table.
+- **The other codes stay on the default deliberately.** Among them, 13 ("Invalid amount."),
+  31 ("Unknown acquirer company ID") and 60 ("The acceptor of the card must contact the
+  acquirer") state no cause the card or the merchant could act on, as Worldline leaves
+  30131001 and 30311001; 12 ("Invalid transaction"), 19 ("Retry later"), 57, 58, 61 and 63
+  refuse the transaction and stay declines, 19 non-retryable like Paysafe's 3018 and 3020;
+  04 and 07 ("Keep the card", "Keep the card, special conditions") claim no fraud, as
+  Worldline reads its Sips 04 and 07; 17 ("Canceled by the buyer") is a decline, as
+  Worldline's 30171001 is; 82 and 83 revoke recurring payments; and 55, 75 and 80 concern
+  PINs and contactless payments.
+- **Both halves map the table the same way.** The browser adapter keeps its own copy, since
+  it cannot depend on the server package. It marks an ACQ_ or AUTH_ refusal non-retryable
+  whatever its code, as the server adapter does, and reads ACQ_999 and AUTH_999 ("technical
+  error" on both pages) as a retryable `psp_unavailable`, as the server adapter does; the
+  browser adapter had read ACQ_999 as a decline and AUTH_999 as `authentication_required`.
+  Lookups read the maps' own keys only.
+- **Doc-derived only.** No sandbox run has produced any of these codes.

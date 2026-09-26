@@ -1462,12 +1462,33 @@ const ACQUIRER_DECLINE_MAP: Record<string, UnifiedErrorCode> = {
   "38": "expired_card",
   "54": "expired_card",
   "14": "invalid_card_data",
+  "15": "invalid_card_data", // Unknown issuer: the card number names none
   "34": "fraud_suspected", // suspected fraud
   "41": "fraud_suspected", // lost card
   "43": "fraud_suspected", // stolen card
   "59": "fraud_suspected", // suspected fraud
   "1A": "authentication_required", // SCA soft decline
+  "81": "authentication_required", // the issuer does not admit a non-secured payment
+  // The merchant's set-up or the request is at fault, not the card.
+  "03": "invalid_request", // Invalid acceptor
+  "30": "invalid_request", // Format error
+  // The issuer, the network or a server failed or answered too late.
+  "20": "processing_error", // Incorrect response (error on the domain server)
+  "68": "processing_error", // Response not received or received too late
+  "90": "processing_error", // Temporary shutdown
+  "91": "processing_error", // Unable to reach the card issuer
+  "96": "processing_error", // System malfunction
+  "97": "processing_error", // Overall monitoring timeout
+  "98": "processing_error", // Server not available, new network route requested
+  "99": "processing_error", // Initiator domain incident
 };
+
+/** Looks an acquirer code up among the map's own keys only. */
+function acquirerCodeFor(detailedErrorCode: string | null | undefined): UnifiedErrorCode | undefined {
+  return typeof detailedErrorCode === "string" && Object.hasOwn(ACQUIRER_DECLINE_MAP, detailedErrorCode)
+    ? ACQUIRER_DECLINE_MAP[detailedErrorCode]
+    : undefined;
+}
 
 const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
   PSP_042: "insufficient_funds",
@@ -1545,10 +1566,10 @@ export function mapPayZenError(answer: PayZenErrorAnswerLike | undefined, raw: u
   if (errorCode === "ACQ_999" || errorCode === "AUTH_999") {
     code = "psp_unavailable";
   } else if (errorCode.startsWith("ACQ_")) {
-    code = ACQUIRER_DECLINE_MAP[answer?.detailedErrorCode ?? ""] ?? "card_declined";
+    code = acquirerCodeFor(answer?.detailedErrorCode) ?? "card_declined";
   } else if (errorCode === "PSP_101") {
     // Refund refused by the issuer; the acquirer refusal code rides detailedErrorCode.
-    code = ACQUIRER_DECLINE_MAP[answer?.detailedErrorCode ?? ""] ?? "card_declined";
+    code = acquirerCodeFor(answer?.detailedErrorCode) ?? "card_declined";
   } else if (errorCode.startsWith("AUTH_")) {
     code = "authentication_required";
   } else if (errorCode.startsWith("INT_") || errorCode.startsWith("CLIENT_")) {

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isPayFanoutError } from "@payfanout/core";
+import { getUserMessage, isPayFanoutError } from "@payfanout/core";
 import { runClientAdapterConformanceTests } from "@payfanout/conformance";
 import {
   PayZenClientAdapter,
@@ -367,6 +367,7 @@ describe("PayZenClientAdapter confirm", () => {
     expect(result.status).toBe("failed");
     expect(result.clientToken).toBeUndefined(); // confirm-on-client: no token, ever
     expect(result.error?.code).toBe("insufficient_funds");
+    expect(result.error?.retryable).toBe(false);
     expect(result.error?.raw).toBe(response);
     expect(isPayFanoutError(result.error)).toBe(true);
   });
@@ -732,12 +733,39 @@ describe("PayZenClientAdapter error mapping", () => {
       [{ errorCode: "CLIENT_997" }, "invalid_request", false], // formToken from a sister platform's endpoint
       [{ errorCode: "CLIENT_999" }, "psp_unavailable", true],
       [{ errorCode: "PSP_108" }, "session_expired", false], // formToken expiry recovers via a new session
-      [{ errorCode: "ACQ_001", detailedErrorCode: "54" }, "expired_card", false],
+      // Every code in the acquirer map.
+      [{ errorCode: "ACQ_001", detailedErrorCode: "51" }, "insufficient_funds", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "33" }, "expired_card", false],
       [{ errorCode: "ACQ_001", detailedErrorCode: "38" }, "expired_card", false],
-      [{ errorCode: "ACQ_001", detailedErrorCode: "59" }, "fraud_suspected", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "54" }, "expired_card", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "14" }, "invalid_card_data", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "15" }, "invalid_card_data", false],
       [{ errorCode: "ACQ_001", detailedErrorCode: "34" }, "fraud_suspected", false],
       [{ errorCode: "ACQ_001", detailedErrorCode: "41" }, "fraud_suspected", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "43" }, "fraud_suspected", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "59" }, "fraud_suspected", false],
       [{ errorCode: "ACQ_001", detailedErrorCode: "1A" }, "authentication_required", false],
+      // An acquirer refusal is final for its transaction, even when a system failed.
+      [{ errorCode: "ACQ_001", detailedErrorCode: "20" }, "processing_error", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "68" }, "processing_error", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "90" }, "processing_error", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "91" }, "processing_error", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "96" }, "processing_error", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "97" }, "processing_error", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "99" }, "processing_error", false],
+      // Another acquirer's table reads these otherwise: ALMA's 03, Elavon Europe's
+      // 30, 81 and 98, the GICC network's 81 and 98.
+      [{ errorCode: "ACQ_001", detailedErrorCode: "03" }, "card_declined", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "30" }, "card_declined", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "81" }, "card_declined", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "98" }, "card_declined", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "60" }, "card_declined", false], // a referral to the acquirer
+      [{ errorCode: "ACQ_001", detailedErrorCode: "94" }, "card_declined", false], // a duplicate
+      [{ errorCode: "ACQ_001", detailedErrorCode: "13" }, "card_declined", false],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "constructor" }, "card_declined", false],
+      [{ errorCode: "ACQ_999" }, "psp_unavailable", true], // technical error, as the server reads it
+      [{ errorCode: "AUTH_999" }, "psp_unavailable", true],
+      [{ errorCode: "constructor" }, "processing_error", true], // the client map's own keys only
       [{ errorCode: "AUTH_149" }, "authentication_required", false],
       [{ errorCode: "SOMETHING_ELSE" }, "processing_error", true], // shopper may safely retry
       [{}, "processing_error", true],
@@ -758,7 +786,26 @@ describe("PayZenClientAdapter error mapping", () => {
     fake.submitCb?.({
       clientAnswer: { orderStatus: "UNPAID", transactions: [{ uuid: "u1", errorCode: "AUTH_149" }] },
     });
-    expect((await pending).error?.code).toBe("authentication_required");
+    expect((await pending).error).toMatchObject({ code: "authentication_required", retryable: false });
+  });
+
+  it("reads an UNPAID order's last transaction, not its first", async () => {
+    stubBrowser();
+    const fake = makeFakeKr();
+    const { adapter } = makeAdapter(fake);
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: FORM_TOKEN });
+    const pending = adapter.confirm(handle);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fake.submitCb?.({
+      clientAnswer: {
+        orderStatus: "UNPAID",
+        transactions: [
+          { uuid: "u1", errorCode: "ACQ_001", detailedErrorCode: "51" },
+          { uuid: "u2", errorCode: "ACQ_001", detailedErrorCode: "33" },
+        ],
+      },
+    });
+    expect((await pending).error).toMatchObject({ code: "expired_card", retryable: false });
   });
 
   it("reports a bare card_declined when an UNPAID answer carries no transaction detail", async () => {
@@ -769,7 +816,100 @@ describe("PayZenClientAdapter error mapping", () => {
     const pending = adapter.confirm(handle);
     await new Promise((resolve) => setTimeout(resolve, 0));
     fake.submitCb?.({ clientAnswer: { orderStatus: "UNPAID" } });
-    expect((await pending).error?.code).toBe("card_declined");
+    expect((await pending).error).toMatchObject({ code: "card_declined", retryable: false });
+  });
+
+  it("reads an UNPAID answer's technical error as a retryable psp_unavailable, on submit and return", async () => {
+    for (const errorCode of ["ACQ_999", "AUTH_999"]) {
+      const clientAnswer = { orderStatus: "UNPAID", transactions: [{ uuid: "u1", errorCode }] };
+      stubBrowser();
+      const fake = makeFakeKr();
+      const { adapter } = makeAdapter(fake);
+      const handle = await adapter.mount(fakeContainer(), { clientSecret: FORM_TOKEN });
+      const pending = adapter.confirm(handle);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      fake.submitCb?.({ clientAnswer });
+      const submitted = await pending;
+      expect(submitted.status, errorCode).toBe("failed");
+      expect(submitted.error, errorCode).toMatchObject({ code: "psp_unavailable", retryable: true });
+
+      const returned = await adapter.handleRedirectReturn({
+        search: `?kr-answer=${encodeURIComponent(JSON.stringify(clientAnswer))}`,
+      });
+      expect(returned?.status, errorCode).toBe("failed");
+      expect(returned?.error, errorCode).toMatchObject({ code: "psp_unavailable", retryable: true });
+    }
+  });
+
+  it("words acquirer and authentication answers with core's catalog, the form's own errors with its texts", async () => {
+    stubBrowser();
+    const fake = makeFakeKr();
+    const { adapter } = makeAdapter(fake);
+    const messages: string[] = [];
+    const handle = await adapter.mount(fakeContainer(), {
+      clientSecret: FORM_TOKEN,
+      onError: (e) => messages.push(e.message),
+    });
+    const answers: Array<[KrErrorLike, string]> = [
+      [{ errorCode: "ACQ_001", detailedErrorCode: "91" }, getUserMessage("processing_error")],
+      [{ errorCode: "ACQ_001", detailedErrorCode: "51" }, getUserMessage("insufficient_funds")],
+      [{ errorCode: "AUTH_149" }, getUserMessage("authentication_required")],
+      [{ errorCode: "ACQ_999" }, getUserMessage("psp_unavailable")],
+      [{ errorCode: "CLIENT_100" }, "The payment form could not be set up."],
+      [{ errorCode: "CLIENT_101" }, "Additional authentication is required."],
+      [{ errorCode: "SOMETHING_ELSE" }, getUserMessage("processing_error")],
+    ];
+    for (const [krError, message] of answers) {
+      fake.errorCb?.(krError);
+      expect(messages.at(-1), JSON.stringify(krError)).toBe(message);
+    }
+
+    const pending = adapter.confirm(handle);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fake.submitCb?.({
+      clientAnswer: {
+        orderStatus: "UNPAID",
+        transactions: [{ uuid: "u1", errorCode: "ACQ_001", detailedErrorCode: "68" }],
+      },
+    });
+    expect((await pending).error?.message).toBe(getUserMessage("processing_error"));
+  });
+});
+
+describe("PayZenClientAdapter browser support", () => {
+  it("uses none of the built-ins the browsers krypton-client supports lack", async () => {
+    // Static guard: a host's bundler lowers syntax for older browsers but adds no
+    // missing built-in, and the ES2022 lib accepts these. PayZen supports Chrome
+    // from 70, Firefox from 64 and Safari from 11; ES2019 and later built-ins are
+    // missing from some of them.
+    const { readdir, readFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const srcDir = fileURLToPath(new URL("../src", import.meta.url));
+    const newer = [
+      /\bObject\.fromEntries\b/,
+      /\.matchAll\(/,
+      /\.flat(?:Map)?\(/,
+      /\.trim(?:Start|End)\(/,
+      /\bglobalThis\b/,
+      /\bPromise\.allSettled\b/,
+      /\bBigInt\b/,
+      /\bObject\.hasOwn\b/,
+      /\.at\(/,
+      /\.replaceAll\(/,
+      /\.findLast(?:Index)?\(/,
+      /\bstructuredClone\b/,
+      /\bPromise\.any\b/,
+      /\bWeakRef\b/,
+      /\bAggregateError\b/,
+      /\bFinalizationRegistry\b/,
+    ];
+    const offenders: string[] = [];
+    for (const file of await readdir(srcDir)) {
+      const content = await readFile(join(srcDir, file), "utf8");
+      for (const builtIn of newer) if (builtIn.test(content)) offenders.push(`${file}: ${builtIn.source}`);
+    }
+    expect(offenders).toEqual([]);
   });
 });
 

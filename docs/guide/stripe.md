@@ -209,6 +209,9 @@ In test mode, use Stripe's test cards with any future expiry, any CVC, and any p
 | `4242 4242 4242 4242` | Success |
 | `4000 0000 0000 0002` | Declined (`card_declined`) |
 | `4000 0000 0000 9995` | Declined (`insufficient_funds`) |
+| `4000 0000 0000 9979` | Declined, card reported stolen (`fraud_suspected`) |
+| `4000 0000 0000 0127` | Incorrect CVC (`invalid_card_data`) |
+| `4000 0000 0000 0069` | Expired card (`expired_card`) |
 | `4000 0025 0000 3155` | Requires authentication (3DS challenge, inline) |
 
 The full matrix (per-brand, per-decline-code, wallet, and dispute-trigger cards) is at

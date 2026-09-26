@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { getUserMessage } from "@payfanout/core";
 import { StripeClientAdapter, type StripeJsFactory, type StripeJsLike } from "../src/index.js";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -172,6 +173,137 @@ describe("StripeClientAdapter edge cases", () => {
     const eResult = await exotic.confirm(eHandle);
     expect(eResult.error?.code).toBe("unknown");
     expect(eResult.status).toBe("failed");
+  });
+
+  it("classifies Stripe.js errors in the server adapter's order", async () => {
+    stubBrowser();
+    const confirmWith = async (error: Record<string, string>) => {
+      const adapter = new StripeClientAdapter({
+        publishableKey: "pk",
+        environment: "sandbox",
+        getStripeGlobal: () => () => ({
+          elements: () => ({ create: () => ({ mount: () => {}, unmount: () => {}, destroy: () => {}, on: () => {} }) }),
+          confirmPayment: async () => ({ error }),
+          confirmSetup: async () => ({ error }),
+          retrievePaymentIntent: async () => ({ error }),
+          retrieveSetupIntent: async () => ({ error }),
+        }),
+        loadScript: async () => {},
+      });
+      return (await adapter.confirm(await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret" }))).error;
+    };
+    const cases: Array<[Record<string, string>, string, boolean]> = [
+      // 2026-08-26.dahlia's payment-method spellings, and the region-specific incorrect_zip.
+      [{ type: "card_error", code: "expired_payment_method" }, "expired_card", false],
+      [{ type: "card_error", code: "incorrect_postal_code" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "incorrect_zip" }, "invalid_card_data", false],
+      // Fraud decline codes, over a failed authentication on the same error as on the server.
+      [{ type: "card_error", code: "card_declined", decline_code: "fraudulent" }, "fraud_suspected", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "stolen_card" }, "fraud_suspected", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "lost_card" }, "fraud_suspected", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "merchant_blacklist" }, "fraud_suspected", false],
+      [{ type: "card_error", code: "authentication_failure", decline_code: "stolen_card" }, "fraud_suspected", false],
+      // Card details the customer can correct come first, as on the server.
+      [{ type: "card_error", code: "incorrect_cvc", decline_code: "fraudulent" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "incorrect_cvc" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "expired_card" }, "expired_card", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "processing_error" }, "processing_error", true],
+      [{ type: "card_error", code: "card_declined", decline_code: "insufficient_funds" }, "insufficient_funds", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "lost_or_stolen_card" }, "fraud_suspected", false],
+      // A required authentication, read from either code, comes before a fraud decline code.
+      [{ type: "card_error", code: "authentication_required", decline_code: "fraudulent" }, "authentication_required", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "authentication_required" }, "authentication_required", false],
+      // The intent-specific failed authentications that accounts before dahlia still receive.
+      [{ type: "card_error", code: "payment_intent_authentication_failure" }, "authentication_required", false],
+      [{ type: "card_error", code: "setup_intent_authentication_failure" }, "authentication_required", false],
+      [{ type: "card_error", code: "processing_error" }, "processing_error", true],
+      // The card-detail codes, whether Stripe returns them as error codes or decline codes.
+      [{ type: "card_error", code: "incorrect_number" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "invalid_number" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "invalid_cvc" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "invalid_expiry_month" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "invalid_expiry_year" }, "invalid_card_data", false],
+      // Every Stripe.js field code, as the other card-detail codes.
+      [{ type: "validation_error", code: "incomplete_number" }, "invalid_card_data", false],
+      [{ type: "validation_error", code: "incomplete_cvc" }, "invalid_card_data", false],
+      [{ type: "validation_error", code: "incomplete_expiry" }, "invalid_card_data", false],
+      // Only the lists' own entries count.
+      [{ type: "card_error", code: "card_declined", decline_code: "constructor" }, "card_declined", false],
+      [{ type: "api_error", code: "constructor" }, "unknown", false],
+    ];
+    for (const [error, code, retryable] of cases) {
+      expect(await confirmWith(error), JSON.stringify(error)).toMatchObject({ code, retryable });
+    }
+    vi.stubGlobal("navigator", { language: "es-ES" });
+    const fraud = await confirmWith({ type: "card_error", code: "card_declined", decline_code: "stolen_card", message: "Card reported stolen." });
+    expect(fraud?.message).toBe(getUserMessage("fraud_suspected", "es"));
+    // Every other message is Stripe.js's own, which it localizes.
+    const funds = await confirmWith({ type: "card_error", code: "card_declined", decline_code: "insufficient_funds", message: "Fonds insuffisants." });
+    expect(funds?.message).toBe("Fonds insuffisants.");
+  });
+
+  it("writes the generic fraud message in the browser's locale under \"auto\", without one, or with an empty one", async () => {
+    stubBrowser();
+    vi.stubGlobal("navigator", { language: "es-ES" });
+    const stolen = { type: "card_error", code: "card_declined", decline_code: "stolen_card", message: "Card reported stolen." };
+    const factory = () => ({
+      elements: () => ({ create: () => ({ mount: () => {}, unmount: () => {}, destroy: () => {}, on: () => {} }) }),
+      confirmPayment: async () => ({ error: stolen }),
+      confirmSetup: async () => ({ error: stolen }),
+      retrievePaymentIntent: async () => ({ error: stolen }),
+      retrieveSetupIntent: async () => ({ error: stolen }),
+    });
+    const spanish = getUserMessage("fraud_suspected", "es");
+    expect(spanish).not.toBe(getUserMessage("fraud_suspected", "en"));
+    for (const locale of ["auto", undefined, ""]) {
+      const adapter = new StripeClientAdapter({
+        publishableKey: "pk",
+        environment: "sandbox",
+        ...(locale === undefined ? {} : { locale }),
+        getStripeGlobal: () => factory,
+        loadScript: async () => {},
+      });
+      const confirmed = await adapter.confirm(await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret" }));
+      expect(confirmed.error?.message, String(locale)).toBe(spanish);
+      const returned = await adapter.handleRedirectReturn({ search: "?payment_intent_client_secret=pi_1_secret" });
+      expect(returned?.error?.message, String(locale)).toBe(spanish);
+    }
+    vi.stubGlobal("navigator", undefined);
+    const noBrowserLocale = new StripeClientAdapter({
+      publishableKey: "pk",
+      environment: "sandbox",
+      getStripeGlobal: () => factory,
+      loadScript: async () => {},
+    });
+    const english = await noBrowserLocale.confirm(await noBrowserLocale.mount({} as HTMLElement, { clientSecret: "pi_1_secret" }));
+    expect(english.error?.message).toBe(getUserMessage("fraud_suspected", "en"));
+  });
+
+  it("writes the generic fraud message in the locale Stripe.js was given", async () => {
+    stubBrowser();
+    vi.stubGlobal("navigator", { language: "es-ES" });
+    const stolen = { type: "card_error", code: "card_declined", decline_code: "stolen_card", message: "Card reported stolen." };
+    const factory = () => ({
+      elements: () => ({ create: () => ({ mount: () => {}, unmount: () => {}, destroy: () => {}, on: () => {} }) }),
+      confirmPayment: async () => ({ error: stolen }),
+      confirmSetup: async () => ({ error: stolen }),
+      retrievePaymentIntent: async () => ({ error: stolen }),
+      retrieveSetupIntent: async () => ({ error: stolen }),
+    });
+    const adapter = new StripeClientAdapter({
+      publishableKey: "pk",
+      environment: "sandbox",
+      locale: "de",
+      getStripeGlobal: () => factory,
+      loadScript: async () => {},
+    });
+    const configured = await adapter.confirm(await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret" }));
+    expect(configured.error?.message).toBe(getUserMessage("fraud_suspected", "de"));
+    expect(configured.error?.message).not.toBe(getUserMessage("fraud_suspected", "en"));
+    const perMount = await adapter.confirm(await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret", locale: "fr" }));
+    expect(perMount.error?.message).toBe(getUserMessage("fraud_suspected", "fr"));
+    const returned = await adapter.handleRedirectReturn({ search: "?payment_intent_client_secret=pi_1_secret" });
+    expect(returned?.error?.message).toBe(getUserMessage("fraud_suspected", "de"));
   });
 
   it("streams field-state changes through onChange, initialized to incomplete", async () => {

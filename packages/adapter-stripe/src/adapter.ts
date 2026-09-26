@@ -1,6 +1,7 @@
 import {
   assertBrowser,
   brandMountedFieldsHandle,
+  getUserMessage,
   injectScript,
   isValidCspNonce,
   PayFanoutError,
@@ -103,6 +104,8 @@ interface StripeHandle {
   elements: StripeJsElementsLike;
   element: StripeJsElementLike;
   clientSecret: string;
+  /** The locale Stripe.js was given for this mount, if any. */
+  locale: string | undefined;
 }
 
 export class StripeClientAdapter implements ClientPaymentAdapter {
@@ -169,7 +172,7 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
     // through untouched so future SDK options need no library release.
     const element = elements.create("payment", options.fieldOptions);
     element.on("ready", () => options.onReady?.());
-    element.on("loaderror", (payload) => options.onError?.(mapStripeJsError(payload?.error)));
+    element.on("loaderror", (payload) => options.onError?.(mapStripeJsError(payload?.error, locale)));
     // Field-state stream: hosts disable Pay until complete. Initialized false
     // so button state is deterministic before the customer types anything.
     options.onChange?.({ complete: false });
@@ -180,7 +183,7 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
       }),
     );
     element.mount(container);
-    const handle: StripeHandle = { pspName: "stripe", stripe, elements, element, clientSecret: options.clientSecret };
+    const handle: StripeHandle = { pspName: "stripe", stripe, elements, element, clientSecret: options.clientSecret, locale };
     return brandMountedFieldsHandle(handle);
   }
 
@@ -199,7 +202,7 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
     const isSetup = h.clientSecret.startsWith("seti_");
     const result = isSetup ? await h.stripe.confirmSetup(params) : await h.stripe.confirmPayment(params);
     if (result.error) {
-      return { status: "failed", error: mapStripeJsError(result.error) };
+      return { status: "failed", error: mapStripeJsError(result.error, h.locale) };
     }
     const status = (result.paymentIntent ?? result.setupIntent)?.status;
     return { status: toUnifiedStatus(status) };
@@ -240,11 +243,11 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
       ? await stripe.retrievePaymentIntent(piSecret)
       : await stripe.retrieveSetupIntent(setiSecret!);
     if (result.error) {
-      return { status: "failed", error: mapStripeJsError(result.error) };
+      return { status: "failed", error: mapStripeJsError(result.error, this.config.locale) };
     }
     const status = (result.paymentIntent ?? result.setupIntent)?.status;
     if (!status) {
-      return { status: "failed", error: mapStripeJsError(undefined) };
+      return { status: "failed", error: mapStripeJsError(undefined, this.config.locale) };
     }
     return { status: toUnifiedStatus(status) };
   }
@@ -315,34 +318,76 @@ function toUnifiedStatus(status: string | undefined): UnifiedPaymentStatus {
   }
 }
 
-const CLIENT_CODE_MAP: Record<string, UnifiedErrorCode> = {
-  insufficient_funds: "insufficient_funds",
-  expired_card: "expired_card",
-  incorrect_number: "invalid_card_data",
-  invalid_number: "invalid_card_data",
-  incorrect_cvc: "invalid_card_data",
-  invalid_cvc: "invalid_card_data",
-  invalid_expiry_month: "invalid_card_data",
-  invalid_expiry_year: "invalid_card_data",
-  incomplete_number: "invalid_card_data",
-  incomplete_cvc: "invalid_card_data",
-  incomplete_expiry: "invalid_card_data",
-  authentication_required: "authentication_required",
-  payment_intent_authentication_failure: "authentication_required",
-  setup_intent_authentication_failure: "authentication_required",
-  authentication_failure: "authentication_required",
-  processing_error: "processing_error",
-  card_declined: "card_declined",
-};
+/** Card details the customer can correct, as error codes or as the issuer's decline codes. */
+const INVALID_CARD_DATA_CODES = new Set([
+  "incorrect_number",
+  "invalid_number",
+  "incorrect_cvc",
+  "invalid_cvc",
+  "invalid_expiry_month",
+  "invalid_expiry_year",
+  "incorrect_zip",
+  "incorrect_postal_code",
+  // Stripe.js refuses incomplete fields before anything is sent.
+  "incomplete_number",
+  "incomplete_cvc",
+  "incomplete_expiry",
+]);
 
-function mapStripeJsError(error: StripeJsErrorLike | undefined): UnifiedError {
-  const code =
-    (error?.decline_code ? CLIENT_CODE_MAP[error.decline_code] : undefined) ??
-    (error?.code ? CLIENT_CODE_MAP[error.code] : undefined) ??
-    (error?.type === "card_error" || error?.type === "validation_error" ? "card_declined" : "unknown");
+/** Decline codes Stripe asks to present as a generic decline; the last is a local payment method's. */
+const FRAUD_DECLINE_CODES = new Set(["fraudulent", "stolen_card", "lost_card", "merchant_blacklist", "lost_or_stolen_card"]);
+
+/** A failed 3-D Secure: the general code 2026-08-26.dahlia added and the intent-specific forms before it. */
+const AUTHENTICATION_FAILURE_CODES = new Set([
+  "authentication_failure",
+  "payment_intent_authentication_failure",
+  "setup_intent_authentication_failure",
+]);
+
+/**
+ * In the server adapter's order, so a decline maps the same way whichever half
+ * reports it. The issuer's decline code counts like the error code wherever
+ * Stripe uses the same word for both.
+ */
+function classifyStripeJsError(error: StripeJsErrorLike | undefined): UnifiedErrorCode {
+  const code = error?.code;
+  const decline = error?.decline_code;
+  const either = (test: (value: string) => boolean) =>
+    (code !== undefined && test(code)) || (decline !== undefined && test(decline));
+  if (either((value) => value === "insufficient_funds")) return "insufficient_funds";
+  if (code === "expired_payment_method" || either((value) => value === "expired_card")) return "expired_card";
+  if (either((value) => INVALID_CARD_DATA_CODES.has(value))) return "invalid_card_data";
+  if (either((value) => value === "authentication_required")) return "authentication_required";
+  if (decline !== undefined && FRAUD_DECLINE_CODES.has(decline)) return "fraud_suspected";
+  if (code !== undefined && AUTHENTICATION_FAILURE_CODES.has(code)) return "authentication_required";
+  if (either((value) => value === "processing_error")) return "processing_error";
+  if (code === "card_declined" || error?.type === "card_error" || error?.type === "validation_error") {
+    return "card_declined";
+  }
+  return "unknown";
+}
+
+/**
+ * The locale a message for the customer is in: Stripe.js's own, which is the
+ * browser's under "auto" or when none was given.
+ */
+function customerLocale(locale: string | undefined): string | undefined {
+  // An empty locale gives Stripe.js none, so it detects the browser's, as under "auto".
+  if (locale && locale !== "auto") return locale;
+  return typeof navigator === "undefined" ? undefined : navigator.language;
+}
+
+function mapStripeJsError(error: StripeJsErrorLike | undefined, locale: string | undefined): UnifiedError {
+  const code = classifyStripeJsError(error);
   return new PayFanoutError({
     code,
-    message: error?.message ?? "Payment failed.",
+    // Stripe asks never to tell the customer more than a generic decline for
+    // these; core's catalog message follows the customer's locale where core or
+    // the host has one, and English otherwise.
+    message:
+      code === "fraud_suspected"
+        ? getUserMessage("fraud_suspected", customerLocale(locale))
+        : (error?.message ?? "Payment failed."),
     // authentication_required is resolved on-session (a 3DS challenge), never by replay.
     retryable: code === "processing_error",
     raw: error,

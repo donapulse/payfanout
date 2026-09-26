@@ -176,7 +176,10 @@ connect-src https://hosted.paysafe.com https://hosted.test.paysafe.com
 ```
 
 The `.test` hosts are exercised only by `environment: "sandbox"` and are harmless
-to allow in a production CSP (or gate them per environment). Override the script
+to allow in a production CSP (or gate them per environment). Paysafe.js also adds
+`<style>` elements of its own, for its 3-D Secure overlay among others, so a
+`style-src` that restricts styles needs `'unsafe-inline'`; Paysafe publishes no CSP
+guidance. Override the script
 URL with the `sdkUrl` config field to pin a version or self-host.
 
 **Nonce-based policies.** Pass the nonce your server put in the page's policy as

@@ -139,10 +139,23 @@ const payzen = new PayZenClientAdapter({
   changes there, so read it before adding `form: "smartform"`.
 
 ::: tip Content-Security-Policy
-krypton-client loads from `https://static.payzen.eu` — if you set a CSP, allow it under
-`script-src`/`style-src`, plus a `frame-src` entry for the hosted-field/3DS iframe hosts
-your form actually uses (watch the console in TEST mode; hosts vary per platform).
-Override the URLs via `scriptUrl` / `cssUrl` (your Back Office "JavaScript URL").
+PayZen's CSP guidance for the JavaScript client lists three directives:
+
+```
+script-src  https://static.payzen.eu
+frame-src   https://static.payzen.eu
+connect-src https://static.payzen.eu
+```
+
+with the same three for `https://secure.payzen.eu` when you use an external fraud
+detection engine (monitor+, ClearSale, …). The adapter also loads the theme stylesheet
+from `https://static.payzen.eu`, so allow it under `style-src` too. That stylesheet
+imports its fonts from Google Fonts (`style-src https://fonts.googleapis.com`,
+`font-src https://fonts.gstatic.com`), and krypton-client adds an inline `<style>`
+element, so `style-src` also needs `'unsafe-inline'`. If you override the URLs with
+`scriptUrl` / `cssUrl` (your Back Office "JavaScript URL"), allow those hosts instead.
+The onboarding descriptor (`payzenOnboarding.csp`) also lists `https://api.payzen.eu`
+under `connect`: the served krypton-client names that host, and PayZen's list does not.
 
 **Nonce-based policies.** Pass the nonce your server put in the page's policy as
 `cspNonce` (the adapter never reads one from the page), and the adapter sets it as the

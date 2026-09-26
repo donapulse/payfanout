@@ -130,17 +130,23 @@ const stripe = new StripeClientAdapter({
 
 ::: tip Content-Security-Policy
 Stripe.js loads from `https://js.stripe.com/v3` and renders card fields, 3DS, and
-redirect challenges in iframes. A CSP-enforcing page needs:
+redirect challenges in iframes. Stripe's security guide lists these sources for
+Stripe.js, and for Link, which the Payment Element offers when your account enables it:
 
 ```
-script-src  https://js.stripe.com
-frame-src   https://js.stripe.com https://hooks.stripe.com
-connect-src https://api.stripe.com
+script-src  https://js.stripe.com https://*.js.stripe.com
+frame-src   https://js.stripe.com https://*.js.stripe.com https://hooks.stripe.com
+            https://link.com https://*.link.com
+connect-src https://api.stripe.com https://link.com https://*.link.com
+img-src     https://*.link.com
 ```
 
-Stripe's fraud signals (Radar) additionally load `https://m.stripe.network` — allow
-it under `frame-src`/`script-src` if you rely on them. Pin or self-host the script
-via the `sdkUrl` config field if you must.
+`https://*.js.stripe.com` lets Stripe.js start its frames on other origins to load faster.
+The guide also lists `https://maps.googleapis.com`, needed only with the Address Element
+and your own Google Maps key; this adapter mounts the Payment Element alone. Stripe.js
+must load from `https://js.stripe.com`: Stripe asks never to bundle or self-host it, and
+the script refuses to run from another origin. The `sdkUrl` config field only points the
+adapter at another `https://js.stripe.com` URL, such as a versioned build.
 
 **Nonce-based policies.** Pass the nonce your server put in the page's policy as
 `cspNonce` (the adapter never reads one from the page), and the adapter sets it as the

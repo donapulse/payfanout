@@ -1,5 +1,16 @@
 # @payfanout/adapter-paypal
 
+## 0.3.0
+
+### Minor Changes
+
+- e856737: Add a `cspNonce` option for pages with a nonce-based Content-Security-Policy: the adapter sets it as both the `nonce` and the `data-csp-nonce` attribute of the PayPal JS SDK `<script>` it injects, as PayPal's nonce-based policy requires, and the SDK applies it to the inline scripts and styles it creates. The constructor rejects a malformed nonce with `invalid_request`.
+
+### Patch Changes
+
+- Updated dependencies [e856737]
+  - @payfanout/core@4.3.0
+
 ## 0.2.11
 
 ### Patch Changes

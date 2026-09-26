@@ -1,5 +1,16 @@
 # @payfanout/adapter-stripe
 
+## 0.3.0
+
+### Minor Changes
+
+- e856737: Add a `cspNonce` option for pages with a nonce-based Content-Security-Policy: the adapter sets it as the `nonce` attribute of the Stripe.js `<script>` it injects, and the constructor rejects a malformed nonce with `invalid_request`. The Stripe guide lists what Stripe.js still loads without a nonce.
+
+### Patch Changes
+
+- Updated dependencies [e856737]
+  - @payfanout/core@4.3.0
+
 ## 0.2.7
 
 ### Patch Changes

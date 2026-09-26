@@ -145,11 +145,29 @@ img-src     *.paypal.com *.paypalobjects.com *.venmo.com data:
 
 PayPal calls a nonce safer than `'unsafe-inline'`: it replaces `'unsafe-inline'` with
 `'nonce-<value>'` in `script-src` and `style-src` and puts the same value in the SDK tag's
-`nonce` and `data-csp-nonce` attributes. The adapter's script loader sets neither, so use
-the `'unsafe-inline'` policy above with the adapter as shipped. PayPal also recommends
+`nonce` and `data-csp-nonce` attributes. Pass that value as `cspNonce` and the adapter sets
+both attributes on the tag it injects. PayPal also recommends
 `Cross-Origin-Opener-Policy: same-origin-allow-popups` on a page running the SDK. The
 onboarding descriptor (`paypalOnboarding.csp`) lists these hosts under `script`, `frame`
 and `connect`; `style-src`, `child-src` and `img-src` have no descriptor field.
+
+**Nonce-based policies.** The adapter never reads a nonce from the page: pass the one your
+server put in the page's policy. Under PayPal's policy the hosts in `script-src` already
+allow the SDK tag, as `'strict-dynamic'` would, since the adapter creates it, so the tag's
+`nonce` matters only for a `script-src` that allows scripts by nonce alone. What changes the
+outcome is `data-csp-nonce`: the SDK reads only that attribute and sets its value on the
+inline scripts and styles it creates, which PayPal's policy blocks otherwise. That
+attribute also puts the nonce back within reach of CSS attribute selectors: under a
+header-delivered policy a browser hides a connected element's `nonce` attribute from them,
+but not a `data-` one. PayPal requires it, so the adapter sets it on PayPal's tag alone.
+Keep PayPal's hosts in `script-src`: some of the SDK's own loads, such as the Messages
+modal's `modal.js`, carry no nonce. Write the source quoted, `'nonce-<value>'`: PayPal's
+examples leave the quotes out, and a browser does not read that form as a nonce. An SDK the
+page loaded itself is used as it is, so give its tag both attributes yourself. PayPal's
+nonce policy puts the nonce in `style-src`, which turns `'unsafe-inline'` off there: on a
+page that can mount other PSPs as well, read
+[Content-Security-Policy on a page with several PSPs](/guide/providers#content-security-policy-on-a-page-with-several-psps)
+first.
 :::
 
 ## 6. The two-step UX: PayPal button approves, your Pay button pays

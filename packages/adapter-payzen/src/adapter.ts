@@ -2,6 +2,9 @@ import {
   assertBrowser,
   brandMountedFieldsHandle,
   getUserMessage,
+  injectScript,
+  injectStylesheet,
+  isValidCspNonce,
   PayFanoutError,
   type ClientPaymentAdapter,
   type ConfirmResult,
@@ -99,7 +102,11 @@ export interface PayZenClientAdapterConfig {
   environment: "sandbox" | "live";
   /** krypton-client script URL — per-shop config in the Back Office, not a constant. */
   scriptUrl?: string;
-  /** Theme stylesheet URL; defaults to the neon reset (unthemed, host CSS styles the fields). */
+  /**
+   * Theme stylesheet URL; defaults to the neon reset (unthemed, host CSS styles
+   * the fields). Injected once the script has loaded, and never awaited. An
+   * empty string loads no theme stylesheet, which PayZen documents as optional.
+   */
   cssUrl?: string;
   /**
    * Form to render on mount — see PayZenFormMode. Default "embedded"
@@ -113,7 +120,24 @@ export interface PayZenClientAdapterConfig {
    */
   paymentMethods?: PaymentMethodCapability[];
   /**
-   * Test seam: full asset injection (stylesheet + script) override. Called again
+   * A Content-Security-Policy nonce for the two tags the adapter injects, the
+   * krypton-client `<script>` and, once it has loaded, the theme stylesheet
+   * `<link>`, set as their `nonce` attribute before insertion, so a
+   * `script-src` or `style-src` that allows them by nonce alone loads them.
+   * krypton-client reads no nonce itself. It adds scripts to the page without
+   * one: its `kr-asset-*` chunks, Apple's Apple Pay SDK when the smartForm
+   * offers Apple Pay with production keys (test keys show a simulator and load
+   * no Apple script), and a risk-analysis script when the form token names
+   * one. The theme stylesheet's Google Fonts `@import`s carry none either, nor
+   * does the `kr-base-styles` `<style>` it adds when a form mounts, which a
+   * nonce in `style-src` therefore blocks. Pass the value alone, as in the
+   * policy's `'nonce-<value>'` source; the constructor refuses anything else.
+   * The adapter never reads a nonce from the page, and a `loadScript` seam
+   * loads both files without it.
+   */
+  cspNonce?: string;
+  /**
+   * Test seam: full asset injection (script + stylesheet) override. Called again
    * by the next loadSdk() after an attempt that rejects or leaves the KR global
    * missing, so it must be safe to call more than once.
    */
@@ -232,13 +256,18 @@ export class PayZenClientAdapter implements ClientPaymentAdapter {
         'PayZenClientAdapter: environment is "live" but config.publicKey is a test key',
       );
     }
+    if (config.cspNonce !== undefined && !isValidCspNonce(config.cspNonce)) {
+      throw PayFanoutError.invalidRequest(
+        "PayZenClientAdapter config.cspNonce must be the value of the policy's 'nonce-…' source: base64 or base64url characters",
+      );
+    }
     this.config = config;
   }
 
   async loadSdk(): Promise<void> {
     assertBrowser("PayZenClientAdapter", "loadSdk");
     if (this.kr()) return;
-    this.sdkPromise ??= (this.config.loadScript ?? injectKrAssets(this.config.publicKey))(
+    this.sdkPromise ??= (this.config.loadScript ?? injectKrAssets(this.config.publicKey, this.config.cspNonce))(
       this.config.scriptUrl ?? KR_SCRIPT_URL,
       this.config.cssUrl ?? KR_CSS_URL,
     );
@@ -753,51 +782,34 @@ function asRedirectHandle(handle: MountedFieldsHandle): PayZenRedirectHandle | u
 }
 
 /**
- * Default asset injection: the theme stylesheet plus the krypton script.
- * Idempotent per page via DOM lookup — KR is a single global, so a second
- * adapter instance reuses the same script element, resolving at once even while
- * that script is still loading; loadSdk() then confirms the KR global. A script
- * this loader injected is removed when it fails to load, so a later call
- * injects a fresh one; the stylesheet link is kept. The script deliberately
- * sets async = false (dynamically injected scripts default to async, and
- * PayZen documents that async loading breaks on older mobile browsers);
- * kr-spa-mode keeps the library from auto-scanning the DOM before mount().
+ * Default asset injection: the krypton script, then the theme stylesheet once
+ * the script has loaded, since PayZen requires theme files to load after the
+ * library. Both go through core's injectScript and injectStylesheet, one tag
+ * each per page: KR is a single global, so a second adapter instance reuses the
+ * script another one injected, waiting for it while it loads and failing with
+ * it, and loadSdk() then confirms the KR global. A script that fails to load is
+ * removed, so a later call fetches it again, and the stylesheet waits for that
+ * later load. The returned promise settles with the script: the stylesheet is
+ * injected without being awaited, and an empty cssUrl injects none. The script
+ * carries kr-public-key and kr-spa-mode, the latter keeping the library from
+ * scanning the DOM before mount(), and loads with async = false, a
+ * conservative choice: dynamically injected scripts are async by default, and
+ * PayZen's current pages do not mention async loading.
  */
-function injectKrAssets(publicKey: string): (scriptUrl: string, cssUrl: string) => Promise<void> {
-  return (scriptUrl, cssUrl) =>
-    new Promise((resolve, reject) => {
-      if (!document.querySelector(`link[href="${cssUrl}"]`)) {
-        const link = document.createElement("link");
-        link.rel = "stylesheet";
-        link.href = cssUrl;
-        document.head.appendChild(link);
-      }
-      const existing = document.querySelector(`script[src="${scriptUrl}"]`);
-      if (existing) {
-        resolve();
-        return;
-      }
-      const script = document.createElement("script");
-      script.src = scriptUrl;
-      script.async = false;
-      script.setAttribute("kr-public-key", publicKey);
-      script.setAttribute("kr-spa-mode", "true");
-      script.onload = () => resolve();
-      script.onerror = () => {
-        reject(
-          new PayFanoutError({
-            code: "psp_unavailable",
-            message: `Failed to load ${scriptUrl}`,
-            retryable: true,
-            raw: undefined,
-            pspName: "payzen",
-          }),
-        );
-        // A failed tag must not satisfy the next lookup, or a retry would resolve
-        // from it without fetching the library again. Element doubles without
-        // remove() must not make this handler throw.
-        if (typeof script.remove === "function") script.remove();
-      };
-      document.head.appendChild(script);
+function injectKrAssets(
+  publicKey: string,
+  nonce: string | undefined,
+): (scriptUrl: string, cssUrl: string) => Promise<void> {
+  return async (scriptUrl, cssUrl) => {
+    await injectScript(scriptUrl, "payzen", {
+      nonce,
+      attributes: { "kr-public-key": publicKey, "kr-spa-mode": "true" },
+      async: false,
     });
+    // Not awaited: a link fires load only once its @imports have loaded, and the
+    // default theme imports Google Fonts, so a slow or blocked font host would
+    // hold up the first mount on each page load. A stylesheet that cannot be
+    // injected only leaves the form unstyled.
+    void injectStylesheet(cssUrl, "payzen", { nonce }).catch(() => undefined);
+  };
 }

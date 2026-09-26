@@ -6,7 +6,12 @@ import {
   type PaymentInfo,
   type UnifiedErrorCode,
 } from "@payfanout/core";
-import { deriveIdempotenceKey, WorldlineServerAdapter, type WorldlineServerAdapterConfig } from "../src/index.js";
+import {
+  deriveIdempotenceKey,
+  WorldlineServerAdapter,
+  type WorldlinePaymentLike,
+  type WorldlineServerAdapterConfig,
+} from "../src/index.js";
 import { FakeWorldlineApi } from "./fake-worldline-api.js";
 
 const HOST_KEY = "complete-order-42";
@@ -114,6 +119,72 @@ function interceptingFetch(fake: FakeWorldlineApi) {
     },
   };
 }
+
+/** How one CreatePayment runs, given the request to the fake. */
+type CreatePaymentStep = (send: () => Promise<Response>) => Promise<Response>;
+
+/** Processed, then the connection fails before the answer arrives. */
+const loseAnswer: CreatePaymentStep = async (send) => {
+  await send();
+  throw new TypeError("simulated connection reset after the request was processed");
+};
+
+const relay: CreatePaymentStep = (send) => send();
+
+/** The answer, with its replay header set to `value`. */
+function withReplayHeader(value: string): CreatePaymentStep {
+  return async (send) => {
+    const response = await send();
+    const headers = new Headers(response.headers);
+    headers.set(REPLAY_HEADER, value);
+    return new Response(await response.text(), { status: response.status, headers });
+  };
+}
+
+/** The answer, its payment (a 2xx's, or a refusal's paymentResult) showing `fields` in place of its own. */
+function showingPayment(fields: Partial<WorldlinePaymentLike>): CreatePaymentStep {
+  return async (send) => {
+    const response = await send();
+    const body = (await response.json()) as { payment?: object; paymentResult?: { payment?: object } };
+    if (body.payment) body.payment = { ...body.payment, ...fields };
+    if (body.paymentResult?.payment) body.paymentResult.payment = { ...body.paymentResult.payment, ...fields };
+    return new Response(JSON.stringify(body), { status: response.status, headers: response.headers });
+  };
+}
+
+/**
+ * Relays to the fake. The next CreatePayments run through the steps given to
+ * `script`, in order, and a payment given to `readBackAs` reads back with the
+ * fields given in place of its own.
+ */
+function scriptedFetch(fake: FakeWorldlineApi) {
+  const steps: CreatePaymentStep[] = [];
+  const reads = new Map<string, Partial<WorldlinePaymentLike>>();
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const send = () => fake.fetch(input, init);
+    const path = new URL(String(input)).pathname;
+    if (init?.method === "POST" && path.endsWith("/payments")) return (steps.shift() ?? relay)(send);
+    const read = /\/payments\/([^/]+)$/.exec(path);
+    const fields = read && init?.method === "GET" ? reads.get(decodeURIComponent(read[1]!)) : undefined;
+    if (!fields) return send();
+    const response = await send();
+    return new Response(JSON.stringify({ ...((await response.json()) as object), ...fields }), {
+      status: response.status,
+      headers: response.headers,
+    });
+  };
+  return {
+    fetchImpl,
+    script: (...next: CreatePaymentStep[]) => void steps.push(...next),
+    readBackAs: (paymentId: string, fields: Partial<WorldlinePaymentLike>) => void reads.set(paymentId, fields),
+  };
+}
+
+/** What a payment Worldline cancelled as an authorisation reads (Statuses reference, CancelPayment). */
+const AUTHORISED_AND_CANCELLED: Partial<WorldlinePaymentLike> = {
+  status: "CANCELLED",
+  statusOutput: { statusCode: 6, statusCategory: "UNSUCCESSFUL" },
+};
 
 /** A transient answer dressed as a replayed decline: the header, and a failed payment in paymentResult. */
 function transientAnswer(status: number): Response {
@@ -459,10 +530,111 @@ describe("a refusal whose payment had not finished", () => {
       new Response(JSON.stringify(body), { status: 402, headers: { "content-type": "application/json", [REPLAY_HEADER]: String(Date.now()) } }),
     );
 
-    const error = await rejection(complete(adapter, await openSession(adapter), "htp_new_card"));
-    expect(error).toMatchObject({ code: "card_declined", retryable: false, outcomeUnknown: true });
+    // Finished, as Authorised and cancelled: returned as it now reads rather than thrown as a decline.
+    const again = await complete(adapter, await openSession(adapter), "htp_new_card");
+    expect(again).toMatchObject({ status: "canceled", pspPaymentId: authorised.pspPaymentId });
     expect(wire.sent).toHaveLength(2);
     expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
+  it("never moves on from a payment answered authorised that reads cancelled without a status code", async () => {
+    const fake = new FakeWorldlineApi();
+    const wire = scriptedFetch(fake);
+    const adapter = makeAdapter(wire.fetchImpl);
+    const session = await openSession(adapter, { captureMethod: "manual" });
+    const authorised = await complete(adapter, session, "htp_card");
+    // The contract does not require the status string or the code; this one reads cancelled by its string alone.
+    wire.readBackAs(authorised.pspPaymentId, { status: "CANCELLED", statusOutput: { statusCategory: "UNSUCCESSFUL" } });
+    const again = await complete(adapter, session, "htp_new_card");
+    expect(again).toMatchObject({ status: "canceled", pspPaymentId: authorised.pspPaymentId });
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+});
+
+describe("a payment authorised and cancelled since", () => {
+  it("returns a manual-capture challenge authorised and then cancelled as it now reads, sending no new attempt", async () => {
+    const { adapter, fake } = makePair();
+    const session = await openSession(adapter, { captureMethod: "manual" });
+    const challenge = await complete(adapter, session, "htp_3ds");
+    fake.settleChallenge(challenge.pspPaymentId, "succeeded");
+    await expect(adapter.cancelPayment(challenge.pspPaymentId, "cancel-order-42")).resolves.toMatchObject({ status: "canceled" });
+
+    const again = await complete(adapter, session, "htp_new_card");
+    expect(again).toMatchObject({ status: "canceled", pspPaymentId: challenge.pspPaymentId });
+    expect((again.raw as WorldlinePaymentLike).statusOutput?.statusCode).toBe(6);
+    expect(fake.uniquePaymentCreations).toBe(1);
+    expect(sends(fake).map(([, replayed]) => replayed)).toEqual([false, true]);
+  });
+
+  it("returns a sale left authorised at 51 and then cancelled as it now reads, sending no new attempt", async () => {
+    const { adapter, fake } = makePair();
+    fake.pendingCards.set("htp_pending", 51);
+    const session = await openSession(adapter);
+    const pending = await complete(adapter, session, "htp_pending");
+    fake.settlePendingAuthorization(pending.pspPaymentId, "succeeded");
+    // The Statuses reference sends 51 on to 2 or 5 only, a sale included.
+    await expect(adapter.retrievePayment(pending.pspPaymentId)).resolves.toMatchObject({ status: "requires_capture" });
+    await adapter.cancelPayment(pending.pspPaymentId, "cancel-order-42");
+
+    const again = await complete(adapter, session, "htp_new_card");
+    expect(again).toMatchObject({ status: "canceled", pspPaymentId: pending.pspPaymentId });
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
+  it("returns a refusal's payment, authorised since and then cancelled, as it now reads", async () => {
+    const { adapter, fake } = makePair();
+    fake.refusedWhilePending.set("htp_unknown", 52);
+    const session = await openSession(adapter, { captureMethod: "manual" });
+    const paymentId = declinedPaymentId(await rejection(complete(adapter, session, "htp_unknown")));
+    fake.settlePendingAuthorization(paymentId, "succeeded");
+    await adapter.cancelPayment(paymentId, "cancel-order-42");
+
+    const again = await complete(adapter, session, "htp_new_card");
+    expect(again).toMatchObject({ status: "canceled", pspPaymentId: paymentId });
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
+  const answers: Array<[string, (fake: FakeWorldlineApi) => void, (fake: FakeWorldlineApi, paymentId: string) => void]> = [
+    ["an authorisation", () => {}, () => {}],
+    [
+      "a refusal whose payment was pending",
+      (fake) => fake.refusedWhilePending.set("htp_card", 52),
+      (fake, paymentId) => fake.settlePendingAuthorization(paymentId, "succeeded"),
+    ],
+  ];
+  for (const [label, arrange, authorise] of answers) {
+    it(`never walks past a replayed answer to ${label} that shows its payment Authorised and cancelled`, async () => {
+      const fake = new FakeWorldlineApi();
+      arrange(fake);
+      const wire = scriptedFetch(fake);
+      const adapter = makeAdapter(wire.fetchImpl);
+      const session = await openSession(adapter, { captureMethod: "manual" });
+      const first = await complete(adapter, session, "htp_card").then(
+        (info) => info.pspPaymentId,
+        (err: unknown) => declinedPaymentId(err as PayFanoutError),
+      );
+      authorise(fake, first);
+      await adapter.cancelPayment(first, "cancel-order-42");
+      // A replay showing the payment's current status rather than its status when created.
+      wire.script(showingPayment(AUTHORISED_AND_CANCELLED));
+
+      const again = await complete(adapter, session, "htp_new_card");
+      expect(again).toMatchObject({ status: "canceled", pspPaymentId: first });
+      expect(fake.uniquePaymentCreations).toBe(1);
+    });
+  }
+
+  it("lets the customer pay under a new idempotency key once the authorisation was cancelled", async () => {
+    const { adapter, fake } = makePair();
+    const session = await openSession(adapter, { captureMethod: "manual" });
+    const authorised = await complete(adapter, session, "htp_card");
+    await adapter.cancelPayment(authorised.pspPaymentId, "cancel-order-42");
+    await expect(complete(adapter, session, "htp_new_card")).resolves.toMatchObject({ status: "canceled" });
+
+    const paid = await adapter.completePayment({ pspSessionId: session, clientToken: "htp_new_card", idempotencyKey: `${HOST_KEY}-2` });
+    expect(paid).toMatchObject({ status: "requires_capture" });
+    expect(paid.pspPaymentId).not.toBe(authorised.pspPaymentId);
+    expect(fake.uniquePaymentCreations).toBe(2);
   });
 });
 
@@ -588,21 +760,27 @@ describe("an answer that is the call's own", () => {
 
 describe("a re-send that meets an earlier completion's attempt", () => {
   /**
-   * A decline, then a success under the next key, both `elapsedMs` before the
-   * clock reads `now`, where it is left for the next completion.
+   * A decline, or with `failure: "invalid"` a 400 that creates no payment,
+   * then a success under the next key, both `elapsedMs` before the clock reads
+   * `now`, where it is left for the next completion.
    */
-  async function paidAfterDecline(elapsedMs: number) {
+  async function paidAfterDecline(elapsedMs: number, failure: "declined" | "invalid" = "declined") {
     const fake = new FakeWorldlineApi();
     fake.declinedCards.add("htp_declined");
+    fake.invalidTokens.add("htp_invalid");
     const now = Date.now();
     let clock = now - elapsedMs;
     fake.clock = clock;
+    const firstRequestAt = fake.clock;
     const adapter = makeAdapter(fake.fetch, { now: () => clock, sessionTtlSeconds: 2 * 60 * 60 });
     const session = await openSession(adapter);
-    const declined = await rejection(complete(adapter, session, "htp_declined"));
+    const failed = await rejection(complete(adapter, session, `htp_${failure}`));
     const paid = await complete(adapter, session, "htp_new_card");
     clock = now;
-    const [linkZero, linkOne] = await Promise.all([keyAfter(), keyAfter(declinedPaymentId(declined))]);
+    const [linkZero, linkOne] = await Promise.all([
+      keyAfter(),
+      keyAfter(failure === "declined" ? declinedPaymentId(failed) : String(firstRequestAt)),
+    ]);
     return { fake, adapter, session, paid, linkZero, linkOne };
   }
 
@@ -648,6 +826,120 @@ describe("a re-send that meets an earlier completion's attempt", () => {
     expect(error).toMatchObject({ code: "card_declined", retryable: false, outcomeUnknown: true });
     expect(fake.uniquePaymentCreations).toBe(1);
   });
+
+  it("throws a refusal that created no payment marked outcomeUnknown when a re-send meets it within 15 minutes", async () => {
+    // An earlier completion's 400, then a success on the second attempt, 5 minutes ago.
+    const { fake, adapter, session, paid, linkZero } = await paidAfterDecline(5 * MINUTE, "invalid");
+    // This call's first send never reaches Worldline.
+    fake.refusedCreatePaymentConnections = 1;
+    const error = await rejection(complete(adapter, session, "htp_third_card"));
+    expect(error).toMatchObject({ code: "invalid_request", retryable: false, outcomeUnknown: true });
+    expect(error.raw).not.toHaveProperty("paymentResult");
+    expect(sends(fake).slice(3)).toEqual([[linkZero, true]]);
+    expect(fake.uniquePaymentCreations).toBe(1);
+
+    await expect(complete(adapter, session, "htp_third_card")).resolves.toMatchObject({ pspPaymentId: paid.pspPaymentId });
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
+  const NOW = Date.UTC(2026, 8, 25, 12);
+  const implausible: Array<[string, string]> = [
+    ["in seconds", String(Math.floor(NOW / 1000))],
+    ["23 hours old", String(NOW - 23 * HOUR)],
+  ];
+  for (const [label, header] of implausible) {
+    it(`takes a re-send's replay timestamp ${label} as possibly the call's own, past the first key too`, async () => {
+      const fake = new FakeWorldlineApi();
+      fake.declinedCards.add("htp_declined_1");
+      fake.declinedCards.add("htp_declined_2");
+      fake.clock = NOW;
+      const wire = scriptedFetch(fake);
+      const adapter = makeAdapter(wire.fetchImpl, { now: () => NOW });
+      const session = await openSession(adapter);
+      const first = await rejection(complete(adapter, session, "htp_declined_1"));
+      // The first key's replay; the next key's first send, processed but unanswered; its re-send.
+      wire.script(relay, loseAnswer, withReplayHeader(header));
+
+      const error = await rejection(complete(adapter, session, "htp_declined_2"));
+      expect(error).toMatchObject({ code: "card_declined", retryable: false, outcomeUnknown: true });
+      const [linkZero, linkOne] = await Promise.all([keyAfter(), keyAfter(declinedPaymentId(first))]);
+      // Nothing goes out under a third key with the card the second key declined.
+      expect(sends(fake)).toEqual([
+        [linkZero, false],
+        [linkZero, true],
+        [linkOne, false],
+        [linkOne, true],
+      ]);
+      expect(fake.uniquePaymentCreations).toBe(2);
+    });
+  }
+
+  describe("that may be the call's own", () => {
+    /** A completion under the key, then `settle`, then a completion whose first send never reaches Worldline. */
+    async function resentAfter(card: string, settle: (fake: FakeWorldlineApi, paymentId: string) => void = () => {}) {
+      const { adapter, fake } = makePair();
+      fake.pendingCards.set("htp_pending", 51);
+      fake.refusedWhilePending.set("htp_unknown", 52);
+      const session = await openSession(adapter);
+      const first = await complete(adapter, session, card).then(
+        (info) => info.pspPaymentId,
+        (err: unknown) => declinedPaymentId(err as PayFanoutError),
+      );
+      settle(fake, first);
+      fake.refusedCreatePaymentConnections = 1;
+      return { adapter, fake, session, first };
+    }
+
+    it("reads a replayed challenge back, returning it as it now reads once it went through", async () => {
+      const { adapter, fake, session, first } = await resentAfter("htp_3ds", (f, id) => f.settleChallenge(id, "succeeded"));
+      const again = await complete(adapter, session, "htp_new_card");
+      expect(again).toMatchObject({ status: "succeeded", pspPaymentId: first });
+      expect(redirectUrl(again)).toBeUndefined();
+      expect(fake.uniquePaymentCreations).toBe(1);
+    });
+
+    it("returns a replayed challenge still open as requires_action, with its redirect", async () => {
+      const { adapter, fake, session, first } = await resentAfter("htp_3ds");
+      const again = await complete(adapter, session, "htp_new_card");
+      expect(again).toMatchObject({ status: "requires_action", pspPaymentId: first });
+      expect(redirectUrl(again)).toContain(first);
+      expect(fake.uniquePaymentCreations).toBe(1);
+    });
+
+    it("throws a replayed challenge that failed since marked outcomeUnknown, and the next completion moves on", async () => {
+      const { adapter, fake, session, first } = await resentAfter("htp_3ds", (f, id) => f.settleChallenge(id, "rejected"));
+      const error = await rejection(complete(adapter, session, "htp_new_card"));
+      expect(error).toMatchObject({ code: "authentication_required", retryable: false, outcomeUnknown: true });
+      expect(error.raw).toMatchObject({ payment: { id: first, status: "REJECTED" } });
+      expect(fake.uniquePaymentCreations).toBe(1);
+
+      const paid = await complete(adapter, session, "htp_new_card");
+      expect(paid.status).toBe("succeeded");
+      expect(fake.paymentIdUnder(await keyAfter(first))).toBe(paid.pspPaymentId);
+    });
+
+    it("throws a replayed pending payment that failed since marked outcomeUnknown", async () => {
+      const { adapter, fake, session, first } = await resentAfter("htp_pending", (f, id) => f.settlePendingAuthorization(id, "rejected"));
+      const error = await rejection(complete(adapter, session, "htp_new_card"));
+      expect(error).toMatchObject({ code: "card_declined", retryable: false, outcomeUnknown: true });
+      expect(error.raw).toMatchObject({ payment: { id: first, status: "REJECTED" } });
+      expect(fake.uniquePaymentCreations).toBe(1);
+    });
+
+    it("returns a replayed refusal's payment that went through since", async () => {
+      const { adapter, fake, session, first } = await resentAfter("htp_unknown", (f, id) => f.settlePendingAuthorization(id, "succeeded"));
+      const again = await complete(adapter, session, "htp_new_card");
+      expect(again).toMatchObject({ status: "succeeded", pspPaymentId: first });
+      expect(fake.uniquePaymentCreations).toBe(1);
+    });
+
+    it("throws a replayed refusal whose payment failed since marked outcomeUnknown", async () => {
+      const { adapter, fake, session } = await resentAfter("htp_unknown", (f, id) => f.settlePendingAuthorization(id, "rejected"));
+      const error = await rejection(complete(adapter, session, "htp_new_card"));
+      expect(error).toMatchObject({ code: "card_declined", retryable: false, outcomeUnknown: true });
+      expect(fake.uniquePaymentCreations).toBe(1);
+    });
+  });
 });
 
 describe("an answer that cannot be read as a payment", () => {
@@ -687,6 +979,172 @@ describe("an answer that cannot be read as a payment", () => {
     expect(error).toMatchObject({ code: "invalid_request", retryable: false, raw: "Bad Request" });
     expect(error.outcomeUnknown).toBeUndefined();
   });
+});
+
+describe("a payment that cannot be read back", () => {
+  function expectUnreadable(error: PayFanoutError): void {
+    // A 404 on its own reads as a final invalid_request; the payment exists, so its outcome is open.
+    expect(error).toMatchObject({ code: "invalid_request", retryable: false, outcomeUnknown: true, pspName: "worldline" });
+    expect(error.raw).toMatchObject({ errors: [{ id: "UNKNOWN_PAYMENT_ID", httpStatusCode: 404 }] });
+  }
+
+  it("throws the read-back of the call's own payment marked outcomeUnknown, and the next completion returns it", async () => {
+    const { adapter, fake } = makePair();
+    const session = await openSession(adapter);
+    fake.paymentReadFailure = 404;
+    expectUnreadable(await rejection(complete(adapter, session, "htp_card")));
+    expect(fake.uniquePaymentCreations).toBe(1);
+
+    fake.paymentReadFailure = undefined;
+    const again = await complete(adapter, session, "htp_other_card");
+    expect(again).toMatchObject({ status: "succeeded", pspPaymentId: fake.paymentIdUnder(await keyAfter()) });
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
+  it("throws the read-back of a replayed challenge marked outcomeUnknown, sending no new attempt", async () => {
+    const { adapter, fake } = makePair();
+    const session = await openSession(adapter);
+    await complete(adapter, session, "htp_3ds");
+    fake.paymentReadFailure = 404;
+    expectUnreadable(await rejection(complete(adapter, session, "htp_new_card")));
+    expect(fake.uniquePaymentCreations).toBe(1);
+    expect(sends(fake).map(([, replayed]) => replayed)).toEqual([false, true]);
+  });
+
+  it("throws the read-back of a payment a re-send met marked outcomeUnknown", async () => {
+    const { adapter, fake } = makePair();
+    const session = await openSession(adapter);
+    await complete(adapter, session, "htp_card");
+    fake.refusedCreatePaymentConnections = 1;
+    fake.paymentReadFailure = 404;
+    expectUnreadable(await rejection(complete(adapter, session, "htp_new_card")));
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
+  it("throws the read-back of a replayed refusal's payment marked outcomeUnknown, sending no new attempt", async () => {
+    const { adapter, fake } = makePair();
+    fake.refusedWhilePending.set("htp_unknown", 52);
+    const session = await openSession(adapter);
+    const paymentId = declinedPaymentId(await rejection(complete(adapter, session, "htp_unknown")));
+    fake.settlePendingAuthorization(paymentId, "succeeded");
+    fake.paymentReadFailure = 404;
+    expectUnreadable(await rejection(complete(adapter, session, "htp_new_card")));
+    expect(fake.uniquePaymentCreations).toBe(1);
+    expect(sends(fake).map(([, replayed]) => replayed)).toEqual([false, true]);
+  });
+
+  it("keeps a read-back that fails transiently a retryable psp_unavailable", async () => {
+    const { adapter, fake } = makePair();
+    const session = await openSession(adapter);
+    fake.paymentReadFailure = 503;
+    const error = await rejection(complete(adapter, session, "htp_card"));
+    expect(error).toMatchObject({ code: "psp_unavailable", retryable: true });
+    expect(error.outcomeUnknown).toBeUndefined();
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+});
+
+describe("a key whose earlier payment was made for another amount or currency", () => {
+  /** A 2500 EUR session declined, then paid on its second attempt, under the host key. */
+  async function paidAfterDecline() {
+    const { adapter, fake } = makePair();
+    fake.declinedCards.add("htp_declined");
+    const first = await openSession(adapter);
+    await rejection(complete(adapter, first, "htp_declined"));
+    const paid = await complete(adapter, first, "htp_new_card");
+    return { adapter, fake, paid };
+  }
+
+  function expectAnotherSessions(error: PayFanoutError, paymentId: string, amount: number, currency: string): void {
+    expect(error).toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      outcomeUnknown: true,
+      pspName: "worldline",
+      message: getUserMessage("invalid_request"),
+    });
+    expect(error.raw).toMatchObject({
+      reason: "another_sessions_payment",
+      payment: { id: paymentId },
+      sessionAmount: amount,
+      sessionCurrency: currency,
+    });
+  }
+
+  const others: Array<[number, string]> = [
+    [3000, "USD"],
+    [3000, "EUR"],
+    [2500, "USD"],
+  ];
+  for (const [amount, currency] of others) {
+    it(`refuses a ${amount} ${currency} session under the same key, creating no payment`, async () => {
+      const { adapter, fake, paid } = await paidAfterDecline();
+      const other = await openSession(adapter, { amount, currency, idempotencyKey: "session-2" });
+      expectAnotherSessions(await rejection(complete(adapter, other, "htp_third_card")), paid.pspPaymentId, amount, currency);
+      expect(fake.uniquePaymentCreations).toBe(2);
+    });
+  }
+
+  it("returns the payment to another session for the same amount and currency", async () => {
+    const { adapter, fake, paid } = await paidAfterDecline();
+    const other = await openSession(adapter, { idempotencyKey: "session-2" });
+    await expect(complete(adapter, other, "htp_third_card")).resolves.toMatchObject({ pspPaymentId: paid.pspPaymentId });
+    expect(fake.uniquePaymentCreations).toBe(2);
+  });
+
+  const omitted: Array<[string, Partial<WorldlinePaymentLike>]> = [
+    ["its payment output", { paymentOutput: undefined }],
+    ["its amount of money", { paymentOutput: {} }],
+    ["the amount and the currency", { paymentOutput: { amountOfMoney: {} } }],
+  ];
+  for (const [label, fields] of omitted) {
+    it(`does not count a payment read back without ${label} as another session's`, async () => {
+      const fake = new FakeWorldlineApi();
+      const wire = scriptedFetch(fake);
+      const adapter = makeAdapter(wire.fetchImpl);
+      const session = await openSession(adapter);
+      const paid = await complete(adapter, session, "htp_card");
+      wire.readBackAs(paid.pspPaymentId, fields);
+      await expect(complete(adapter, session, "htp_new_card")).resolves.toMatchObject({
+        status: "succeeded",
+        pspPaymentId: paid.pspPaymentId,
+      });
+      expect(fake.uniquePaymentCreations).toBe(1);
+    });
+  }
+
+  it("refuses the same integer amount in a currency with another exponent", async () => {
+    const { adapter, fake } = makePair();
+    const paid = await complete(adapter, await openSession(adapter, { amount: 500, currency: "JPY" }), "htp_card");
+    const other = await openSession(adapter, { amount: 500, currency: "BHD", idempotencyKey: "session-2" });
+    expectAnotherSessions(await rejection(complete(adapter, other, "htp_new_card")), paid.pspPaymentId, 500, "BHD");
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
+  it("still walks past another session's attempt that failed, and pays this session's amount", async () => {
+    const { adapter, fake } = makePair();
+    fake.declinedCards.add("htp_declined");
+    await rejection(complete(adapter, await openSession(adapter), "htp_declined"));
+    const other = await openSession(adapter, { amount: 3000, currency: "USD", idempotencyKey: "session-2" });
+    await expect(complete(adapter, other, "htp_new_card")).resolves.toMatchObject({ status: "succeeded", amount: 3000, currency: "USD" });
+    expect(fake.uniquePaymentCreations).toBe(2);
+  });
+
+  for (const captureMethod of ["automatic", "manual"] as const) {
+    it(`refuses it after a refusal whose pending ${captureMethod}-capture payment was captured since`, async () => {
+      const { adapter, fake } = makePair();
+      fake.refusedWhilePending.set("htp_unknown", 52);
+      const first = await openSession(adapter, { captureMethod });
+      const paymentId = declinedPaymentId(await rejection(complete(adapter, first, "htp_unknown")));
+      fake.settlePendingAuthorization(paymentId, "succeeded");
+      if (captureMethod === "manual") await adapter.capturePayment(paymentId, undefined, "capture-order-42");
+      await expect(adapter.retrievePayment(paymentId)).resolves.toMatchObject({ status: "succeeded" });
+
+      const other = await openSession(adapter, { amount: 3000, currency: "USD", idempotencyKey: "session-2" });
+      expectAnotherSessions(await rejection(complete(adapter, other, "htp_new_card")), paymentId, 3000, "USD");
+      expect(fake.uniquePaymentCreations).toBe(1);
+    });
+  }
 });
 
 describe("the limits of one key", () => {

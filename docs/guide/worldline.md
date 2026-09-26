@@ -123,7 +123,7 @@ const payments = new PaymentService({ adapters: [worldline] });
 | `defaultReturnUrl` | ✅¹ | - | Where Worldline returns the customer after a 3-D Secure challenge; the same URL rules as a session's `returnUrl` apply (§6), checked when the adapter is constructed. ¹Required unless every session passes its own `returnUrl`: Worldline lists the return URL among the mandatory 3-D Secure properties of every card payment, so a session with neither is refused (§6). **Set it before upgrading** from a release that did not require a return URL: sessions that release created without their own `returnUrl` carry none, and completing them is otherwise refused. |
 | `sessionSigningKey` | ✅ | - | HMAC key for the stateless signed session. **You generate this.** Keep it stable across restarts/instances. |
 | `webhookKeys` | ✅ | - | Array of `{ keyId, secretKey }`. Pass several to rotate with no cutover. |
-| `sessionTtlSeconds` | - | `3600` | How long a signed session stays completable (1h). Enforced at completion. |
+| `sessionTtlSeconds` | - | `3600` | How long a signed session stays completable (1h). Enforced at completion. Worldline gives the Hosted Tokenization session at most 3 hours and a temporary card token two hours, which a longer TTL outlives; a session living 23 hours or more can also be refused another attempt after a decline ([§7](#paying-again-under-the-same-key)). |
 | `requestTimeoutMs` | - | `30000` | Abort a hung Worldline connection; surfaces as a retryable `psp_unavailable`. |
 | `maxNetworkRetries` | - | `2` | Retries transport trouble (network/timeout/5xx/429) only, never business errors like declines. |
 
@@ -321,30 +321,52 @@ charges nothing.
 An attempt counts as failed only once its payment was declined or cancelled. When the
 replayed answer does not already say so, `completePayment` reads the payment back first:
 
-- **A 3-D Secure challenge** that failed or was cancelled is walked past. One still open comes
-  back as `requires_action` with its redirect URL, because the customer may still finish it,
-  and any other, one that went through or one handed on to a pending authorisation, is
-  returned as it now reads.
+- **A 3-D Secure challenge** that failed or was cancelled is walked past, unless it reads
+  Authorised and cancelled (below). One still open comes back as `requires_action` with its
+  redirect URL, because the customer may still finish it, and any other, one that went through
+  or one handed on to a pending authorisation, is returned as it now reads.
 - **A payment still pending when it was created**, such as Worldline's statuses 50 (fraud
   screening), 51 (awaiting the acquirer) and 52 ("Authorisation not known"), is walked past
   once it failed. Until then it is returned as it now reads, `processing` included; of 52,
   Worldline says the request "might have been successful" and asks not to resend it.
 - **A payment authorised or captured when it was created**, a manual-capture authorisation
   included, is always returned as it now reads, and never walked past, even once cancelled.
+- **A payment that reads Authorised and cancelled (6)**, whatever its answer showed, is
+  returned as `canceled` and never walked past: a challenge authorised and then cancelled, or a
+  sale Worldline left authorised after status 51 and you then cancelled. A completion repeated
+  after you cancelled an authorisation never authorises the customer again. To charge them
+  again, complete under a new idempotency key: that is safe, since 6 is final and no
+  completion sent an attempt after that payment.
 - **A decline whose error body reports a payment that has not ended** rejects with its usual
   `code` marked `outcomeUnknown: true`, because that payment may still go through. No Worldline
   page shows such an answer, and the API contract does not rule it out. Complete again only
   under the same key: once the payment failed, the next completion walks past it, and once it
   went through, the next completion returns it.
 
+A read-back that fails with an error retrying will not change, a 404 `UNKNOWN_PAYMENT_ID` for
+instance, rejects with that error marked `outcomeUnknown: true`, the call's own payment
+included: the payment exists and may have gone through, so complete again only under the same
+key. A read that fails transiently keeps its retryable error.
+
 The walk has limits:
 
 - **An abandoned challenge holds the key.** Worldline keeps a challenge the customer abandoned
   open "indefinitely", so the key keeps returning it rather than send a second payment that
-  could be charged alongside it. Before the customer pays under a new idempotency key, cancel
-  that payment with `cancelPayment` while Worldline reports it cancellable
-  (`raw.statusOutput.isCancellable` on `retrievePayment`); one you cannot cancel may still go
-  through, so reconcile it before charging again.
+  could be charged alongside it. Cancel it with `cancelPayment` while Worldline reports it
+  cancellable (`raw.statusOutput.isCancellable` on `retrievePayment`); one you cannot cancel
+  may still go through, so reconcile it before charging again. Once `cancelPayment` succeeds
+  the payment is final and no attempt was sent after it, so completing under a new idempotency
+  key is safe. The same key walks past it only if it reads Cancelled (1): one that reads
+  Authorised and cancelled (6), the final status Worldline lists for CancelPayment, is returned
+  as `canceled`, as above.
+- **A key's payment belongs to the amount and currency it was made for.** A completion under a
+  key whose earlier payment was made for another amount or currency, and did not end unpaid,
+  rejects with a non-retryable `invalid_request` whose `raw.reason` is
+  `"another_sessions_payment"` and whose `raw.payment` is that payment as it now reads. It is
+  marked `outcomeUnknown: true`, since that payment may be the one you meant. Earlier attempts
+  that failed are still walked past, whatever their amount. When an order's amount or currency
+  changes, complete it under a new idempotency key (one that includes the amount, for
+  example), once you know what became of the payment the old key holds.
 - **A key carries at most 20 attempts.** The next completion rejects with a non-retryable
   `invalid_request` whose `raw.reason` is `"attempt_limit"`. Every attempt under the key was
   read back and failed, so it carries no `outcomeUnknown`: create a new session and complete
@@ -352,9 +374,10 @@ The walk has limits:
 - **The first attempt must outlive the session.** Every completion starts from your key's own
   first attempt, which Worldline promises to keep for at least 24 hours. When that attempt
   failed and the session could still be completed after Worldline may have forgotten it (a
-  session under the same key that expires 23 hours or more after that attempt, so one
-  created about 22 hours after it with the default one-hour `sessionTtlSeconds`), the
-  completion rejects with a non-retryable `invalid_request` whose `raw.reason` is
+  session under the same key that expires 23 hours or more after that attempt: one created
+  about 22 hours after it with the default one-hour `sessionTtlSeconds`, or any session living
+  23 hours or more, for an attempt made at its start or before it), the completion rejects
+  with a non-retryable `invalid_request` whose `raw.reason` is
   `"first_attempt_may_expire"`, instead of sending anything, since a forgotten first attempt
   would go out as a new one. A replay timestamp that is not the documented milliseconds, or
   that lies more than an hour ahead of your server's clock, is refused the same way. The
@@ -370,12 +393,29 @@ The walk has limits:
 - **A re-send can meet either of two replays.** After a timeout or a lost connection the
   adapter sends the same key again, and Worldline may answer with the call's own first
   request, processed but unanswered, or with an earlier completion's attempt. A replayed
-  attempt made more than 15 minutes before the call's first send is an earlier completion's,
-  and the walk goes on as the first send would have. Any other is taken as the call's own, and
-  a failure among them rejects marked `outcomeUnknown: true`, since a later attempt under the
-  key may hold a payment: complete again under the same key, which returns that payment or
-  sends the new attempt. A 409, 429 or 5xx never leads to a new attempt; it keeps its
-  retryable error.
+  attempt made more than 15 minutes before the call's first send, by a timestamp in the
+  documented milliseconds and less than 23 hours old, is an earlier completion's, and the walk
+  goes on as the first send would have. Any other may be the call's own. It is read back and
+  settled like any replay, a challenge included, except that a failed attempt among them
+  rejects marked `outcomeUnknown: true` instead of being walked past, since a later attempt
+  under the key may hold a payment: complete again under the same key, which returns that
+  payment or sends the new attempt. A 409, 429 or 5xx never leads to a new attempt; it keeps
+  its retryable error.
+- **Keep your server's clock in sync with Worldline's.** Those 15 minutes assume your clock
+  runs less than 15 minutes ahead of Worldline's. With a clock further ahead, a re-send could
+  read the call's own lost decline as an earlier completion's and send the same card again
+  under the next key. Worldline's manual-authentication guide bounds the other direction: "Our
+  platform will reject requests with a timestamp older than 5 minutes."
+- **Handle each completion POST once.** A duplicate POST of a completion (a double click, or a
+  request your client retried) that arrives after the first was declined meets that decline
+  replayed, so the adapter sends the same card again under the next key. For the codes it
+  lists as non-retriable, a stolen card among them, Worldline's payment retry guidelines say:
+  "We strongly recommend not resubmitting the payment request." Deduplicate completion POSTs
+  per `clientToken`, answering a repeat with the result recorded for the first rather than
+  calling `completePayment` again. Worldline issues one `hostedTokenizationId` per Hosted
+  Tokenization session, so a second card entered in the same session can arrive with the same
+  `clientToken`: when the customer tries another card, create a new session for it and keep
+  the same idempotency key.
 
 ### Declines
 

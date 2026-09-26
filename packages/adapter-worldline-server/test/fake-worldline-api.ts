@@ -27,6 +27,8 @@ import type {
  *   - authorisations the platform has not finished (50, 51, 52), answered
  *     201 at AUTHORIZATION_REQUESTED, or behind a lever as a 402 carrying such
  *     a payment, and settled later with settlePendingAuthorization
+ *   - GetPayment failing behind a lever: 404 with the UNKNOWN_PAYMENT_ID body
+ *     of the API Troubleshooting page, or 503
  */
 interface StoredPayment {
   id: string;
@@ -112,6 +114,8 @@ export class FakeWorldlineApi {
   refusedCreatePaymentConnections = 0;
   /** Replays carry a new errorId, as a platform that ids every error response would send. */
   freshErrorIdOnReplay = false;
+  /** GET /payments/{id} answers this status instead of the payment, whatever the id. */
+  paymentReadFailure: 404 | 503 | undefined = undefined;
   /** The time a key's first CreatePayment is stamped with, in ms since the epoch; each one moves it on a second. */
   clock = Date.now();
   /** Every CreatePayment that reached the fake, in order: its idempotence key, and whether it replayed a stored answer. */
@@ -178,6 +182,8 @@ export class FakeWorldlineApi {
     }
     const paymentMatch = /^\/v2\/[^/]+\/payments\/([^/]+)$/.exec(path);
     if (method === "GET" && paymentMatch) {
+      if (this.paymentReadFailure === 404) return unknownPaymentId();
+      if (this.paymentReadFailure === 503) return json(503, { errorId: "unavailable", errors: [{ httpStatusCode: 503 }] });
       const payment = this.payments.get(decodeURIComponent(paymentMatch[1]!));
       if (!payment) return notFound();
       return json(200, publicPayment(payment));
@@ -404,21 +410,29 @@ export class FakeWorldlineApi {
   /**
    * Test helper: the result a pending authorisation (50, 51, 52) ends with.
    * The Statuses reference sends all three on to authorised (5) or refused (2),
-   * and 50 and 52 also to captured (9) for a sale.
+   * and 50 and 52 also to captured (9) for a sale; 51 lists 2 and 5 only, so a
+   * sale left at 51 ends authorised.
    */
   settlePendingAuthorization(paymentId: string, outcome: "succeeded" | "rejected"): void {
     const payment = this.payments.get(paymentId);
     if (!payment || payment.status !== "AUTHORIZATION_REQUESTED") throw new Error(`No pending authorisation on payment ${paymentId}`);
-    this.settle(payment, outcome, { errorCode: "30051001", category: "PAYMENT_PLATFORM_ERROR", httpStatusCode: 402, message: "Do not honour" });
+    const refusal = { errorCode: "30051001", category: "PAYMENT_PLATFORM_ERROR", httpStatusCode: 402, message: "Do not honour" };
+    this.settle(payment, outcome, refusal, payment.statusCode !== 51);
   }
 
-  private settle(payment: StoredPayment, outcome: "succeeded" | "rejected" | "cancelled", refusal: WorldlineApiError): void {
+  /** `saleCaptures`: whether a sale that goes through is captured (9), or left authorised (5). */
+  private settle(
+    payment: StoredPayment,
+    outcome: "succeeded" | "rejected" | "cancelled",
+    refusal: WorldlineApiError,
+    saleCaptures = true,
+  ): void {
     if (outcome === "rejected") {
       Object.assign(payment, { status: "REJECTED", statusCode: 2, statusCategory: "UNSUCCESSFUL" });
       payment.errors = [refusal];
     } else if (outcome === "cancelled") {
       Object.assign(payment, { status: "CANCELLED", statusCode: 1, statusCategory: "UNSUCCESSFUL", capturableRemaining: 0 });
-    } else if (payment.sale) {
+    } else if (payment.sale && saleCaptures) {
       Object.assign(payment, { status: "CAPTURED", statusCode: 9, statusCategory: "COMPLETED", capturableRemaining: 0 });
       payment.captures.push({
         id: `cap_${++this.seq}`,
@@ -496,8 +510,11 @@ export class FakeWorldlineApi {
 
   private cancelOutcome(payment: StoredPayment): { status: number; body: unknown } {
     // API contract, CancelPayment 409: "Cancellation is not allowed because payment is closed".
+    // A sale is closed once created, unless it was left authorised (5), as a
+    // sale pending at 51 ends.
     const cancelled = payment.status === "CANCELLED" && payment.statusCode === 6;
-    if (payment.sale || this.hasSettledCapture(payment) || cancelled) {
+    const closedSale = payment.sale && payment.statusCode !== 5;
+    if (closedSale || this.hasSettledCapture(payment) || cancelled) {
       return {
         status: 409,
         body: {
@@ -675,6 +692,25 @@ function lowercase(headers: Record<string, string>): Record<string, string> {
 
 function notFound(message = "Unknown entity"): Response {
   return json(404, { errorId: "nf", errors: [{ code: "1", message, httpStatusCode: 404 }] });
+}
+
+/** The API Troubleshooting page's "Technical error (Missing/wrong properties)" example. */
+function unknownPaymentId(): Response {
+  return json(404, {
+    errorId: "4dac7acb-70c1-4917-80cd-068833fd8da5",
+    errors: [
+      {
+        errorCode: "50001130",
+        category: "DIRECT_PLATFORM_ERROR",
+        code: "1002",
+        httpStatusCode: 404,
+        id: "UNKNOWN_PAYMENT_ID",
+        message: "UNKNOWN_PAYMENT_ID",
+        propertyName: "paymentId",
+        retriable: false,
+      },
+    ],
+  });
 }
 
 function json(status: number, body: unknown): Response {

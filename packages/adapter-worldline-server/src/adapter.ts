@@ -80,8 +80,12 @@ export interface WorldlineServerAdapterConfig {
    * How long a signed session context stays completable, in seconds.
    * Default 3600 (1h). A signed token must not be valid forever — expiry is
    * enforced at completePayment. Worldline gives the Hosted Tokenization
-   * session behind it a maximum life span of 3 hours, which a longer TTL
-   * outlives.
+   * session behind it a maximum life span of 3 hours, and the temporary token
+   * a card entered there becomes "a lifespan of two hours" (API contract),
+   * which a longer TTL outlives. A session living 23 hours or more also
+   * outlives what Worldline promises to keep of a failed attempt made at its
+   * start or before it, so after one it gets no further attempt (see
+   * completePayment).
    */
   sessionTtlSeconds?: number;
   /**
@@ -238,8 +242,9 @@ interface CreatePaymentAnswer {
   replayOf: string | undefined;
   /**
    * A replay that may be the call's own first send, processed but unanswered,
-   * or an earlier completion's: handled as the call's own, and a failure it
-   * reports is thrown marked outcomeUnknown.
+   * or an earlier completion's: read like a replay, except that a failed
+   * attempt, answered or read back, is thrown marked outcomeUnknown rather than
+   * walked past.
    */
   uncertain: boolean;
 }
@@ -429,16 +434,24 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
    * returns that payment. An attempt failed once its payment was declined or
    * cancelled, as its answer shows or, for a 3-D Secure challenge or a payment
    * still pending when answered, as it reads back now. A payment authorised or
-   * captured when created never counts as failed, a challenge still open is
-   * returned as requires_action, and a refusal whose payment may still go
-   * through is thrown marked outcomeUnknown.
+   * captured when created never counts as failed, nor does one that reads
+   * Authorised and cancelled (6); a challenge still open is returned as
+   * requires_action, and a refusal whose payment may still go through is
+   * thrown marked outcomeUnknown, as is a payment that cannot be read back. An
+   * earlier attempt's payment that did not end unpaid is returned only when it
+   * was made for the session's amount and currency; otherwise the completion
+   * is refused with a non-retryable invalid_request marked outcomeUnknown
+   * (`raw.reason: "another_sessions_payment"`).
    *
    * A replay is recognised by its `X-GCS-Idempotence-Request-Timestamp` header
    * on the key's first send in the call. On a re-send, after a timeout or a lost
-   * connection, only a timestamp more than 15 minutes before that first send
-   * names an earlier completion's attempt; any other replayed answer is taken as
-   * the call's own, and a failure among them is thrown marked outcomeUnknown. A
-   * 409, a 429 and a 5xx never lead to a new attempt. The completion is refused
+   * connection, only a timestamp that reads as the documented milliseconds,
+   * less than 23 hours old and more than 15 minutes before that first send,
+   * names an earlier completion's attempt. Any other replayed answer may be
+   * the call's own: it is read like a replay, but a failed attempt among them
+   * is thrown marked outcomeUnknown instead of walked past. That margin assumes
+   * this server's clock runs less than 15 minutes ahead of Worldline's. A 409,
+   * a 429 and a 5xx never lead to a new attempt. The completion is refused
    * with a non-retryable invalid_request after 20 attempts under one key
    * (`raw.reason: "attempt_limit"`), and, marked outcomeUnknown, when Worldline
    * could forget the key's first attempt before the session expires
@@ -514,7 +527,10 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
   /**
    * What one CreatePayment answer settles: the payment to return, or, for a
    * replay of an earlier attempt that failed, the id the next key derives from.
-   * Any other failure throws, mapped as it always was.
+   * The call's own failure throws, mapped as it always was. An answer that may
+   * be the call's own or an earlier completion's is read like a replay, but a
+   * failed attempt, which a replay would walk past, throws marked
+   * outcomeUnknown.
    */
   private async settleCreatePayment(
     answer: CreatePaymentAnswer,
@@ -546,30 +562,38 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       });
     const answered = paymentStatus(payment);
     const { replayOf } = answer;
-    if (replayOf === undefined) {
+    if (replayOf === undefined && !answer.uncertain) {
       if (challenge) return { info: asChallenge() };
       // Some Worldline flows answer 2xx with a REJECTED payment rather than an
       // HTTP error. It throws a rejection mapped from the payment's own
       // statusOutput.errors, as the 402 path does from the error body, rather
       // than returning a "failed" PaymentInfo.
-      if (answered === "failed") throw flagOutcomeUnknown(mapWorldlineRejectedPayment(created), answer.uncertain);
-      return { info: await this.retrievePayment(payment.id, context.id) };
+      if (answered === "failed") throw mapWorldlineRejectedPayment(created);
+      return { info: await this.readBack(payment.id, context) };
     }
-    if (endedUnpaid(answered)) return { after: payment.id, replayOf };
+    // An uncertain answer may be an earlier completion's, whose later key may
+    // hold a payment, so its failed attempt throws where a replay's is walked.
+    const failed = (rejected: WorldlineCreatePaymentResponse): SettledAttempt => {
+      if (replayOf !== undefined) return { after: payment.id, replayOf };
+      throw flagOutcomeUnknown(mapWorldlineRejectedPayment(rejected), true);
+    };
+    if (failedAttempt(payment)) return failed(created);
     // An earlier attempt's payment, which may have moved since: Worldline keeps
     // a challenge the customer abandoned open "indefinitely", and resolves a
     // pending authorisation later.
-    const current = await this.retrievePayment(payment.id, context.id);
-    if (walkable(answered, current.status)) return { after: payment.id, replayOf };
+    const current = await this.readBack(payment.id, context);
+    if (walkable(answered, current)) return failed({ payment: current.raw as WorldlinePaymentLike });
+    assertSessionsPayment(current, context);
     return { info: challenge && current.status === "requires_action" ? asChallenge() : current };
   }
 
   /**
    * A CreatePayment refusal: a 4xx other than 409 and 429. A replayed one is
-   * walked past once its payment, when the error body reports one, ended
-   * unpaid, as the body shows or as it reads back; one that went through is
-   * returned. Otherwise the refusal throws, mapped as it always was, and marked
-   * outcomeUnknown while its payment may still go through.
+   * walked past once its attempt failed: it created no payment, or the payment
+   * the error body reports ended unpaid, as the body shows or as it reads back.
+   * One whose payment has finished otherwise is returned. Else the refusal
+   * throws, mapped as it always was, and marked outcomeUnknown while its
+   * payment may still go through or the answer may be an earlier completion's.
    */
   private async settleRefusal(answer: CreatePaymentAnswer, context: WorldlineSessionContextV1): Promise<SettledAttempt> {
     const { replayOf } = answer;
@@ -586,14 +610,37 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     // REJECTED one, and Worldline asks not to resend a request whose outcome is
     // unknown (52, 92): "your initial request might have been successful".
     const answered = paymentStatus(payment);
-    if (replayOf === undefined) throw flagOutcomeUnknown(refusal, answer.uncertain || !endedUnpaid(answered));
-    if (endedUnpaid(answered)) return { after: payment.id, replayOf };
-    const current = await this.retrievePayment(payment.id, context.id);
-    if (walkable(answered, current.status)) return { after: payment.id, replayOf };
+    if (replayOf === undefined && !answer.uncertain) throw flagOutcomeUnknown(refusal, !endedUnpaid(answered));
+    const failed = (): SettledAttempt => {
+      if (replayOf !== undefined) return { after: payment.id, replayOf };
+      throw flagOutcomeUnknown(refusal, true);
+    };
+    if (failedAttempt(payment)) return failed();
+    const current = await this.readBack(payment.id, context);
+    if (walkable(answered, current)) return failed();
     // Throwing the refusal would tell the host this key's payment was declined
-    // when it went through, so it is returned, like any replayed success.
-    if (wentThrough(current.status)) return { info: current };
+    // when it went through, or was authorised and cancelled since, so a
+    // payment that has finished is returned, like any replayed success.
+    if (wentThrough(current.status) || endedUnpaid(current.status)) {
+      assertSessionsPayment(current, context);
+      return { info: current };
+    }
     throw flagOutcomeUnknown(refusal, true);
+  }
+
+  /**
+   * A payment CreatePayment named, as it reads now. The payment exists, so a
+   * read that fails for good (a 404 UNKNOWN_PAYMENT_ID, say) says nothing of
+   * how it ended, and is thrown marked outcomeUnknown; a retryable failure
+   * already leaves the outcome open.
+   */
+  private async readBack(paymentId: string, context: WorldlineSessionContextV1): Promise<PaymentInfo> {
+    try {
+      return await this.retrievePayment(paymentId, context.id);
+    } catch (err) {
+      const error = PayFanoutError.wrap(err, { code: "processing_error", pspName: this.pspName });
+      throw error.retryable ? error : flagOutcomeUnknown(error, true);
+    }
   }
 
   async retrievePayment(pspPaymentId: string, payfanoutId?: string): Promise<PaymentInfo> {
@@ -1352,13 +1399,50 @@ function wentThrough(status: UnifiedPaymentStatus): boolean {
 }
 
 /**
- * Whether a replayed attempt whose answer showed its payment unfinished is
- * walked past, given how the payment reads now: once it ended unpaid, and never
- * when the answer showed it authorised or captured, whatever became of it
- * since (a merchant's cancellation, say).
+ * Whether the attempt a payment came from failed: the payment ended unpaid and
+ * was never authorised. Authorised and cancelled (6), "You successfully
+ * deleted the authorisation of a transaction" (Statuses reference), is a
+ * payment that went through and was then cancelled, which a repeated
+ * completion must not replace.
  */
-function walkable(answered: UnifiedPaymentStatus, current: UnifiedPaymentStatus): boolean {
-  return !wentThrough(answered) && endedUnpaid(current);
+function failedAttempt(payment: WorldlinePaymentLike): boolean {
+  return endedUnpaid(paymentStatus(payment)) && payment.statusOutput?.statusCode !== 6;
+}
+
+/**
+ * Whether a replayed attempt whose answer showed its payment unfinished is
+ * walked past, given how the payment reads now (see readBack): once its attempt
+ * failed, and never when the answer showed it authorised or captured, whatever
+ * became of it since (a merchant's cancellation, say).
+ */
+function walkable(answered: UnifiedPaymentStatus, current: PaymentInfo): boolean {
+  return !wentThrough(answered) && failedAttempt(current.raw as WorldlinePaymentLike);
+}
+
+/**
+ * Refuses an earlier attempt's payment made for another amount or currency
+ * than the session's, unless it ended unpaid. The request named the session's
+ * own, so such a payment answered another request, one an idempotencyKey
+ * reused across sessions replays; it may be the payment the host meant, so the
+ * refusal carries outcomeUnknown. A field the payment omits is not a mismatch.
+ */
+function assertSessionsPayment(current: PaymentInfo, context: WorldlineSessionContextV1): void {
+  if (endedUnpaid(current.status)) return;
+  const payment = current.raw as WorldlinePaymentLike;
+  const amount = payment.paymentOutput?.amountOfMoney?.amount ?? undefined;
+  const currency = payment.paymentOutput?.amountOfMoney?.currencyCode ?? undefined;
+  const differs =
+    (amount !== undefined && amount !== context.amount) ||
+    (currency !== undefined && String(currency).toUpperCase() !== context.currency);
+  if (!differs) return;
+  throw new PayFanoutError({
+    code: "invalid_request",
+    message: getUserMessage("invalid_request"),
+    retryable: false,
+    outcomeUnknown: true,
+    raw: { reason: "another_sessions_payment", payment, sessionAmount: context.amount, sessionCurrency: context.currency },
+    pspName: WORLDLINE_PSP_NAME,
+  });
 }
 
 /** The error, marked outcomeUnknown when `unknown` holds. */
@@ -1380,14 +1464,23 @@ function replayTimestamp(value: string): number {
 }
 
 /**
+ * Whether a replay timestamp can be the documented milliseconds, read against
+ * this server's clock: newer than the period a key's outcome can be relied on,
+ * and no more than an hour ahead. A value in seconds or microseconds is not.
+ */
+function plausibleReplayTimestamp(timestamp: number, now: number): boolean {
+  return timestamp > now - RELIABLE_REPLAY_PERIOD_MS && timestamp <= now + REPLAY_CLOCK_LEAD_MS;
+}
+
+/**
  * What a CreatePayment answer's replay header says. An empty value marks
  * nothing, as in Worldline's Node SDK. On the key's first send in the call,
  * any value marks a replay of an earlier completion's attempt. On a re-send
  * (`resentAfter` is the first send's time) the header also comes back when the
- * first send was processed but its answer lost, so only a timestamp older than
- * the first send by more than the margin names an earlier completion's
- * attempt: exactly what the first send would have met. Any other value is
- * uncertain.
+ * first send was processed but its answer lost, so only a plausible timestamp
+ * older than the first send by more than the margin names an earlier
+ * completion's attempt: exactly what the first send would have met. Any other
+ * value is uncertain.
  */
 function readReplayHeader(
   header: string | null,
@@ -1395,7 +1488,9 @@ function readReplayHeader(
 ): Pick<CreatePaymentAnswer, "replayOf" | "uncertain"> {
   const value = header?.trim() || undefined;
   if (value === undefined) return { replayOf: undefined, uncertain: false };
-  if (resentAfter === undefined || replayTimestamp(value) < resentAfter - EARLIER_ATTEMPT_MARGIN_MS) {
+  if (resentAfter === undefined) return { replayOf: value, uncertain: false };
+  const requestedAt = replayTimestamp(value);
+  if (plausibleReplayTimestamp(requestedAt, resentAfter) && requestedAt < resentAfter - EARLIER_ATTEMPT_MARGIN_MS) {
     return { replayOf: value, uncertain: false };
   }
   return { replayOf: undefined, uncertain: true };
@@ -1408,14 +1503,13 @@ function readReplayHeader(
  * attempt, and charge again after a later attempt succeeded. A key reused for
  * a session created about a day after its first attempt, or a session that
  * lives that long, gets no further attempt; nor does a timestamp that is not
- * the documented milliseconds, or that lies more than an hour ahead of this
- * server's clock. The refusal reads no further than the first key, so a
- * success a later key holds from an earlier session goes unseen: it is marked
- * outcomeUnknown.
+ * plausibly the documented milliseconds. The refusal reads no further than the
+ * first key, so a success a later key holds from an earlier session goes
+ * unseen: it is marked outcomeUnknown.
  */
 function assertFirstAttemptOutlivesSession(replayOf: string, expiresAt: number, now: number, lastFailure: unknown): void {
   const firstRequestAt = replayTimestamp(replayOf);
-  if (firstRequestAt <= now + REPLAY_CLOCK_LEAD_MS && firstRequestAt + RELIABLE_REPLAY_PERIOD_MS > expiresAt) return;
+  if (plausibleReplayTimestamp(firstRequestAt, now) && firstRequestAt + RELIABLE_REPLAY_PERIOD_MS > expiresAt) return;
   throw new PayFanoutError({
     code: "invalid_request",
     message: getUserMessage("invalid_request"),

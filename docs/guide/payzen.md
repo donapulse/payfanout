@@ -125,7 +125,8 @@ const payzen = new PayZenClientAdapter({
   (`cssUrl`) is added once the script has loaded, since PayZen
   [requires](https://payzen.io/en-EN/rest/V4.0/javascript/guide/payment_form.html) theme
   files to load after the library, and `loadSdk()` does not wait for it: the default theme
-  imports Google Fonts, whose loading would otherwise hold up every mount. An empty
+  imports Google Fonts, whose loading would otherwise hold up the first mount on each page
+  load. An empty
   `cssUrl` loads no theme stylesheet, which PayZen describes as optional. KR is a single
   page-global: one PayZen form per page, and a second adapter instance waits for the
   script another one is still loading.

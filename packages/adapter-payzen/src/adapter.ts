@@ -808,8 +808,8 @@ function injectKrAssets(
     });
     // Not awaited: a link fires load only once its @imports have loaded, and the
     // default theme imports Google Fonts, so a slow or blocked font host would
-    // hold up every mount. A stylesheet that cannot be injected only leaves the
-    // form unstyled.
+    // hold up the first mount on each page load. A stylesheet that cannot be
+    // injected only leaves the form unstyled.
     void injectStylesheet(cssUrl, "payzen", { nonce }).catch(() => undefined);
   };
 }

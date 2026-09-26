@@ -349,8 +349,9 @@ Implement `ClientPaymentAdapter`:
   whose own rules applied when one of its `@import`s fails, and a later call reuses it.
   A call that finds a link an earlier call injected, still loading, waits for it, and a
   link fires `load` only once its `@import`s have loaded, so don't make mounting wait on
-  a sheet that imports from another host (PayZen's theme imports Google Fonts, and its
-  adapter injects the theme without awaiting it). Say in the option's JSDoc what the
+  a sheet you know imports from another host (PayZen's theme imports Google Fonts, and its
+  adapter injects the theme without awaiting it); if a host can name its own sheet and
+  mounting waits for it, say so in the option's JSDoc, as Adyen's `stylesheetUrl` does. Say in the option's JSDoc what the
   nonce covers for your PSP and what its SDK still loads or inlines without one.
 - `mount(container, options)`: render **hosted/iframe fields only** (SAQ-A), never a raw
   card input. Forward `options.appearance` to the PSP's styling hooks. Return a branded

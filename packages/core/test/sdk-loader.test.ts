@@ -219,6 +219,8 @@ async function expectLoadFailure(loading: Promise<void>, url: string): Promise<v
 }
 
 async function expectRefused(loading: Promise<void>, message: string): Promise<void> {
+  // Every refusal settles at once, so a missing one fails here rather than by timeout.
+  expect(await hasSettled(loading)).toBe(true);
   const error = await rejection(loading);
   expect(error.toJSON()).toEqual({
     name: "PayFanoutError",

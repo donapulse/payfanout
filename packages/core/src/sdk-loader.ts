@@ -327,9 +327,10 @@ export interface InjectStylesheetOptions {
  * that from a sheet that failed, so a later call for `url` finds the link and
  * resolves at once instead of fetching the sheet again. An empty `url` names no
  * sheet, and a link with an empty `href` fires neither event, so nothing is
- * injected and the call resolves at once. The call rejects only for invalid
- * options, with a non-retryable invalid_request attributed to `pspName`, and
- * nothing is injected then.
+ * injected and the call resolves at once. The call rejects for invalid options,
+ * with a non-retryable invalid_request attributed to `pspName`, and nothing is
+ * injected then; a `url` holding a double quote also rejects, with the DOM's
+ * own error, since the page lookup cannot quote it.
  *
  * A `<link rel="stylesheet">` already on the page for `url` is reused as it
  * is, with nothing injected and none of its attributes compared: one the page

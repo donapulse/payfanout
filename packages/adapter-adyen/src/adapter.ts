@@ -108,7 +108,7 @@ export interface AdyenClientAdapterConfig {
    * without an integrity check. An empty string loads no stylesheet, for a page
    * that ships Adyen Web's styles itself. `loadSdk()` waits for the sheet to
    * load or fail, and with it for every sheet it `@import`s, so a sheet that
-   * imports from a slow host delays every mount.
+   * imports from a slow host delays the first mount on each page load.
    */
   stylesheetUrl?: string;
   /**

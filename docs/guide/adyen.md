@@ -319,7 +319,7 @@ const adyen = new AdyenClientAdapter({
   result. A stylesheet that failed stays on the page and is reused, and it never blocks the
   fields from mounting. The mount does wait for the stylesheet to load or fail, and for the
   sheets it `@import`s: Adyen's `adyen.css` imports none, but a `stylesheetUrl` of your own
-  that imports from a slow host delays every mount.
+  that imports from a slow host delays the first mount on each page load.
 
 ::: tip Content-Security-Policy
 A CSP-enforcing page must allow Adyen, or the fields fail quietly. 3-D Secure 2 challenges

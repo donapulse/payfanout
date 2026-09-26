@@ -2122,7 +2122,9 @@ sandbox round-trip before production use, and the setup guide carries that warni
     Adyen Web reports a contradicting prefix only once `AdyenCheckout()` runs and still
     takes an origin key (`pub.`) with a console notice. If the script fails to load, the
     next mount fetches it again, with the stylesheet if that failed too (a `<link>` the
-    adapter injected is removed when its load fails); if it loaded without defining
+    adapter injected is removed when its load fails; superseded 2026-09-26 by "CSP nonces on
+    injected PSP tags (2026-09-26)": a failed stylesheet link now stays on the page and is
+    reused); if it loaded without defining
     `window.AdyenWeb`, the next mount checks again instead of failing from a cached result,
     and only a host `loadScript` fetches anew then, since the tag already on the page is
     reused. Adyen Web errors are read by `name` first (the 6.45.2 source defines
@@ -4184,7 +4186,8 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   content API on 2026-09-26) says "Theme files must imperatively be loaded after the
   JavaScript library.", where the old loader appended the stylesheet first. `loadSdk()`
   still resolves once the script has loaded and `KR` exists: awaiting the link would hold
-  every mount until the library had run and Google Fonts had answered the theme's
+  the first mount on each page load until the library had run and Google Fonts had
+  answered the theme's
   `@import`s, and never release it for a link that fires no event. The same guide says
   "Theme files are optional. If they are not included, the payment form will be functional
   but with a minimalist look.", and an empty `cssUrl` now loads none, where the old loader

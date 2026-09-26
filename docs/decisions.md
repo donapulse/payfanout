@@ -3998,9 +3998,8 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   decline could surface under a different unified code depending on which half reported
   it. The browser mapped neither `expired_payment_method` nor `incorrect_postal_code`, the
   2026-08-26.dahlia payment-method codes, nor `incorrect_zip`, nor the fraud decline codes.
-  The server read the issuer's decline codes
-  only for insufficient funds, a required authentication and fraud. Both halves now read, in
-  this order:
+  The server read the issuer's decline codes only for insufficient funds, a required
+  authentication and fraud. Both halves now read, in this order:
   1. `insufficient_funds`;
   2. `expired_card` (`expired_card`, `expired_payment_method`);
   3. `invalid_card_data` (`incorrect_number`, `invalid_number`, `incorrect_cvc`,
@@ -4024,10 +4023,9 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `invalid_number`, `processing_error` and `authentication_required` as decline codes. Each
   describes the failure its error-code namesake does (for `incorrect_cvc`: "The CVC number
   is incorrect.", remedy "The customer needs to try again using the correct CVC."). The
-  error-codes page (docs.stripe.com/error-codes) gives
-  `expired_payment_method` "The payment method expired", `incorrect_postal_code` "The
-  payment method’s postal code is incorrect" and `incorrect_zip` "The card’s postal code is
-  incorrect".
+  error-codes page (docs.stripe.com/error-codes) gives `expired_payment_method` "The payment
+  method expired", `incorrect_postal_code` "The payment method’s postal code is incorrect"
+  and `incorrect_zip` "The card’s postal code is incorrect".
 - **A fraud decline shows the generic message in both halves.** For `fraudulent`,
   `stolen_card` and `merchant_blacklist` Stripe says "Don’t report more detailed information
   to your customer. Instead, present it in the same manner as `generic_decline`", and for

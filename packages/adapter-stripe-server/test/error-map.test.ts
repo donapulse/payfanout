@@ -164,6 +164,12 @@ describe("mapStripeError", () => {
       code: "authentication_required",
       retryable: false,
     },
+    ...["incorrect_number", "invalid_cvc", "invalid_expiry_month", "invalid_expiry_year"].map((declineCode) => ({
+      name: `issuer decline code ${declineCode}`,
+      err: { type: "StripeCardError", code: "card_declined", decline_code: declineCode, message: "…" },
+      code: "invalid_card_data" as UnifiedErrorCode,
+      retryable: false,
+    })),
     {
       name: "issuer decline requiring authentication",
       err: { type: "StripeCardError", code: "card_declined", decline_code: "authentication_required", message: "…" },

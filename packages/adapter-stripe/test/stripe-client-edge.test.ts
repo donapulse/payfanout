@@ -217,6 +217,12 @@ describe("StripeClientAdapter edge cases", () => {
       [{ type: "card_error", code: "payment_intent_authentication_failure" }, "authentication_required", false],
       [{ type: "card_error", code: "setup_intent_authentication_failure" }, "authentication_required", false],
       [{ type: "card_error", code: "processing_error" }, "processing_error", true],
+      // The card-detail codes, whether Stripe returns them as error codes or decline codes.
+      [{ type: "card_error", code: "incorrect_number" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "invalid_number" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "invalid_cvc" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "invalid_expiry_month" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "invalid_expiry_year" }, "invalid_card_data", false],
       // Every Stripe.js field code, as the other card-detail codes.
       [{ type: "validation_error", code: "incomplete_number" }, "invalid_card_data", false],
       [{ type: "validation_error", code: "incomplete_cvc" }, "invalid_card_data", false],
@@ -275,6 +281,7 @@ describe("StripeClientAdapter edge cases", () => {
 
   it("writes the generic fraud message in the locale Stripe.js was given", async () => {
     stubBrowser();
+    vi.stubGlobal("navigator", { language: "es-ES" });
     const stolen = { type: "card_error", code: "card_declined", decline_code: "stolen_card", message: "Card reported stolen." };
     const factory = () => ({
       elements: () => ({ create: () => ({ mount: () => {}, unmount: () => {}, destroy: () => {}, on: () => {} }) }),

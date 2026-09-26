@@ -814,7 +814,8 @@ docs.direct.worldline-solutions.com unless noted):
   `clientSecret` is the `hostedTokenizationUrl` the browser iframe mounts from (no client
   key). The host id round-trips via `order.references.merchantReference` only — Worldline has
   no arbitrary metadata map — so conformance `money.expectations` is
-  `{ idRoundTrip: true, metadataEcho: false }`. Doc-verified 2026-09-23 (Hosted Tokenization
+  `{ idRoundTrip: true, metadataEcho: false }` (superseded 2026-09-26 by "Worldline: metadata
+  echo and creation time (2026-09-26)"). Doc-verified 2026-09-23 (Hosted Tokenization
   Page guide and the served `tokenizer.min.js`): the browser `Tokenizer` hides the
   cardholder-name field unless constructed with `hideCardholderName: false`, although the name
   is mandatory, and calls `validationCallback` with `{ valid }` whenever the form's validity
@@ -1124,7 +1125,8 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   consistent with the platform's examples but worth one sandbox observation.
 - **`PaymentInfo.createdAt`** falls back to epoch — the Worldline payment object exposes no
   stable creation timestamp in a documented field; hosts read the timestamp from the webhook
-  `created` or their own record. Revisit if the sandbox payment object carries one.
+  `created` or their own record. Revisit if the sandbox payment object carries one
+  (superseded 2026-09-26 by "Worldline: metadata echo and creation time (2026-09-26)").
 
 ## Paysafe Interac e-Transfer (2026-07-15)
 
@@ -4378,3 +4380,168 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   in tests that set `IS_REACT_ACT_ENVIRONMENT`, and an unmount committed before that microtask
   would force a choice between a late report and a lost one. Keying on the inputs with no
   window would drop the reveal's report.
+
+## Worldline: metadata echo and creation time (2026-09-26)
+
+- **Session metadata travels as `order.references.merchantParameters`, JSON-encoded, and
+  reads back as `PaymentInfo.metadata`.** This supersedes the note in "Worldline Direct
+  adapter (2026-07-14)" that Worldline has no arbitrary metadata map: the conformance fixture
+  now runs with `metadataEcho: true`. Doc-verified 2026-09-26 against the API contract
+  (payment.preprod.direct.worldline-solutions.com/v1/public-contract-definition.yaml,
+  v2.507.0): `orderReferences.merchantParameters` is a string with `maxLength: 1000`, "It
+  allows you to store additional parameters for the transaction in the format you prefer
+  (e.g.-> key-value query string, JSON, etc.) These parameters are then echoed back to you in
+  API GET calls and Webhook notifications. This field must not contain any personal data."
+  The echo is `paymentOutput.references.merchantParameters` (`paymentReferences`), and
+  `paymentOutput.merchantParameters` is `deprecated: true` with
+  `x-deprecated-by: references/merchantParameters`. Worldline's Node SDK types both as
+  `string | null` (github.com/wl-online-payments-direct/sdk-nodejs,
+  `src/generated/model/domain/index.ts`).
+- **The release is a major.** Before it the adapter ignored session `metadata`; now it sends
+  it to a field whose contract says it "must not contain any personal data", and session
+  creation refuses metadata it used to accept (below). The 2.0.0 release listed its new
+  session-creation refusals under "Breaking:", and behind `PaymentRouter` the refusal ends the
+  cascade, since `defaultShouldFailover` fails over only on a retryable error or a transient
+  code and `invalid_request` is neither: a session that reached Worldline before is refused
+  with no failover. The metadata is sent by default, as every other adapter that echoes
+  metadata sends it, with no switch to turn it off; the changeset and the guide's "Upgrading
+  from 2.x" note ask hosts to remove personal data and keep within the limit before upgrading.
+- **What is sent, and what is checked, is the JSON.** The adapter serializes the metadata once,
+  before any call to Worldline, with `JSON.stringify` and checks the parse of that exact string,
+  never the object's own entries, so what is sent is what reads back: an object's `toJSON`
+  decides what is sent, an entry JSON leaves out (an `undefined` value) is not sent, and a
+  `Map`, whose JSON is `{}`, sends nothing, as an empty object does. The signed session context
+  carries that parse, not the object, which the host may change while the session is being
+  created. It is an optional field, so a token signed before it was carried still decodes and
+  completes, sending none; a hand-minted context whose metadata's JSON is not an object with
+  entries sends none either. The host id stays on `merchantReference` alone and is not copied
+  into the metadata as `payfanout_id`, which would spend the 1000 characters on a value that
+  already round-trips. Replays are unaffected: the idempotence key replays by key, not by
+  payload.
+- **Refused at session creation, before any call to Worldline,** each as a non-retryable
+  `invalid_request`: metadata whose JSON is longer than 1000 characters; JSON that is not an
+  object (a string's, an array's, a `Date`'s), or no JSON at all (a function, and a `BigInt`
+  or a cycle, which `JSON.stringify` cannot write); and an entry whose value is not a string,
+  which would not read back. The contract is OpenAPI 3.0, whose `maxLength` is JSON Schema's
+  count of characters, defined as Unicode code points, and Worldline may count UTF-16 code
+  units or UTF-8 bytes instead. The adapter counts UTF-16 code units (JavaScript's `length`),
+  as its `merchantReference` and `softDescriptor` checks do: one per character of the Basic
+  Multilingual Plane and two for any other, such as an emoji, so nothing it lets through is
+  over 1000 code points or 1000 code units. The price is refusing metadata that only
+  characters outside that plane take past 1000 code units while it stays within 1000 code
+  points. UTF-8 bytes are not guarded: `JSON.stringify` leaves characters outside ASCII
+  unescaped, and each takes two to four bytes, so if Worldline counts bytes, such metadata can
+  pass the check and be refused by CreatePayment after the customer entered a card.
+- **What is read back.** `references.merchantParameters`, else, only when that is absent
+  (missing or null), the deprecated field. It becomes `metadata` only when it parses to a JSON
+  object with at least one entry, every value a string, as the adapter writes it. Anything else
+  leaves `metadata` unset and never throws, a value in another format among them, such as the
+  contract's own example, `SessionID=126548354&ShopperID=73541312`. A JSON object of strings
+  that another integration on the account stored there would read as metadata.
+- **A 3-D Secure challenge's `requires_action` answer** is built from the CreatePayment answer,
+  not from a read. The contract's schema for that answer's payment includes
+  `paymentOutput.references.merchantParameters`, but its description documents the echo "in
+  API GET calls and Webhook notifications" only. The answer reports the echo whenever it
+  carries the field, read by the rules above, so an echo that is not metadata reports none.
+  Only when it carries none (missing or null) does the metadata of the request that made the
+  payment stand in. For the completion's own payment that is the completion's own, as the JSON
+  it sent reads back: that request made the payment, which stores what was sent, and the Adyen
+  adapter's completion answer reports its context's metadata the same way. For an earlier
+  attempt's payment still open, which may be another session's, it is the metadata that
+  payment reads back with, never this session's, so a completion that returns an earlier
+  session's payment, a challenge or not, reports that payment's metadata. Reporting nothing
+  without an echo was rejected: it would report a payment that carries metadata as having
+  none, which the `retrievePayment` that follows would contradict.
+- **Webhooks.** `UnifiedWebhookEvent` has no metadata field, and the contract stays as it is,
+  so the package exports `readWorldlineWebhookMetadata(event)`, which applies the same rules to
+  the event's raw `payment.paymentOutput`; a refund resource alone yields nothing. It never
+  reads the refund resource's `refundOutput.references.merchantParameters` (nor the deprecated
+  `refundOutput.merchantParameters`): in the contract, RefundPayment takes references of its
+  own (`refundRequest.references`, the same `paymentReferences` schema), so that value is the
+  refund's, which the adapter never sends (its RefundPayment body is `amountOfMoney` alone),
+  and nothing says it repeats the payment's. The contract also marks `refundRequest.references`
+  and `refundOutput.references` deprecated ("**Deprecated for capture/refund**: Use
+  operationReferences instead."), and `refundOutput.merchantParameters` deprecated by
+  `references/merchantParameters`; the schema of `operationReferences`,
+  `operationPaymentReferences`, has no `merchantParameters`. The webhooks guide's examples
+  (docs.direct.worldline-solutions.com/en/integration/api-developer-guide/webhooks) carry
+  `references.merchantReference` and no `merchantParameters`, so the webhook echo rests on the
+  contract's description.
+- **Personal data and secrets** are the host's to keep out, as the JSDoc, the guide and the
+  README say; the adapter does not try to detect them. The session context is signed, not
+  encrypted, so whoever holds `pspSessionId` can read the metadata in it.
+  `createCompletionHandler` resolves `pspSessionId` on the server from the `sessionRef` the
+  browser sends (the session's `clientSecret`, for Worldline the `hostedTokenizationUrl`), so it
+  never has to reach the browser. The metadata does: the completion route answers the browser
+  with the whole `PaymentInfo` (`packages/server/src/completion.ts`), `metadata` included, and
+  after a read-back `raw` holds Worldline's echo, so the guide and the README say to treat
+  Worldline metadata as visible to the customer; in 2.x a Worldline completion carried neither.
+  Measured 2026-09-26 with the adapter and the fake: a minimal session's `pspSessionId` is 264
+  characters, and metadata at the limit adds 1,350 characters when it is ASCII, 2,672 when every
+  character takes two UTF-8 bytes (`é`) or is an emoji, and 3,995 when every character takes
+  three (`€`, `中`), the most it can add, as the JSON's UTF-8 bytes grow by base64url's four
+  characters per three bytes.
+- **`PaymentInfo.createdAt` comes from `paymentOutput.transactionDate`, when it carries a time
+  zone.** This supersedes the note in the same 2026-07-14 entry that it falls back to epoch.
+  The contract types it `format: date-time`, "It is the server-side processing date and time
+  of the transaction.", example `2019-08-24T14:15:22Z`, with the pattern
+  `^([12]\d{3}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01][0-9]|2[0-3]):[0-5]\d:[0-5]\d)(\.\d+)?Z?$`,
+  whose Z is optional. `paymentOutputSummary.transactionDate`, on GetPaymentsReport, is "Date
+  and time the payment was created in UTC", with the Z required. OpenAPI 3.0.0 defines
+  `date-time` "As defined by `date-time` - RFC3339 Section 5.6", whose `full-time` requires a
+  `time-offset`, `"Z" / time-numoffset`, with `time-numoffset = ("+" / "-") time-hour ":"
+  time-minute`. The adapter reads the contract's pattern with the zone made mandatory: Z,
+  `±HH:MM`, as on the webhooks guide's envelope `created`
+  (`2020-12-09T11:20:40.3744722+01:00`), and the hour-only `±HH`, which RFC 3339 does not
+  have but Worldline's Java SDK reads (below), with minutes 00. A value without a zone keeps
+  `1970-01-01T00:00:00.000Z`: the contract names no zone for it and Worldline's own SDKs
+  disagree, and a date that is visibly unknown is safer than one that may be hours out.
+  Fractional seconds are truncated to milliseconds, a day the month does not have is not a
+  date, and anything else, or no value, keeps the placeholder too.
+- **Worldline's SDKs on a `transactionDate` without a zone**, read 2026-09-26 on their default
+  branches:
+  - Java (github.com/wl-online-payments-direct/sdk-java): `PaymentOutput.transactionDate` is
+    a `ZonedDateTime`. `DefaultMarshaller`'s `ZonedDateTimeAdapter.read` tries
+    `DateTimeFormatter.ISO_OFFSET_DATE_TIME`, then `ISO_LOCAL_DATE_TIME` followed by
+    `appendOffset("+HH", "Z")`, and otherwise throws `DateTimeParseException` ("Unable to parse
+    date"). `DefaultMarshallerTest` pins both: `"2026-03-26T12:34:56+01"` parses as `+01:00`,
+    and `"2026-03-10T11:14:15"`, named `withoutOffset`, throws. The short offset came with
+    7.4.1 (2026-03-30): "Fixed deserialization of `ZonedDateTime` in the `DefaultMarshaller`
+    implementation."
+  - .NET (github.com/wl-online-payments-direct/sdk-dotnet): `PaymentOutput.TransactionDate` is
+    a `DateTimeOffset?`, read by Json.NET (`Newtonsoft.Json` 13.0.3 or later), whose
+    `DateTimeUtils.TryParseDateTimeOffsetIso` gives a value without a zone
+    `TimeZoneInfo.Local.GetUtcOffset(d)`, the offset of the machine it runs on
+    (github.com/JamesNK/Newtonsoft.Json, `Src/Newtonsoft.Json/Utilities/DateTimeUtils.cs`). The
+    SDK's `Unmarshal_WithDateTimeWithoutOffset_ParsesDateTime` asserts only the wall-clock
+    `DateTime`, and `Unmarshal_WithShortTimezoneOffset_NormalizesToFullOffset` reads `+01` as
+    `+01:00`.
+  - PHP (github.com/wl-online-payments-direct/sdk-php): `PaymentOutput::fromObject` does
+    `new DateTime($object->transactionDate)`. `DateTime::__construct` (php.net) uses "the
+    current timezone" unless the string specifies one, and `date_default_timezone_get()` takes
+    it from `date_default_timezone_set()`, else the `date.timezone` ini option, else UTC.
+  - Node (sdk-nodejs): `transactionDate` is `string | null`, left to the integrator.
+- **AMBIGUOUS: processing time or creation time.** "The server-side processing date and time
+  of the transaction" does not say whether a later operation moves it. The report schema's
+  "created" supports the creation time, but it describes another schema. Sandbox check: create
+  a payment with manual capture and read `transactionDate` from GetPayment, capture it some
+  minutes later and read it again, then refund it and read it once more; record whether it
+  moves and whether it carries a time zone, and in which form. If it moves, `createdAt`
+  reports a time later than the payment's creation, and the placeholder should come back.
+- **Sandbox checks for the metadata.** Complete one payment with metadata and record whether
+  GetPayment echoes it unchanged under `references`, whether the deprecated field carries it
+  too, whether the CreatePayment answer's payment echoes it (a challenge's answer reports the
+  metadata sent only when it does not), and whether the webhooks of the sale, of a capture and
+  of a refund echo it. Then send metadata whose JSON is 1000 code units of a character such as
+  `é` (1,992 UTF-8 bytes), and metadata within 1000 code points but over 1000 code units, to
+  learn whether Worldline counts code points, UTF-16 code units or UTF-8 bytes.
+- **The fake** stores `merchantParameters` (a string of at most 1000 code units, else a 400 on
+  the property) and echoes it under `references` on GetPayment and webhooks only. It never
+  echoes it on the deprecated field, so the round-trip tests prove the current field is read,
+  nor on the payment a CreatePayment or CancelPayment answer carries, where the contract does
+  not document it, so no test leans on an echo the platform may not send. It stamps
+  `transactionDate` when the payment is created, in the contract example's form
+  (`2019-08-24T14:15:22Z`), and leaves it on later operations: the creation-time reading,
+  unconfirmed. `webhookBody(paymentId, type)` builds a delivery around the payment as
+  GetPayment returns it.
+- **Doc-derived only.** No sandbox run has sent `merchantParameters` or read `transactionDate`.

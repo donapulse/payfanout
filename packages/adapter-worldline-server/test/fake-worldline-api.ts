@@ -29,12 +29,25 @@ import type {
  *     a payment, and settled later with settlePendingAuthorization
  *   - GetPayment failing behind a lever: 404 with the UNKNOWN_PAYMENT_ID body
  *     of the API Troubleshooting page, or 503
+ *   - order.references.merchantParameters, a string of at most 1000
+ *     characters (UTF-16 code units, as for the other limits here), stored and
+ *     echoed as paymentOutput.references.merchantParameters on GetPayment and
+ *     webhooks, where the API contract documents the echo, and never on the
+ *     payment a CreatePayment or CancelPayment answer carries, nor on the
+ *     deprecated paymentOutput.merchantParameters
+ *   - paymentOutput.transactionDate, stamped when the payment is created and
+ *     left as it is by later operations: the creation-time reading of "the
+ *     server-side processing date and time of the transaction", which no
+ *     sandbox run has confirmed yet
  */
 interface StoredPayment {
   id: string;
   amount: number;
   currencyCode: string;
   merchantReference?: string;
+  merchantParameters?: string;
+  /** In the API contract example's form, "2019-08-24T14:15:22Z". */
+  transactionDate: string;
   status: string;
   statusCode: number;
   statusCategory: string;
@@ -128,7 +141,10 @@ export class FakeWorldlineApi {
   freshErrorIdOnReplay = false;
   /** GET /payments/{id} answers this status instead of the payment, whatever the id. */
   paymentReadFailure: 404 | 503 | undefined = undefined;
-  /** The time a key's first CreatePayment is stamped with, in ms since the epoch; each one moves it on a second. */
+  /**
+   * The time a key's first CreatePayment is stamped with, in ms since the epoch,
+   * and its payment's transactionDate; each one moves it on a second.
+   */
   clock = Date.now();
   /** Every CreatePayment that reached the fake, in order: its idempotence key, and whether it replayed a stored answer. */
   readonly createPaymentLog: Array<{ idemKey: string | undefined; replayed: boolean }> = [];
@@ -224,7 +240,7 @@ export class FakeWorldlineApi {
     }
     const requestedAt = this.clock;
     this.clock += 1000;
-    const { status, body: answer } = this.processCreatePayment(body);
+    const { status, body: answer } = this.processCreatePayment(body, requestedAt);
     const serialized = JSON.stringify(answer);
     // Every answer the fake gives is a completed request's, a refusal included:
     // the guide's "For completed requests" read literally.
@@ -232,10 +248,10 @@ export class FakeWorldlineApi {
     return new Response(serialized, { status, headers: { "content-type": "application/json" } });
   }
 
-  private processCreatePayment(body: Record<string, unknown>): { status: number; body: unknown } {
+  private processCreatePayment(body: Record<string, unknown>, requestedAt: number): { status: number; body: unknown } {
     const order = (body["order"] ?? {}) as {
       amountOfMoney?: { amount?: number; currencyCode?: string };
-      references?: { merchantReference?: string; softDescriptor?: string };
+      references?: { merchantReference?: string; softDescriptor?: string; merchantParameters?: unknown };
       customer?: { device?: unknown };
     };
     // hostedTokenizationId is a ROOT CreatePayment property on the real platform.
@@ -300,6 +316,11 @@ export class FakeWorldlineApi {
     if ((order.references?.softDescriptor?.length ?? 0) > 256) {
       return invalid("order.references.softDescriptor", "exceeds 256 characters");
     }
+    // The API contract types orderReferences.merchantParameters as a string of at most 1000 characters.
+    const merchantParameters = order.references?.merchantParameters;
+    if (merchantParameters !== undefined && !text(1000)(merchantParameters)) {
+      return invalid("order.references.merchantParameters", "outside the documented type or limit");
+    }
     // The API contract's types and limits on customerDevice and its browserData.
     const device = order.customer?.device;
     if (device !== undefined) {
@@ -329,12 +350,20 @@ export class FakeWorldlineApi {
     const id = `pay_${++this.seq}`;
     const sale = (card.authorizationMode ?? "SALE").toUpperCase() !== "PRE_AUTHORIZATION";
     const merchantReference = order.references?.merchantReference;
+    const created = {
+      id,
+      amount,
+      currencyCode,
+      merchantReference,
+      merchantParameters: merchantParameters as string | undefined,
+      transactionDate: contractDateTime(requestedAt),
+    };
     const refusedPendingCode = this.refusedWhilePending.get(hostedTokenizationId);
     if (amount === DECLINE_AMOUNT || this.declinedCards.has(hostedTokenizationId) || refusedPendingCode !== undefined) {
       // Documented decline shape: HTTP 402 with errors[] and, in paymentResult,
       // the payment the attempt created, REJECTED unless a lever says otherwise.
       const payment: StoredPayment = {
-        id, amount, currencyCode, merchantReference,
+        ...created,
         ...(refusedPendingCode === undefined
           ? { status: "REJECTED", statusCode: 2, statusCategory: "UNSUCCESSFUL" }
           : pendingAuthorization(refusedPendingCode)),
@@ -356,7 +385,7 @@ export class FakeWorldlineApi {
     const pendingCode = this.pendingCards.get(hostedTokenizationId);
     if (pendingCode !== undefined) {
       const payment: StoredPayment = {
-        id, amount, currencyCode, merchantReference,
+        ...created,
         ...pendingAuthorization(pendingCode),
         sale, capturableRemaining: 0, captures: [], refunds: [],
       };
@@ -365,7 +394,7 @@ export class FakeWorldlineApi {
     }
     if (this.rejectPayment) {
       const payment: StoredPayment = {
-        id, amount, currencyCode, merchantReference,
+        ...created,
         status: "REJECTED", statusCode: 2, statusCategory: "UNSUCCESSFUL",
         sale, capturableRemaining: 0, captures: [], refunds: [],
         ...(this.rejectPayment.errors ? { errors: this.rejectPayment.errors } : {}),
@@ -375,7 +404,7 @@ export class FakeWorldlineApi {
     }
     if (hostedTokenizationId === THREE_DS_TOKEN) {
       const payment: StoredPayment = {
-        id, amount, currencyCode, merchantReference,
+        ...created,
         status: "REDIRECTED", statusCode: 46, statusCategory: "PENDING_CONNECT_OR_3RD_PARTY",
         sale, capturableRemaining: sale ? 0 : amount, captures: [], refunds: [],
       };
@@ -388,12 +417,12 @@ export class FakeWorldlineApi {
             actionType: "REDIRECT",
             redirectData: { redirectURL: `https://payment.preprod.direct.worldline-solutions.com/3ds/challenge/${id}` },
           },
-          payment: publicPayment(payment),
+          payment: publicPayment(payment, "answer"),
         },
       };
     }
     const payment: StoredPayment = {
-      id, amount, currencyCode, merchantReference,
+      ...created,
       status: sale ? "CAPTURED" : "PENDING_CAPTURE",
       statusCode: sale ? 9 : 5,
       statusCategory: sale ? "COMPLETED" : "PENDING_MERCHANT",
@@ -411,6 +440,17 @@ export class FakeWorldlineApi {
   private store(payment: StoredPayment): void {
     this.payments.set(payment.id, payment);
     this.uniquePaymentCreations++;
+  }
+
+  /**
+   * Test helper: a `type` webhook delivery carrying the payment as GetPayment
+   * returns it now, in the envelope of the webhooks guide's examples less the
+   * merchantId the adapter never reads.
+   */
+  webhookBody(paymentId: string, type: string): Record<string, unknown> {
+    const payment = this.payments.get(paymentId);
+    if (!payment) throw new Error(`No payment ${paymentId}`);
+    return { apiVersion: "v1", id: `evt_${++this.seq}`, created: new Date(this.clock).toISOString(), type, payment: publicPayment(payment) };
   }
 
   /** Test helper: the payment the answer stored under an idempotence key reports, if any. */
@@ -563,7 +603,10 @@ export class FakeWorldlineApi {
       return {
         status: 200,
         body: {
-          payment: publicPayment({ ...payment, status: "CANCELLATION_REJECTED", statusCode: 63, statusCategory: "UNSUCCESSFUL" }),
+          payment: publicPayment(
+            { ...payment, status: "CANCELLATION_REJECTED", statusCode: 63, statusCategory: "UNSUCCESSFUL" },
+            "answer",
+          ),
         },
       };
     }
@@ -576,11 +619,11 @@ export class FakeWorldlineApi {
       payment.statusCode = 61;
       return {
         status: 200,
-        body: { payment: { ...publicPayment(payment), statusOutput: { statusCode: 61, statusCategory: "PENDING_MERCHANT" } } },
+        body: { payment: { ...publicPayment(payment, "answer"), statusOutput: { statusCode: 61, statusCategory: "PENDING_MERCHANT" } } },
       };
     }
     payment.statusCode = 6;
-    return { status: 200, body: { payment: publicPayment(payment) } };
+    return { status: 200, body: { payment: publicPayment(payment, "answer") } };
   }
 
   private refund(id: string, body: Record<string, unknown>, idemKey: string | undefined): Response {
@@ -633,6 +676,7 @@ export class FakeWorldlineApi {
         id: paymentId,
         amount: 1000,
         currencyCode: "EUR",
+        transactionDate: contractDateTime(this.clock),
         status: "CAPTURED",
         statusCode: 9,
         statusCategory: "COMPLETED",
@@ -688,7 +732,16 @@ export class FakeWorldlineApi {
   }
 }
 
-function publicPayment(payment: StoredPayment): WorldlinePaymentLike {
+/**
+ * The payment as GetPayment and webhooks show it, or as a POST `answer`
+ * carries it, without the merchantParameters echo the API contract documents
+ * "in API GET calls and Webhook notifications" only.
+ */
+function publicPayment(payment: StoredPayment, view: "read" | "answer" = "read"): WorldlinePaymentLike {
+  const references = {
+    ...(payment.merchantReference ? { merchantReference: payment.merchantReference } : {}),
+    ...(view === "read" && payment.merchantParameters !== undefined ? { merchantParameters: payment.merchantParameters } : {}),
+  };
   return {
     id: payment.id,
     status: payment.status,
@@ -699,20 +752,26 @@ function publicPayment(payment: StoredPayment): WorldlinePaymentLike {
     },
     paymentOutput: {
       amountOfMoney: { amount: payment.amount, currencyCode: payment.currencyCode },
-      ...(payment.merchantReference ? { references: { merchantReference: payment.merchantReference } } : {}),
+      ...(Object.keys(references).length > 0 ? { references } : {}),
       cardPaymentMethodSpecificOutput: {
         card: { cardNumber: "************4675", expiryDate: "1230" },
         paymentProductId: 1,
       },
+      transactionDate: payment.transactionDate,
     },
   };
+}
+
+/** Epoch milliseconds as the API contract's transactionDate example writes a date-time: whole seconds, UTC, Z. */
+function contractDateTime(epochMs: number): string {
+  return new Date(epochMs).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
 function createResponse(payment: StoredPayment): {
   creationOutput: unknown;
   payment: WorldlinePaymentLike;
 } {
-  return { creationOutput: { tokens: "" }, payment: publicPayment(payment) };
+  return { creationOutput: { tokens: "" }, payment: publicPayment(payment, "answer") };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

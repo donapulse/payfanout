@@ -217,6 +217,19 @@ field only points the adapter at a different Worldline-served URL. Worldline als
 the script tag to carry `integrity` (the `sri` value of the CreateHostedTokenization response)
 and `crossorigin="anonymous"`; the adapter does not apply that subresource integrity check
 yet.
+
+**Nonce-based policies.** Pass the nonce your server put in the page's policy as
+`cspNonce` (the adapter never reads one from the page), and the adapter sets it as the
+`nonce` attribute of the Tokenizer `<script>` it injects. That matters only for a
+`script-src` that allows scripts by nonce without `'strict-dynamic'`: under
+`'strict-dynamic'` the script-created tag loads without one, and the Worldline host in
+`script-src` allows it anyway. The Tokenizer reads no nonce, loads no further script and
+adds no `<style>`, so that tag is all the nonce needs to cover; `frame-src` and
+`connect-src` still need the host. It sets one inline `style` attribute, which no nonce
+can cover: under a `style-src` without `'unsafe-inline'`, such as one with a nonce, the
+browser skips it, a cosmetic loss. On a page that can mount other PSPs as well, read
+[Content-Security-Policy on a page with several PSPs](/guide/providers#content-security-policy-on-a-page-with-several-psps)
+before giving a directive a nonce.
 :::
 
 ## 6. 3-D Secure
@@ -233,6 +246,7 @@ supply:
 | Authentication | `threeDSecure.skipAuthentication: false`, never the deprecated flat `cardPaymentMethodSpecificInput.skipAuthentication` |
 | Browser device data | `order.customer.device`: `locale`, `timezoneOffsetUtcMinutes`, `userAgent`, and `browserData` (`colorDepth`, `javaEnabled`, `javaScriptEnabled`, `screenHeight`, `screenWidth`), read in the browser by the client adapter's `confirm()` |
 | Challenge preference | `threeDSecure.challengeIndicator: "challenge-required"` when the session passes `sca: { challenge: "force" }`; otherwise omitted, which is Worldline's `no-preference` default |
+| Cartes Bancaires use case | `cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure.usecase: "single-amount"` on every payment, whatever the card's brand, which the adapter does not learn before paying. The 3-D Secure guide writes `useCase`; the API contract and Worldline's Node SDK spell it `usecase`. The adapter neither stores cards nor charges them again, so each payment is a single amount |
 
 **The return URL is mandatory.** Pass `returnUrl` on `createPaymentSession`, or set
 `defaultReturnUrl` on the adapter (§4), absolute, with a scheme such as `https://` or an app
@@ -250,9 +264,17 @@ The descriptor is sent as `order.references.softDescriptor`, not the deprecated 
 Worldline advises at most 22 characters, as issuers start truncating beyond that, and
 currently allows a per-payment override only for the AIB and Barclays acquirers.
 
-`sca: { exemption: "moto" }` is not mapped yet. Worldline models MOTO as a transaction channel
-(`cardPaymentMethodSpecificInput.transactionChannel: "MOTO"`), not as an exemption, so such a
-payment goes out as an e-commerce payment with 3-D Secure.
+`sca: { exemption: "moto" }` sends `cardPaymentMethodSpecificInput.transactionChannel: "MOTO"`,
+Worldline's channel for mail order and telephone order payments. Without it no channel is sent,
+and Worldline applies its `ECOMMERCE` default. Worldline's 3-D Secure page lists MOTO among the
+transactions outside the scope of SCA and says its platform detects such exclusions itself, but
+not what it does with the 3-D Secure data a MOTO payment carries. The adapter sends that data
+unchanged, so a MOTO payment Worldline does not treat as excluded still goes through 3-D Secure
+rather than skipping it. A challenge then comes back as `requires_action` like any other, and on
+a telephone order it would open in the browser the card was typed into, not the cardholder's,
+so such a payment stays unfinished instead of being charged without authentication. A
+`challenge: "force"` on the same session still sends `challengeIndicator: "challenge-required"`,
+as Stripe's adapter does. Run one MOTO payment in the sandbox before you rely on it (§10).
 
 `confirm()` hands the server a JSON `clientToken`,
 `{"hostedTokenizationId":"…","device":{…}}`. It carries browser characteristics only, never
@@ -267,11 +289,6 @@ Worldline also lists `order.customer.device.acceptHeader` and, for Visa and Cart
 `order.customer.device.ipAddress`. Both come from the customer's HTTP request to your server,
 not from the browser, and neither `CompletePaymentInput` nor `createCompletionHandler` carries
 them to the adapter today, so the adapter cannot send them.
-
-Cartes Bancaires additionally requires
-`cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure.useCase`.
-Worldline's API contract spells that property `usecase`, so the adapter does not send it until
-a sandbox run settles the name.
 :::
 
 The adapter tokenizes with `storePermanently: false`, so no card is stored at Worldline for
@@ -640,6 +657,15 @@ current list there** rather than assuming.
 
 - [ ] Before you switch, run one **challenge-flow** test card (§9) end to end in sandbox, so
       the return to your `returnUrl` and the `retrievePayment` reconciliation are exercised.
+- [ ] Accepting Cartes Bancaires? Run one frictionless and one challenge card from the
+      Cartes Bancaires block of Worldline's test cases (§9), which exercise the use case the
+      adapter sends on every card payment.
+- [ ] Sending `sca: { exemption: "moto" }`? Run one MOTO payment end to end in sandbox too,
+      since what Worldline does with its 3-D Secure data is undocumented (§6). For MOTO
+      payments taken in its e-Terminal, Worldline requires an acquirer that allows them and the
+      feature enabled on your account, and asks you to "Meet the PCI DSS certification SAQ
+      C-VT": check all three for your API account. Card details your staff key in bring their
+      workstations into PCI DSS scope, so confirm your SAQ with your acquirer.
 - [ ] Swap in the **live** API key id + secret and the **live** merchant id.
 - [ ] Plan the live API key renewal ahead of its *Expiration date* (Developer → Payment API):
       the old pair expires within four hours of creating a new one, so deploy the new pair
@@ -649,8 +675,8 @@ current list there** rather than assuming.
 - [ ] Register the **live** webhook endpoint in the portal and use its **live** key id + secret.
 - [ ] Keep `WORLDLINE_SESSION_KEY` stable and secret in production, rotate it deliberately
       (it invalidates in-flight sessions), and store it like any other secret.
-- [ ] Verify card fields are still the Worldline Hosted Tokenization iframe (SAQ-A), no raw
-      card input.
+- [ ] Verify card fields are still the Worldline Hosted Tokenization iframe, no raw card
+      input: SAQ-A for card details the cardholder enters.
 - [ ] Re-check endpoint paths, webhook event types, and error codes against the current
       Worldline documentation.
 

@@ -59,9 +59,9 @@ export interface WorldlineSessionContextV1 {
   shippingDetails?: ShippingDetails;
   /**
    * SCA preference. `challenge: "force"` becomes threeDSecure.challengeIndicator
-   * "challenge-required". `exemption: "moto"` is not mapped yet: Worldline models MOTO as
-   * cardPaymentMethodSpecificInput.transactionChannel "MOTO", not as an exemption, so such a
-   * payment goes out as an e-commerce payment with 3-D Secure.
+   * "challenge-required". `exemption: "moto"` becomes
+   * cardPaymentMethodSpecificInput.transactionChannel "MOTO", Worldline's mail order /
+   * telephone order channel, and leaves the 3-D Secure data unchanged.
    */
   sca?: CreatePaymentSessionInput["sca"];
 }

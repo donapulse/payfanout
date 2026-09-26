@@ -120,9 +120,16 @@ const payzen = new PayZenClientAdapter({
 
 - Card number, expiry, and CVV render as **Lyra-hosted iframes** (SAQ-A eligible); 3DS2
   challenges run in an inline pop-in, never a navigation.
-- The script loads in SPA mode (`kr-spa-mode`) and deliberately **without `async`**
-  (PayZen documents that async loading breaks on older mobile browsers). KR is a single
-  page-global: one PayZen form per page.
+- The script loads in SPA mode (`kr-spa-mode`) and without `async`, a conservative
+  choice: PayZen's current pages do not mention async loading. The theme stylesheet
+  (`cssUrl`) is added once the script has loaded, since PayZen
+  [requires](https://payzen.io/en-EN/rest/V4.0/javascript/guide/payment_form.html) theme
+  files to load after the library, and `loadSdk()` does not wait for it: the default theme
+  imports Google Fonts, whose loading would otherwise hold up the first mount on each page
+  load. An empty
+  `cssUrl` loads no theme stylesheet, which PayZen describes as optional. KR is a single
+  page-global: one PayZen form per page, and a second adapter instance waits for the
+  script another one is still loading.
 - `fieldOptions` passes through to `KR.setFormConfig` (`kr-placeholder-*`,
   `kr-hide-debug-toolbar`, …). Protected keys the host cannot override: `formToken`,
   `kr-public-key`, `kr-spa-mode`, and `language` when a `locale` is given.
@@ -154,6 +161,30 @@ element, so `style-src` also needs `'unsafe-inline'`. If you override the URLs w
 `scriptUrl` / `cssUrl` (your Back Office "JavaScript URL"), allow those hosts instead.
 The onboarding descriptor (`payzenOnboarding.csp`) also lists `https://api.payzen.eu`
 under `connect`: the served krypton-client names that host, and PayZen's list does not.
+
+**Nonce-based policies.** Pass the nonce your server put in the page's policy as
+`cspNonce` (the adapter never reads one from the page), and the adapter sets it as the
+`nonce` attribute of both tags it injects, the krypton-client `<script>` and the theme
+stylesheet `<link>`. For the script, that matters only for a `script-src` that allows
+scripts by nonce without `'strict-dynamic'`: under `'strict-dynamic'` the script-created
+tag loads without one, and `https://static.payzen.eu` in `script-src` allows it anyway.
+For the stylesheet, it matters for any `style-src` that allows stylesheets by nonce, since
+`'strict-dynamic'` never applies to styles. krypton-client reads no nonce itself, and the
+scripts it adds to your page carry none: its `kr-asset-*` chunks from
+`https://static.payzen.eu`, Apple's Apple Pay SDK from `https://applepay.cdn-apple.com`
+when the smartForm offers Apple Pay with production keys (with test keys krypton-client
+shows a simulator and loads no Apple script, so a sandbox run will not reveal a missing
+host), and a risk-analysis script whose URL comes from the
+form token. A nonce-only `script-src` must allow their hosts, or add `'strict-dynamic'`,
+which allows the scripts krypton-client creates. Its Google Pay and Samsung Pay SDKs load
+inside krypton-client's own iframe, which your page's policy does not govern. The theme
+stylesheet's Google Fonts `@import`s carry no nonce either, so a nonce-based `style-src`
+still needs the Google Fonts hosts above. Nor does the inline `<style>` above
+(`kr-base-styles`, added when a form mounts): a nonce in `style-src` turns
+`'unsafe-inline'` off, so it blocks that style whatever `cspNonce` does. On a page that can
+mount other PSPs as well, read
+[Content-Security-Policy on a page with several PSPs](/guide/providers#content-security-policy-on-a-page-with-several-psps)
+before giving a directive a nonce.
 :::
 
 ## 6. Offer several payment methods (smartForm)

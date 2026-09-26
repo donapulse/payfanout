@@ -314,10 +314,12 @@ const adyen = new AdyenClientAdapter({
   makes the load fail with `invalid_request`. A stylesheet `<link>` your page adds for the
   default URL is used as it is, so give it `ADYEN_WEB_STYLESHEET_INTEGRITY` and a
   `crossorigin` attribute to keep the check.
-- If the script fails to load, the next mount fetches it again, with the stylesheet if that
-  failed too; if it loaded without defining `window.AdyenWeb`, the next mount checks again
-  instead of failing from a cached result. A stylesheet that fails to load never blocks the
-  fields from mounting.
+- If the script fails to load, the next mount fetches it again; if it loaded without
+  defining `window.AdyenWeb`, the next mount checks again instead of failing from a cached
+  result. A stylesheet that failed stays on the page and is reused, and it never blocks the
+  fields from mounting. The mount does wait for the stylesheet to load or fail, and for the
+  sheets it `@import`s: Adyen's `adyen.css` imports none, but a `stylesheetUrl` of your own
+  that imports from a slow host delays the first mount on each page load.
 
 ::: tip Content-Security-Policy
 A CSP-enforcing page must allow Adyen, or the fields fail quietly. 3-D Secure 2 challenges
@@ -357,6 +359,21 @@ Adyen's sample also allows wallet and partner hosts in `script-src`; this adapte
 only the Card component, so it needs none of them. The onboarding descriptor
 (`adyenOnboarding.csp`) lists `https://*.adyen.com` under `script` and `*` under `frame` and
 `connect`; `style-src`, `form-action` and `img-src` have no descriptor field.
+
+**Nonce-based policies.** Pass the nonce your server put in the page's policy as
+`cspNonce` (the adapter never reads one from the page), and the adapter sets it as the
+`nonce` attribute of both tags it injects, the Adyen Web `<script>` and the `adyen.css`
+`<link>`. For the script, that matters only for a `script-src` that allows scripts by
+nonce without `'strict-dynamic'`: under `'strict-dynamic'` the script-created tag loads
+without one, and `https://*.adyen.com` in `script-src` allows it anyway. For the
+stylesheet, it matters for any `style-src` that allows stylesheets by nonce, since
+`'strict-dynamic'` never applies to styles. The Card component reads no nonce, adds no
+inline script or style and loads no further script, as long as `fieldOptions` configures
+no wallet such as Click to Pay, so those two tags are all the nonce needs to cover; frames,
+connections, form targets and images still follow the policy above. On a page that can
+mount other PSPs as well, read
+[Content-Security-Policy on a page with several PSPs](/guide/providers#content-security-policy-on-a-page-with-several-psps)
+before giving a directive a nonce.
 :::
 
 ## 6. 3-D Secure

@@ -870,11 +870,13 @@ docs.direct.worldline-solutions.com unless noted):
   Worldline models MOTO as `cardPaymentMethodSpecificInput.transactionChannel` (`ECOMMERCE` by
   default, or `MOTO`), not as an `exemptionRequest` value; the adapter does not map
   `sca.exemption: "moto"` yet, so such a payment goes out as an e-commerce payment with
-  3-D Secure. The return URL became mandatory — the session's `returnUrl` or the new
-  `defaultReturnUrl`, refused before any call otherwise (a breaking change), as is a URL over
-  the contract's 200 characters or without a protocol (`https://`, or a custom `protocol://`
-  for mobile apps). `merchantReference` (max 40) and the statement descriptor (max 256) are
-  length-checked at session creation. The descriptor is now sent as `softDescriptor`:
+  3-D Secure (superseded 2026-09-26: it now sends `transactionChannel: "MOTO"`, see "Worldline:
+  Cartes Bancaires use case and MOTO (2026-09-26)"). The return URL became mandatory — the
+  session's `returnUrl` or the new `defaultReturnUrl`, refused before any call otherwise (a
+  breaking change), as is a URL over the contract's 200 characters or without a protocol
+  (`https://`, or a custom `protocol://` for mobile apps). `merchantReference` (max 40) and the
+  statement descriptor (max 256) are length-checked at session creation. The descriptor is now
+  sent as `softDescriptor`:
   `descriptor` is deprecated with `x-deprecated-by: merchantReconciliationReference`, and its
   description recommends `merchantReconciliationReference` "for the same usage, and the new
   softDescriptor on top only in case you start needing another specific value to be pushed to
@@ -895,8 +897,10 @@ docs.direct.worldline-solutions.com unless noted):
   adapter, so neither is sent; Cartes Bancaires also requires
   `cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure.useCase`, which
   the contract's `paymentProduct130SpecificThreeDSecure` spells `usecase`, so it is not sent
-  until a sandbox run settles the name. Sandbox-verify one challenge flow with device data
-  before production.
+  until a sandbox run settles the name. Superseded 2026-09-26 by "Worldline: Cartes Bancaires
+  use case and MOTO (2026-09-26)": the contract, Worldline's Node SDK and Worldline's own
+  plugins agree on `usecase`, which every card payment now sends. Sandbox-verify one challenge
+  flow with device data before production.
 - **Refund reads (corrected in review, 2026-07-15):** Direct has NO refund-by-id endpoint —
   `GET /{merchantId}/refunds/{refundId}` is Connect-era; the only read surface is
   `GET /v2/{merchantId}/payments/{paymentId}/refunds`. `refundPayment` therefore returns a
@@ -2122,7 +2126,9 @@ sandbox round-trip before production use, and the setup guide carries that warni
     Adyen Web reports a contradicting prefix only once `AdyenCheckout()` runs and still
     takes an origin key (`pub.`) with a console notice. If the script fails to load, the
     next mount fetches it again, with the stylesheet if that failed too (a `<link>` the
-    adapter injected is removed when its load fails); if it loaded without defining
+    adapter injected is removed when its load fails; superseded 2026-09-26 by "CSP nonces on
+    injected PSP tags (2026-09-26)": a failed stylesheet link now stays on the page and is
+    reused); if it loaded without defining
     `window.AdyenWeb`, the next mount checks again instead of failing from a cached result,
     and only a host `loadScript` fetches anew then, since the tag already on the page is
     reused. Adyen Web errors are read by `name` first (the 6.45.2 source defines
@@ -4043,3 +4049,280 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `reenter_transaction` stay declines in both halves. The server reads Stripe's
   `processing_error` as retryable, and whether a retried confirmation of the same intent
   would help after those answers is not documented.
+
+## Worldline: Cartes Bancaires use case and MOTO (2026-09-26)
+
+- **Every card CreatePayment sends the Cartes Bancaires use case, `single-amount`,** as
+  `cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure.usecase`. This
+  supersedes the 2026-09-23 note in "Worldline Direct adapter (2026-07-14)" that the use case
+  is "not sent until a sandbox run settles the name": the documentation settles it.
+  Doc-verified 2026-09-26 against the 3-D Secure implementation guide
+  (docs.direct.worldline-solutions.com/en/security-and-risk-management/3d-secure/implementation,
+  "Mandatory properties"): "If you process transactions for Cartes Bancaires, make sure to add
+  the following mandatory properties as well: For all integration methods:
+  cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure.useCase". The API
+  contract (payment.preprod.direct.worldline-solutions.com/v1/public-contract-definition.yaml,
+  v2.507.0) names the property `usecase` on `paymentProduct130SpecificThreeDSecure`, "Indicates
+  the type of payment for which an authentication is requested", with the values
+  `single-amount`, `fixed-amount-term-subscription`, `payment-by-instalments`,
+  `payment-upon-shipment` and `other-recurring-payments`. Worldline's Node SDK spells it the
+  same way (`usecase?: string | null` on `PaymentProduct130SpecificThreeDSecure`,
+  github.com/wl-online-payments-direct/sdk-nodejs, `src/generated/model/domain/index.ts`), and
+  so do Worldline's own e-commerce plugins, which send `single-amount` (plugin-prestashop-8
+  `src/Builder/PaymentRequestBuilder.php`, plugin-magento-creditcard
+  `Service/CreatePaymentRequest/CardPaymentMethodSIDBuilder.php`). The guide's `useCase` does
+  not outweigh them: the same list writes `order.customer.billingaddress.city` next to
+  `order.customer.billingAddress.countryCode`. Worldline's Cartes Bancaires payment-method
+  page (docs.direct.worldline-solutions.com/en/payment-methods-and-features/payment-methods/cartes-bancaires)
+  does not name `paymentProduct130SpecificInput`; the implementation guide's mandatory list is
+  the more specific statement, so an audit working from that page should not drop the
+  property.
+- **Whatever the brand, and always `single-amount`.** The adapter does not read the card
+  before creating the payment. GetHostedTokenization would name its product
+  (`token.paymentProductId`), at the cost of a call on every completion, to withhold a property
+  Worldline's own plugins send for every brand: both build it in their generic card builders,
+  whatever authorisation mode the merchant configured, gated only by their own 3-D Secure
+  settings. The adapter declares neither saved payment methods nor native subscriptions, and
+  its client tokenizes with `storePermanently: false`, so every payment is a one-off charge,
+  manual capture included. `numberOfItems` (int32, 0 to 99, "99 if more than 99 items") is left
+  out, since `CreatePaymentSessionInput` carries no line items, and so are `acquirerExemption`
+  and `merchantScore`, for which the adapter has no input.
+- **`sca.exemption: "moto"` sends `cardPaymentMethodSpecificInput.transactionChannel: "MOTO"`.**
+  This supersedes the 2026-09-23 note in the same entry that the adapter does not map it. The
+  contract describes the channel as "Indicates the channel via which the payment is created.
+  Allowed values: ECOMMERCE - The transaction is a regular E-Commerce transaction. MOTO - The
+  transaction is a Mail Order/Telephone Order. Defaults to ECOMMERCE.", and its
+  `exemptionRequest` has no MOTO value (`none`, `transaction-risk-analysis`, `low-value`,
+  `whitelist`). Without the exemption no channel is sent, so the default applies. Core's
+  `ScaPreference.exemption` has no other value, and a context carrying another sends no channel
+  either.
+- **AMBIGUOUS: the 3-D Secure data on a MOTO payment.** Worldline's 3-D Secure page
+  (docs.direct.worldline-solutions.com/en/security-and-risk-management/3d-secure/) lists
+  "Transactions through mail order/telephone order (MOTO)" among the transactions out of SCA's
+  scope, and says "Our platform detects these exclusions automatically, freeing you from
+  indicating them in your transaction requests." No page says whether a MOTO CreatePayment
+  should still carry `threeDSecure` (`skipAuthentication: false`, `redirectionData`, a
+  `challengeIndicator`) and the device data, nor what the platform does with them. The adapter
+  takes the conservative reading and sends them unchanged: a MOTO payment the platform does not
+  treat as excluded then goes through 3-D Secure instead of skipping it. The cost: on a
+  telephone order, a challenge opens in the browser the card was typed into, not the
+  cardholder's, so that payment stays unfinished rather than being charged unauthenticated.
+  The device data is that operator's browser too, the same for every order they key in, so a
+  frictionless pass on a MOTO payment would rest on data that is not the cardholder's.
+  Sandbox check: complete a MOTO session with the frictionless and the challenge test cards,
+  and record whether Worldline accepts each, whether the challenge card still answers with a
+  REDIRECT merchantAction, what `cardPaymentMethodSpecificOutput.threeDSecureResults` (eci,
+  liability) shows on the frictionless one, and what an account without MOTO enabled answers. For MOTO payments
+  taken in the e-Terminal, the e-Terminal page
+  (docs.direct.worldline-solutions.com/en/design-and-test-tools/applications/merchant-portal/e-terminal)
+  asks "Meet the PCI DSS certification SAQ C-VT. Ensure your acquirer allows you to process
+  mail order/telephone order (MOTO) transactions. Have the feature enabled on your account.";
+  the guide passes all three on to hosts until the check shows what API payments need.
+- **The fake checks both properties against the contract.** It rejects a `transactionChannel`
+  other than `ECOMMERCE` or `MOTO`, a `paymentProduct130SpecificInput` or `threeDSecure` that is
+  not an object, a `usecase` outside the five values, a `numberOfItems` that is not an integer
+  from 0 to 99, an `acquirerExemption` that is not a boolean, and a `merchantScore` that is not
+  a string of at most 20 characters. It models no card brands, so it does not refuse a Cartes
+  Bancaires payment sent without the use case; the adapter's tests check that every
+  CreatePayment carries it, those of a completion walked past a decline included.
+- **Doc-derived only.** No sandbox run has sent either property. Sandbox check for the use
+  case: pay with one frictionless and one challenge card from the "Cartes Bancaires" block of
+  the test cases page (docs.direct.worldline-solutions.com/en/integration/how-to-integrate/test-cases/)
+  and record whether CreatePayment accepts `usecase`.
+
+## CSP nonces on injected PSP tags (2026-09-26)
+
+- **The nonce is an explicit adapter option, and core puts it on the tags.** Every client
+  adapter that injects a PSP browser SDK (Stripe, Paysafe, PayPal, PayZen, Worldline,
+  Adyen) takes an optional `cspNonce`; GoCardless injects nothing and takes none. Like
+  `environment`, it is never inferred: no adapter reads a nonce from the page, and a host
+  `loadScript` or `loadStylesheet` seam loads without it. Core's `InjectScriptOptions`
+  gains `nonce`, `attributes` and `async` (`true` unless given `false`), and core exports
+  `injectStylesheet` and `isValidCspNonce`, which both helpers and every constructor use.
+  This closes #179; moving the PayZen loader onto the helpers closes #173.
+- **Set with `setAttribute`, before the URL and before insertion.** Doc-verified
+  2026-09-26 against the HTML standard and the CSP3 editor's draft of 16 September 2026.
+  HTML's "prepare the script element" reads "Let cryptographic nonce be el's
+  [[CryptographicNonce]] internal slot's value." when the inserted element is prepared,
+  and "user agents may start fetching the classic script … as soon as the src attribute
+  is set"; CSP3 §6.7.2.3 adds "If nonce is the empty string, return "Does Not Match"."
+  For a `<link rel="stylesheet">`, "create link options from element" takes "the current
+  value of el's [[CryptographicNonce]] internal slot" when the fetch starts, as the link
+  becomes connected, and CSP3's `style-src` governs "Stylesheet requests originating from a
+  link element". In headless Chromium 151, a script and a link whose nonce was set before
+  insertion loaded, while a nonce set after `src` or `href` on an inserted element, an
+  empty nonce and a wrong one were blocked. The `nonce` property and `setAttribute` both
+  reach [[CryptographicNonce]], but CSP3's inline check reads the content attribute ("If
+  element does not have an attribute named "nonce", return "Not Nonceable"."), so the
+  helpers use `setAttribute`, which satisfies both readings; `attributes` and `async` are
+  set at the same point.
+- **Validated against CSP3's grammar.** `isValidCspNonce` accepts a non-empty
+  `base64-value = 1*( ALPHA / DIGIT / "+" / "/" / "-" / "_" ) *2( "=" )`, the only value a
+  `'nonce-…'` source holds, so a tag carrying anything else can match no policy. Both
+  helpers reject another value with a non-retryable `invalid_request` before injecting
+  anything, and every constructor refuses a malformed `cspNonce` as it refuses a bad
+  `environment`, without echoing it. The check is on form only: a value that kept its
+  `nonce-` prefix passes, and matches nothing. It returns a plain `boolean`, not a
+  `value is string` predicate: TypeScript reads a predicate as true exactly when the value
+  is a string, so a `false` for a malformed string nonce would narrow that string to
+  `never`.
+- **`attributes` refuses what the helper manages and what runs script.** `src`, `async`,
+  `defer`, `integrity`, `crossorigin`, `nonce` and `type`, then `nomodule`, `language`,
+  `event` and `for`, and any name starting with `on`, compared in ASCII lowercase since
+  `setAttribute` lowercases names on HTML elements, reject with `invalid_request`, as does
+  a name `setAttribute` refuses, with its DOMException on `raw`. The four in the middle can
+  make the browser skip the script without a load or error event, which would leave the
+  call pending: HTML's "prepare the script element" returns for "a nomodule content
+  attribute and its type is "classic"", for a type string built from "the concatenation of
+  "text/" and the value of el's language attribute" that names no script type ("No script
+  is executed"), and for an `event` and `for` pair unless "for" matches "window" and
+  "event" matches "onload" or "onload()". `event` and `for` act only as a pair, and each is
+  refused on its own. The element is built before the page lookup, so that refusal does
+  not depend on what the page already holds.
+- **Reuse compares neither the nonce nor the attributes.** The browser read a tag's nonce
+  when it prepared it, so nothing a later call sets changes whether that tag runs. Under a
+  header-delivered policy it also hides the nonce of a connected element (HTML "nonce
+  attributes": "If CSP list contains a header-delivered Content Security Policy, and
+  element has a nonce content attribute whose value is not the empty string: … Set an
+  attribute value for element using "nonce" and the empty string."); Chromium then
+  returned `""` from `getAttribute("nonce")` and the value from the `nonce` property, and
+  kept the attribute under a meta-delivered policy. An attribute comparison would refuse
+  the very tags a nonce policy allowed. A tag the page added itself keeps what the page
+  gave it, so a PayPal SDK tag without `data-csp-nonce`, like a `window.paypal` the page
+  already defined, is used as it is; the PayPal guide says so.
+- **The script nonce matters only without `'strict-dynamic'` and without a host
+  source.** CSP3's script pre-request check under `'strict-dynamic'`: "If the request's
+  parser metadata is "parser-inserted", return "Blocked". Otherwise, return "Allowed"." A
+  script-created tag, which every adapter injects, is allowed without a nonce, as Chromium
+  confirmed, and a host source allows it anyway. `'strict-dynamic'` "only applies to
+  scripts", so the link nonce matters for any nonce-based `style-src`. Under a nonce-only
+  `script-src`, several SDKs' own loads are blocked whatever the adapter sets, since they
+  carry no nonce (served files read 2026-09-26): Stripe.js v3's lazy chunks from
+  `https://js.stripe.com/v3/`, krypton-client V4.0's `kr-asset-*` chunks, Paysafe.js's
+  loaders for the Google Pay, Apple Pay and Paze SDKs, and the PayPal Messages modal's
+  `modal.js`. Stripe.js and krypton-client each carry a chunk loader that would set a
+  nonce, but nothing in either file assigns one. Each guide names what the SDK still
+  needs.
+- **PayPal also gets `data-csp-nonce`, on its tag only.** The v5 best-practices page
+  (developer.paypal.com/sdk/js/v5/best-practices) says "When using a nonce, be sure to pass
+  the nonce into your JS SDK script." and puts one placeholder in both `nonce` and
+  `data-csp-nonce`; the configuration page (developer.paypal.com/sdk/js/v5/configuration)
+  describes `data-csp-nonce` as "CSP single-use token used to render the button." Neither
+  requires the two values to be equal, but the served SDK (5.0.576, loaded with PayPal's
+  `client-id=test` placeholder and `components=buttons`) reads only `data-csp-nonce` from
+  its own tag (`CSP_NONCE:"data-csp-nonce"`), never the tag's `nonce`, and sets the value
+  with `setAttribute` on the inline scripts and styles it creates, while the browser checks
+  the tag's `nonce`; with one nonce per response, both carry the same value. In Chromium,
+  under PayPal's nonce policy, the SDK with `nonce` alone rendered its buttons but its
+  inline style was blocked (one `style-src-elem` violation); with both attributes there was
+  none. The data- copy stays out of core: HTML hides only the `nonce` content attribute, a
+  measure "meant to prevent exfiltration of the nonce value through mechanisms that can
+  easily read content attributes, such as selectors", and a `data-csp-nonce` puts the
+  value back within their reach, which only PayPal needs; the PayPal guide and the option's
+  JSDoc say so. PayPal writes its sources unquoted (`nonce-YOUR_NONCE`), which a browser
+  does not read as a nonce, since CSP3's grammar is `nonce-source = "'nonce-" base64-value
+  "'"`; the guide keeps the quoted form.
+- **Stylesheets through `injectStylesheet`.** It adds one
+  `<link rel="stylesheet">` per page, looked up with `link[rel~="stylesheet"][href="…"]`
+  so that a `<link rel="preload">` for the same URL, which fetches the sheet without
+  applying it, never stands in for it. The nonce, `integrity` and `crossorigin` are set
+  before `href` and insertion, and the call resolves when the sheet loads and also when it
+  fails, since styling is cosmetic. A call that finds a link an earlier call injected,
+  still loading, waits for it; a link the page added is reused at once, its attributes not
+  compared. An empty URL injects nothing and resolves at once: HTML's "create a link
+  request" opens with "Assert: options's href is not the empty string.", and Chromium 151
+  fired neither event for a link with an empty `href`, so the call would never settle.
+- **A link that fires `error` stays on the page.** In headless Chromium 151 (2026-09-26),
+  a link whose own rules applied fired `error` when one of its `@import`s failed: with no
+  policy, for an import answering 404 and for one whose host refused the connection; under
+  `style-src 'nonce-…'`, for every import, same-origin included, since the nonce reaches
+  only the link's own request (a `'self'` beside the nonce let the same-origin import
+  load). The page cannot tell that from a sheet that failed, so removing the link on
+  `error` would strip a theme that applied. PayZen's default `neon-reset.min.css` opens
+  with two `@import`s from `https://fonts.googleapis.com`, so a blocked Google Fonts host
+  (a policy without it, a font blocker, the network) would have deleted the whole theme;
+  the old PayZen loader never removed its link. A failed link now stays, and a later call
+  finds it and resolves at once instead of fetching the sheet again; Adyen's private
+  injection used to remove it. The pinned `adyen.css` has no `@import`, but `stylesheetUrl`
+  points at a sheet the adapter has never seen, so the rule is the same for both adapters.
+  A link also fires `load` only once its `@import`s have settled (HTML's "fetch and process
+  the linked resource": "wait for the link resource's critical subresources to finish
+  loading" before the step that fires `load` or `error`), which is why PayZen does not
+  await its theme (below). Firefox and WebKit were not run, so whether they also report a
+  failed `@import` as `error` is open; keeping the link is right either way.
+- **Adyen's stylesheet injection moved onto the helper** with its `loadStylesheet` seam and
+  its integrity rule (Adyen's hash and `crossorigin="anonymous"` on the default URL of the
+  pinned build only); the attributes are now set with `setAttribute` instead of the
+  properties that reflect them, and an empty `stylesheetUrl`, which used to leave
+  `loadSdk()` pending, loads no stylesheet. A Card-only Adyen Web 6.45.2 mount adds no
+  `<style>` and loads no further script: the served `adyen.js` has no
+  `createElement("style")`, its only `createElement("script")` is the wallet loader, and
+  the published source map shows the Card creating Click to Pay only "in case the required
+  configuration is provided", which the adapter never passes.
+- **PayZen's loader moves onto the helpers (#173), with the theme after the library.**
+  `injectKrAssets` now calls `injectScript` with `kr-public-key` and `kr-spa-mode: "true"`
+  in `attributes`, `async: false` and the nonce, then starts `injectStylesheet` once the
+  script has loaded, without awaiting it. PayZen's V4.0 JavaScript client reference
+  (payzen.io/en-EN/rest/V4.0/javascript/features/reference.html) lists `kr-public-key`
+  ("Public key for making a payment.") and `kr-spa-mode` ("If the value is true, the form
+  is not automatically initialized") among the tag's parameters, and its payment form guide
+  (payzen.io/en-EN/rest/V4.0/javascript/guide/payment_form.html, read through payzen.io's
+  content API on 2026-09-26) says "Theme files must imperatively be loaded after the
+  JavaScript library.", where the old loader appended the stylesheet first. `loadSdk()`
+  still resolves once the script has loaded and `KR` exists: awaiting the link would hold
+  the first mount on each page load until the library had run and Google Fonts had
+  answered the theme's
+  `@import`s, and never release it for a link that fires no event. The same guide says
+  "Theme files are optional. If they are not included, the payment form will be functional
+  but with a minimalist look.", and an empty `cssUrl` now loads none, where the old loader
+  added a `<link>` with an empty `href`. A rejected injection is caught, so it leaves the
+  form unstyled and nothing unhandled. A second adapter instance now waits for a
+  krypton-client script the first is still loading and fails with it, where it used to
+  resolve at once and then fail its `KR` check; a failed script is removed, and the
+  stylesheet waits for the next load. `async = false` stays, as a conservative
+  carry-over, but the note that PayZen documents async loading as breaking older mobile
+  browsers is withdrawn: no current payzen.io page read (the JavaScript client reference,
+  the payment form, presentation and SPA guides, the themes page) mentions `async`,
+  `defer` or older mobile browsers, a site search found nothing either, and the served
+  script has no `document.write` and waits for `DOMContentLoaded`.
+- **A style nonce turns `'unsafe-inline'` off for the whole directive.** CSP3
+  `#allow-all-inline`: "If expression matches the nonce-source or hash-source grammar,
+  return "Does Not Allow"."; Chromium, under `'nonce-x' 'unsafe-inline'`, blocked both a
+  nonce-less inline script and a nonce-less inline style, and did not apply a `style`
+  attribute set by script, which it applied under `'unsafe-inline'` alone. Paysafe.js (its
+  3-D Secure and redirect overlays), krypton-client (`kr-base-styles`, added when a form
+  mounts), Stripe.js (a fallback `<style>` where constructable stylesheets are missing)
+  and the Worldline Tokenizer (one `style` attribute, which no nonce can cover; CSP3:
+  "Nonces only apply to inline script and inline style, not to attributes of either
+  element") all add inline styles without a nonce, so a page mounting several PSPs, as a
+  failover page does, loses them under a nonce-based `style-src` such as PayPal's. The
+  providers page ("Content-Security-Policy on a page with several PSPs") states the rule
+  once; each guide names only its own SDK's inline styles and links there, since a list of
+  the other PSPs in every guide would drift. In the served Paysafe.js, `applyStyle` creates
+  a `<style>` and sets `disabled` on its `sheet`, and the 3-D Secure path runs it just
+  before `r.submit()` on the form posting to the issuer's ACS. A blocked `<style>` has a
+  null `sheet`: in Chromium 151, a nonce-less `<style>` under `style-src 'nonce-…'` had
+  none, and setting `disabled` on it threw a TypeError. So that path likely throws before
+  the form is submitted; that is read from the served file and was not run against
+  Paysafe.
+- **What krypton-client loads on the host page.** Read from the served V4.0 build
+  (Last-Modified 9 September 2026) on 2026-09-26. The bundle runs as the host app unless
+  the document holds `#slave-app` (a card-field iframe) or `#appGhost` (its hidden
+  iframe). The Google Fonts `<link>` built from `"https://fonts.googleapis.com/css?family="`
+  belongs to `src/slave/SlaveApp.vue`, so it loads inside the card-field iframes, which
+  are PayZen's documents and outside the host's policy; the Google Fonts requests on the
+  host page are the theme's `@import`s, which carry no nonce. On the host, the script
+  loader appends a nonce-less `<script>` to `<body>` for Apple Pay
+  (`https://applepay.cdn-apple.com/jsapi/1.latest/apple-pay-sdk.js`, when the payment
+  methods include `APPLE_PAY`, and with test keys only if `forceRealWithTestKeys` is set)
+  and for the risk analyser
+  (the form token's `riskAnalyser.jsUrl`). The Google Pay
+  (`https://pay.google.com/gp/p/js/pay.js`) and Samsung Pay
+  (`https://img.mpay.samsung.com/gsmpi/sdk/samsungpay_web_sdk.js`) loads run in the hidden
+  iframe instead: the host only posts `setupGooglePaySDK` and `setupSamsungPaySDK`, and its
+  communicator sends to `iframeController.ghostContainer`. The PayZen guide and the
+  `cspNonce` JSDoc say which of these a nonce-only `script-src` must allow.
+- **Checked in Chromium only, and against no PSP sandbox.** Firefox and WebKit were not
+  run. Among these providers only PayPal documents a nonce for its SDK, and Adyen for its
+  PayPal component alone; none of the adapters has run under a nonce policy against a
+  sandbox.

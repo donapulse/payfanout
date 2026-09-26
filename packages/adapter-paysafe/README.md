@@ -88,9 +88,11 @@ connect-src https://hosted.paysafe.com https://hosted.test.paysafe.com
             https://api.paysafe.com https://api.test.paysafe.com
 ```
 
-The `.test` hosts are used only by `environment: "sandbox"`. See
+The `.test` hosts are used only by `environment: "sandbox"`. On a nonce-based
+policy, pass the nonce as `cspNonce` and the adapter puts it on the Paysafe.js
+`<script>` it injects. See
 [Set up Paysafe](https://donapulse.github.io/payfanout/guide/paysafe) for the
-per-directive failure modes.
+per-directive failure modes and what Paysafe.js still needs beyond the nonce.
 
 ## What's inside
 

@@ -407,16 +407,17 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
    *
    * Every payment carries the mandatory 3-D Secure properties the adapter can
    * supply: the return URL in both documented forms,
-   * `threeDSecure.skipAuthentication: false`, and the device data as
-   * `order.customer.device`. `acceptHeader` and `ipAddress` are observed on the
-   * customer's HTTP request and CompletePaymentInput carries neither, so they
-   * are not sent; nor is the Cartes Bancaires `useCase`, which the API
-   * contract spells `usecase`. The cardholder name is entered in the Hosted
+   * `threeDSecure.skipAuthentication: false`, the device data as
+   * `order.customer.device`, and the use case Cartes Bancaires requires,
+   * `paymentProduct130SpecificInput.threeDSecure.usecase: "single-amount"`,
+   * whatever the card's brand. `acceptHeader` and `ipAddress` are observed on
+   * the customer's HTTP request and CompletePaymentInput carries neither, so
+   * they are not sent. The cardholder name is entered in the Hosted
    * Tokenization iframe. `sca.challenge: "force"` requests
-   * `challengeIndicator: "challenge-required"`. `sca.exemption: "moto"` is not
-   * mapped yet: Worldline models MOTO as `transactionChannel: "MOTO"`, not as
-   * an exemption, so such a payment goes out as an e-commerce payment with
-   * 3-D Secure.
+   * `challengeIndicator: "challenge-required"`. `sca.exemption: "moto"` sends
+   * `transactionChannel: "MOTO"`, Worldline's mail order / telephone order
+   * channel, with the 3-D Secure data unchanged; without it no channel is
+   * sent, which Worldline reads as ECOMMERCE.
    *
    * A REDIRECT merchantAction (3-D Secure challenge) surfaces as
    * requires_action with the redirect URL on `raw`; the customer completes it
@@ -484,9 +485,15 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       hostedTokenizationId: token.hostedTokenizationId,
       cardPaymentMethodSpecificInput: {
         authorizationMode: context.captureMethod === "manual" ? "PRE_AUTHORIZATION" : "SALE",
+        // Worldline has no MOTO exemption request: MOTO is a channel, and an
+        // absent channel is ECOMMERCE.
+        ...(context.sca?.exemption === "moto" ? { transactionChannel: "MOTO" } : {}),
         // The Hosted Tokenization guide names the flat returnUrl; the 3-D Secure
         // guide lists the redirectionData form as mandatory — send both.
         returnUrl,
+        // Kept on a MOTO payment too: what Worldline does with it there is
+        // undocumented, and a MOTO payment it does not treat as out of SCA scope
+        // must still authenticate.
         threeDSecure: {
           // Only here: the flat cardPaymentMethodSpecificInput.skipAuthentication
           // is deprecated in favor of this one.
@@ -494,6 +501,11 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
           redirectionData: { returnUrl },
           ...(context.sca?.challenge === "force" ? { challengeIndicator: "challenge-required" } : {}),
         },
+        // Mandatory for Cartes Bancaires, and sent whatever the brand, which the
+        // adapter does not learn before paying. `usecase` is the API contract's
+        // spelling of the 3-D Secure guide's `useCase`. Each payment is a one-off
+        // charge: the adapter never stores a card, nor charges one again.
+        paymentProduct130SpecificInput: { threeDSecure: { usecase: "single-amount" } },
       },
     };
     // The first attempt goes out under the host key itself, as it did before

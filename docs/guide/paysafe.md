@@ -177,10 +177,27 @@ connect-src https://hosted.paysafe.com https://hosted.test.paysafe.com
 
 The `.test` hosts are exercised only by `environment: "sandbox"` and are harmless
 to allow in a production CSP (or gate them per environment). Paysafe.js also adds
-`<style>` elements of its own, for its 3-D Secure overlay among others, so a
-`style-src` that restricts styles needs `'unsafe-inline'`; Paysafe publishes no CSP
-guidance. Override the script
+`<style>` elements of its own, without a nonce, for its 3-D Secure and redirect overlays,
+so a `style-src` that restricts styles needs `'unsafe-inline'` with no nonce or hash beside
+it, since either turns `'unsafe-inline'` off. Read from the served `paysafe.min.js` and not
+run: before its 3-D Secure path submits the form that opens the card issuer's page, it sets
+`disabled` on the `sheet` of the `<style>` it has just added, and a blocked `<style>` has no
+sheet, so under a policy that blocks it that step likely throws before the form is
+submitted. Paysafe publishes no CSP guidance. Override the script
 URL with the `sdkUrl` config field to pin a version or self-host.
+
+**Nonce-based policies.** Pass the nonce your server put in the page's policy as
+`cspNonce` (the adapter never reads one from the page), and the adapter sets it as the
+`nonce` attribute of the Paysafe.js `<script>` it injects. That matters only for a
+`script-src` that allows scripts by nonce without `'strict-dynamic'`: under
+`'strict-dynamic'` the script-created tag loads without one, and
+`https://hosted.paysafe.com` in `script-src` allows it anyway. Paysafe.js reads no nonce
+itself. It loads the Google Pay, Apple Pay and Paze SDKs without one, and compiles
+templates at run time on its installments path, which needs `'unsafe-eval'` in
+`script-src`. Its overlay `<style>` elements, above, are why a page running Paysafe.js
+should keep nonces out of `style-src`. On a page that can mount other PSPs as well, read
+[Content-Security-Policy on a page with several PSPs](/guide/providers#content-security-policy-on-a-page-with-several-psps)
+before giving a directive a nonce.
 :::
 
 ## 6. Billing postal code is required

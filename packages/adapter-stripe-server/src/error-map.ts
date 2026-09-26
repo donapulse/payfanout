@@ -19,7 +19,8 @@ const INVALID_CARD_DATA_CODES = new Set([
   "incorrect_postal_code",
 ]);
 
-const FRAUD_DECLINE_CODES = new Set(["fraudulent", "stolen_card", "lost_card", "merchant_blacklist"]);
+// The last is a local payment method's decline code, with the same instruction.
+const FRAUD_DECLINE_CODES = new Set(["fraudulent", "stolen_card", "lost_card", "merchant_blacklist", "lost_or_stolen_card"]);
 
 /** A failed 3-D Secure: the general code 2026-08-26.dahlia added and the intent-specific forms before it. */
 const AUTHENTICATION_FAILURE_CODES = new Set([

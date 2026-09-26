@@ -158,6 +158,19 @@ describe("mapStripeError", () => {
       retryable: true,
     },
     {
+      // A required authentication comes before a fraud decline code, as in the browser.
+      name: "authentication required on a card reported fraudulent",
+      err: { type: "StripeCardError", code: "authentication_required", decline_code: "fraudulent", message: "…" },
+      code: "authentication_required",
+      retryable: false,
+    },
+    {
+      name: "a local payment method reported lost or stolen",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "lost_or_stolen_card", message: "…" },
+      code: "fraud_suspected",
+      retryable: false,
+    },
+    {
       name: "a decline code no list holds",
       err: { type: "StripeCardError", code: "card_declined", decline_code: "constructor", message: "…" },
       code: "card_declined",

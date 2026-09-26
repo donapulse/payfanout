@@ -91,6 +91,8 @@ interface StripeHandle {
   elements: StripeJsElementsLike;
   element: StripeJsElementLike;
   clientSecret: string;
+  /** The locale Stripe.js was given for this mount, if any. */
+  locale: string | undefined;
 }
 
 export class StripeClientAdapter implements ClientPaymentAdapter {
@@ -150,7 +152,7 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
     // through untouched so future SDK options need no library release.
     const element = elements.create("payment", options.fieldOptions);
     element.on("ready", () => options.onReady?.());
-    element.on("loaderror", (payload) => options.onError?.(mapStripeJsError(payload?.error)));
+    element.on("loaderror", (payload) => options.onError?.(mapStripeJsError(payload?.error, locale)));
     // Field-state stream: hosts disable Pay until complete. Initialized false
     // so button state is deterministic before the customer types anything.
     options.onChange?.({ complete: false });
@@ -161,7 +163,7 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
       }),
     );
     element.mount(container);
-    const handle: StripeHandle = { pspName: "stripe", stripe, elements, element, clientSecret: options.clientSecret };
+    const handle: StripeHandle = { pspName: "stripe", stripe, elements, element, clientSecret: options.clientSecret, locale };
     return brandMountedFieldsHandle(handle);
   }
 
@@ -180,7 +182,7 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
     const isSetup = h.clientSecret.startsWith("seti_");
     const result = isSetup ? await h.stripe.confirmSetup(params) : await h.stripe.confirmPayment(params);
     if (result.error) {
-      return { status: "failed", error: mapStripeJsError(result.error) };
+      return { status: "failed", error: mapStripeJsError(result.error, h.locale) };
     }
     const status = (result.paymentIntent ?? result.setupIntent)?.status;
     return { status: toUnifiedStatus(status) };
@@ -221,11 +223,11 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
       ? await stripe.retrievePaymentIntent(piSecret)
       : await stripe.retrieveSetupIntent(setiSecret!);
     if (result.error) {
-      return { status: "failed", error: mapStripeJsError(result.error) };
+      return { status: "failed", error: mapStripeJsError(result.error, this.config.locale) };
     }
     const status = (result.paymentIntent ?? result.setupIntent)?.status;
     if (!status) {
-      return { status: "failed", error: mapStripeJsError(undefined) };
+      return { status: "failed", error: mapStripeJsError(undefined, this.config.locale) };
     }
     return { status: toUnifiedStatus(status) };
   }
@@ -312,8 +314,8 @@ const INVALID_CARD_DATA_CODES = new Set([
   "incomplete_expiry",
 ]);
 
-/** Decline codes Stripe asks to present as a generic decline. */
-const FRAUD_DECLINE_CODES = new Set(["fraudulent", "stolen_card", "lost_card", "merchant_blacklist"]);
+/** Decline codes Stripe asks to present as a generic decline; the last is a local payment method's. */
+const FRAUD_DECLINE_CODES = new Set(["fraudulent", "stolen_card", "lost_card", "merchant_blacklist", "lost_or_stolen_card"]);
 
 /** A failed 3-D Secure: the general code 2026-08-26.dahlia added and the intent-specific forms before it. */
 const AUTHENTICATION_FAILURE_CODES = new Set([
@@ -345,12 +347,26 @@ function classifyStripeJsError(error: StripeJsErrorLike | undefined): UnifiedErr
   return "unknown";
 }
 
-function mapStripeJsError(error: StripeJsErrorLike | undefined): UnifiedError {
+/**
+ * The locale a message for the customer is in: Stripe.js's own, which is the
+ * browser's under "auto" or when none was given.
+ */
+function customerLocale(locale: string | undefined): string | undefined {
+  if (locale !== undefined && locale !== "auto") return locale;
+  return typeof navigator === "undefined" ? undefined : navigator.language;
+}
+
+function mapStripeJsError(error: StripeJsErrorLike | undefined, locale: string | undefined): UnifiedError {
   const code = classifyStripeJsError(error);
   return new PayFanoutError({
     code,
-    // Stripe asks never to tell the customer more than a generic decline for these.
-    message: code === "fraud_suspected" ? getUserMessage("fraud_suspected") : (error?.message ?? "Payment failed."),
+    // Stripe asks never to tell the customer more than a generic decline for
+    // these; core's catalog message follows the customer's locale where core or
+    // the host has one, and English otherwise.
+    message:
+      code === "fraud_suspected"
+        ? getUserMessage("fraud_suspected", customerLocale(locale))
+        : (error?.message ?? "Payment failed."),
     // authentication_required is resolved on-session (a 3DS challenge), never by replay.
     retryable: code === "processing_error",
     raw: error,

@@ -209,6 +209,14 @@ describe("StripeClientAdapter edge cases", () => {
       [{ type: "card_error", code: "card_declined", decline_code: "expired_card" }, "expired_card", false],
       [{ type: "card_error", code: "card_declined", decline_code: "processing_error" }, "processing_error", true],
       [{ type: "card_error", code: "card_declined", decline_code: "insufficient_funds" }, "insufficient_funds", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "lost_or_stolen_card" }, "fraud_suspected", false],
+      // A required authentication, read from either code, comes before a fraud decline code.
+      [{ type: "card_error", code: "authentication_required", decline_code: "fraudulent" }, "authentication_required", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "authentication_required" }, "authentication_required", false],
+      // The intent-specific failed authentications that accounts before dahlia still receive.
+      [{ type: "card_error", code: "payment_intent_authentication_failure" }, "authentication_required", false],
+      [{ type: "card_error", code: "setup_intent_authentication_failure" }, "authentication_required", false],
+      [{ type: "card_error", code: "processing_error" }, "processing_error", true],
       // Only the lists' own entries count.
       [{ type: "card_error", code: "card_declined", decline_code: "constructor" }, "card_declined", false],
       [{ type: "api_error", code: "constructor" }, "unknown", false],
@@ -217,9 +225,36 @@ describe("StripeClientAdapter edge cases", () => {
       expect(await confirmWith(error), JSON.stringify(error)).toMatchObject({ code, retryable });
     }
     const fraud = await confirmWith({ type: "card_error", code: "card_declined", decline_code: "stolen_card", message: "Card reported stolen." });
-    expect(fraud?.message).toBe(getUserMessage("fraud_suspected"));
-    const declined = await confirmWith({ type: "card_error", code: "card_declined", message: "Your card was declined." });
-    expect(declined?.message).toBe("Your card was declined.");
+    expect(fraud?.message).toBe(getUserMessage("fraud_suspected", navigator.language));
+    // Every other message is Stripe.js's own, which it localizes.
+    const funds = await confirmWith({ type: "card_error", code: "card_declined", decline_code: "insufficient_funds", message: "Fonds insuffisants." });
+    expect(funds?.message).toBe("Fonds insuffisants.");
+  });
+
+  it("writes the generic fraud message in the locale Stripe.js was given", async () => {
+    stubBrowser();
+    const stolen = { type: "card_error", code: "card_declined", decline_code: "stolen_card", message: "Card reported stolen." };
+    const factory = () => ({
+      elements: () => ({ create: () => ({ mount: () => {}, unmount: () => {}, destroy: () => {}, on: () => {} }) }),
+      confirmPayment: async () => ({ error: stolen }),
+      confirmSetup: async () => ({ error: stolen }),
+      retrievePaymentIntent: async () => ({ error: stolen }),
+      retrieveSetupIntent: async () => ({ error: stolen }),
+    });
+    const adapter = new StripeClientAdapter({
+      publishableKey: "pk",
+      environment: "sandbox",
+      locale: "de",
+      getStripeGlobal: () => factory,
+      loadScript: async () => {},
+    });
+    const configured = await adapter.confirm(await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret" }));
+    expect(configured.error?.message).toBe(getUserMessage("fraud_suspected", "de"));
+    expect(configured.error?.message).not.toBe(getUserMessage("fraud_suspected", "en"));
+    const perMount = await adapter.confirm(await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret", locale: "fr" }));
+    expect(perMount.error?.message).toBe(getUserMessage("fraud_suspected", "fr"));
+    const returned = await adapter.handleRedirectReturn({ search: "?payment_intent_client_secret=pi_1_secret" });
+    expect(returned?.error?.message).toBe(getUserMessage("fraud_suspected", "de"));
   });
 
   it("streams field-state changes through onChange, initialized to incomplete", async () => {

@@ -344,10 +344,12 @@ bounced payment) when the bank bounces the debit. Bacs runs a ~10-business-day c
 Never ship the order on `processing`.
 Settlement-lifecycle events (`SETTLEMENT_*`) carry settlement ids, not payment ids, and
 are delivered as `unknown` — correlate by payload `merchantRefNum` (your
-`idempotencyKey`) if you consume them. Paysafe documents **no refunds for Bacs**; refund
-support on the other rails follows your account, and an in-flight settlement reports
-`availableToRefund: 0` ("not refundable yet"), so refunds only open up once settlement
-completes.
+`idempotencyKey`) if you consume them. Paysafe refunds **neither SEPA nor Bacs** (its pages
+list SEPA refunds as "Not Supported" and Bacs refunds as "NA"), so `refundPayment` rejects
+a payment on either rail with a non-retryable `unsupported_operation` once it has read the
+payment, before anything else goes out: refund those customers another way. Refunds on ACH
+and EFT follow your account, and an in-flight settlement reports `availableToRefund: 0`
+("not refundable yet"), so refunds only open up once settlement completes.
 :::
 
 Sandbox test values (from Paysafe's pages): SEPA IBAN `NL77ABNA0492122466` (BIC

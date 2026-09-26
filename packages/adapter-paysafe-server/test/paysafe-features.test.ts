@@ -254,7 +254,7 @@ describe("Paysafe refund lifecycle", () => {
     const pending = fake.seedRefund({ status: "PENDING", amount: 800 });
     const first = await adapter.retrieveRefund(pending.id);
     expect(first).toMatchObject({ refundId: pending.id, status: "pending", amount: 800 });
-    expect(first.createdAt).toBe("2026-07-04T10:10:00Z");
+    expect(first.createdAt).toBe("2026-07-04T10:10:00.000Z");
 
     fake.seedRefund({ id: pending.id, status: "COMPLETED", amount: 800 });
     expect((await adapter.retrieveRefund(pending.id)).status).toBe("succeeded");
@@ -262,6 +262,30 @@ describe("Paysafe refund lifecycle", () => {
     expect((await adapter.retrieveRefund(pending.id)).status).toBe("failed");
     fake.seedRefund({ id: pending.id, status: "CANCELLED", amount: 800 });
     expect((await adapter.retrieveRefund(pending.id)).status).toBe("failed");
+    // "EXPIRED - The transaction request is expired.": terminal, and nothing went back.
+    fake.seedRefund({ id: pending.id, status: "EXPIRED", amount: 800 });
+    expect((await adapter.retrieveRefund(pending.id)).status).toBe("failed");
+  });
+
+  it("answers a refund Paysafe files EXPIRED as failed, not as a refund still pending", async () => {
+    const { adapter } = makePair({
+      fetch: async (input, init) => {
+        const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+        if (init?.method === "POST") {
+          return new Response(JSON.stringify({ id: "ref_1", merchantRefNum: "k-refund", status: "EXPIRED", amount: 500 }));
+        }
+        if (url.pathname === "/paymenthub/v1/settlements") {
+          return new Response(
+            JSON.stringify({ settlements: [{ id: "stl_1", status: "COMPLETED", amount: 2000, availableToRefund: 2000 }] }),
+          );
+        }
+        return new Response(
+          JSON.stringify({ id: "pay_1", merchantRefNum: "k-pay", status: "COMPLETED", amount: 2000, currencyCode: "USD", settleWithAuth: true }),
+        );
+      },
+    });
+    const refund = await adapter.refundPayment({ pspPaymentId: "pay_1", amount: 500, idempotencyKey: "k-refund" });
+    expect(refund).toMatchObject({ refundId: "ref_1", status: "failed", amount: 500 });
   });
 
   it("a real refund's id is retrievable end-to-end", async () => {
@@ -491,17 +515,18 @@ describe("Paysafe payment method details", () => {
     expect(info.paymentMethodDetails).toEqual({ brand: "visa", last4: "1111", expMonth: 12, expYear: 2030 });
   });
 
-  it("prefers an explicit cardBrand and tolerates unknown type codes and absent expiry", async () => {
-    const withCard = (card: Record<string, unknown>): PaysafeServerAdapterConfig["fetch"] =>
-      async () =>
-        new Response(JSON.stringify({ id: "pay_1", amount: 100, currencyCode: "USD", status: "COMPLETED", settleWithAuth: true, card }), { status: 200 });
-
-    const branded = new PaysafeServerAdapter({
+  /** An adapter whose payment reads answer a settled payment echoing this card. */
+  const withCard = (card: Record<string, unknown>): PaysafeServerAdapter =>
+    new PaysafeServerAdapter({
       username: "u", password: "p", environment: "sandbox",
       merchantAccountResolver: () => undefined,
       sessionSigningKey: SIGNING_KEY, webhookHmacKey: WEBHOOK_KEY,
-      fetch: withCard({ cardBrand: "Mastercard", lastDigits: "5100", cardExpiry: { month: 3, year: 2031 } }),
+      fetch: async () =>
+        new Response(JSON.stringify({ id: "pay_1", amount: 100, currencyCode: "USD", status: "COMPLETED", settleWithAuth: true, card }), { status: 200 }),
     });
+
+  it("prefers an explicit cardBrand and tolerates unknown type codes and absent expiry", async () => {
+    const branded = withCard({ cardBrand: "Mastercard", lastDigits: "5100", cardExpiry: { month: 3, year: 2031 } });
     expect((await branded.retrievePayment("pay_1")).paymentMethodDetails).toEqual({
       brand: "mastercard",
       last4: "5100",
@@ -509,13 +534,210 @@ describe("Paysafe payment method details", () => {
       expYear: 2031,
     });
 
-    const unknownType = new PaysafeServerAdapter({
-      username: "u", password: "p", environment: "sandbox",
-      merchantAccountResolver: () => undefined,
-      sessionSigningKey: SIGNING_KEY, webhookHmacKey: WEBHOOK_KEY,
-      fetch: withCard({ cardType: "ZZ", lastDigits: "0001" }),
-    });
+    const unknownType = withCard({ cardType: "ZZ", lastDigits: "0001" });
     expect((await unknownType.retrievePayment("pay_1")).paymentMethodDetails).toEqual({ last4: "0001" });
+  });
+
+  it("names each cardType as the Payments API lists it: MD is Maestro and SO is Solo", async () => {
+    const brands: Array<[string, string]> = [
+      ["AM", "amex"],
+      ["DI", "discover"],
+      ["JC", "jcb"],
+      ["MC", "mastercard"],
+      ["MD", "maestro"],
+      ["SO", "solo"],
+      ["VI", "visa"],
+      ["VD", "visa"],
+      ["VE", "visa"],
+    ];
+    for (const [cardType, brand] of brands) {
+      const details = (await withCard({ cardType, lastDigits: "0004" }).retrievePayment("pay_1")).paymentMethodDetails;
+      expect(details?.brand, cardType).toBe(brand);
+    }
+  });
+
+  it("reads the expiry month and year that Paysafe's response examples send as strings", async () => {
+    const stringExpiry = withCard({ cardType: "VI", lastDigits: "1026", cardExpiry: { month: "10", year: "2025" } });
+    expect((await stringExpiry.retrievePayment("pay_1")).paymentMethodDetails).toEqual({
+      brand: "visa",
+      last4: "1026",
+      expMonth: 10,
+      expYear: 2025,
+    });
+    // Anything that is not a whole month (1-12) or a four-digit year is left out, never guessed.
+    for (const cardExpiry of [
+      { month: "1O", year: "2O25" },
+      { month: "13", year: "25" },
+      { month: "0", year: "20250" },
+      { month: 10.5, year: "" },
+    ]) {
+      const details = (await withCard({ cardType: "VI", lastDigits: "1026", cardExpiry }).retrievePayment("pay_1"))
+        .paymentMethodDetails;
+      expect(details, JSON.stringify(cardExpiry)).toEqual({ brand: "visa", last4: "1026" });
+    }
+  });
+});
+
+/**
+ * A Paysafe stand-in that records every request: a write gets `write`, the
+ * settlements lookup `settlements`, the refunds lookup nothing, and any other
+ * read `payment`.
+ */
+function paysafeAnswering(answers: {
+  payment: Record<string, unknown>;
+  settlements?: Array<Record<string, unknown>>;
+  write?: Record<string, unknown>;
+}): { fetch: typeof fetch; requests: Array<{ method: string; path: string }> } {
+  const requests: Array<{ method: string; path: string }> = [];
+  const reply = (body: unknown): Response =>
+    new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+    const method = init?.method ?? "GET";
+    requests.push({ method, path: url.pathname });
+    if (method === "POST") return reply(answers.write ?? {});
+    if (url.pathname === "/paymenthub/v1/settlements") return reply({ settlements: answers.settlements ?? [] });
+    if (url.pathname === "/paymenthub/v1/refunds") return reply({ refunds: [] });
+    return reply(answers.payment);
+  };
+  return { fetch, requests };
+}
+
+describe("Paysafe timestamps", () => {
+  const at = "2026-07-04T10:10:00Z";
+  const iso = "2026-07-04T10:10:00.000Z";
+  const epoch = Date.parse(at);
+
+  it("reports the capture time of a settlement Paysafe embeds with an epoch-millisecond txnTime", async () => {
+    // The shape of the spec's "Card - with Settlement" answer to POST /payments:
+    // the payment's txnTime a date-time string, its settlement's epoch milliseconds.
+    const { adapter } = makePair({
+      fetch: async (input, init) => {
+        if (init?.method !== "POST") return new Response(JSON.stringify({ payments: [] }));
+        return new Response(
+          JSON.stringify({
+            id: "pay_1",
+            paymentType: "CARD",
+            paymentHandleToken: "tok_ok",
+            merchantRefNum: "k-complete",
+            currencyCode: "USD",
+            settleWithAuth: true,
+            txnTime: "2023-01-27T10:15:29Z",
+            status: "COMPLETED",
+            amount: 2000,
+            availableToSettle: 0,
+            settlements: [
+              { merchantRefNum: "k-complete", amount: 2000, id: "stl_1", availableToRefund: 2000, txnTime: 1674814529000, status: "PENDING" },
+            ],
+            card: { cardExpiry: { month: "10", year: "2030" }, cardType: "VI", lastDigits: "1111" },
+          }),
+        );
+      },
+    });
+    const session = await adapter.createPaymentSession(sessionInput);
+    const info = await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: "tok_ok",
+      idempotencyKey: "k-complete",
+    });
+    expect(info.capturedAt).toBe("2023-01-27T10:15:29.000Z");
+    expect(info.createdAt).toBe("2023-01-27T10:15:29.000Z");
+    expect(info.paymentMethodDetails).toEqual({ brand: "visa", last4: "1111", expMonth: 10, expYear: 2030 });
+  });
+
+  it("reads a refund's txnTime as ISO 8601 from a date-time string, epoch milliseconds or their digits", async () => {
+    for (const txnTime of [at, epoch, String(epoch)]) {
+      const stub = paysafeAnswering({ payment: { id: "ref_1", status: "COMPLETED", amount: 500, txnTime } });
+      const { adapter } = makePair({ fetch: stub.fetch });
+      expect((await adapter.retrieveRefund("ref_1")).createdAt, String(txnTime)).toBe(iso);
+    }
+    // An unreadable time is left out rather than passed through.
+    const garbled = paysafeAnswering({ payment: { id: "ref_1", status: "COMPLETED", amount: 500, txnTime: "not-a-date" } });
+    expect((await makePair({ fetch: garbled.fetch }).adapter.retrieveRefund("ref_1")).createdAt).toBeUndefined();
+  });
+
+  it("reads a payment's and a verification's txnTime the same way, falling back to the epoch when unreadable", async () => {
+    const payment = { id: "pay_1", status: "COMPLETED", amount: 500, currencyCode: "USD", settleWithAuth: true };
+    for (const [txnTime, expected] of [
+      [String(epoch), iso],
+      [epoch, iso],
+      [at, iso],
+      ["not-a-date", "1970-01-01T00:00:00.000Z"],
+    ] as const) {
+      const stub = paysafeAnswering({
+        payment: { ...payment, txnTime },
+        write: { id: "ver_1", merchantRefNum: "k-verify", status: "COMPLETED", currencyCode: "USD", txnTime },
+      });
+      const { adapter } = makePair({ fetch: stub.fetch });
+      expect((await adapter.retrievePayment("pay_1")).createdAt, String(txnTime)).toBe(expected);
+      const session = await adapter.createPaymentSession({ ...sessionInput, amount: 0 });
+      const verified = await adapter.verifyPaymentMethod({
+        pspSessionId: session.pspSessionId,
+        clientToken: "tok_verify",
+        idempotencyKey: "k-verify",
+      });
+      expect(verified.createdAt, String(txnTime)).toBe(expected);
+    }
+  });
+});
+
+describe("Paysafe settlements that moved no money", () => {
+  const manualCapture = {
+    id: "pay_1",
+    merchantRefNum: "k-pay",
+    status: "COMPLETED",
+    amount: 1000,
+    availableToSettle: 0,
+    currencyCode: "USD",
+    settleWithAuth: false,
+    txnTime: "2026-07-04T10:00:00Z",
+  };
+
+  it("counts neither an expired nor a cancelled settlement as captured or refunded money", async () => {
+    // Both report nothing left to refund, which would otherwise read as refunded.
+    const stub = paysafeAnswering({
+      payment: manualCapture,
+      settlements: [
+        { id: "stl_expired", status: "EXPIRED", amount: 300, availableToRefund: 0, txnTime: "2026-07-04T10:01:00Z" },
+        { id: "stl_cancelled", status: "CANCELLED", amount: 200, availableToRefund: 0, txnTime: "2026-07-04T10:02:00Z" },
+        { id: "stl_live", status: "COMPLETED", amount: 500, availableToRefund: 500, txnTime: "2026-07-04T10:03:00Z" },
+      ],
+    });
+    const info = await makePair({ fetch: stub.fetch }).adapter.retrievePayment("pay_1");
+    expect(info).toMatchObject({ status: "succeeded", amount: 500, amountCaptured: 500, amountRefunded: 0 });
+    expect(info.capturedAt).toBe("2026-07-04T10:03:00.000Z");
+  });
+
+  it("takes a refund out of a settlement that moved money, never an expired or cancelled one", async () => {
+    const stub = paysafeAnswering({
+      payment: { ...manualCapture, settleWithAuth: true },
+      settlements: [
+        { id: "stl_expired", status: "EXPIRED", amount: 1000, availableToRefund: 1000 },
+        { id: "stl_cancelled", status: "CANCELLED", amount: 1000, availableToRefund: 1000 },
+        { id: "stl_live", status: "COMPLETED", amount: 1000, availableToRefund: 1000 },
+      ],
+      write: { id: "ref_1", merchantRefNum: "k-refund", status: "COMPLETED", amount: 400 },
+    });
+    const refund = await makePair({ fetch: stub.fetch }).adapter.refundPayment({
+      pspPaymentId: "pay_1",
+      amount: 400,
+      idempotencyKey: "k-refund",
+    });
+    expect(refund).toMatchObject({ refundId: "ref_1", status: "succeeded", amount: 400 });
+    expect(stub.requests.filter((r) => r.method === "POST").map((r) => r.path)).toEqual([
+      "/paymenthub/v1/settlements/stl_live/refunds",
+    ]);
+  });
+
+  it("refuses a refund when every settlement expired, without sending one", async () => {
+    const stub = paysafeAnswering({
+      payment: { ...manualCapture, settleWithAuth: true },
+      settlements: [{ id: "stl_expired", status: "EXPIRED", amount: 1000, availableToRefund: 1000 }],
+    });
+    await expect(
+      makePair({ fetch: stub.fetch }).adapter.refundPayment({ pspPaymentId: "pay_1", idempotencyKey: "k-refund" }),
+    ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringMatching(/no refundable settlement/) });
+    expect(stub.requests.some((r) => r.method === "POST")).toBe(false);
   });
 });
 

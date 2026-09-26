@@ -1,0 +1,5 @@
+---
+"@payfanout/adapter-paysafe-server": patch
+---
+
+Map more of Paysafe's documented error codes: a 3060 decline (Strong Customer Authentication required) is now a non-retryable `authentication_required`, the fraud and risk declines 3054, 4001 and 4002 are `fraud_suspected`, an invalid card number, CVV or expiry date (3002, 3005, 3012) is `invalid_card_data`, and the refund and void state checks 3403, 3419 and 3507 are `invalid_request` instead of `card_declined`. An expired refund and a verification in `ERROR` now report `failed`, an expired settlement no longer counts as captured or refunded money nor gets refunded against, and a refund of a SEPA or Bacs payment, which Paysafe does not support, rejects with a non-retryable `unsupported_operation` before any refund request. `createdAt` and `capturedAt` are always ISO 8601, including a settlement time Paysafe sends as epoch milliseconds, card expiry months and years sent as strings are read (the exported `PaysafeCardLike` and `PaysafeSettlementLike` types now allow those forms), and Maestro (`MD`) and Solo (`SO`) cards report the brands `maestro` and `solo`.

@@ -423,6 +423,56 @@ describe("Paysafe bank-debit sessions", () => {
   });
 });
 
+describe("Paysafe bank-debit refunds", () => {
+  const completed = async (fixture: RailFixture): Promise<{ adapter: PaysafeServerAdapter; fake: FakePaysafeApi; id: string }> => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession(sessionInput(fixture));
+    const info = await adapter.completePayment({
+      pspSessionId: session.pspSessionId,
+      clientToken: envelope(fixture.details),
+      idempotencyKey: `complete-refund-${fixture.rail}`,
+    });
+    return { adapter, fake, id: info.pspPaymentId };
+  };
+
+  it("refuses SEPA and Bacs refunds with unsupported_operation after reading only the payment", async () => {
+    // SEPA: "Refunds | Not Supported"; Bacs: "Refunds | NA".
+    for (const [fixture, rail] of [
+      [RAILS[0]!, "SEPA Direct Debit"],
+      [RAILS[2]!, "Bacs Direct Debit"],
+    ] as const) {
+      const { adapter, fake, id } = await completed(fixture);
+      const before = fake.requests.length;
+      const err = await adapter
+        .refundPayment({ pspPaymentId: id, amount: 500, idempotencyKey: `refund-${fixture.rail}` })
+        .then(() => undefined, (e: unknown) => e);
+      expect(err, fixture.rail).toMatchObject({
+        code: "unsupported_operation",
+        retryable: false,
+        pspName: "paysafe",
+        raw: { id, paymentType: fixture.paymentType },
+      });
+      expect((err as Error).message).toContain(rail);
+      expect(fake.requests.slice(before).map((r) => `${r.method} ${r.path}`)).toEqual([
+        `GET /paymenthub/v1/payments/${id}`,
+      ]);
+      expect(fake.uniqueRefundCreations).toBe(0);
+    }
+  });
+
+  it("leaves ACH and EFT refunds to Paysafe, whose pages say nothing about them", async () => {
+    for (const fixture of [RAILS[1]!, RAILS[3]!]) {
+      const { adapter, fake, id } = await completed(fixture);
+      // The debit is still in flight, so its settlement has nothing to refund yet.
+      await expect(
+        adapter.refundPayment({ pspPaymentId: id, idempotencyKey: `refund-${fixture.rail}` }),
+        fixture.rail,
+      ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringMatching(/no refundable settlement/) });
+      expect(fake.requests.some((r) => r.method === "GET" && r.path === "/paymenthub/v1/settlements")).toBe(true);
+    }
+  });
+});
+
 describe("Paysafe bank-debit session guards", () => {
   const rejects = async (
     input: CreatePaymentSessionInput,

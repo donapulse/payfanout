@@ -1239,6 +1239,17 @@ describe("Paysafe modification replays", () => {
         failure: { status: 402, code: "3013", message: "Your request has been declined by the issuing bank due to problems with the credit card account." },
         expected: "card_declined",
       },
+      // A mapped code reads back as its answer would have.
+      {
+        token: "tok_verify",
+        failure: { status: 402, code: "3060", message: "Your request has been declined because Strong Customer Authentication is required." },
+        expected: "authentication_required",
+      },
+      {
+        token: "tok_verify",
+        failure: { status: 402, code: "4002", message: "The transaction was declined by our Risk Management department." },
+        expected: "fraud_suspected",
+      },
     ];
     for (const { token, failure, expected } of cases) {
       const { adapter, fake } = makePair();

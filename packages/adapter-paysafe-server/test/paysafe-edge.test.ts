@@ -54,15 +54,51 @@ describe("Paysafe status mapping", () => {
   }
 });
 
+describe("Paysafe verification status mapping", () => {
+  const cases: Array<[string, UnifiedPaymentStatus]> = [
+    ["COMPLETED", "succeeded"],
+    ["FAILED", "failed"],
+    // "The verification has errored - failed for non-business reason"
+    ["ERROR", "failed"],
+    ["RECEIVED", "processing"],
+  ];
+  for (const [status, expected] of cases) {
+    it(`maps a verification answered ${status} -> ${expected}`, async () => {
+      const adapter = adapterWithPayment({ id: "ver_1", merchantRefNum: "k-verify", status, txnTime: "2026-07-04T10:00:00Z" });
+      const session = await adapter.createPaymentSession({ amount: 0, currency: "USD", idempotencyKey: "k" });
+      const info = await adapter.verifyPaymentMethod({
+        pspSessionId: session.pspSessionId,
+        clientToken: "tok_verify",
+        idempotencyKey: "k-verify",
+      });
+      expect(info.status).toBe(expected);
+    });
+  }
+});
+
 describe("mapPaysafeError", () => {
+  // HTTP statuses as Paysafe's card errors table pairs them with each code.
   const cases: Array<[number, string | undefined, UnifiedErrorCode, boolean]> = [
     [402, "3406", "processing_error", true], // settlement not batched yet
     [402, "3022", "insufficient_funds", false],
-    [402, "3006", "expired_card", false],
+    [400, "3006", "expired_card", false],
     [402, "3017", "invalid_card_data", false],
+    [400, "3002", "invalid_card_data", false], // invalid card number or brand
+    [400, "3005", "invalid_card_data", false], // incorrect CVV
+    [402, "3012", "invalid_card_data", false], // invalid expiry date
     [402, "3004", "invalid_request", false], // zip/billing data required — data quality, not a decline
     [402, "3009", "card_declined", false],
-    [402, "8000", "fraud_suspected", false],
+    [402, "3060", "authentication_required", false], // Strong Customer Authentication is required
+    [402, "3054", "fraud_suspected", false], // declined due to suspected fraud
+    [402, "4001", "fraud_suspected", false], // in Paysafe's negative database
+    [402, "4002", "fraud_suspected", false], // declined by Paysafe's Risk Management
+    [402, "8000", "fraud_suspected", false], // in no current table, still mapped
+    [402, "8001", "fraud_suspected", false],
+    [402, "3204", "invalid_request", false], // capture beyond the remaining authorization
+    [402, "3402", "invalid_request", false], // refund beyond the remaining settlement
+    [402, "3403", "invalid_request", false], // the settlement's maximum number of refunds
+    [402, "3419", "invalid_request", false], // this type of transaction cannot be refunded
+    [402, "3507", "invalid_request", false], // no partial void on this authorization
     [402, "9999", "card_declined", false], // unknown code on a 402 is still a decline
     [429, undefined, "rate_limited", true],
     [500, undefined, "psp_unavailable", true],
@@ -86,6 +122,34 @@ describe("mapPaysafeError", () => {
     const mapped = mapPaysafeError(402, { error: { code: "3004", message: "Zip is required" } });
     expect(mapped.message).toBe(getUserMessage("invalid_request"));
     expect(mapped.message).not.toBe(getUserMessage("card_declined"));
+  });
+
+  it("never relays Paysafe's own wording: every code gets its catalog message", () => {
+    const answers: Array<[number, string, string]> = [
+      [402, "3060", "Your request has been declined because Strong Customer Authentication is required."],
+      [402, "4002", "The transaction was declined by our Risk Management department."],
+      [400, "3005", "You submitted an incorrect CVV value with your request."],
+      [402, "3419", "This type of transaction cannot be refunded."],
+    ];
+    for (const [status, code, message] of answers) {
+      const mapped = mapPaysafeError(status, { error: { code, message } });
+      expect(mapped.message, code).toBe(getUserMessage(mapped.code));
+      expect(mapped.message, code).not.toBe(message);
+    }
+  });
+
+  it("leaves the answers the replay logic reads by code on their HTTP fallback", () => {
+    const replayAnswers: Array<[number, string, UnifiedErrorCode]> = [
+      [409, "5031", "invalid_request"],
+      [402, "3044", "card_declined"],
+      [402, "3417", "card_declined"],
+      [400, "5283", "invalid_request"],
+    ];
+    for (const [status, code, expected] of replayAnswers) {
+      const mapped = mapPaysafeError(status, { error: { code, message: "x" } });
+      expect(mapped.code, code).toBe(expected);
+      expect(mapped.retryable, code).toBe(false);
+    }
   });
 });
 

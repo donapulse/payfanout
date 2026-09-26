@@ -549,6 +549,19 @@ describe("refusals and refund reasons", () => {
     ).rejects.toMatchObject({ code: "fraud_suspected", retryable: false });
   });
 
+  it("looks refusal codes up among the map's own keys only", () => {
+    for (const refusalReasonCode of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+      expect(mapAdyenRefusal({ resultCode: "Refused", refusalReasonCode })).toMatchObject({
+        code: "card_declined",
+        retryable: false,
+      });
+      expect(mapAdyenRefusal({ resultCode: "Error", refusalReasonCode })).toMatchObject({
+        code: "processing_error",
+        retryable: false,
+      });
+    }
+  });
+
   it("sends the refund reason in Adyen's merchantRefundReason vocabulary, and nothing without one", async () => {
     const { adapter, fake } = withFake();
     const cases = [

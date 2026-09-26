@@ -670,9 +670,19 @@ describe("AdyenServerAdapter specifics", () => {
       ["6", "expired_card"],
       ["12", "insufficient_funds"],
       ["11", "authentication_required"],
+      ["38", "authentication_required"],
       ["20", "fraud_suspected"],
       ["24", "invalid_card_data"],
+      ["32", "invalid_card_data"],
       ["9", "processing_error"],
+      // The acquirer, the network, the issuer or the scheme failed, not the card.
+      ["4", "processing_error"],
+      ["21", "processing_error"],
+      ["39", "processing_error"],
+      ["40", "processing_error"],
+      ["42", "processing_error"],
+      // Left on the default deliberately: an amount mismatch whose cause Adyen does not state.
+      ["7", "card_declined"],
       // An unrecognized refusal is still a decline — never a retryable error.
       ["999", "card_declined"],
     ];

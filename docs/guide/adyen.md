@@ -791,6 +791,16 @@ field, with any test card above. If the Card shows no cardholder-name field, ena
 | `NOT_ENOUGH_BALANCE` | Not enough balance | `insufficient_funds` |
 | `CVC_DECLINED` | CVC Declined | `invalid_card_data` |
 | `ISSUER_UNAVAILABLE` | Issuer Unavailable | `processing_error` |
+| `NOT_3D_AUTHENTICATED` | 3D Not Authenticated | `authentication_required` |
+| `THREED_SECURE_AUTHENTICATION_ERROR` | 3DS Authentication Error | `processing_error` |
+| `RREQ_NOT_RECEIVED` | RReq not received from DS | `processing_error` |
+| `BAN_CURRENT_AID` | Current AID is in Penalty Box | `processing_error` |
+| `NOT_SUBMITTED` | Not Submitted | `processing_error` |
+| `ERROR` | Acquirer Error | `processing_error` |
+| `AVS_DECLINED` | AVS Declined | `invalid_card_data` |
+
+`FRAUD_CANCELLED` comes back with `resultCode` Cancelled rather than a refusal:
+`completePayment` resolves with the payment `canceled`.
 
 For the failure webhooks, a payment made with the name `capture failed` gets
 `CAPTURE_FAILED` on its capture, and one made with `refund failed` gets `REFUND_FAILED` on

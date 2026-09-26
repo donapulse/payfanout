@@ -357,6 +357,20 @@ Adyen's sample also allows wallet and partner hosts in `script-src`; this adapte
 only the Card component, so it needs none of them. The onboarding descriptor
 (`adyenOnboarding.csp`) lists `https://*.adyen.com` under `script` and `*` under `frame` and
 `connect`; `style-src`, `form-action` and `img-src` have no descriptor field.
+
+**Nonce-based policies.** Pass the nonce your server put in the page's policy as
+`cspNonce` (the adapter never reads one from the page), and the adapter sets it as the
+`nonce` attribute of both tags it injects, the Adyen Web `<script>` and the `adyen.css`
+`<link>`. That matters for a `script-src` that allows scripts by nonce without
+`'strict-dynamic'` (under `'strict-dynamic'` the script-created tag loads without one, and
+`https://*.adyen.com` allows it anyway) and for a `style-src` that allows stylesheets by
+nonce, which `'strict-dynamic'` never covers. The Card component reads no nonce, adds no
+inline script or style and loads no further script, as long as `fieldOptions` configures
+no wallet such as Click to Pay, so those two tags are all the nonce needs to cover; frames,
+connections, form targets and images still follow the policy above. A nonce in
+`style-src` turns `'unsafe-inline'` off there, so on a page that also mounts other PSPs it
+blocks the inline styles Paysafe.js and PayZen add without a nonce, Stripe's fallback
+`<style>` and the Worldline Tokenizer's `style` attribute.
 :::
 
 ## 6. 3-D Secure

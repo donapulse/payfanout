@@ -217,6 +217,19 @@ field only points the adapter at a different Worldline-served URL. Worldline als
 the script tag to carry `integrity` (the `sri` value of the CreateHostedTokenization response)
 and `crossorigin="anonymous"`; the adapter does not apply that subresource integrity check
 yet.
+
+**Nonce-based policies.** Pass the nonce your server put in the page's policy as
+`cspNonce` (the adapter never reads one from the page), and the adapter sets it as the
+`nonce` attribute of the Tokenizer `<script>` it injects. That matters only for a
+`script-src` that allows scripts by nonce without `'strict-dynamic'`: under
+`'strict-dynamic'` the script-created tag loads without one, and the Worldline host in
+`script-src` allows it anyway. The Tokenizer reads no nonce, loads no further script and
+adds no `<style>`, so that tag is all the nonce needs to cover; `frame-src` and
+`connect-src` still need the host. It sets one inline `style` attribute, which no nonce
+can cover: under a `style-src` without `'unsafe-inline'`, such as one with a nonce, the
+browser skips it, a cosmetic loss. A nonce in a directive turns `'unsafe-inline'` off
+there, so on a page that also mounts other PSPs a `style-src` nonce blocks the inline
+styles Paysafe.js and PayZen add without a nonce and Stripe's fallback `<style>`.
 :::
 
 ## 6. 3-D Secure

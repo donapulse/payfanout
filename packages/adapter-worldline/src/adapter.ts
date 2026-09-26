@@ -3,6 +3,7 @@ import {
   brandMountedFieldsHandle,
   getUserMessage,
   injectScript,
+  isValidCspNonce,
   PayFanoutError,
   type ClientPaymentAdapter,
   type ConfirmResult,
@@ -50,6 +51,18 @@ export interface WorldlineClientAdapterConfig {
   environment: "sandbox" | "live";
   /** Account capabilities vary per contract — override the conservative default. */
   paymentMethods?: PaymentMethodCapability[];
+  /**
+   * A Content-Security-Policy nonce for the Tokenizer `<script>` the adapter
+   * injects, set as its `nonce` attribute before the tag is inserted, so a
+   * `script-src` that allows scripts by nonce without `'strict-dynamic'` runs
+   * it. The Tokenizer reads no nonce, loads no further script and adds no
+   * `<style>`, so that tag is all the nonce needs to cover; the one inline
+   * `style` attribute it sets is cosmetic, and no nonce applies to attributes.
+   * Pass the value alone, as in the policy's `'nonce-<value>'` source; the
+   * constructor refuses anything else. The adapter never reads a nonce from
+   * the page, and a `loadScript` seam loads the script without it.
+   */
+  cspNonce?: string;
   /** Test seams. */
   loadScript?: (url: string) => Promise<void>;
   getWorldlineGlobal?: () => WorldlineTokenizerConstructor | undefined;
@@ -80,6 +93,11 @@ export class WorldlineClientAdapter implements ClientPaymentAdapter {
     if (config.environment !== "sandbox" && config.environment !== "live") {
       throw PayFanoutError.invalidRequest('WorldlineClientAdapter config.environment must be "sandbox" or "live"');
     }
+    if (config.cspNonce !== undefined && !isValidCspNonce(config.cspNonce)) {
+      throw PayFanoutError.invalidRequest(
+        "WorldlineClientAdapter config.cspNonce must be the value of the policy's 'nonce-…' source: base64 or base64url characters",
+      );
+    }
     this.config = config;
   }
 
@@ -87,14 +105,16 @@ export class WorldlineClientAdapter implements ClientPaymentAdapter {
     assertBrowser("WorldlineClientAdapter", "loadSdk");
     if (this.worldlineGlobal()) return;
     const url = this.config.sdkUrl ?? this.defaultSdkUrl();
-    this.sdkPromise ??= (this.config.loadScript ? this.config.loadScript(url) : injectScript(url, this.pspName)).catch(
-      (err) => {
-        // A flaky script load must not poison every later mount — clear the
-        // cached promise so the next loadSdk() retries the injection.
-        this.sdkPromise = undefined;
-        throw err;
-      },
-    );
+    this.sdkPromise ??= (
+      this.config.loadScript
+        ? this.config.loadScript(url)
+        : injectScript(url, this.pspName, { nonce: this.config.cspNonce })
+    ).catch((err) => {
+      // A flaky script load must not poison every later mount — clear the
+      // cached promise so the next loadSdk() retries the injection.
+      this.sdkPromise = undefined;
+      throw err;
+    });
     await this.sdkPromise;
     if (!this.worldlineGlobal()) {
       throw new PayFanoutError({

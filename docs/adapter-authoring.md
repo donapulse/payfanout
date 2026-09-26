@@ -335,6 +335,19 @@ Implement `ClientPaymentAdapter`:
   other token and would run the file unchecked).
   That detects a conflicting tag; it is not a trust boundary, since returning early on
   the SDK global means a copy the host page already loaded is used without any check.
+  For pages with a nonce-based Content-Security-Policy, take an optional `cspNonce` in the
+  config: refuse a malformed one in the constructor with core's `isValidCspNonce`, as you
+  refuse a bad `environment`, never read one from the page, and pass it as
+  `injectScript`'s `nonce`, which sets the tag's `nonce` attribute before `src` and
+  insertion, where the browser reads it. `attributes` sets any other attribute the SDK
+  reads from its own tag the same way (PayZen's `kr-public-key`, PayPal's
+  `data-csp-nonce`), refusing names the helper manages and `on…` handlers, and
+  `async: false` injects a non-async script. Load a stylesheet with
+  `injectStylesheet(url, pspName, { nonce, integrity })`: one `<link rel="stylesheet">`
+  per URL, resolving when it loads and also when it fails (styling is cosmetic; the failed
+  link is removed so a later call fetches it again), and a call that finds a link an
+  earlier call injected, still loading, waits for it. Say in the option's JSDoc what the
+  nonce covers for your PSP and what its SDK still loads or inlines without one.
 - `mount(container, options)`: render **hosted/iframe fields only** (SAQ-A), never a raw
   card input. Forward `options.appearance` to the PSP's styling hooks. Return a branded
   handle via `brandMountedFieldsHandle`, and validate handles you receive back. A

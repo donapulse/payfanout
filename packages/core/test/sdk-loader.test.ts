@@ -1,11 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PayFanoutError } from "../src/errors.js";
-import { injectScript } from "../src/sdk-loader.js";
+import { injectScript, injectStylesheet, isValidCspNonce } from "../src/sdk-loader.js";
 
 const SDK_URL = "https://sdk.acme.test/v1/acme.js";
 const OTHER_URL = "https://sdk.acme.test/v1/acme-extra.js";
+const CSS_URL = "https://sdk.acme.test/v1/acme.css";
 const HASH = `sha384-${"a".repeat(64)}`;
 const OTHER_HASH = `sha384-${"b".repeat(64)}`;
+const NONCE = "cmFuZG9tLW5vbmNlLXZhbHVl";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -33,6 +35,9 @@ class FakeScript {
   srcSetWith: Record<string, string> | undefined;
   /** Attributes as they stood at insertion, which is when a browser reads them. */
   insertedWith: Record<string, string> | undefined;
+  /** The async flag when `src` was first set and at insertion. */
+  asyncWhenSrcSet: boolean | undefined;
+  asyncWhenInserted: boolean | undefined;
   /** Takes the tag off the page, as Element.remove() does; set by the page stub. */
   remove: (() => void) | undefined;
   private srcValue = "";
@@ -44,9 +49,14 @@ class FakeScript {
   set src(value: string) {
     this.srcValue = value;
     this.srcSetWith ??= Object.fromEntries(this.attributes);
+    this.asyncWhenSrcSet ??= this.async;
   }
 
+  /** Refuses what the DOM refuses as an attribute name: empty, or holding whitespace, "/", "=", ">" or NUL. */
   setAttribute(name: string, value: string): void {
+    if (name === "" || /[\t\n\f\r /=>\0]/.test(name)) {
+      throw new DOMException(`"${name}" is not a valid attribute name.`, "InvalidCharacterError");
+    }
     this.attributes.set(name, value);
   }
 
@@ -85,12 +95,83 @@ function stubPage(...onPage: FakeScript[]): { injected: FakeScript[] } {
     head: {
       appendChild: (script: FakeScript) => {
         script.insertedWith = Object.fromEntries(script.attributes);
+        script.asyncWhenInserted = script.async;
         head.push(script);
         injected.push(script);
       },
     },
   });
   return { injected };
+}
+
+class FakeLink {
+  rel = "";
+  onload: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  readonly attributes = new Map<string, string>();
+  /** Attributes and `rel` as they stood when `href` was first set. */
+  hrefSetWith: Record<string, string> | undefined;
+  relWhenHrefSet: string | undefined;
+  /** Attributes as they stood at insertion, which is when a browser starts fetching the sheet. */
+  insertedWith: Record<string, string> | undefined;
+  /** Takes the link off the page, as Element.remove() does; set by the page stub. */
+  remove: (() => void) | undefined;
+  private hrefValue = "";
+
+  get href(): string {
+    return this.hrefValue;
+  }
+
+  set href(value: string) {
+    this.hrefValue = value;
+    this.hrefSetWith ??= Object.fromEntries(this.attributes);
+    this.relWhenHrefSet ??= this.rel;
+  }
+
+  setAttribute(name: string, value: string): void {
+    this.attributes.set(name, value);
+  }
+
+  getAttribute(name: string): string | null {
+    return this.attributes.get(name) ?? null;
+  }
+}
+
+function linkOnPage(href: string, attributes: Record<string, string> = {}): FakeLink {
+  const link = new FakeLink();
+  link.rel = "stylesheet";
+  link.href = href;
+  for (const [name, value] of Object.entries(attributes)) link.setAttribute(name, value);
+  return link;
+}
+
+/** A page whose head already holds `onPage`; lookups answer the loader's `link[href="…"]` selector. */
+function stubLinkPage(...onPage: FakeLink[]): { injected: FakeLink[]; head: FakeLink[] } {
+  const head = [...onPage];
+  const injected: FakeLink[] = [];
+  vi.stubGlobal("document", {
+    querySelector: (selector: string) => {
+      const href = /^link\[href="(.*)"\]$/.exec(selector)?.[1];
+      return head.find((link) => link.href === href) ?? null;
+    },
+    createElement: (tagName: string) => {
+      expect(tagName).toBe("link");
+      const link = new FakeLink();
+      link.remove = () => {
+        const index = head.indexOf(link);
+        if (index >= 0) head.splice(index, 1);
+      };
+      return link;
+    },
+    head: {
+      appendChild: (link: FakeLink) => {
+        link.insertedWith = Object.fromEntries(link.attributes);
+        head.push(link);
+        injected.push(link);
+      },
+    },
+  });
+  return { injected, head };
 }
 
 /** Whether `loading` has settled once every callback already queued has run. */
@@ -436,5 +517,272 @@ describe("injectScript while the tag an earlier call injected is loading", () =>
     expect(injected).toHaveLength(1);
     injected[0]!.onload!();
     await expect(first).resolves.toBeUndefined();
+  });
+});
+
+const NONCE_REFUSAL = (url: string) =>
+  `The nonce for ${url} is not a CSP nonce: base64 or base64url characters, with at most two trailing "="`;
+
+/** Values outside CSP3's base64-value, which no 'nonce-…' source can name. */
+const MALFORMED_NONCES = ["", " ", "a b", " abc", "abc\n", "'abc'", "'nonce-abc'", "abc===", "=abc", "ab=c", "abc;", "été"];
+
+describe("isValidCspNonce", () => {
+  it("accepts CSP3's base64-value: base64 or base64url characters with up to two trailing padding signs", () => {
+    for (const nonce of [NONCE, "abc", "ABCxyz019", "a+b/c-d_e", "abc=", "abc==", "-", "_"]) {
+      expect(isValidCspNonce(nonce), nonce).toBe(true);
+    }
+  });
+
+  it("refuses the empty string, anything outside the grammar, and non-strings", () => {
+    for (const nonce of [...MALFORMED_NONCES, "=", "==", 123, null, undefined, {}, ["abc"]]) {
+      expect(isValidCspNonce(nonce), String(nonce)).toBe(false);
+    }
+  });
+
+  it("checks the form only, so a value that kept its nonce- prefix still passes", () => {
+    expect(isValidCspNonce("nonce-abc")).toBe(true);
+  });
+});
+
+describe("injectScript nonce, attributes and async", () => {
+  it("sets the nonce, the further attributes and async before setting src and inserting the script", async () => {
+    const { injected } = stubPage();
+    const loading = injectScript(SDK_URL, "acme", {
+      nonce: NONCE,
+      attributes: { "data-csp-nonce": NONCE, "kr-spa-mode": "true" },
+      async: false,
+    });
+    const expected = { nonce: NONCE, "data-csp-nonce": NONCE, "kr-spa-mode": "true" };
+    expect(injected).toHaveLength(1);
+    expect(injected[0]!.srcSetWith).toEqual(expected);
+    expect(injected[0]!.insertedWith).toEqual(expected);
+    expect([injected[0]!.asyncWhenSrcSet, injected[0]!.asyncWhenInserted]).toEqual([false, false]);
+    injected[0]!.onload!();
+    await expect(loading).resolves.toBeUndefined();
+  });
+
+  it("keeps async true unless told otherwise, set before src too", () => {
+    const { injected } = stubPage();
+    void injectScript(SDK_URL, "acme", { nonce: NONCE });
+    void injectScript(OTHER_URL, "acme", { async: true });
+    expect(injected.map((script) => [script.asyncWhenSrcSet, script.asyncWhenInserted])).toEqual([
+      [true, true],
+      [true, true],
+    ]);
+  });
+
+  it("sets the nonce beside integrity and crossorigin, all before src", () => {
+    const { injected } = stubPage();
+    void injectScript(SDK_URL, "acme", { integrity: HASH, nonce: NONCE });
+    expect(injected[0]!.srcSetWith).toEqual({ nonce: NONCE, integrity: HASH, crossorigin: "anonymous" });
+  });
+
+  it("refuses a nonce outside CSP3's base64-value and injects nothing", async () => {
+    const { injected } = stubPage();
+    for (const nonce of MALFORMED_NONCES) {
+      await expectRefused(injectScript(SDK_URL, "acme", { nonce }), NONCE_REFUSAL(SDK_URL));
+    }
+    expect(injected).toHaveLength(0);
+  });
+
+  it("refuses an attribute the helper manages, in any letter case, and injects nothing", async () => {
+    const { injected } = stubPage();
+    for (const name of ["src", "SRC", "async", "Defer", "integrity", "crossOrigin", "NONCE", "type"]) {
+      await expectRefused(
+        injectScript(SDK_URL, "acme", { attributes: { "data-ok": "1", [name]: "x" } }),
+        `The ${JSON.stringify(name)} attribute for ${SDK_URL} is managed by injectScript, so attributes may not set it`,
+      );
+    }
+    expect(injected).toHaveLength(0);
+  });
+
+  it("refuses an attribute that runs script, in any letter case, and injects nothing", async () => {
+    const { injected } = stubPage();
+    for (const name of ["onload", "ONERROR", "onClick", "on"]) {
+      await expectRefused(
+        injectScript(SDK_URL, "acme", { attributes: { [name]: "alert(1)" } }),
+        `The ${JSON.stringify(name)} attribute for ${SDK_URL} runs script, so attributes may not set it`,
+      );
+    }
+    expect(injected).toHaveLength(0);
+  });
+
+  it("refuses a name the DOM refuses, whatever the page holds, keeping the DOM's error on raw", async () => {
+    for (const onPage of [[], [scriptOnPage(SDK_URL)]]) {
+      const { injected } = stubPage(...onPage);
+      const error = await rejection(injectScript(SDK_URL, "acme", { attributes: { "data ok": "1" } }));
+      expect(error.toJSON()).toEqual({
+        name: "PayFanoutError",
+        code: "invalid_request",
+        message: `The DOM refuses "data ok" as an attribute name, so nothing was injected for ${SDK_URL}`,
+        retryable: false,
+        pspName: "acme",
+      });
+      expect(error.raw).toBeInstanceOf(DOMException);
+      expect((error.raw as DOMException).name).toBe("InvalidCharacterError");
+      expect(injected).toHaveLength(0);
+    }
+  });
+
+  it("refuses invalid options at once, even while a tag for the url is still loading", async () => {
+    const { injected } = stubPage();
+    const first = injectScript(SDK_URL, "acme");
+    await expectRefused(injectScript(SDK_URL, "acme", { nonce: "a b" }), NONCE_REFUSAL(SDK_URL));
+    await expectRefused(
+      injectScript(SDK_URL, "acme", { attributes: { onload: "x" } }),
+      `The "onload" attribute for ${SDK_URL} runs script, so attributes may not set it`,
+    );
+    expect(injected).toHaveLength(1);
+    injected[0]!.onload!();
+    await expect(first).resolves.toBeUndefined();
+  });
+
+  it("reuses a script already on the page without comparing its nonce or attributes", async () => {
+    // A connected tag's nonce reads as "" under a header-delivered policy.
+    const { injected } = stubPage(scriptOnPage(SDK_URL, { nonce: "", "kr-public-key": "another-key" }));
+    await expect(
+      injectScript(SDK_URL, "acme", { nonce: NONCE, attributes: { "kr-public-key": "this-key" }, async: false }),
+    ).resolves.toBeUndefined();
+    expect(injected).toHaveLength(0);
+  });
+
+  it("makes a call carrying a nonce wait for the tag an earlier call injected without one", async () => {
+    const { injected } = stubPage();
+    const first = injectScript(SDK_URL, "acme");
+    const second = injectScript(SDK_URL, "acme", { nonce: NONCE, attributes: { "data-csp-nonce": NONCE } });
+    expect(await hasSettled(second)).toBe(false);
+    expect(injected).toHaveLength(1);
+    expect(injected[0]!.insertedWith).toEqual({});
+    injected[0]!.onload!();
+    await expect(first).resolves.toBeUndefined();
+    await expect(second).resolves.toBeUndefined();
+  });
+
+  it("rejects a call carrying a nonce with the failure of the tag it waited on", async () => {
+    const { injected } = stubPage();
+    const first = injectScript(SDK_URL, "acme", { nonce: NONCE });
+    const second = injectScript(SDK_URL, "acme", { nonce: NONCE, attributes: { "kr-spa-mode": "true" } });
+    injected[0]!.onerror!();
+    await expectLoadFailure(first, SDK_URL);
+    await expectLoadFailure(second, SDK_URL);
+    expect(injected).toHaveLength(1);
+  });
+});
+
+describe("injectStylesheet", () => {
+  it("injects one link carrying only rel and href without options, and resolves when it loads", async () => {
+    // No setAttribute on the doubles: a call without options must not need it.
+    const appended: Record<string, unknown>[] = [];
+    vi.stubGlobal("document", {
+      querySelector: () => null,
+      createElement: () => ({}),
+      head: { appendChild: (el: Record<string, unknown>) => appended.push(el) },
+    });
+    const loading = injectStylesheet(CSS_URL, "acme");
+    expect(appended).toHaveLength(1);
+    expect(Object.keys(appended[0]!).sort()).toEqual(["href", "onerror", "onload", "rel"]);
+    expect(appended[0]).toMatchObject({ rel: "stylesheet", href: CSS_URL });
+    (appended[0]!["onload"] as () => void)();
+    await expect(loading).resolves.toBeUndefined();
+  });
+
+  it("sets rel, the nonce, integrity and a default crossorigin of anonymous before href and insertion", async () => {
+    const { injected } = stubLinkPage();
+    const loading = injectStylesheet(CSS_URL, "acme", { nonce: NONCE, integrity: HASH });
+    const expected = { nonce: NONCE, integrity: HASH, crossorigin: "anonymous" };
+    expect(injected).toHaveLength(1);
+    expect(injected[0]!.relWhenHrefSet).toBe("stylesheet");
+    expect(injected[0]!.hrefSetWith).toEqual(expected);
+    expect(injected[0]!.insertedWith).toEqual(expected);
+    injected[0]!.onload!();
+    await expect(loading).resolves.toBeUndefined();
+  });
+
+  it("honours an explicit crossOrigin, and sets crossorigin without integrity only when asked", () => {
+    const { injected } = stubLinkPage();
+    void injectStylesheet(CSS_URL, "acme", { integrity: HASH, crossOrigin: "use-credentials" });
+    void injectStylesheet(`${CSS_URL}?2`, "acme", { nonce: NONCE });
+    void injectStylesheet(`${CSS_URL}?3`, "acme", { crossOrigin: "anonymous" });
+    expect(injected.map((link) => link.hrefSetWith)).toEqual([
+      { integrity: HASH, crossorigin: "use-credentials" },
+      { nonce: NONCE },
+      { crossorigin: "anonymous" },
+    ]);
+  });
+
+  it("resolves when the sheet fails to load and removes the link, so the next call fetches it again", async () => {
+    const { injected, head } = stubLinkPage();
+    const first = injectStylesheet(CSS_URL, "acme", { integrity: HASH });
+    // A sheet failing its integrity check reaches the page only as the error event.
+    injected[0]!.onerror!();
+    await expect(first).resolves.toBeUndefined();
+    expect(head).toEqual([]);
+    const second = injectStylesheet(CSS_URL, "acme", { integrity: HASH });
+    expect(injected).toHaveLength(2);
+    injected[1]!.onload!();
+    await expect(second).resolves.toBeUndefined();
+    expect(head).toEqual([injected[1]]);
+  });
+
+  it("makes a later call wait for the link an earlier call injected, and resolves both when it loads", async () => {
+    const { injected } = stubLinkPage();
+    const first = injectStylesheet(CSS_URL, "acme");
+    const second = injectStylesheet(CSS_URL, "acme-eu", { nonce: NONCE });
+    expect(await hasSettled(second)).toBe(false);
+    expect(injected).toHaveLength(1);
+    injected[0]!.onload!();
+    await expect(first).resolves.toBeUndefined();
+    await expect(second).resolves.toBeUndefined();
+    const later = injectStylesheet(CSS_URL, "acme");
+    expect(await hasSettled(later)).toBe(true);
+    expect(injected).toHaveLength(1);
+  });
+
+  it("resolves the calls waiting on a link that fails, which is off the page before they carry on", async () => {
+    const { injected } = stubLinkPage();
+    void injectStylesheet(CSS_URL, "acme");
+    const retried = injectStylesheet(CSS_URL, "acme").then(() => injectStylesheet(CSS_URL, "acme"));
+    injected[0]!.onerror!();
+    expect(await hasSettled(retried)).toBe(false);
+    expect(injected).toHaveLength(2);
+    injected[1]!.onload!();
+    await expect(retried).resolves.toBeUndefined();
+  });
+
+  it("reuses a link already on the page at once, whatever it carries, and never takes it over", async () => {
+    const pageLink = linkOnPage(CSS_URL, { integrity: OTHER_HASH });
+    pageLink.remove = vi.fn();
+    const { injected } = stubLinkPage(pageLink);
+    await expect(injectStylesheet(CSS_URL, "acme", { nonce: NONCE, integrity: HASH })).resolves.toBeUndefined();
+    expect(pageLink.onload).toBeNull();
+    expect(pageLink.onerror).toBeNull();
+    expect(pageLink.remove).not.toHaveBeenCalled();
+    expect(injected).toHaveLength(0);
+  });
+
+  it("refuses an invalid nonce or integrity, even with a link for the url on the page, and injects nothing", async () => {
+    const { injected } = stubLinkPage(linkOnPage(CSS_URL));
+    for (const nonce of MALFORMED_NONCES) {
+      await expectRefused(injectStylesheet(CSS_URL, "acme", { nonce }), NONCE_REFUSAL(CSS_URL));
+    }
+    for (const integrity of ["", "SHA384-abc", "sha384-?"]) {
+      await expectRefused(
+        injectStylesheet(CSS_URL, "acme", { integrity }),
+        `The integrity for ${CSS_URL} holds no sha256, sha384 or sha512 hash`,
+      );
+    }
+    expect(injected).toHaveLength(0);
+  });
+
+  it("tolerates a link double without remove() when its load fails", async () => {
+    const appended: Record<string, unknown>[] = [];
+    vi.stubGlobal("document", {
+      querySelector: () => null,
+      createElement: () => ({}),
+      head: { appendChild: (el: Record<string, unknown>) => appended.push(el) },
+    });
+    const loading = injectStylesheet(CSS_URL, "acme");
+    expect(() => (appended[0]!["onerror"] as () => void)()).not.toThrow();
+    await expect(loading).resolves.toBeUndefined();
   });
 });

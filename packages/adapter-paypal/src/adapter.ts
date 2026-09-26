@@ -2,6 +2,7 @@ import {
   assertBrowser,
   brandMountedFieldsHandle,
   injectScript,
+  isValidCspNonce,
   normalizeCurrency,
   PayFanoutError,
   type ClientPaymentAdapter,
@@ -58,6 +59,18 @@ export interface PayPalClientAdapterConfig {
    * to capture-on-approval flows. Both adapters must agree.
    */
   userAction?: "continue" | "pay_now";
+  /**
+   * A Content-Security-Policy nonce for the JS SDK `<script>` the adapter
+   * injects, set as both its `nonce` and its `data-csp-nonce` attribute before
+   * the tag is inserted. The browser checks `nonce` against `script-src`; the
+   * SDK reads only `data-csp-nonce` and sets it on the inline scripts and
+   * styles it creates, which PayPal's nonce-based policy needs. Pass the value
+   * alone, as in the policy's `'nonce-<value>'` source; the constructor refuses
+   * anything else. The adapter never reads a nonce from the page, a
+   * `loadScript` seam loads the script without it, and an SDK the page already
+   * loaded is used as it is.
+   */
+  cspNonce?: string;
   /** Test seams. */
   sdkBaseUrl?: string;
   /**
@@ -112,6 +125,11 @@ export class PayPalClientAdapter implements ClientPaymentAdapter {
       throw PayFanoutError.invalidRequest('PayPalClientAdapter config.userAction must be "continue" or "pay_now"');
     }
     if (config.currency !== undefined) normalizeCurrency(config.currency);
+    if (config.cspNonce !== undefined && !isValidCspNonce(config.cspNonce)) {
+      throw PayFanoutError.invalidRequest(
+        "PayPalClientAdapter config.cspNonce must be the value of the policy's 'nonce-…' source: base64 or base64url characters",
+      );
+    }
     this.config = config;
   }
 
@@ -122,7 +140,13 @@ export class PayPalClientAdapter implements ClientPaymentAdapter {
     // reuse it as-is — one currency and intent per page load (see the guide).
     if (this.payPalGlobal()) return;
     const url = this.sdkUrl();
-    this.sdkPromise ??= this.config.loadScript ? this.config.loadScript(url) : injectScript(url, this.pspName);
+    const nonce = this.config.cspNonce;
+    // The browser checks the nonce attribute and the SDK reads data-csp-nonce.
+    // Only this tag carries the data- copy: under a header-delivered policy the
+    // browser hides the nonce attribute from CSS selectors, never a data- one.
+    this.sdkPromise ??= this.config.loadScript
+      ? this.config.loadScript(url)
+      : injectScript(url, this.pspName, nonce === undefined ? {} : { nonce, attributes: { "data-csp-nonce": nonce } });
     const loading = this.sdkPromise;
     try {
       await loading;

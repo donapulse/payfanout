@@ -830,7 +830,7 @@ describe("PayZenClientAdapter loadSdk", () => {
     await expect(adapter.loadSdk()).rejects.toMatchObject({ code: "psp_unavailable" });
   });
 
-  it("injects the stylesheet and a non-async script carrying the kr attributes", async () => {
+  it("injects a non-async script carrying the kr attributes, then the stylesheet once the script has loaded", async () => {
     const { created, head } = stubBrowser();
     let kr: KrLike | undefined = undefined;
     const adapter = new PayZenClientAdapter({
@@ -841,19 +841,24 @@ describe("PayZenClientAdapter loadSdk", () => {
     const loading = adapter.loadSdk();
     const script = created.find((el) => el.src)!;
     expect(script.src).toContain("kr-payment-form.min.js");
-    expect(script.async).toBe(false); // PayZen forbids async loading; dynamic scripts default to async
+    expect(script.async).toBe(false); // dynamically injected scripts default to async
     expect(script.attributes["kr-public-key"]).toBe(PUBLIC_KEY);
     expect(script.attributes["kr-spa-mode"]).toBe("true");
-    const link = created.find((el) => el.rel === "stylesheet")!;
-    expect(link.href).toContain("neon-reset.min.css");
-    expect(head.children).toContain(script);
+    // PayZen: "Theme files must imperatively be loaded after the JavaScript library."
+    expect(head.children).toEqual([script]);
+    expect(created.some((el) => el.rel === "stylesheet")).toBe(false);
     kr = makeFakeKr();
     script.onload?.();
+    await tick();
+    const link = created.find((el) => el.rel === "stylesheet")!;
+    expect(link.href).toContain("neon-reset.min.css");
+    expect(head.children).toEqual([script, link]);
+    link.onload?.();
     await expect(loading).resolves.toBeUndefined();
   });
 
   it("reuses already-injected assets instead of adding a second script (single KR global per page)", async () => {
-    const { created, existing } = stubBrowser();
+    const { head, existing } = stubBrowser();
     existing.set(
       'script[src="https://static.payzen.eu/static/js/krypton-client/V4.0/stable/kr-payment-form.min.js"]',
       fakeElement(),
@@ -872,7 +877,7 @@ describe("PayZenClientAdapter loadSdk", () => {
       getKrGlobal: () => (lookups++ === 0 ? undefined : kr),
     });
     await adapter.loadSdk();
-    expect(created).toHaveLength(0); // nothing new injected
+    expect(head.children).toHaveLength(0); // nothing new injected
   });
 
   it("maps a script load failure to a retryable psp_unavailable", async () => {
@@ -970,10 +975,14 @@ describe("PayZenClientAdapter loadSdk", () => {
     expect(fresh.async).toBe(false);
     expect(fresh.attributes).toEqual({ "kr-public-key": PUBLIC_KEY, "kr-spa-mode": "true" });
     expect(head).toContain(fresh);
-    // The stylesheet stays on the page and is not added twice.
-    expect(created.filter((el) => el.rel === "stylesheet")).toHaveLength(1);
+    // The stylesheet waits for a script that loads.
+    expect(created.filter((el) => el.rel === "stylesheet")).toHaveLength(0);
     kr = makeFakeKr();
     fresh.onload?.();
+    await tick();
+    const links = created.filter((el) => el.rel === "stylesheet");
+    expect(links).toHaveLength(1);
+    links[0]!.onload?.();
     await expect(second).resolves.toBeUndefined();
   });
 
@@ -1008,9 +1017,257 @@ describe("PayZenClientAdapter loadSdk", () => {
     });
     const loading = adapter.loadSdk();
     expect(created.find((el) => el.src)!.src).toBe("https://assets.example/kr.js");
-    expect(created.find((el) => el.rel === "stylesheet")!.href).toBe("https://assets.example/kr.css");
     kr = makeFakeKr();
     created.find((el) => el.src)!.onload?.();
+    await tick();
+    const link = created.find((el) => el.rel === "stylesheet")!;
+    expect(link.href).toBe("https://assets.example/kr.css");
+    link.onload?.();
     await loading;
+  });
+});
+
+const KR_SCRIPT_URL = "https://static.payzen.eu/static/js/krypton-client/V4.0/stable/kr-payment-form.min.js";
+const KR_CSS_URL = "https://static.payzen.eu/static/js/krypton-client/V4.0/ext/neon-reset.min.css";
+/** A per-response Content-Security-Policy nonce, as a host server would mint it. */
+const NONCE = "cmFuZG9tLW5vbmNlLXZhbHVl";
+
+/** Lets every callback already queued run. */
+function tick(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** Whether `loading` has settled once every callback already queued has run. */
+async function hasSettled(loading: Promise<void>): Promise<boolean> {
+  let settled = false;
+  void loading.then(
+    () => (settled = true),
+    () => (settled = true),
+  );
+  await tick();
+  return settled;
+}
+
+interface FakePage {
+  /** The tags on the page, in insertion order. */
+  head: FakeTag[];
+}
+
+/**
+ * A `<script>` or `<link>` double recording its attributes and async flag when
+ * its URL is first set and when it is inserted, the moments a browser reads them.
+ */
+class FakeTag {
+  readonly attributes: Record<string, string> = {};
+  rel = "";
+  async = true;
+  onload: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  urlSetWith: Record<string, string> | undefined;
+  asyncWhenUrlSet: boolean | undefined;
+  insertedWith: Record<string, string> | undefined;
+  asyncWhenInserted: boolean | undefined;
+  readonly remove: ReturnType<typeof vi.fn>;
+  private url = "";
+
+  constructor(
+    readonly tagName: string,
+    page: FakePage,
+  ) {
+    this.remove = vi.fn(() => {
+      page.head = page.head.filter((tag) => tag !== this);
+    });
+  }
+
+  setAttribute(name: string, value: string): void {
+    this.attributes[name] = value;
+  }
+
+  getAttribute(name: string): string | null {
+    return this.attributes[name] ?? null;
+  }
+
+  get src(): string {
+    return this.url;
+  }
+
+  set src(value: string) {
+    this.setUrl(value);
+  }
+
+  get href(): string {
+    return this.url;
+  }
+
+  set href(value: string) {
+    this.setUrl(value);
+  }
+
+  private setUrl(value: string): void {
+    this.url = value;
+    this.urlSetWith ??= { ...this.attributes };
+    this.asyncWhenUrlSet ??= this.async;
+  }
+}
+
+/** A page whose lookups see what the loaders inserted and removed. */
+function stubPage(): FakePage {
+  const page: FakePage = { head: [] };
+  vi.stubGlobal("window", {});
+  vi.stubGlobal("document", {
+    createElement: (tagName: string) => new FakeTag(tagName, page),
+    querySelector: (selector: string) => {
+      const match = /^(script|link)\[(?:src|href)="(.*)"\]$/.exec(selector);
+      if (!match) throw new Error(`unexpected selector ${selector}`);
+      return page.head.find((tag) => tag.tagName === match[1] && tag.src === match[2]) ?? null;
+    },
+    head: {
+      appendChild: (tag: FakeTag) => {
+        tag.insertedWith = { ...tag.attributes };
+        tag.asyncWhenInserted = tag.async;
+        page.head.push(tag);
+      },
+    },
+  });
+  return page;
+}
+
+function tagOf(page: FakePage, tagName: "script" | "link"): FakeTag {
+  const tag = page.head.find((candidate) => candidate.tagName === tagName);
+  if (!tag) throw new Error(`no <${tagName}> on the page`);
+  return tag;
+}
+
+describe("PayZenClientAdapter asset injection", () => {
+  it("makes a second adapter instance wait for the krypton script the first is still loading", async () => {
+    const page = stubPage();
+    let kr: KrLike | undefined = undefined;
+    const config = { publicKey: PUBLIC_KEY, environment: "sandbox", getKrGlobal: () => kr } as const;
+    const first = new PayZenClientAdapter(config).loadSdk();
+    const second = new PayZenClientAdapter(config).loadSdk();
+    // Before, the second instance resolved at once from the tag and failed its KR check.
+    expect(await hasSettled(second)).toBe(false);
+    expect(page.head.map((tag) => tag.tagName)).toEqual(["script"]);
+    kr = makeFakeKr();
+    tagOf(page, "script").onload!();
+    await tick();
+    // One stylesheet for both instances, injected once the library has loaded.
+    expect(page.head.map((tag) => tag.tagName)).toEqual(["script", "link"]);
+    expect(await hasSettled(second)).toBe(false);
+    tagOf(page, "link").onload!();
+    await expect(first).resolves.toBeUndefined();
+    await expect(second).resolves.toBeUndefined();
+  });
+
+  it("fails a second adapter instance with the krypton script it waited on, injecting no stylesheet", async () => {
+    const page = stubPage();
+    const config = { publicKey: PUBLIC_KEY, environment: "sandbox", getKrGlobal: () => undefined } as const;
+    const first = new PayZenClientAdapter(config).loadSdk();
+    const second = new PayZenClientAdapter(config).loadSdk();
+    const script = tagOf(page, "script");
+    script.onerror!();
+    for (const loading of [first, second]) {
+      await expect(loading).rejects.toMatchObject({
+        code: "psp_unavailable",
+        message: `Failed to load ${KR_SCRIPT_URL}`,
+        retryable: true,
+        pspName: "payzen",
+      });
+    }
+    expect(script.remove).toHaveBeenCalledTimes(1);
+    expect(page.head).toEqual([]);
+  });
+
+  it("sets the kr attributes and async false on the script before its URL and insertion", async () => {
+    const page = stubPage();
+    let kr: KrLike | undefined = undefined;
+    const adapter = new PayZenClientAdapter({ publicKey: PUBLIC_KEY, environment: "sandbox", getKrGlobal: () => kr });
+    const loading = adapter.loadSdk();
+    const script = tagOf(page, "script");
+    const attributes = { "kr-public-key": PUBLIC_KEY, "kr-spa-mode": "true" };
+    expect(script.src).toBe(KR_SCRIPT_URL);
+    expect([script.urlSetWith, script.insertedWith]).toEqual([attributes, attributes]);
+    expect([script.asyncWhenUrlSet, script.asyncWhenInserted]).toEqual([false, false]);
+    kr = makeFakeKr();
+    script.onload!();
+    await tick();
+    const link = tagOf(page, "link");
+    expect([link.href, link.rel, link.insertedWith]).toEqual([KR_CSS_URL, "stylesheet", {}]);
+    link.onload!();
+    await expect(loading).resolves.toBeUndefined();
+  });
+
+  it("puts cspNonce on the krypton script and on the stylesheet link, before their URL and insertion", async () => {
+    const page = stubPage();
+    let kr: KrLike | undefined = undefined;
+    const adapter = new PayZenClientAdapter({
+      publicKey: PUBLIC_KEY,
+      environment: "sandbox",
+      cspNonce: NONCE,
+      getKrGlobal: () => kr,
+    });
+    const loading = adapter.loadSdk();
+    const script = tagOf(page, "script");
+    const scriptAttributes = { nonce: NONCE, "kr-public-key": PUBLIC_KEY, "kr-spa-mode": "true" };
+    expect([script.urlSetWith, script.insertedWith]).toEqual([scriptAttributes, scriptAttributes]);
+    kr = makeFakeKr();
+    script.onload!();
+    await tick();
+    const link = tagOf(page, "link");
+    expect([link.urlSetWith, link.insertedWith]).toEqual([{ nonce: NONCE }, { nonce: NONCE }]);
+    link.onload!();
+    await expect(loading).resolves.toBeUndefined();
+  });
+
+  it("resolves once the stylesheet fails to load, and removes it so the next load fetches it again", async () => {
+    const page = stubPage();
+    let kr: KrLike | undefined = undefined;
+    const adapter = new PayZenClientAdapter({ publicKey: PUBLIC_KEY, environment: "sandbox", getKrGlobal: () => kr });
+    const loading = adapter.loadSdk();
+    kr = makeFakeKr();
+    tagOf(page, "script").onload!();
+    await tick();
+    const link = tagOf(page, "link");
+    link.onerror!();
+    await expect(loading).resolves.toBeUndefined();
+    expect(link.remove).toHaveBeenCalledTimes(1);
+    expect(page.head.map((tag) => tag.tagName)).toEqual(["script"]);
+  });
+
+  it("hands a loadScript seam only the two URLs, so it loads without the nonce", async () => {
+    const calls: unknown[][] = [];
+    let kr: KrLike | undefined;
+    const adapter = new PayZenClientAdapter({
+      publicKey: PUBLIC_KEY,
+      environment: "sandbox",
+      cspNonce: NONCE,
+      getKrGlobal: () => kr,
+      loadScript: async (...args: unknown[]) => {
+        calls.push(args);
+        kr = makeFakeKr();
+      },
+    });
+    stubPage();
+    await adapter.loadSdk();
+    expect(calls).toEqual([[KR_SCRIPT_URL, KR_CSS_URL]]);
+  });
+
+  it("refuses a malformed cspNonce at construction, without echoing it", () => {
+    for (const cspNonce of ["", "a b", "'nonce-abc'", "abc==="]) {
+      let err: unknown;
+      try {
+        new PayZenClientAdapter({ publicKey: PUBLIC_KEY, environment: "sandbox", cspNonce });
+      } catch (caught) {
+        err = caught;
+      }
+      expect(isPayFanoutError(err), JSON.stringify(cspNonce)).toBe(true);
+      expect(err).toMatchObject({
+        code: "invalid_request",
+        retryable: false,
+        message:
+          "PayZenClientAdapter config.cspNonce must be the value of the policy's 'nonce-…' source: base64 or base64url characters",
+      });
+    }
+    expect(() => new PayZenClientAdapter({ publicKey: PUBLIC_KEY, environment: "sandbox", cspNonce: NONCE })).not.toThrow();
   });
 });

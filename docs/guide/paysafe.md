@@ -178,6 +178,21 @@ connect-src https://hosted.paysafe.com https://hosted.test.paysafe.com
 The `.test` hosts are exercised only by `environment: "sandbox"` and are harmless
 to allow in a production CSP (or gate them per environment). Override the script
 URL with the `sdkUrl` config field to pin a version or self-host.
+
+**Nonce-based policies.** Pass the nonce your server put in the page's policy as
+`cspNonce` (the adapter never reads one from the page), and the adapter sets it as the
+`nonce` attribute of the Paysafe.js `<script>` it injects. That matters only for a
+`script-src` that allows scripts by nonce without `'strict-dynamic'`: under
+`'strict-dynamic'` the script-created tag loads without one, and
+`https://hosted.paysafe.com` in `script-src` allows it anyway. Paysafe.js reads no nonce
+itself. It loads the Google Pay, Apple Pay and Paze SDKs without one, adds `<style>`
+elements without a nonce for its 3-D Secure and redirect overlays, which need
+`'unsafe-inline'` in `style-src`, and compiles templates at run time on its installments
+path, which needs `'unsafe-eval'` in `script-src`. A nonce in a directive turns
+`'unsafe-inline'` off there, so a `style-src` nonce, such as the one PayPal's nonce policy
+uses, blocks those overlay styles, and on a page that also mounts other PSPs the inline
+styles PayZen adds without a nonce, Stripe's fallback `<style>` and the Worldline
+Tokenizer's `style` attribute.
 :::
 
 ## 6. Billing postal code is required

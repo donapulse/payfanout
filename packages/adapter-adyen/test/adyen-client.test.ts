@@ -331,7 +331,7 @@ describe("AdyenClientAdapter", () => {
     vi.stubGlobal("window", {});
     vi.stubGlobal("document", {
       createElement: (tag: string) => {
-        const element: Record<string, unknown> = { tag, id: "", remove: vi.fn() };
+        const element: Record<string, unknown> = { tag, id: "", remove: vi.fn(), setAttribute: vi.fn() };
         if (tag === "link") links.push(element);
         return element;
       },
@@ -711,6 +711,8 @@ describe("AdyenClientAdapter 3-D Secure", () => {
 /** The sha384 hashes Adyen's release notes publish for Adyen Web 6.45.2's adyen.js and adyen.css. */
 const SCRIPT_INTEGRITY = "sha384-crX4Byf88JpnQfdUaDuwVOj3qlk5tmSa3rhIalmJIyo1kC49EDIcnNQ9fY5blVUV";
 const STYLESHEET_INTEGRITY = "sha384-KhV4iC2YVQosq5vzx0xN0yGDVMZA++mbd6obc2JKUszVBdXmexFTRHOXKh5DcqDF";
+/** A per-response Content-Security-Policy nonce, as a host server would mint it. */
+const NONCE = "cmFuZG9tLW5vbmNlLXZhbHVl";
 
 interface FakePage {
   /** The tags on the page, in insertion order. */
@@ -957,6 +959,79 @@ describe("AdyenClientAdapter loading Adyen Web", () => {
     }
   });
 
+  it("puts cspNonce on the script and the stylesheet link, before their URL is set and at insertion", async () => {
+    const page = stubPage();
+    const { adapter, defineGlobal } = pageAdapter({ cspNonce: NONCE });
+    const loading = adapter.loadSdk();
+    const script = tagOf(page, "script");
+    const link = tagOf(page, "link");
+    const scriptAttributes = { nonce: NONCE, integrity: SCRIPT_INTEGRITY, crossorigin: "anonymous" };
+    const linkAttributes = { nonce: NONCE, integrity: STYLESHEET_INTEGRITY, crossorigin: "anonymous" };
+    expect([script.urlSetWith, script.insertedWith]).toEqual([scriptAttributes, scriptAttributes]);
+    expect([link.urlSetWith, link.insertedWith]).toEqual([linkAttributes, linkAttributes]);
+    defineGlobal();
+    loadAll(page);
+    await expect(loading).resolves.toBeUndefined();
+  });
+
+  it("keeps the nonce on files loaded without an integrity check", async () => {
+    const page = stubPage();
+    const { adapter, defineGlobal } = pageAdapter({ cspNonce: NONCE, sdkVersion: "6.44.0" });
+    const loading = adapter.loadSdk();
+    expect(tagOf(page, "script").insertedWith).toEqual({ nonce: NONCE });
+    expect(tagOf(page, "link").insertedWith).toEqual({ nonce: NONCE });
+    defineGlobal();
+    loadAll(page);
+    await expect(loading).resolves.toBeUndefined();
+  });
+
+  it("hands the seams only the URL, so a host loadScript or loadStylesheet loads without the nonce", async () => {
+    const page = stubPage();
+    const scripts: string[] = [];
+    const stylesheets: string[] = [];
+    let global: unknown;
+    const adapter = new AdyenClientAdapter({
+      clientKey: "test_CLIENTKEY",
+      environment: "sandbox",
+      countryCode: "NL",
+      cspNonce: NONCE,
+      getAdyenGlobal: () => global as never,
+      loadScript: async (...args: unknown[]) => {
+        scripts.push(...(args as string[]));
+        global = makeFakeAdyenWeb().AdyenWeb;
+      },
+      loadStylesheet: async (...args: unknown[]) => {
+        stylesheets.push(...(args as string[]));
+      },
+    });
+    await adapter.loadSdk();
+    const base = `https://checkoutshopper-test.cdn.adyen.com/checkoutshopper/sdk/${ADYEN_WEB_VERSION}`;
+    expect([scripts, stylesheets]).toEqual([[`${base}/adyen.js`], [`${base}/adyen.css`]]);
+    expect(page.head).toEqual([]);
+  });
+
+  it("makes a second adapter wait for the stylesheet another one injected while it loads", async () => {
+    const page = stubPage();
+    const first = pageAdapter({ cspNonce: NONCE });
+    const second = pageAdapter({ cspNonce: NONCE });
+    const loadingFirst = first.adapter.loadSdk();
+    const loadingSecond = second.adapter.loadSdk();
+    first.defineGlobal();
+    second.defineGlobal();
+    const script = tagOf(page, "script");
+    const link = tagOf(page, "link");
+    script.onload!();
+    let secondSettled = false;
+    void loadingSecond.then(() => (secondSettled = true));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // The script has loaded, the stylesheet has not: both loads wait for it.
+    expect(secondSettled).toBe(false);
+    link.onload!();
+    await expect(loadingFirst).resolves.toBeUndefined();
+    await expect(loadingSecond).resolves.toBeUndefined();
+    expect(page.head).toEqual([script, link]);
+  });
+
   it("removes a stylesheet it injected whose load failed, so the next load fetches it again", async () => {
     const page = stubPage();
     let loads = 0;
@@ -997,7 +1072,7 @@ describe("AdyenClientAdapter loading Adyen Web", () => {
     vi.stubGlobal("window", {});
     vi.stubGlobal("document", {
       createElement: () => {
-        const link: Record<string, unknown> = {};
+        const link: Record<string, unknown> = { setAttribute: () => undefined };
         links.push(link);
         return link;
       },
@@ -1069,6 +1144,20 @@ describe("AdyenClientAdapter loading Adyen Web", () => {
 describe("AdyenClientAdapter configuration checks", () => {
   const sandbox = { clientKey: "test_CLIENTKEY", environment: "sandbox", countryCode: "NL" } as const;
   const live = { clientKey: "live_CLIENTKEY", environment: "live", countryCode: "NL" } as const;
+
+  it("refuses a malformed cspNonce at construction, without echoing it", () => {
+    for (const cspNonce of ["", "a b", "'nonce-abc'", "abc==="]) {
+      const err = constructionError({ ...sandbox, cspNonce });
+      expect(isPayFanoutError(err), JSON.stringify(cspNonce)).toBe(true);
+      expect(err).toMatchObject({
+        code: "invalid_request",
+        retryable: false,
+        message:
+          "AdyenClientAdapter config.cspNonce must be the value of the policy's 'nonce-…' source: base64 or base64url characters",
+      });
+    }
+    expect(constructionError({ ...sandbox, cspNonce: NONCE })).toBeUndefined();
+  });
 
   it("refuses a client key whose prefix contradicts the environment, without echoing the key", () => {
     const cases: Array<[AdyenClientAdapterConfig, RegExp]> = [

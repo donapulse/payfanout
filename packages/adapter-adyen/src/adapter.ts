@@ -4,6 +4,8 @@ import {
   brandMountedFieldsHandle,
   getUserMessage,
   injectScript,
+  injectStylesheet,
+  isValidCspNonce,
   PayFanoutError,
   type ClientPaymentAdapter,
   type ConfirmResult,
@@ -103,6 +105,19 @@ export interface AdyenClientAdapterConfig {
   sdkUrl?: string;
   /** Self-hosting: the stylesheet URL to load instead of Adyen's CDN copy, without an integrity check. */
   stylesheetUrl?: string;
+  /**
+   * A Content-Security-Policy nonce for the two tags the adapter injects, the
+   * Adyen Web `<script>` and the stylesheet `<link>`, set as their `nonce`
+   * attribute before insertion, so a `script-src` and a `style-src` that allow
+   * them by nonce load them; a `'strict-dynamic'` `script-src` allows the
+   * script without one, and never applies to styles. The Card component
+   * reads no nonce and adds no script or `<style>` of its own, unless
+   * `fieldOptions` configures a wallet such as Click to Pay. Pass the value
+   * alone, as in the policy's `'nonce-<value>'` source; the constructor
+   * refuses anything else. The adapter never reads a nonce from the page, and
+   * the `loadScript` and `loadStylesheet` seams load their file without it.
+   */
+  cspNonce?: string;
   /** Test seam: loads the script in place of the adapter's injection, which carries the integrity check. */
   loadScript?: (url: string) => Promise<void>;
   /** Test seam: loads the stylesheet in place of the adapter's injection, which carries the integrity check. */
@@ -223,6 +238,11 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
           `"${config.environment}", which takes ${live ? '"live" or a regional "live-…" value' : '"test"'}`,
       );
     }
+    if (config.cspNonce !== undefined && !isValidCspNonce(config.cspNonce)) {
+      throw PayFanoutError.invalidRequest(
+        "AdyenClientAdapter config.cspNonce must be the value of the policy's 'nonce-…' source: base64 or base64url characters",
+      );
+    }
     this.config = config;
     this.adyenEnvironment = adyenEnvironment;
   }
@@ -232,10 +252,11 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
    * configured Adyen environment. Loaded from their default URLs, both files
    * carry the Subresource Integrity hash Adyen publishes for ADYEN_WEB_VERSION;
    * `sdkVersion` turns the check off for both, `sdkUrl` for the script and
-   * `stylesheetUrl` for the stylesheet. If the script fails to load, the next
-   * call fetches it again, with the stylesheet if that failed too; if it loaded
-   * without defining `window.AdyenWeb`, the next call checks again instead of
-   * failing from a cached result.
+   * `stylesheetUrl` for the stylesheet. With `cspNonce` both carry the nonce.
+   * If the script fails to load, the next call fetches it again, with the
+   * stylesheet if that failed too; if it loaded without defining
+   * `window.AdyenWeb`, the next call checks again instead of failing from a
+   * cached result.
    */
   async loadSdk(): Promise<void> {
     assertBrowser("AdyenClientAdapter", "loadSdk");
@@ -246,11 +267,15 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
     const scriptIntegrity = pinnedBuild && this.config.sdkUrl === undefined ? ADYEN_WEB_SCRIPT_INTEGRITY : undefined;
     const stylesheetIntegrity =
       pinnedBuild && this.config.stylesheetUrl === undefined ? ADYEN_WEB_STYLESHEET_INTEGRITY : undefined;
+    const nonce = this.config.cspNonce;
     const loading = (this.sdkPromise ??= Promise.all([
       this.config.loadScript
         ? this.config.loadScript(url)
-        : injectScript(url, this.pspName, { integrity: scriptIntegrity }),
-      this.injectStylesheet(stylesheet, stylesheetIntegrity),
+        : injectScript(url, this.pspName, { integrity: scriptIntegrity, nonce }),
+      // A sheet that fails to load resolves too: styling must never block the fields.
+      this.config.loadStylesheet
+        ? this.config.loadStylesheet(stylesheet)
+        : injectStylesheet(stylesheet, this.pspName, { integrity: stylesheetIntegrity, nonce }),
     ])
       .then(() => undefined)
       .catch((err: unknown) => {
@@ -462,39 +487,6 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
   private cdnBase(): string {
     const version = this.config.sdkVersion ?? ADYEN_WEB_VERSION;
     return `https://checkoutshopper-${this.adyenEnvironment}.cdn.adyen.com/checkoutshopper/sdk/${version}`;
-  }
-
-  /**
-   * A `<link>` already on the page for the URL is reused as it is. One this
-   * injects and whose load fails is removed again, so the next load fetches
-   * the file anew.
-   */
-  private injectStylesheet(url: string, integrity: string | undefined): Promise<void> {
-    if (this.config.loadStylesheet) return this.config.loadStylesheet(url);
-    return new Promise<void>((resolve) => {
-      if (document.querySelector(`link[href="${url}"]`)) {
-        resolve();
-        return;
-      }
-      const link = document.createElement("link");
-      link.rel = "stylesheet";
-      // Set before href and insertion, as injectScript does for the script: the
-      // browser checks a cross-origin file only when it fetches it in CORS mode.
-      if (integrity !== undefined) {
-        link.integrity = integrity;
-        link.crossOrigin = "anonymous";
-      }
-      link.href = url;
-      link.onload = () => resolve();
-      // Styling is cosmetic: a stylesheet that fails to load, or fails its
-      // integrity check, must never block the fields from mounting.
-      link.onerror = () => {
-        resolve();
-        // Element doubles without remove(), as in injectScript, must not make this handler throw.
-        if (typeof link.remove === "function") link.remove();
-      };
-      document.head.appendChild(link);
-    });
   }
 
   private adyenGlobal(): AdyenWebGlobal | undefined {

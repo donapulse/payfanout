@@ -79,6 +79,11 @@ load the script / stylesheet from your own host. The adapter carries Adyen's int
 for its pinned build only, so an overridden file loads without an integrity check:
 `sdkVersion` turns it off for both files, `sdkUrl` and `stylesheetUrl` for their own.
 
+`cspNonce` puts your Content-Security-Policy nonce on both tags the adapter injects, the
+script and the stylesheet `<link>`, for a page whose `script-src` or `style-src` allows them
+by nonce; the adapter never reads a nonce from the page. See the
+[Adyen guide](https://donapulse.github.io/payfanout/guide/adyen) for what it covers.
+
 ## 3-D Secure
 
 A challenge comes back from the *server*: `completePayment` reports `requires_action` with

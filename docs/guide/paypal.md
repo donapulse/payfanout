@@ -145,11 +145,25 @@ img-src     *.paypal.com *.paypalobjects.com *.venmo.com data:
 
 PayPal calls a nonce safer than `'unsafe-inline'`: it replaces `'unsafe-inline'` with
 `'nonce-<value>'` in `script-src` and `style-src` and puts the same value in the SDK tag's
-`nonce` and `data-csp-nonce` attributes. The adapter's script loader sets neither, so use
-the `'unsafe-inline'` policy above with the adapter as shipped. PayPal also recommends
+`nonce` and `data-csp-nonce` attributes. Pass that value as `cspNonce` and the adapter sets
+both attributes on the tag it injects. PayPal also recommends
 `Cross-Origin-Opener-Policy: same-origin-allow-popups` on a page running the SDK. The
 onboarding descriptor (`paypalOnboarding.csp`) lists these hosts under `script`, `frame`
 and `connect`; `style-src`, `child-src` and `img-src` have no descriptor field.
+
+**Nonce-based policies.** The adapter never reads a nonce from the page: pass the one your
+server put in the page's policy. Under PayPal's policy the hosts in `script-src` already
+allow the SDK tag, as `'strict-dynamic'` would, since the adapter creates it, so the tag's
+`nonce` matters only for a `script-src` that allows scripts by nonce alone. What changes the
+outcome is `data-csp-nonce`: the SDK reads only that attribute and sets its value on the
+inline scripts and styles it creates, which PayPal's policy blocks otherwise. Keep PayPal's
+hosts in `script-src`: some of the SDK's own loads, such as the Messages modal's `modal.js`,
+carry no nonce. Write the source quoted, `'nonce-<value>'`: PayPal's examples leave the
+quotes out, and a browser reads that form as a host name. An SDK the page loaded itself is
+used as it is, so give its tag both attributes yourself. A nonce in `style-src` turns
+`'unsafe-inline'` off there, so on a page that also mounts other PSPs it blocks the inline
+styles Paysafe.js and PayZen add without a nonce, Stripe's fallback `<style>` and the
+Worldline Tokenizer's `style` attribute.
 :::
 
 ## 6. The two-step UX: PayPal button approves, your Pay button pays

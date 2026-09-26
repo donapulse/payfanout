@@ -141,6 +141,19 @@ connect-src https://api.stripe.com
 Stripe's fraud signals (Radar) additionally load `https://m.stripe.network` — allow
 it under `frame-src`/`script-src` if you rely on them. Pin or self-host the script
 via the `sdkUrl` config field if you must.
+
+**Nonce-based policies.** Pass the nonce your server put in the page's policy as
+`cspNonce` (the adapter never reads one from the page), and the adapter sets it as the
+`nonce` attribute of the Stripe.js `<script>` it injects. That matters only for a
+`script-src` that allows scripts by nonce without `'strict-dynamic'`: under
+`'strict-dynamic'` the script-created tag loads without one, and `https://js.stripe.com`
+in `script-src` allows it anyway. Stripe.js reads no nonce itself and loads its lazy
+chunks from `https://js.stripe.com` without one, so such a policy must still list that
+host. Where the browser lacks constructable stylesheets, Stripe.js adds a `<style>`
+without a nonce, which needs `'unsafe-inline'` in `style-src`. A nonce in a directive
+turns `'unsafe-inline'` off there, so a `style-src` nonce blocks that fallback, and on a
+page that also mounts other PSPs the inline styles Paysafe.js and PayZen add without a
+nonce and the Worldline Tokenizer's `style` attribute.
 :::
 
 ## 6. Register the webhook endpoint

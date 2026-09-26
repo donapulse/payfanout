@@ -7,6 +7,7 @@ import {
   lowercaseKeys,
   normalizeCurrency,
   normalizeSecrets,
+  normalizeTime,
   PayFanoutError,
   requestWithTimeout,
   safeJson,
@@ -138,7 +139,8 @@ export interface PaysafeCardLike {
   cardType?: string;
   cardBrand?: string;
   lastDigits?: string;
-  cardExpiry?: { month?: number; year?: number };
+  /** Numbers in the schema; Paysafe's response examples send strings ("10", "2025"). */
+  cardExpiry?: { month?: number | string; year?: number | string };
 }
 
 /** Structural shape of Paysafe Payments API responses. */
@@ -150,7 +152,11 @@ export interface PaysafeSettlementLike {
   /** Decreases as refunds land — the source of truth for amountRefunded. */
   availableToRefund?: number;
   refundedAmount?: number;
-  txnTime?: string;
+  /**
+   * A date-time string in the schema; Paysafe's payment examples send an
+   * embedded settlement's as epoch milliseconds.
+   */
+  txnTime?: string | number;
 }
 
 /** Masked bank-account facts as Paysafe's sepa/bacs/ach/eft payload objects echo them. */
@@ -502,6 +508,16 @@ const BANK_REQUIRED_FIELDS: Record<BankDebitPaymentType, ReadonlyArray<keyof Pay
 /** Mandate schemes: a completion the customer never agreed to is not a payment we may take. */
 const BANK_MANDATE_PAYMENT_TYPES = new Set<BankDebitPaymentType>(["SEPA", "BACS"]);
 
+/**
+ * The rails Paysafe does not refund: SEPA "Refunds | Not Supported", Bacs
+ * "Refunds | NA". The ACH, EFT and Interac pages say nothing about refunds,
+ * so those go to Paysafe, which decides.
+ */
+const NON_REFUNDABLE_RAILS: Record<string, string> = {
+  SEPA: "SEPA Direct Debit",
+  BACS: "Bacs Direct Debit",
+};
+
 interface ParsedBankDetails {
   accountHolderName: string;
   /** The rail's bank object, keyed and shaped as POST /paymenthandles takes it. */
@@ -670,8 +686,29 @@ function parseSubscriptionCursor(cursor: string | undefined): number {
   return Number(cursor);
 }
 
-function isIsoParseable(value: string | undefined): value is string {
+function isIsoParseable(value: unknown): value is string {
   return typeof value === "string" && !Number.isNaN(Date.parse(value));
+}
+
+/** Epoch milliseconds a Paysafe time is read as: from 1973 (1e11) to the end of year 9999. */
+const MIN_EPOCH_MS = 1e11;
+const MAX_EPOCH_MS = 253402300799999;
+
+/**
+ * A Paysafe txnTime as ISO 8601, or undefined when it cannot be read. The
+ * schema types every txnTime as a date-time string, but Paysafe's payment
+ * examples send an embedded settlement's as epoch milliseconds
+ * (1674814529000), so a number, or a string of digits, is read as that when
+ * it lies between MIN_EPOCH_MS and MAX_EPOCH_MS. Epoch seconds, or a
+ * digits-only date such as "20260704", fall below and are left out rather
+ * than read as an instant in 1970.
+ */
+function paysafeTime(value: unknown): string | undefined {
+  const epoch = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
+  if (typeof epoch === "number") {
+    return epoch >= MIN_EPOCH_MS && epoch <= MAX_EPOCH_MS ? new Date(epoch).toISOString() : undefined;
+  }
+  return isIsoParseable(epoch) ? normalizeTime(epoch) : undefined;
 }
 
 /**
@@ -1032,9 +1069,9 @@ function isFailedRecord(record: RefNumRecord): boolean {
 
 /**
  * Voided, cancelled or expired: a payment, settlement or refund in one of
- * these moved no money, as the Payments API describes them, and as
- * RETRY_OR_START_AGAIN and refundPayment's settlement filter already read
- * CANCELLED.
+ * these moved no money, as the Payments API describes them. RETRY_OR_START_AGAIN
+ * reads them that way too, and so do the settlement sums on a PaymentInfo and
+ * the choice of the settlement a refund comes out of.
  */
 const NO_MONEY_STATUSES = new Set(["CANCELLED", "EXPIRED"]);
 
@@ -1074,7 +1111,7 @@ function recordedFailure<T extends RefNumRecord>(record: T): T {
   const pspCode = record.error?.code;
   if (!pspCode) return record;
   const nonBusiness = INTERNAL_ERROR_CODES.has(pspCode) || (record.status ?? "").toUpperCase() === "ERROR";
-  const code = PAYSAFE_CODE_MAP[pspCode] ?? (nonBusiness ? "processing_error" : "card_declined");
+  const code = paysafeCodeFor(pspCode) ?? (nonBusiness ? "processing_error" : "card_declined");
   throw new PayFanoutError({
     code,
     message: getUserMessage(code),
@@ -1714,10 +1751,25 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     return [];
   }
 
-  /** Paysafe refunds settle against a settlement, not the payment — resolved here so callers keep one API. */
+  /**
+   * Paysafe refunds settle against a settlement, not the payment — resolved
+   * here so callers keep one API. A SEPA or Bacs payment is refused once the
+   * payment read shows its type, before anything else is sent: Paysafe
+   * refunds neither rail.
+   */
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
     if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
     const payment = await this.fetchPayment(req.pspPaymentId);
+    const rail = NON_REFUNDABLE_RAILS[(payment.paymentType ?? "").toUpperCase()];
+    if (rail) {
+      throw new PayFanoutError({
+        code: "unsupported_operation",
+        message: `Paysafe does not refund ${rail} payments — refund the customer by other means`,
+        retryable: false,
+        raw: payment,
+        pspName: this.pspName,
+      });
+    }
     const settlements = payment.settlements?.length ? payment.settlements : await this.findSettlements(payment);
     // Refund records name no settlement or payment and the lookup is
     // account-wide, so the key must be unique across the account.
@@ -1729,9 +1781,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       movesMoney: true,
       readBackOnRejection: true,
     };
-    const settlement = settlements.find(
-      (s) => s.status !== "CANCELLED" && s.status !== "FAILED" && (s.availableToRefund ?? s.amount ?? 0) > 0,
-    );
+    const settlement = settlements.find((s) => !movedNoMoney(s) && (s.availableToRefund ?? s.amount ?? 0) > 0);
     if (!settlement) {
       // Nothing left to refund may be this very refund's work, replayed:
       // answer with that refund instead of rejecting the replay.
@@ -1784,12 +1834,13 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       txnTime?: string;
       paymentId?: string;
     }>("GET", `/paymenthub/v1/refunds/${encodeURIComponent(refundId)}`);
+    const createdAt = paysafeTime(refund.txnTime);
     return {
       refundId: refund.id,
       status: mapRefundStatus(refund.status),
       amount: refund.amount ?? 0,
       ...(refund.paymentId ? { pspPaymentId: refund.paymentId } : {}),
-      ...(refund.txnTime ? { createdAt: refund.txnTime } : {}),
+      ...(createdAt ? { createdAt } : {}),
       raw: refund,
     };
   }
@@ -1823,12 +1874,12 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       id: context.id ?? verification.id,
       pspName: this.pspName,
       pspPaymentId: verification.id,
-      status: verification.status === "COMPLETED" ? "succeeded" : verification.status === "FAILED" ? "failed" : "processing",
+      status: mapVerificationStatus(verification.status),
       amount: 0,
       amountRefunded: 0,
       currency: context.currency,
       paymentMethodType: "card",
-      createdAt: verification.txnTime ?? "1970-01-01T00:00:00.000Z",
+      createdAt: normalizeTime(paysafeTime(verification.txnTime)),
       raw: verification,
     };
   }
@@ -2338,9 +2389,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   ): PaymentInfo {
     const methodDetails = toPaymentMethodDetails(payment.card);
     const mandateReference = bankMandateReference(payment) ?? fallbackMandateReference;
-    const settlements = (payment.settlements ?? []).filter(
-      (s) => s.status !== "CANCELLED" && s.status !== "FAILED",
-    );
+    const settlements = (payment.settlements ?? []).filter((s) => !movedNoMoney(s));
     const completed = (payment.status ?? "").toUpperCase() === "COMPLETED";
     let settled = settlements.reduce((sum, s) => sum + (s.amount ?? 0), 0);
     if (settled === 0 && knownSettled !== undefined) {
@@ -2367,6 +2416,8 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     else if (completed && (typeof payment.availableToSettle === "number" || knownSettled !== undefined)) {
       amountCaptured = 0;
     }
+    const capturedAt =
+      amountCaptured !== undefined && amountCaptured > 0 ? paysafeTime(settlements[0]?.txnTime) : undefined;
     return {
       id: payfanoutId ?? payment.merchantRefNum ?? payment.id,
       pspName: this.pspName,
@@ -2384,10 +2435,8 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       paymentMethodType: toUnifiedMethodType(payment.paymentType),
       ...(methodDetails ? { paymentMethodDetails: methodDetails } : {}),
       ...(mandateReference ? { mandateReference } : {}),
-      createdAt: payment.txnTime ?? "1970-01-01T00:00:00.000Z",
-      ...(amountCaptured !== undefined && amountCaptured > 0 && settlements[0]?.txnTime
-        ? { capturedAt: settlements[0].txnTime }
-        : {}),
+      createdAt: normalizeTime(paysafeTime(payment.txnTime)),
+      ...(capturedAt ? { capturedAt } : {}),
       raw: payment,
     };
   }
@@ -2850,13 +2899,17 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   }
 }
 
-/** Paysafe card.type codes → lowercase brand names hosts can render. */
+/**
+ * Paysafe cardType codes → lowercase brand names hosts can render. The
+ * Payments API lists AM, DI, JC, MC, MD ("Maestro"), SO ("Solo"), VI, VD and VE.
+ */
 const PAYSAFE_CARD_TYPE_TO_BRAND: Record<string, string> = {
   VI: "visa",
   VD: "visa", // Visa Debit
   VE: "visa", // Visa Electron
   MC: "mastercard",
-  MD: "mastercard", // Debit MasterCard
+  MD: "maestro",
+  SO: "solo",
   AM: "amex",
   DI: "discover",
   JC: "jcb",
@@ -2887,13 +2940,24 @@ function toPaymentMethodDetails(card: PaysafeCardLike | undefined): PaymentMetho
   const brand =
     card.cardBrand?.toLowerCase() ??
     (card.cardType ? PAYSAFE_CARD_TYPE_TO_BRAND[card.cardType.toUpperCase()] : undefined);
+  const expMonth = expiryPart(card.cardExpiry?.month, 1, 12);
+  const expYear = expiryPart(card.cardExpiry?.year, 1000, 9999);
   const details: PaymentMethodDetails = {
     ...(brand ? { brand } : {}),
     ...(card.lastDigits ? { last4: card.lastDigits } : {}),
-    ...(typeof card.cardExpiry?.month === "number" ? { expMonth: card.cardExpiry.month } : {}),
-    ...(typeof card.cardExpiry?.year === "number" ? { expYear: card.cardExpiry.year } : {}),
+    ...(expMonth !== undefined ? { expMonth } : {}),
+    ...(expYear !== undefined ? { expYear } : {}),
   };
   return Object.keys(details).length > 0 ? details : undefined;
+}
+
+/**
+ * An expiry month or year as an integer in its range, sent either as the
+ * schema's number or as the examples' string; anything else is left out.
+ */
+function expiryPart(value: number | string | undefined, min: number, max: number): number | undefined {
+  const part = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
+  return typeof part === "number" && Number.isInteger(part) && part >= min && part <= max ? part : undefined;
 }
 
 /** A settlement Paysafe has not finished moving — nothing has been refunded out of it yet. */
@@ -2946,11 +3010,28 @@ function mapRefundStatus(status: string | undefined): RefundResult["status"] {
       return "succeeded";
     case "FAILED":
     case "CANCELLED":
+    case "EXPIRED": // "The transaction request is expired.": nothing went back to the customer
     case "DECLINED":
     case "ERROR":
       return "failed";
     default: // RECEIVED / PENDING / PROCESSING / INITIATED
       return "pending";
+  }
+}
+
+/**
+ * Verification statuses: FAILED is a 402 decline and ERROR a failure "for
+ * non-business reason"; RECEIVED has not reached the gateway yet.
+ */
+function mapVerificationStatus(status: string | undefined): UnifiedPaymentStatus {
+  switch ((status ?? "").toUpperCase()) {
+    case "COMPLETED":
+      return "succeeded";
+    case "FAILED":
+    case "ERROR":
+      return "failed";
+    default:
+      return "processing";
   }
 }
 
@@ -2978,37 +3059,96 @@ function mapPaysafeStatus(payment: PaysafePaymentLike, settledAmount: number): U
   }
 }
 
-/** Paysafe error body: { error: { code, message } } with meaningful HTTP statuses (402 = declined). */
+/**
+ * Paysafe error body: { error: { code, message } } with meaningful HTTP
+ * statuses (402 = declined), per the card errors table. The replay answers
+ * (5031, 3044, 3417, 5283) stay on their HTTP fallback: sendWrite
+ * recognizes them by the Paysafe code on `raw`, not by what they map to.
+ */
 const PAYSAFE_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "3022": "insufficient_funds",
   "3006": "expired_card",
+  // An invalid card number or brand (3002, 3017), CVV (3005) or expiry date
+  // (3012), or a failed CVV (3019) or AVS (3007) check: data the customer
+  // can correct.
+  "3002": "invalid_card_data",
+  "3005": "invalid_card_data",
+  "3007": "invalid_card_data",
+  "3012": "invalid_card_data",
   "3017": "invalid_card_data",
+  "3019": "invalid_card_data",
   // 3004: the zip/billing data Paysafe requires is missing from the request —
   // a data-quality error (fixed by supplying billingDetails), not a decline.
   "3004": "invalid_request",
   "3009": "card_declined",
+  // "Strong Customer Authentication is required" (3060), or the
+  // authentication value is invalid (3039): the customer comes back
+  // on-session; replaying the call cannot help.
+  "3039": "authentication_required",
+  "3060": "authentication_required",
+  // Declined for suspected fraud (3054), as a card that may be lost or stolen
+  // (3016), by Paysafe's negative database (4001) or by its Risk Management
+  // department (4002).
+  "3016": "fraud_suspected",
+  "3054": "fraud_suspected",
+  "4001": "fraud_suspected",
+  "4002": "fraud_suspected",
+  // In no current Paysafe error table; kept in case an account still gets them.
+  "8000": "fraud_suspected",
+  "8001": "fraud_suspected",
   // 3406: settlement not batched yet — a timing state, retry later.
   "3406": "processing_error",
   // Capture, refund and void state checks (402): the authorization or
   // settlement cannot take the request — not a card decline.
+  "3202": "invalid_request", // the authorization has had its maximum number of settlements
   "3203": "invalid_request", // the authorization is fully settled or cancelled
   "3204": "invalid_request", // the settlement exceeds the remaining authorization
+  "3205": "invalid_request", // the authorization has expired
   "3402": "invalid_request", // the refund exceeds the remaining settlement
+  "3403": "invalid_request", // the settlement has had its maximum number of refunds
   "3404": "invalid_request", // the settlement is already fully refunded
+  "3405": "invalid_request", // the settlement has expired
   "3501": "invalid_request", // the void exceeds the remaining authorization
   "3502": "invalid_request", // the authorization has been settled
   "3506": "invalid_request", // the void exceeds the remaining authorization
-  "8000": "fraud_suspected",
-  "8001": "fraud_suspected",
+  // Refunds the merchant account cannot fund: its overdraft, the Visa credit ratio.
+  "3412": "invalid_request",
+  "3413": "invalid_request",
+  // 400s that refuse the card itself: a closed account, a card type the account does not take.
+  "3073": "card_declined",
+  "3008": "card_declined",
+  // Operations the transaction, its card type or the account's gateway does
+  // not support (402): refused as PaymentService refuses a capability an
+  // adapter lacks, not as a card decline.
+  "3416": "unsupported_operation", // the gateway takes no partial settlement
+  "3418": "unsupported_operation", // the gateway takes no partial refund
+  "3419": "unsupported_operation", // this type of transaction cannot be refunded
+  "3503": "unsupported_operation", // the authorization's card type takes no void
+  "3504": "unsupported_operation", // the gateway takes no partial void
+  "3507": "unsupported_operation", // the authorization takes no partial void
 };
 
+/** Own keys only: the code is Paysafe's text, and "constructor" names no mapping. */
+function paysafeCodeFor(pspCode: string | undefined): UnifiedErrorCode | undefined {
+  return pspCode !== undefined && Object.hasOwn(PAYSAFE_CODE_MAP, pspCode) ? PAYSAFE_CODE_MAP[pspCode] : undefined;
+}
+
+/**
+ * Maps a non-2xx Paysafe answer onto the unified taxonomy. A 429 or a 5xx is
+ * `rate_limited` or `psp_unavailable`, retryable, whatever code it carries:
+ * sendWrite reads a 5xx as an outcome it must look up, and a code must not
+ * turn that into a final answer. Otherwise a mapped code decides, then a
+ * 402 is `card_declined` and any other status `invalid_request`. The message
+ * is the catalog's, never Paysafe's own; the body stays untouched on `raw`.
+ */
 export function mapPaysafeError(httpStatus: number, body: unknown): PayFanoutError {
-  const errorBody = (body as { error?: { code?: string; message?: string } } | undefined)?.error;
-  const pspCode = errorBody?.code;
+  const mapped = paysafeCodeFor((body as { error?: { code?: string } } | undefined)?.error?.code);
   let code: UnifiedErrorCode;
   let retryable = false;
-  if (pspCode && PAYSAFE_CODE_MAP[pspCode]) {
-    code = PAYSAFE_CODE_MAP[pspCode];
+  if (httpStatus === 429 || httpStatus >= 500) {
+    ({ code, retryable } = classifyHttpFallback(httpStatus));
+  } else if (mapped) {
+    code = mapped;
     retryable = code === "processing_error";
   } else if (httpStatus === 402) {
     code = "card_declined";

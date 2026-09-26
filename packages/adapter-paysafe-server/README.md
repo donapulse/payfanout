@@ -124,6 +124,9 @@ retrieved, not a separate credential).
   original that cannot be read back rejects with a non-retryable `processing_error`; retry
   it later with the same key. The default `requestTimeoutMs` is 60000, the response timeout
   of Paysafe's own SDKs, and bounds each exchange rather than a whole call.
+- Paysafe refunds neither SEPA nor Bacs direct debits, so `refundPayment` rejects a
+  payment on either rail with a non-retryable `unsupported_operation` once it has read the
+  payment, before any refund request.
 - Paysafe has no public events API (`supportsEventPolling: false`), so missed-webhook
   recovery falls back to `retrievePayment` per order.
 - Scheduler availability is per merchant account, like every Paysafe product option —

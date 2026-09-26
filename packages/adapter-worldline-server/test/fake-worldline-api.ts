@@ -52,6 +52,18 @@ const DECLINE_AMOUNT = 1302;
 /** hostedTokenizationId that forces a 3-D Secure challenge (REDIRECT merchantAction). */
 const THREE_DS_TOKEN = "htp_3ds";
 
+/** The API contract's cardPaymentMethodSpecificInput.transactionChannel values. */
+const TRANSACTION_CHANNELS = new Set<unknown>(["ECOMMERCE", "MOTO"]);
+
+/** The API contract's paymentProduct130SpecificThreeDSecure.usecase values. */
+const CARTES_BANCAIRES_USE_CASES = new Set<unknown>([
+  "single-amount",
+  "fixed-amount-term-subscription",
+  "payment-by-instalments",
+  "payment-upon-shipment",
+  "other-recurring-payments",
+]);
+
 /**
  * Statuses reference: 50 "Authorised waiting external result" (fraud
  * screening), 51 "Authorisation waiting" (the acquirer) and 52 "Authorisation
@@ -213,11 +225,11 @@ export class FakeWorldlineApi {
     const requestedAt = this.clock;
     this.clock += 1000;
     const { status, body: answer } = this.processCreatePayment(body);
-    const text = JSON.stringify(answer);
+    const serialized = JSON.stringify(answer);
     // Every answer the fake gives is a completed request's, a refusal included:
     // the guide's "For completed requests" read literally.
-    if (idemKey) this.createAnswerByIdemKey.set(idemKey, { status, body: text, requestedAt });
-    return new Response(text, { status, headers: { "content-type": "application/json" } });
+    if (idemKey) this.createAnswerByIdemKey.set(idemKey, { status, body: serialized, requestedAt });
+    return new Response(serialized, { status, headers: { "content-type": "application/json" } });
   }
 
   private processCreatePayment(body: Record<string, unknown>): { status: number; body: unknown } {
@@ -230,8 +242,10 @@ export class FakeWorldlineApi {
     const hostedTokenizationId = body["hostedTokenizationId"] as string | undefined;
     const card = (body["cardPaymentMethodSpecificInput"] ?? {}) as {
       authorizationMode?: string;
+      transactionChannel?: unknown;
       returnUrl?: string;
       threeDSecure?: { redirectionData?: { returnUrl?: string } };
+      paymentProduct130SpecificInput?: unknown;
     };
     const amount = order.amountOfMoney?.amount ?? 0;
     const currencyCode = order.amountOfMoney?.currencyCode ?? "EUR";
@@ -258,6 +272,27 @@ export class FakeWorldlineApi {
       if (returnUrl.length > 200) return invalid(propertyName, "exceeds 200 characters");
       if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(returnUrl)) return invalid(propertyName, "must contain a protocol");
     }
+    // The API contract's enum on the channel, and its types, enum and limits on
+    // the Cartes Bancaires 3-D Secure data.
+    if (card.transactionChannel !== undefined && !TRANSACTION_CHANNELS.has(card.transactionChannel)) {
+      return invalid("cardPaymentMethodSpecificInput.transactionChannel", "not an allowed value");
+    }
+    const cartesBancaires = card.paymentProduct130SpecificInput;
+    if (cartesBancaires !== undefined) {
+      const path = "cardPaymentMethodSpecificInput.paymentProduct130SpecificInput";
+      if (!isObject(cartesBancaires)) return invalid(path, "must be an object");
+      const threeDSecure = cartesBancaires["threeDSecure"] === undefined ? {} : cartesBancaires["threeDSecure"];
+      if (!isObject(threeDSecure)) return invalid(`${path}.threeDSecure`, "must be an object");
+      const fields: Array<[string, unknown, (value: unknown) => boolean]> = [
+        ["usecase", threeDSecure["usecase"], (value) => CARTES_BANCAIRES_USE_CASES.has(value)],
+        ["numberOfItems", threeDSecure["numberOfItems"], (value) => typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 99],
+        ["acquirerExemption", threeDSecure["acquirerExemption"], flag],
+        ["merchantScore", threeDSecure["merchantScore"], text(20)],
+      ];
+      for (const [field, value, valid] of fields) {
+        if (value !== undefined && !valid(value)) return invalid(`${path}.threeDSecure.${field}`, "outside the documented type or limit");
+      }
+    }
     // The API contract caps orderReferences.merchantReference at 40 characters and softDescriptor at 256.
     if ((order.references?.merchantReference?.length ?? 0) > 40) {
       return invalid("order.references.merchantReference", "exceeds 40 characters");
@@ -268,10 +303,6 @@ export class FakeWorldlineApi {
     // The API contract's types and limits on customerDevice and its browserData.
     const device = order.customer?.device;
     if (device !== undefined) {
-      const isObject = (value: unknown): value is Record<string, unknown> =>
-        typeof value === "object" && value !== null && !Array.isArray(value);
-      const text = (maxLength: number) => (value: unknown) => typeof value === "string" && value.length <= maxLength;
-      const flag = (value: unknown) => typeof value === "boolean";
       if (!isObject(device)) return invalid("order.customer.device", "must be an object");
       const browserData = device["browserData"] === undefined ? {} : device["browserData"];
       if (!isObject(browserData)) return invalid("order.customer.device.browserData", "must be an object");
@@ -682,6 +713,19 @@ function createResponse(payment: StoredPayment): {
   payment: WorldlinePaymentLike;
 } {
   return { creationOutput: { tokens: "" }, payment: publicPayment(payment) };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** A string of at most `maxLength` characters. */
+function text(maxLength: number): (value: unknown) => boolean {
+  return (value) => typeof value === "string" && value.length <= maxLength;
+}
+
+function flag(value: unknown): boolean {
+  return typeof value === "boolean";
 }
 
 function lowercase(headers: Record<string, string>): Record<string, string> {

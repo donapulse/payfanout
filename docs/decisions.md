@@ -870,11 +870,13 @@ docs.direct.worldline-solutions.com unless noted):
   Worldline models MOTO as `cardPaymentMethodSpecificInput.transactionChannel` (`ECOMMERCE` by
   default, or `MOTO`), not as an `exemptionRequest` value; the adapter does not map
   `sca.exemption: "moto"` yet, so such a payment goes out as an e-commerce payment with
-  3-D Secure. The return URL became mandatory — the session's `returnUrl` or the new
-  `defaultReturnUrl`, refused before any call otherwise (a breaking change), as is a URL over
-  the contract's 200 characters or without a protocol (`https://`, or a custom `protocol://`
-  for mobile apps). `merchantReference` (max 40) and the statement descriptor (max 256) are
-  length-checked at session creation. The descriptor is now sent as `softDescriptor`:
+  3-D Secure (superseded 2026-09-26: it now sends `transactionChannel: "MOTO"`, see "Worldline:
+  Cartes Bancaires use case and MOTO (2026-09-26)"). The return URL became mandatory — the
+  session's `returnUrl` or the new `defaultReturnUrl`, refused before any call otherwise (a
+  breaking change), as is a URL over the contract's 200 characters or without a protocol
+  (`https://`, or a custom `protocol://` for mobile apps). `merchantReference` (max 40) and the
+  statement descriptor (max 256) are length-checked at session creation. The descriptor is now
+  sent as `softDescriptor`:
   `descriptor` is deprecated with `x-deprecated-by: merchantReconciliationReference`, and its
   description recommends `merchantReconciliationReference` "for the same usage, and the new
   softDescriptor on top only in case you start needing another specific value to be pushed to
@@ -895,8 +897,10 @@ docs.direct.worldline-solutions.com unless noted):
   adapter, so neither is sent; Cartes Bancaires also requires
   `cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure.useCase`, which
   the contract's `paymentProduct130SpecificThreeDSecure` spells `usecase`, so it is not sent
-  until a sandbox run settles the name. Sandbox-verify one challenge flow with device data
-  before production.
+  until a sandbox run settles the name. Superseded 2026-09-26 by "Worldline: Cartes Bancaires
+  use case and MOTO (2026-09-26)": the contract, Worldline's Node SDK and Worldline's own
+  plugins agree on `usecase`, which every card payment now sends. Sandbox-verify one challenge
+  flow with device data before production.
 - **Refund reads (corrected in review, 2026-07-15):** Direct has NO refund-by-id endpoint —
   `GET /{merchantId}/refunds/{refundId}` is Connect-era; the only read surface is
   `GET /v2/{merchantId}/payments/{paymentId}/refunds`. `refundPayment` therefore returns a
@@ -4043,3 +4047,83 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `reenter_transaction` stay declines in both halves. The server reads Stripe's
   `processing_error` as retryable, and whether a retried confirmation of the same intent
   would help after those answers is not documented.
+
+## Worldline: Cartes Bancaires use case and MOTO (2026-09-26)
+
+- **Every card CreatePayment sends the Cartes Bancaires use case, `single-amount`,** as
+  `cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure.usecase`. This
+  supersedes the 2026-09-23 note in "Worldline Direct adapter (2026-07-14)" that the use case
+  is "not sent until a sandbox run settles the name": the documentation settles it.
+  Doc-verified 2026-09-26 against the 3-D Secure implementation guide
+  (docs.direct.worldline-solutions.com/en/security-and-risk-management/3d-secure/implementation,
+  "Mandatory properties"): "If you process transactions for Cartes Bancaires, make sure to add
+  the following mandatory properties as well: For all integration methods:
+  cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure.useCase". The API
+  contract (payment.preprod.direct.worldline-solutions.com/v1/public-contract-definition.yaml,
+  v2.507.0) names the property `usecase` on `paymentProduct130SpecificThreeDSecure`, "Indicates
+  the type of payment for which an authentication is requested", with the values
+  `single-amount`, `fixed-amount-term-subscription`, `payment-by-instalments`,
+  `payment-upon-shipment` and `other-recurring-payments`. Worldline's Node SDK spells it the
+  same way (`usecase?: string | null` on `PaymentProduct130SpecificThreeDSecure`,
+  github.com/wl-online-payments-direct/sdk-nodejs, `src/generated/model/domain/index.ts`), and
+  so do Worldline's own e-commerce plugins, which send `single-amount` (plugin-prestashop-8
+  `src/Builder/PaymentRequestBuilder.php`, plugin-magento-creditcard
+  `Service/CreatePaymentRequest/CardPaymentMethodSIDBuilder.php`). The guide's `useCase` does
+  not outweigh them: the same list writes `order.customer.billingaddress.city` next to
+  `order.customer.billingAddress.countryCode`. Worldline's Cartes Bancaires payment-method
+  page (docs.direct.worldline-solutions.com/en/payment-methods-and-features/payment-methods/cartes-bancaires)
+  does not name `paymentProduct130SpecificInput`; the implementation guide's mandatory list is
+  the more specific statement, so an audit working from that page should not drop the
+  property.
+- **Whatever the brand, and always `single-amount`.** The adapter does not read the card
+  before creating the payment. GetHostedTokenization would name its product
+  (`token.paymentProductId`), at the cost of a call on every completion, to withhold a property
+  Worldline's own plugins send for every brand: both build it in their generic card builders,
+  whatever authorisation mode the merchant configured, gated only by their own 3-D Secure
+  settings. The adapter declares neither saved payment methods nor native subscriptions, and
+  its client tokenizes with `storePermanently: false`, so every payment is a one-off charge,
+  manual capture included. `numberOfItems` (int32, 0 to 99, "99 if more than 99 items") is left
+  out, since `CreatePaymentSessionInput` carries no line items, and so are `acquirerExemption`
+  and `merchantScore`, for which the adapter has no input.
+- **`sca.exemption: "moto"` sends `cardPaymentMethodSpecificInput.transactionChannel: "MOTO"`.**
+  This supersedes the 2026-09-23 note in the same entry that the adapter does not map it. The
+  contract describes the channel as "Indicates the channel via which the payment is created.
+  Allowed values: ECOMMERCE - The transaction is a regular E-Commerce transaction. MOTO - The
+  transaction is a Mail Order/Telephone Order. Defaults to ECOMMERCE.", and its
+  `exemptionRequest` has no MOTO value (`none`, `transaction-risk-analysis`, `low-value`,
+  `whitelist`). Without the exemption no channel is sent, so the default applies. Core's
+  `ScaPreference.exemption` has no other value, and a context carrying another sends no channel
+  either.
+- **AMBIGUOUS: the 3-D Secure data on a MOTO payment.** Worldline's 3-D Secure page
+  (docs.direct.worldline-solutions.com/en/security-and-risk-management/3d-secure/) lists
+  "Transactions through mail order/telephone order (MOTO)" among the transactions out of SCA's
+  scope, and says "Our platform detects these exclusions automatically, freeing you from
+  indicating them in your transaction requests." No page says whether a MOTO CreatePayment
+  should still carry `threeDSecure` (`skipAuthentication: false`, `redirectionData`, a
+  `challengeIndicator`) and the device data, nor what the platform does with them. The adapter
+  takes the conservative reading and sends them unchanged: a MOTO payment the platform does not
+  treat as excluded then goes through 3-D Secure instead of skipping it. The cost: on a
+  telephone order, a challenge opens in the browser the card was typed into, not the
+  cardholder's, so that payment stays unfinished rather than being charged unauthenticated.
+  The device data is that operator's browser too, the same for every order they key in, so a
+  frictionless pass on a MOTO payment would rest on data that is not the cardholder's.
+  Sandbox check: complete a MOTO session with the frictionless and the challenge test cards,
+  and record whether Worldline accepts each, whether the challenge card still answers with a
+  REDIRECT merchantAction, what `cardPaymentMethodSpecificOutput.threeDSecureResults` (eci,
+  liability) shows on the frictionless one, and what an account without MOTO enabled answers. For MOTO payments
+  taken in the e-Terminal, the e-Terminal page
+  (docs.direct.worldline-solutions.com/en/design-and-test-tools/applications/merchant-portal/e-terminal)
+  asks "Meet the PCI DSS certification SAQ C-VT. Ensure your acquirer allows you to process
+  mail order/telephone order (MOTO) transactions. Have the feature enabled on your account.";
+  the guide passes all three on to hosts until the check shows what API payments need.
+- **The fake checks both properties against the contract.** It rejects a `transactionChannel`
+  other than `ECOMMERCE` or `MOTO`, a `paymentProduct130SpecificInput` or `threeDSecure` that is
+  not an object, a `usecase` outside the five values, a `numberOfItems` that is not an integer
+  from 0 to 99, an `acquirerExemption` that is not a boolean, and a `merchantScore` that is not
+  a string of at most 20 characters. It models no card brands, so it does not refuse a Cartes
+  Bancaires payment sent without the use case; the adapter's tests check that every
+  CreatePayment carries it, those of a completion walked past a decline included.
+- **Doc-derived only.** No sandbox run has sent either property. Sandbox check for the use
+  case: pay with one frictionless and one challenge card from the "Cartes Bancaires" block of
+  the test cases page (docs.direct.worldline-solutions.com/en/integration/how-to-integrate/test-cases/)
+  and record whether CreatePayment accepts `usecase`.

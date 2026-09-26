@@ -66,6 +66,17 @@ function createPaymentBody(fake: FakeWorldlineApi) {
   };
 }
 
+/** Every CreatePayment card input the adapter sent, in order. */
+function sentCardInputs(fetchSpy: ReturnType<typeof makePair>["fetchSpy"]): Array<Record<string, unknown>> {
+  return fetchSpy.mock.calls
+    .filter(([url, init]) => String(url) === PAYMENTS_URL && init?.method === "POST")
+    .map(([, init]) => JSON.parse(String(init?.body)) as { cardPaymentMethodSpecificInput: Record<string, unknown> })
+    .map((body) => body.cardPaymentMethodSpecificInput);
+}
+
+/** The Cartes Bancaires input every card payment carries: the use case alone. */
+const CARTES_BANCAIRES_INPUT = { threeDSecure: { usecase: "single-amount" } };
+
 function thrownBy(run: () => unknown): PayFanoutError {
   try {
     run();
@@ -96,6 +107,7 @@ function paymentBody(
       authorizationMode: "SALE",
       returnUrl: RETURN_URL,
       threeDSecure: { skipAuthentication: false, redirectionData: { returnUrl: RETURN_URL } },
+      paymentProduct130SpecificInput: CARTES_BANCAIRES_INPUT,
       ...overrides.card,
     },
   };
@@ -279,28 +291,36 @@ describe("completePayment sends Worldline's mandatory 3-D Secure data", () => {
       authorizationMode: "SALE",
       returnUrl: RETURN_URL,
       threeDSecure: { skipAuthentication: false, redirectionData: { returnUrl: RETURN_URL } },
+      paymentProduct130SpecificInput: CARTES_BANCAIRES_INPUT,
     });
   });
 
-  const scaCases: Array<[CreatePaymentSessionInput["sca"], string | undefined]> = [
-    [{ challenge: "force" }, "challenge-required"],
-    [{ challenge: "force", exemption: "moto" }, "challenge-required"],
-    [{ challenge: "automatic" }, undefined],
-    [{ exemption: "moto" }, undefined],
-    [undefined, undefined],
+  const scaCases: Array<[CreatePaymentSessionInput["sca"], { challengeIndicator?: string; transactionChannel?: string }]> = [
+    [{ challenge: "force" }, { challengeIndicator: "challenge-required" }],
+    [{ challenge: "force", exemption: "moto" }, { challengeIndicator: "challenge-required", transactionChannel: "MOTO" }],
+    [{ challenge: "automatic" }, {}],
+    [{ challenge: "automatic", exemption: "moto" }, { transactionChannel: "MOTO" }],
+    [{ exemption: "moto" }, { transactionChannel: "MOTO" }],
+    [{}, {}],
+    [undefined, {}],
   ];
-  for (const [sca, challengeIndicator] of scaCases) {
-    it(`maps sca ${JSON.stringify(sca) ?? "absent"} to ${challengeIndicator ?? "no challengeIndicator"}, as an e-commerce payment with 3-D Secure`, async () => {
+  for (const [sca, { challengeIndicator, transactionChannel }] of scaCases) {
+    const channel = transactionChannel ? `transactionChannel ${transactionChannel}` : "no transactionChannel";
+    it(`maps sca ${JSON.stringify(sca) ?? "absent"} to ${challengeIndicator ?? "no challengeIndicator"} and ${channel}, with the same 3-D Secure data`, async () => {
       const { adapter, fake } = makePair();
-      await complete(adapter, sca ? { sca } : {});
-      const card = createPaymentBody(fake).cardPaymentMethodSpecificInput;
-      if (challengeIndicator) expect(card.threeDSecure).toHaveProperty("challengeIndicator", challengeIndicator);
-      else expect(card.threeDSecure).not.toHaveProperty("challengeIndicator");
-      // Worldline models MOTO as transactionChannel "MOTO", not as an exemption, and the
-      // adapter does not map it yet: every payment keeps the default ECOMMERCE channel.
-      expect(card).not.toHaveProperty("transactionChannel");
-      expect(card.threeDSecure).not.toHaveProperty("exemptionRequest");
-      expect(card.threeDSecure).toHaveProperty("skipAuthentication", false);
+      const info = await complete(adapter, sca ? { sca } : {});
+      expect(info.status).toBe("succeeded");
+      expect(createPaymentBody(fake).cardPaymentMethodSpecificInput).toEqual({
+        authorizationMode: "SALE",
+        ...(transactionChannel ? { transactionChannel } : {}),
+        returnUrl: RETURN_URL,
+        threeDSecure: {
+          skipAuthentication: false,
+          redirectionData: { returnUrl: RETURN_URL },
+          ...(challengeIndicator ? { challengeIndicator } : {}),
+        },
+        paymentProduct130SpecificInput: CARTES_BANCAIRES_INPUT,
+      });
     });
   }
 
@@ -365,6 +385,109 @@ describe("completePayment sends Worldline's mandatory 3-D Secure data", () => {
       expect(createPaymentBody(fake).order.amountOfMoney).toEqual({ amount, currencyCode: currency });
     }
   });
+});
+
+describe("every card payment carries the Cartes Bancaires use case", () => {
+  const completions: Array<[string, Partial<CreatePaymentSessionInput>, string, string]> = [
+    ["an automatic-capture payment", {}, envelope("htp_1", DEVICE), "succeeded"],
+    ["a manual-capture payment", { captureMethod: "manual" }, envelope("htp_1", DEVICE), "requires_capture"],
+    ["a payment met with a 3-D Secure challenge", {}, envelope("htp_3ds", DEVICE), "requires_action"],
+    ["a payment forcing a challenge", { sca: { challenge: "force" } }, envelope("htp_1", DEVICE), "succeeded"],
+    ["a MOTO payment", { sca: { exemption: "moto" } }, envelope("htp_1", DEVICE), "succeeded"],
+    ["a JPY payment", { amount: 500, currency: "JPY" }, envelope("htp_1", DEVICE), "succeeded"],
+    ["a BHD payment", { amount: 1234, currency: "BHD" }, envelope("htp_1", DEVICE), "succeeded"],
+    ["a bare hostedTokenizationId", {}, "htp_legacy", "succeeded"],
+  ];
+  for (const [name, session, clientToken, status] of completions) {
+    it(`sends usecase "single-amount" and no other Cartes Bancaires data on ${name}`, async () => {
+      const { adapter, fetchSpy } = makePair();
+      const info = await complete(adapter, session, clientToken);
+      expect(info.status).toBe(status);
+      const sent = sentCardInputs(fetchSpy);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toHaveProperty("paymentProduct130SpecificInput", CARTES_BANCAIRES_INPUT);
+    });
+  }
+
+  it("sends it on every CreatePayment of a completion that walks past a decline, the declined attempt and the replay included", async () => {
+    const { adapter, fake, fetchSpy } = makePair();
+    fake.declinedCards.add("htp_declined");
+    const session = await adapter.createPaymentSession({ amount: 2500, currency: "EUR", returnUrl: RETURN_URL, idempotencyKey: "session-1" });
+    const input = { pspSessionId: session.pspSessionId, idempotencyKey: "complete-1" };
+    await expect(adapter.completePayment({ ...input, clientToken: envelope("htp_declined", DEVICE) })).rejects.toMatchObject({
+      code: "card_declined",
+    });
+    expect((await adapter.completePayment({ ...input, clientToken: envelope("htp_new_card", DEVICE) })).status).toBe("succeeded");
+    expect(fake.createPaymentLog.map(({ replayed }) => replayed)).toEqual([false, true, false]);
+    const sent = sentCardInputs(fetchSpy);
+    expect(sent).toHaveLength(3);
+    for (const card of sent) expect(card).toHaveProperty("paymentProduct130SpecificInput", CARTES_BANCAIRES_INPUT);
+  });
+});
+
+describe("sca.exemption moto sends Worldline's MOTO channel", () => {
+  it("keeps the 3-D Secure data, so a MOTO payment Worldline challenges still comes back as requires_action", async () => {
+    const { adapter, fake } = makePair();
+    const info = await complete(adapter, { sca: { exemption: "moto" } }, envelope("htp_3ds", DEVICE));
+    expect(info.status).toBe("requires_action");
+    const card = createPaymentBody(fake).cardPaymentMethodSpecificInput;
+    expect(card).toHaveProperty("transactionChannel", "MOTO");
+    expect(card.threeDSecure).toEqual({ skipAuthentication: false, redirectionData: { returnUrl: RETURN_URL } });
+    expect(card).toHaveProperty("returnUrl", RETURN_URL);
+    expect(createPaymentBody(fake).order.customer).toEqual({ device: DEVICE });
+  });
+
+  it("sends the channel on every CreatePayment of a MOTO completion that walks past a decline", async () => {
+    const { adapter, fake, fetchSpy } = makePair();
+    fake.declinedCards.add("htp_declined");
+    const session = await adapter.createPaymentSession({
+      amount: 2500,
+      currency: "EUR",
+      returnUrl: RETURN_URL,
+      sca: { exemption: "moto" },
+      idempotencyKey: "session-1",
+    });
+    const input = { pspSessionId: session.pspSessionId, idempotencyKey: "complete-1" };
+    await expect(adapter.completePayment({ ...input, clientToken: envelope("htp_declined", DEVICE) })).rejects.toMatchObject({
+      code: "card_declined",
+    });
+    expect((await adapter.completePayment({ ...input, clientToken: envelope("htp_new_card", DEVICE) })).status).toBe("succeeded");
+    const sent = sentCardInputs(fetchSpy);
+    expect(sent).toHaveLength(3);
+    for (const card of sent) {
+      expect(card).toHaveProperty("transactionChannel", "MOTO");
+      expect(card).toHaveProperty("threeDSecure", { skipAuthentication: false, redirectionData: { returnUrl: RETURN_URL } });
+    }
+  });
+
+  it("completes a MOTO session under manual capture as an authorisation on the MOTO channel", async () => {
+    const { adapter, fake } = makePair();
+    const info = await complete(adapter, { sca: { exemption: "moto" }, captureMethod: "manual" });
+    expect(info.status).toBe("requires_capture");
+    expect(createPaymentBody(fake).cardPaymentMethodSpecificInput).toMatchObject({
+      authorizationMode: "PRE_AUTHORIZATION",
+      transactionChannel: "MOTO",
+    });
+  });
+
+  const withoutMoto: Array<[string, CreatePaymentSessionInput["sca"]]> = [
+    ["no sca", undefined],
+    ["an empty sca", {}],
+    ["sca.challenge force", { challenge: "force" }],
+    ["sca.challenge automatic", { challenge: "automatic" }],
+    // Core's type knows only "moto"; a value from elsewhere must not pick a channel.
+    ["an exemption other than moto", { exemption: "low-value" } as unknown as CreatePaymentSessionInput["sca"]],
+  ];
+  for (const [name, sca] of withoutMoto) {
+    it(`sends no transactionChannel, and so Worldline's ECOMMERCE default, for ${name}`, async () => {
+      const { adapter, fetchSpy } = makePair();
+      await complete(adapter, sca ? { sca } : {});
+      const [card] = sentCardInputs(fetchSpy);
+      expect(card).toBeDefined();
+      expect(card).not.toHaveProperty("transactionChannel");
+      expect(card?.["threeDSecure"]).not.toHaveProperty("exemptionRequest");
+    });
+  }
 });
 
 describe("the 3-D Secure return URL is mandatory", () => {
@@ -576,6 +699,78 @@ describe("the fake enforces the documented limits the adapter relies on", () => 
       const [parent, child] = field.split(".") as [string, string | undefined];
       const device = child ? { [parent]: { [child]: value } } : { [parent]: value };
       await expectRejection(paymentBody({ order: { customer: { device } } }), `order.customer.device.${field}`);
+    });
+  }
+
+  it("accepts every transactionChannel and Cartes Bancaires use case the contract defines, and each Cartes Bancaires field at its limits", async () => {
+    const useCases = [
+      "single-amount",
+      "fixed-amount-term-subscription",
+      "payment-by-instalments",
+      "payment-upon-shipment",
+      "other-recurring-payments",
+    ];
+    const accepted: Array<Record<string, unknown>> = [
+      { transactionChannel: "ECOMMERCE" },
+      { transactionChannel: "MOTO" },
+      ...useCases.map((usecase) => ({ paymentProduct130SpecificInput: { threeDSecure: { usecase } } })),
+      ...[0, 99].map((numberOfItems) => ({
+        paymentProduct130SpecificInput: { threeDSecure: { usecase: "single-amount", numberOfItems } },
+      })),
+      { paymentProduct130SpecificInput: { threeDSecure: { acquirerExemption: false, merchantScore: "m".repeat(20) } } },
+      { paymentProduct130SpecificInput: {} },
+    ];
+    for (const card of accepted) {
+      const fake = new FakeWorldlineApi();
+      expect((await postCreatePayment(fake, paymentBody({ card }))).status, JSON.stringify(card)).toBe(201);
+    }
+  });
+
+  for (const transactionChannel of ["moto", "MAIL_ORDER", "", 1, null]) {
+    it(`rejects cardPaymentMethodSpecificInput.transactionChannel = ${describeValue(transactionChannel)}, outside the contract's enum`, async () => {
+      await expectRejection(paymentBody({ card: { transactionChannel } }), "cardPaymentMethodSpecificInput.transactionChannel");
+    });
+  }
+
+  it("rejects a Cartes Bancaires input, or its threeDSecure, that is not an object", async () => {
+    for (const input of ["single-amount", ["single-amount"], null]) {
+      await expectRejection(
+        paymentBody({ card: { paymentProduct130SpecificInput: input } }),
+        "cardPaymentMethodSpecificInput.paymentProduct130SpecificInput",
+      );
+    }
+    for (const threeDSecure of ["single-amount", ["single-amount"], null]) {
+      await expectRejection(
+        paymentBody({ card: { paymentProduct130SpecificInput: { threeDSecure } } }),
+        "cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure",
+      );
+    }
+  });
+
+  const cartesBancairesRejections: Array<[string, unknown]> = [
+    ["usecase", "SINGLE-AMOUNT"],
+    ["usecase", "single_amount"],
+    ["usecase", ""],
+    ["usecase", "recurring"],
+    ["usecase", 1],
+    ["usecase", null],
+    ["numberOfItems", -1],
+    ["numberOfItems", 100],
+    ["numberOfItems", 2.5],
+    ["numberOfItems", "5"],
+    ["numberOfItems", null],
+    ["acquirerExemption", "false"],
+    ["acquirerExemption", 0],
+    ["merchantScore", "m".repeat(21)],
+    ["merchantScore", 23],
+  ];
+  for (const [field, value] of cartesBancairesRejections) {
+    it(`rejects paymentProduct130SpecificInput.threeDSecure.${field} = ${describeValue(value)}, off the contract's types, enum and limits`, async () => {
+      const threeDSecure = { ...CARTES_BANCAIRES_INPUT.threeDSecure, [field]: value };
+      await expectRejection(
+        paymentBody({ card: { paymentProduct130SpecificInput: { threeDSecure } } }),
+        `cardPaymentMethodSpecificInput.paymentProduct130SpecificInput.threeDSecure.${field}`,
+      );
     });
   }
 

@@ -1,5 +1,16 @@
 # @payfanout/adapter-worldline
 
+## 1.1.0
+
+### Minor Changes
+
+- e856737: Add a `cspNonce` option for pages with a nonce-based Content-Security-Policy: the adapter sets it as the `nonce` attribute of the Tokenizer `<script>` it injects, and the constructor rejects a malformed nonce with `invalid_request`.
+
+### Patch Changes
+
+- Updated dependencies [e856737]
+  - @payfanout/core@4.3.0
+
 ## 1.0.2
 
 ### Patch Changes

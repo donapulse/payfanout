@@ -1,5 +1,12 @@
 # @payfanout/adapter-payzen-server
 
+## 2.0.4
+
+### Patch Changes
+
+- Updated dependencies [e856737]
+  - @payfanout/core@4.3.0
+
 ## 2.0.3
 
 ### Patch Changes

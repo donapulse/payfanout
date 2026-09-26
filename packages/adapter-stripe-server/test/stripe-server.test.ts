@@ -526,3 +526,13 @@ describe("StripeServerAdapter specifics", () => {
     });
   });
 });
+
+describe("stripeOnboarding.csp", () => {
+  it("lists the sources Stripe's security guide gives for Stripe.js", () => {
+    expect(stripeOnboarding.csp).toEqual({
+      script: ["https://js.stripe.com", "https://*.js.stripe.com"],
+      frame: ["https://js.stripe.com", "https://*.js.stripe.com", "https://hooks.stripe.com"],
+      connect: ["https://api.stripe.com"],
+    });
+  });
+});

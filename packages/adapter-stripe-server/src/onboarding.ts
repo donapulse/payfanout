@@ -32,8 +32,10 @@ export const stripeOnboarding: AdapterOnboardingDescriptor = {
     ],
   },
   csp: {
-    script: ["https://js.stripe.com"],
-    frame: ["https://js.stripe.com", "https://hooks.stripe.com"],
+    // Stripe's security guide adds *.js.stripe.com so Stripe.js can start frames on
+    // other origins; Link's hosts apply only to accounts that enable it.
+    script: ["https://js.stripe.com", "https://*.js.stripe.com"],
+    frame: ["https://js.stripe.com", "https://*.js.stripe.com", "https://hooks.stripe.com"],
     connect: ["https://api.stripe.com"],
   },
 };

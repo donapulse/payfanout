@@ -1072,8 +1072,8 @@ const REFUSAL_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "32": "invalid_card_data", // AVS Declined: the address the shopper entered is wrong
   "38": "authentication_required", // Authentication required: the issuer refused the exemption
   // 3-D Secure the network, the issuer or the scheme could not complete, and a
-  // payment network out of reach: Adyen advises a new transaction or another
-  // payment method, not a new authentication by the cardholder.
+  // payment network out of reach: not the card, and not a failed cardholder
+  // authentication.
   "39": "processing_error", // RReq not received from DS
   "40": "processing_error", // Current AID is in Penalty Box
   "42": "processing_error", // 3DS Authentication Error

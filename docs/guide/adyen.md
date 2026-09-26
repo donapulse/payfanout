@@ -799,6 +799,9 @@ field, with any test card above. If the Card shows no cardholder-name field, ena
 | `ERROR` | Acquirer Error | `processing_error` |
 | `AVS_DECLINED` | AVS Declined | `invalid_card_data` |
 
+`FRAUD_CANCELLED` comes back with `resultCode` Cancelled rather than a refusal:
+`completePayment` resolves with the payment `canceled`.
+
 For the failure webhooks, a payment made with the name `capture failed` gets
 `CAPTURE_FAILED` on its capture, and one made with `refund failed` gets `REFUND_FAILED` on
 its refund; Adyen notes the simulation can take up to 24 hours

@@ -46,6 +46,49 @@ const SINGLE_EVENT_BODY =
   '{"events":[{"id":"EV123","created_at":"2014-08-04T12:00:00.000Z","action":"cancelled","resource_type":"mandates","links":{"mandate":"MD123","organisation":"OR123"},"details":{"origin":"bank","cause":"bank_account_disabled","description":"Your customer closed their bank account.","scheme":"bacs","reason_code":"ADDACS-B"}}]}';
 const SINGLE_EVENT_SIG = "d62f67f03929fa7fb6dc8449336a5967471532ae6acf50072061cdb8e5beaab2";
 
+// What a host reads for each 403, chosen from GoCardless's error reason.
+const REFUNDS_NOT_ENABLED = "Refunds are not enabled on this GoCardless account — enable them in the GoCardless Dashboard.";
+const REFUNDS_NOT_ENABLED_OR_NO_PERMISSION =
+  "Refunds may not be enabled on this GoCardless account (enable them in the GoCardless Dashboard), " +
+  "or the access token does not have permission for this operation.";
+const TOKEN_LACKS_SCOPE =
+  "The GoCardless access token does not have the scope this operation needs — use a read-write access token.";
+const DASHBOARD_ONLY = "This action can only be performed from the GoCardless Dashboard.";
+const FEATURE_NOT_ENABLED =
+  "This feature is not enabled on the GoCardless account — contact GoCardless support to enable it.";
+const NO_PERMISSION = "The GoCardless access token does not have permission for this operation.";
+
+/** A GoCardless error envelope naming one reason, as the Responses and Errors page documents it. */
+function gocardlessError(code: number, type: string, reason: string, message: string): unknown {
+  return {
+    error: {
+      message,
+      documentation_url: "/docs/api-reference/responses-and-errors",
+      type,
+      request_id: "req_fake_error",
+      code,
+      errors: [{ reason, message }],
+    },
+  };
+}
+
+/** An adapter whose every request is answered with `status` and exactly `body`, counting the calls. */
+function answering(
+  status: number,
+  body: string | null,
+  config: Partial<GoCardlessServerAdapterConfig> = {},
+): { adapter: GoCardlessServerAdapter; calls: () => number } {
+  let calls = 0;
+  const { adapter } = makePair({
+    fetch: async () => {
+      calls += 1;
+      return new Response(body, { status });
+    },
+    ...config,
+  });
+  return { adapter, calls: () => calls };
+}
+
 describe("GoCardless config validation", () => {
   it("rejects missing/invalid config eagerly", () => {
     expect(() => makePair({ accessToken: "" })).toThrowError(/accessToken/);
@@ -226,10 +269,11 @@ describe("GoCardless error mapping", () => {
     expect(auth.message).toMatch(/access token/);
 
     const forbidden = mapGoCardlessError(403, { error: { type: "invalid_api_usage" } }, "/payments/PM1");
-    expect(forbidden.message).toMatch(/permission/);
+    expect(forbidden.message).toBe(NO_PERMISSION);
 
+    // No reason: either cause can be behind a 403 on refunds.
     const refundsOff = mapGoCardlessError(403, { error: { type: "invalid_api_usage" } }, "/refunds");
-    expect(refundsOff.message).toMatch(/Refunds are not enabled/);
+    expect(refundsOff.message).toBe(REFUNDS_NOT_ENABLED_OR_NO_PERMISSION);
 
     for (const status of [400, 404, 409, 422]) {
       const err = mapGoCardlessError(status, { error: { type: "invalid_state" } });
@@ -241,6 +285,78 @@ describe("GoCardless error mapping", () => {
     expect(text.code).toBe("psp_unavailable");
     expect(text.raw).toBe("Bad gateway");
     expect(text.pspName).toBe("gocardless");
+  });
+
+  it("chooses a 403's message from the reason GoCardless names", () => {
+    const cases: Array<[string | undefined, string | undefined, string]> = [
+      ["/refunds", "feature_disabled", REFUNDS_NOT_ENABLED],
+      ["/refunds", "insufficient_permissions", TOKEN_LACKS_SCOPE],
+      ["/refunds", "insufficient_permissions_continue_on_dashboard", DASHBOARD_ONLY],
+      ["/refunds", "forbidden", REFUNDS_NOT_ENABLED_OR_NO_PERMISSION],
+      ["/refunds", undefined, REFUNDS_NOT_ENABLED_OR_NO_PERMISSION],
+      ["/refunds?payment=PM1&limit=500", "feature_disabled", REFUNDS_NOT_ENABLED],
+      ["/refunds/RF1", "forbidden", REFUNDS_NOT_ENABLED_OR_NO_PERMISSION],
+      ["/payments/PM1", "feature_disabled", FEATURE_NOT_ENABLED],
+      ["/billing_requests", "insufficient_permissions", TOKEN_LACKS_SCOPE],
+      ["/payments/PM1/actions/cancel", "insufficient_permissions_continue_on_dashboard", DASHBOARD_ONLY],
+      ["/payments/PM1", "forbidden", NO_PERMISSION],
+      ["/payments/PM1", undefined, NO_PERMISSION],
+      [undefined, "feature_disabled", FEATURE_NOT_ENABLED],
+      [undefined, undefined, NO_PERMISSION],
+    ];
+    for (const [path, reason, message] of cases) {
+      const body =
+        reason === undefined
+          ? { error: { message: "Forbidden", type: "invalid_api_usage", code: 403, errors: [] } }
+          : gocardlessError(403, "invalid_api_usage", reason, "Forbidden");
+      const err = mapGoCardlessError(403, body, path);
+      expect(err, `${path} ${reason}`).toMatchObject({
+        code: "invalid_request",
+        retryable: false,
+        message,
+        pspName: "gocardless",
+      });
+      expect(err.raw, `${path} ${reason}`).toBe(body);
+    }
+
+    // The first reason named decides; items without one (validation errors carry fields) are passed over.
+    const several = {
+      error: {
+        type: "invalid_api_usage",
+        code: 403,
+        errors: [{ message: "no reason" }, { reason: "feature_disabled" }, { reason: "insufficient_permissions" }],
+      },
+    };
+    expect(mapGoCardlessError(403, several, "/refunds").message).toBe(REFUNDS_NOT_ENABLED);
+    // Bodies that are not GoCardless's envelope name no reason.
+    for (const body of ["Forbidden", undefined, null, { error: "Forbidden" }, { error: { errors: [null, 7] } }]) {
+      expect(mapGoCardlessError(403, body, "/refunds").message, JSON.stringify(body)).toBe(
+        REFUNDS_NOT_ENABLED_OR_NO_PERMISSION,
+      );
+      expect(mapGoCardlessError(403, body, "/payments").message, JSON.stringify(body)).toBe(NO_PERMISSION);
+    }
+  });
+
+  it("tells the host why GoCardless refused a refund", async () => {
+    for (const [reason, message] of [
+      ["feature_disabled", REFUNDS_NOT_ENABLED],
+      ["forbidden", REFUNDS_NOT_ENABLED_OR_NO_PERMISSION],
+    ] as const) {
+      const { adapter, fake } = makePair();
+      const paymentId = await confirmedPayment(adapter, fake, 1000);
+      fake.refundsEnabled = false;
+      fake.refundsDisabledReason = reason;
+      await expect(
+        adapter.refundPayment({ pspPaymentId: paymentId, idempotencyKey: `r-${reason}` }),
+        reason,
+      ).rejects.toMatchObject({
+        code: "invalid_request",
+        retryable: false,
+        message,
+        raw: { error: { code: 403, errors: [{ reason }] } },
+      });
+      expect(fake.uniqueRefundCreations, reason).toBe(0);
+    }
   });
 
   it("preserves the raw envelope on API rejections", async () => {
@@ -310,6 +426,115 @@ describe("GoCardless verifyCredentials (Test connection probe)", () => {
     await expect(outage.adapter.verifyCredentials()).resolves.toMatchObject({ ok: false, category: "network" });
     // 5xx is the classic hang case — the single-shot probe must not retry it.
     expect(outage.fake.callCount).toBe(1);
+  });
+
+  it("reports any other status as a failure, naming the status and GoCardless's reason", async () => {
+    // A wrong baseUrl or goCardlessVersion gets an answer, but never the payments list.
+    const cases: Array<[number, unknown, string]> = [
+      [400, gocardlessError(400, "invalid_api_usage", "version_not_found", "Specified version does not exist."), "HTTP 400, version_not_found"],
+      [404, gocardlessError(404, "invalid_api_usage", "path_not_found", "URL path not recognised."), "HTTP 404, path_not_found"],
+      [406, gocardlessError(406, "invalid_api_usage", "not_acceptable", "Accept header content type not supported."), "HTTP 406, not_acceptable"],
+      // A validation error names fields, not a reason.
+      [
+        422,
+        { error: { message: "Validation failed", type: "validation_failed", code: 422, errors: [{ field: "limit", message: "is invalid" }] } },
+        "HTTP 422",
+      ],
+      [410, { error: { message: "Gone", type: "invalid_api_usage", code: 410, errors: [] } }, "HTTP 410"],
+    ];
+    for (const [status, body, detail] of cases) {
+      const { adapter, calls } = answering(status, JSON.stringify(body));
+      await expect(adapter.verifyCredentials(), detail).resolves.toEqual({
+        ok: false,
+        category: "internal",
+        message: `GoCardless rejected the connectivity check (${detail}) — check baseUrl and goCardlessVersion.`,
+      });
+      expect(calls(), detail).toBe(1);
+    }
+    // Not GoCardless at all: a proxy's page, a redirect nobody followed.
+    for (const [status, body] of [
+      [404, "<html><body>Not Found</body></html>"],
+      [300, null],
+      [399, "moved"],
+    ] as const) {
+      const { adapter } = answering(status, body);
+      await expect(adapter.verifyCredentials(), String(status)).resolves.toEqual({
+        ok: false,
+        category: "internal",
+        message: `GoCardless rejected the connectivity check (HTTP ${status}) — check baseUrl and goCardlessVersion.`,
+      });
+    }
+    // An injected fetch can hand back a network-error Response (status 0) instead of rejecting.
+    const { adapter: errored } = makePair({ fetch: async () => Response.error() });
+    await expect(errored.verifyCredentials()).resolves.toMatchObject({ ok: false, category: "internal" });
+  });
+
+  it("reports ok for a 2xx answer, whatever its body", async () => {
+    for (const [status, body] of [
+      [200, JSON.stringify({ payments: [], meta: { cursors: { before: null, after: null }, limit: 1 } })],
+      [201, "{}"],
+      [204, null],
+      [299, ""],
+    ] as const) {
+      const { adapter, calls } = answering(status, body);
+      await expect(adapter.verifyCredentials(), String(status)).resolves.toEqual({ ok: true });
+      expect(calls(), String(status)).toBe(1);
+    }
+  });
+
+  it("keeps auth rejections and transient answers in their buckets, whatever reason GoCardless names", async () => {
+    const cases: Array<[number, string, string, "auth" | "network"]> = [
+      [401, "invalid_api_usage", "access_token_revoked", "auth"],
+      [401, "invalid_api_usage", "access_token_not_active", "auth"],
+      [403, "invalid_api_usage", "insufficient_permissions", "auth"],
+      [403, "invalid_api_usage", "forbidden", "auth"],
+      [429, "invalid_api_usage", "rate_limit_exceeded", "network"],
+      [500, "gocardless", "internal_server_error", "network"],
+      [504, "gocardless", "request_timed_out", "network"],
+    ];
+    for (const [status, type, reason, category] of cases) {
+      const { adapter, fake } = makePair();
+      fake.failNextWith(status, gocardlessError(status, type, reason, "GoCardless error"));
+      await expect(adapter.verifyCredentials(), `${status} ${reason}`).resolves.toEqual({
+        ok: false,
+        category,
+        message:
+          category === "auth"
+            ? "Authentication failed — check the GoCardless access token."
+            : "Could not reach GoCardless — try again.",
+      });
+      expect(fake.callCount, `${status} ${reason}`).toBe(1);
+    }
+  });
+
+  it("names only a reason that reads as a GoCardless code, never the access token", async () => {
+    // Whatever answers at a wrong baseUrl writes the body, and it was sent the token.
+    const statusOnly = {
+      ok: false,
+      category: "internal",
+      message: "GoCardless rejected the connectivity check (HTTP 404) — check baseUrl and goCardlessVersion.",
+    };
+    for (const reason of [
+      "fake-sandbox-access-token",
+      "Bearer fake-sandbox-access-token",
+      "Path_not_found",
+      "path not found",
+      "<b>path_not_found</b>",
+      "_path_not_found",
+      "a".repeat(65),
+      404,
+    ]) {
+      const { adapter } = answering(404, JSON.stringify({ error: { code: 404, errors: [{ reason, message: "x" }] } }));
+      await expect(adapter.verifyCredentials(), String(reason)).resolves.toEqual(statusOnly);
+    }
+    // A token that happens to look like a reason code is not echoed either.
+    const codeShaped = "sandbox_token_shaped_like_a_reason";
+    const { adapter } = answering(
+      404,
+      JSON.stringify({ error: { code: 404, errors: [{ reason: `${codeShaped}_echoed`, message: "x" }] } }),
+      { accessToken: codeShaped },
+    );
+    await expect(adapter.verifyCredentials()).resolves.toEqual(statusOnly);
   });
 });
 
@@ -1620,6 +1845,7 @@ describe("GoCardless refund replays", () => {
     const { adapter, fake, levers } = makeFlakyRefundPair();
     const paymentId = await confirmedPayment(adapter, fake, 1000);
     fake.refundsEnabled = false;
+    fake.refundsDisabledReason = "feature_disabled";
     levers.listAnswer = gocardlessForbids;
     // The create's own 403 decides the code and message: only the create's names a reason.
     const refusal = await adapter
@@ -1630,7 +1856,7 @@ describe("GoCardless refund replays", () => {
       retryable: false,
       outcomeUnknown: true,
       pspName: "gocardless",
-      message: expect.stringMatching(/Refunds are not enabled/),
+      message: REFUNDS_NOT_ENABLED,
     });
     expect((refusal as { raw: unknown }).raw).toEqual({
       rejection: expect.objectContaining({ error: expect.objectContaining({ code: 403 }) }),

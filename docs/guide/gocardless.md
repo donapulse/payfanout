@@ -305,9 +305,17 @@ already-reclaimed funds being debited from a payout — not a dispute outcome; i
 
 ## 8. Refunds must be enabled first
 
-Refunds are **disabled by default** on GoCardless accounts — a registered admin requests
-them from GoCardless support. Until then, `refundPayment` rejects with an
-`invalid_request` explaining exactly that (the API returns 403). Once enabled: full and
+Refunds are **disabled by default** on GoCardless accounts. GoCardless's API reference
+says to enable them in the GoCardless Dashboard; its partner integration guide says they
+are available on request. Until then, `refundPayment` rejects with a
+non-retryable `invalid_request`. When GoCardless refuses with a 403, the message follows
+the reason it gives: refunds not enabled on the account (`feature_disabled`), an access
+token without the scope the call needs (`insufficient_permissions`: use a read-write
+token), or an action GoCardless allows only from its Dashboard
+(`insufficient_permissions_continue_on_dashboard`). GoCardless does not document which
+reason a disabled refunds endpoint gives, so any other reason, or none, gets a message
+naming both likely causes: refunds not enabled, or a token without permission.
+GoCardless's own answer is on the error's `raw`. Once enabled: full and
 partial refunds work, the adapter computes GoCardless's required
 `total_amount_confirmation` safety check from a fresh read, and refunds report
 `pending` until the money moves — poll `retrieveRefund` to a terminal state. A refund
@@ -371,7 +379,8 @@ webhooks. "Send test webhook" in the dashboard exercises your endpoint end to en
 - [ ] Set `environment: "live"` on **both** adapters (host flips to `api.gocardless.com`).
 - [ ] Complete GoCardless account verification (payouts require it).
 - [ ] Create the **live** webhook endpoint and use its **live** secret.
-- [ ] If you refund, confirm refunds are enabled on the **live** account too.
+- [ ] If you refund, confirm refunds are enabled on the **live** account too (GoCardless
+      Dashboard).
 - [ ] Re-check scheme/currency enablement for your account and override
       `paymentMethods` if it differs from the defaults.
 

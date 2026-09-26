@@ -766,7 +766,14 @@ describe("PayZenClientAdapter error mapping", () => {
       [{ errorCode: "ACQ_999" }, "psp_unavailable", true], // technical error, as the server reads it
       [{ errorCode: "AUTH_999" }, "psp_unavailable", true],
       [{ errorCode: "constructor" }, "processing_error", true], // the client map's own keys only
-      [{ errorCode: "AUTH_149" }, "authentication_required", false],
+      // Every code in the AUTH_ map, as the server reads them; a refusal, never retryable.
+      [{ errorCode: "AUTH_100" }, "processing_error", false],
+      [{ errorCode: "AUTH_101" }, "processing_error", false],
+      [{ errorCode: "AUTH_149" }, "processing_error", false],
+      [{ errorCode: "AUTH_102" }, "invalid_request", false],
+      [{ errorCode: "AUTH_103" }, "invalid_request", false],
+      [{ errorCode: "AUTH_150" }, "processing_error", false], // a code the page does not list
+      [{ errorCode: "AUTH_102", detailedErrorCode: "51" }, "invalid_request", false], // never an acquirer code
       [{ errorCode: "SOMETHING_ELSE" }, "processing_error", true], // shopper may safely retry
       [{}, "processing_error", true],
     ];
@@ -777,16 +784,26 @@ describe("PayZenClientAdapter error mapping", () => {
   });
 
   it("refines UNPAID declines from AUTH_-family transaction errors", async () => {
-    stubBrowser();
-    const fake = makeFakeKr();
-    const { adapter } = makeAdapter(fake);
-    const handle = await adapter.mount(fakeContainer(), { clientSecret: FORM_TOKEN });
-    const pending = adapter.confirm(handle);
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    fake.submitCb?.({
-      clientAnswer: { orderStatus: "UNPAID", transactions: [{ uuid: "u1", errorCode: "AUTH_149" }] },
-    });
-    expect((await pending).error).toMatchObject({ code: "authentication_required", retryable: false });
+    const cases: Array<[string, string]> = [
+      ["AUTH_100", "processing_error"],
+      ["AUTH_101", "processing_error"],
+      ["AUTH_149", "processing_error"],
+      ["AUTH_102", "invalid_request"],
+      ["AUTH_103", "invalid_request"],
+      ["AUTH_150", "processing_error"],
+    ];
+    for (const [errorCode, code] of cases) {
+      stubBrowser();
+      const fake = makeFakeKr();
+      const { adapter } = makeAdapter(fake);
+      const handle = await adapter.mount(fakeContainer(), { clientSecret: FORM_TOKEN });
+      const pending = adapter.confirm(handle);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      fake.submitCb?.({
+        clientAnswer: { orderStatus: "UNPAID", transactions: [{ uuid: "u1", errorCode }] },
+      });
+      expect((await pending).error, errorCode).toMatchObject({ code, retryable: false });
+    }
   });
 
   it("reads an UNPAID order's last transaction, not its first", async () => {
@@ -853,7 +870,8 @@ describe("PayZenClientAdapter error mapping", () => {
     const answers: Array<[KrErrorLike, string]> = [
       [{ errorCode: "ACQ_001", detailedErrorCode: "91" }, getUserMessage("processing_error")],
       [{ errorCode: "ACQ_001", detailedErrorCode: "51" }, getUserMessage("insufficient_funds")],
-      [{ errorCode: "AUTH_149" }, getUserMessage("authentication_required")],
+      [{ errorCode: "AUTH_149" }, getUserMessage("processing_error")],
+      [{ errorCode: "AUTH_103" }, getUserMessage("invalid_request")],
       [{ errorCode: "ACQ_999" }, getUserMessage("psp_unavailable")],
       [{ errorCode: "CLIENT_100" }, "The payment form could not be set up."],
       [{ errorCode: "CLIENT_101" }, "Additional authentication is required."],

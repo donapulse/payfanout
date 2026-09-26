@@ -3308,7 +3308,8 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   may still occur", so a replayed REDIRECT is followed by `GET /payments/{id}`. Failed or
   cancelled (1, "a final status"), the walk goes on with that payment's id; still waiting,
   the challenge comes back as `requires_action` with its redirect URL; anything else,
-  `processing` and Authorised and cancelled (6) included, is returned as it now reads. The
+  `processing`, Authorised and cancelled (6) and every other cancellation code included, is
+  returned as it now reads. The
   Statuses page says of 46: "If your customer abandons the 3-D Secure check prematurely
   (i.e. by closing the browser window), the transaction will remain in
   statusOutput.statusCode=46 indefinitely." An open challenge may still be authorised, so
@@ -3328,7 +3329,7 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   not known") on to 2, 5 or 9 later, and says of 52 and 92: "As your initial request might
   have been successful, please do not resend the initial request. This is to avoid double
   bookings of the same order." A replayed 2xx whose payment was pending when created is read
-  back, walked past once it reads failed or cancelled, and otherwise returned as it now
+  back, walked past once it reads failed or Cancelled (1), and otherwise returned as it now
   reads, `processing` included. A payment authorised or captured when created, a
   manual-capture authorisation (5) among them, is returned as it now reads and never walked
   past, even once a merchant has cancelled it: a completion repeated after that must not
@@ -3350,6 +3351,16 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   that completing under a new key after cancelling an authorisation is safe. The fake used
   to settle a sale pending at 51 straight to 9; it now settles it to 5, as that entry lists,
   and lets such a sale be cancelled.
+- **Only Cancelled (1) counts as a failed attempt among the cancellations (review,
+  2026-09-26).** The Statuses page's table of payment statuses lists CANCELLED /
+  UNSUCCESSFUL with "1/6/61/62/64/75/96" and describes none of 64, 75 and 96, and a
+  cancellation read without a code says nothing of how it came about; the page's Hosted
+  Checkout status CANCELLED is "Applicable only for transactions reaching
+  statusOutput.statusCode=1". Walking past a payment cancelled at one of those codes could
+  follow one that took money with a second, so such a payment is held like 6, returned as it
+  now reads, `canceled` (AMBIGUOUS 11). A completion's own answer is also checked against the
+  session's amount and currency: the request named them, so a payment for another is a
+  replay whose header did not arrive.
 - **A replayed refusal that reports a payment is walked past only once that payment ended
   unpaid (corrected in review, 2026-09-26).** Walking past any replayed 4xx on its status
   alone would let a 402 carrying a payment at AUTHORIZATION_REQUESTED (52) chain to a new
@@ -3548,8 +3559,12 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   list CANCELLED/UNSUCCESSFUL/6 as the final one, while Cancelled (1) is described for
   Hosted Checkout cancellations and expired sessions. At 6 the walk never passes it and the
   host completes under a new key; at 1 the same key walks past it too. Check: create a
-  challenge, cancel it before the redirect, and read it back. No sandbox run has exercised
-  any of this yet.
+  challenge, cancel it before the redirect, and read it back. (11) What a cancellation at
+  64, 75 or 96, or without a code, means; no page describes them, and the adapter holds such
+  a payment rather than walk past it. Check: cancel payments at each stage the sandbox
+  allows (an open challenge, an authorisation, a pending authorisation) and record each
+  CANCELLED payment's `statusOutput.statusCode`. No sandbox run has exercised any of this
+  yet.
 
 ## Paysafe answers mapped as documented (2026-09-26)
 

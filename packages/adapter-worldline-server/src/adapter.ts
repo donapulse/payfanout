@@ -563,6 +563,9 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     const answered = paymentStatus(payment);
     const { replayOf } = answer;
     if (replayOf === undefined && !answer.uncertain) {
+      // The request named the session's own amount and currency, so a payment
+      // for another answers another request: a replay whose header was lost.
+      assertSessionsPayment(payment, context);
       if (challenge) return { info: asChallenge() };
       // Some Worldline flows answer 2xx with a REJECTED payment rather than an
       // HTTP error. It throws a rejection mapped from the payment's own
@@ -583,7 +586,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     // pending authorisation later.
     const current = await this.readBack(payment.id, context);
     if (walkable(answered, current)) return failed({ payment: current.raw as WorldlinePaymentLike });
-    assertSessionsPayment(current, context);
+    assertSessionsPayment(current.raw as WorldlinePaymentLike, context);
     return { info: challenge && current.status === "requires_action" ? asChallenge() : current };
   }
 
@@ -622,7 +625,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     // when it went through, or was authorised and cancelled since, so a
     // payment that has finished is returned, like any replayed success.
     if (wentThrough(current.status) || endedUnpaid(current.status)) {
-      assertSessionsPayment(current, context);
+      assertSessionsPayment(current.raw as WorldlinePaymentLike, context);
       return { info: current };
     }
     throw flagOutcomeUnknown(refusal, true);
@@ -1399,14 +1402,16 @@ function wentThrough(status: UnifiedPaymentStatus): boolean {
 }
 
 /**
- * Whether the attempt a payment came from failed: the payment ended unpaid and
- * was never authorised. Authorised and cancelled (6), "You successfully
- * deleted the authorisation of a transaction" (Statuses reference), is a
- * payment that went through and was then cancelled, which a repeated
- * completion must not replace.
+ * Whether the attempt a payment came from failed: the payment was declined, or
+ * reads Cancelled (1). Every other cancellation is held. Authorised and
+ * cancelled (6), "You successfully deleted the authorisation of a transaction"
+ * (Statuses reference), is a payment that went through and was then cancelled,
+ * which a repeated completion must not replace, and the reference describes
+ * none of 64, 75 and 96, nor a cancellation without a code.
  */
 function failedAttempt(payment: WorldlinePaymentLike): boolean {
-  return endedUnpaid(paymentStatus(payment)) && payment.statusOutput?.statusCode !== 6;
+  const status = paymentStatus(payment);
+  return status === "failed" || (status === "canceled" && payment.statusOutput?.statusCode === 1);
 }
 
 /**
@@ -1426,9 +1431,8 @@ function walkable(answered: UnifiedPaymentStatus, current: PaymentInfo): boolean
  * reused across sessions replays; it may be the payment the host meant, so the
  * refusal carries outcomeUnknown. A field the payment omits is not a mismatch.
  */
-function assertSessionsPayment(current: PaymentInfo, context: WorldlineSessionContextV1): void {
-  if (endedUnpaid(current.status)) return;
-  const payment = current.raw as WorldlinePaymentLike;
+function assertSessionsPayment(payment: WorldlinePaymentLike, context: WorldlineSessionContextV1): void {
+  if (endedUnpaid(paymentStatus(payment))) return;
   const amount = payment.paymentOutput?.amountOfMoney?.amount ?? undefined;
   const currency = payment.paymentOutput?.amountOfMoney?.currencyCode ?? undefined;
   const differs =

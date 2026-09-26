@@ -401,6 +401,29 @@ describe("a replayed 3-D Secure challenge", () => {
     });
   }
 
+  // The Statuses reference lists CANCELLED with 1, 6, 61, 62, 64, 75 and 96, and describes none of 64, 75 and 96.
+  const held: Array<[string, Partial<WorldlinePaymentLike>]> = [
+    ["code 64", { status: "CANCELLED", statusOutput: { statusCode: 64, statusCategory: "UNSUCCESSFUL" } }],
+    ["code 75", { status: "CANCELLED", statusOutput: { statusCode: 75, statusCategory: "UNSUCCESSFUL" } }],
+    ["code 96", { status: "CANCELLED", statusOutput: { statusCode: 96, statusCategory: "UNSUCCESSFUL" } }],
+    ["no status code", { status: "CANCELLED", statusOutput: { statusCategory: "UNSUCCESSFUL" } }],
+  ];
+  for (const [label, fields] of held) {
+    it(`is held, not walked past, once its payment reads cancelled with ${label}`, async () => {
+      const fake = new FakeWorldlineApi();
+      const wire = scriptedFetch(fake);
+      const adapter = makeAdapter(wire.fetchImpl);
+      const session = await openSession(adapter);
+      const challenge = await complete(adapter, session, "htp_3ds");
+      fake.settleChallenge(challenge.pspPaymentId, "cancelled");
+      wire.readBackAs(challenge.pspPaymentId, fields);
+
+      const again = await complete(adapter, session, "htp_new_card");
+      expect(again).toMatchObject({ status: "canceled", pspPaymentId: challenge.pspPaymentId });
+      expect(fake.uniquePaymentCreations).toBe(1);
+    });
+  }
+
   it("is returned again as requires_action, with its redirect, while the customer has not finished it", async () => {
     const { adapter, fake } = makePair();
     const session = await openSession(adapter);
@@ -1084,6 +1107,38 @@ describe("a key whose earlier payment was made for another amount or currency", 
       expect(fake.uniquePaymentCreations).toBe(2);
     });
   }
+
+  it("refuses another session's payment answered without the replay header, as if it were the call's own", async () => {
+    const fake = new FakeWorldlineApi();
+    const adapter = makeAdapter(rewritingReplayHeader(fake, String(Date.now()), "X-Unrelated-Header"));
+    const paid = await complete(adapter, await openSession(adapter), "htp_card");
+    const other = await openSession(adapter, { amount: 3000, idempotencyKey: "session-2" });
+    expectAnotherSessions(await rejection(complete(adapter, other, "htp_new_card")), paid.pspPaymentId, 3000, "EUR");
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
+  it("does not count a payment read back with a lower-case currency code as another session's", async () => {
+    const fake = new FakeWorldlineApi();
+    const wire = scriptedFetch(fake);
+    const adapter = makeAdapter(wire.fetchImpl);
+    const session = await openSession(adapter);
+    const paid = await complete(adapter, session, "htp_card");
+    wire.readBackAs(paid.pspPaymentId, { paymentOutput: { amountOfMoney: { amount: 2500, currencyCode: "eur" } } });
+    await expect(complete(adapter, session, "htp_new_card")).resolves.toMatchObject({ pspPaymentId: paid.pspPaymentId });
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
+  it("returns another session's payment, authorised and cancelled since, as it now reads", async () => {
+    const { adapter, fake } = makePair();
+    const authorised = await complete(adapter, await openSession(adapter, { captureMethod: "manual" }), "htp_card");
+    await adapter.cancelPayment(authorised.pspPaymentId, "cancel-order-42");
+    const other = await openSession(adapter, { amount: 3000, idempotencyKey: "session-2" });
+    await expect(complete(adapter, other, "htp_new_card")).resolves.toMatchObject({
+      status: "canceled",
+      pspPaymentId: authorised.pspPaymentId,
+    });
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
 
   it("returns the payment to another session for the same amount and currency", async () => {
     const { adapter, fake, paid } = await paidAfterDecline();

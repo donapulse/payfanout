@@ -318,11 +318,10 @@ from there. Every completion walks the same keys in the same order and stops at 
 attempt that did not fail, so a completion repeated after a success returns that payment and
 charges nothing.
 
-An attempt counts as failed only once its payment was declined or cancelled. When the
+An attempt counts as failed only once its payment was declined, or reads Cancelled (1). When the
 replayed answer does not already say so, `completePayment` reads the payment back first:
 
-- **A 3-D Secure challenge** that failed or was cancelled is walked past, unless it reads
-  Authorised and cancelled (below). One still open comes back as `requires_action` with its
+- **A 3-D Secure challenge** that failed or reads Cancelled (1) is walked past. One still open comes back as `requires_action` with its
   redirect URL, because the customer may still finish it, and any other, one that went through
   or one handed on to a pending authorisation, is returned as it now reads.
 - **A payment still pending when it was created**, such as Worldline's statuses 50 (fraud
@@ -337,6 +336,9 @@ replayed answer does not already say so, `completePayment` reads the payment bac
   after you cancelled an authorisation never authorises the customer again. To charge them
   again, complete under a new idempotency key: that is safe, since 6 is final and no
   completion sent an attempt after that payment.
+- **A payment that reads cancelled at any other code, or at none**, is returned as `canceled`
+  the same way. Worldline lists 64, 75 and 96 among the cancelled statuses without describing
+  them, so the adapter does not take them for a failed attempt that another may follow.
 - **A decline whose error body reports a payment that has not ended** rejects with its usual
   `code` marked `outcomeUnknown: true`, because that payment may still go through. No Worldline
   page shows such an answer, and the API contract does not rule it out. Complete again only
@@ -354,8 +356,8 @@ The walk has limits:
   open "indefinitely", so the key keeps returning it rather than send a second payment that
   could be charged alongside it. Cancel it with `cancelPayment` while Worldline reports it
   cancellable (`raw.statusOutput.isCancellable` on `retrievePayment`); one you cannot cancel
-  may still go through, so reconcile it before charging again. Once `cancelPayment` succeeds
-  the payment is final and no attempt was sent after it, so completing under a new idempotency
+  may still go through, so reconcile it before charging again. Once the payment reads
+  `canceled` it is final and no attempt was sent after it, so completing under a new idempotency
   key is safe. The same key walks past it only if it reads Cancelled (1): one that reads
   Authorised and cancelled (6), the final status Worldline lists for CancelPayment, is returned
   as `canceled`, as above.

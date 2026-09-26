@@ -1,5 +1,12 @@
 # @payfanout/adapter-paypal
 
+## 0.3.1
+
+### Patch Changes
+
+- Updated dependencies [31c83be]
+  - @payfanout/core@4.4.0
+
 ## 0.3.0
 
 ### Minor Changes

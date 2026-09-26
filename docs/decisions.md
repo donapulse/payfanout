@@ -4756,11 +4756,19 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   manually captured payment walks the references, one lookup each (one more when the range is
   refused), and ten spent captures are far more than one authorization plausibly survives;
   Paysafe caps the settlements of an authorization at a number it does not state (3202, "You
-  have exceeded the maximum number of Settlements allowed."). A capture with no amount when
-  nothing is left and no reference holds a live settlement is refused as nothing left to
-  capture, a plain `invalid_request`, and never sends a zero settlement. A capture of the
-  authorized amount that meets a live settlement of another amount (the rest, after partial
-  captures) is refused as already captured in full, a plain `invalid_request` without
+  have exceeded the maximum number of Settlements allowed."). A capture with no amount, or the
+  authorized amount, when nothing is left and no reference holds a live settlement is refused as
+  nothing left to capture, a plain `invalid_request`, and never sends a zero settlement. Before
+  refusing, it reads the reference it would settle under again, up to three times, as the replay
+  read-back does: a retry after a lost answer, as the retry advice asks for, can meet a payment
+  read that shows the capture while the lookup still trails it (changed in review, 2026-09-27:
+  the refusal came without that read, and reported a capture that had settled as not made). The
+  refusal says to check `retrievePayment`. After a refused range, a reference that holds records
+  resets the walk's choice of the reference to settle under, since an empty reference before it
+  only looked empty: the adapter never settles past an empty one (changed in review,
+  2026-09-27). A range refused on a payment's own reference is carried into its walk. A capture
+  of the authorized amount that meets a live settlement of another amount (the rest, after
+  partial captures) is refused as already captured in full, a plain `invalid_request` without
   `outcomeUnknown`; it had answered `invalid_request` with `outcomeUnknown` and the advice to
   use a new key, as for a key reused by another request. A capture with no amount that meets one
   answers with it: it was the remainder then. With no live settlement, a capture of the
@@ -4845,40 +4853,40 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   WebHelp gives a pre-authorised transaction "between three and five days".
 - **Settlement reads start the day before the payment.** Doc-verified 2026-09-26 against the
   same spec: `startDate` is "This is the start date in UTC. Default = 30 days before the
-  endDate." (`format: date`, example `2022-11-18`) and `endDate` "This is the end date in
-  UTC. Default = current date and time.", so a payment settled more than 30 days earlier had
-  no refundable settlement either. The lookups that find a payment's settlements, for
+  endDate." (`format: date`, example `2022-11-18`) and `endDate` "This is the end date in UTC.
+  Default = current date and time.", so a payment settled more than 30 days earlier had no
+  refundable settlement either. The lookups that find a payment's settlements, for
   `retrievePayment`, `cancelPayment`, `refundPayment` and a full capture's walk, now send
-  `startDate`: the UTC date of the payment's `txnTime` less one day, a margin for a
-  settlement timed just before its payment. They send no `endDate`, and ask for `limit=50`,
-  the spec's maximum for `limit` ("This is the total number of records to return.", default
-  10, maximum 50), so a reused completion key's records are not cut at ten. A payment
-  without a readable `txnTime` sends no `startDate`. The replay reads keep the default
-  window: they look for a write made moments before. The widest range Paysafe accepts is
-  undocumented, so a ranged lookup Paysafe refuses as a request error (a 4xx mapped to
-  `invalid_request`, as a 400/5068 field error is) is sent once more without `startDate`,
-  over the default window. A reference can look empty over that window while older records
-  under it are out of sight (changed in review, 2026-09-26: with a failure under the first
-  reference on day 0 and the full capture under `-a2` on day 6, a refund on day 34 stopped
-  at the first reference and was refused). Once any lookup of a walk has fallen back, the
-  walk goes on past empty references, still ten at most, and takes the first live
-  settlement; a full capture still settles under the first empty one when none shows. The
-  refused range is not asked for again on the later references, so where nothing shows,
-  such a read makes eleven lookups. A not-found answer
-  (404/5269) reads as no settlement under the reference. Any other failure of either lookup,
-  an outage, a rate limit or a 5xx, is thrown as it maps, retryable where core says so
-  (changed in review, 2026-09-26: the first version read every lookup failure as no
-  settlement, so a settlements outage made `refundPayment` throw a non-retryable "no
-  refundable settlement" and `retrievePayment` report `amountRefunded: 0`). A cancel whose
-  read fails after its void rejects retryable, and its replay under the same key answers
-  with that void. A capture makes no settlement lookup after its write (changed in review,
-  2026-09-26: a partial capture read the payment back through `retrievePayment`, whose walk
-  throws on a failed lookup, so an outage right after the settlement rejected a capture that
-  had settled). Its answer is the payment read afterwards with the settlement in hand, and a
-  partial capture's amounts are the ones `retrievePayment` then reports. Only records filed
+  `startDate`: the UTC date of the payment's `txnTime` less one day, a margin for a settlement
+  timed just before its payment. They send no `endDate`, and ask for `limit=50`, the spec's
+  maximum for `limit` ("This is the total number of records to return.", default 10, maximum
+  50), so a reused completion key's records are not cut at ten. A payment without a readable
+  `txnTime` sends no `startDate`. The replay reads keep the default window: they look for a
+  write made moments before. The widest range Paysafe accepts is undocumented, so a ranged
+  lookup Paysafe refuses as a request error (a 4xx mapped to `invalid_request`, as a 400/5068
+  field error is) is sent once more without `startDate`, over the default window. A reference
+  can look empty over that window while older records under it are out of sight (changed in
+  review, 2026-09-26: with a failure under the first reference on day 0 and the full capture
+  under `-a2` on day 6, a refund on day 34 stopped at the first reference and was refused). Once
+  any lookup of a walk has fallen back, the walk goes on past empty references, still ten at
+  most, and takes the first live settlement; when none shows, a full capture settles under the
+  first empty one after the last reference that holds records. The refused range is not asked
+  for again on the later references, nor in a walk after the payment's own reference refused it,
+  so where nothing shows, such a read makes eleven lookups, twelve for a payment that states no
+  `settleWithAuth`. A not-found answer (404/5269) reads as no settlement under the reference.
+  Any other failure of either lookup, an outage, a rate limit or a 5xx, is thrown as it maps,
+  retryable where core says so (changed in review, 2026-09-26: the first version read every
+  lookup failure as no settlement, so a settlements outage made `refundPayment` throw a
+  non-retryable "no refundable settlement" and `retrievePayment` report `amountRefunded: 0`). A
+  cancel whose read fails after its void rejects retryable, and its replay under the same key
+  answers with that void. A capture makes no settlement lookup after its write (changed in
+  review, 2026-09-26: a partial capture read the payment back through `retrievePayment`, whose
+  walk throws on a failed lookup, so an outage right after the settlement rejected a capture
+  that had settled). Its answer is the payment read afterwards with the settlement in hand, and
+  a partial capture's amounts are the ones `retrievePayment` then reports. Only records filed
   under the reference looked up are read as its own. Every card example among the
-  settle-with-auth examples of `POST /v1/payments`, "Card - with Settlement" among them,
-  embeds a settlement under the payment's own `merchantRefNum`.
+  settle-with-auth examples of `POST /v1/payments`, "Card - with Settlement" among them, embeds
+  a settlement under the payment's own `merchantRefNum`.
 - **Which references a payment reads.** A payment that moved no money is given no
   settlement: a settlement names no payment, and a card completion keyed by order files a
   declined attempt and the payment that went through under the same reference. The lookup

@@ -356,6 +356,26 @@ describe("Paysafe full-capture replays", () => {
     }
   });
 
+  it("answers a full capture retried while the lookup still trails its settled first attempt, instead of refusing it as nothing left", async () => {
+    for (const amount of [undefined, 2000]) {
+      const label = String(amount);
+      const { adapter, fake } = makePair();
+      const id = await complete(adapter, "manual");
+      const reference = `payfanout-capture-${id}`;
+      fake.loseAnswer(SETTLE);
+      // The first attempt's check and three reads, and the retry's own walk, all trail the settlement.
+      fake.hideFromLookups("settlements", reference, 5);
+      const err = await rejection(adapter.capturePayment(id, amount, "k-capture"));
+      expect(err, label).toMatchObject({ code: "processing_error", outcomeUnknown: true });
+      // The payment read shows nothing left, so the retry reads the reference again before refusing.
+      const retried = await adapter.capturePayment(id, amount, "k-capture");
+      expect(retried, label).toMatchObject({ status: "succeeded", amountCaptured: 2000, amountCapturable: 0 });
+      expect(captureSettlementOf(retried), label).toMatchObject({ merchantRefNum: reference, amount: 2000 });
+      expect(sent(fake, SETTLE), label).toHaveLength(1);
+      expect(fake.uniqueSettlementCreations, label).toBe(1);
+    }
+  });
+
   it("meets the first full capture's settlement under another key instead of refusing or settling again", async () => {
     for (const stateCheckFirst of [false, true]) {
       for (const [first, second] of [[undefined, undefined], [undefined, 2000], [2000, undefined], [2000, 2000]]) {
@@ -433,7 +453,8 @@ describe("Paysafe full-capture replays", () => {
       expect(err.outcomeUnknown, label).toBeUndefined();
       expect(err.message, label).toBe(
         left === 0
-          ? `Payment ${id} has nothing left to capture: Paysafe shows none of its authorization left to settle, and no full capture of it`
+          ? `Payment ${id} has nothing left to capture: Paysafe shows none of its authorization left to settle, and no full capture of it. ` +
+              "A full capture made moments ago may not show in Paysafe's lookup yet, so check retrievePayment before reading the payment as not captured"
           : `Payment ${id} has only 1300 of its authorization left to settle, not the 2000 this capture asks for: capture the rest with no amount`,
       );
       expect(sent(fake, SETTLE), label).toHaveLength(before);
@@ -1178,6 +1199,46 @@ describe("Paysafe settlement lookups", () => {
     // A full capture then still settles under the first empty reference.
     await adapter.capturePayment(idle, undefined, "k-capture-idle");
     expect(sent(fake, SETTLE).at(-1)?.body).toEqual({ merchantRefNum: fullCaptureRefs(idle)[0], dupCheck: true, amount: 2000 });
+  });
+
+  it("settles after the last reference holding records once Paysafe refuses the range, not under one that only looks empty", async () => {
+    const { adapter, fake } = makePair();
+    fake.lookupRangeLimitDays = 20;
+    const id = await complete(adapter, "manual");
+    const refs = fullCaptureRefs(id);
+    // Day 0: a full capture fails under the first reference.
+    fake.recordFailure(SETTLE, GATEWAY_REJECTION);
+    await rejection(adapter.capturePayment(id, undefined, "k-capture-1"));
+    // Day 25: the default window still shows that failure, so the retry settles, and fails, under the second.
+    fake.passDays(25);
+    fake.recordFailure(SETTLE, GATEWAY_REJECTION);
+    await rejection(adapter.capturePayment(id, undefined, "k-capture-2"));
+    expect(sent(fake, SETTLE).map((r) => r.body?.["merchantRefNum"])).toEqual(refs.slice(0, 2));
+    // Day 40: the default window no longer shows the first failure, but still the second, so the first only looks empty.
+    fake.passDays(15);
+    const captured = await adapter.capturePayment(id, undefined, "k-capture-3");
+    expect(captureSettlementOf(captured)).toMatchObject({ merchantRefNum: refs[2], amount: 2000 });
+    expect(captured).toMatchObject({ status: "succeeded", amountCaptured: 2000 });
+  });
+
+  it("carries a range refused on the payment's own reference into the walk, asking for it no more", async () => {
+    // A payment that states no settleWithAuth reads its own reference first.
+    const payment = { id: "pay_1", merchantRefNum: "k-pay", status: "COMPLETED", amount: 1000, availableToSettle: 1000, currencyCode: "USD", txnTime: "2026-07-04T10:00:00Z" };
+    const lookups: Array<[string | null, string | null]> = [];
+    const { adapter } = makePair({
+      fetch: async (input) => {
+        const url = new URL(urlOf(input));
+        if (url.pathname !== SETTLEMENTS) return new Response(JSON.stringify(payment));
+        lookups.push([url.searchParams.get("merchantRefNum"), url.searchParams.get("startDate")]);
+        if (url.searchParams.has("startDate")) {
+          return new Response(JSON.stringify({ error: { code: "5068", message: "Field error(s)" } }), { status: 400 });
+        }
+        return new Response(JSON.stringify({ settlements: [] }));
+      },
+    });
+    expect(await adapter.retrievePayment("pay_1")).toMatchObject({ status: "requires_capture", amountCapturable: 1000 });
+    const refs = fullCaptureRefs("pay_1");
+    expect(lookups).toEqual([["k-pay", "2026-07-03"], ["k-pay", null], ...refs.map((ref): [string, null] => [ref, null])]);
   });
 
   it("reads on past empty references for the rest of a walk once any of its lookups has fallen back", async () => {

@@ -257,8 +257,11 @@ you capture decides what `refundPayment` can reach later:
   partial captures (below), a capture of the authorized amount is refused with a
   non-retryable `invalid_request` before any settlement request, saying how much is left:
   capture the rest with no `amount`. Once the rest is captured, the same capture is
-  refused as already captured in full. A capture with no `amount` when nothing is left and
-  no full capture shows is refused as having nothing left to capture.
+  refused as already captured in full. A capture, with no `amount` or the authorized
+  amount, when nothing is left and no full capture shows is refused as having nothing left
+  to capture, after reading the next reference again: a full capture made moments ago can
+  trail in Paysafe's lookup, so check `retrievePayment` before treating the payment as not
+  captured.
 - **A full capture that moved no money frees the next reference.** Once a full capture
   failed, or its settlement was cancelled while pending or expired, a new full capture,
   under any key, settles under `payfanout-capture-<pspPaymentId>-a2`, then `-a3`, up to

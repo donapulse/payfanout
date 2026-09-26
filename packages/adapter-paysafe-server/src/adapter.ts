@@ -1762,23 +1762,6 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     if (walk.captured) {
       capture = walk.captured;
     } else if (walk.free !== undefined) {
-      const left = remainingToSettle(payment);
-      if (left === 0) {
-        throw PayFanoutError.invalidRequest(
-          `Payment ${pspPaymentId} has nothing left to capture: Paysafe shows none of its authorization left to ` +
-            "settle, and no full capture of it",
-          payment,
-        );
-      }
-      // Paysafe would refuse more than is left (3204), and whether that
-      // refusal still holds the reference under dupCheck is undocumented.
-      if (amount !== undefined && amount > left) {
-        throw PayFanoutError.invalidRequest(
-          `Payment ${pspPaymentId} has only ${left} of its authorization left to settle, not the ${amount} this ` +
-            "capture asks for: capture the rest with no amount",
-          payment,
-        );
-      }
       // No amount is compared on a read-back: a reference holds one full
       // capture, whichever call made it, and the amount is checked below.
       const replay: ReplayableWrite<PaysafeSettlementLike> = {
@@ -1788,14 +1771,39 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
         movesMoney: true,
         readBackOnRejection: true,
       };
-      // Paysafe requires an explicit amount on settlements (error 5068 without
-      // one), so "capture everything" settles what remains.
-      const settlement = await this.sendWrite(replay, settlementsPath(pspPaymentId), {
-        merchantRefNum: walk.free,
-        dupCheck: true,
-        amount: amount ?? left,
-      });
-      capture = { settlement, settlements: [settlement] };
+      const left = remainingToSettle(payment);
+      // With nothing left, the settlement may be this reference's own, which
+      // the lookup can trail: a retry after a lost answer, as the retry
+      // advice says. A read sends nothing, so it is safe to wait for.
+      const trailing = left === 0 ? await this.readBackPatiently(replay) : undefined;
+      if (trailing !== undefined && !movedNoMoney(trailing)) {
+        capture = { settlement: trailing, settlements: [trailing] };
+      } else if (left === 0) {
+        throw PayFanoutError.invalidRequest(
+          `Payment ${pspPaymentId} has nothing left to capture: Paysafe shows none of its authorization left to ` +
+            "settle, and no full capture of it. A full capture made moments ago may not show in Paysafe's " +
+            "lookup yet, so check retrievePayment before reading the payment as not captured",
+          payment,
+        );
+      } else {
+        // Paysafe would refuse more than is left (3204), and whether that
+        // refusal still holds the reference under dupCheck is undocumented.
+        if (amount !== undefined && amount > left) {
+          throw PayFanoutError.invalidRequest(
+            `Payment ${pspPaymentId} has only ${left} of its authorization left to settle, not the ${amount} this ` +
+              "capture asks for: capture the rest with no amount",
+            payment,
+          );
+        }
+        // Paysafe requires an explicit amount on settlements (error 5068 without
+        // one), so "capture everything" settles what remains.
+        const settlement = await this.sendWrite(replay, settlementsPath(pspPaymentId), {
+          merchantRefNum: walk.free,
+          dupCheck: true,
+          amount: amount ?? left,
+        });
+        capture = { settlement, settlements: [settlement] };
+      }
     } else {
       throw PayFanoutError.invalidRequest(
         `Payment ${pspPaymentId} cannot be captured in full here: every reference its full captures settle under ` +
@@ -1829,10 +1837,14 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * records, so the walk goes on past it too, to a full capture filed
    * later, and the first empty one remains where the next settles.
    */
-  private async walkFullCaptures(paymentId: string, startDate: string | undefined): Promise<FullCaptureWalk> {
+  private async walkFullCaptures(
+    paymentId: string,
+    startDate: string | undefined,
+    alreadyFellBack = false,
+  ): Promise<FullCaptureWalk> {
     const spent: string[] = [];
     let free: string | undefined;
-    let fellBack = false;
+    let fellBack = alreadyFellBack;
     for (const merchantRefNum of fullCaptureRefs(paymentId)) {
       // Paysafe refused this range once; it would refuse it for every reference.
       const lookup = await this.settlementsUnder(merchantRefNum, fellBack ? undefined : startDate);
@@ -1840,8 +1852,14 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       const { settlements } = lookup;
       const settlement = settlements.find((s) => !movedNoMoney(s));
       if (settlement) return { captured: { merchantRefNum, settlement, settlements }, spent };
-      if (settlements.length > 0) spent.push(merchantRefNum);
-      else free ??= merchantRefNum;
+      if (settlements.length > 0) {
+        spent.push(merchantRefNum);
+        // An empty reference before one that holds records only looked empty:
+        // the adapter never settles past an empty one.
+        if (fellBack) free = undefined;
+      } else {
+        free ??= merchantRefNum;
+      }
       if (free !== undefined && !fellBack) break;
     }
     return free === undefined ? { spent } : { free, spent };
@@ -1914,12 +1932,13 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     // reused by the payment that went through.
     if (movedNoMoney(payment)) return [];
     const startDate = settlementLookupStart(payment.txnTime);
-    const own =
+    const ownLookup =
       payment.settleWithAuth !== false && payment.merchantRefNum
-        ? (await this.settlementsUnder(payment.merchantRefNum, startDate)).settlements
-        : [];
+        ? await this.settlementsUnder(payment.merchantRefNum, startDate)
+        : { settlements: [], fellBack: false };
+    const own = ownLookup.settlements;
     if (payment.settleWithAuth === true || own.some((s) => !movedNoMoney(s))) return own;
-    return (await this.walkFullCaptures(payment.id, startDate)).captured?.settlements ?? own;
+    return (await this.walkFullCaptures(payment.id, startDate, ownLookup.fellBack)).captured?.settlements ?? own;
   }
 
   /**

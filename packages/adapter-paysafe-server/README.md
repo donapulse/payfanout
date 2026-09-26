@@ -131,7 +131,10 @@ retrieved, not a separate credential).
   moved no money (failed, cancelled or expired). `retrievePayment` and `refundPayment`
   look those references up, and a capture that finds the payment already captured in full
   there answers with that settlement, whatever its key. After partial captures, a capture
-  of the authorized amount is refused before it is sent: capture the rest with no amount.
+  of the authorized amount is refused before it is sent: capture the rest with no amount,
+  while some is left. With nothing left and no full capture showing, a capture is refused
+  as nothing left to capture; a full capture made moments ago can trail in Paysafe's
+  lookup, so check `retrievePayment` first.
   A partial capture settles under its idempotency key, which may not start with
   `payfanout-capture-`, and no read can find it from the payment: its amount counts in
   `amountCaptured`, but `refundPayment` cannot refund it. Every capture's answer carries

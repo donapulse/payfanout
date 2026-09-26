@@ -2,4 +2,4 @@
 "@payfanout/adapter-payzen-server": patch
 ---
 
-Map the CB network codes PayZen documents for a merchant set-up, request or network failure: acquirer codes 03 and 30 are now `invalid_request`; 20, 68, 90, 91, 96, 97, 98 and 99 `processing_error`; 15 `invalid_card_data`; and 81 `authentication_required`, instead of `card_declined`. Refusals stay non-retryable.
+Map the acquirer codes that every acquirer table PayZen documents reads the same way: 15 is now `invalid_card_data`, and 20, 68, 90, 91, 96, 97 and 99 `processing_error`, instead of `card_declined`, both on an ACQ_001 refusal and on a refund that `refundPayment` sees refused with PSP_101. A refund refused with a code read as `authentication_required` now rejects as `card_declined`. Refusals stay non-retryable.

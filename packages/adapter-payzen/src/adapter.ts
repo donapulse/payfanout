@@ -1,6 +1,7 @@
 import {
   assertBrowser,
   brandMountedFieldsHandle,
+  getUserMessage,
   PayFanoutError,
   type ClientPaymentAdapter,
   type ConfirmResult,
@@ -607,23 +608,15 @@ function confirmResultFrom(response: KrPaymentResponseLike): ConfirmResult {
   if (orderStatus === "PAID") return { status: "succeeded" };
   if (orderStatus === "RUNNING" || orderStatus === "PARTIALLY_PAID") return { status: "processing" };
   const tx = answer?.transactions?.[answer.transactions.length - 1];
-  return {
-    status: "failed",
-    error: new PayFanoutError({
-      code: declineCode(tx?.errorCode, tx?.detailedErrorCode),
-      message: userMessageFor(declineCode(tx?.errorCode, tx?.detailedErrorCode)),
-      retryable: false,
-      raw: response,
-      pspName: "payzen",
-    }),
-  };
+  return { status: "failed", error: transactionError(tx?.errorCode, tx?.detailedErrorCode, response) };
 }
 
 /**
- * Acquirer refusal codes (ACQ_001 detailedErrorCode) → the taxonomy, from
- * PayZen's CB network table, as the server adapter maps them.
+ * Acquirer codes (ACQ_001 detailedErrorCode) → the taxonomy: the server
+ * adapter's map, under its rule that a code is mapped only when every acquirer
+ * table PayZen documents reads it the same way.
  */
-const ACQUIRER_DECLINE_MAP: Record<string, UnifiedErrorCode> = {
+const ACQUIRER_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "51": "insufficient_funds",
   "33": "expired_card",
   "38": "expired_card",
@@ -635,26 +628,24 @@ const ACQUIRER_DECLINE_MAP: Record<string, UnifiedErrorCode> = {
   "43": "fraud_suspected", // stolen card
   "59": "fraud_suspected", // suspected fraud
   "1A": "authentication_required", // SCA soft decline
-  "81": "authentication_required", // the issuer does not admit a non-secured payment
-  // The merchant's set-up or the request is at fault, not the card.
-  "03": "invalid_request", // Invalid acceptor
-  "30": "invalid_request", // Format error
-  // The issuer, the network or a server failed or answered too late.
+  // The issuer, the network or a system failed or answered too late.
   "20": "processing_error", // Incorrect response (error on the domain server)
   "68": "processing_error", // Response not received or received too late
   "90": "processing_error", // Temporary shutdown
   "91": "processing_error", // Unable to reach the card issuer
   "96": "processing_error", // System malfunction
   "97": "processing_error", // Overall monitoring timeout
-  "98": "processing_error", // Server not available, new network route requested
   "99": "processing_error", // Initiator domain incident
 };
 
-/** Looks an acquirer code up among the map's own keys only. */
-function acquirerCodeFor(detailedErrorCode: string | null | undefined): UnifiedErrorCode | undefined {
-  return typeof detailedErrorCode === "string" && Object.hasOwn(ACQUIRER_DECLINE_MAP, detailedErrorCode)
-    ? ACQUIRER_DECLINE_MAP[detailedErrorCode]
-    : undefined;
+/** Looks a code up among the map's own keys only. */
+function ownCodeFor(
+  map: Record<string, UnifiedErrorCode>,
+  key: string | null | undefined,
+): UnifiedErrorCode | undefined {
+  // hasOwnProperty.call, not the ES2022 static, which older browsers
+  // krypton-client supports lack.
+  return typeof key === "string" && Object.prototype.hasOwnProperty.call(map, key) ? map[key] : undefined;
 }
 
 /** ACQ_999 and AUTH_999 are PayZen's technical errors, not refusals. */
@@ -662,10 +653,29 @@ function isTechnicalError(errorCode: string | null | undefined): boolean {
   return errorCode === "ACQ_999" || errorCode === "AUTH_999";
 }
 
-function declineCode(errorCode: string | null | undefined, detailedErrorCode: string | null | undefined): UnifiedErrorCode {
-  if (isTechnicalError(errorCode)) return "psp_unavailable";
-  if (errorCode?.startsWith("AUTH_")) return "authentication_required";
-  return acquirerCodeFor(detailedErrorCode) ?? "card_declined";
+/**
+ * The error for PayZen's answer on a transaction: an unpaid order's last
+ * transaction, or an ACQ_ or AUTH_ error from KR.onError. A technical error
+ * is a psp_unavailable, which core makes always retryable; any other answer
+ * refused the transaction, and no refusal maps to a retryable code. The
+ * message is core's: the form's own texts describe its CLIENT_ errors.
+ */
+function transactionError(
+  errorCode: string | null | undefined,
+  detailedErrorCode: string | null | undefined,
+  raw: unknown,
+): PayFanoutError {
+  let code: UnifiedErrorCode;
+  if (isTechnicalError(errorCode)) code = "psp_unavailable";
+  else if (errorCode?.startsWith("AUTH_")) code = "authentication_required";
+  else code = ownCodeFor(ACQUIRER_CODE_MAP, detailedErrorCode) ?? "card_declined";
+  return new PayFanoutError({
+    code,
+    message: getUserMessage(code),
+    retryable: code === "psp_unavailable",
+    raw,
+    pspName: "payzen",
+  });
 }
 
 const KR_CLIENT_CODE_MAP: Record<string, UnifiedErrorCode> = {
@@ -687,16 +697,13 @@ const KR_CLIENT_CODE_MAP: Record<string, UnifiedErrorCode> = {
 function mapKrError(err: unknown): UnifiedError {
   const e = err as KrErrorLike | undefined;
   const rawCode = e?.errorCode ?? "";
+  if (rawCode.startsWith("ACQ_") || rawCode.startsWith("AUTH_")) {
+    return transactionError(rawCode, e?.detailedErrorCode, err);
+  }
   let code: UnifiedErrorCode;
-  // An acquirer's or an authentication server's refusal is final for its
-  // transaction, whatever its code, as the server adapter reads it.
-  let refusal = false;
-  const clientCode = Object.hasOwn(KR_CLIENT_CODE_MAP, rawCode) ? KR_CLIENT_CODE_MAP[rawCode] : undefined;
+  const clientCode = ownCodeFor(KR_CLIENT_CODE_MAP, rawCode);
   if (clientCode) {
     code = clientCode;
-  } else if (rawCode.startsWith("ACQ_") || rawCode.startsWith("AUTH_")) {
-    code = declineCode(rawCode, e?.detailedErrorCode);
-    refusal = !isTechnicalError(rawCode);
   } else if (rawCode.startsWith("CLIENT_")) {
     // CLIENT_ = browser-side, pre-transaction by definition (integration
     // errors and warnings included) — retrying cannot help, unlike the
@@ -707,34 +714,24 @@ function mapKrError(err: unknown): UnifiedError {
   }
   return new PayFanoutError({
     code,
-    message: userMessageFor(code),
-    retryable: !refusal && (code === "processing_error" || code === "psp_unavailable"),
+    message: formMessageFor(code),
+    retryable: code === "processing_error" || code === "psp_unavailable",
     raw: err,
     pspName: "payzen",
   });
 }
 
-function userMessageFor(code: UnifiedErrorCode): string {
+/** The form's own errors keep these texts; any other code reads core's catalog. */
+function formMessageFor(code: UnifiedErrorCode): string {
   switch (code) {
-    case "insufficient_funds":
-      return "Your card has insufficient funds.";
-    case "expired_card":
-      return "Your card has expired.";
-    case "invalid_card_data":
-      return "The card details are invalid.";
-    case "card_declined":
-    case "fraud_suspected":
-      return "Your card was declined.";
     case "authentication_required":
       return "Additional authentication is required.";
-    case "session_expired":
-      return "Your payment session has expired — please start again.";
     case "invalid_request":
       return "The payment form could not be set up.";
-    case "psp_unavailable":
-      return "The payment provider is temporarily unavailable.";
-    default:
+    case "processing_error":
       return "The payment could not be processed. Please try again.";
+    default:
+      return getUserMessage(code);
   }
 }
 

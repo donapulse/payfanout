@@ -180,19 +180,25 @@ describe("mapPayZenError (envelope taxonomy)", () => {
     ["ACQ_001", "41", "fraud_suspected", false], // lost card
     ["ACQ_001", "38", "expired_card", false],
     ["ACQ_001", "1A", "authentication_required", false],
-    ["ACQ_001", "81", "authentication_required", false], // a non-secured payment the issuer does not admit
     ["ACQ_001", "15", "invalid_card_data", false], // unknown issuer
-    ["ACQ_001", "03", "invalid_request", false], // invalid acceptor
-    ["ACQ_001", "30", "invalid_request", false], // format error
     ["ACQ_001", "20", "processing_error", false],
     ["ACQ_001", "68", "processing_error", false], // no response, or too late
     ["ACQ_001", "90", "processing_error", false],
     ["ACQ_001", "91", "processing_error", false], // issuer out of reach
     ["ACQ_001", "96", "processing_error", false],
     ["ACQ_001", "97", "processing_error", false],
-    ["ACQ_001", "98", "processing_error", false],
     ["ACQ_001", "99", "processing_error", false],
+    // Another acquirer's table reads these otherwise: ALMA's 03, Elavon Europe's
+    // 30, 81 and 98, the GICC network's 81 and 98.
+    ["ACQ_001", "03", "card_declined", false],
+    ["ACQ_001", "30", "card_declined", false],
+    ["ACQ_001", "81", "card_declined", false],
+    ["ACQ_001", "98", "card_declined", false],
+    ["ACQ_001", "60", "card_declined", false], // a referral to the acquirer
+    ["ACQ_001", "94", "card_declined", false], // a duplicate
     ["PSP_101", "91", "processing_error", false], // a refund refused the same way
+    ["PSP_101", "15", "invalid_card_data", false],
+    ["PSP_101", "1A", "card_declined", false], // a refund has no authentication to go back to
     ["ACQ_001", "13", "card_declined", false], // invalid amount, left on the default
     ["ACQ_001", "constructor", "card_declined", false], // the map's own keys only
     ["ACQ_001", "05", "card_declined", false],
@@ -252,6 +258,20 @@ describe("mapPayZenError (envelope taxonomy)", () => {
 
   it("gives INT_905 an actionable credentials message", () => {
     expect(mapPayZenError({ errorCode: "INT_905" }, {}).message).toMatch(/shopId, password/);
+  });
+
+  it("holds the same acquirer map as the browser adapter", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const { fileURLToPath } = await import("node:url");
+    const entries = async (path: string): Promise<string[]> => {
+      const source = await readFile(fileURLToPath(new URL(path, import.meta.url)), "utf8");
+      const start = source.indexOf("const ACQUIRER_CODE_MAP");
+      const block = source.slice(start, source.indexOf("\n};", start));
+      return [...block.matchAll(/^\s*"([^"]+)": "([a-z_]+)",/gm)].map((m) => `${m[1]}=${m[2]}`).sort();
+    };
+    const server = await entries("../src/adapter.ts");
+    expect(server.length).toBeGreaterThan(0);
+    expect(await entries("../../adapter-payzen/src/adapter.ts")).toEqual(server);
   });
 });
 

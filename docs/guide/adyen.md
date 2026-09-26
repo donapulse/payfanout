@@ -793,6 +793,10 @@ field, with any test card above. If the Card shows no cardholder-name field, ena
 | `ISSUER_UNAVAILABLE` | Issuer Unavailable | `processing_error` |
 | `NOT_3D_AUTHENTICATED` | 3D Not Authenticated | `authentication_required` |
 | `THREED_SECURE_AUTHENTICATION_ERROR` | 3DS Authentication Error | `processing_error` |
+| `RREQ_NOT_RECEIVED` | RReq not received from DS | `processing_error` |
+| `BAN_CURRENT_AID` | Current AID is in Penalty Box | `processing_error` |
+| `NOT_SUBMITTED` | Not Submitted | `processing_error` |
+| `ERROR` | Acquirer Error | `processing_error` |
 | `AVS_DECLINED` | AVS Declined | `invalid_card_data` |
 
 For the failure webhooks, a payment made with the name `capture failed` gets

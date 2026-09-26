@@ -1065,20 +1065,22 @@ const REFUSAL_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "12": "insufficient_funds", // Not enough balance
   "14": "fraud_suspected", // Acquirer Fraud
   "20": "fraud_suspected", // FRAUD
-  "21": "processing_error", // Not Submitted: the payment never reached processing
+  "21": "processing_error", // Not Submitted: read as a payment that did not reach processing
+  "22": "fraud_suspected", // FRAUD-CANCELLED: flagged as fraudulent and refused
   "24": "invalid_card_data", // CVC Declined
   "31": "fraud_suspected", // Issuer Suspected Fraud
   "32": "invalid_card_data", // AVS Declined: the address the shopper entered is wrong
-  "38": "authentication_required", // the issuer refused the exemption and asks for 3-D Secure
+  "38": "authentication_required", // Authentication required: the issuer refused the exemption
   // 3-D Secure the network, the issuer or the scheme could not complete, and a
-  // payment network out of reach: authenticating again now does not help.
+  // payment network out of reach: Adyen advises a new transaction or another
+  // payment method, not a new authentication by the cardholder.
   "39": "processing_error", // RReq not received from DS
   "40": "processing_error", // Current AID is in Penalty Box
   "42": "processing_error", // 3DS Authentication Error
   "46": "card_declined", // Transaction blocked by Adyen
 };
 
-/** Looks a refusal code up among the map's own keys only. */
+/** Own keys only: the code is Adyen's text, and "constructor" names no mapping. */
 function refusalCodeFor(reason: string | undefined): UnifiedErrorCode | undefined {
   return reason !== undefined && Object.hasOwn(REFUSAL_CODE_MAP, reason) ? REFUSAL_CODE_MAP[reason] : undefined;
 }

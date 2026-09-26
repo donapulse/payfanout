@@ -675,7 +675,9 @@ describe("AdyenServerAdapter specifics", () => {
       ["24", "invalid_card_data"],
       ["32", "invalid_card_data"],
       ["9", "processing_error"],
-      // The acquirer, the network, the issuer or the scheme failed, not the card.
+      ["22", "fraud_suspected"],
+      // Not the card: the acquirer, the network, the issuer or the scheme failed, or the
+      // payment was not submitted.
       ["4", "processing_error"],
       ["21", "processing_error"],
       ["39", "processing_error"],

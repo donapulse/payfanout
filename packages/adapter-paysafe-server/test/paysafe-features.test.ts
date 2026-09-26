@@ -656,18 +656,20 @@ describe("Paysafe timestamps", () => {
     expect((await makePair({ fetch: garbled.fetch }).adapter.retrieveRefund("ref_1")).createdAt).toBeUndefined();
   });
 
-  it("reads a number as epoch milliseconds only from 1e11 (1973) to 8.64e15, never epoch seconds as 1970", async () => {
+  it("reads a number as epoch milliseconds only from 1e11 (1973) to the end of year 9999, never epoch seconds as 1970", async () => {
     const refundCreatedAt = async (txnTime: unknown): Promise<string | undefined> => {
       const stub = paysafeAnswering({ payment: { id: "ref_1", status: "COMPLETED", amount: 500, txnTime } });
       return (await makePair({ fetch: stub.fetch }).adapter.retrieveRefund("ref_1")).createdAt;
     };
     const seconds = epoch / 1000;
     // Epoch seconds and a digits-only date would read as instants in January 1970.
-    for (const txnTime of [seconds, String(seconds), "20260704", 1e11 - 1, 8.64e15 + 1, "8640000000000001", -epoch]) {
+    // Epoch microseconds would read as the year 55042.
+    const micros = epoch * 1000;
+    for (const txnTime of [seconds, String(seconds), "20260704", 1e11 - 1, 253402300800000, "253402300800000", micros, -epoch]) {
       expect(await refundCreatedAt(txnTime), String(txnTime)).toBeUndefined();
     }
     expect(await refundCreatedAt(1e11)).toBe("1973-03-03T09:46:40.000Z");
-    expect(await refundCreatedAt("8640000000000000")).toBe("+275760-09-13T00:00:00.000Z");
+    expect(await refundCreatedAt("253402300799999")).toBe("9999-12-31T23:59:59.999Z");
     // A payment's required createdAt takes the fallback every unreadable time takes.
     const payment = paysafeAnswering({
       payment: { id: "pay_1", status: "COMPLETED", amount: 500, currencyCode: "USD", settleWithAuth: true, txnTime: seconds },

@@ -113,7 +113,11 @@ describe("mapPaysafeError", () => {
     [402, "3503", "unsupported_operation", false], // no void for the card type
     [402, "3504", "unsupported_operation", false], // the gateway takes no partial void
     [402, "9999", "card_declined", false], // unknown code on a 402 is still a decline
-    [402, "3413", "card_declined", false], // a code the map leaves on the 402 default
+    [402, "3421", "card_declined", false], // a code the map leaves on the 402 default
+    [402, "3412", "invalid_request", false],
+    [402, "3413", "invalid_request", false],
+    [400, "3073", "card_declined", false],
+    [400, "3008", "card_declined", false],
     [402, "constructor", "card_declined", false], // only the map's own keys are codes
     [429, undefined, "rate_limited", true],
     [429, "1200", "rate_limited", true], // Paysafe's rate-limit code

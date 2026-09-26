@@ -1159,6 +1159,15 @@ describe("Paysafe modification replays", () => {
     expect(fake.uniqueRefundCreations).toBe(0);
   });
 
+  it("reads a lost refund's recorded code among the map's own keys only", async () => {
+    const { adapter, fake } = makePair();
+    const id = await settle(adapter);
+    fake.loseAnswer(REFUND);
+    fake.recordFailure(REFUND, { status: 402, code: "constructor", message: "Declined." });
+    const err = await rejection(adapter.refundPayment({ pspPaymentId: id, amount: 500, idempotencyKey: "k-refund" }));
+    expect(err).toMatchObject({ code: "card_declined", retryable: false, raw: { status: "FAILED" } });
+  });
+
   it("reads a refund replay Paysafe answers 3417 (another request in progress) back as that refund", async () => {
     const { adapter, fake } = makePair();
     const id = await settle(adapter);

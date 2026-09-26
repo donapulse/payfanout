@@ -3271,8 +3271,8 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   these codes maps the same way.
   The card simulator
   (developer.paysafe.com/en/api-docs/payments-api/add-payment-methods/cards/simulating-card-payments/)
-  returns 4002, 4001 and 3060 for the amounts 23, 25 and 77 (3060 "Applies for Acquiring
-  (UK/EU)."); no sandbox run has done so yet.
+  returns 4002, 4001, 3007 and 3060 for the amounts 23, 25, 24 and 77 (3060 "Applies for
+  Acquiring (UK/EU)."); no sandbox run has done so yet.
 - **Four more capture and refund state checks are `invalid_request`.** "402 | 3202 | You
   have exceeded the maximum number of Settlements allowed.", "402 | 3205 | The Authorization
   you are attempting to settle has expired.", "402 | 3403 | You have already processed the
@@ -3309,12 +3309,17 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   ("The bank has requested that you retry the transaction.") and 3041 ("Your request has
   been declined due to a timeout.") stay non-retryable: Paysafe files the attempt as
   declined, so a replay under the same key reads that decline back, and only a new attempt,
-  the customer's or the host's call, can follow. 3412 ("The Refund transaction you
-  attempted was not permitted because your merchant account is in overdraft.") and 3413
-  ("The requested Refund amount exceeds the permissible Visa credit ratio.") refuse a
-  refund over the merchant account's standing, which no code of the taxonomy names, and
-  3415 ("You cannot cancel this transaction as it is no longer in a pending state.")
-  answers a cancellation the adapter never sends. 3417 is a replay answer (below). The
+  the customer's or the host's call, can follow. 3415 ("You cannot cancel this transaction
+  as it is no longer in a pending state.") answers a cancellation the adapter never sends.
+- **Refunds the merchant account cannot fund are `invalid_request`,** as the state checks
+  are: 3412 ("The Refund transaction you attempted was not permitted because your merchant
+  account is in overdraft.") and 3413 ("The requested Refund amount exceeds the permissible
+  Visa credit ratio."), an amount limit like 3402. The card is not at fault, so a decline
+  would mislead the merchant. Two 400 rows that refuse the card itself are `card_declined`
+  rather than the 400 fallback's `invalid_request`: 3073 ("Your request has been declined
+  due to closed customer account.") and 3008 ("You submitted a card type for which the
+  merchant account is not configured."); the customer can pay with another card. The other
+  400 rows are request errors and stay on the fallback. 3417 is a replay answer (below). The
   Merchant Advice and ISO response codes the page lists ride `error.additionalDetails`, not
   `error.code`, and stay on `raw`.
 - **8000 and 8001 stay `fraud_suspected`, although no current Paysafe error table lists
@@ -3416,8 +3421,9 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   now, and SO, which had no mapping and so no brand, is "solo". DC ("DC - Diners Club" in
   `cardTypeConfig`) and UP, in no current Paysafe enum, keep their earlier brands.
 - **Doc-derived only; to settle in the sandbox:**
-  - **The simulated declines.** Charge a card account the simulator's amounts 23, 25 and 77
-    and record that they answer 4002, 4001 and 3060 (3060 on UK/EU acquiring only). No
+  - **The simulated declines.** Charge a card account the simulator's amounts 23, 25, 24
+    and 77 and record that they answer 4002, 4001, 3007 and 3060 (3060 on UK/EU acquiring
+    only). No
     sandbox run has returned any code this entry maps.
   - **The statuses and shapes read here.** Record an expired refund or settlement, an
     `ERROR` verification, an epoch-millisecond settlement time or a string expiry if a run

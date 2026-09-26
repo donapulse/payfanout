@@ -277,6 +277,9 @@ still verifies but whose handle is gone. Set `sessionTtlSeconds` near the handle
 you run Interac.
 :::
 
+Paysafe documents no refunds for Interac e-Transfer; a refund of an Interac payment goes to
+Paysafe like any other and stands or falls on your account's setup.
+
 ::: warning The return trip is a hint — webhooks are the outcome
 Paysafe signals results by *which* return link it uses, PayFanout points them all at your one
 `returnUrl`, and Paysafe's Interac integration notes are explicit that Interac does **not**

@@ -690,9 +690,9 @@ function isIsoParseable(value: unknown): value is string {
   return typeof value === "string" && !Number.isNaN(Date.parse(value));
 }
 
-/** Epoch milliseconds a Paysafe time is read as: from 1973 (1e11) to the last instant a Date holds. */
+/** Epoch milliseconds a Paysafe time is read as: from 1973 (1e11) to the end of year 9999. */
 const MIN_EPOCH_MS = 1e11;
-const MAX_EPOCH_MS = 8.64e15;
+const MAX_EPOCH_MS = 253402300799999;
 
 /**
  * A Paysafe txnTime as ISO 8601, or undefined when it cannot be read. The
@@ -3111,6 +3111,12 @@ const PAYSAFE_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "3501": "invalid_request", // the void exceeds the remaining authorization
   "3502": "invalid_request", // the authorization has been settled
   "3506": "invalid_request", // the void exceeds the remaining authorization
+  // Refunds the merchant account cannot fund: its overdraft, the Visa credit ratio.
+  "3412": "invalid_request",
+  "3413": "invalid_request",
+  // 400s that refuse the card itself: a closed account, a card type the account does not take.
+  "3073": "card_declined",
+  "3008": "card_declined",
   // Operations the transaction, its card type or the account's gateway does
   // not support (402): refused as PaymentService refuses a capability an
   // adapter lacks, not as a card decline.

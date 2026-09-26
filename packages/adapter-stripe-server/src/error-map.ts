@@ -69,10 +69,12 @@ function classify(e: StripeErrorLike): {
     if (e.decline_code === "insufficient_funds" || e.code === "insufficient_funds") {
       return { code: "insufficient_funds", retryable: false, message: userMessage };
     }
-    if (e.code === "expired_card" || e.code === "expired_payment_method") {
+    // The issuer's decline code counts like the error code wherever Stripe uses the
+    // same word for both, as the browser adapter reads it.
+    if (e.code === "expired_card" || e.code === "expired_payment_method" || e.decline_code === "expired_card") {
       return { code: "expired_card", retryable: false, message: userMessage };
     }
-    if (e.code && INVALID_CARD_DATA_CODES.has(e.code)) {
+    if ((e.code && INVALID_CARD_DATA_CODES.has(e.code)) || (e.decline_code && INVALID_CARD_DATA_CODES.has(e.decline_code))) {
       return { code: "invalid_card_data", retryable: false, message: userMessage };
     }
     if (e.code === "authentication_required" || e.decline_code === "authentication_required") {
@@ -87,7 +89,7 @@ function classify(e: StripeErrorLike): {
       // their failed 3-D Secure.
       return { code: "authentication_required", retryable: false, message: userMessage };
     }
-    if (e.code === "processing_error") {
+    if (e.code === "processing_error" || e.decline_code === "processing_error") {
       return { code: "processing_error", retryable: true, message: userMessage };
     }
     return { code: "card_declined", retryable: false, message: userMessage };

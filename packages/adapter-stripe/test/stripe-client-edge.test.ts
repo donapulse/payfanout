@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { getUserMessage } from "@payfanout/core";
 import { StripeClientAdapter, type StripeJsFactory, type StripeJsLike } from "../src/index.js";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -172,6 +173,53 @@ describe("StripeClientAdapter edge cases", () => {
     const eResult = await exotic.confirm(eHandle);
     expect(eResult.error?.code).toBe("unknown");
     expect(eResult.status).toBe("failed");
+  });
+
+  it("classifies Stripe.js errors in the server adapter's order", async () => {
+    stubBrowser();
+    const confirmWith = async (error: Record<string, string>) => {
+      const adapter = new StripeClientAdapter({
+        publishableKey: "pk",
+        environment: "sandbox",
+        getStripeGlobal: () => () => ({
+          elements: () => ({ create: () => ({ mount: () => {}, unmount: () => {}, destroy: () => {}, on: () => {} }) }),
+          confirmPayment: async () => ({ error }),
+          confirmSetup: async () => ({ error }),
+          retrievePaymentIntent: async () => ({ error }),
+          retrieveSetupIntent: async () => ({ error }),
+        }),
+        loadScript: async () => {},
+      });
+      return (await adapter.confirm(await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret" }))).error;
+    };
+    const cases: Array<[Record<string, string>, string, boolean]> = [
+      // 2026-08-26.dahlia's payment-method spellings, and the region-specific incorrect_zip.
+      [{ type: "card_error", code: "expired_payment_method" }, "expired_card", false],
+      [{ type: "card_error", code: "incorrect_postal_code" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "incorrect_zip" }, "invalid_card_data", false],
+      // Fraud decline codes, over a failed authentication on the same error as on the server.
+      [{ type: "card_error", code: "card_declined", decline_code: "fraudulent" }, "fraud_suspected", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "stolen_card" }, "fraud_suspected", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "lost_card" }, "fraud_suspected", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "merchant_blacklist" }, "fraud_suspected", false],
+      [{ type: "card_error", code: "authentication_failure", decline_code: "stolen_card" }, "fraud_suspected", false],
+      // Card details the customer can correct come first, as on the server.
+      [{ type: "card_error", code: "incorrect_cvc", decline_code: "fraudulent" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "incorrect_cvc" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "expired_card" }, "expired_card", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "processing_error" }, "processing_error", true],
+      [{ type: "card_error", code: "card_declined", decline_code: "insufficient_funds" }, "insufficient_funds", false],
+      // Only the lists' own entries count.
+      [{ type: "card_error", code: "card_declined", decline_code: "constructor" }, "card_declined", false],
+      [{ type: "api_error", code: "constructor" }, "unknown", false],
+    ];
+    for (const [error, code, retryable] of cases) {
+      expect(await confirmWith(error), JSON.stringify(error)).toMatchObject({ code, retryable });
+    }
+    const fraud = await confirmWith({ type: "card_error", code: "card_declined", decline_code: "stolen_card", message: "Card reported stolen." });
+    expect(fraud?.message).toBe(getUserMessage("fraud_suspected"));
+    const declined = await confirmWith({ type: "card_error", code: "card_declined", message: "Your card was declined." });
+    expect(declined?.message).toBe("Your card was declined.");
   });
 
   it("streams field-state changes through onChange, initialized to incomplete", async () => {

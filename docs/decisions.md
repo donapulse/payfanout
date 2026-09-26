@@ -2314,8 +2314,8 @@ description of what v2 changes is what the migration then had to implement.
 - **Server half only, and only for hosts pinned to 2026-08-26.dahlia or later.**
   `mapStripeError` sees the errors of the adapter's own calls, which carry the host's pinned
   `apiVersion`. The browser adapter follows the account's default API version through
-  Stripe.js and maps none of these codes (nor `incorrect_zip`) except `authentication_failure`
-  (decided 2026-09-25, below); aligning the rest is a follow-up (#213).
+  Stripe.js; since 2026-09-26 it maps these codes and `incorrect_zip` the same way (see
+  "Stripe: one card-error classification on both halves (2026-09-26)").
 - **The checks live in the `StripeCardError` branch only.** Neither page states which error
   `type` the new codes arrive with, so the conservative reading extends the branch that
   already handles `expired_card` and `incorrect_zip`; under any other type they fall through
@@ -2343,9 +2343,10 @@ description of what v2 changes is what the migration then had to implement.
   `authentication_required`, and retrying 3-D Secure is one of the two remedies Stripe's guide
   gives. Both halves now map `authentication_failure` that way, and the server half also maps
   the two intent-specific codes, which hosts pinned before dahlia still receive. On the server
-  a fraud decline code on the same error still takes precedence. The browser half maps no
-  fraud decline codes at all (`fraudulent`, `stolen_card`, `lost_card`,
-  `merchant_blacklist`); that gap and the dahlia codes above are tracked in #213. Left
+  a fraud decline code on the same error still takes precedence. The browser half mapped no
+  fraud decline codes (`fraudulent`, `stolen_card`, `lost_card`, `merchant_blacklist`)
+  until 2026-09-26, when it took the server's order (see "Stripe: one card-error
+  classification on both halves (2026-09-26)"). Left
   unmapped, an account moving to dahlia could see a failed browser 3-D Secure change quietly
   from `authentication_required` to `card_declined` or `unknown`, if Stripe.js reports the
   general code there. Would be wrong if Stripe used the code for failures where no new
@@ -3758,3 +3759,45 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
     of any refusal. The CAD sandbox account completed an EFT debit on 2026-07-15, so EFT can
     run first; ACH needs an account provisioned for it. A refusal means refusing that rail
     locally, as SEPA and Bacs are.
+
+## Stripe: one card-error classification on both halves (2026-09-26)
+
+- **The browser adapter classifies Stripe.js errors in the server adapter's order.** A
+  decline could surface under a different unified code depending on which half reported
+  it. The browser mapped none of the 2026-08-26.dahlia payment-method codes, nor
+  `incorrect_zip`, nor the fraud decline codes. The server read the issuer's decline codes
+  only for insufficient funds, a required authentication and fraud. Both halves now read, in
+  this order:
+  1. `insufficient_funds`;
+  2. `expired_card` (`expired_card`, `expired_payment_method`);
+  3. `invalid_card_data` (`incorrect_number`, `invalid_number`, `incorrect_cvc`,
+     `invalid_cvc`, `invalid_expiry_month`, `invalid_expiry_year`, `incorrect_zip`,
+     `incorrect_postal_code`, and in the browser Stripe.js's `incomplete_*` field codes);
+  4. `authentication_required`;
+  5. the fraud decline codes (`fraudulent`, `stolen_card`, `lost_card`, `merchant_blacklist`),
+     as `fraud_suspected`;
+  6. the failed-authentication codes (`authentication_failure` and the intent-specific
+     forms), as `authentication_required`;
+  7. `processing_error`, the only retryable one;
+  8. a decline.
+
+  An issuer decline code counts like the error code wherever Stripe uses the same word for
+  both. Doc-verified 2026-09-26: the decline-codes page (docs.stripe.com/declines/codes)
+  lists `expired_card`, `incorrect_cvc`, `incorrect_number`, `incorrect_zip`,
+  `insufficient_funds`, `invalid_cvc`, `invalid_expiry_month`, `invalid_expiry_year`,
+  `invalid_number`, `processing_error` and `authentication_required` as decline codes. Each
+  has the remedy of its error-code namesake (for `incorrect_cvc`: "The customer needs to try
+  again using the correct CVC."). The error-codes page (docs.stripe.com/error-codes) gives
+  `expired_payment_method` "The payment method expired", `incorrect_postal_code` "The
+  payment method’s postal code is incorrect" and `incorrect_zip` "The card’s postal code is
+  incorrect".
+- **A fraud decline shows the generic message in both halves.** For `fraudulent`,
+  `stolen_card` and `merchant_blacklist` Stripe says "Don’t report more detailed information
+  to your customer. Instead, present it in the same manner as `generic_decline`", and for
+  `lost_card` "The specific reason for the decline shouldn’t be reported to the customer".
+  The browser now shows core's catalog message for `fraud_suspected`, which the server
+  already did, instead of Stripe.js's text.
+- **Left on the default.** `issuer_not_available` ("The card issuer couldn’t be reached") and
+  `reenter_transaction` stay declines in both halves. The server reads Stripe's
+  `processing_error` as retryable, and whether a retried confirmation of the same intent
+  would help after those answers is not documented.

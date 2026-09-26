@@ -132,6 +132,37 @@ describe("mapStripeError", () => {
       code: "processing_error",
       retryable: true,
     },
+    // The issuer's decline codes that repeat an error code map as that code does.
+    {
+      name: "issuer decline naming a wrong CVC",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "incorrect_cvc", message: "…" },
+      code: "invalid_card_data",
+      retryable: false,
+    },
+    {
+      name: "issuer decline naming a wrong postal code",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "incorrect_zip", message: "…" },
+      code: "invalid_card_data",
+      retryable: false,
+    },
+    {
+      name: "issuer decline for an expired card",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "expired_card", message: "…" },
+      code: "expired_card",
+      retryable: false,
+    },
+    {
+      name: "issuer decline for a processing error",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "processing_error", message: "…" },
+      code: "processing_error",
+      retryable: true,
+    },
+    {
+      name: "a decline code no list holds",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "constructor", message: "…" },
+      code: "card_declined",
+      retryable: false,
+    },
     {
       name: "generic decline",
       err: { type: "StripeCardError", code: "card_declined", message: "…" },

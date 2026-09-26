@@ -728,8 +728,6 @@ function formMessageFor(code: UnifiedErrorCode): string {
       return "Additional authentication is required.";
     case "invalid_request":
       return "The payment form could not be set up.";
-    case "processing_error":
-      return "The payment could not be processed. Please try again.";
     default:
       return getUserMessage(code);
   }

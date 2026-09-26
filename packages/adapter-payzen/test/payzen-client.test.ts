@@ -789,6 +789,25 @@ describe("PayZenClientAdapter error mapping", () => {
     expect((await pending).error).toMatchObject({ code: "authentication_required", retryable: false });
   });
 
+  it("reads an UNPAID order's last transaction, not its first", async () => {
+    stubBrowser();
+    const fake = makeFakeKr();
+    const { adapter } = makeAdapter(fake);
+    const handle = await adapter.mount(fakeContainer(), { clientSecret: FORM_TOKEN });
+    const pending = adapter.confirm(handle);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    fake.submitCb?.({
+      clientAnswer: {
+        orderStatus: "UNPAID",
+        transactions: [
+          { uuid: "u1", errorCode: "ACQ_001", detailedErrorCode: "51" },
+          { uuid: "u2", errorCode: "ACQ_001", detailedErrorCode: "33" },
+        ],
+      },
+    });
+    expect((await pending).error).toMatchObject({ code: "expired_card", retryable: false });
+  });
+
   it("reports a bare card_declined when an UNPAID answer carries no transaction detail", async () => {
     stubBrowser();
     const fake = makeFakeKr();
@@ -838,7 +857,7 @@ describe("PayZenClientAdapter error mapping", () => {
       [{ errorCode: "ACQ_999" }, getUserMessage("psp_unavailable")],
       [{ errorCode: "CLIENT_100" }, "The payment form could not be set up."],
       [{ errorCode: "CLIENT_101" }, "Additional authentication is required."],
-      [{ errorCode: "SOMETHING_ELSE" }, "The payment could not be processed. Please try again."],
+      [{ errorCode: "SOMETHING_ELSE" }, getUserMessage("processing_error")],
     ];
     for (const [krError, message] of answers) {
       fake.errorCb?.(krError);
@@ -858,15 +877,23 @@ describe("PayZenClientAdapter error mapping", () => {
 });
 
 describe("PayZenClientAdapter browser support", () => {
-  it("uses none of the built-ins older browsers krypton-client supports lack", async () => {
+  it("uses none of the built-ins the browsers krypton-client supports lack", async () => {
     // Static guard: a host's bundler lowers syntax for older browsers but adds no
     // missing built-in, and the ES2022 lib accepts these. PayZen supports Chrome
-    // from 70, Firefox from 64 and Safari from 11.
+    // from 70, Firefox from 64 and Safari from 11; ES2019 and later built-ins are
+    // missing from some of them.
     const { readdir, readFile } = await import("node:fs/promises");
     const { join } = await import("node:path");
     const { fileURLToPath } = await import("node:url");
     const srcDir = fileURLToPath(new URL("../src", import.meta.url));
     const newer = [
+      /\bObject\.fromEntries\b/,
+      /\.matchAll\(/,
+      /\.flat(?:Map)?\(/,
+      /\.trim(?:Start|End)\(/,
+      /\bglobalThis\b/,
+      /\bPromise\.allSettled\b/,
+      /\bBigInt\b/,
       /\bObject\.hasOwn\b/,
       /\.at\(/,
       /\.replaceAll\(/,

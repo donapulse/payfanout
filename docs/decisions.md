@@ -3906,7 +3906,8 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   of Manipulation", the French CONECS table), 41 (CB, Elavon Europe, the French CONECS table),
   43 (CB, Elavon Europe, GICC, the French CONECS table) and 59 (CB, CONECS, Elavon Europe)
   agree. 38 is "Expired card" on the CB table but "PIN Tries Exceeded, Pick-Up" on Elavon
-  Europe's, and stays `expired_card`. 1A, `authentication_required`, is on no table in either
+  Europe's, and stays `expired_card`: kept from before this change so nothing regresses, and
+  Elavon's is a PIN answer, which an online card payment should not receive. 1A, `authentication_required`, is on no table in either
   edition: the French Elavon Europe table has it only as the label of its code 110 ("1A - Soft
   Decline requesting 3D Secure Version 2 authentication on an unsecured ecommerce
   transaction"), and 110 is "Invalid amount." on the American Express Global table.
@@ -3968,12 +3969,16 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   refusal, never retryable. It had read ACQ_999 as a decline and AUTH_999 as
   `authentication_required` on both paths. These errors take core's catalog messages, as the
   server adapter's do; the form's own texts, such as "The payment form could not be set up.",
-  stay with the CLIENT_ errors they describe. Lookups read the maps' own keys only, the
+  stay with the form's CLIENT_ errors, and every other code takes the catalog's message. Lookups read the maps' own keys only, the
   browser adapter's through `Object.prototype.hasOwnProperty.call`: the ES2022 `Object.hasOwn`
   is missing from Chrome before 93, Firefox before 92 and Safari before 15.4, and PayZen's
   JavaScript client reference (payzen.io/en-EN/rest/V4.0/javascript/features/reference.html)
-  supports Chrome from 70, Firefox from 64 and Safari from 11. A test keeps such built-ins out
-  of the browser package.
+  supports Chrome from 70, Firefox from 64 and Safari from 11, besides Internet Explorer 10,
+  Edge 17 and the Android 5.0 browser, which this package does not target. A host's bundler
+  lowers syntax such as `??=` but adds no missing built-in, so a test keeps ES2019 and later
+  built-ins (`Object.fromEntries`, `matchAll`, `flat`, `trimStart`, `Object.hasOwn` and
+  the like) out of the browser package's source; core's source, which the same bundle ships,
+  is not scanned.
 - **Known difference, tracked in #232: AUTH_100 to AUTH_149 stay `authentication_required`.**
   The AUTH error page (payzen.io/en-EN/rest/V4.0/api/errors_auth.html) describes AUTH_100 as
   "invalid ACS Signature", AUTH_101 as "technical error 3DS", AUTH_102 as "wrong Parameter

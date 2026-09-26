@@ -1,6 +1,6 @@
 import { createHash, createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { getRefundState, isPayFanoutError, type ServerPaymentAdapter } from "@payfanout/core";
+import { getRefundState, isPayFanoutError, utf8ToBase64Url, type ServerPaymentAdapter } from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
 import {
   decodeSessionContext,
@@ -197,6 +197,48 @@ runServerAdapterConformanceTests(
           return a.completePayment!({ pspSessionId: session.pspSessionId, clientToken: "tok_declined", idempotencyKey: "k3" });
         },
         expectedCode: "insufficient_funds",
+      },
+      {
+        name: "completePayment when the issuer requires Strong Customer Authentication (3060)",
+        invoke: async (a) => {
+          lastFake.recordFailure(
+            { method: "POST", path: "/paymenthub/v1/payments" },
+            {
+              status: 402,
+              code: "3060",
+              message: "Your request has been declined because Strong Customer Authentication is required.",
+            },
+          );
+          const session = await a.createPaymentSession({ amount: 100, currency: "USD", idempotencyKey: "k" });
+          return a.completePayment!({ pspSessionId: session.pspSessionId, clientToken: "tok_sca", idempotencyKey: "k-sca" });
+        },
+        expectedCode: "authentication_required",
+      },
+      {
+        name: "refundPayment of a SEPA Direct Debit, which Paysafe does not refund",
+        invoke: async (a) => {
+          const session = await a.createPaymentSession({
+            amount: 1250,
+            currency: "EUR",
+            paymentMethodTypes: ["sepa_debit"],
+            idempotencyKey: "k-sepa",
+          });
+          const paid = await a.completePayment!({
+            pspSessionId: session.pspSessionId,
+            clientToken: `paysafe-bank.${utf8ToBase64Url(
+              JSON.stringify({
+                v: 1,
+                paymentType: "SEPA",
+                accountHolderName: "Erik van Houten",
+                iban: "NL77ABNA0492122466", // Paysafe's documented SEPA test IBAN
+                mandateConsent: true,
+              }),
+            )}`,
+            idempotencyKey: "k-sepa-complete",
+          });
+          return a.refundPayment({ pspPaymentId: paid.pspPaymentId, idempotencyKey: "k-sepa-refund" });
+        },
+        expectedCode: "unsupported_operation",
       },
       {
         name: "completePayment with an expired session context",

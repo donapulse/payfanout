@@ -715,6 +715,29 @@ describe("Paysafe write transport", () => {
     expect(fake.uniquePaymentCreations).toBe(1);
   });
 
+  it("takes a 5xx for an unknown outcome whatever code it carries, never for that code's decline", async () => {
+    // Paysafe processes the payment, and its answer comes back a 502 carrying a decline code.
+    const fake = new FakePaysafeApi();
+    let answered = false;
+    const { adapter } = makePair({
+      fetch: async (input, init) => {
+        const response = await fake.fetch(input, init);
+        if (answered || init?.method !== "POST" || new URL(urlOf(input)).pathname !== PAYMENTS) return response;
+        answered = true;
+        return new Response(
+          JSON.stringify({ error: { code: "3022", message: "The card has been declined due to insufficient funds." } }),
+          { status: 502 },
+        );
+      },
+    });
+    const pspSessionId = await cardSession(adapter);
+    const info = await adapter.completePayment({ pspSessionId, clientToken: "tok_card", idempotencyKey: "k-complete" });
+    expect(info).toMatchObject({ status: "succeeded", amount: 2000 });
+    expect(sent(fake, CREATE_PAYMENT)).toHaveLength(1);
+    expect(lookups(fake, "payments", "k-complete")).toHaveLength(2); // the key's read, then the read-back
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
   it("re-sends a verification after a 5xx once the lookup shows nothing: it moves no money", async () => {
     const { adapter, fake } = makePair();
     const pspSessionId = await cardSession(adapter, { amount: 0 });
@@ -1136,6 +1159,15 @@ describe("Paysafe modification replays", () => {
     expect(fake.uniqueRefundCreations).toBe(0);
   });
 
+  it("reads a lost refund's recorded code among the map's own keys only", async () => {
+    const { adapter, fake } = makePair();
+    const id = await settle(adapter);
+    fake.loseAnswer(REFUND);
+    fake.recordFailure(REFUND, { status: 402, code: "constructor", message: "Declined." });
+    const err = await rejection(adapter.refundPayment({ pspPaymentId: id, amount: 500, idempotencyKey: "k-refund" }));
+    expect(err).toMatchObject({ code: "card_declined", retryable: false, raw: { status: "FAILED" } });
+  });
+
   it("reads a refund replay Paysafe answers 3417 (another request in progress) back as that refund", async () => {
     const { adapter, fake } = makePair();
     const id = await settle(adapter);
@@ -1238,6 +1270,17 @@ describe("Paysafe modification replays", () => {
         token: "tok_verify",
         failure: { status: 402, code: "3013", message: "Your request has been declined by the issuing bank due to problems with the credit card account." },
         expected: "card_declined",
+      },
+      // A mapped code reads back as its answer would have.
+      {
+        token: "tok_verify",
+        failure: { status: 402, code: "3060", message: "Your request has been declined because Strong Customer Authentication is required." },
+        expected: "authentication_required",
+      },
+      {
+        token: "tok_verify",
+        failure: { status: 402, code: "4002", message: "The transaction was declined by our Risk Management department." },
+        expected: "fraud_suspected",
       },
     ];
     for (const { token, failure, expected } of cases) {

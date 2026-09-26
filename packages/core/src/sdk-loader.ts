@@ -11,9 +11,12 @@ const SRI_TOKEN = /^sha(?:256|384|512)-[A-Za-z0-9+/_-]+={0,2}(?:\?[!-~]*)?$/;
 const CSP_NONCE = /^[A-Za-z0-9+/_-]+={0,2}$/;
 
 // Names injectScript sets itself or that change how the tag loads or runs.
+// nomodule, language, and event with for can make the browser skip the script
+// without a load or error event, which would leave the call pending.
 // Compared in ASCII lowercase, as setAttribute lowercases names on HTML elements.
 const MANAGED_SCRIPT_ATTRIBUTES: ReadonlySet<string> = new Set([
   "src", "async", "defer", "integrity", "crossorigin", "nonce", "type",
+  "nomodule", "language", "event", "for",
 ]);
 
 function holdsUsableHash(integrity: string): boolean {
@@ -37,18 +40,22 @@ function nonceRefusal(url: string, pspName: string): PayFanoutError {
 
 /**
  * The calls waiting on each tag injectScript or injectStylesheet added, from
- * insertion until the tag loads or fails. A tag without an entry has loaded,
+ * insertion until the tag loads or fails. A tag without an entry has settled,
  * or the page added it.
  */
 const loadingTags = new WeakMap<Element, Array<(loaded: boolean) => void>>();
 
 /**
  * Tracks `tag`, about to be inserted, until its load or error event, then
- * settles every call waiting on it, `first` included. A failed tag is off the
- * page before any of those calls carries on, so a call made from their
- * handlers fetches the file again.
+ * settles every call waiting on it, `first` included. With `dropOnError`, a
+ * failed tag is off the page before any of those calls carries on, so a call
+ * made from their handlers fetches the file again.
  */
-function watchLoad(tag: HTMLScriptElement | HTMLLinkElement, first: (loaded: boolean) => void): void {
+function watchLoad(
+  tag: HTMLScriptElement | HTMLLinkElement,
+  first: (loaded: boolean) => void,
+  dropOnError: boolean,
+): void {
   const settleCalls = [first];
   loadingTags.set(tag, settleCalls);
   const settleAll = (loaded: boolean) => {
@@ -58,10 +65,9 @@ function watchLoad(tag: HTMLScriptElement | HTMLLinkElement, first: (loaded: boo
   tag.onload = () => settleAll(true);
   tag.onerror = () => {
     settleAll(false);
-    // A failed tag must not satisfy the next lookup, or the file would never be
-    // fetched again. Element doubles without remove(), like the bare objects
-    // adapter test fakes may return, must not make this handler throw.
-    if (typeof tag.remove === "function") tag.remove();
+    // Element doubles without remove(), like the bare objects adapter test
+    // fakes may return, must not make this handler throw.
+    if (dropOnError && typeof tag.remove === "function") tag.remove();
   };
 }
 
@@ -138,7 +144,9 @@ export interface InjectScriptOptions {
    * Further attributes for the tag, set with `setAttribute`, such as the
    * configuration an SDK reads from its own `<script>`. A name the helper
    * manages (`src`, `async`, `defer`, `integrity`, `crossorigin`, `nonce`,
-   * `type`) or one that runs script (any name starting with `on`), compared
+   * `type`, and `nomodule`, `language`, `event` and `for`, which can make the
+   * browser skip the script without a load or error event, leaving the call
+   * pending) or one that runs script (any name starting with `on`), compared
    * case-insensitively, rejects with a non-retryable invalid_request, as does a
    * name `setAttribute` refuses; either way nothing is injected.
    */
@@ -271,7 +279,9 @@ export function injectScript(url: string, pspName: string, options: InjectScript
       return;
     }
     script.src = url;
-    watchLoad(script, settle);
+    // A failed tag must not satisfy the next lookup, or the file would never be
+    // fetched again.
+    watchLoad(script, settle, true);
     document.head.appendChild(script);
   });
 }
@@ -311,18 +321,27 @@ export interface InjectStylesheetOptions {
  * Injects a PSP stylesheet `<link rel="stylesheet">` once per page (idempotent
  * via DOM lookup on `href`) and resolves when the sheet loads. Styling is
  * cosmetic, so a load failure, including a sheet that fails its
- * `options.integrity` check, resolves as well, and removes the link this call
- * injected so a later call fetches the sheet again. The call rejects only for
- * invalid options, with a non-retryable invalid_request attributed to
- * `pspName`, and nothing is injected then.
+ * `options.integrity` check, resolves as well. The link stays on the page
+ * either way: a browser can also fire `error` on a link whose own rules
+ * applied when one of the sheets it `@import`s fails, and the page cannot tell
+ * that from a sheet that failed, so a later call for `url` finds the link and
+ * resolves at once instead of fetching the sheet again. An empty `url` names no
+ * sheet, and a link with an empty `href` fires neither event, so nothing is
+ * injected and the call resolves at once. The call rejects only for invalid
+ * options, with a non-retryable invalid_request attributed to `pspName`, and
+ * nothing is injected then.
  *
- * A `<link>` already on the page for `url` is reused as it is, with nothing
- * injected and none of its attributes compared: one the page added itself
- * keeps an integrity check only if it carries its own `integrity` and
- * `crossorigin`. If an earlier call injected that link and it is still
- * loading, the call waits for it and resolves once it loads or fails; any
- * other link resolves the call at once. There is no timeout: a link that fires
- * neither event keeps every call waiting on it pending.
+ * A `<link rel="stylesheet">` already on the page for `url` is reused as it
+ * is, with nothing injected and none of its attributes compared: one the page
+ * added itself keeps an integrity check only if it carries its own `integrity`
+ * and `crossorigin`. A link of another type for `url`, such as
+ * `rel="preload"`, is not a match. If an earlier call injected that link and
+ * it is still loading, the call waits for it and resolves once it loads or
+ * fails; any other link resolves the call at once. There is no timeout: a link
+ * that fires neither event keeps every call waiting on it pending. A browser
+ * fires `load` only once the sheets a stylesheet `@import`s have loaded or
+ * failed, so a caller that must not wait on their hosts should not await the
+ * call.
  */
 export function injectStylesheet(url: string, pspName: string, options: InjectStylesheetOptions = {}): Promise<void> {
   const { integrity, nonce } = options;
@@ -336,7 +355,11 @@ export function injectStylesheet(url: string, pspName: string, options: InjectSt
       reject(refusal(`The integrity for ${url} holds no sha256, sha384 or sha512 hash`, pspName));
       return;
     }
-    const onPage = document.querySelector(`link[href="${url}"]`);
+    if (url === "") {
+      resolve();
+      return;
+    }
+    const onPage = document.querySelector(`link[rel~="stylesheet"][href="${url}"]`);
     if (onPage) {
       const waiting = loadingTags.get(onPage);
       if (waiting) waiting.push(() => resolve());
@@ -352,7 +375,7 @@ export function injectStylesheet(url: string, pspName: string, options: InjectSt
     if (integrity !== undefined) link.setAttribute("integrity", integrity);
     if (crossOrigin !== undefined) link.setAttribute("crossorigin", crossOrigin);
     link.href = url;
-    watchLoad(link, () => resolve());
+    watchLoad(link, () => resolve(), false);
     document.head.appendChild(link);
   });
 }

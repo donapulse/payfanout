@@ -156,10 +156,11 @@ adapter at another `https://js.stripe.com` URL, such as a versioned build.
 in `script-src` allows it anyway. Stripe.js reads no nonce itself and loads its lazy
 chunks from `https://js.stripe.com` without one, so such a policy must still list that
 host. Where the browser lacks constructable stylesheets, Stripe.js adds a `<style>`
-without a nonce, which needs `'unsafe-inline'` in `style-src`. A nonce in a directive
-turns `'unsafe-inline'` off there, so a `style-src` nonce blocks that fallback, and on a
-page that also mounts other PSPs the inline styles Paysafe.js and PayZen add without a
-nonce and the Worldline Tokenizer's `style` attribute.
+without a nonce, which needs `'unsafe-inline'` in `style-src`, and a nonce in `style-src`
+turns `'unsafe-inline'` off there, blocking that fallback. On a page that can mount other
+PSPs as well, read
+[Content-Security-Policy on a page with several PSPs](/guide/providers#content-security-policy-on-a-page-with-several-psps)
+before giving a directive a nonce.
 :::
 
 ## 6. Register the webhook endpoint

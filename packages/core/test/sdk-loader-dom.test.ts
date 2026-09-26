@@ -110,4 +110,27 @@ describe("the SDK loaders against a DOM", () => {
     await expect(second).resolves.toBeUndefined();
     expect(document.querySelector("link")).toBe(link);
   });
+
+  it("keep a stylesheet link on the page when its error event fires, and let a later call reuse it", async () => {
+    // Chromium fires error on a link whose own rules applied when one of its @imports fails.
+    const first = injectStylesheet(CSS_URL, "acme");
+    const link = document.querySelector(`link[href="${CSS_URL}"]`)!;
+    link.dispatchEvent(new Event("error"));
+    await expect(first).resolves.toBeUndefined();
+    const insertions = recordInsertions();
+    await expect(injectStylesheet(CSS_URL, "acme")).resolves.toBeUndefined();
+    expect(insertions).toEqual([]);
+    expect(Array.from(document.querySelectorAll("link"))).toEqual([link]);
+  });
+
+  it("insert a stylesheet beside a preload link for the same URL, and reuse a stylesheet link the page added", async () => {
+    document.head.innerHTML = `<link rel="preload" as="style" href="${CSS_URL}">`;
+    const insertions = recordInsertions();
+    void injectStylesheet(CSS_URL, "acme", { nonce: NONCE });
+    expect(insertions).toEqual([{ tagName: "LINK", attributes: { rel: "stylesheet", nonce: NONCE, href: CSS_URL } }]);
+
+    document.head.innerHTML = `<link rel="stylesheet" href="${CSS_URL}">`;
+    await expect(injectStylesheet(CSS_URL, "acme")).resolves.toBeUndefined();
+    expect(insertions).toHaveLength(1);
+  });
 });

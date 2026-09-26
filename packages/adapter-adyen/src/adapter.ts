@@ -103,7 +103,11 @@ export interface AdyenClientAdapterConfig {
   sdkVersion?: string;
   /** Self-hosting: the script URL to load instead of Adyen's CDN copy, without an integrity check. */
   sdkUrl?: string;
-  /** Self-hosting: the stylesheet URL to load instead of Adyen's CDN copy, without an integrity check. */
+  /**
+   * Self-hosting: the stylesheet URL to load instead of Adyen's CDN copy,
+   * without an integrity check. An empty string loads no stylesheet, for a page
+   * that ships Adyen Web's styles itself.
+   */
   stylesheetUrl?: string;
   /**
    * A Content-Security-Policy nonce for the two tags the adapter injects, the
@@ -253,8 +257,9 @@ export class AdyenClientAdapter implements ClientPaymentAdapter {
    * carry the Subresource Integrity hash Adyen publishes for ADYEN_WEB_VERSION;
    * `sdkVersion` turns the check off for both, `sdkUrl` for the script and
    * `stylesheetUrl` for the stylesheet. With `cspNonce` both carry the nonce.
-   * If the script fails to load, the next call fetches it again, with the
-   * stylesheet if that failed too; if it loaded without defining
+   * If the script fails to load, the next call fetches it again; a stylesheet
+   * that failed stays on the page and is reused, as core's `injectStylesheet`
+   * keeps every link it injects. If the script loaded without defining
    * `window.AdyenWeb`, the next call checks again instead of failing from a
    * cached result.
    */

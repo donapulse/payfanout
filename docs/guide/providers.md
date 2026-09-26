@@ -53,6 +53,25 @@ credentials and the `environment` string; each set-up guide ends with a **Go liv
 checklist that spells out exactly what swaps. Because PayFanout is stateless, there is no
 data migration between sandbox and live, the switch is credentials only.
 
+## Content-Security-Policy on a page with several PSPs
+
+The set-up guides list the sources each PSP's browser SDK needs and what the client
+adapter's `cspNonce` option covers on a page whose policy allows scripts and styles by
+nonce. A page that can mount more than one PSP, side by side or one after another as the
+[router fails over](/guide/server#routing-failover), needs one policy that allows what
+every one of them loads, and one CSP rule reaches across PSPs: a nonce or a hash in a
+directive turns `'unsafe-inline'` off for that whole directive. CSP3 states it as "If
+expression matches the nonce-source or hash-source grammar, return "Does Not Allow"", and
+Chromium applies it: under `style-src 'nonce-…' 'unsafe-inline'` it blocks a `<style>`
+element without the nonce and any `style` attribute.
+
+So giving `style-src` a nonce for one PSP, as a PSP's own nonce-based policy may ask, also
+blocks the inline styles that every other PSP on the page adds without that nonce, and no
+nonce can cover a `style` attribute. A nonce in `script-src` does the same to inline
+scripts. Each guide says which inline styles its SDK adds. Before a page that mounts
+several PSPs gives a directive a nonce, check every PSP it can mount, and if one of them
+needs `'unsafe-inline'` there, keep `'unsafe-inline'` with no nonce or hash beside it.
+
 ## Installing a PSP we don't ship yet
 
 Another PSP is **a new adapter package, not a fork**. You implement the

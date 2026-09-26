@@ -64,8 +64,11 @@ export interface PayPalClientAdapterConfig {
    * injects, set as both its `nonce` and its `data-csp-nonce` attribute before
    * the tag is inserted. The browser checks `nonce` against `script-src`; the
    * SDK reads only `data-csp-nonce` and sets it on the inline scripts and
-   * styles it creates, which PayPal's nonce-based policy needs. Pass the value
-   * alone, as in the policy's `'nonce-<value>'` source; the constructor refuses
+   * styles it creates, which PayPal's nonce-based policy needs. Unlike
+   * `nonce`, which the browser hides from CSS selectors once the tag is
+   * connected under a header-delivered policy, `data-csp-nonce` stays readable
+   * to attribute selectors, so only this tag carries it. Pass the value alone,
+   * as in the policy's `'nonce-<value>'` source; the constructor refuses
    * anything else. The adapter never reads a nonce from the page, a
    * `loadScript` seam loads the script without it, and an SDK the page already
    * loaded is used as it is.

@@ -156,14 +156,18 @@ server put in the page's policy. Under PayPal's policy the hosts in `script-src`
 allow the SDK tag, as `'strict-dynamic'` would, since the adapter creates it, so the tag's
 `nonce` matters only for a `script-src` that allows scripts by nonce alone. What changes the
 outcome is `data-csp-nonce`: the SDK reads only that attribute and sets its value on the
-inline scripts and styles it creates, which PayPal's policy blocks otherwise. Keep PayPal's
-hosts in `script-src`: some of the SDK's own loads, such as the Messages modal's `modal.js`,
-carry no nonce. Write the source quoted, `'nonce-<value>'`: PayPal's examples leave the
-quotes out, and a browser reads that form as a host name. An SDK the page loaded itself is
-used as it is, so give its tag both attributes yourself. A nonce in `style-src` turns
-`'unsafe-inline'` off there, so on a page that also mounts other PSPs it blocks the inline
-styles Paysafe.js and PayZen add without a nonce, Stripe's fallback `<style>` and the
-Worldline Tokenizer's `style` attribute.
+inline scripts and styles it creates, which PayPal's policy blocks otherwise. That
+attribute also puts the nonce back within reach of CSS attribute selectors: under a
+header-delivered policy a browser hides a connected element's `nonce` attribute from them,
+but not a `data-` one. PayPal requires it, so the adapter sets it on PayPal's tag alone.
+Keep PayPal's hosts in `script-src`: some of the SDK's own loads, such as the Messages
+modal's `modal.js`, carry no nonce. Write the source quoted, `'nonce-<value>'`: PayPal's
+examples leave the quotes out, and a browser does not read that form as a nonce. An SDK the
+page loaded itself is used as it is, so give its tag both attributes yourself. PayPal's
+nonce policy puts the nonce in `style-src`, which turns `'unsafe-inline'` off there: on a
+page that can mount other PSPs as well, read
+[Content-Security-Policy on a page with several PSPs](/guide/providers#content-security-policy-on-a-page-with-several-psps)
+first.
 :::
 
 ## 6. The two-step UX: PayPal button approves, your Pay button pays

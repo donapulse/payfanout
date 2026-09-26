@@ -363,26 +363,11 @@ describe("AdyenClientAdapter", () => {
     (links[0]!["onerror"] as () => void)();
     await expect(loading).resolves.toBeUndefined();
     expect(links[0]).toMatchObject({ rel: "stylesheet" });
-    // The failed link is taken off the page, so it cannot satisfy a later lookup.
-    expect(links[0]!["remove"]).toHaveBeenCalledTimes(1);
+    // The failed link stays on the page: its own rules may have applied.
+    expect(links[0]!["remove"]).not.toHaveBeenCalled();
 
-    let loadedGlobal: unknown;
-    const styled = new AdyenClientAdapter({
-      clientKey: "test_CLIENTKEY",
-      environment: "sandbox",
-      countryCode: "NL",
-      getAdyenGlobal: () => loadedGlobal as never,
-      loadScript: async () => {
-        loadedGlobal = makeFakeAdyenWeb().AdyenWeb;
-      },
-    });
-    const styling = styled.loadSdk();
-    (links[1]!["onload"] as () => void)();
-    await expect(styling).resolves.toBeUndefined();
-    expect(links[1]!["remove"]).not.toHaveBeenCalled();
-
-    // A second adapter finds the loaded link already in the document and skips it.
-    existing = links[1];
+    // A second adapter finds that link in the document and skips the stylesheet.
+    existing = links[0];
     let secondGlobal: unknown;
     const again = new AdyenClientAdapter({
       clientKey: "test_CLIENTKEY",
@@ -394,7 +379,7 @@ describe("AdyenClientAdapter", () => {
       },
     });
     await expect(again.loadSdk()).resolves.toBeUndefined();
-    expect(links).toHaveLength(2);
+    expect(links).toHaveLength(1);
   });
 
   it("cleans up its generated container and tears the component down on unmount", async () => {
@@ -779,13 +764,19 @@ class FakeTag {
   }
 }
 
-/** Stubs a page that core's injectScript and the adapter's stylesheet injection both run against. */
+/** Stubs a page that core's injectScript and injectStylesheet both run against. */
 function stubPage(): FakePage {
   const page: FakePage = { head: [] };
   const matching = (selector: string): FakeTag[] => {
-    const match = /^(script|link)\[(?:src|href)="(.*)"\]$/.exec(selector);
-    if (!match) throw new Error(`unexpected selector ${selector}`);
-    return page.head.filter((tag) => tag.tagName === match[1] && tag.src === match[2]);
+    const script = /^script\[src="(.*)"\]$/.exec(selector);
+    if (script) return page.head.filter((tag) => tag.tagName === "script" && tag.src === script[1]);
+    const link = /^link\[rel~="stylesheet"\]\[href="(.*)"\]$/.exec(selector);
+    if (link) {
+      return page.head.filter(
+        (tag) => tag.tagName === "link" && tag.rel.split(" ").includes("stylesheet") && tag.href === link[1],
+      );
+    }
+    throw new Error(`unexpected selector ${selector}`);
   };
   vi.stubGlobal("window", {});
   vi.stubGlobal("document", {
@@ -1032,7 +1023,9 @@ describe("AdyenClientAdapter loading Adyen Web", () => {
     expect(page.head).toEqual([script, link]);
   });
 
-  it("removes a stylesheet it injected whose load failed, so the next load fetches it again", async () => {
+  it("keeps a stylesheet it injected whose load failed, and reuses it on the next load", async () => {
+    // A browser can also fire error on a sheet whose own rules applied when one of its
+    // @imports fails, which a self-hosted stylesheet may hold, so the link stays.
     const page = stubPage();
     let loads = 0;
     let global: unknown;
@@ -1053,18 +1046,24 @@ describe("AdyenClientAdapter loading Adyen Web", () => {
     // A stylesheet failing its integrity check fires the same error event.
     failed.onerror!();
     await expect(first).rejects.toThrowError(/Failed to load/);
-    expect(failed.remove).toHaveBeenCalledTimes(1);
-    expect(page.head).toEqual([]);
+    expect(failed.remove).not.toHaveBeenCalled();
+    expect(page.head).toEqual([failed]);
 
-    const second = adapter.loadSdk();
-    const retried = tagOf(page, "link");
-    expect(retried).not.toBe(failed);
-    expect(retried.attributes).toEqual({ integrity: STYLESHEET_INTEGRITY, crossorigin: "anonymous" });
-    retried.onload!();
-    await expect(second).resolves.toBeUndefined();
-    expect(retried.remove).not.toHaveBeenCalled();
-    expect(page.head).toEqual([retried]);
+    await expect(adapter.loadSdk()).resolves.toBeUndefined();
+    expect(failed.remove).not.toHaveBeenCalled();
+    expect(page.head).toEqual([failed]);
     expect(loads).toBe(2);
+  });
+
+  it("loads no stylesheet when stylesheetUrl is empty", async () => {
+    const page = stubPage();
+    const { adapter, defineGlobal } = pageAdapter({ stylesheetUrl: "", cspNonce: NONCE });
+    const loading = adapter.loadSdk();
+    expect(page.head.map((tag) => tag.tagName)).toEqual(["script"]);
+    defineGlobal();
+    tagOf(page, "script").onload!();
+    await expect(loading).resolves.toBeUndefined();
+    expect(page.head.map((tag) => tag.tagName)).toEqual(["script"]);
   });
 
   it("tolerates a stylesheet element without remove() when its load fails", async () => {

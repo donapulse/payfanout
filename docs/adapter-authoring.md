@@ -344,9 +344,13 @@ Implement `ClientPaymentAdapter`:
   `data-csp-nonce`), refusing names the helper manages and `on…` handlers, and
   `async: false` injects a non-async script. Load a stylesheet with
   `injectStylesheet(url, pspName, { nonce, integrity })`: one `<link rel="stylesheet">`
-  per URL, resolving when it loads and also when it fails (styling is cosmetic; the failed
-  link is removed so a later call fetches it again), and a call that finds a link an
-  earlier call injected, still loading, waits for it. Say in the option's JSDoc what the
+  per URL, resolving when it loads and also when it fails, since styling is cosmetic. The
+  link stays on the page either way, because a browser can also fire `error` on a link
+  whose own rules applied when one of its `@import`s fails, and a later call reuses it.
+  A call that finds a link an earlier call injected, still loading, waits for it, and a
+  link fires `load` only once its `@import`s have loaded, so don't make mounting wait on
+  a sheet that imports from another host (PayZen's theme imports Google Fonts, and its
+  adapter injects the theme without awaiting it). Say in the option's JSDoc what the
   nonce covers for your PSP and what its SDK still loads or inlines without one.
 - `mount(container, options)`: render **hosted/iframe fields only** (SAQ-A), never a raw
   card input. Forward `options.appearance` to the PSP's styling hooks. Return a branded

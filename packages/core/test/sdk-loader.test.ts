@@ -106,6 +106,8 @@ function stubPage(...onPage: FakeScript[]): { injected: FakeScript[] } {
 
 class FakeLink {
   rel = "";
+  /** Set once the sheet's own rules apply, as a browser does whether or not its @imports load. */
+  sheet: object | null = null;
   onload: (() => void) | null = null;
   onerror: (() => void) | null = null;
   readonly attributes = new Map<string, string>();
@@ -137,22 +139,31 @@ class FakeLink {
   }
 }
 
-function linkOnPage(href: string, attributes: Record<string, string> = {}): FakeLink {
+function linkOnPage(href: string, attributes: Record<string, string> = {}, rel = "stylesheet"): FakeLink {
   const link = new FakeLink();
-  link.rel = "stylesheet";
+  link.rel = rel;
   link.href = href;
   for (const [name, value] of Object.entries(attributes)) link.setAttribute(name, value);
   return link;
 }
 
-/** A page whose head already holds `onPage`; lookups answer the loader's `link[href="…"]` selector. */
+/**
+ * A page whose head already holds `onPage`. Lookups answer `link[href="…"]`,
+ * which any link for the URL matches, and `link[rel~="stylesheet"][href="…"]`,
+ * which only a stylesheet link does.
+ */
 function stubLinkPage(...onPage: FakeLink[]): { injected: FakeLink[]; head: FakeLink[] } {
   const head = [...onPage];
   const injected: FakeLink[] = [];
   vi.stubGlobal("document", {
     querySelector: (selector: string) => {
-      const href = /^link\[href="(.*)"\]$/.exec(selector)?.[1];
-      return head.find((link) => link.href === href) ?? null;
+      const match = /^link(\[rel~="stylesheet"\])?\[href="(.*)"\]$/.exec(selector);
+      if (!match) throw new Error(`unexpected selector ${selector}`);
+      const [, stylesheetOnly, href] = match;
+      return (
+        head.find((link) => link.href === href && (!stylesheetOnly || link.rel.split(" ").includes("stylesheet"))) ??
+        null
+      );
     },
     createElement: (tagName: string) => {
       expect(tagName).toBe("link");
@@ -596,6 +607,28 @@ describe("injectScript nonce, attributes and async", () => {
     expect(injected).toHaveLength(0);
   });
 
+  it("refuses an attribute that can make the browser skip the script without an event, and injects nothing", async () => {
+    // Each would leave the call pending: a script the browser skips fires neither load nor error.
+    const { injected } = stubPage();
+    const cases: Record<string, string>[] = [
+      { nomodule: "" },
+      { NoModule: "" },
+      { language: "vbscript" },
+      { Language: "vbscript" },
+      { event: "onclick", for: "document" },
+      { EVENT: "onclick" },
+      { For: "document" },
+    ];
+    for (const attributes of cases) {
+      const name = Object.keys(attributes)[0]!;
+      await expectRefused(
+        injectScript(SDK_URL, "acme", { attributes: { "data-ok": "1", ...attributes } }),
+        `The ${JSON.stringify(name)} attribute for ${SDK_URL} is managed by injectScript, so attributes may not set it`,
+      );
+    }
+    expect(injected).toHaveLength(0);
+  });
+
   it("refuses an attribute that runs script, in any letter case, and injects nothing", async () => {
     const { injected } = stubPage();
     for (const name of ["onload", "ONERROR", "onClick", "on"]) {
@@ -710,18 +743,31 @@ describe("injectStylesheet", () => {
     ]);
   });
 
-  it("resolves when the sheet fails to load and removes the link, so the next call fetches it again", async () => {
+  it("resolves when the sheet fails to load and keeps the link, which a later call reuses at once", async () => {
     const { injected, head } = stubLinkPage();
     const first = injectStylesheet(CSS_URL, "acme", { integrity: HASH });
+    injected[0]!.remove = vi.fn();
     // A sheet failing its integrity check reaches the page only as the error event.
     injected[0]!.onerror!();
     await expect(first).resolves.toBeUndefined();
-    expect(head).toEqual([]);
+    expect(injected[0]!.remove).not.toHaveBeenCalled();
+    expect(head).toEqual([injected[0]]);
     const second = injectStylesheet(CSS_URL, "acme", { integrity: HASH });
-    expect(injected).toHaveLength(2);
-    injected[1]!.onload!();
-    await expect(second).resolves.toBeUndefined();
-    expect(head).toEqual([injected[1]]);
+    expect(await hasSettled(second)).toBe(true);
+    expect(injected).toHaveLength(1);
+  });
+
+  it("keeps a link whose error event fires after its own rules applied, as a failed @import makes it", async () => {
+    // Chromium fires error on such a link: the page cannot tell it from a sheet that failed.
+    const { injected, head } = stubLinkPage();
+    const loading = injectStylesheet(CSS_URL, "acme", { nonce: NONCE });
+    const link = injected[0]!;
+    link.remove = vi.fn();
+    link.sheet = { cssRules: [{ cssText: ".kr-embedded { display: block; }" }] };
+    link.onerror!();
+    await expect(loading).resolves.toBeUndefined();
+    expect(link.remove).not.toHaveBeenCalled();
+    expect(head).toEqual([link]);
   });
 
   it("makes a later call wait for the link an earlier call injected, and resolves both when it loads", async () => {
@@ -738,15 +784,13 @@ describe("injectStylesheet", () => {
     expect(injected).toHaveLength(1);
   });
 
-  it("resolves the calls waiting on a link that fails, which is off the page before they carry on", async () => {
+  it("resolves the calls waiting on a link that fails, and a call made from their handlers reuses it", async () => {
     const { injected } = stubLinkPage();
     void injectStylesheet(CSS_URL, "acme");
     const retried = injectStylesheet(CSS_URL, "acme").then(() => injectStylesheet(CSS_URL, "acme"));
     injected[0]!.onerror!();
-    expect(await hasSettled(retried)).toBe(false);
-    expect(injected).toHaveLength(2);
-    injected[1]!.onload!();
     await expect(retried).resolves.toBeUndefined();
+    expect(injected).toHaveLength(1);
   });
 
   it("reuses a link already on the page at once, whatever it carries, and never takes it over", async () => {
@@ -757,6 +801,39 @@ describe("injectStylesheet", () => {
     expect(pageLink.onload).toBeNull();
     expect(pageLink.onerror).toBeNull();
     expect(pageLink.remove).not.toHaveBeenCalled();
+    expect(injected).toHaveLength(0);
+  });
+
+  it("reuses a link whose rel lists stylesheet among other link types", async () => {
+    const { injected } = stubLinkPage(linkOnPage(CSS_URL, {}, "stylesheet prefetch"));
+    await expect(injectStylesheet(CSS_URL, "acme")).resolves.toBeUndefined();
+    expect(injected).toHaveLength(0);
+  });
+
+  it("injects a stylesheet beside a link of another type for the url, such as a preload", async () => {
+    // A preload fetches the sheet without applying it, so it must not stand in for the stylesheet.
+    const preload = linkOnPage(CSS_URL, { as: "style" }, "preload");
+    const { injected, head } = stubLinkPage(preload);
+    const loading = injectStylesheet(CSS_URL, "acme", { nonce: NONCE });
+    expect(injected).toHaveLength(1);
+    expect(injected[0]).toMatchObject({ rel: "stylesheet", href: CSS_URL });
+    expect(head).toEqual([preload, injected[0]]);
+    injected[0]!.onload!();
+    await expect(loading).resolves.toBeUndefined();
+  });
+
+  it("injects nothing and resolves at once for an empty url, which names no sheet", async () => {
+    // A link with an empty href fetches nothing and fires neither event.
+    const { injected } = stubLinkPage();
+    const loading = injectStylesheet("", "acme", { nonce: NONCE, integrity: HASH });
+    expect(await hasSettled(loading)).toBe(true);
+    await expect(loading).resolves.toBeUndefined();
+    expect(injected).toHaveLength(0);
+  });
+
+  it("checks the options of a call for an empty url all the same", async () => {
+    const { injected } = stubLinkPage();
+    await expectRefused(injectStylesheet("", "acme", { nonce: "a b" }), NONCE_REFUSAL(""));
     expect(injected).toHaveLength(0);
   });
 

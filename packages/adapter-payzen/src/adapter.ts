@@ -101,7 +101,11 @@ export interface PayZenClientAdapterConfig {
   environment: "sandbox" | "live";
   /** krypton-client script URL — per-shop config in the Back Office, not a constant. */
   scriptUrl?: string;
-  /** Theme stylesheet URL; defaults to the neon reset (unthemed, host CSS styles the fields). */
+  /**
+   * Theme stylesheet URL; defaults to the neon reset (unthemed, host CSS styles
+   * the fields). Injected once the script has loaded, and never awaited. An
+   * empty string loads no theme stylesheet, which PayZen documents as optional.
+   */
   cssUrl?: string;
   /**
    * Form to render on mount — see PayZenFormMode. Default "embedded"
@@ -119,12 +123,15 @@ export interface PayZenClientAdapterConfig {
    * krypton-client `<script>` and, once it has loaded, the theme stylesheet
    * `<link>`, set as their `nonce` attribute before insertion, so a
    * `script-src` or `style-src` that allows them by nonce alone loads them.
-   * krypton-client reads no nonce itself: the chunk scripts it loads, the
-   * `kr-base-styles` `<style>` it adds when a form mounts and the Google Fonts
-   * stylesheet it may link carry none, and a nonce in `style-src` blocks that
-   * inline style. Pass the value alone, as in the policy's `'nonce-<value>'`
-   * source; the constructor refuses anything else. The adapter never reads a
-   * nonce from the page, and a `loadScript` seam loads both files without it.
+   * krypton-client reads no nonce itself. It adds scripts to the page without
+   * one: its `kr-asset-*` chunks, Apple's Apple Pay SDK when the smartForm
+   * offers Apple Pay, and a risk-analysis script when the form token names
+   * one. The theme stylesheet's Google Fonts `@import`s carry none either, nor
+   * does the `kr-base-styles` `<style>` it adds when a form mounts, which a
+   * nonce in `style-src` therefore blocks. Pass the value alone, as in the
+   * policy's `'nonce-<value>'` source; the constructor refuses anything else.
+   * The adapter never reads a nonce from the page, and a `loadScript` seam
+   * loads both files without it.
    */
   cspNonce?: string;
   /**
@@ -753,10 +760,12 @@ function asRedirectHandle(handle: MountedFieldsHandle): PayZenRedirectHandle | u
  * script another one injected, waiting for it while it loads and failing with
  * it, and loadSdk() then confirms the KR global. A script that fails to load is
  * removed, so a later call fetches it again, and the stylesheet waits for that
- * later load. The script carries kr-public-key and kr-spa-mode, the latter
- * keeping the library from scanning the DOM before mount(), and loads with
- * async = false, a conservative choice: dynamically injected scripts are async
- * by default, and PayZen's current pages do not mention async loading.
+ * later load. The returned promise settles with the script: the stylesheet is
+ * injected without being awaited, and an empty cssUrl injects none. The script
+ * carries kr-public-key and kr-spa-mode, the latter keeping the library from
+ * scanning the DOM before mount(), and loads with async = false, a
+ * conservative choice: dynamically injected scripts are async by default, and
+ * PayZen's current pages do not mention async loading.
  */
 function injectKrAssets(
   publicKey: string,
@@ -768,6 +777,10 @@ function injectKrAssets(
       attributes: { "kr-public-key": publicKey, "kr-spa-mode": "true" },
       async: false,
     });
-    await injectStylesheet(cssUrl, "payzen", { nonce });
+    // Not awaited: a link fires load only once its @imports have loaded, and the
+    // default theme imports Google Fonts, so a slow or blocked font host would
+    // hold up every mount. A stylesheet that cannot be injected only leaves the
+    // form unstyled.
+    void injectStylesheet(cssUrl, "payzen", { nonce }).catch(() => undefined);
   };
 }

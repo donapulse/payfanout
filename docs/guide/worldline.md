@@ -227,9 +227,9 @@ yet.
 adds no `<style>`, so that tag is all the nonce needs to cover; `frame-src` and
 `connect-src` still need the host. It sets one inline `style` attribute, which no nonce
 can cover: under a `style-src` without `'unsafe-inline'`, such as one with a nonce, the
-browser skips it, a cosmetic loss. A nonce in a directive turns `'unsafe-inline'` off
-there, so on a page that also mounts other PSPs a `style-src` nonce blocks the inline
-styles Paysafe.js and PayZen add without a nonce and Stripe's fallback `<style>`.
+browser skips it, a cosmetic loss. On a page that can mount other PSPs as well, read
+[Content-Security-Policy on a page with several PSPs](/guide/providers#content-security-policy-on-a-page-with-several-psps)
+before giving a directive a nonce.
 :::
 
 ## 6. 3-D Secure

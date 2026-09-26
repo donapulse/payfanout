@@ -1,5 +1,12 @@
 # @payfanout/adapter-stripe-server
 
+## 2.0.7
+
+### Patch Changes
+
+- Updated dependencies [e856737]
+  - @payfanout/core@4.3.0
+
 ## 2.0.6
 
 ### Patch Changes

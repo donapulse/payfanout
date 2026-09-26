@@ -132,6 +132,62 @@ describe("mapStripeError", () => {
       code: "processing_error",
       retryable: true,
     },
+    // The issuer's decline codes that repeat an error code map as that code does.
+    {
+      name: "issuer decline naming a wrong CVC",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "incorrect_cvc", message: "…" },
+      code: "invalid_card_data",
+      retryable: false,
+    },
+    {
+      name: "issuer decline naming a wrong postal code",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "incorrect_zip", message: "…" },
+      code: "invalid_card_data",
+      retryable: false,
+    },
+    {
+      name: "issuer decline for an expired card",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "expired_card", message: "…" },
+      code: "expired_card",
+      retryable: false,
+    },
+    {
+      name: "issuer decline for a processing error",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "processing_error", message: "…" },
+      code: "processing_error",
+      retryable: true,
+    },
+    {
+      // A required authentication comes before a fraud decline code, as in the browser.
+      name: "authentication required on a card reported fraudulent",
+      err: { type: "StripeCardError", code: "authentication_required", decline_code: "fraudulent", message: "…" },
+      code: "authentication_required",
+      retryable: false,
+    },
+    ...["incorrect_number", "invalid_cvc", "invalid_expiry_month", "invalid_expiry_year"].map((declineCode) => ({
+      name: `issuer decline code ${declineCode}`,
+      err: { type: "StripeCardError", code: "card_declined", decline_code: declineCode, message: "…" },
+      code: "invalid_card_data" as UnifiedErrorCode,
+      retryable: false,
+    })),
+    {
+      name: "issuer decline requiring authentication",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "authentication_required", message: "…" },
+      code: "authentication_required",
+      retryable: false,
+    },
+    {
+      name: "a local payment method reported lost or stolen",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "lost_or_stolen_card", message: "…" },
+      code: "fraud_suspected",
+      retryable: false,
+    },
+    {
+      name: "a decline code no list holds",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "constructor", message: "…" },
+      code: "card_declined",
+      retryable: false,
+    },
     {
       name: "generic decline",
       err: { type: "StripeCardError", code: "card_declined", message: "…" },

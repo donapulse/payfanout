@@ -68,6 +68,12 @@ describe("mapStripeError", () => {
       retryable: false,
     },
     {
+      name: "incorrect address",
+      err: { type: "StripeCardError", code: "incorrect_address", message: "…" },
+      code: "invalid_card_data",
+      retryable: false,
+    },
+    {
       // Resolved by bringing the customer back on-session — never by replay.
       name: "3DS required",
       err: { type: "StripeCardError", code: "authentication_required", message: "…" },
@@ -146,6 +152,12 @@ describe("mapStripeError", () => {
       retryable: false,
     },
     {
+      name: "issuer decline naming a wrong address",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "incorrect_address", message: "…" },
+      code: "invalid_card_data",
+      retryable: false,
+    },
+    {
       name: "issuer decline for an expired card",
       err: { type: "StripeCardError", code: "card_declined", decline_code: "expired_card", message: "…" },
       code: "expired_card",
@@ -174,6 +186,26 @@ describe("mapStripeError", () => {
       name: "issuer decline requiring authentication",
       err: { type: "StripeCardError", code: "card_declined", decline_code: "authentication_required", message: "…" },
       code: "authentication_required",
+      retryable: false,
+    },
+    {
+      name: "issuer decline after a skipped authentication",
+      err: { type: "StripeCardError", code: "card_declined", decline_code: "authentication_not_handled", message: "…" },
+      code: "authentication_required",
+      retryable: false,
+    },
+    {
+      // Read in the required-authentication step, so a processing error cannot make it retryable.
+      name: "skipped authentication with a processing error",
+      err: { type: "StripeCardError", code: "processing_error", decline_code: "authentication_not_handled", message: "…" },
+      code: "authentication_required",
+      retryable: false,
+    },
+    {
+      // Stripe lists authentication_not_handled as a decline code only.
+      name: "authentication_not_handled as an error code",
+      err: { type: "StripeCardError", code: "authentication_not_handled", message: "…" },
+      code: "card_declined",
       retryable: false,
     },
     {

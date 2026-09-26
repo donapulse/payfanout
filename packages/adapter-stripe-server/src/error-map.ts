@@ -15,6 +15,7 @@ const INVALID_CARD_DATA_CODES = new Set([
   "invalid_cvc",
   "invalid_expiry_month",
   "invalid_expiry_year",
+  "incorrect_address",
   "incorrect_zip",
   "incorrect_postal_code",
 ]);
@@ -78,7 +79,12 @@ function classify(e: StripeErrorLike): {
     if ((e.code && INVALID_CARD_DATA_CODES.has(e.code)) || (e.decline_code && INVALID_CARD_DATA_CODES.has(e.decline_code))) {
       return { code: "invalid_card_data", retryable: false, message: userMessage };
     }
-    if (e.code === "authentication_required" || e.decline_code === "authentication_required") {
+    if (
+      e.code === "authentication_required" ||
+      e.decline_code === "authentication_required" ||
+      // Only a decline code: the issuer declines again when the required authentication was skipped.
+      e.decline_code === "authentication_not_handled"
+    ) {
       // Resolved by bringing the customer back on-session, never by replaying the call.
       return { code: "authentication_required", retryable: false, message: userMessage };
     }

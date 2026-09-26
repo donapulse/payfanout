@@ -106,7 +106,9 @@ export interface AdyenClientAdapterConfig {
   /**
    * Self-hosting: the stylesheet URL to load instead of Adyen's CDN copy,
    * without an integrity check. An empty string loads no stylesheet, for a page
-   * that ships Adyen Web's styles itself.
+   * that ships Adyen Web's styles itself. `loadSdk()` waits for the sheet to
+   * load or fail, and with it for every sheet it `@import`s, so a sheet that
+   * imports from a slow host delays every mount.
    */
   stylesheetUrl?: string;
   /**

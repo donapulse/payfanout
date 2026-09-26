@@ -171,7 +171,9 @@ For the stylesheet, it matters for any `style-src` that allows stylesheets by no
 `'strict-dynamic'` never applies to styles. krypton-client reads no nonce itself, and the
 scripts it adds to your page carry none: its `kr-asset-*` chunks from
 `https://static.payzen.eu`, Apple's Apple Pay SDK from `https://applepay.cdn-apple.com`
-when the smartForm offers Apple Pay, and a risk-analysis script whose URL comes from the
+when the smartForm offers Apple Pay with production keys (with test keys krypton-client
+shows a simulator and loads no Apple script, so a sandbox run will not reveal a missing
+host), and a risk-analysis script whose URL comes from the
 form token. A nonce-only `script-src` must allow their hosts, or add `'strict-dynamic'`,
 which allows the scripts krypton-client creates. Its Google Pay and Samsung Pay SDKs load
 inside krypton-client's own iframe, which your page's policy does not govern. The theme

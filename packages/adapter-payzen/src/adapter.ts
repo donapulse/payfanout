@@ -126,7 +126,8 @@ export interface PayZenClientAdapterConfig {
    * `script-src` or `style-src` that allows them by nonce alone loads them.
    * krypton-client reads no nonce itself. It adds scripts to the page without
    * one: its `kr-asset-*` chunks, Apple's Apple Pay SDK when the smartForm
-   * offers Apple Pay, and a risk-analysis script when the form token names
+   * offers Apple Pay with production keys (test keys show a simulator and load
+   * no Apple script), and a risk-analysis script when the form token names
    * one. The theme stylesheet's Google Fonts `@import`s carry none either, nor
    * does the `kr-base-styles` `<style>` it adds when a form mounts, which a
    * nonce in `style-src` therefore blocks. Pass the value alone, as in the

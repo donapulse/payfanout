@@ -1066,7 +1066,7 @@ describe("AdyenClientAdapter loading Adyen Web", () => {
     expect(page.head.map((tag) => tag.tagName)).toEqual(["script"]);
   });
 
-  it("tolerates a stylesheet element without remove() when its load fails", async () => {
+  it("keeps a stylesheet element without remove() when its load fails, without throwing", async () => {
     const links: Array<Record<string, unknown>> = [];
     vi.stubGlobal("window", {});
     vi.stubGlobal("document", {

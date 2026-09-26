@@ -621,8 +621,11 @@ describe("injectScript nonce, attributes and async", () => {
     ];
     for (const attributes of cases) {
       const name = Object.keys(attributes)[0]!;
+      const loading = injectScript(SDK_URL, "acme", { attributes: { "data-ok": "1", ...attributes } });
+      // Settled at once, so a missing refusal fails here rather than by timeout.
+      expect(await hasSettled(loading), name).toBe(true);
       await expectRefused(
-        injectScript(SDK_URL, "acme", { attributes: { "data-ok": "1", ...attributes } }),
+        loading,
         `The ${JSON.stringify(name)} attribute for ${SDK_URL} is managed by injectScript, so attributes may not set it`,
       );
     }
@@ -632,8 +635,10 @@ describe("injectScript nonce, attributes and async", () => {
   it("refuses an attribute that runs script, in any letter case, and injects nothing", async () => {
     const { injected } = stubPage();
     for (const name of ["onload", "ONERROR", "onClick", "on"]) {
+      const loading = injectScript(SDK_URL, "acme", { attributes: { [name]: "alert(1)" } });
+      expect(await hasSettled(loading), name).toBe(true);
       await expectRefused(
-        injectScript(SDK_URL, "acme", { attributes: { [name]: "alert(1)" } }),
+        loading,
         `The ${JSON.stringify(name)} attribute for ${SDK_URL} runs script, so attributes may not set it`,
       );
     }
@@ -851,7 +856,7 @@ describe("injectStylesheet", () => {
     expect(injected).toHaveLength(0);
   });
 
-  it("tolerates a link double without remove() when its load fails", async () => {
+  it("keeps a link double without remove() when its load fails, without throwing", async () => {
     const appended: Record<string, unknown>[] = [];
     vi.stubGlobal("document", {
       querySelector: () => null,

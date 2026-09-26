@@ -38,7 +38,9 @@ describe("PayPalClientAdapter cspNonce", () => {
     const loading = adapter.loadSdk();
     expect(insertions).toHaveLength(1);
     expect(insertions[0]).toMatchObject({ nonce: NONCE, "data-csp-nonce": NONCE });
-    expect(insertions[0]!["src"]).toMatch(new RegExp(`^${PAYPAL_SDK_URL}\\?client-id=test-client-id&`));
+    const src = new URL(insertions[0]!["src"]!);
+    expect(src.origin + src.pathname).toBe(PAYPAL_SDK_URL);
+    expect(src.searchParams.get("client-id")).toBe("test-client-id");
     paypal = { Buttons: () => ({ render: () => undefined }) };
     document.querySelector("script")!.dispatchEvent(new Event("load"));
     await expect(loading).resolves.toBeUndefined();

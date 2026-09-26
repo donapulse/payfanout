@@ -48,6 +48,8 @@ export {
   withTransportRetries,
 } from "./transport.js";
 
+export { repeatsSecret } from "./secret-screen.js";
+
 export { lowercaseKeys, normalizeSecrets, normalizeTime } from "./webhook-util.js";
 
 export type { InjectScriptOptions, InjectStylesheetOptions } from "./sdk-loader.js";

@@ -105,8 +105,11 @@ rather than silently dropping events — use the recipe above for GoCardless ing
 - One-off billing request payments support **GBP and EUR** only; bank payments confirm
   **asynchronously** (seconds for instant rails, days for debit fallback) and late
   failures exist — webhooks are the source of truth.
-- **Refunds are disabled by default** on GoCardless accounts; until support enables them,
-  `refundPayment` surfaces the 403 with an actionable message.
+- **Refunds are disabled by default** on GoCardless accounts: enable them in the
+  GoCardless Dashboard. Until then `refundPayment` rejects with `invalid_request`. A
+  403's message follows the reason GoCardless gives (refunds not enabled, an access token
+  without the scope, an action only the Dashboard allows); with no such reason, a refund
+  403 names both likely causes, refunds not enabled or a token without permission.
 - Saved payment methods are declared `false` in v1: GoCardless mandates are reusable
   charging handles, but bank debits cannot meet the vault contract's instantly-succeeded
   off-session charge. Mandates-as-vault is documented future work.

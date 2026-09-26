@@ -936,39 +936,60 @@ describe("Paysafe modification replays", () => {
       })
     ).pspPaymentId;
 
+  /** A partial capture settles under its key, a full one under the payment's own reference. */
+  const captureReference = (id: string, amount: number): string =>
+    amount === 2000 ? `payfanout-capture-${id}` : "k-capture";
+
   it("recovers a capture whose answer was lost: one settlement, the captured payment returned", async () => {
-    const { adapter, fake } = makePair();
-    const id = await authorize(adapter);
-    fake.loseAnswer(SETTLE);
-    const captured = await adapter.capturePayment(id, 2000, "k-capture");
-    expect(captured).toMatchObject({ status: "succeeded", amountCaptured: 2000, amountCapturable: 0 });
-    const attempts = sent(fake, SETTLE);
-    expect(attempts).toHaveLength(1);
-    expect(attempts[0]!.body).toMatchObject({ merchantRefNum: "k-capture", dupCheck: true, amount: 2000 });
-    expect(lookups(fake, "settlements", "k-capture")).toHaveLength(1);
+    for (const amount of [1500, 2000]) {
+      const { adapter, fake } = makePair();
+      const id = await authorize(adapter);
+      const reference = captureReference(id, amount);
+      fake.loseAnswer(SETTLE);
+      const captured = await adapter.capturePayment(id, amount, "k-capture");
+      expect(captured, String(amount)).toMatchObject({
+        status: "succeeded",
+        amountCaptured: amount,
+        amountCapturable: 2000 - amount,
+      });
+      const attempts = sent(fake, SETTLE);
+      expect(attempts).toHaveLength(1);
+      expect(attempts[0]!.body).toMatchObject({ merchantRefNum: reference, dupCheck: true, amount });
+      // The read-back keeps the lookup's default window: it looks for a write made moments before.
+      const readBacks = lookups(fake, "settlements", reference).filter((r) => !r.search.includes("startDate"));
+      expect(readBacks, String(amount)).toHaveLength(1);
+    }
   });
 
   it("does not re-send a capture whose lost answer cannot be read back", async () => {
-    const { adapter, fake } = makePair();
-    const id = await authorize(adapter);
-    fake.loseAnswer(SETTLE);
-    fake.hideFromLookups("settlements", "k-capture");
-    const err = await rejection(adapter.capturePayment(id, 2000, "k-capture"));
-    expect(err).toMatchObject({ code: "processing_error", retryable: false, outcomeUnknown: true });
-    expect(err.message).toContain('settlement request with merchantRefNum "k-capture" went unanswered');
-    expect(sent(fake, SETTLE)).toHaveLength(1);
-    expect(lookups(fake, "settlements", "k-capture")).toHaveLength(3);
+    for (const amount of [1500, 2000]) {
+      const { adapter, fake } = makePair();
+      const id = await authorize(adapter);
+      const reference = captureReference(id, amount);
+      fake.loseAnswer(SETTLE);
+      fake.hideFromLookups("settlements", reference);
+      const err = await rejection(adapter.capturePayment(id, amount, "k-capture"));
+      expect(err, String(amount)).toMatchObject({ code: "processing_error", retryable: false, outcomeUnknown: true });
+      expect(err.message).toContain(`settlement request with merchantRefNum "${reference}" went unanswered`);
+      expect(sent(fake, SETTLE)).toHaveLength(1);
+      // A full capture checks its reference before writing, then reads it back three times.
+      expect(lookups(fake, "settlements", reference), String(amount)).toHaveLength(amount === 2000 ? 4 : 3);
+    }
   });
 
   it("answers a replayed capture from its settlement, whichever check Paysafe runs first", async () => {
     for (const stateCheckFirst of [false, true]) {
-      const { adapter, fake } = makePair();
-      fake.stateCheckFirst = stateCheckFirst;
-      const id = await authorize(adapter);
-      await adapter.capturePayment(id, 2000, "k-capture");
-      const again = await adapter.capturePayment(id, 2000, "k-capture");
-      expect(again.amountCaptured, `stateCheckFirst ${stateCheckFirst}`).toBe(2000);
-      expect(sent(fake, SETTLE)).toHaveLength(2);
+      for (const amount of [1500, 2000]) {
+        const label = `stateCheckFirst ${stateCheckFirst}, ${amount}`;
+        const { adapter, fake } = makePair();
+        fake.stateCheckFirst = stateCheckFirst;
+        const id = await authorize(adapter);
+        await adapter.capturePayment(id, amount, "k-capture");
+        const again = await adapter.capturePayment(id, amount, "k-capture");
+        expect(again.amountCaptured, label).toBe(amount);
+        // A partial replay is refused and read back; a full one finds its settlement before sending anything.
+        expect(sent(fake, SETTLE), label).toHaveLength(amount === 2000 ? 1 : 2);
+      }
     }
   });
 

@@ -5,6 +5,7 @@ import {
   normalizeCurrency,
   normalizeSecrets,
   PayFanoutError,
+  repeatsSecret,
   requestWithTimeout,
   safeJson,
   sha256Hex,
@@ -340,17 +341,34 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * connection" button. Makes ONE read-only GET /payments (limit 1) and reads
    * the RAW HTTP status so an auth rejection (401/403) is told apart from an
    * outage (429/5xx) directly from the status line, never from a body that a
-   * proxy or edge error page may not carry. A single shot with no transport
-   * retry loop: a "Test connection" click cannot hang on backoff, and a bad key
-   * is not replayed. Never mutates PSP state, never puts the token in the result.
+   * proxy or edge error page may not carry. Only a 2xx answer carrying the
+   * payment list (`{ payments: [...] }`) passes. Any other answer that is
+   * neither an auth rejection nor an outage means the probe never reached
+   * that list, as when a `baseUrl` or `goCardlessVersion`
+   * override is wrong (GoCardless documents `path_not_found` and
+   * `version_not_found`), or a `baseUrl` names a host that answers 200 with
+   * something else: it reports `internal`, naming the HTTP status and, when
+   * the body carries one, GoCardless's error reason.
+   * A single shot with no transport retry loop: a "Test connection" click
+   * cannot hang on backoff, and a bad key is not replayed. Never mutates PSP
+   * state, never puts the token in the result.
    */
   async verifyCredentials(): Promise<VerifyCredentialsResult> {
-    let status: number;
+    let probe: { status: number; listed: boolean; reason?: string };
     try {
-      status = await this.probeStatus("/payments?limit=1");
+      probe = await this.probeStatus("/payments?limit=1");
     } catch {
       // requestWithTimeout rejects only on a network failure or timeout.
       return { ok: false, category: "network", message: "Could not reach GoCardless — try again." };
+    }
+    const { status, reason, listed } = probe;
+    if (status >= 200 && status < 300) {
+      if (listed) return { ok: true };
+      return {
+        ok: false,
+        category: "internal",
+        message: `GoCardless answered the connectivity check without a payment list (HTTP ${status}) — check baseUrl.`,
+      };
     }
     if (status === 401 || status === 403) {
       return {
@@ -362,8 +380,13 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
     if (status === 429 || status >= 500) {
       return { ok: false, category: "network", message: "Could not reach GoCardless — try again." };
     }
-    // The read-only GET authenticated — a healthy probe answers 200 with the list.
-    return { ok: true };
+    // Whatever answers a wrong baseUrl writes the body, and it was sent the token.
+    const named = reason && !repeatsSecret(reason, [this.config.accessToken]) ? `, ${reason}` : "";
+    return {
+      ok: false,
+      category: "internal",
+      message: `GoCardless rejected the connectivity check (HTTP ${status}${named}) — check baseUrl and goCardlessVersion.`,
+    };
   }
 
   /**
@@ -1302,12 +1325,14 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * One read-only exchange returning the RAW HTTP status instead of mapping a
    * non-2xx into a PayFanoutError — verifyCredentials needs the status itself to
    * tell an auth rejection (401/403) apart from an outage (429/5xx), without
-   * depending on the error body carrying a numeric code. No retry loop: a single
-   * probe is the contract. A network failure/timeout rejects.
+   * depending on the error body carrying a numeric code. It also returns, from
+   * the body the exchange already read, whether a 2xx carries the payment list
+   * and a non-2xx's first error reason. No retry loop: a single probe is the
+   * contract. A network failure/timeout rejects.
    */
-  private async probeStatus(path: string): Promise<number> {
+  private async probeStatus(path: string): Promise<{ status: number; listed: boolean; reason?: string }> {
     const timeoutMs = this.config.requestTimeoutMs ?? 30_000;
-    const { response } = await requestWithTimeout(
+    const { response, text } = await requestWithTimeout(
       {
         fetch: this.config.fetch ?? fetch,
         timeoutMs,
@@ -1323,7 +1348,10 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
         },
       },
     );
-    return response.status;
+    const json = safeJson(text);
+    const reason = response.ok ? undefined : firstErrorReason(json);
+    const listed = response.ok && Array.isArray((json as { payments?: unknown } | null | undefined)?.payments);
+    return { status: response.status, listed, ...(reason ? { reason } : {}) };
   }
 
   private async requestOnce<T>(method: "GET" | "POST", path: string, options: RequestOptions): Promise<T> {
@@ -1503,7 +1531,12 @@ function mapSchemeToMethodType(scheme: string | undefined): UnifiedPaymentMethod
  * GoCardless error envelope: { error: { message, type, code, errors: [{reason,
  * field, message, links}] } } with type ∈ validation_failed | invalid_api_usage
  * | invalid_state | gocardless. Declines never arrive here — they surface as
- * payment `failed` statuses/events, not API errors.
+ * payment `failed` statuses/events, not API errors. A 403's message follows
+ * its first error reason: a feature not enabled on the account, an access
+ * token without the scope, or an action only the GoCardless Dashboard allows.
+ * On a `/refunds` path, a 403 with none of these reasons names both likely
+ * causes: refunds not enabled (they are disabled by default) or a token
+ * without permission.
  */
 export function mapGoCardlessError(httpStatus: number, body: unknown, path?: string): PayFanoutError {
   const errorBody = (body as { error?: { type?: string; message?: string } } | undefined)?.error;
@@ -1524,9 +1557,7 @@ export function mapGoCardlessError(httpStatus: number, body: unknown, path?: str
     message = "GoCardless rejected the access token — check the credential and its environment.";
   } else if (httpStatus === 403) {
     code = "invalid_request";
-    message = path?.startsWith("/refunds")
-      ? "Refunds are not enabled on this GoCardless account — ask GoCardless support to switch them on."
-      : "The GoCardless access token does not have permission for this operation.";
+    message = forbiddenMessage(firstErrorReason(body), path?.startsWith("/refunds") === true);
   } else {
     // 400/404/409/422 (validation_failed, invalid_api_usage, invalid_state):
     // caller-side facts — never retryable, the router must not cascade on them.
@@ -1534,6 +1565,47 @@ export function mapGoCardlessError(httpStatus: number, body: unknown, path?: str
     message = getUserMessage(code);
   }
   return new PayFanoutError({ code, message, retryable, raw: body, pspName: GOCARDLESS_PSP_NAME });
+}
+
+/**
+ * Creating a refund: "This endpoint is disabled by default. To enable it, you
+ * will need to enable refunds on your GoCardless Dashboard." Elsewhere,
+ * `feature_disabled` is "Feature not enabled on your account. Contact support
+ * to enable." (Responses and Errors).
+ */
+function forbiddenMessage(reason: string | undefined, refunds: boolean): string {
+  switch (reason) {
+    case "feature_disabled":
+      return refunds
+        ? "Refunds are not enabled on this GoCardless account — enable them in the GoCardless Dashboard."
+        : "This feature is not enabled on the GoCardless account — contact GoCardless support to enable it.";
+    case "insufficient_permissions":
+      return "The GoCardless access token does not have the scope this operation needs — use a read-write access token.";
+    case "insufficient_permissions_continue_on_dashboard":
+      return "This action can only be performed from the GoCardless Dashboard.";
+    default:
+      return refunds
+        ? "Refunds may not be enabled on this GoCardless account (enable them in the GoCardless Dashboard), " +
+            "or the access token does not have permission for this operation."
+        : "The GoCardless access token does not have permission for this operation.";
+  }
+}
+
+/** GoCardless's reasons are snake_case codes: nothing else in the slot is matched or echoed. */
+const ERROR_REASON = /^[a-z][a-z0-9_]{0,63}$/;
+
+/**
+ * The first reason in `error.errors[]` (the items of a validation_failed
+ * error usually name a field instead), when it reads as a reason code.
+ */
+function firstErrorReason(body: unknown): string | undefined {
+  const errors = (body as { error?: { errors?: unknown } } | null | undefined)?.error?.errors;
+  if (!Array.isArray(errors)) return undefined;
+  for (const item of errors) {
+    const reason = (item as { reason?: unknown } | null | undefined)?.reason;
+    if (typeof reason === "string") return ERROR_REASON.test(reason) ? reason : undefined;
+  }
+  return undefined;
 }
 
 /** Extracts links.conflicting_resource_id from a 409 idempotent_creation_conflict, else undefined. */

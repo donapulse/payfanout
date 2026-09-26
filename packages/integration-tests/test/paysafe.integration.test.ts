@@ -345,7 +345,34 @@ describeIf("Paysafe sandbox integration", () => {
 
     const captured = await adapter.capturePayment(authorized.pspPaymentId, undefined, key());
     expect(["succeeded", "processing"]).toContain(captured.status);
-  });
+    expect(captured.capturedAt).toBeDefined();
+
+    // A full capture settles under the payment's own reference, where reads find it once the
+    // settlement lookup shows it: it can trail the write.
+    let read = await adapter.retrievePayment(authorized.pspPaymentId);
+    for (let attempt = 1; read.capturedAt === undefined && attempt < 5; attempt += 1) {
+      await pause(2_000);
+      read = await adapter.retrievePayment(authorized.pspPaymentId);
+    }
+    expect(read.capturedAt).toBeDefined();
+    try {
+      const refund = await adapter.refundPayment({
+        pspPaymentId: authorized.pspPaymentId,
+        amount: 1000,
+        idempotencyKey: key(),
+      });
+      expect(["succeeded", "pending"]).toContain(refund.status);
+      const info = await adapter.retrievePayment(authorized.pspPaymentId);
+      if (info.amountRefunded > 0) expect(getRefundState(info)).toBe("partial");
+    } catch (err) {
+      // The batch-delay tolerance of the refund case below, 3406 on a PENDING settlement
+      // (processing_error, retryable) or a settlement not refundable yet, but a settlement
+      // the refund cannot find must surface.
+      if (!isPayFanoutError(err) || (err.code !== "processing_error" && err.code !== "invalid_request")) throw err;
+      expect(err.retryable || err.message.includes("the settlement it has is not refundable yet")).toBe(true);
+      console.warn("[paysafe-integration] refund of the full capture deferred — settlement not batched yet:", err.message);
+    }
+  }, 60_000);
 
   it("void: authorize -> cancelPayment -> canceled", async () => {
     const adapter = makeAdapter();
@@ -566,7 +593,7 @@ describeIf("Paysafe sandbox integration", () => {
       clientToken: token,
       idempotencyKey: key(),
     });
-    // Default capture key keeps the settlement statelessly rediscoverable.
+    // A partial capture settles under its key, which no read finds: the void's answer reports the split.
     const captured = await adapter.capturePayment(authorized.pspPaymentId, 1000, key());
     expect(["succeeded", "processing"]).toContain(captured.status);
 

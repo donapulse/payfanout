@@ -166,6 +166,7 @@ export class FakeWorldlineApi {
     }
 
     if (method === "GET" && /^\/v2\/[^/]+\/services\/testconnection$/.test(path)) {
+      // The API contract types `result` only as a string; Worldline's own plugins compare it with "OK".
       return json(200, { result: "OK" });
     }
     if (method === "POST" && /^\/v2\/[^/]+\/hostedtokenizations$/.test(path)) {

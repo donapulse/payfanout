@@ -4329,6 +4329,37 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   PayPal component alone; none of the adapters has run under a nonce policy against a
   sandbox.
 
+## React: rejected mounts under StrictMode (2026-09-26)
+
+- **`<PaymentFields>` reports a mount it rejects before loading the PSP's SDK once,
+  StrictMode included (#214).** The mount effect rejects three cases synchronously: no PSP to
+  mount, no client adapter registered for the PSP, and another instance holding the mount
+  slot. With
+  StrictMode on, "React will also run one extra setup+cleanup cycle in development for every
+  Effect" (react.dev/reference/react/StrictMode), so each rejection reached `onError` twice in
+  development. The instance now keeps the failure it last reported with the inputs it failed
+  on: the adapter instance, the psp and the clientSecret. A failing setup on the same inputs
+  that runs after the reporting setup's cleanup and before the next microtask is StrictMode's
+  replay: it puts the reported error back into `lastError` and `status` and does not call
+  `onError`. Read in react-dom 18.3.1 and 19.3.0: the replayed cleanup and setup run in one
+  synchronous call at the end of the passive-effects flush (`commitDoubleInvokeEffectsInDEV`,
+  through `doubleInvokeEffectsOnFiber` in 19), so no microtask runs between them. The react
+  suites also pass against React 18.3.1, except the `<Activity>` tests, which need 19.2.
+- **Every other setup reports**: new inputs, a new instance, the same failure after a setup
+  that passed the checks, and an `<Activity>` reveal. A hidden Activity "will also destroy
+  their Effects", and a reveal will "re-create their Effects"
+  (react.dev/reference/react/Activity): the fields mount again on a reveal and an asynchronous
+  mount failure is reported again, so a rejection is too. A hide and a reveal committed in the
+  same task, with no microtask between them, report once, and so does a re-run on unchanged
+  inputs inside one flush, which a Fast Refresh of this module itself makes: it counts as a
+  replay.
+- **Delivery stays synchronous, inside the effect.** Deferring the report until the effect
+  outlives StrictMode's cleanup would move every production report to a later microtask. A
+  host that sets state in `onError` would then do so after `act()` returned, which React flags
+  in tests that set `IS_REACT_ACT_ENVIRONMENT`, and an unmount committed before that microtask
+  would force a choice between a late report and a lost one. Keying on the inputs with no
+  window would drop the reveal's report.
+
 ## Worldline: metadata echo and creation time (2026-09-26)
 
 - **Session metadata travels as `order.references.merchantParameters`, JSON-encoded, and

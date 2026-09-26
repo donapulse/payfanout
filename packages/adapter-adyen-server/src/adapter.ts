@@ -1054,6 +1054,7 @@ export function mapAdyenResultCode(
  */
 const REFUSAL_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "2": "card_declined", // Refused
+  "4": "processing_error", // Acquirer Error: the acquirer failed, not the card
   "5": "card_declined", // Blocked Card
   "6": "expired_card",
   "8": "invalid_card_data", // Invalid Card Number
@@ -1064,19 +1065,32 @@ const REFUSAL_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "12": "insufficient_funds", // Not enough balance
   "14": "fraud_suspected", // Acquirer Fraud
   "20": "fraud_suspected", // FRAUD
+  "21": "processing_error", // Not Submitted: read as a payment that did not reach processing
+  "22": "fraud_suspected", // FRAUD-CANCELLED: flagged as fraudulent and refused
   "24": "invalid_card_data", // CVC Declined
   "31": "fraud_suspected", // Issuer Suspected Fraud
-  "38": "authentication_required",
-  "42": "authentication_required", // 3DS Authentication Error
+  "32": "invalid_card_data", // AVS Declined: the address the shopper entered is wrong
+  "38": "authentication_required", // Authentication required: the issuer refused the exemption
+  // 3-D Secure the network, the issuer or the scheme could not complete, and a
+  // payment network out of reach: not the card, and not a failed cardholder
+  // authentication.
+  "39": "processing_error", // RReq not received from DS
+  "40": "processing_error", // Current AID is in Penalty Box
+  "42": "processing_error", // 3DS Authentication Error
   "46": "card_declined", // Transaction blocked by Adyen
 };
+
+/** Own keys only: the code is Adyen's text, and "constructor" names no mapping. */
+function refusalCodeFor(reason: string | undefined): UnifiedErrorCode | undefined {
+  return reason !== undefined && Object.hasOwn(REFUSAL_CODE_MAP, reason) ? REFUSAL_CODE_MAP[reason] : undefined;
+}
 
 export function mapAdyenRefusal(response: AdyenPaymentResponse): PayFanoutError {
   // Adyen separates "Refused" (the issuer said no) from "Error" (the payment
   // failed while being processed). Defaulting both to card_declined would tell a
   // shopper their card was declined when nothing reached the issuer.
   const fallback: UnifiedErrorCode = response.resultCode === "Error" ? "processing_error" : "card_declined";
-  const code = REFUSAL_CODE_MAP[response.refusalReasonCode ?? ""] ?? fallback;
+  const code = refusalCodeFor(response.refusalReasonCode) ?? fallback;
   return new PayFanoutError({
     code,
     message: getUserMessage(code),

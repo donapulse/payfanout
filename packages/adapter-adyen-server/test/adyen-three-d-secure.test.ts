@@ -706,6 +706,24 @@ describe("Adyen 3-D Secure completion", () => {
     ).rejects.toMatchObject({ code: "authentication_required", retryable: false });
   });
 
+  it("reports a 3-D Secure the network or the issuer could not complete (refusal 42) on the submitted details as processing_error", async () => {
+    const { adapter, fake } = makePair();
+    const created = await session(adapter);
+    const redirected = await adapter.completePayment({
+      pspSessionId: created.pspSessionId,
+      clientToken: JSON.stringify(CHALLENGED_CARD),
+      idempotencyKey: "complete-1",
+    });
+    fake.refuseDetailsWith = "42";
+    await expect(
+      adapter.completePayment({
+        pspSessionId: created.pspSessionId,
+        clientToken: JSON.stringify({ details: fake.detailsFor(actionOf(redirected.raw)) }),
+        idempotencyKey: "complete-2",
+      }),
+    ).rejects.toMatchObject({ code: "processing_error", retryable: false, raw: { refusalReasonCode: "42" } });
+  });
+
   it("completes a redirect return with the redirectResult the shopper came back with", async () => {
     const { adapter, fake } = makePair();
     fake.detailsCarryPaymentFacts = true;

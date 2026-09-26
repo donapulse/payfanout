@@ -5,6 +5,7 @@ import {
   normalizeCurrency,
   normalizeSecrets,
   PayFanoutError,
+  repeatsSecret,
   requestWithTimeout,
   safeJson,
   sha256Hex,
@@ -380,7 +381,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       return { ok: false, category: "network", message: "Could not reach GoCardless — try again." };
     }
     // Whatever answers a wrong baseUrl writes the body, and it was sent the token.
-    const named = reason && !mentionsToken(reason, this.config.accessToken) ? `, ${reason}` : "";
+    const named = reason && !repeatsSecret(reason, [this.config.accessToken]) ? `, ${reason}` : "";
     return {
       ok: false,
       category: "internal",
@@ -1592,11 +1593,6 @@ function forbiddenMessage(reason: string | undefined, refunds: boolean): string 
 
 /** GoCardless's reasons are snake_case codes: nothing else in the slot is matched or echoed. */
 const ERROR_REASON = /^[a-z][a-z0-9_]{0,63}$/;
-
-/** Whether an error reason repeats the access token, or a stretch of it long enough to matter. */
-function mentionsToken(reason: string, accessToken: string): boolean {
-  return reason.includes(accessToken) || (reason.length >= 8 && accessToken.includes(reason));
-}
 
 /**
  * The first reason in `error.errors[]` (the items of a validation_failed

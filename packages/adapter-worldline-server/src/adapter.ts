@@ -7,6 +7,7 @@ import {
   isTransportRetryable,
   normalizeCurrency,
   PayFanoutError,
+  repeatsSecret,
   requestWithTimeout,
   safeJson,
   withTransportRetries,
@@ -951,7 +952,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     }
     // Whatever answers a wrong baseUrl writes the body, and the request named the API key id.
     const credentials = [this.config.apiKeyId, this.config.secretApiKey];
-    const named = errorName && !repeatsCredential(errorName, credentials) ? `, ${errorName}` : "";
+    const named = errorName && !repeatsSecret(errorName, credentials) ? `, ${errorName}` : "";
     return {
       ok: false,
       category: "internal",
@@ -1738,21 +1739,6 @@ function firstErrorName(errors: unknown): string | undefined {
   const first: WorldlineApiError | null | undefined = Array.isArray(errors) ? errors[0] : undefined;
   const id: unknown = first?.id;
   return typeof id === "string" && ERROR_NAME.test(id) ? id : undefined;
-}
-
-/**
- * Whether an error id holds a credential, or eight characters or more of one,
- * in any letter case (an id has no lower-case letters, see ERROR_NAME).
- */
-function repeatsCredential(errorName: string, credentials: readonly string[]): boolean {
-  return credentials.some((credential) => {
-    const capitals = credential.toUpperCase();
-    const span = Math.min(8, capitals.length);
-    for (let start = 0; start + span <= capitals.length; start++) {
-      if (errorName.includes(capitals.slice(start, start + span))) return true;
-    }
-    return false;
-  });
 }
 
 /** Own keys only: the code is Worldline's text, and "constructor" names no mapping. */

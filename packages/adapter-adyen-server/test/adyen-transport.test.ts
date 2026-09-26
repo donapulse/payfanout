@@ -549,6 +549,27 @@ describe("refusals and refund reasons", () => {
     ).rejects.toMatchObject({ code: "fraud_suspected", retryable: false });
   });
 
+  it("resolves a FRAUD-CANCELLED answer, which comes with resultCode Cancelled, as a canceled payment", async () => {
+    const { adapter } = answering(
+      200,
+      JSON.stringify({ pspReference: "8836100000000022", resultCode: "Cancelled", refusalReason: "FRAUD-CANCELLED", refusalReasonCode: "22" }),
+    );
+    await expect(pay(adapter, "c-22")).resolves.toMatchObject({ status: "canceled" });
+  });
+
+  it("looks refusal codes up among the map's own keys only", () => {
+    for (const refusalReasonCode of ["constructor", "toString", "__proto__", "hasOwnProperty"]) {
+      expect(mapAdyenRefusal({ resultCode: "Refused", refusalReasonCode })).toMatchObject({
+        code: "card_declined",
+        retryable: false,
+      });
+      expect(mapAdyenRefusal({ resultCode: "Error", refusalReasonCode })).toMatchObject({
+        code: "processing_error",
+        retryable: false,
+      });
+    }
+  });
+
   it("sends the refund reason in Adyen's merchantRefundReason vocabulary, and nothing without one", async () => {
     const { adapter, fake } = withFake();
     const cases = [

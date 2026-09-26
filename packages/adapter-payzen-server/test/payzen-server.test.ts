@@ -966,6 +966,25 @@ describe("PayZenServerAdapter refunds", () => {
     }
   });
 
+  it("maps an issuer's refusal of a refund through the acquirer codes, never to authentication_required", async () => {
+    const cases: Array<[string, string]> = [
+      ["91", "processing_error"],
+      ["1A", "card_declined"], // PayZen's remedy is paying the buyer back by other means
+    ];
+    for (const [detailedErrorCode, expected] of cases) {
+      const { adapter, fake } = makePair();
+      const uuid = await capturedPayment(adapter, fake);
+      fake.failNextEnvelope(
+        { errorCode: "PSP_101", errorMessage: "Refund refused", detailedErrorCode },
+        "Transaction/Refund",
+      );
+      await expect(
+        adapter.refundPayment({ pspPaymentId: uuid, amount: 500, idempotencyKey: "r" }),
+        detailedErrorCode,
+      ).rejects.toMatchObject({ code: expected, retryable: false });
+    }
+  });
+
   it("refunding a refused payment rejects with the unpaid-transaction error", async () => {
     const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession({ amount: 3000, currency: "EUR", idempotencyKey: "k" });

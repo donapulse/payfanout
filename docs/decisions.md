@@ -2806,9 +2806,11 @@ description of what v2 changes is what the migration then had to implement.
   again" cannot help, and `card_declined`'s "use another card" helps only when that card
   goes through another, working MID. The PayZen server adapter maps its merchant-configuration
   refusals the same way (PSP_100, the REST API not enabled on the shop; PSP_109, production
-  mode not activated; PSP_610, no acceptance agreement). Its CB network table does not yet:
-  PayZen's acquirer codes 03, 30, 68 and 91, the Sips codes behind 30031001, 30301001,
-  30681001 and 30911001, stay `card_declined` there, tracked in #218.
+  mode not activated; PSP_610, no acceptance agreement). Its acquirer codes follow in part
+  since 2026-09-26: 68 and 91, the Sips codes behind 30681001 and 30911001, are
+  `processing_error`, but 03 and 30, those behind 30031001 and 30301001, stay `card_declined`,
+  since other acquirers' tables give them other meanings (see "PayZen acquirer codes aligned
+  (2026-09-26)").
 - **A 429 or a 5xx is classified by its status before any code.** Before, a 5xx carrying a
   mapped code (30511001, say) came out as a non-retryable decline and skipped the transport
   retries. The order is now: 429 or 5xx; the code map; 402 → `card_declined`; 409 → the
@@ -3860,3 +3862,128 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   table in the served paysafe.min.js. That file also adds `<style>` elements of its own
   (`document.createElement("style")`, used for the 3-D Secure overlay among others), so the
   guide now says a `style-src` that restricts styles needs `'unsafe-inline'`.
+
+## PayZen acquirer codes aligned (2026-09-26)
+
+- **An acquirer code is mapped only when every acquirer table PayZen documents reads it the
+  same way.** Doc-verified 2026-09-26 against the ACQ error page
+  (payzen.io/en-EN/rest/V4.0/api/errors_acq.html): the acquirer's refusal code "is returned in
+  detailedErrorCode. These codes are returned without modification. They are specific to each
+  acquirer." The page points to the list of detailedErrorCode values
+  (payzen.io/en-EN/rest/V4.0/api/acq_errors/acquirers_response_codes_list.html), which links a
+  table per acquirer or network in the same folder: the CB network (cb.html), CONECS
+  (conecs.html), ALMA (alma.html), American Express Global (amex_global.html), Elavon Europe
+  (gateconex.html) and the GICC network (gicc.html). The error names no network: an ERROR
+  answer carries errorCode, errorMessage, detailedErrorCode and detailedErrorMessage
+  (payzen.io/en-EN/rest/V4.0/api/errors-reference.html), and the error KR.onError reports is
+  documented with the same four plus `children` and `field`
+  (payzen.io/en-EN/rest/V4.0/javascript/features/kr_onError.html). A code another table reads
+  otherwise cannot be read from the CB table alone. The rule covers both editions of the
+  tables, which differ: the English one, which es-ES and pt-BR follow code for code, and the
+  French one (fr-FR). The French CB table adds 84, 86 and 88 and reads 82 as "CVV, dCVV, iCVV
+  incorrect", its CONECS table holds codes the English one lacks and lacks the English 82 and
+  94, and its Elavon Europe table adds 110. No verdict below depends on the edition.
+- **Mapped since 2026-09-26: 15, 20, 68, 90, 91, 96, 97 and 99, none retryable.**
+  `processing_error`: 20 ("Incorrect response (error on the domain server)"; CB only), 68
+  ("Response not received or received too late"; CB, Elavon Europe's "Response Received Too
+  Late", the French CONECS table), 90 ("Temporary shutdown"; CB, CONECS, Elavon Europe's
+  "Cut-Off In Progress"), 91 ("Unable to reach the card issuer"; CB, CONECS, Elavon Europe's
+  "Issuer Or Switch Inoperative", GICC's "Card issuer temporarily not reachable"), 96 ("System
+  malfunction"; CB, CONECS, Elavon Europe's "Communication System Malfunction", GICC's
+  "Processing temporarily not possible"), 97 ("Overall monitoring timeout"; CB, CONECS, Elavon
+  Europe's "Communication Error - Cannot Connect To FNB", and GICC's "Security breach - MAC
+  check indicates error condition", read as a failed check between systems) and 99 ("Initiator
+  domain incident"; CB, CONECS, GICC's "Error in PAC encryption detected", and ALMA's "Unknown
+  error", read as an error apart from ALMA's refusal, 03). Worldline maps the Sips
+  counterparts of 20, 68, 91 and 99 (30201001, 30681001, 30911001 and 30991001) the same way.
+  `invalid_card_data`: 15 ("Unknown issuer"; CB, Elavon Europe's "No Such Issuer", the French
+  CONECS table), as Worldline maps 30151001 ("No such issuer"). PayZen refused the
+  transaction, so none is retryable: a new one is the customer's move.
+- **The codes mapped before meet the rule, except 38 and 1A, which stay until the codes can be
+  read per network.** 51 (CB, Elavon Europe, the French CONECS table), 33 (CB, Elavon Europe,
+  GICC, the French CONECS table), 54 (CB, Elavon Europe, the French CONECS table), 14 (CB,
+  CONECS, Elavon Europe, and GICC's "invalid card"), 34 (CB, Elavon Europe, GICC's "Suspicion
+  of Manipulation", the French CONECS table), 41 (CB, Elavon Europe, the French CONECS table),
+  43 (CB, Elavon Europe, GICC, the French CONECS table) and 59 (CB, CONECS, Elavon Europe)
+  agree. 38 is "Expired card" on the CB table but "PIN Tries Exceeded, Pick-Up" on Elavon
+  Europe's, and stays `expired_card`: kept from before this change so nothing regresses, and
+  Elavon's is a PIN answer, which an online card payment should not receive. 1A, `authentication_required`, is on no table in either
+  edition: the French Elavon Europe table has it only as the label of its code 110 ("1A - Soft
+  Decline requesting 3D Secure Version 2 authentication on an unsecured ecommerce
+  transaction"), and 110 is "Invalid amount." on the American Express Global table.
+- **03, 30, 81 and 98 stay `card_declined`, although the CB table reads them otherwise.** CB
+  and CONECS give 03 as "Invalid acceptor" and 30 as "Format error", the merchant's set-up or
+  request at fault, and GICC's 30 is "Format Error" too, but ALMA's 03 is "Payment refused by
+  Alma." and Elavon Europe's 30 "File Update Failed". CB's 81, "The non-secured payment is not
+  admitted by the issuer", is "Approved Commercial" on Elavon Europe's table and "Message-flow
+  error" on GICC's; 98, "Server not available, new network route requested" on CB and CONECS,
+  is "Exceeds Cash Limit" on Elavon Europe's and "Date and time not plausible" on GICC's. The
+  Worldline adapter maps the Sips counterparts of 03 and 30 (30031001 and 30301001) to
+  `invalid_request`; the PayZen adapters cannot follow until they know the network.
+- **Reading the codes per network is follow-up work.** A transaction's
+  `transactionDetails.acquirerNetwork` names its network: the rendered Transaction reference
+  (payzen.io/en-EN/rest/V4.0/api/playground/answer/Transaction) lists its values, CB, CONECS,
+  ALMA, AMEXGLOBAL, GATECONEX and GICC_VISA among them, where the downloadable schema
+  (payzen.io/files/schema-api-v4.json) gives a free string. No page says which table a value's
+  codes follow, and most of the listed networks, EVO and REDSYS_REST among them, have none. An
+  unpaid order's transactions in the browser answer carry the field, and so does the
+  transaction the server adapter reads before a refund; an ERROR answer and the KR.onError
+  error document none. Elavon Europe and GICC print codes below 10 without a leading zero; no
+  mapped code is below 10.
+- **60 and 94 stay declines.** 60 ("The acceptor of the card must contact the acquirer"; CB,
+  the French CONECS table, and Elavon Europe's "Contact Acquirer") refers the merchant to the
+  acquirer, as 02 ("Contact the card issuer") refers it to the issuer. No table names the
+  merchant's set-up or request as the cause, as 03 and 30 do, and an online payment cannot
+  wait for the call, so it is not `invalid_request`. 94 ("Duplicate transaction."; CONECS's
+  "Duplicate request", Elavon Europe's "Duplicate Transaction") refuses the repeat of a
+  transaction already processed: the repeat moves no money, the original keeps its own
+  outcome, and `processing_error`'s "please try again" would invite one more repeat.
+- **The other CB codes stay on the default deliberately.** 00 approves. 05 ("Do not honor"),
+  12 ("Invalid transaction"), 57 and 58 ("Transaction not allowed for this cardholder"), 61
+  ("Withdrawal limit exceeded") and 63 ("Security rules unfulfilled") refuse the transaction,
+  and so does 19 ("Retry later"), which stays non-retryable like Paysafe's 3018 and 3020. 08
+  ("Confirm after identification") asks for a check an online payment cannot make. 13
+  ("Invalid amount.") and 31 ("Unknown acquirer company ID") state no cause the card or the
+  merchant could act on, as Worldline leaves 30131001 and 30311001. 04 and 07 ("Keep the
+  card", "Keep the card, special conditions") claim no fraud, as Worldline reads its Sips 04
+  and 07. 17 ("Canceled by the buyer") is a decline, as Worldline's 30171001 is. 56 ("Card
+  absent from the file") says a file lacks the card, not that its number is wrong, as 14 does.
+  24 to 29 ("Unsupported file update" to "Unable to update") answer file updates, and 76 ("The
+  cardholder is already blocked, the previous record has been saved") the blocking of a card,
+  requests the adapters never send. 82 and 83 revoke recurring payments, and 55, 75 and 80
+  concern PINs and contactless payments. The French CB table's own entries stay there too: its
+  82 ("CVV, dCVV, iCVV incorrect") contradicts the English one, and 84, 86 and 88 are in that
+  edition alone.
+- **A refund refused with an authentication code is `card_declined`.** PSP_101 ("The
+  transaction cannot be refunded. It is the buyer's bank that opposes the refund request. You
+  must reimburse your buyer by another means of payment (check, transfer ...).",
+  payzen.io/en-EN/rest/V4.0/api/errors_psp.html) carries the refusal code in detailedErrorCode
+  and links the CB table for it, so `refundPayment` reads the same map, with one exception: a
+  code the map reads as `authentication_required` (1A) is `card_declined` there, since a
+  refund has no cardholder authentication to go back to.
+- **Both halves map the codes the same way.** The browser adapter keeps its own copy of the
+  map, since it cannot depend on the server package, and a test compares the two. It builds
+  the error for an unpaid order's last transaction and for an ACQ_ or AUTH_ error from
+  KR.onError in one helper: ACQ_999 and AUTH_999 ("technical error" on both pages) are a
+  `psp_unavailable`, retryable as core requires of that code, and every other answer is a
+  refusal, never retryable. It had read ACQ_999 as a decline and AUTH_999 as
+  `authentication_required` on both paths. These errors take core's catalog messages, as the
+  server adapter's do; the form's own texts, such as "The payment form could not be set up.",
+  stay with the form's CLIENT_ errors, and every other code takes the catalog's message. Lookups read the maps' own keys only, the
+  browser adapter's through `Object.prototype.hasOwnProperty.call`: the ES2022 `Object.hasOwn`
+  is missing from Chrome before 93, Firefox before 92 and Safari before 15.4, and PayZen's
+  JavaScript client reference (payzen.io/en-EN/rest/V4.0/javascript/features/reference.html)
+  supports Chrome from 70, Firefox from 64 and Safari from 11, besides Internet Explorer 10,
+  Edge 17 and the Android 5.0 browser, which this package does not target. A host's bundler
+  lowers syntax such as `??=` but adds no missing built-in, so a test keeps ES2019 and later
+  built-ins (`Object.fromEntries`, `matchAll`, `flat`, `trimStart`, `Object.hasOwn` and
+  the like) out of the browser package's source; core's source, which the same bundle ships,
+  is not scanned.
+- **Known difference, tracked in #232: AUTH_100 to AUTH_149 stay `authentication_required`.**
+  The AUTH error page (payzen.io/en-EN/rest/V4.0/api/errors_auth.html) describes AUTH_100 as
+  "invalid ACS Signature", AUTH_101 as "technical error 3DS", AUTH_102 as "wrong Parameter
+  3DS", AUTH_103 as "3DS Disabled" and AUTH_149 as "3DS operation timeout": none describes a
+  cardholder who failed to authenticate or an issuer asking for authentication, which is what
+  the other adapters read as `authentication_required` (see "Worldline decline codes
+  (2026-09-25)").
+- **Doc-derived only.** No sandbox run has produced any of these codes.

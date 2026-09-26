@@ -1819,11 +1819,12 @@ sandbox round-trip before production use, and the setup guide carries that warni
   `AuthenticationNotRequired` → `processing`, `RedirectShopper`/`IdentifyShopper`/
   `ChallengeShopper`/`PresentToShopper`/`PartiallyAuthorised` → `requires_action`,
   `Refused`/`Error` raise a mapped `PayFanoutError` rather than a "failed" PaymentInfo.
-  Refusal codes map 2/5/46 → `card_declined`, 6 → `expired_card`, 8/24 →
-  `invalid_card_data`, 11/38/42 → `authentication_required`, 12 → `insufficient_funds`,
-  14/20/31 → `fraud_suspected` (31, Issuer Suspected Fraud, since 2026-09-23), 9 (Issuer
-  Unavailable) → `processing_error` (42 questioned 2026-09-25: see "Worldline decline codes
-  (2026-09-25)" and #217). None is retryable:
+  Refusal codes map 2/5/46 → `card_declined`, 6 → `expired_card`, 8/24/32 →
+  `invalid_card_data` (32 since 2026-09-26), 11/38 → `authentication_required`, 12 →
+  `insufficient_funds`, 14/20/22/31 → `fraud_suspected` (31, Issuer Suspected Fraud, since
+  2026-09-23; 22 since 2026-09-26), 4/9/21/39/40/42 → `processing_error` (4, 21, 39, 40 and
+  42 since 2026-09-26; 42 was `authentication_required` until then). See "Adyen refusal
+  reasons (2026-09-26)". None is retryable:
   replaying the same idempotency key returns the same refusal, so a fresh attempt is the
   shopper's move, and an unrecognized code is still a decline.
 - **CLP, CVE, IDR and ISK are rejected locally** (`invalid_request`): Adyen prices them with
@@ -2333,8 +2334,9 @@ description of what v2 changes is what the migration then had to implement.
   presents it as the general form of `payment_intent_authentication_failure` and
   `setup_intent_authentication_failure`, whose documented remedy is a new payment method.
   The Stripe browser adapter maps those two codes to `authentication_required`, as Worldline
-  does `40001134` ("a failed 3-D Secure check") and Adyen `11` and `42`. Both candidates are
-  non-retryable, so retries and the router cascade are unaffected; the choice decides which
+  does `40001134` ("a failed 3-D Secure check") and Adyen `11` (and `42` until
+  2026-09-26). Both candidates are non-retryable, so retries and the router cascade are
+  unaffected; the choice decides which
   code and message the host shows. Stripe's 3-D Secure guide
   (docs.stripe.com/payments/3d-secure/authentication-flow) gives both remedies after a failed
   authentication: try a different payment method, or retry 3-D Secure by reconfirming. Which
@@ -2352,8 +2354,8 @@ description of what v2 changes is what the migration then had to implement.
   authentication can succeed, where `card_declined`'s "use another card" is the only remedy.
   (Clarified 2026-09-25: this holds for a failed cardholder authentication. A 3-D Secure that
   fails outside the customer's control is `processing_error` on Worldline, and Adyen's refusal
-  42 is such a failure, which still maps to `authentication_required` until #217; see
-  "Worldline decline codes (2026-09-25)".)
+  42 is such a failure, which maps to `processing_error` since 2026-09-26; see "Worldline
+  decline codes (2026-09-25)" and "Adyen refusal reasons (2026-09-26)".)
 - **`payment_method_restricted` stays `card_declined`.** Stripe's example is a card reported
   lost or stolen; the existing `restricted_card` decline code ("it's possible it was reported
   lost or stolen") already falls through to `card_declined`, and a `lost_card` or
@@ -2788,12 +2790,12 @@ description of what v2 changes is what the migration then had to implement.
   PIN codes) or fraud attempts". The second is 40001135/50001081, 40001137, 40001138 and
   40001146, where the issuer, the acquirer or the platform could not complete 3-D Secure:
   authenticating again now does not help, and Worldline advises another payment method or a
-  later attempt (for 40001146, contacting it). The Adyen adapter maps its refusal 42 to
-  `authentication_required`, although Adyen's refusal-reasons page
+  later attempt (for 40001146, contacting it). The Adyen adapter mapped its refusal 42 to
+  `authentication_required` until 2026-09-26, although Adyen's refusal-reasons page
   (docs.adyen.com/development-resources/refusal-reasons) reads "The 3D Secure authentication
-  failed due to an issue at the card network or issuer". That is inconsistent with this
-  reading, and it is tracked in #217. The Stripe entry's `authentication_failure`
-  bullet carries the same clarification.
+  failed due to an issue at the card network or issuer"; it now maps it to
+  `processing_error`, as this reading asks (see "Adyen refusal reasons (2026-09-26)"). The
+  Stripe entry's `authentication_failure` bullet carries the same clarification.
 - **The merchant's set-up and request refusals are `invalid_request`.** 30031001 is the
   acquirer refusing the merchant id: Worldline asks the merchant to "Contact us and your
   acquirer to make sure that the MID properly set up on our side and your acquirer's side",
@@ -3758,6 +3760,65 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
     of any refusal. The CAD sandbox account completed an EFT debit on 2026-07-15, so EFT can
     run first; ACH needs an account provisioned for it. A refusal means refusing that rail
     locally, as SEPA and Bacs are.
+
+## Adyen refusal reasons (2026-09-26)
+
+- **Refusals Adyen attributes to the acquirer, the network, the issuer or the scheme are
+  `processing_error`, never retryable.** Doc-verified 2026-09-26 against the refusal-reasons
+  page (docs.adyen.com/development-resources/refusal-reasons): 42, "3DS Authentication
+  Error": "The 3D Secure authentication failed due to an issue at the card network or
+  issuer. Retry the transaction, or retry the transaction with a different payment
+  method."; 39, "RReq not received from DS": "The issuer or the scheme wasn't able to
+  communicate the outcome via RReq."; 40, "Current AID is in Penalty Box": "The payment
+  network cannot be reached. Retry the transaction with a different payment method.", whose
+  point-of-sale form, "AID banned", reads "The application is temporarily in our AID penalty
+  box until its payments network can be reached again."
+  (docs.adyen.com/point-of-sale/error-scenarios/refusal-reasons-pos); and 4, "Acquirer
+  Error": "The transaction did not go through due to an error that occurred on the
+  acquirer's end." The card is not at fault. For 40 and 42 Adyen's remedy is a new
+  transaction or another payment method, not a new authentication by the cardholder, as with
+  the issuer-side 3-D Secure failures in "Worldline decline codes (2026-09-25)"; for 39 and
+  4 the page states none. 42 was
+  `authentication_required`, the code of a failed cardholder authentication, which 11 ("3D
+  Secure authentication was not executed, or it did not execute successfully.") and 38 ("The
+  issuer declined the authentication exemption request and requires authentication for the
+  transaction. Retry with 3D Secure.") stay. 39 and 40 had fallen to `card_declined`, as had
+  4 whenever it came with `resultCode` Refused; Adyen's testing page gives 4 with Error, which
+  already read as `processing_error`. A refusal stays non-retryable: a replay of the same
+  idempotency key returns the same refusal, so a new attempt is the shopper's move.
+- **21 ("Not Submitted") is read as a payment that did not reach processing, and is
+  `processing_error` too.** Its description, "The transaction was not submitted correctly
+  for processing.", names no party. The reading rests on that wording and on Adyen
+  answering with a refusal, not a validation error; the point-of-sale page gives the same
+  description. It had fallen to `card_declined`. Would be wrong if Adyen used 21 for a
+  request the merchant must fix, which would call for `invalid_request`, as Worldline's
+  "Format error" (30301001) is.
+- **32 ("AVS Declined": "The address data the shopper entered is incorrect.") is
+  `invalid_card_data`,** as the Paysafe adapter maps its failed AVS check (3007): the
+  customer can correct it. **22 ("FRAUD-CANCELLED") is `fraud_suspected`,** like 20: "the
+  transaction was flagged as fraudulent, and was refused." The testing page gives it with
+  `resultCode` Cancelled, which reports the payment `canceled` without reaching the refusal
+  map, so the entry covers a 22 that comes with Refused.
+- **Left on the default deliberately.** 7 ("Invalid Amount": "An amount mismatch occurred
+  during the transaction process.") states no cause, like Worldline's 30131001 ("Invalid
+  amount"), and stays `card_declined`. The issuer's refusals of the card or the transaction
+  (3, 10, 23, 25, 26, 27, 28, 29 and 50) are declines. 15 and 16 (Cancelled, Shopper
+  Cancelled) are cancellations the taxonomy has no code for; the Worldline adapter reports
+  its customer cancellation (30171001) as a decline too. The PIN, account-type, contactless
+  and chip answers (17 to 19, 33 to 37, 41 and 43 to 45) come from in-person payments, which
+  this adapter does not take.
+- **The lookup reads the map's own keys only**, as the Paysafe adapter's does: a
+  `refusalReasonCode` such as `constructor` falls back like any unknown code.
+- **`createCompletionHandler` answers the refusals now read as `processing_error` with HTTP
+  502 instead of 402** (`completionErrorStatus`); the client rebuilds the error from the body,
+  so the code, not the status, drives the UI.
+- **Doc-derived only.** The testing page
+  (docs.adyen.com/development-resources/testing/result-codes) triggers each of these
+  through the cardholder name: THREED_SECURE_AUTHENTICATION_ERROR (42), RREQ_NOT_RECEIVED
+  (39), BAN_CURRENT_AID (40), ERROR (4), NOT_SUBMITTED (21) and AVS_DECLINED (32).
+  FRAUD_CANCELLED (22) comes with `resultCode` Cancelled there, so `completePayment`
+  resolves with the payment `canceled` rather than rejecting. No sandbox run has done so: the
+  project has no Adyen test account.
 
 ## CSP guidance re-verified (2026-09-26)
 

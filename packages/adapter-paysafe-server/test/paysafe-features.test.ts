@@ -656,6 +656,27 @@ describe("Paysafe timestamps", () => {
     expect((await makePair({ fetch: garbled.fetch }).adapter.retrieveRefund("ref_1")).createdAt).toBeUndefined();
   });
 
+  it("reads a number as epoch milliseconds only from 1e11 (1973) to 8.64e15, never epoch seconds as 1970", async () => {
+    const refundCreatedAt = async (txnTime: unknown): Promise<string | undefined> => {
+      const stub = paysafeAnswering({ payment: { id: "ref_1", status: "COMPLETED", amount: 500, txnTime } });
+      return (await makePair({ fetch: stub.fetch }).adapter.retrieveRefund("ref_1")).createdAt;
+    };
+    const seconds = epoch / 1000;
+    // Epoch seconds and a digits-only date would read as instants in January 1970.
+    for (const txnTime of [seconds, String(seconds), "20260704", 1e11 - 1, 8.64e15 + 1, "8640000000000001", -epoch]) {
+      expect(await refundCreatedAt(txnTime), String(txnTime)).toBeUndefined();
+    }
+    expect(await refundCreatedAt(1e11)).toBe("1973-03-03T09:46:40.000Z");
+    expect(await refundCreatedAt("8640000000000000")).toBe("+275760-09-13T00:00:00.000Z");
+    // A payment's required createdAt takes the fallback every unreadable time takes.
+    const payment = paysafeAnswering({
+      payment: { id: "pay_1", status: "COMPLETED", amount: 500, currencyCode: "USD", settleWithAuth: true, txnTime: seconds },
+    });
+    expect((await makePair({ fetch: payment.fetch }).adapter.retrievePayment("pay_1")).createdAt).toBe(
+      "1970-01-01T00:00:00.000Z",
+    );
+  });
+
   it("reads a payment's and a verification's txnTime the same way, falling back to the epoch when unreadable", async () => {
     const payment = { id: "pay_1", status: "COMPLETED", amount: 500, currencyCode: "USD", settleWithAuth: true };
     for (const [txnTime, expected] of [
@@ -693,11 +714,16 @@ describe("Paysafe settlements that moved no money", () => {
     txnTime: "2026-07-04T10:00:00Z",
   };
 
-  it("counts neither an expired nor a cancelled settlement as captured or refunded money", async () => {
-    // Both report nothing left to refund, which would otherwise read as refunded.
+  /** A settlement Paysafe filed with an error: whatever its status says, it moved no money. */
+  const errored = { status: "COMPLETED", error: { code: "3009", message: "Your request has been declined by the issuing bank." } };
+
+  it("counts no expired, cancelled or errored settlement as captured or refunded money, in any letter case", async () => {
+    // Each reports nothing left to refund, which would otherwise read as refunded.
     const stub = paysafeAnswering({
       payment: manualCapture,
       settlements: [
+        { id: "stl_expired_lower", status: "expired", amount: 300, availableToRefund: 0, txnTime: "2026-07-04T10:00:30Z" },
+        { id: "stl_errored", ...errored, amount: 250, availableToRefund: 0, txnTime: "2026-07-04T10:00:45Z" },
         { id: "stl_expired", status: "EXPIRED", amount: 300, availableToRefund: 0, txnTime: "2026-07-04T10:01:00Z" },
         { id: "stl_cancelled", status: "CANCELLED", amount: 200, availableToRefund: 0, txnTime: "2026-07-04T10:02:00Z" },
         { id: "stl_live", status: "COMPLETED", amount: 500, availableToRefund: 500, txnTime: "2026-07-04T10:03:00Z" },
@@ -708,10 +734,12 @@ describe("Paysafe settlements that moved no money", () => {
     expect(info.capturedAt).toBe("2026-07-04T10:03:00.000Z");
   });
 
-  it("takes a refund out of a settlement that moved money, never an expired or cancelled one", async () => {
+  it("takes a refund out of a settlement that moved money, never an expired, cancelled or errored one", async () => {
     const stub = paysafeAnswering({
       payment: { ...manualCapture, settleWithAuth: true },
       settlements: [
+        { id: "stl_expired_lower", status: "expired", amount: 1000, availableToRefund: 1000 },
+        { id: "stl_errored", ...errored, amount: 1000, availableToRefund: 1000 },
         { id: "stl_expired", status: "EXPIRED", amount: 1000, availableToRefund: 1000 },
         { id: "stl_cancelled", status: "CANCELLED", amount: 1000, availableToRefund: 1000 },
         { id: "stl_live", status: "COMPLETED", amount: 1000, availableToRefund: 1000 },

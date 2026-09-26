@@ -715,6 +715,29 @@ describe("Paysafe write transport", () => {
     expect(fake.uniquePaymentCreations).toBe(1);
   });
 
+  it("takes a 5xx for an unknown outcome whatever code it carries, never for that code's decline", async () => {
+    // Paysafe processes the payment, and its answer comes back a 502 carrying a decline code.
+    const fake = new FakePaysafeApi();
+    let answered = false;
+    const { adapter } = makePair({
+      fetch: async (input, init) => {
+        const response = await fake.fetch(input, init);
+        if (answered || init?.method !== "POST" || new URL(urlOf(input)).pathname !== PAYMENTS) return response;
+        answered = true;
+        return new Response(
+          JSON.stringify({ error: { code: "3022", message: "The card has been declined due to insufficient funds." } }),
+          { status: 502 },
+        );
+      },
+    });
+    const pspSessionId = await cardSession(adapter);
+    const info = await adapter.completePayment({ pspSessionId, clientToken: "tok_card", idempotencyKey: "k-complete" });
+    expect(info).toMatchObject({ status: "succeeded", amount: 2000 });
+    expect(sent(fake, CREATE_PAYMENT)).toHaveLength(1);
+    expect(lookups(fake, "payments", "k-complete")).toHaveLength(2); // the key's read, then the read-back
+    expect(fake.uniquePaymentCreations).toBe(1);
+  });
+
   it("re-sends a verification after a 5xx once the lookup shows nothing: it moves no money", async () => {
     const { adapter, fake } = makePair();
     const pspSessionId = await cardSession(adapter, { amount: 0 });

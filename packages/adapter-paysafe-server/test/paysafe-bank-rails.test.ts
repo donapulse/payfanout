@@ -460,6 +460,23 @@ describe("Paysafe bank-debit refunds", () => {
     }
   });
 
+  it("reads the rail in any letter case: a payment typed 'sepa' is refused the same way", async () => {
+    const requests: string[] = [];
+    const { adapter } = makePair({
+      fetch: async (input, init) => {
+        const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url);
+        requests.push(`${init?.method ?? "GET"} ${url.pathname}`);
+        return new Response(
+          JSON.stringify({ id: "pay_sepa", paymentType: "sepa", status: "COMPLETED", amount: 1250, currencyCode: "EUR", settleWithAuth: true }),
+        );
+      },
+    });
+    await expect(
+      adapter.refundPayment({ pspPaymentId: "pay_sepa", idempotencyKey: "refund-sepa-lowercase" }),
+    ).rejects.toMatchObject({ code: "unsupported_operation", retryable: false, raw: { id: "pay_sepa", paymentType: "sepa" } });
+    expect(requests).toEqual(["GET /paymenthub/v1/payments/pay_sepa"]);
+  });
+
   it("leaves ACH and EFT refunds to Paysafe, whose pages say nothing about them", async () => {
     for (const fixture of [RAILS[1]!, RAILS[3]!]) {
       const { adapter, fake, id } = await completed(fixture);

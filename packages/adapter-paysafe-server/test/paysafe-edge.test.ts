@@ -77,7 +77,9 @@ describe("Paysafe verification status mapping", () => {
 });
 
 describe("mapPaysafeError", () => {
-  // HTTP statuses as Paysafe's card errors table pairs them with each code.
+  // HTTP statuses as Paysafe's card errors table pairs them with each code,
+  // except 3004 (a 400 there), sent as a 402 so that its mapping, not the
+  // HTTP fallback, decides.
   const cases: Array<[number, string | undefined, UnifiedErrorCode, boolean]> = [
     [402, "3406", "processing_error", true], // settlement not batched yet
     [402, "3022", "insufficient_funds", false],
@@ -86,23 +88,42 @@ describe("mapPaysafeError", () => {
     [400, "3002", "invalid_card_data", false], // invalid card number or brand
     [400, "3005", "invalid_card_data", false], // incorrect CVV
     [402, "3012", "invalid_card_data", false], // invalid expiry date
+    [402, "3019", "invalid_card_data", false], // failed the CVV check
+    [402, "3007", "invalid_card_data", false], // failed the AVS check
     [402, "3004", "invalid_request", false], // zip/billing data required — data quality, not a decline
     [402, "3009", "card_declined", false],
     [402, "3060", "authentication_required", false], // Strong Customer Authentication is required
+    [402, "3039", "authentication_required", false], // invalid authentication value
     [402, "3054", "fraud_suspected", false], // declined due to suspected fraud
+    [402, "3016", "fraud_suspected", false], // may be a lost or stolen card
     [402, "4001", "fraud_suspected", false], // in Paysafe's negative database
     [402, "4002", "fraud_suspected", false], // declined by Paysafe's Risk Management
     [402, "8000", "fraud_suspected", false], // in no current table, still mapped
     [402, "8001", "fraud_suspected", false],
+    [402, "3202", "invalid_request", false], // the maximum number of settlements
     [402, "3204", "invalid_request", false], // capture beyond the remaining authorization
+    [402, "3205", "invalid_request", false], // the authorization to settle has expired
     [402, "3402", "invalid_request", false], // refund beyond the remaining settlement
     [402, "3403", "invalid_request", false], // the settlement's maximum number of refunds
-    [402, "3419", "invalid_request", false], // this type of transaction cannot be refunded
-    [402, "3507", "invalid_request", false], // no partial void on this authorization
+    [402, "3405", "invalid_request", false], // the settlement to refund has expired
+    [402, "3419", "unsupported_operation", false], // this type of transaction cannot be refunded
+    [402, "3507", "unsupported_operation", false], // no partial void on this authorization
+    [402, "3416", "unsupported_operation", false], // the gateway takes no partial settlement
+    [402, "3418", "unsupported_operation", false], // the gateway takes no partial refund
+    [402, "3503", "unsupported_operation", false], // no void for the card type
+    [402, "3504", "unsupported_operation", false], // the gateway takes no partial void
     [402, "9999", "card_declined", false], // unknown code on a 402 is still a decline
+    [402, "3413", "card_declined", false], // a code the map leaves on the 402 default
+    [402, "constructor", "card_declined", false], // only the map's own keys are codes
     [429, undefined, "rate_limited", true],
+    [429, "1200", "rate_limited", true], // Paysafe's rate-limit code
     [500, undefined, "psp_unavailable", true],
     [503, "1234", "psp_unavailable", true],
+    // A 429 or a 5xx stays transient whatever mapped code it carries.
+    [429, "3406", "rate_limited", true],
+    [500, "3022", "psp_unavailable", true],
+    [502, "3060", "psp_unavailable", true],
+    [504, "3419", "psp_unavailable", true],
     [400, "5068", "invalid_request", false],
     [404, undefined, "invalid_request", false],
     [401, undefined, "invalid_request", false],

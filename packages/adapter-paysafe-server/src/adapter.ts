@@ -690,17 +690,23 @@ function isIsoParseable(value: unknown): value is string {
   return typeof value === "string" && !Number.isNaN(Date.parse(value));
 }
 
+/** Epoch milliseconds a Paysafe time is read as: from 1973 (1e11) to the last instant a Date holds. */
+const MIN_EPOCH_MS = 1e11;
+const MAX_EPOCH_MS = 8.64e15;
+
 /**
  * A Paysafe txnTime as ISO 8601, or undefined when it cannot be read. The
  * schema types every txnTime as a date-time string, but Paysafe's payment
  * examples send an embedded settlement's as epoch milliseconds
- * (1674814529000), so a number, or a string of digits, is read as that.
+ * (1674814529000), so a number, or a string of digits, is read as that when
+ * it lies between MIN_EPOCH_MS and MAX_EPOCH_MS. Epoch seconds, or a
+ * digits-only date such as "20260704", fall below and are left out rather
+ * than read as an instant in 1970.
  */
 function paysafeTime(value: unknown): string | undefined {
   const epoch = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
   if (typeof epoch === "number") {
-    const time = new Date(epoch);
-    return Number.isNaN(time.getTime()) ? undefined : time.toISOString();
+    return epoch >= MIN_EPOCH_MS && epoch <= MAX_EPOCH_MS ? new Date(epoch).toISOString() : undefined;
   }
   return isIsoParseable(epoch) ? normalizeTime(epoch) : undefined;
 }
@@ -1105,7 +1111,7 @@ function recordedFailure<T extends RefNumRecord>(record: T): T {
   const pspCode = record.error?.code;
   if (!pspCode) return record;
   const nonBusiness = INTERNAL_ERROR_CODES.has(pspCode) || (record.status ?? "").toUpperCase() === "ERROR";
-  const code = PAYSAFE_CODE_MAP[pspCode] ?? (nonBusiness ? "processing_error" : "card_declined");
+  const code = paysafeCodeFor(pspCode) ?? (nonBusiness ? "processing_error" : "card_declined");
   throw new PayFanoutError({
     code,
     message: getUserMessage(code),
@@ -3063,20 +3069,27 @@ const PAYSAFE_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "3022": "insufficient_funds",
   "3006": "expired_card",
   // An invalid card number or brand (3002, 3017), CVV (3005) or expiry date
-  // (3012): data the customer can correct.
+  // (3012), or a failed CVV (3019) or AVS (3007) check: data the customer
+  // can correct.
   "3002": "invalid_card_data",
   "3005": "invalid_card_data",
+  "3007": "invalid_card_data",
   "3012": "invalid_card_data",
   "3017": "invalid_card_data",
+  "3019": "invalid_card_data",
   // 3004: the zip/billing data Paysafe requires is missing from the request —
   // a data-quality error (fixed by supplying billingDetails), not a decline.
   "3004": "invalid_request",
   "3009": "card_declined",
-  // 3060: "Strong Customer Authentication is required" — the customer comes
-  // back on-session; replaying the call cannot help.
+  // "Strong Customer Authentication is required" (3060), or the
+  // authentication value is invalid (3039): the customer comes back
+  // on-session; replaying the call cannot help.
+  "3039": "authentication_required",
   "3060": "authentication_required",
-  // Declined for suspected fraud (3054), by Paysafe's negative database
-  // (4001) or by its Risk Management department (4002).
+  // Declined for suspected fraud (3054), as a card that may be lost or stolen
+  // (3016), by Paysafe's negative database (4001) or by its Risk Management
+  // department (4002).
+  "3016": "fraud_suspected",
   "3054": "fraud_suspected",
   "4001": "fraud_suspected",
   "4002": "fraud_suspected",
@@ -3087,25 +3100,49 @@ const PAYSAFE_CODE_MAP: Record<string, UnifiedErrorCode> = {
   "3406": "processing_error",
   // Capture, refund and void state checks (402): the authorization or
   // settlement cannot take the request — not a card decline.
+  "3202": "invalid_request", // the authorization has had its maximum number of settlements
   "3203": "invalid_request", // the authorization is fully settled or cancelled
   "3204": "invalid_request", // the settlement exceeds the remaining authorization
+  "3205": "invalid_request", // the authorization has expired
   "3402": "invalid_request", // the refund exceeds the remaining settlement
   "3403": "invalid_request", // the settlement has had its maximum number of refunds
   "3404": "invalid_request", // the settlement is already fully refunded
-  "3419": "invalid_request", // this type of transaction cannot be refunded
+  "3405": "invalid_request", // the settlement has expired
   "3501": "invalid_request", // the void exceeds the remaining authorization
   "3502": "invalid_request", // the authorization has been settled
   "3506": "invalid_request", // the void exceeds the remaining authorization
-  "3507": "invalid_request", // the authorization takes no partial void
+  // Operations the transaction, its card type or the account's gateway does
+  // not support (402): refused as PaymentService refuses a capability an
+  // adapter lacks, not as a card decline.
+  "3416": "unsupported_operation", // the gateway takes no partial settlement
+  "3418": "unsupported_operation", // the gateway takes no partial refund
+  "3419": "unsupported_operation", // this type of transaction cannot be refunded
+  "3503": "unsupported_operation", // the authorization's card type takes no void
+  "3504": "unsupported_operation", // the gateway takes no partial void
+  "3507": "unsupported_operation", // the authorization takes no partial void
 };
 
+/** Own keys only: the code is Paysafe's text, and "constructor" names no mapping. */
+function paysafeCodeFor(pspCode: string | undefined): UnifiedErrorCode | undefined {
+  return pspCode !== undefined && Object.hasOwn(PAYSAFE_CODE_MAP, pspCode) ? PAYSAFE_CODE_MAP[pspCode] : undefined;
+}
+
+/**
+ * Maps a non-2xx Paysafe answer onto the unified taxonomy. A 429 or a 5xx is
+ * `rate_limited` or `psp_unavailable`, retryable, whatever code it carries:
+ * sendWrite reads a 5xx as an outcome it must look up, and a code must not
+ * turn that into a final answer. Otherwise a mapped code decides, then a
+ * 402 is `card_declined` and any other status `invalid_request`. The message
+ * is the catalog's, never Paysafe's own; the body stays untouched on `raw`.
+ */
 export function mapPaysafeError(httpStatus: number, body: unknown): PayFanoutError {
-  const errorBody = (body as { error?: { code?: string; message?: string } } | undefined)?.error;
-  const pspCode = errorBody?.code;
+  const mapped = paysafeCodeFor((body as { error?: { code?: string } } | undefined)?.error?.code);
   let code: UnifiedErrorCode;
   let retryable = false;
-  if (pspCode && PAYSAFE_CODE_MAP[pspCode]) {
-    code = PAYSAFE_CODE_MAP[pspCode];
+  if (httpStatus === 429 || httpStatus >= 500) {
+    ({ code, retryable } = classifyHttpFallback(httpStatus));
+  } else if (mapped) {
+    code = mapped;
     retryable = code === "processing_error";
   } else if (httpStatus === 402) {
     code = "card_declined";

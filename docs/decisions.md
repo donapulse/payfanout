@@ -3248,28 +3248,75 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   (developer.paysafe.com/en/api-docs/payments-api/add-payment-methods/cards/card-errors/,
   unchanged from the copy read on 2026-09-24). `authentication_required`, never retryable:
   "402 | 3060 | Your request has been declined because Strong Customer Authentication is
-  required."; the customer comes back on-session, and a replay cannot help.
+  required." and "402 | 3039 | Your request has been declined due to an invalid
+  authentication value."; the customer comes back on-session, and a replay cannot help.
   `fraud_suspected`: "402 | 3054 | The transaction was declined due to suspected fraud.",
-  "402 | 4001 | The card number or email address associated with this transaction is in our
-  negative database." and "402 | 4002 | The transaction was declined by our Risk Management
-  department." `invalid_card_data`, as 3017 already was: "400 | 3002 | You submitted an
-  invalid card number or brand or combination of card number and brand with your
-  request.", "400 | 3005 | You submitted an incorrect CVV value with your request." and
-  "402 | 3012 | Your request has been declined by the issuing bank because the credit card
-  expiry date submitted is invalid." The 402s had fallen to `card_declined` and the 400s to
-  `invalid_request`. A failed record read back with one of these codes maps the same way.
+  "402 | 3016 | The bank has requested that you retrieve the card from the cardholder - it
+  may be a lost or stolen card.", "402 | 4001 | The card number or email address associated
+  with this transaction is in our negative database." and "402 | 4002 | The transaction was
+  declined by our Risk Management department."; the Stripe adapter maps a lost or stolen
+  card the same way. `invalid_card_data`, as 3017 already was: "400 | 3002 | You submitted
+  an invalid card number or brand or combination of card number and brand with your
+  request.", "400 | 3005 | You submitted an incorrect CVV value with your request.", "402 |
+  3012 | Your request has been declined by the issuing bank because the credit card expiry
+  date submitted is invalid.", "402 | 3019 | Your request has failed the CVV check. Please
+  note that the amount may still have been reserved on the customer's card, in which case
+  it will be released in 3-5 business days." and "402 | 3007 | Your request has failed the
+  AVS check. Note that the amount has still been reserved on the customer's card and will
+  be released in 3-5 business days. Please ensure the billing address is accurate before
+  retrying the transaction."; the customer can correct each, and the Stripe adapter maps an
+  incorrect CVC or postal code the same way. The hold 3019 and 3007 describe is released,
+  not captured, so they stay definitive failures. The 402s had fallen to `card_declined`,
+  and 3002 and 3005, the 400s, to `invalid_request`. A failed record read back with one of
+  these codes maps the same way.
   The card simulator
   (developer.paysafe.com/en/api-docs/payments-api/add-payment-methods/cards/simulating-card-payments/)
   returns 4002, 4001 and 3060 for the amounts 23, 25 and 77 (3060 "Applies for Acquiring
   (UK/EU)."); no sandbox run has done so yet.
-- **Three more capture, refund and void state checks are `invalid_request`.** "402 | 3403 |
-  You have already processed the maximum number of refunds allowed for this Settlement.",
-  "402 | 3419 | This type of transaction cannot be refunded." and "402 | 3507 | The
-  Authorization does not support a partial Void (Authorization Reversal)." join 3203, 3204,
-  3402, 3404, 3501, 3502 and 3506: the settlement or the authorization cannot take the
-  request, and the card is not at fault. The page's other settlement, refund and void codes
-  (3202, 3205, 3405, 3412, 3413, 3415, 3416, 3418, 3503, 3504) still reach `card_declined`
-  through the 402 default.
+- **Four more capture and refund state checks are `invalid_request`.** "402 | 3202 | You
+  have exceeded the maximum number of Settlements allowed.", "402 | 3205 | The Authorization
+  you are attempting to settle has expired.", "402 | 3403 | You have already processed the
+  maximum number of refunds allowed for this Settlement." and "402 | 3405 | The Settlement
+  you are attempting to Refund has expired." join 3203, 3204, 3402, 3404, 3501, 3502 and
+  3506: the settlement or the authorization cannot take the request, and the card is not at
+  fault.
+- **An operation the transaction, its card type or the account's gateway does not support
+  is `unsupported_operation`, never retryable.** "402 | 3419 | This type of transaction
+  cannot be refunded." and "402 | 3507 | The Authorization does not support a partial Void
+  (Authorization Reversal)." refuse the operation itself, not the request's amount or the
+  record's state, so they map as `refundPayment` refuses a SEPA or Bacs refund and as
+  `PaymentService`'s capability guards refuse what an adapter lacks. The page's other
+  answers of that kind map with them: "402 | 3416 | The external processing gateway for
+  which your merchant account is configured does not support partial Settlements.", "402 |
+  3418 | The external processing gateway for which your merchant account is configured does
+  not support partial Credits.", "402 | 3503 | The Void (Authorization Reversal) transaction
+  is not supported for the card type used for the Authorization you are attempting to
+  reverse." and "402 | 3504 | The external processing gateway for which your merchant
+  account is configured does not support partial Voids (Authorization Reversals)." The
+  adapter declares partial refunds and multi-capture, and `cancelPayment` voids what is
+  left of an authorization, a partial void once part of it is settled: on an account whose
+  gateway supports none of these, those calls meet 3418, 3416, 3504 or 3507 at run time,
+  while the full operation may still go through.
+- **Every other 402 code on the page stays on the `card_declined` default, deliberately.**
+  The issuer's, the network's and the gateway's refusals of the card or of the transaction
+  are card declines: 3011, 3013, 3014, 3015, 3018, 3020, 3023, 3024, 3027, 3029, 3030,
+  3035, 3036, 3037, 3040, 3041, 3042 and 3057 among the authorization errors, 3206 ("The
+  external processing gateway has rejected the transaction.") and 3207 ("Due to issuer
+  policies, this type of transaction is not allowed") among the settlement errors, 3421
+  ("The purchase return authorization has been declined by the issuing bank.") and 3422
+  ("The purchase return authorization has failed.") among the refund errors, and 5021
+  ("Your transaction request has been declined.") among the common ones. 3018 and 3020
+  ("The bank has requested that you retry the transaction.") and 3041 ("Your request has
+  been declined due to a timeout.") stay non-retryable: Paysafe files the attempt as
+  declined, so a replay under the same key reads that decline back, and only a new attempt,
+  the customer's or the host's call, can follow. 3412 ("The Refund transaction you
+  attempted was not permitted because your merchant account is in overdraft.") and 3413
+  ("The requested Refund amount exceeds the permissible Visa credit ratio.") refuse a
+  refund over the merchant account's standing, which no code of the taxonomy names, and
+  3415 ("You cannot cancel this transaction as it is no longer in a pending state.")
+  answers a cancellation the adapter never sends. 3417 is a replay answer (below). The
+  Merchant Advice and ISO response codes the page lists ride `error.additionalDetails`, not
+  `error.code`, and stay on `raw`.
 - **8000 and 8001 stay `fraud_suspected`, although no current Paysafe error table lists
   them.** Neither code appears on the card errors page, nor on any of the 195 pages linked
   from the Payments API documentation's navigation (Payments API, Paysafe Checkout, Paysafe
@@ -3280,6 +3327,17 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   map (409 and 400 → `invalid_request`, 402 → `card_declined`): `sendWrite` recognizes them
   by the Paysafe code on `raw`, so "Paysafe replay safety (2026-09-24)" is unchanged, and a
   test pins the fallback.
+- **A 429 or a 5xx is classified by its status before its code.** `mapPaysafeError` answers
+  `rate_limited` or `psp_unavailable`, retryable, whatever code the body carries, as
+  `mapWorldlineError` does, and the code map speaks for the other statuses only. A 5xx is
+  how `sendWrite` learns that a write's outcome is unknown and must be looked up: a code
+  mapped to a final answer, a decline on a 502 say, would have ended the call without that
+  lookup although Paysafe may have processed the write. No 429 or 5xx row on the page (1000,
+  1001, 1002, 1003, 1007, 1008, 1020, 1200, 3028, 3420, 3423, 3424, 3505, 5050, 9000)
+  carries a mapped code, so no documented answer changes. `sendWrite` still reads the replay
+  codes and the lookups' 5269 from the body on `raw`, whatever the mapped code. Only the
+  map's own keys count as codes, as in the Worldline adapter, so a code such as
+  "constructor" falls through to the HTTP fallback.
 - **The test double already answered the state checks as documented.** Since #198 it
   refuses an over-refund with 402/3402 and an over-capture with 402/3204, where it once
   answered 400/3407 and 400/5050. The card errors page gives 3407 as "400 | 3407 | The
@@ -3316,36 +3374,56 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   (developer.paysafe.com/en/api-docs/payments-api/add-payment-methods/sepa-direct-debit/)
   lists "Refunds | Not Supported" and the Bacs Direct Debit page
   (developer.paysafe.com/en/api-docs/payments-api/add-payment-methods/bacs-direct-debit/)
-  "Refunds | NA". The ACH, EFT and Interac e-Transfer pages say nothing about refunds, so
-  those still go to Paysafe. Only the payment names its rail, so `refundPayment` reads it
-  first, then refuses a SEPA or BACS payment, non-retryable and with the payment on `raw`,
-  before the settlement lookup or any refund write. `supportsRefunds` stays true: the
-  contract has no per-rail refund flag, so the refusal and the guide carry the limit. This
-  extends the 2026-07-15 bank-rails note, which recorded the Bacs case only.
+  "Refunds | NA". The ACH, EFT and Interac e-Transfer pages say nothing about refunds, and
+  the spec is no firmer: the `refunds` schema's `paymentType` enum lists CARD, PAYSAFECARD,
+  PAYSAFECASH, RAPID_TRANSFER, SKRILL, SKRILL1TAP, MYBANK and EPS, with no bank rail and no
+  Interac, while the refund endpoint's own examples also refund TRUSTLY, MBWAY and
+  MULTIBANCO payments, which the enum leaves out. Whether Paysafe refunds an ACH or EFT
+  payment is therefore uncertain; since the enum is no complete list and no page refuses
+  them, those refunds still go to Paysafe, whose answer stands, and the sandbox check below
+  settles it. Only the payment names its rail, so `refundPayment` reads it first, then
+  refuses a SEPA or BACS payment, non-retryable and with the payment on `raw`, before the
+  settlement lookup or any refund write. `supportsRefunds` stays true: the contract has no
+  per-rail refund flag, so the refusal and the guide carry the limit. This extends the
+  2026-07-15 bank-rails note, which recorded the Bacs case only.
 - **Timestamps come out as ISO 8601 whatever form Paysafe sends them in.** The spec types
   every `txnTime` as a date-time string, but six of its POST /v1/payments response examples
   ("Card - with Settlement" among them) carry the embedded settlement's as epoch
   milliseconds (`"txnTime": 1674814529000`, the instant of the payment's own
   `"2023-01-27T10:15:29Z"`), which the adapter passed through as `capturedAt`, a number.
   `createdAt` on payments, verifications and refunds, and `capturedAt`, now go through one
-  reader: a number or a string of digits is epoch milliseconds, any other string goes
-  through core's `normalizeTime`, and an unreadable value is left out of the optional
-  fields, while the required `createdAt` keeps its epoch fallback. An ISO string comes back
-  normalized (`2026-07-04T10:10:00Z` becomes `2026-07-04T10:10:00.000Z`). Epoch seconds are
-  not guessed at: no Paysafe example sends them.
+  reader: a number or a string of digits is epoch milliseconds when it lies between 1e11
+  (1973-03-03) and 8.64e15, the last instant a `Date` holds, any other string goes through
+  core's `normalizeTime`, and an unreadable value is left out of the optional fields, while
+  the required `createdAt` keeps its epoch fallback. An ISO string comes back normalized
+  (`2026-07-04T10:10:00Z` becomes `2026-07-04T10:10:00.000Z`). Epoch seconds are not guessed
+  at, since no Paysafe example sends them: they fall below the range, as a digits-only date
+  such as "20260704" does, so they count as unreadable rather than as an instant in January
+  1970.
 - **Card expiry strings are read.** `cardExpiry.month` and `year` are numbers in the schema
   (examples 12 and 2022), but 27 of the spec's 28 response examples that carry an expiry
   send strings (`{"month": "10", "year": "2025"}`), on the payment, verification, payment
   handle and Customer Vault endpoints among others, and the adapter read numbers only, so
   those instruments reported no expiry. Both forms are read now; anything but a whole
   month from 1 to 12 or a four-digit year, the ranges `PaymentMethodDetails` documents, is
-  left out. The exported `PaysafeCardLike.cardExpiry` and `PaysafeSettlementLike.txnTime`
-  types widen to the forms the examples show.
+  left out. `PaysafeCardLike.cardExpiry` and the `txnTime` of
+  `PaysafePaymentLike.settlements` entries, both exported, widen to the forms the examples
+  show (`PaysafeSettlementLike`, the entries' type, is not exported itself); TypeScript code
+  reading them as a plain number or string must handle both.
 - **Card brands follow the cardType enum.** The spec's `baseCard.cardType` reads "MD –
   Maestro" and "SO – Solo" (its internal `cardTypeConfig` also lists "MD - Maestro"). MD
   had been reported as "mastercard", under a "Debit MasterCard" comment; it is "maestro"
   now, and SO, which had no mapping and so no brand, is "solo". DC ("DC - Diners Club" in
   `cardTypeConfig`) and UP, in no current Paysafe enum, keep their earlier brands.
-- **Doc-derived only.** No sandbox run has yet returned 3060, 4001, 4002, an expired refund
-  or settlement, an ERROR verification, an epoch-millisecond settlement time or a string
-  expiry. The simulator amounts above cover the three codes on a card account.
+- **Doc-derived only; to settle in the sandbox:**
+  - **The simulated declines.** Charge a card account the simulator's amounts 23, 25 and 77
+    and record that they answer 4002, 4001 and 3060 (3060 on UK/EU acquiring only). No
+    sandbox run has returned any code this entry maps.
+  - **The statuses and shapes read here.** Record an expired refund or settlement, an
+    `ERROR` verification, an epoch-millisecond settlement time or a string expiry if a run
+    meets one; none has yet.
+  - **An ACH and an EFT refund.** Refund a completed ACH payment and a completed EFT payment
+    once the settlement batch has run, and record whether Paysafe refunds each, and the code
+    of any refusal. The CAD sandbox account completed an EFT debit on 2026-07-15, so EFT can
+    run first; ACH needs an account provisioned for it. A refusal means refusing that rail
+    locally, as SEPA and Bacs are.

@@ -4010,8 +4010,10 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   2. `expired_card` (`expired_card`, `expired_payment_method`);
   3. `invalid_card_data` (`incorrect_number`, `invalid_number`, `incorrect_cvc`,
      `invalid_cvc`, `invalid_expiry_month`, `invalid_expiry_year`, `incorrect_zip`,
-     `incorrect_postal_code`, and in the browser Stripe.js's `incomplete_*` field codes);
-  4. `authentication_required`;
+     `incorrect_postal_code`, `incorrect_address` since #235, and in the browser Stripe.js's
+     `incomplete_*` field codes);
+  4. `authentication_required` (and, since #235, the decline code
+     `authentication_not_handled`);
   5. the fraud decline codes (`fraudulent`, `stolen_card`, `lost_card`, `merchant_blacklist`,
      and `lost_or_stolen_card`, a local payment method's), as `fraud_suspected`;
   6. the failed-authentication codes (`authentication_failure` and the intent-specific

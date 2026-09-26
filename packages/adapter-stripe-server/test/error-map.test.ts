@@ -158,6 +158,13 @@ describe("mapStripeError", () => {
       retryable: false,
     },
     {
+      // In the card-data step, so it comes before a fraud decline code on the same error.
+      name: "a wrong address with a fraud decline code",
+      err: { type: "StripeCardError", code: "incorrect_address", decline_code: "fraudulent", message: "…" },
+      code: "invalid_card_data",
+      retryable: false,
+    },
+    {
       name: "issuer decline for an expired card",
       err: { type: "StripeCardError", code: "card_declined", decline_code: "expired_card", message: "…" },
       code: "expired_card",
@@ -206,6 +213,13 @@ describe("mapStripeError", () => {
       name: "authentication_not_handled as an error code",
       err: { type: "StripeCardError", code: "authentication_not_handled", message: "…" },
       code: "card_declined",
+      retryable: false,
+    },
+    {
+      // Card data the customer can correct comes before the skipped authentication.
+      name: "a wrong CVC with a skipped authentication",
+      err: { type: "StripeCardError", code: "incorrect_cvc", decline_code: "authentication_not_handled", message: "…" },
+      code: "invalid_card_data",
       retryable: false,
     },
     {

@@ -1,5 +1,16 @@
 # @payfanout/adapter-adyen
 
+## 1.1.0
+
+### Minor Changes
+
+- e856737: Add a `cspNonce` option for pages with a nonce-based Content-Security-Policy: the adapter sets it as the `nonce` attribute of both the Adyen Web `<script>` and the stylesheet `<link>` it injects, and the constructor rejects a malformed nonce with `invalid_request`. The stylesheet now loads through core's `injectStylesheet`: a second adapter instance waits for a stylesheet another is still loading, a `<link rel="preload">` for the same URL no longer stands in for it, a stylesheet that fails to load stays on the page rather than being fetched again, and an empty `stylesheetUrl` loads no stylesheet instead of leaving `loadSdk()` pending.
+
+### Patch Changes
+
+- Updated dependencies [e856737]
+  - @payfanout/core@4.3.0
+
 ## 1.0.1
 
 ### Patch Changes

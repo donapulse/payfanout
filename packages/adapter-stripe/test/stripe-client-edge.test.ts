@@ -197,6 +197,11 @@ describe("StripeClientAdapter edge cases", () => {
       [{ type: "card_error", code: "expired_payment_method" }, "expired_card", false],
       [{ type: "card_error", code: "incorrect_postal_code" }, "invalid_card_data", false],
       [{ type: "card_error", code: "incorrect_zip" }, "invalid_card_data", false],
+      // A wrong address, as an error code or the issuer's decline code, like incorrect_zip.
+      [{ type: "card_error", code: "incorrect_address" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "card_declined", decline_code: "incorrect_address" }, "invalid_card_data", false],
+      // In the card-data step, so it comes before a fraud decline code on the same error.
+      [{ type: "card_error", code: "incorrect_address", decline_code: "fraudulent" }, "invalid_card_data", false],
       // Fraud decline codes, over a failed authentication on the same error as on the server.
       [{ type: "card_error", code: "card_declined", decline_code: "fraudulent" }, "fraud_suspected", false],
       [{ type: "card_error", code: "card_declined", decline_code: "stolen_card" }, "fraud_suspected", false],
@@ -213,6 +218,14 @@ describe("StripeClientAdapter edge cases", () => {
       // A required authentication, read from either code, comes before a fraud decline code.
       [{ type: "card_error", code: "authentication_required", decline_code: "fraudulent" }, "authentication_required", false],
       [{ type: "card_error", code: "card_declined", decline_code: "authentication_required" }, "authentication_required", false],
+      // The issuer's decline after a skipped authentication, in the same step, so a processing
+      // error cannot make it retryable; Stripe lists it as a decline code only.
+      [{ type: "card_error", code: "card_declined", decline_code: "authentication_not_handled" }, "authentication_required", false],
+      [{ type: "card_error", code: "processing_error", decline_code: "authentication_not_handled" }, "authentication_required", false],
+      [{ type: "card_error", code: "authentication_not_handled" }, "card_declined", false],
+      // Card data the customer can correct comes before the skipped authentication.
+      [{ type: "card_error", code: "incorrect_cvc", decline_code: "authentication_not_handled" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "incorrect_address", decline_code: "authentication_not_handled" }, "invalid_card_data", false],
       // The intent-specific failed authentications that accounts before dahlia still receive.
       [{ type: "card_error", code: "payment_intent_authentication_failure" }, "authentication_required", false],
       [{ type: "card_error", code: "setup_intent_authentication_failure" }, "authentication_required", false],

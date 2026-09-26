@@ -326,6 +326,7 @@ const INVALID_CARD_DATA_CODES = new Set([
   "invalid_cvc",
   "invalid_expiry_month",
   "invalid_expiry_year",
+  "incorrect_address",
   "incorrect_zip",
   "incorrect_postal_code",
   // Stripe.js refuses incomplete fields before anything is sent.
@@ -357,7 +358,11 @@ function classifyStripeJsError(error: StripeJsErrorLike | undefined): UnifiedErr
   if (either((value) => value === "insufficient_funds")) return "insufficient_funds";
   if (code === "expired_payment_method" || either((value) => value === "expired_card")) return "expired_card";
   if (either((value) => INVALID_CARD_DATA_CODES.has(value))) return "invalid_card_data";
-  if (either((value) => value === "authentication_required")) return "authentication_required";
+  // authentication_not_handled is only a decline code: the issuer declines again when
+  // the required authentication was skipped.
+  if (either((value) => value === "authentication_required") || decline === "authentication_not_handled") {
+    return "authentication_required";
+  }
   if (decline !== undefined && FRAUD_DECLINE_CODES.has(decline)) return "fraud_suspected";
   if (code !== undefined && AUTHENTICATION_FAILURE_CODES.has(code)) return "authentication_required";
   if (either((value) => value === "processing_error")) return "processing_error";

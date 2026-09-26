@@ -4012,8 +4012,10 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   2. `expired_card` (`expired_card`, `expired_payment_method`);
   3. `invalid_card_data` (`incorrect_number`, `invalid_number`, `incorrect_cvc`,
      `invalid_cvc`, `invalid_expiry_month`, `invalid_expiry_year`, `incorrect_zip`,
-     `incorrect_postal_code`, and in the browser Stripe.js's `incomplete_*` field codes);
-  4. `authentication_required`;
+     `incorrect_postal_code`, `incorrect_address` since #235, and in the browser Stripe.js's
+     `incomplete_*` field codes);
+  4. `authentication_required` (and, since #235, the decline code
+     `authentication_not_handled`);
   5. the fraud decline codes (`fraudulent`, `stolen_card`, `lost_card`, `merchant_blacklist`,
      and `lost_or_stolen_card`, a local payment method's), as `fraud_suspected`;
   6. the failed-authentication codes (`authentication_failure` and the intent-specific
@@ -4051,6 +4053,25 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `reenter_transaction` stay declines in both halves. The server reads Stripe's
   `processing_error` as retryable, and whether a retried confirmation of the same intent
   would help after those answers is not documented.
+- **Added 2026-09-26 (#235): `incorrect_address` joins step 3 and `authentication_not_handled`
+  step 4, in both halves.** Both were `card_declined` until then. Doc-verified 2026-09-26:
+  docs.stripe.com/declines/codes lists the decline code `incorrect_address`, "The address
+  entered by the customer is incorrect." (next step "The customer needs to try again using
+  the correct address."), and docs.stripe.com/error-codes the error code, "The card’s address
+  is incorrect. Check the card’s address or use a different card.", so it is read from either
+  code, as `incorrect_zip` is. The decline code `authentication_not_handled` reads "Related to
+  `authentication_required`. The customer tried to proceed without performing the required
+  authentication, so the issuer declined again.", next step "Run the EMV 3D Secure (3DS) or
+  strong customer authentication (SCA) flow. For off-session payments, collect and prepare
+  authentication on-session first, then fall back to on-session if needed.": the customer
+  comes back on-session to authenticate, which is what `authentication_required` stands for,
+  and in step 4 a `processing_error` on the same error cannot make it retryable. It is read
+  from `decline_code` only, as the fraud codes are: the error-codes page lists no error code
+  by that name, and neither does the `last_payment_error.code` enum of the Stripe Node SDK
+  the server adapter uses (22.6.2, generated from Stripe's OpenAPI spec v2442), which does
+  list `incorrect_address`. On the server both sit in the `StripeCardError` branch, with the
+  other card codes. No test card on docs.stripe.com/testing returns either code, so neither
+  is sandbox-verified.
 
 ## Worldline: Cartes Bancaires use case and MOTO (2026-09-26)
 

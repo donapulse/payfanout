@@ -10,6 +10,7 @@ import {
 } from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
 import {
+  deriveIdempotenceKey,
   encodeSessionContext,
   worldlineOnboarding,
   WorldlineServerAdapter,
@@ -542,16 +543,22 @@ describe("a 2xx CreatePayment carrying a REJECTED payment", () => {
     }
   });
 
-  it("answers a completion replayed under its key with the same rejection, however the card would fare now", async () => {
+  it("sends a completion repeated under its key after a REJECTED payment as a new attempt, which the new card decides", async () => {
     const { adapter, fake } = makePair();
     fake.rejectPayment = { errors: [apiError({ errorCode: "30431001" })] };
     const session = await adapter.createPaymentSession({ amount: 2500, currency: "EUR", idempotencyKey: "session-stolen" });
-    const input = { pspSessionId: session.pspSessionId, clientToken: "htp_stolen", idempotencyKey: "complete-stolen" };
-    const first = await adapter.completePayment(input).then(() => undefined, (err: unknown) => err);
-    fake.rejectPayment = undefined;
-    const second = await adapter.completePayment(input).then(() => undefined, (err: unknown) => err);
+    const complete = (clientToken: string) =>
+      adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken, idempotencyKey: "complete-stolen" });
+    const first = await complete("htp_stolen").then(() => undefined, (err: unknown) => err as PayFanoutError);
     expect(first).toMatchObject({ code: "fraud_suspected", retryable: false });
-    expect(second).toMatchObject({ code: "fraud_suspected", retryable: false });
-    expect(fake.uniquePaymentCreations).toBe(1);
+    const rejectedId = (first?.raw as { payment: { id: string } }).payment.id;
+    fake.rejectPayment = undefined;
+
+    const paid = await complete("htp_other");
+    expect(paid.status).toBe("succeeded");
+    expect(paid.pspPaymentId).not.toBe(rejectedId);
+    expect(fake.uniquePaymentCreations).toBe(2);
+    const linkOne = await deriveIdempotenceKey(`complete-stolen:after:${rejectedId}`);
+    expect(fake.paymentIdUnder(linkOne)).toBe(paid.pspPaymentId);
   });
 });

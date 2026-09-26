@@ -1,5 +1,12 @@
 # @payfanout/server
 
+## 2.1.2
+
+### Patch Changes
+
+- Updated dependencies [31c83be]
+  - @payfanout/core@4.4.0
+
 ## 2.1.1
 
 ### Patch Changes

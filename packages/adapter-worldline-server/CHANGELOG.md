@@ -1,5 +1,14 @@
 # @payfanout/adapter-worldline-server
 
+## 3.0.1
+
+### Patch Changes
+
+- f878008: `verifyCredentials` now reports `ok: true` only when Worldline's test-connection service answers OK. Any other answer that is neither an authentication rejection nor a transient error, such as the empty answer a wrong `baseUrl` override gets or a web page at a mis-pasted `baseUrl`, reports a failure with `category: "internal"` instead of `ok: true`, and its message names the HTTP status and, when it reads as one, Worldline's error id. The authentication-failure message now also names the `merchantId`, the environment and the server's clock, since Worldline answers a wrong one with the same 403 as a mismatched key, and the `baseUrl` when one is configured.
+- 31c83be: The `verifyCredentials` message now screens Worldline's error id with core's shared `repeatsSecret`: an id holding the API key id or the secret API key, or eight consecutive characters of either in any letter case, is left out.
+- Updated dependencies [31c83be]
+  - @payfanout/core@4.4.0
+
 ## 3.0.0
 
 ### Major Changes

@@ -152,6 +152,8 @@ imports its fonts from Google Fonts (`style-src https://fonts.googleapis.com`,
 `font-src https://fonts.gstatic.com`), and krypton-client adds an inline `<style>`
 element, so `style-src` also needs `'unsafe-inline'`. If you override the URLs with
 `scriptUrl` / `cssUrl` (your Back Office "JavaScript URL"), allow those hosts instead.
+The onboarding descriptor (`payzenOnboarding.csp`) also lists `https://api.payzen.eu`
+under `connect`: the served krypton-client names that host, and PayZen's list does not.
 :::
 
 ## 6. Offer several payment methods (smartForm)

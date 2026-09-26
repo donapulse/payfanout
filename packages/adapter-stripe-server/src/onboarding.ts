@@ -33,9 +33,10 @@ export const stripeOnboarding: AdapterOnboardingDescriptor = {
   },
   csp: {
     // Stripe's security guide adds *.js.stripe.com so Stripe.js can start frames on
-    // other origins; Link's hosts apply only to accounts that enable it.
+    // other origins. Link's hosts are listed because the Payment Element offers Link
+    // whenever the account enables it; its img-src host has no descriptor field.
     script: ["https://js.stripe.com", "https://*.js.stripe.com"],
-    frame: ["https://js.stripe.com", "https://*.js.stripe.com", "https://hooks.stripe.com"],
-    connect: ["https://api.stripe.com"],
+    frame: ["https://js.stripe.com", "https://*.js.stripe.com", "https://hooks.stripe.com", "https://link.com", "https://*.link.com"],
+    connect: ["https://api.stripe.com", "https://link.com", "https://*.link.com"],
   },
 };

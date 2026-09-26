@@ -130,21 +130,23 @@ const stripe = new StripeClientAdapter({
 
 ::: tip Content-Security-Policy
 Stripe.js loads from `https://js.stripe.com/v3` and renders card fields, 3DS, and
-redirect challenges in iframes. Stripe's security guide lists, for Stripe.js:
+redirect challenges in iframes. Stripe's security guide lists these sources for
+Stripe.js, and for Link, which the Payment Element offers when your account enables it:
 
 ```
 script-src  https://js.stripe.com https://*.js.stripe.com
 frame-src   https://js.stripe.com https://*.js.stripe.com https://hooks.stripe.com
-connect-src https://api.stripe.com
+            https://link.com https://*.link.com
+connect-src https://api.stripe.com https://link.com https://*.link.com
+img-src     https://*.link.com
 ```
 
 `https://*.js.stripe.com` lets Stripe.js start its frames on other origins to load faster.
-If your account enables Link, which the Payment Element then offers, Stripe also lists
-`frame-src` and `connect-src` `https://link.com https://*.link.com`, and `img-src
-https://*.link.com`. `https://maps.googleapis.com` is needed only with the Address
-Element and your own Google Maps key; this adapter mounts the Payment Element alone.
-Stripe.js must load from `https://js.stripe.com`: Stripe asks never to bundle or
-self-host it, and the script refuses to run from another origin.
+The guide also lists `https://maps.googleapis.com`, needed only with the Address Element
+and your own Google Maps key; this adapter mounts the Payment Element alone. Stripe.js
+must load from `https://js.stripe.com`: Stripe asks never to bundle or self-host it, and
+the script refuses to run from another origin. The `sdkUrl` config field only points the
+adapter at another `https://js.stripe.com` URL, such as a versioned build.
 :::
 
 ## 6. Register the webhook endpoint

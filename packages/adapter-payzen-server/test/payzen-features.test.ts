@@ -274,7 +274,7 @@ describe("mapPayZenError (envelope taxonomy)", () => {
       const start = source.indexOf(`const ${map}:`);
       if (start === -1) return [];
       const block = source.slice(start, source.indexOf("\n};", start));
-      return [...block.matchAll(/^\s*["']?(\w+)["']?\s*:\s*["']([a-z_]+)["'],/gm)].map((m) => `${m[1]}=${m[2]}`).sort();
+      return [...block.matchAll(/^\s*["']?(\w+)["']?\s*:\s*["']([a-z_]+)["'],?/gm)].map((m) => `${m[1]}=${m[2]}`).sort();
     };
     for (const map of ["ACQUIRER_CODE_MAP", "AUTH_CODE_MAP"]) {
       const server = await entries("../src/adapter.ts", map);

@@ -259,8 +259,9 @@ not what it does with the 3-D Secure data a MOTO payment carries. The adapter se
 unchanged, so a MOTO payment Worldline does not treat as excluded still goes through 3-D Secure
 rather than skipping it. A challenge then comes back as `requires_action` like any other, and on
 a telephone order it would open in the browser the card was typed into, not the cardholder's,
-so such a payment stays unfinished instead of being charged without authentication. Run one
-MOTO payment in the sandbox before you rely on it (§10).
+so such a payment stays unfinished instead of being charged without authentication. A
+`challenge: "force"` on the same session still sends `challengeIndicator: "challenge-required"`,
+as Stripe's adapter does. Run one MOTO payment in the sandbox before you rely on it (§10).
 
 `confirm()` hands the server a JSON `clientToken`,
 `{"hostedTokenizationId":"…","device":{…}}`. It carries browser characteristics only, never
@@ -643,10 +644,15 @@ current list there** rather than assuming.
 
 - [ ] Before you switch, run one **challenge-flow** test card (§9) end to end in sandbox, so
       the return to your `returnUrl` and the `retrievePayment` reconciliation are exercised.
+- [ ] Accepting Cartes Bancaires? Run one frictionless and one challenge card from the
+      Cartes Bancaires block of Worldline's test cases (§9), which exercise the use case the
+      adapter sends on every card payment.
 - [ ] Sending `sca: { exemption: "moto" }`? Run one MOTO payment end to end in sandbox too,
       since what Worldline does with its 3-D Secure data is undocumented (§6). For MOTO
       payments taken in its e-Terminal, Worldline requires an acquirer that allows them and the
-      feature enabled on your account; check both for your API account.
+      feature enabled on your account, and asks you to "Meet the PCI DSS certification SAQ
+      C-VT": check all three for your API account. Card details your staff key in bring their
+      workstations into PCI DSS scope, so confirm your SAQ with your acquirer.
 - [ ] Swap in the **live** API key id + secret and the **live** merchant id.
 - [ ] Plan the live API key renewal ahead of its *Expiration date* (Developer → Payment API):
       the old pair expires within four hours of creating a new one, so deploy the new pair
@@ -656,8 +662,8 @@ current list there** rather than assuming.
 - [ ] Register the **live** webhook endpoint in the portal and use its **live** key id + secret.
 - [ ] Keep `WORLDLINE_SESSION_KEY` stable and secret in production, rotate it deliberately
       (it invalidates in-flight sessions), and store it like any other secret.
-- [ ] Verify card fields are still the Worldline Hosted Tokenization iframe (SAQ-A), no raw
-      card input.
+- [ ] Verify card fields are still the Worldline Hosted Tokenization iframe, no raw card
+      input: SAQ-A for card details the cardholder enters.
 - [ ] Re-check endpoint paths, webhook event types, and error codes against the current
       Worldline documentation.
 

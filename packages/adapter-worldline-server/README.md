@@ -129,7 +129,8 @@ SCA, but not what it does with that data, so a MOTO payment it does not treat as
 still goes through 3-D Secure rather than skipping it. A challenge then comes back as
 `requires_action`, and on a telephone order it would open in the browser the card was typed
 into, not the cardholder's, so such a payment stays unfinished instead of being charged
-without authentication. Run one MOTO payment in the sandbox before relying on it.
+without authentication. MOTO needs an acquirer and a Worldline account that allow it; run one
+MOTO payment in the sandbox before relying on it.
 
 Session creation also refuses, with `invalid_request` and before any call to Worldline, an
 `id` longer than 40 characters (it travels as `order.references.merchantReference`) and a

@@ -225,11 +225,11 @@ export class FakeWorldlineApi {
     const requestedAt = this.clock;
     this.clock += 1000;
     const { status, body: answer } = this.processCreatePayment(body);
-    const text = JSON.stringify(answer);
+    const serialized = JSON.stringify(answer);
     // Every answer the fake gives is a completed request's, a refusal included:
     // the guide's "For completed requests" read literally.
-    if (idemKey) this.createAnswerByIdemKey.set(idemKey, { status, body: text, requestedAt });
-    return new Response(text, { status, headers: { "content-type": "application/json" } });
+    if (idemKey) this.createAnswerByIdemKey.set(idemKey, { status, body: serialized, requestedAt });
+    return new Response(serialized, { status, headers: { "content-type": "application/json" } });
   }
 
   private processCreatePayment(body: Record<string, unknown>): { status: number; body: unknown } {

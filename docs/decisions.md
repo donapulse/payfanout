@@ -4070,7 +4070,11 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `src/Builder/PaymentRequestBuilder.php`, plugin-magento-creditcard
   `Service/CreatePaymentRequest/CardPaymentMethodSIDBuilder.php`). The guide's `useCase` does
   not outweigh them: the same list writes `order.customer.billingaddress.city` next to
-  `order.customer.billingAddress.countryCode`.
+  `order.customer.billingAddress.countryCode`. Worldline's Cartes Bancaires payment-method
+  page (docs.direct.worldline-solutions.com/en/payment-methods-and-features/payment-methods/cartes-bancaires)
+  does not name `paymentProduct130SpecificInput`; the implementation guide's mandatory list is
+  the more specific statement, so an audit working from that page should not drop the
+  property.
 - **Whatever the brand, and always `single-amount`.** The adapter does not read the card
   before creating the payment. GetHostedTokenization would name its product
   (`token.paymentProductId`), at the cost of a call on every completion, to withhold a property
@@ -4101,14 +4105,17 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   treat as excluded then goes through 3-D Secure instead of skipping it. The cost: on a
   telephone order, a challenge opens in the browser the card was typed into, not the
   cardholder's, so that payment stays unfinished rather than being charged unauthenticated.
+  The device data is that operator's browser too, the same for every order they key in, so a
+  frictionless pass on a MOTO payment would rest on data that is not the cardholder's.
   Sandbox check: complete a MOTO session with the frictionless and the challenge test cards,
   and record whether Worldline accepts each, whether the challenge card still answers with a
-  REDIRECT merchantAction, and what an account without MOTO enabled answers. For MOTO payments
+  REDIRECT merchantAction, what `cardPaymentMethodSpecificOutput.threeDSecureResults` (eci,
+  liability) shows on the frictionless one, and what an account without MOTO enabled answers. For MOTO payments
   taken in the e-Terminal, the e-Terminal page
   (docs.direct.worldline-solutions.com/en/design-and-test-tools/applications/merchant-portal/e-terminal)
-  asks "Ensure your acquirer allows you to process mail order/telephone order (MOTO)
-  transactions. Have the feature enabled on your account."; the guide passes that on to hosts
-  until the check shows what API payments need.
+  asks "Meet the PCI DSS certification SAQ C-VT. Ensure your acquirer allows you to process
+  mail order/telephone order (MOTO) transactions. Have the feature enabled on your account.";
+  the guide passes all three on to hosts until the check shows what API payments need.
 - **The fake checks both properties against the contract.** It rejects a `transactionChannel`
   other than `ECOMMERCE` or `MOTO`, a `paymentProduct130SpecificInput` or `threeDSecure` that is
   not an object, a `usecase` outside the five values, a `numberOfItems` that is not an integer
@@ -4116,4 +4123,7 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   a string of at most 20 characters. It models no card brands, so it does not refuse a Cartes
   Bancaires payment sent without the use case; the adapter's tests check that every
   CreatePayment carries it, those of a completion walked past a decline included.
-- **Doc-derived only.** No sandbox run has sent either property.
+- **Doc-derived only.** No sandbox run has sent either property. Sandbox check for the use
+  case: pay with one frictionless and one challenge card from the "Cartes Bancaires" block of
+  the test cases page (docs.direct.worldline-solutions.com/en/integration/how-to-integrate/test-cases/)
+  and record whether CreatePayment accepts `usecase`.

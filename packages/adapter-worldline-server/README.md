@@ -55,19 +55,28 @@ server-completion route for it).
 
 Because PayFanout persists nothing, this adapter's session is a **signed, self-contained
 context**: amount, currency, capture method, and the `hostedTokenizationId` are HMAC-signed
-into `pspSessionId` at creation and verified at `completePayment`. The browser round-trips the
-token but cannot tamper with the amount, and every context carries an **expiry**
-(`sessionTtlSeconds`, default 1h) enforced at completion. `encodeSessionContext` /
-`decodeSessionContext` are exported for advanced use.
+into `pspSessionId` at creation and verified at `completePayment`. Whoever holds the token
+cannot tamper with the amount, and every context carries an **expiry** (`sessionTtlSeconds`,
+default 1h) enforced at completion. `encodeSessionContext` / `decodeSessionContext` are
+exported for advanced use.
+
+The context is signed, not encrypted: whoever holds `pspSessionId` can read it, `metadata`
+included, so keep secrets as well as personal data out of it and keep `pspSessionId` on your
+server (`createCompletionHandler` never needs it in the browser). Metadata at Worldline's
+1000-character limit (below) adds up to about 4 KB to `pspSessionId`: 1,350 characters when it
+is ASCII, and 3,995 when every character takes three UTF-8 bytes, as `€` does.
 
 The host id round-trips via `order.references.merchantReference` (`PaymentInfo.id`), and the
 session's `metadata` via `order.references.merchantParameters`, sent JSON-encoded and echoed
 by Worldline on reads and webhooks: `retrievePayment` reports it as `PaymentInfo.metadata`, and
 `readWorldlineWebhookMetadata(event)` reads it from a webhook's payment. Worldline caps the
-field at 1000 characters, so a session whose metadata, JSON-encoded, is longer is refused with
-`invalid_request` before any call to Worldline, as is a metadata value that is not a string.
+field at 1000 characters, so a session whose metadata, as the JSON sent, is longer or is not an
+object of string values is refused with `invalid_request` before any call to Worldline.
 Worldline also says the field "must not contain any personal data": keep personal data out of
-a Worldline session's metadata. The adapter cannot tell and sends what it is given.
+a Worldline session's metadata. The adapter cannot tell and sends what it is given. **Before
+upgrading from 2.x**, which ignored session metadata, remove personal data from it and keep it
+within that limit ([Set up Worldline](https://donapulse.github.io/payfanout/guide/worldline),
+step 7).
 
 ## Authentication
 
@@ -196,10 +205,12 @@ Session creation also refuses, with `invalid_request` and before any call to Wor
 - Worldline Direct exposes no public events-list API (`supportsEventPolling: false`), so
   missed-webhook recovery falls back to `retrievePayment` per order.
 - `PaymentInfo.createdAt` is the payment's `paymentOutput.transactionDate`, which Worldline
-  describes as "the server-side processing date and time of the transaction"; a value without
-  a zone is read as UTC. Whether a later capture or refund moves it is undocumented and not
-  yet sandbox-verified, so keep your own record of when an order was placed. A payment that
-  reports none, or one that is not a date, gets `1970-01-01T00:00:00.000Z`.
+  describes as "the server-side processing date and time of the transaction", read only when
+  it carries a time zone (`Z`, `±HH:MM` or `±HH`): Worldline names no zone for a value without
+  one, and its own SDKs read such a value differently. Whether a later capture or refund moves
+  it is undocumented and not yet sandbox-verified, so keep your own record of when an order was
+  placed. A payment that reports none, one without a time zone, or one that is not a date,
+  gets `1970-01-01T00:00:00.000Z`.
 - Card vaulting, zero-amount verification, session update, and listing are out of scope for
   this version (declared `false`).
 - A capture or cancellation the acquirer refuses leaves the payment authorised: it reads

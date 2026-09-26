@@ -31,8 +31,10 @@ import type {
  *     of the API Troubleshooting page, or 503
  *   - order.references.merchantParameters, a string of at most 1000
  *     characters (UTF-16 code units, as for the other limits here), stored and
- *     echoed as paymentOutput.references.merchantParameters on reads and
- *     webhooks, never on the deprecated paymentOutput.merchantParameters
+ *     echoed as paymentOutput.references.merchantParameters on GetPayment and
+ *     webhooks, where the API contract documents the echo, and never on the
+ *     payment a CreatePayment or CancelPayment answer carries, nor on the
+ *     deprecated paymentOutput.merchantParameters
  *   - paymentOutput.transactionDate, stamped when the payment is created and
  *     left as it is by later operations: the creation-time reading of "the
  *     server-side processing date and time of the transaction", which no
@@ -415,7 +417,7 @@ export class FakeWorldlineApi {
             actionType: "REDIRECT",
             redirectData: { redirectURL: `https://payment.preprod.direct.worldline-solutions.com/3ds/challenge/${id}` },
           },
-          payment: publicPayment(payment),
+          payment: publicPayment(payment, "answer"),
         },
       };
     }
@@ -601,7 +603,10 @@ export class FakeWorldlineApi {
       return {
         status: 200,
         body: {
-          payment: publicPayment({ ...payment, status: "CANCELLATION_REJECTED", statusCode: 63, statusCategory: "UNSUCCESSFUL" }),
+          payment: publicPayment(
+            { ...payment, status: "CANCELLATION_REJECTED", statusCode: 63, statusCategory: "UNSUCCESSFUL" },
+            "answer",
+          ),
         },
       };
     }
@@ -614,11 +619,11 @@ export class FakeWorldlineApi {
       payment.statusCode = 61;
       return {
         status: 200,
-        body: { payment: { ...publicPayment(payment), statusOutput: { statusCode: 61, statusCategory: "PENDING_MERCHANT" } } },
+        body: { payment: { ...publicPayment(payment, "answer"), statusOutput: { statusCode: 61, statusCategory: "PENDING_MERCHANT" } } },
       };
     }
     payment.statusCode = 6;
-    return { status: 200, body: { payment: publicPayment(payment) } };
+    return { status: 200, body: { payment: publicPayment(payment, "answer") } };
   }
 
   private refund(id: string, body: Record<string, unknown>, idemKey: string | undefined): Response {
@@ -727,10 +732,15 @@ export class FakeWorldlineApi {
   }
 }
 
-function publicPayment(payment: StoredPayment): WorldlinePaymentLike {
+/**
+ * The payment as GetPayment and webhooks show it, or as a POST `answer`
+ * carries it, without the merchantParameters echo the API contract documents
+ * "in API GET calls and Webhook notifications" only.
+ */
+function publicPayment(payment: StoredPayment, view: "read" | "answer" = "read"): WorldlinePaymentLike {
   const references = {
     ...(payment.merchantReference ? { merchantReference: payment.merchantReference } : {}),
-    ...(payment.merchantParameters !== undefined ? { merchantParameters: payment.merchantParameters } : {}),
+    ...(view === "read" && payment.merchantParameters !== undefined ? { merchantParameters: payment.merchantParameters } : {}),
   };
   return {
     id: payment.id,
@@ -761,7 +771,7 @@ function createResponse(payment: StoredPayment): {
   creationOutput: unknown;
   payment: WorldlinePaymentLike;
 } {
-  return { creationOutput: { tokens: "" }, payment: publicPayment(payment) };
+  return { creationOutput: { tokens: "" }, payment: publicPayment(payment, "answer") };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

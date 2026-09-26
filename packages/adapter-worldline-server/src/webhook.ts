@@ -223,7 +223,9 @@ export async function parseWorldlineWebhookEvent(rawBody: string): Promise<Unifi
  * the adapter sent. `UnifiedWebhookEvent` has no metadata field, so this reads
  * the event's `raw` delivery. Undefined for another PSP's event, a delivery
  * without a payment resource (a refund resource alone, a payment link), or an
- * echo that is not metadata the adapter wrote.
+ * echo that is not metadata the adapter wrote. A refund resource's own
+ * merchantParameters is never read: it is the refund's, which RefundPayment
+ * takes in its own request and the adapter never sends, not the payment's.
  */
 export function readWorldlineWebhookMetadata(event: UnifiedWebhookEvent): Record<string, string> | undefined {
   if (event.pspName !== "worldline") return undefined;

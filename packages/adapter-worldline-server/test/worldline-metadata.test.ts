@@ -105,22 +105,58 @@ function metadataOfLength(length: number, character = "x"): Record<string, strin
   return metadata;
 }
 
-/** A CreatePayment body within every documented limit, sent straight to the fake. */
-async function postCreatePayment(fake: FakeWorldlineApi, references: Record<string, unknown>) {
-  const response = await fake.fetch(PAYMENTS_URL, {
-    method: "POST",
-    headers: { authorization: "GCS v1HMAC:api-key-id:signature", "content-type": "application/json" },
-    body: JSON.stringify({
-      order: { amountOfMoney: { amount: 1000, currencyCode: "EUR" }, references },
-      hostedTokenizationId: "htp_1",
-      cardPaymentMethodSpecificInput: {
-        authorizationMode: "SALE",
-        returnUrl: RETURN_URL,
-        threeDSecure: { skipAuthentication: false, redirectionData: { returnUrl: RETURN_URL } },
-      },
-    }),
+interface FakeAnswer {
+  status: number;
+  body: {
+    errors?: Array<{ propertyName?: string }>;
+    payment?: { id: string };
+    paymentResult?: { payment?: { id: string } };
+  };
+}
+
+/** A request straight to the fake, signed as the adapter would sign it. */
+async function callFake(fake: FakeWorldlineApi, method: "GET" | "POST", url: string, body?: unknown): Promise<FakeAnswer> {
+  const response = await fake.fetch(url, {
+    method,
+    headers: {
+      authorization: "GCS v1HMAC:api-key-id:signature",
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
-  return { status: response.status, body: (await response.json()) as { errors?: Array<{ propertyName?: string }> } };
+  return { status: response.status, body: (await response.json()) as FakeAnswer["body"] };
+}
+
+/** A CreatePayment body within every documented limit, sent straight to the fake. */
+function postCreatePayment(
+  fake: FakeWorldlineApi,
+  references: Record<string, unknown>,
+  { amount = 1000, hostedTokenizationId = "htp_1", authorizationMode = "SALE" } = {},
+): Promise<FakeAnswer> {
+  return callFake(fake, "POST", PAYMENTS_URL, {
+    order: { amountOfMoney: { amount, currencyCode: "EUR" }, references },
+    hostedTokenizationId,
+    cardPaymentMethodSpecificInput: {
+      authorizationMode,
+      returnUrl: RETURN_URL,
+      threeDSecure: { skipAuthentication: false, redirectionData: { returnUrl: RETURN_URL } },
+    },
+  });
+}
+
+/** An adapter whose CreatePayment answers come from the fake, their paymentOutput edited on the way back. */
+function editingCreateAnswers(edit: (paymentOutput: Record<string, unknown>) => void) {
+  const fake = new FakeWorldlineApi();
+  const { adapter } = makePair({
+    fetch: async (input, init) => {
+      const response = await fake.fetch(input, init);
+      if (init?.method !== "POST" || !new URL(String(input)).pathname.endsWith("/payments")) return response;
+      const answer = (await response.json()) as { payment: { paymentOutput: Record<string, unknown> } };
+      edit(answer.payment.paymentOutput);
+      return new Response(JSON.stringify(answer), { status: response.status, headers: response.headers });
+    },
+  });
+  return { adapter, fake };
 }
 
 describe("session metadata travels as order.references.merchantParameters", () => {
@@ -135,11 +171,47 @@ describe("session metadata travels as order.references.merchantParameters", () =
     expect((await decodeSessionContext(session.pspSessionId, SIGNING_KEY)).metadata).toEqual(METADATA);
   });
 
-  it("reads it back on a 3-D Secure challenge's answer", async () => {
+  it("reports on a 3-D Secure challenge's answer the metadata it sent, which the answer does not echo, and reads Worldline's echo on retrievePayment", async () => {
     const { adapter } = makePair();
     const { info } = await complete(adapter, { metadata: METADATA }, "htp_3ds");
     expect(info.status).toBe("requires_action");
+    expect(JSON.stringify(info.raw)).not.toContain("merchantParameters");
     expect(info.metadata).toEqual(METADATA);
+    expect((await adapter.retrievePayment(info.pspPaymentId)).metadata).toEqual(METADATA);
+  });
+
+  it("reports a challenge answer's own echo whenever it carries one, and the metadata sent only when it carries none", async () => {
+    const cases: Array<[string, (paymentOutput: Record<string, unknown>) => void, Record<string, string> | undefined]> = [
+      ["no echo", () => {}, METADATA],
+      ["an echo of null", (output) => (output["references"] = { merchantParameters: null }), METADATA],
+      ["an echo of null on the deprecated field", (output) => (output["merchantParameters"] = null), METADATA],
+      ["an echo", (output) => (output["references"] = { merchantParameters: JSON.stringify({ source: "echo" }) }), { source: "echo" }],
+      [
+        "an echo on the deprecated field only",
+        (output) => (output["merchantParameters"] = JSON.stringify({ source: "deprecated" })),
+        { source: "deprecated" },
+      ],
+      ["an echo that is not metadata", (output) => (output["references"] = { merchantParameters: "SessionID=126548354" }), undefined],
+    ];
+    for (const [label, edit, expected] of cases) {
+      const { adapter } = editingCreateAnswers(edit);
+      const { info } = await complete(adapter, { metadata: METADATA }, "htp_3ds");
+      expect(info.status, label).toBe("requires_action");
+      expect(info.metadata, label).toEqual(expected);
+    }
+  });
+
+  it("reports an earlier session's metadata on the payment a completion under its key returns, not its own session's", async () => {
+    for (const card of ["htp_1", "htp_3ds"]) {
+      const { adapter, fake } = makePair();
+      const first = await complete(adapter, { metadata: { order: "first" } }, card);
+      // Another session completed under the same key: Worldline replays the first answer.
+      const { info } = await complete(adapter, { metadata: { order: "second" } }, "htp_other");
+      expect(info.pspPaymentId, card).toBe(first.info.pspPaymentId);
+      expect(info.status, card).toBe(first.info.status);
+      expect(info.metadata, card).toEqual({ order: "first" });
+      expect(fake.uniquePaymentCreations, card).toBe(1);
+    }
   });
 
   it("reads it back from the payment's webhook through readWorldlineWebhookMetadata", async () => {
@@ -185,6 +257,33 @@ describe("session metadata travels as order.references.merchantParameters", () =
     expect(sentReferences(fake)).toEqual({ merchantReference: "order-old" });
     expect(info).not.toHaveProperty("metadata");
   });
+
+  it("sends none for a hand-minted context whose metadata is empty or not an object, and reports none on its challenge", async () => {
+    for (const metadata of [{}, "plan=pro"]) {
+      for (const [clientToken, status] of [["htp_1", "succeeded"], ["htp_3ds", "requires_action"]] as const) {
+        const label = `${JSON.stringify(metadata)} ${clientToken}`;
+        const context = await encodeSessionContext(
+          {
+            v: 1,
+            amount: 1000,
+            currency: "EUR",
+            captureMethod: "automatic",
+            hostedTokenizationId: clientToken,
+            expiresAt: Date.now() + 60_000,
+            returnUrl: RETURN_URL,
+            id: "order-minted",
+            metadata: metadata as unknown as Record<string, string>,
+          },
+          SIGNING_KEY,
+        );
+        const { adapter, fake } = makePair();
+        const info = await adapter.completePayment({ pspSessionId: context, clientToken, idempotencyKey: "complete-minted" });
+        expect(info.status, label).toBe(status);
+        expect(sentReferences(fake), label).toEqual({ merchantReference: "order-minted" });
+        expect(info, label).not.toHaveProperty("metadata");
+      }
+    }
+  });
 });
 
 describe("merchantParameters holds at most 1000 characters", () => {
@@ -220,22 +319,44 @@ describe("merchantParameters holds at most 1000 characters", () => {
     expect((await complete(makePair().adapter, { metadata: accented })).info.metadata).toEqual(accented);
   });
 
-  it("refuses metadata that is not an object of strings before any call to Worldline", async () => {
-    const cases: Array<[unknown, Record<string, unknown>]> = [
-      [{ plan: "pro", seats: 3 }, { key: "seats" }],
-      [{ gift: true }, { key: "gift" }],
-      [{ note: null }, { key: "note" }],
-      [{ plan: { tier: "pro" } }, { key: "plan" }],
-      ["plan=pro", {}],
-      [["pro"], {}],
+  it("refuses metadata whose JSON is not an object of strings before any call to Worldline", async () => {
+    class Tier {
+      readonly plan = "pro";
+      // What JSON.stringify sends, and what reads back, is this, not the string above.
+      toJSON(): Record<string, unknown> {
+        return { plan: 1 };
+      }
+    }
+    const cycle: Record<string, unknown> = { plan: "pro" };
+    cycle["self"] = cycle;
+    const cases: Array<[string, unknown, Record<string, unknown>]> = [
+      ["a number value", { plan: "pro", seats: 3 }, { key: "seats" }],
+      ["a boolean value", { gift: true }, { key: "gift" }],
+      ["a null value", { note: null }, { key: "note" }],
+      ["a nested object", { plan: { tier: "pro" } }, { key: "plan" }],
+      ["a toJSON that makes a number of a string entry", new Tier(), { key: "plan" }],
+      ["a string", "plan=pro", {}],
+      ["an array", ["pro"], {}],
+      ["a Date, whose JSON is a string", new Date(0), {}],
+      ["a BigInt value, which JSON cannot hold", { seats: 3n }, {}],
+      ["a cycle, which JSON cannot hold", cycle, {}],
+      ["a function, which has no JSON", () => "pro", {}],
     ];
-    for (const [metadata, raw] of cases) {
+    for (const [label, metadata, raw] of cases) {
       const { adapter, fetchSpy } = makePair();
       const error = await refusal(adapter, metadata);
-      expect(error, JSON.stringify(metadata)).toMatchObject({ code: "invalid_request", retryable: false });
-      expect(error?.raw).toEqual({ propertyName: PROPERTY_NAME, ...raw });
-      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(error, label).toMatchObject({ code: "invalid_request", retryable: false });
+      expect(error?.raw, label).toEqual({ propertyName: PROPERTY_NAME, ...raw });
+      expect(fetchSpy, label).not.toHaveBeenCalled();
     }
+  });
+
+  it("checks the JSON that is sent, so an entry JSON leaves out is not sent and reads back absent", async () => {
+    const { adapter, fake } = makePair();
+    const { session, info } = await complete(adapter, { metadata: { plan: "pro", coupon: undefined } as unknown as Record<string, string> });
+    expect(sentReferences(fake)?.["merchantParameters"]).toBe('{"plan":"pro"}');
+    expect(info.metadata).toStrictEqual({ plan: "pro" });
+    expect((await decodeSessionContext(session.pspSessionId, SIGNING_KEY)).metadata).toStrictEqual({ plan: "pro" });
   });
 
   it("the fake rejects merchantParameters over 1000 characters that a hand-minted context carries to it", async () => {
@@ -281,6 +402,32 @@ describe("merchantParameters holds at most 1000 characters", () => {
       }
     }
   });
+
+  it("the fake echoes it on GetPayment and webhooks only, never on the payment a CreatePayment or CancelPayment answer carries", async () => {
+    const cases: Array<[string, Parameters<typeof postCreatePayment>[2], number]> = [
+      ["a sale", {}, 201],
+      ["a decline's paymentResult", { amount: 1302 }, 402],
+      ["a 3-D Secure challenge", { hostedTokenizationId: "htp_3ds" }, 201],
+      ["an authorisation", { authorizationMode: "PRE_AUTHORIZATION" }, 201],
+    ];
+    for (const [label, options, status] of cases) {
+      const fake = new FakeWorldlineApi();
+      const answer = await postCreatePayment(fake, { merchantReference: "order-7", merchantParameters: "p=1" }, options);
+      expect(answer.status, label).toBe(status);
+      expect(JSON.stringify(answer.body), label).toContain('"merchantReference":"order-7"');
+      expect(JSON.stringify(answer.body), label).not.toContain("merchantParameters");
+      const id = answer.body.payment?.id ?? answer.body.paymentResult?.payment?.id ?? "";
+      const read = (await callFake(fake, "GET", `${PAYMENTS_URL}/${id}`)).body as WorldlinePaymentLike;
+      expect(read.paymentOutput?.references, label).toEqual({ merchantReference: "order-7", merchantParameters: "p=1" });
+      const delivered = fake.webhookBody(id, "payment.created")["payment"] as WorldlinePaymentLike;
+      expect(delivered.paymentOutput?.references, label).toEqual({ merchantReference: "order-7", merchantParameters: "p=1" });
+      if (options?.authorizationMode === "PRE_AUTHORIZATION") {
+        const cancelled = await callFake(fake, "POST", `${PAYMENTS_URL}/${id}/cancel`);
+        expect(cancelled.status, label).toBe(200);
+        expect(JSON.stringify(cancelled.body), label).not.toContain("merchantParameters");
+      }
+    }
+  });
 });
 
 describe("the merchantParameters echo reads back only as metadata the adapter could have written", () => {
@@ -299,6 +446,7 @@ describe("the merchantParameters echo reads back only as metadata the adapter co
     ["a number instead of a string", 42],
     ["an object instead of a string", { plan: "pro" }],
     ["a boolean instead of a string", true],
+    ["an array holding the metadata's JSON instead of a string", [JSON.stringify(METADATA)]],
   ];
   for (const [label, merchantParameters] of ignored) {
     it(`reads ${label} as no metadata, without throwing`, async () => {
@@ -370,12 +518,16 @@ describe("the merchantParameters echo reads back only as metadata the adapter co
 describe("createdAt comes from paymentOutput.transactionDate", () => {
   const readable: Array<[string, string]> = [
     ["2026-09-26T10:15:30Z", "2026-09-26T10:15:30.000Z"],
-    ["2026-09-26T10:15:30", "2026-09-26T10:15:30.000Z"],
     ["2026-09-26T10:15:30.5Z", "2026-09-26T10:15:30.500Z"],
-    ["2026-09-26T10:15:30.1239876", "2026-09-26T10:15:30.123Z"],
+    ["2026-09-26T10:15:30.1239876Z", "2026-09-26T10:15:30.123Z"],
     ["2026-09-26T12:15:30+02:00", "2026-09-26T10:15:30.000Z"],
     ["2026-09-26T08:45:30.25-01:30", "2026-09-26T10:15:30.250Z"],
+    // Hour-only offsets, which Worldline's Java SDK reads.
+    ["2026-09-26T12:15:30+02", "2026-09-26T10:15:30.000Z"],
+    ["2026-09-26T09:15:30.5-01", "2026-09-26T10:15:30.500Z"],
+    ["2026-09-26T10:15:30-00:00", "2026-09-26T10:15:30.000Z"],
     ["2026-09-27T00:30:00+01:00", "2026-09-26T23:30:00.000Z"],
+    ["1999-12-31T23:30:00-01:00", "2000-01-01T00:30:00.000Z"],
     ["2028-02-29T23:59:59Z", "2028-02-29T23:59:59.000Z"],
   ];
   for (const [transactionDate, expected] of readable) {
@@ -384,28 +536,39 @@ describe("createdAt comes from paymentOutput.transactionDate", () => {
     });
   }
 
-  it("reads a transactionDate without a zone as UTC, whatever the server's time zone", async () => {
+  it("reads a transactionDate with a zone alike whatever the server's time zone, and one without a zone as none", async () => {
     const previous = process.env.TZ;
     const systemZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     process.env.TZ = "Asia/Kolkata";
     try {
       expect(new Date(2026, 8, 26).getTimezoneOffset()).toBe(-330);
-      expect((await readBack(captured({ transactionDate: "2026-09-26T10:15:30" }))).createdAt).toBe("2026-09-26T10:15:30.000Z");
+      expect((await readBack(captured({ transactionDate: "2026-09-26T10:15:30Z" }))).createdAt).toBe("2026-09-26T10:15:30.000Z");
+      expect((await readBack(captured({ transactionDate: "2026-09-26T10:15:30" }))).createdAt).toBe(EPOCH);
     } finally {
       process.env.TZ = previous ?? systemZone;
     }
   });
 
   const unreadable: Array<[string, unknown]> = [
+    ["no time zone", "2026-09-26T10:15:30"],
+    ["no time zone, with a fraction", "2026-09-26T10:15:30.1239876"],
     ["a February 30", "2026-02-30T10:15:30Z"],
     ["a February 29 outside a leap year", "2026-02-29T10:15:30Z"],
     ["a September 31", "2026-09-31T10:15:30Z"],
     ["a 13th month", "2026-13-01T10:15:30Z"],
+    ["year 0099, which Date.UTC would take for 1999", "0099-09-26T10:15:30Z"],
     ["hour 24", "2026-09-26T24:00:00Z"],
     ["a leap second", "2026-06-30T23:59:60Z"],
     ["a space instead of the T", "2026-09-26 10:15:30Z"],
     ["a date without a time", "2026-09-26"],
+    ["text before the date", "x2026-09-26T10:15:30Z"],
+    ["text after the zone", "2026-09-26T10:15:30Zx"],
+    ["an offset of 24 hours", "2026-09-26T10:15:30+24:00"],
+    ["an hour-only offset of 24", "2026-09-26T10:15:30+24"],
+    ["an offset of 60 minutes", "2026-09-26T10:15:30+02:60"],
     ["an offset without a colon", "2026-09-26T10:15:30+0200"],
+    ["a colon without offset minutes", "2026-09-26T10:15:30+02:"],
+    ["a one-digit offset", "2026-09-26T10:15:30+2"],
     ["a decimal point without digits", "2026-09-26T10:15:30.Z"],
     ["a lower-case zone", "2026-09-26T10:15:30z"],
     ["another format", "26/09/2026 10:15:30"],
@@ -413,6 +576,7 @@ describe("createdAt comes from paymentOutput.transactionDate", () => {
     ["epoch milliseconds", 1790410530000],
     ["null", null],
     ["an object", { value: "2026-09-26T10:15:30Z" }],
+    ["an array holding a date", ["2026-09-26T10:15:30Z"]],
   ];
   for (const [label, transactionDate] of unreadable) {
     it(`keeps the 1970 placeholder for ${label}`, async () => {

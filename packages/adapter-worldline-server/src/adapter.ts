@@ -30,7 +30,12 @@ import {
   type VerifyCredentialsResult,
 } from "@payfanout/core";
 import { decodeWorldlineClientToken, type WorldlineCustomerDevice } from "./client-token.js";
-import { assertMerchantParametersFit, readMerchantParameters, toMerchantParameters } from "./merchant-parameters.js";
+import {
+  assertMerchantParametersFit,
+  metadataAsSent,
+  readMerchantParameters,
+  toMerchantParameters,
+} from "./merchant-parameters.js";
 import { buildV1HmacAuthorization, deriveIdempotenceKey } from "./signing.js";
 import {
   decodeSessionContext,
@@ -350,7 +355,8 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
    * readWorldlineWebhookMetadata reads it from a webhook. Worldline's API
    * contract says of that field: "This field must not contain any personal
    * data." Keep personal data out of a Worldline session's metadata; the
-   * adapter sends what it is given.
+   * adapter sends what it is given. The context is signed, not encrypted:
+   * whoever holds `pspSessionId` can read it, the metadata included.
    *
    * Refused with invalid_request before anything reaches Worldline when the
    * session has no return URL (neither a non-empty `returnUrl` nor the
@@ -359,10 +365,10 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
    * when `id` is longer than the 40 characters
    * `order.references.merchantReference` accepts, when
    * `statementDescriptor` is longer than the 256 characters
-   * `order.references.softDescriptor` accepts, or when `metadata` has a value
-   * that is not a string or, JSON-encoded, is longer than the 1000 characters
-   * `order.references.merchantParameters` accepts (UTF-16 code units, so an
-   * emoji counts two).
+   * `order.references.softDescriptor` accepts, or when the JSON sent for
+   * `metadata` is not an object of string values or is longer than the 1000
+   * characters `order.references.merchantParameters` accepts (UTF-16 code
+   * units, so an emoji counts two).
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertMinorUnitAmount(input.amount, "amount");
@@ -387,6 +393,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       {},
       input.idempotencyKey,
     );
+    const metadata = metadataAsSent(input.metadata);
     const context: WorldlineSessionContextV1 = {
       v: 1,
       amount: input.amount,
@@ -401,8 +408,8 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       receiptEmail: input.receiptEmail,
       shippingDetails: input.shippingDetails,
       sca: input.sca,
-      // Carried only when there is something to send as merchantParameters.
-      ...(toMerchantParameters(input.metadata) ? { metadata: input.metadata } : {}),
+      // As the JSON sent for it reads back, and only when that has entries.
+      ...(metadata ? { metadata } : {}),
     };
     const token = await encodeSessionContext(context, this.config.sessionSigningKey);
     return {
@@ -442,7 +449,12 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
    *
    * A REDIRECT merchantAction (3-D Secure challenge) surfaces as
    * requires_action with the redirect URL on `raw`; the customer completes it
-   * and the host reconciles with retrievePayment. A decline rejects with the
+   * and the host reconciles with retrievePayment. Its `metadata` is the
+   * answer's merchantParameters echo when it carries one. The API contract
+   * documents that echo on GET calls and webhooks only, so without one it is
+   * the metadata the payment's request carried: this call's for the call's own
+   * payment, and for an earlier attempt's, the metadata that payment reads
+   * back with. A decline rejects with the
    * same error code whether Worldline answers it with a 402 or with a 2xx
    * carrying a REJECTED payment (see mapWorldlineError); `raw` is the error
    * body in the first case and the whole CreatePayment response in the second.
@@ -587,13 +599,16 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       });
     }
     const challenge = created.merchantAction?.actionType?.toUpperCase() === "REDIRECT";
-    const asChallenge = (): PaymentInfo =>
+    // `metadataFallback`: what the request that made the payment carried,
+    // reported only if the answer echoes no merchantParameters.
+    const asChallenge = (metadataFallback: Record<string, string> | undefined): PaymentInfo =>
       this.buildPaymentInfo(payment, {
         raw: created,
         payfanoutId: context.id,
         statusOverride: "requires_action",
         amountFallback: context.amount,
         currencyFallback: context.currency,
+        metadataFallback,
       });
     const answered = paymentStatus(payment);
     const { replayOf } = answer;
@@ -601,7 +616,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       // The request named the session's own amount and currency, so a payment
       // for another answers another request: a replay whose header was lost.
       assertSessionsPayment(payment, context);
-      if (challenge) return { info: asChallenge() };
+      if (challenge) return { info: asChallenge(metadataAsSent(context.metadata)) };
       // Some Worldline flows answer 2xx with a REJECTED payment rather than an
       // HTTP error. It throws a rejection mapped from the payment's own
       // statusOutput.errors, as the 402 path does from the error body, rather
@@ -622,7 +637,9 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     const current = await this.readBack(payment.id, context);
     if (walkable(answered, current)) return failed({ payment: current.raw as WorldlinePaymentLike });
     assertSessionsPayment(current.raw as WorldlinePaymentLike, context);
-    return { info: challenge && current.status === "requires_action" ? asChallenge() : current };
+    // A replayed attempt's payment may be an earlier session's, so the
+    // metadata it reads back with stands in, not this session's.
+    return { info: challenge && current.status === "requires_action" ? asChallenge(current.metadata) : current };
   }
 
   /**
@@ -687,8 +704,9 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
    * createPaymentSession). `createdAt` is the payment's
    * `paymentOutput.transactionDate`, which Worldline describes as "the
    * server-side processing date and time of the transaction" without saying
-   * whether a later capture or refund moves it; a value without a zone is read
-   * as UTC. Without a readable one it is 1970-01-01T00:00:00.000Z.
+   * whether a later capture or refund moves it. It is read only with a time
+   * zone: Z, `±HH:MM` or `±HH`. Without a readable one, a value without a zone
+   * included, it is 1970-01-01T00:00:00.000Z.
    */
   async retrievePayment(pspPaymentId: string, payfanoutId?: string): Promise<PaymentInfo> {
     const payment = await this.fetchPayment(pspPaymentId);
@@ -945,6 +963,8 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       amountRefunded?: number;
       amountFallback?: number;
       currencyFallback?: string;
+      /** The metadata reported when the payment echoes no merchantParameters (see readMerchantParameters). */
+      metadataFallback?: Record<string, string>;
     } = {},
   ): PaymentInfo {
     const output = payment.paymentOutput ?? {};
@@ -954,7 +974,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       opts.statusOverride ??
       mapWorldlineStatus(payment.status, payment.statusOutput?.statusCode, payment.statusOutput?.statusCategory);
     const methodDetails = toPaymentMethodDetails(output.cardPaymentMethodSpecificOutput);
-    const metadata = readMerchantParameters(output);
+    const metadata = readMerchantParameters(output, opts.metadataFallback);
     return {
       id: opts.payfanoutId ?? merchantReference ?? payment.id,
       pspName: this.pspName,
@@ -1169,24 +1189,26 @@ function parseExpiry(expiryDate: string | undefined): { month?: number; year?: n
 const UNKNOWN_CREATED_AT = "1970-01-01T00:00:00.000Z";
 
 /**
- * The API contract's pattern for paymentOutput.transactionDate, whose trailing
- * Z is optional, extended to the explicit offset a date-time may carry, as the
- * webhooks guide's envelope examples do on `created`.
+ * The API contract's pattern for paymentOutput.transactionDate with its time
+ * zone made mandatory, as the RFC 3339 date-time of its `format` has it, and
+ * widened to the offsets Worldline's Java SDK reads besides Z: `±HH:MM`, as on
+ * the webhooks guide's envelope `created`, and `±HH`.
  */
 const TRANSACTION_DATE =
-  /^([12]\d{3})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):([0-5]\d):([0-5]\d)(?:\.(\d+))?(?:Z|([+-])([01]\d|2[0-3]):([0-5]\d))?$/;
+  /^([12]\d{3})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):([0-5]\d):([0-5]\d)(?:\.(\d+))?(?:Z|([+-])([01]\d|2[0-3])(?::([0-5]\d))?)$/;
 
 /**
  * A transactionDate as ISO 8601 UTC, or undefined when it is not one. A value
- * without a zone is UTC, as the contract gives GetPaymentsReport's
- * transactionDate ("in UTC"), never the server's local time; fractional
- * seconds are truncated to milliseconds, and a day the month does not have
- * (February 30) is no date.
+ * without a time zone is not read: the contract names no zone for it, and
+ * Worldline's own SDKs disagree on one (Java refuses the value; .NET and PHP
+ * take the zone they run in), so any reading could be hours out. An hour-only
+ * offset has no minutes, fractional seconds are truncated to milliseconds,
+ * and a day the month does not have (February 30) is no date.
  */
 function readTransactionDate(value: unknown): string | undefined {
   const match = typeof value === "string" ? TRANSACTION_DATE.exec(value) : null;
   if (!match) return undefined;
-  const [, year, month, day, hours, minutes, seconds, fraction = "", sign, offsetHours, offsetMinutes] = match;
+  const [, year, month, day, hours, minutes, seconds, fraction = "", sign, offsetHours, offsetMinutes = "00"] = match;
   const milliseconds = Number(fraction.slice(0, 3).padEnd(3, "0"));
   const wallClock = Date.UTC(
     Number(year),

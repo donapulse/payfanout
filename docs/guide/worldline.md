@@ -55,8 +55,8 @@ the host from `environment` (`sandbox → payment.preprod.direct.worldline-solut
 ::: danger One secret you generate yourself
 `sessionSigningKey` is **not issued by Worldline.** Because PayFanout is stateless, the
 Worldline "session" is a **signed, self-contained token**, amount, currency, capture method,
-and the `hostedTokenizationId` are HMAC-signed into it so the browser can round-trip it but
-cannot tamper with the amount. That HMAC key is **yours**. Generate a strong random secret
+and the `hostedTokenizationId` are HMAC-signed into it so whoever holds it cannot tamper with
+the amount. That HMAC key is **yours**. Generate a strong random secret
 once and keep it stable:
 
 ```bash
@@ -329,11 +329,21 @@ JSON-encoded, and Worldline echoes it "back to you in API GET calls and Webhook
 notifications": `retrievePayment` reports it as `PaymentInfo.metadata`, and
 `readWorldlineWebhookMetadata(event)` reads it from a webhook's payment, since the unified
 event carries no metadata. Both read it only when the echo is a JSON object of string values,
-as the adapter writes it, so a value another integration stored there reads as no metadata.
-Worldline accepts at most 1000 characters in the field: a session whose metadata, JSON-encoded,
-is longer is refused with `invalid_request` before anything reaches Worldline, as is a
-metadata value that is not a string. The adapter counts UTF-16 code units, in which an emoji
-counts two.
+as the adapter writes it, so a value in another format, such as the contract's example query
+string, reads as no metadata. The `requires_action` answer of a 3-D Secure challenge comes from
+the CreatePayment answer, on which the contract does not document the echo: it reports the
+metadata the completion sent, unless the answer carries an echo, which it reports instead.
+
+Worldline accepts at most 1000 characters in the field. A session whose metadata, as the JSON
+the adapter sends, is longer or is not an object of string values is refused with
+`invalid_request` before anything reaches Worldline. The check runs on that JSON, so an entry
+JSON leaves out, such as one whose value is `undefined`, is neither sent nor refused. Worldline
+does not say what it counts as a character: Unicode code points, UTF-16 code units or UTF-8
+bytes. The adapter counts UTF-16 code units, in which an emoji counts two, so metadata it
+accepts is within 1000 code points and 1000 code units. In UTF-8 bytes any character outside
+ASCII counts more than one, so if Worldline counts bytes, metadata with such characters can
+pass this check and still be refused by CreatePayment once the customer has entered a card. No
+sandbox run has settled the unit yet.
 
 ::: warning No personal data in Worldline metadata
 Worldline's API contract says of `merchantParameters`: "This field must not contain any
@@ -341,11 +351,30 @@ personal data." Keep personal data, such as names and email addresses, out of th
 of a Worldline session. The adapter cannot tell it apart and sends what it is given.
 :::
 
+`pspSessionId` is signed, not encrypted: whoever holds it can read the session context it
+carries, `metadata` included, so keep secrets as well as personal data out of it and keep
+`pspSessionId` on your server (`createCompletionHandler` never needs it in the browser).
+Metadata at the limit adds up to about 4 KB to `pspSessionId`: 1,350 characters when it is
+ASCII, and 3,995 when every character takes three UTF-8 bytes, as `€` does.
+
+::: warning Upgrading from 2.x
+Up to 2.x the adapter ignored a Worldline session's `metadata`; it now reaches Worldline.
+Before upgrading, remove personal data from the metadata of your Worldline sessions and keep it
+within the limit above: session creation now refuses metadata whose JSON is longer than 1000
+characters or is not an object of string values, with a non-retryable `invalid_request`.
+`PaymentRouter` does not fail over on that code, so behind the router such a session is
+refused instead of being routed to another provider.
+:::
+
 `PaymentInfo.createdAt` is the payment's `paymentOutput.transactionDate`, which the API
-contract describes as "the server-side processing date and time of the transaction"; a value
-without a zone is read as UTC. Worldline does not say whether a later capture or refund moves
-it, and no sandbox run has checked yet, so keep your own record of when an order was placed.
-A payment that reports none, or one that is not a date, gets `1970-01-01T00:00:00.000Z`.
+contract describes as "the server-side processing date and time of the transaction". It is read
+only when it carries a time zone: `Z`, `±HH:MM` or `±HH`. The contract's pattern makes the zone
+optional without saying what a value without one is in, and Worldline's own SDKs disagree: the
+Java SDK refuses such a value, and the .NET and PHP SDKs read it in the time zone they run in.
+A payment that reports none, one without a time zone, or one that is not a date, gets
+`1970-01-01T00:00:00.000Z`, a visibly unknown date rather than one that could be hours out.
+Worldline does not say whether a later capture or refund moves `transactionDate`, and no
+sandbox run has checked yet, so keep your own record of when an order was placed.
 
 ### Paying again under the same key
 
@@ -356,7 +385,8 @@ card after a failed attempt: when the key answers with a replayed failure, `comp
 sends the payment again under a key derived from yours and the failed attempt, and goes on
 from there. Every completion walks the same keys in the same order and stops at the first
 attempt that did not fail, so a completion repeated after a success returns that payment and
-charges nothing.
+charges nothing. A completion that returns an earlier session's payment reports that payment's
+`metadata`, not its own session's.
 
 An attempt counts as failed only once its payment was declined, or reads Cancelled (1). When the
 replayed answer does not already say so, `completePayment` reads the payment back first:
@@ -691,8 +721,8 @@ current list there** rather than assuming.
       feature enabled on your account, and asks you to "Meet the PCI DSS certification SAQ
       C-VT": check all three for your API account. Card details your staff key in bring their
       workstations into PCI DSS scope, so confirm your SAQ with your acquirer.
-- [ ] Sending session `metadata`? Keep personal data out of it (§7), and check in sandbox that
-      `retrievePayment` and your webhooks read it back.
+- [ ] Sending session `metadata`? Keep personal data and secrets out of it (§7), and check in
+      sandbox that `retrievePayment` and your webhooks read it back.
 - [ ] Swap in the **live** API key id + secret and the **live** merchant id.
 - [ ] Plan the live API key renewal ahead of its *Expiration date* (Developer → Payment API):
       the old pair expires within four hours of creating a new one, so deploy the new pair

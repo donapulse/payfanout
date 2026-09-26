@@ -240,6 +240,77 @@ bank-debit errors after which you start again under a new key, once a later retr
 fails and the Paysafe portal shows every payment under the old one as failed or cancelled,
 or none at all.
 
+### Captures and refunds
+
+With `captureMethod: "manual"`, `completePayment` authorizes the card (`requires_capture`)
+and `capturePayment(pspPaymentId, amount, idempotencyKey)` settles it. Refunds come out of
+settlements, and Paysafe finds a settlement again only by its `merchantRefNum`, so the way
+you capture decides what `refundPayment` can reach later:
+
+- **Capture in full to keep a payment refundable.** A capture with no `amount` (everything
+  that remains) or with the authorized amount settles under a reference derived from the
+  payment, `payfanout-capture-<pspPaymentId>`, never under your key, so the Paysafe portal
+  shows that reference for the settlement, not your key. `retrievePayment` and
+  `refundPayment` look the reference up: the capture time and refunds show, and refunds
+  come out of that settlement. A capture that finds the payment already captured there
+  answers with that settlement, under the same key or another, and sends nothing. After
+  partial captures (below), a capture of the authorized amount is refused with a
+  non-retryable `invalid_request` before any settlement request, saying how much is left:
+  capture the rest with no `amount`. Once the rest is captured, the same capture is
+  refused as already captured in full. A capture, with no `amount` or the authorized
+  amount, when nothing is left and no full capture shows is refused as having nothing left
+  to capture, after reading the next reference again: a full capture made moments ago can
+  trail in Paysafe's lookup, so check `retrievePayment` before treating the payment as not
+  captured.
+- **A full capture that moved no money frees the next reference.** Once a full capture
+  failed, or its settlement was cancelled while pending or expired, a new full capture,
+  under any key, settles under `payfanout-capture-<pspPaymentId>-a2`, then `-a3`, up to
+  `-a10`, and reads follow the references in that order. When all ten hold settlements
+  that moved no money, a full capture is refused with `invalid_request` naming them:
+  capture the payment in the Paysafe portal, and refund it there too, since PayFanout does
+  not find a settlement made there.
+- **A partial capture stays out of reach.** Any other amount settles under your
+  `idempotencyKey`, which must be unique across the merchant account and may not start
+  with `payfanout-capture-` (such a key is refused before any settlement request), and no
+  read can find that settlement from the payment. Its amount still counts in
+  `amountCaptured`, which Paysafe's `availableToSettle` witnesses, but it shows no
+  `capturedAt`, and `refundPayment` cannot refund it: with no other settlement to refund
+  from, it rejects with `invalid_request`. Every capture's answer carries its settlement
+  on `raw.captureSettlement`, beside the payment's own fields: keep a partial capture's
+  `id`, and refund that settlement in the Paysafe portal, whose transaction search takes
+  an id or a merchant transaction ID (your key). Capturing the rest afterwards (no
+  `amount`) settles it under the payment's reference: that part is refundable here, and
+  `amountCaptured` counts the partial captures before it.
+- **Captures made by earlier releases.** Earlier releases of this adapter settled every
+  capture made with an idempotency key (every capture, since 1.0.0) under that key, full
+  captures included, so `refundPayment` cannot reach those settlements either: refund them
+  in the Paysafe portal.
+- **A void after partial captures.** `cancelPayment` voids what remains and its answer
+  reports the captured split. A later `retrievePayment` cannot tell the partial captures
+  from the voided remainder, since `availableToSettle` is its only witness, and reports the
+  whole authorization as captured.
+- **Older payments stay refundable.** Paysafe's settlement lookup covers the last 30 days
+  unless told otherwise, so the lookups that find a payment's settlements, for a read, a
+  refund, a cancel or a full capture, start the day before the payment. The reads after a
+  lost answer keep the default window: they look for a write made moments before.
+  Paysafe documents no longest range. If it refuses the range as a request error, the
+  lookup is sent once more over the default 30 days, and since a reference can then look
+  empty while older records under it are out of sight, reads go on past empty references
+  to the payment's later ones, ten at most. Any other failure of a lookup, an outage or a
+  rate limit, fails the call as it maps (retryable for those two) instead of reading as no
+  settlement, and a full capture sends nothing after it. A capture that has settled
+  answers without a settlement lookup, so an outage then cannot fail it.
+- **A payment that moved no money has no settlement.** A declined or cancelled payment
+  settled nothing, so `retrievePayment` reports no capture or refund on it and
+  `refundPayment` refuses it, even when another payment carries the same reference, as the
+  payment that went through does after a declined card under the same completion key.
+- **Two payments under one completion key.** Two completions sent under one key before
+  either shows in Paysafe's lookup can both be charged (§10). A manually captured payment
+  never looks its completion key up, only its own references, so its reads and refunds
+  stay its own. An automatically captured payment's settlement is filed under the
+  completion key, so in that case each of the two reports both settlements and can refund
+  either: keep one completion in flight per order.
+
 ## 8. Interac e-Transfer (Canada)
 
 Paysafe.js cannot tokenize Interac e-Transfer — it is a Payments-API rail — so PayFanout
@@ -405,11 +476,13 @@ and a payments call spends the single-use handle whatever its outcome, so a seco
 with that handle answers `5283`. The adapter is built around that rather than around blind
 retries, for every write it makes:
 
-- Every payment, payment handle (vault saves included), capture, void, refund and
-  verification sends your `idempotencyKey` as its `merchantRefNum`. Customer profiles key
-  on `merchantCustomerId` instead (your customer `id`, or the key), native subscriptions on
-  the `merchantRefNum` you pass (or the key), and deleting a saved card carries no key: the
-  vault is checked instead.
+- Every payment, payment handle (vault saves included), partial capture, void, refund and
+  verification sends your `idempotencyKey` as its `merchantRefNum`. A full capture sends
+  `payfanout-capture-<pspPaymentId>` instead, or the next of its `-a2` to `-a10` references
+  once a full capture has moved no money (see §7, "Captures and refunds"). Customer
+  profiles key on `merchantCustomerId` (your customer `id`, or the key), native
+  subscriptions on the `merchantRefNum` you pass (or the key), and deleting a saved card
+  carries no key: the vault is checked instead.
 - `dupCheck` is `true` on saved-card charges, captures, refunds and verifications, and
   `false` on card and Interac completions, whose single-use handle already refuses a second
   charge. With `dupCheck: true`, a card declined under your completion key would block every
@@ -435,9 +508,11 @@ retries, for every write it makes:
   `merchantRefNum`, and when Paysafe has the record it becomes the call's result. A payment,
   capture or refund is never re-sent after that: when the lookup cannot show it, the call
   fails with a non-retryable `processing_error` that names the `merchantRefNum`. Retry it
-  later with the **same** key, never a new one, which could repeat the payment. A payment
-  handle, verification or void moves no money, so it is re-sent once the lookup shows
-  nothing. A 429 is re-sent after backoff, because Paysafe refused it unprocessed.
+  later with the **same** key, never a new one, which could repeat the payment. A full
+  capture's error says to retry the full capture later instead: its reference comes from
+  the payment, so any key reads the same settlement. A payment handle, verification or
+  void moves no money, so it is re-sent once the lookup shows nothing. A 429 is re-sent
+  after backoff, because Paysafe refused it unprocessed.
 - A key already used for a **different** amount or currency, or for a different saved card
   or verification card, rejects with `invalid_request`: give every new payment its own
   key. When the payment, capture or refund already under the key may have moved money (it
@@ -452,8 +527,8 @@ retries, for every write it makes:
   the failed attempt's payment handle states its amount. On a card, Interac or bank-debit
   completion a new card is a new attempt under the same key; a payment the key already
   made is returned instead, and a fully voided one comes back `canceled` (start a new
-  attempt after a void under a new key). Capture, cancel and refund keys must be unique
-  across the merchant account, because Paysafe's lookups for them are account-wide.
+  attempt after a void under a new key). Partial-capture, cancel and refund keys must be
+  unique across the merchant account, because Paysafe's lookups for them are account-wide.
 - A duplicate whose original cannot be read back rejects with the same non-retryable
   `processing_error`. A fresh write can take a moment to appear, and the lookup only
   covers the last 30 days, so an original older than that can never be read back:
@@ -494,7 +569,8 @@ retries, for every write it makes:
 each exchange with Paysafe, and one call can make several: a read up to
 `1 + maxNetworkRetries` attempts, a write up to `1 + maxNetworkRetries` attempts with up to
 three lookups after one that went unanswered, and many calls read before they write (a
-completion reads its key, a refund the payment and its settlements). If Paysafe hangs on
+completion reads its key, a refund the payment and its settlements, a full capture the
+payment and its settlement references). If Paysafe hangs on
 every exchange, one write can take about `(1 + maxNetworkRetries) × 4 × requestTimeoutMs`,
 plus `(1 + maxNetworkRetries) × requestTimeoutMs` for each read before it: minutes, at the
 defaults. On a platform that ends requests sooner (serverless functions often allow 25-30

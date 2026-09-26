@@ -86,9 +86,11 @@ type RefNumIndex<T> = Map<string, T[]>;
  * - capture, refund and void state checks answer the documented 402 codes
  *   (3203/3204, 3402/3404, 3501/3502), and a refund of an unknown
  *   settlement 400/3407;
- * - the GET ?merchantRefNum= lookups answer the documented collections, over
- *   their default window ("Default = 30 days before the endDate"), while
- *   dupCheck looks back 90 days (`passDays` ages what is filed).
+ * - the GET ?merchantRefNum= lookups answer the documented collections, from
+ *   `startDate` to `endDate` ("This is the start date in UTC. Default = 30
+ *   days before the endDate.", "This is the end date in UTC. Default =
+ *   current date and time."), while dupCheck looks back 90 days. Records are
+ *   filed and timed on the fake's own date, which `passDays` moves on.
  * Where Paysafe documents nothing — a reused merchantRefNum without dupCheck
  * on /payments, /paymenthandles or /voidauths — the fake takes the dangerous
  * reading and processes the request again, so no test can pass on an
@@ -136,6 +138,8 @@ export class FakePaysafeApi {
   private seq = 0;
   uniqueHandleCreations = 0;
   uniquePaymentCreations = 0;
+  /** Settlements captures made; one a payment settles with its authorization is not counted. */
+  uniqueSettlementCreations = 0;
   uniqueRefundCreations = 0;
   uniqueCustomerCreations = 0;
   uniquePlanCreations = 0;
@@ -177,6 +181,21 @@ export class FakePaysafeApi {
    * follows is undocumented (docs/decisions.md).
    */
   refusalSpendsHandle = true;
+  /**
+   * The widest startDate-to-endDate range, in days, the lookups accept.
+   * Paysafe documents none, so none by default; past it a lookup is refused
+   * as a field error (400/5068), Paysafe's answer to a value it cannot take.
+   */
+  lookupRangeLimitDays: number | undefined = undefined;
+  /**
+   * A settlement refused on state (3203, 3204) files no record the lookup
+   * shows; whether its merchantRefNum still counts under dupCheck is
+   * undocumented. Set true for the reading where it does: a settlement under
+   * that reference is then refused (5031) for 90 days, with nothing to read back.
+   */
+  stateRefusalHoldsReference = false;
+  /** Settlement references a state refusal holds, and the day it did. */
+  private readonly heldSettlementRefs = new Map<string, number>();
 
   constructor() {
     this.multiUseTokens.add(SEEDED_MULTI_USE_TOKEN);
@@ -228,12 +247,35 @@ export class FakePaysafeApi {
   }
 
   /**
-   * Everything filed so far grows `days` older. Past 30 days a record leaves
-   * the lookups, which the adapter reads over their default window, and past
-   * 90 days dupCheck no longer counts it.
+   * The fake's date moves `days` on, so everything filed so far grows that
+   * much older. Past 30 days a record leaves a lookup sent without a
+   * startDate, and past 90 days dupCheck no longer counts it.
    */
   passDays(days: number): void {
     this.today += days;
+  }
+
+  /**
+   * A settlement cancelled outside the adapter, in the portal or with Cancel
+   * Settlement (`PUT /settlements/{id}`, status CANCELLED), which Paysafe
+   * allows "only if the payment type is CARD and the status is PENDING". What
+   * the authorization has left to settle afterwards is undocumented: the fake
+   * takes the reading under which it can be captured again, and returns the
+   * amount to availableToSettle.
+   */
+  cancelSettlement(settlementId: string): void {
+    for (const payment of this.payments.values()) {
+      const settlement = payment.settlements?.find((s) => s.id === settlementId);
+      if (!settlement) continue;
+      if (settlement.status !== "PENDING" || payment.paymentType !== "CARD") {
+        throw new Error(`Settlement ${settlementId} is not a pending card settlement`);
+      }
+      settlement.status = "CANCELLED";
+      settlement.availableToRefund = 0;
+      payment.availableToSettle = (payment.availableToSettle ?? 0) + (settlement.amount ?? 0);
+      return;
+    }
+    throw new Error(`No settlement ${settlementId} to cancel`);
   }
 
   /** A payment answered PROCESSING fails afterwards, as a bank debit can: its record turns FAILED with this error. */
@@ -417,7 +459,8 @@ export class FakePaysafeApi {
 
   /**
    * GET /<collection>?merchantRefNum=: every record filed under the
-   * reference, in the documented `{ <collection>: [...], meta }` shape.
+   * reference within the lookup's dates, in the documented
+   * `{ <collection>: [...], meta }` shape.
    */
   private lookup<T>(
     collection: string,
@@ -431,13 +474,18 @@ export class FakePaysafeApi {
         error: { code: "5068", message: "Field error(s)", fieldErrors: [{ field: "merchantRefNum", error: "Value is required." }] },
       });
     }
+    const window = this.lookupWindow(params);
+    if (window instanceof Response) return window;
     const lagKey = `${collection} ${refNum}`;
     const lag = this.lookupLag.get(lagKey) ?? 0;
     if (lag > 0) {
       this.lookupLag.set(lagKey, lag - 1);
       return json(200, { meta: { numberOfRecords: 0 }, [collection]: [] });
     }
-    let filed = (index.get(refNum) ?? []).filter((record) => this.ageOf(record) <= LOOKUP_WINDOW_DAYS);
+    let filed = (index.get(refNum) ?? []).filter((record) => {
+      const day = this.filedDay(record);
+      return day >= window.from && day <= window.to;
+    });
     for (const trailing of this.trailingHandles) {
       if (trailing.collection !== collection || trailing.remaining <= 0) continue;
       const shown = filed.filter((record) => handleTokenOf(record) !== trailing.paymentHandleToken);
@@ -450,6 +498,24 @@ export class FakePaysafeApi {
     const offset = Number(params.get("offset") ?? 0);
     const records = filed.map(view).slice(offset, offset + limit);
     return json(200, { meta: { numberOfRecords: records.length }, [collection]: records });
+  }
+
+  /**
+   * The days a lookup covers, both ends included: `startDate` to `endDate`,
+   * UTC dates, by default the 30 days up to today. A date that is not
+   * YYYY-MM-DD is a field error, and so is a range the caller set past
+   * lookupRangeLimitDays; the default range is always accepted.
+   */
+  private lookupWindow(params: URLSearchParams): { from: number; to: number } | Response {
+    const start = params.get("startDate");
+    const end = params.get("endDate");
+    const to = end === null ? this.today : dayOfDate(end);
+    if (to === undefined) return fieldError("endDate");
+    const from = start === null ? to - LOOKUP_WINDOW_DAYS : dayOfDate(start);
+    if (from === undefined) return fieldError("startDate");
+    const limit = this.lookupRangeLimitDays;
+    if (limit !== undefined && (start !== null || end !== null) && to - from > limit) return fieldError("startDate");
+    return { from, to };
   }
 
   /**
@@ -491,7 +557,7 @@ export class FakePaysafeApi {
       status: "INITIATED",
       action: "REDIRECT",
       usage: "SINGLE_USE",
-      txnTime: "2026-07-04T10:00:00Z",
+      txnTime: this.stamp("10:00:00"),
       links: [{ rel: "redirect_payment", href: `https://api.test.paysafe.com/alternatepayments/v1/redirect?paymentHandleId=${id}` }],
       ...(interac ? { interacEtransfer: { consumerId: interac.consumerId, type: interac.type ?? "EMAIL" } } : {}),
     };
@@ -541,7 +607,7 @@ export class FakePaysafeApi {
       amount: body["amount"] as number,
       status: "PAYABLE",
       usage: "SINGLE_USE",
-      txnTime: "2026-07-04T10:00:00Z",
+      txnTime: this.stamp("10:00:00"),
       ...(echo ? { [railKey]: echo } : {}),
     };
     this.fileHandle(refNum, handle, {
@@ -582,13 +648,27 @@ export class FakePaysafeApi {
     this.filedOn.set(record, this.today);
   }
 
+  private filedDay(record: unknown): number {
+    return this.filedOn.get(record as object) ?? this.today;
+  }
+
   private ageOf(record: unknown): number {
-    return this.today - (this.filedOn.get(record as object) ?? this.today);
+    return this.today - this.filedDay(record);
+  }
+
+  /** A txnTime on the fake's current date. */
+  private stamp(time: string): string {
+    return `${new Date(FAKE_EPOCH_MS + this.today * DAY_MS).toISOString().slice(0, 10)}T${time}Z`;
   }
 
   /** dupCheck: "a previous request within the past 90 days". */
   private isFiled<T extends object>(index: RefNumIndex<T>, refNum: string): boolean {
     return (index.get(refNum) ?? []).some((record) => this.ageOf(record) <= DUP_CHECK_DAYS);
+  }
+
+  private isHeld(refNum: string): boolean {
+    const day = this.heldSettlementRefs.get(refNum);
+    return day !== undefined && this.today - day <= DUP_CHECK_DAYS;
   }
 
   private createPayment(body: Record<string, unknown>): Response {
@@ -641,7 +721,7 @@ export class FakePaysafeApi {
             amount,
             currencyCode,
             settleWithAuth,
-            txnTime: "2026-07-04T10:00:00Z",
+            txnTime: this.stamp("10:00:00"),
             paymentType: this.railHandles.get(token)?.paymentType ?? "CARD",
             error: { code: failure.code, message: failure.message },
           };
@@ -658,7 +738,7 @@ export class FakePaysafeApi {
       availableToSettle: settleWithAuth ? 0 : amount,
       currencyCode,
       settleWithAuth,
-      txnTime: "2026-07-04T10:00:00Z",
+      txnTime: this.stamp("10:00:00"),
       paymentType: "CARD",
       // Real API echoes masked instrument facts on the payment object (cardType, not type).
       card: { cardType: "VI", lastDigits: "1111", cardExpiry: { month: 12, year: 2030 } },
@@ -683,7 +763,7 @@ export class FakePaysafeApi {
         status: "PROCESSING",
         amount,
         availableToRefund: 0,
-        txnTime: "2026-07-04T10:00:01Z",
+        txnTime: this.stamp("10:00:01"),
       };
       payment.settlements = [settlement];
       this.file(this.settlementsByRef, refNum, settlement);
@@ -699,7 +779,7 @@ export class FakePaysafeApi {
         amount,
         availableToRefund: amount,
         refundedAmount: 0,
-        txnTime: "2026-07-04T10:00:01Z",
+        txnTime: this.stamp("10:00:01"),
       };
       payment.settlements = [settlement];
       this.file(this.settlementsByRef, refNum, settlement);
@@ -726,7 +806,8 @@ export class FakePaysafeApi {
     if (!payment) return json(404, { error: { code: "5269", message: "No such payment" } });
     const refNum = body["merchantRefNum"] as string;
     // Settlements default dupCheck to true.
-    const reused = body["dupCheck"] !== false && this.isFiled(this.settlementsByRef, refNum);
+    const checked = body["dupCheck"] !== false;
+    const reused = checked && (this.isFiled(this.settlementsByRef, refNum) || this.isHeld(refNum));
     if (reused && !this.stateCheckFirst) return duplicateRefNum();
     // Real Paysafe rejects settlements without an explicit amount.
     if (typeof body["amount"] !== "number") {
@@ -737,15 +818,19 @@ export class FakePaysafeApi {
     const settleAmount = body["amount"] as number;
     // Real API allows MULTIPLE partial settlements while availableToSettle covers them.
     const remaining = payment.availableToSettle ?? payment.amount ?? 0;
+    const refusedOnState = (code: string, message: string): Response => {
+      if (checked && this.stateRefusalHoldsReference) this.heldSettlementRefs.set(refNum, this.today);
+      return stateRejection(code, message);
+    };
     if (payment.status !== "COMPLETED" || payment.settleWithAuth || remaining <= 0) {
-      return stateRejection("3203", "The Authorization is either fully settled or cancelled.");
+      return refusedOnState("3203", "The Authorization is either fully settled or cancelled.");
     }
     if (settleAmount > remaining) {
-      return stateRejection("3204", "The requested Settlement amount exceeds the remaining Authorization amount.");
+      return refusedOnState("3204", "The requested Settlement amount exceeds the remaining Authorization amount.");
     }
     if (reused) return duplicateRefNum();
     if (this.activeFailure) {
-      const failed = { id: `stl_${++this.seq}`, merchantRefNum: refNum, ...failedRecord(this.activeFailure), amount: settleAmount };
+      const failed = { id: `stl_${++this.seq}`, merchantRefNum: refNum, ...failedRecord(this.activeFailure, this.stamp("10:00:00")), amount: settleAmount };
       this.file(this.settlementsByRef, refNum, failed);
       return json(this.activeFailure.status, { error: failed.error });
     }
@@ -756,11 +841,12 @@ export class FakePaysafeApi {
       amount: settleAmount,
       availableToRefund: settleAmount,
       refundedAmount: 0,
-      txnTime: "2026-07-04T10:05:00Z",
+      txnTime: this.stamp("10:05:00"),
     };
     payment.settlements = [...(payment.settlements ?? []), settlement];
     payment.availableToSettle = remaining - settleAmount;
     this.file(this.settlementsByRef, refNum, settlement);
+    this.uniqueSettlementCreations++;
     return json(200, settlement);
   }
 
@@ -798,7 +884,7 @@ export class FakePaysafeApi {
       merchantRefNum: body["merchantRefNum"] as string,
       status: "COMPLETED",
       amount: body["amount"] as number,
-      txnTime: "2026-07-04T10:06:00Z",
+      txnTime: this.stamp("10:06:00"),
     };
     this.file(this.voidsByRef, voided.merchantRefNum, voided);
     return json(200, voided);
@@ -825,7 +911,7 @@ export class FakePaysafeApi {
           const failed = {
             id: `ref_${++this.seq}`,
             merchantRefNum: refNum,
-            ...failedRecord(this.activeFailure),
+            ...failedRecord(this.activeFailure, this.stamp("10:00:00")),
             amount,
             currencyCode: payment.currencyCode,
           };
@@ -840,7 +926,7 @@ export class FakePaysafeApi {
           status: "COMPLETED",
           amount,
           currencyCode: payment.currencyCode,
-          txnTime: "2026-07-04T10:10:00Z",
+          txnTime: this.stamp("10:10:00"),
         };
         this.file(this.refundsByRef, refNum, refund);
         this.refundsById.set(refund.id, refund);
@@ -863,13 +949,13 @@ export class FakePaysafeApi {
       merchantRefNum: refNum,
       paymentHandleToken: token,
       currencyCode: body["currencyCode"] as string,
-      txnTime: "2026-07-04T10:00:00Z",
+      txnTime: this.stamp("10:00:00"),
     };
     const failure =
       this.activeFailure ??
       (token === "tok_declined" ? { status: 402, code: "3022", message: "Insufficient funds" } : undefined);
     if (failure) {
-      const failed = { ...base, ...failedRecord(failure) };
+      const failed = { ...base, ...failedRecord(failure, base.txnTime) };
       this.file(this.verificationsByRef, refNum, failed);
       return json(failure.status, { error: failed.error });
     }
@@ -1152,6 +1238,25 @@ const LOOKUP_WINDOW_DAYS = 30;
 /** dupCheck: "already been used in a previous request within the past 90 days". */
 const DUP_CHECK_DAYS = 90;
 
+/** Day 0 of the fake's clock: its records carry 2026-07-04 until passDays moves the date on. */
+const FAKE_EPOCH_MS = Date.UTC(2026, 6, 4);
+const DAY_MS = 86_400_000;
+
+/** A YYYY-MM-DD lookup date as a day of the fake's clock, or undefined when it is no such date. */
+function dayOfDate(value: string): number | undefined {
+  const ms = Date.parse(`${value}T00:00:00Z`);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || Number.isNaN(ms) || new Date(ms).toISOString().slice(0, 10) !== value) {
+    return undefined;
+  }
+  return Math.round((ms - FAKE_EPOCH_MS) / DAY_MS);
+}
+
+function fieldError(field: string): Response {
+  return json(400, {
+    error: { code: "5068", message: "Field error(s)", fieldErrors: [{ field, error: "Either invalid or no value provided" }] },
+  });
+}
+
 function duplicateRefNum(): Response {
   return json(409, { error: { code: "5031", message: "The transaction you have submitted has already been processed." } });
 }
@@ -1166,10 +1271,13 @@ function stateRejection(code: string, message: string): Response {
 }
 
 /** The fields a write processed into a failure is filed with. */
-function failedRecord(failure: RecordedFailure): { status: string; txnTime: string; error: { code: string; message: string } } {
+function failedRecord(
+  failure: RecordedFailure,
+  txnTime: string,
+): { status: string; txnTime: string; error: { code: string; message: string } } {
   return {
     status: failure.recordStatus ?? "FAILED",
-    txnTime: "2026-07-04T10:00:00Z",
+    txnTime,
     error: { code: failure.code, message: failure.message },
   };
 }

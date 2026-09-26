@@ -122,8 +122,30 @@ retrieved, not a separate credential).
   failed, been voided, cancelled or expired), or a bank-debit key holds a spent handle
   whose payment the lookup does not show, the rejection carries `outcomeUnknown`. An
   original that cannot be read back rejects with a non-retryable `processing_error`; retry
-  it later with the same key. The default `requestTimeoutMs` is 60000, the response timeout
-  of Paysafe's own SDKs, and bounds each exchange rather than a whole call.
+  it later with the same key, or, for a full capture, whose reference does not come from
+  the key, capture in full again later. The default `requestTimeoutMs` is 60000, the
+  response timeout of Paysafe's own SDKs, and bounds each exchange rather than a whole call.
+- A capture of the whole authorization (no amount, or the authorized amount) settles under
+  a reference derived from the payment, not under its idempotency key:
+  `payfanout-capture-<pspPaymentId>`, then `-a2` to `-a10` once a full capture there has
+  moved no money (failed, cancelled or expired). `retrievePayment` and `refundPayment`
+  look those references up, and a capture that finds the payment already captured in full
+  there answers with that settlement, whatever its key. After partial captures, a capture
+  of the authorized amount is refused before it is sent: capture the rest with no amount,
+  while some is left. With nothing left and no full capture showing, a capture is refused
+  as nothing left to capture; a full capture made moments ago can trail in Paysafe's
+  lookup, so check `retrievePayment` first.
+  A partial capture settles under its idempotency key, which may not start with
+  `payfanout-capture-`, and no read can find it from the payment: its amount counts in
+  `amountCaptured`, but `refundPayment` cannot refund it. Every capture's answer carries
+  its settlement on `raw.captureSettlement`: keep a partial capture's settlement `id` and
+  refund it in the Paysafe portal, as you would a capture an earlier release made, which
+  settled under the capture's key. Settlement lookups start the day before the payment
+  instead of covering Paysafe's default 30 days, and are sent again over that window only
+  when Paysafe refuses the range; any other lookup failure fails the call instead of
+  reading as no settlement. See [captures and
+  refunds](https://donapulse.github.io/payfanout/guide/paysafe#captures-and-refunds) in
+  the setup guide.
 - Paysafe refunds neither SEPA nor Bacs direct debits, so `refundPayment` rejects a
   payment on either rail with a non-retryable `unsupported_operation` once it has read the
   payment, before any refund request.

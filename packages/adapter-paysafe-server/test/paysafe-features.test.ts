@@ -354,8 +354,8 @@ describe("Paysafe multi-capture (partial settlements)", () => {
     const captured = await adapter.capturePayment(authorized.pspPaymentId, undefined, "k-cap-all");
     expect(captured.status).toBe("succeeded");
     expect(captured.amountCaptured).toBe(2000);
-    // Same key: nothing is left to settle, so the settlement is read back by its
-    // merchantRefNum instead of settling zero — no double charge, no rejection.
+    // Same key: the replay finds the full capture under the payment's own
+    // reference before sending anything — no double charge, no zero settlement.
     const replay = await adapter.capturePayment(authorized.pspPaymentId, undefined, "k-cap-all");
     expect(replay.amountCaptured).toBe(2000);
   });

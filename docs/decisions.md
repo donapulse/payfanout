@@ -431,7 +431,9 @@ choices they forced:
     lowercase snake_case code of at most 64 characters (every documented reason does; the
     longest has 46) and neither contains the access token nor is a stretch of it of eight
     characters or more: a wrong `baseUrl` sends the token to whatever answers, and that
-    server writes the body. Observed 2026-09-26 without credentials against the sandbox
+    server writes the body. (Superseded 2026-09-26 for the token test by "the reason screen
+    moved to core" below, which also withholds a stretch inside a longer reason.) Observed
+    2026-09-26 without credentials against the sandbox
     host: `GoCardless-Version: 2030-01-01` answers 400 `version_not_found` before any
     authentication, which the probe reports as `internal (HTTP 400, version_not_found)`,
     and an unknown path answers a plain-text 404 with no error envelope.

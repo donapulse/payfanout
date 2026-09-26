@@ -1,17 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { isPayFanoutError, repeatsSecret } from "@payfanout/core";
+import { repeatsSecret } from "@payfanout/core";
 
 const SECRET = "0123456789abcdefghij";
-
-/** The PayFanoutError a call with `span` throws, if any. */
-function refusal(span: number): unknown {
-  try {
-    repeatsSecret("x", [SECRET], span);
-  } catch (err) {
-    return isPayFanoutError(err) ? err : undefined;
-  }
-  return undefined;
-}
 
 describe("repeatsSecret", () => {
   it("flags a text holding a secret whole", () => {
@@ -30,6 +20,8 @@ describe("repeatsSecret", () => {
     expect(repeatsSecret("x-abcdefgh-y", ["ABCDEFGHIJ"])).toBe(true);
     expect(repeatsSecret("x-AbCdEfGh-y", ["aBcDeFgHiJ"])).toBe(true);
     expect(repeatsSecret("CLÉ-SECRÈTE", ["clé-secrète-42"])).toBe(true);
+    // Upper-cased, not lower-cased: "ß" upper-cases to "SS", so this echo is caught.
+    expect(repeatsSecret("x-STRASSE12-y", ["straße12"])).toBe(true);
   });
 
   it("does not flag seven characters of a secret", () => {
@@ -38,7 +30,7 @@ describe("repeatsSecret", () => {
     }
   });
 
-  it("matches a secret shorter than the span only whole", () => {
+  it("matches a secret of eight characters or fewer only whole", () => {
     expect(repeatsSecret("K7_ECHO", ["K7"])).toBe(true);
     expect(repeatsSecret("k7_echo", ["K7"])).toBe(true);
     expect(repeatsSecret("K_7_ECHO", ["K7"])).toBe(false);
@@ -64,19 +56,6 @@ describe("repeatsSecret", () => {
   it("flags nothing in a text unrelated to the secrets", () => {
     for (const text of ["path_not_found", "UNKNOWN_PAYMENT_ID", "<html><body>Not Found</body></html>", ""]) {
       expect(repeatsSecret(text, [SECRET, "sandbox_fragmenttoken_1234"]), text).toBe(false);
-    }
-  });
-
-  it("takes another span, and refuses one that is not a positive integer", () => {
-    expect(repeatsSecret("x-0123-y", [SECRET], 4)).toBe(true);
-    expect(repeatsSecret("x-012-y", [SECRET], 4)).toBe(false);
-    expect(repeatsSecret("x-9abcdefghij-y", [SECRET], 11)).toBe(true);
-    expect(repeatsSecret("x-abcdefghij-y", [SECRET], 11)).toBe(false);
-    for (const span of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
-      expect(refusal(span), String(span)).toMatchObject({
-        code: "invalid_request",
-        message: expect.stringMatching(/span must be a positive integer/),
-      });
     }
   });
 });

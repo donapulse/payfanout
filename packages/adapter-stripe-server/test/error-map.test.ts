@@ -223,6 +223,12 @@ describe("mapStripeError", () => {
       retryable: false,
     },
     {
+      name: "a wrong address with a skipped authentication",
+      err: { type: "StripeCardError", code: "incorrect_address", decline_code: "authentication_not_handled", message: "…" },
+      code: "invalid_card_data",
+      retryable: false,
+    },
+    {
       name: "a local payment method reported lost or stolen",
       err: { type: "StripeCardError", code: "card_declined", decline_code: "lost_or_stolen_card", message: "…" },
       code: "fraud_suspected",

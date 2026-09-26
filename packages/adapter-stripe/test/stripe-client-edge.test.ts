@@ -225,6 +225,7 @@ describe("StripeClientAdapter edge cases", () => {
       [{ type: "card_error", code: "authentication_not_handled" }, "card_declined", false],
       // Card data the customer can correct comes before the skipped authentication.
       [{ type: "card_error", code: "incorrect_cvc", decline_code: "authentication_not_handled" }, "invalid_card_data", false],
+      [{ type: "card_error", code: "incorrect_address", decline_code: "authentication_not_handled" }, "invalid_card_data", false],
       // The intent-specific failed authentications that accounts before dahlia still receive.
       [{ type: "card_error", code: "payment_intent_authentication_failure" }, "authentication_required", false],
       [{ type: "card_error", code: "setup_intent_authentication_failure" }, "authentication_required", false],

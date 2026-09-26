@@ -579,14 +579,20 @@ describe("createdAt comes from paymentOutput.transactionDate", () => {
 
   it("reads a transactionDate with a zone alike whatever the server's time zone, and one without a zone as none", async () => {
     const previous = process.env.TZ;
+    const systemZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     process.env.TZ = "Asia/Kolkata";
     try {
       expect(new Date(2026, 8, 26).getTimezoneOffset()).toBe(-330);
       expect((await readBack(captured({ transactionDate: "2026-09-26T10:15:30Z" }))).createdAt).toBe("2026-09-26T10:15:30.000Z");
       expect((await readBack(captured({ transactionDate: "2026-09-26T10:15:30" }))).createdAt).toBe(EPOCH);
     } finally {
-      if (previous === undefined) delete process.env.TZ;
-      else process.env.TZ = previous;
+      if (previous === undefined) {
+        // Node on Windows resets the zone when TZ is assigned, not when it is deleted.
+        process.env.TZ = systemZone;
+        delete process.env.TZ;
+      } else {
+        process.env.TZ = previous;
+      }
     }
   });
 

@@ -10,7 +10,7 @@ import {
   useRedirectReturn,
   type PayResult,
 } from "../src/index.js";
-import { FakeClientAdapter } from "./fake-client-adapter.js";
+import { deferred, FakeClientAdapter } from "./fake-client-adapter.js";
 
 afterEach(cleanup);
 
@@ -149,6 +149,24 @@ describe.each([
     expect(screen.getByTestId("status").textContent).toBe("error");
     expect(onLastError.mock.lastCall![0]).toBe(err);
     expect(adapter.loadSdkCalls).toBe(0);
+  });
+
+  it("keeps status on the rejection while the first instance is still loading", async () => {
+    const adapter = new FakeClientAdapter();
+    adapter.mountGate = deferred<void>();
+    const onError = vi.fn();
+    render(
+      inMode(
+        <PayFanoutProvider adapters={[adapter]}>
+          <PaymentFields clientSecret="cs_1" />
+          <PaymentFields clientSecret="cs_2" onError={onError} />
+          <StatusProbe />
+        </PayFanoutProvider>,
+      ),
+    );
+    await settle();
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("status").textContent).toBe("error");
   });
 
   it("reports a second instance mounted alongside the first once", async () => {

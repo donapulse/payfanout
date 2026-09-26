@@ -2,4 +2,4 @@
 "@payfanout/react": patch
 ---
 
-Report a mount that `<PaymentFields>` rejects before loading the PSP's SDK to its `onError` prop once under React StrictMode. The rejected cases are no PSP to mount, no client adapter registered for the PSP, and another `<PaymentFields>` already mounted. StrictMode's extra development-only effect run reported each of them twice; production builds were not affected.
+`<PaymentFields>` now calls `onError` once instead of twice under React StrictMode when it rejects a mount before loading the PSP's SDK: no PSP to mount, no client adapter registered for the PSP, or another `<PaymentFields>` already mounted. Production builds were not affected.

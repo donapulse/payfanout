@@ -240,6 +240,41 @@ bank-debit errors after which you start again under a new key, once a later retr
 fails and the Paysafe portal shows every payment under the old one as failed or cancelled,
 or none at all.
 
+### Captures and refunds
+
+With `captureMethod: "manual"`, `completePayment` authorizes the card (`requires_capture`)
+and `capturePayment(pspPaymentId, amount, idempotencyKey)` settles it. Refunds come out of
+settlements, and Paysafe finds a settlement again only by its `merchantRefNum`, so the way
+you capture decides what `refundPayment` can reach later:
+
+- **Capture in full to keep a payment refundable.** A capture with no `amount` (everything
+  that remains) or with the authorized amount settles under
+  `payfanout-capture-<pspPaymentId>`, a reference derived from the payment, which
+  `retrievePayment` and `refundPayment` look up: its capture time and its refunds show, and
+  refunds come out of it. A payment is captured in full once, so a retry under the same key
+  or another one answers with that settlement instead of settling again or failing.
+- **A partial capture stays out of reach.** Any other amount settles under your
+  `idempotencyKey`, and no read can find that settlement from the payment. Its amount still
+  counts in `amountCaptured`, which Paysafe's `availableToSettle` witnesses, but it shows no
+  `capturedAt`, and `refundPayment` cannot refund it: with no other settlement to refund
+  from, it rejects with `invalid_request`. Keep your own record of each partial capture's
+  key and amount, and refund that money in the Paysafe portal, where the settlement carries
+  your key as its `merchantRefNum`. Capturing the rest afterwards (no `amount`) settles it
+  under the payment's reference: that part is refundable here, and `amountCaptured` counts
+  the partial captures before it.
+- **A void after partial captures.** `cancelPayment` voids what remains and its answer
+  reports the captured split. A later `retrievePayment` cannot tell the partial captures
+  from the voided remainder, since `availableToSettle` is its only witness, and reports the
+  whole authorization as captured.
+- **Older payments stay refundable.** Paysafe's settlement lookup covers the last 30 days
+  unless told otherwise, so every lookup the adapter makes for a payment's settlements
+  starts the day before the payment. Paysafe documents no longest range; if it refuses one,
+  the lookup is sent again over the default 30 days.
+- **A payment that moved no money has no settlement.** A declined, cancelled or expired
+  payment settled nothing, so `retrievePayment` reports no capture or refund on it and
+  `refundPayment` refuses it, even when another payment carries the same reference, as the
+  payment that went through does after a declined card under the same completion key.
+
 ## 8. Interac e-Transfer (Canada)
 
 Paysafe.js cannot tokenize Interac e-Transfer — it is a Payments-API rail — so PayFanout
@@ -405,11 +440,12 @@ and a payments call spends the single-use handle whatever its outcome, so a seco
 with that handle answers `5283`. The adapter is built around that rather than around blind
 retries, for every write it makes:
 
-- Every payment, payment handle (vault saves included), capture, void, refund and
-  verification sends your `idempotencyKey` as its `merchantRefNum`. Customer profiles key
-  on `merchantCustomerId` instead (your customer `id`, or the key), native subscriptions on
-  the `merchantRefNum` you pass (or the key), and deleting a saved card carries no key: the
-  vault is checked instead.
+- Every payment, payment handle (vault saves included), partial capture, void, refund and
+  verification sends your `idempotencyKey` as its `merchantRefNum`. A full capture sends
+  `payfanout-capture-<pspPaymentId>` instead (see §7, "Captures and refunds"). Customer
+  profiles key on `merchantCustomerId` (your customer `id`, or the key), native
+  subscriptions on the `merchantRefNum` you pass (or the key), and deleting a saved card
+  carries no key: the vault is checked instead.
 - `dupCheck` is `true` on saved-card charges, captures, refunds and verifications, and
   `false` on card and Interac completions, whose single-use handle already refuses a second
   charge. With `dupCheck: true`, a card declined under your completion key would block every
@@ -452,8 +488,8 @@ retries, for every write it makes:
   the failed attempt's payment handle states its amount. On a card, Interac or bank-debit
   completion a new card is a new attempt under the same key; a payment the key already
   made is returned instead, and a fully voided one comes back `canceled` (start a new
-  attempt after a void under a new key). Capture, cancel and refund keys must be unique
-  across the merchant account, because Paysafe's lookups for them are account-wide.
+  attempt after a void under a new key). Partial-capture, cancel and refund keys must be
+  unique across the merchant account, because Paysafe's lookups for them are account-wide.
 - A duplicate whose original cannot be read back rejects with the same non-retryable
   `processing_error`. A fresh write can take a moment to appear, and the lookup only
   covers the last 30 days, so an original older than that can never be read back:

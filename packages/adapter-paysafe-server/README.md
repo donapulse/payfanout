@@ -124,6 +124,16 @@ retrieved, not a separate credential).
   original that cannot be read back rejects with a non-retryable `processing_error`; retry
   it later with the same key. The default `requestTimeoutMs` is 60000, the response timeout
   of Paysafe's own SDKs, and bounds each exchange rather than a whole call.
+- A capture of the whole authorization (no amount, or the authorized amount) settles under
+  `payfanout-capture-<pspPaymentId>`, which `retrievePayment` and `refundPayment` look up,
+  and a retry under any key answers with that settlement. A partial capture settles under
+  its idempotency key, which no read can find from the payment: its amount counts in
+  `amountCaptured`, but `refundPayment` cannot refund it, so keep each partial capture's key
+  and refund that settlement in the Paysafe portal. Settlement lookups start the day before
+  the payment instead of covering Paysafe's default 30 days, and fall back to that window
+  when Paysafe refuses the range. See [captures and
+  refunds](https://donapulse.github.io/payfanout/guide/paysafe#captures-and-refunds) in the
+  setup guide.
 - Paysafe refunds neither SEPA nor Bacs direct debits, so `refundPayment` rejects a
   payment on either rail with a non-retryable `unsupported_operation` once it has read the
   payment, before any refund request.

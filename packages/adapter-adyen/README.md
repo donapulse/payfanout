@@ -79,6 +79,11 @@ load the script / stylesheet from your own host. The adapter carries Adyen's int
 for its pinned build only, so an overridden file loads without an integrity check:
 `sdkVersion` turns it off for both files, `sdkUrl` and `stylesheetUrl` for their own.
 
+`cspNonce` puts your Content-Security-Policy nonce on both tags the adapter injects, the
+script and the stylesheet `<link>`, for a page whose `script-src` or `style-src` allows them
+by nonce; the adapter never reads a nonce from the page. See the
+[Adyen guide](https://donapulse.github.io/payfanout/guide/adyen) for what it covers.
+
 ## 3-D Secure
 
 A challenge comes back from the *server*: `completePayment` reports `requires_action` with
@@ -123,10 +128,12 @@ again.
   reject with `invalid_request`. A stylesheet `<link>` your page adds for the default URL is
   used as it is, so give it `ADYEN_WEB_STYLESHEET_INTEGRITY` and a `crossorigin` attribute
   to keep the check.
-- If the script fails to load, the next mount fetches it again, with the stylesheet if that
-  failed too; if it loaded without defining `window.AdyenWeb`, the next mount checks again
-  instead of failing from a cached result. A stylesheet that fails to load never blocks the
-  fields from mounting.
+- If the script fails to load, the next mount fetches it again; if it loaded without
+  defining `window.AdyenWeb`, the next mount checks again instead of failing from a cached
+  result. A stylesheet that failed stays on the page and is reused, and it never blocks the
+  fields from mounting. The mount does wait for the stylesheet to load or fail, and for the
+  sheets it `@import`s: Adyen's `adyen.css` imports none, but a `stylesheetUrl` of your own
+  that imports from a slow host delays the first mount on each page load.
 
 ## Documentation
 

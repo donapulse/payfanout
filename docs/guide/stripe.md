@@ -147,6 +147,20 @@ and your own Google Maps key; this adapter mounts the Payment Element alone. Str
 must load from `https://js.stripe.com`: Stripe asks never to bundle or self-host it, and
 the script refuses to run from another origin. The `sdkUrl` config field only points the
 adapter at another `https://js.stripe.com` URL, such as a versioned build.
+
+**Nonce-based policies.** Pass the nonce your server put in the page's policy as
+`cspNonce` (the adapter never reads one from the page), and the adapter sets it as the
+`nonce` attribute of the Stripe.js `<script>` it injects. That matters only for a
+`script-src` that allows scripts by nonce without `'strict-dynamic'`: under
+`'strict-dynamic'` the script-created tag loads without one, and `https://js.stripe.com`
+in `script-src` allows it anyway. Stripe.js reads no nonce itself and loads its lazy
+chunks from `https://js.stripe.com` without one, so such a policy must still list that
+host. Where the browser lacks constructable stylesheets, Stripe.js adds a `<style>`
+without a nonce, which needs `'unsafe-inline'` in `style-src`, and a nonce in `style-src`
+turns `'unsafe-inline'` off there, blocking that fallback. On a page that can mount other
+PSPs as well, read
+[Content-Security-Policy on a page with several PSPs](/guide/providers#content-security-policy-on-a-page-with-several-psps)
+before giving a directive a nonce.
 :::
 
 ## 6. Register the webhook endpoint

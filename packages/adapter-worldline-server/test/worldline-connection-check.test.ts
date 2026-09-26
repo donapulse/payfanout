@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { VerifyCredentialsResult } from "@payfanout/core";
 import { WorldlineServerAdapter, type WorldlineServerAdapterConfig } from "../src/index.js";
 
@@ -7,7 +7,7 @@ const PROBE_URL = "https://payment.preprod.direct.worldline-solutions.com/v2/mid
 const AUTH_FAILED: VerifyCredentialsResult = {
   ok: false,
   category: "auth",
-  message: "Authentication failed — check the Worldline API key id, secret API key, merchantId and environment.",
+  message: "Authentication failed — check the Worldline API key id, secret API key, merchantId and environment, and the server's clock.",
 };
 const UNREACHABLE: VerifyCredentialsResult = {
   ok: false,
@@ -130,13 +130,14 @@ describe("Worldline verifyCredentials (Test connection probe)", () => {
     const answers: Array<[number, string | null]> = [
       [200, "<html><body>Sign in</body></html>"],
       [200, "{}"],
-      // Any other result is no OK: Worldline's own plugins fail the check on it too.
+      // Any other result is no OK: Worldline's Magento, PrestaShop and SAP Commerce plugins fail the check on it too.
       [200, JSON.stringify({ result: "Invalid" })],
       [200, JSON.stringify({ result: "NOK" })],
       [200, JSON.stringify({ result: "ok" })],
       [200, JSON.stringify({ result: "OK " })],
       [200, JSON.stringify({ result: "any other text" })],
       [200, JSON.stringify({ result: "" })],
+      [200, JSON.stringify({ result: ["OK"] })],
       [200, JSON.stringify({ result: null })],
       [200, JSON.stringify({ result: 1 })],
       [200, JSON.stringify({ result: true })],
@@ -201,28 +202,54 @@ describe("Worldline verifyCredentials (Test connection probe)", () => {
     const overridden = answering(403, null, { baseUrl: "https://payment.preprod.direct.worldline-solutions.com" });
     await expect(overridden.adapter.verifyCredentials()).resolves.toEqual({
       ...AUTH_FAILED,
-      message: "Authentication failed — check the Worldline API key id, secret API key, merchantId, environment and baseUrl.",
+      message:
+        "Authentication failed — check the Worldline API key id, secret API key, merchantId, environment and baseUrl, and the server's clock.",
     });
   });
 
-  it("reports a probe that outlives requestTimeoutMs as unreachable", async () => {
-    let aborted = false;
-    const { adapter } = probing(() => new Response(null, { status: 200 }), {
-      requestTimeoutMs: 20,
-      fetch: (_input, init) =>
-        new Promise<Response>((_resolve, reject) => {
-          init?.signal?.addEventListener(
-            "abort",
-            () => {
-              aborted = true;
-              reject(new DOMException("The operation was aborted.", "AbortError"));
-            },
-            { once: true },
-          );
-        }),
-    });
-    await expect(adapter.verifyCredentials()).resolves.toEqual(UNREACHABLE);
-    expect(aborted).toBe(true);
+  it("reports a probe that outlives requestTimeoutMs as unreachable, at that timeout and after one request", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let calls = 0;
+      let aborted = false;
+      let fetchCalled: () => void = () => undefined;
+      const fetched = new Promise<void>((resolve) => {
+        fetchCalled = resolve;
+      });
+      const { adapter } = probing(
+        () => {
+          throw new Error("the injected fetch below answers instead");
+        },
+        {
+          requestTimeoutMs: 20,
+          fetch: (_input, init) => {
+            calls += 1;
+            fetchCalled();
+            return new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener(
+                "abort",
+                () => {
+                  aborted = true;
+                  reject(new DOMException("The operation was aborted.", "AbortError"));
+                },
+                { once: true },
+              );
+            });
+          },
+        },
+      );
+      const result = adapter.verifyCredentials();
+      // The timer is armed before fetch is called.
+      await fetched;
+      await vi.advanceTimersByTimeAsync(19);
+      expect(aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(aborted).toBe(true);
+      await expect(result).resolves.toEqual(UNREACHABLE);
+      expect(calls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("reports any other status as a failure, naming the status and Worldline's error id", async () => {

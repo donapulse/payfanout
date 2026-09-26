@@ -1157,8 +1157,8 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   - *What passes.* The contract lists two responses for the probe's
     `GET /v2/{merchantId}/services/testconnection` ("Test your connection and
     credentials"): a 200 with `testConnection`, `{ result }`, and a 403 "Your API
-    authentication failed." with the `errorResponse` envelope. Only a 2xx whose body is
-    `{ "result": "OK" }` passes; 401/403 stay `auth` and 429/5xx stay `network`.
+    authentication failed." with the `errorResponse` envelope. Only a 2xx whose body
+    carries `"result": "OK"` passes; 401/403 stay `auth` and 429/5xx stay `network`.
     Any other answer reported `ok: true` and now reports `internal`. The troubleshooting
     guide answers a "non-existent/wrong API endpoint" with an empty body
     (`content-length = 0`), which a wrong `baseUrl` override meets, and a `baseUrl` naming
@@ -1170,8 +1170,8 @@ current status (remaining sandbox checks run via the dispatch-only integration w
     setup correctly in our system.", `result` "OK result on the connection to the payment
     engine.", example `{ "result" : "OK" }`. Worldline's Magento, PrestaShop and SAP
     Commerce plugins fail the check on anything but `"OK"`, and the Direct contract's
-    `validateCredentials` answers a 200 whose `result` is `Valid` or `Invalid`, a failure
-    reported with a 200. So only `"OK"`, exactly, passes.
+    webhooks `validateCredentials` answers a 200 whose `result` is `Valid` or `Invalid`, a
+    failure reported with a 200. So only `"OK"`, exactly, passes.
   - *What the message names.* The status and, on a non-2xx, the first error's `id` ("ID of
     the error. This is a short human-readable message that briefly describes the error."),
     from the body the probe already read. `aPIError` requires only `errorCode`, so an error
@@ -1190,6 +1190,8 @@ current status (remaining sandbox checks run via the dispatch-only integration w
     environment reads as `auth`, and that message now names the `merchantId` and the
     environment beside the API key id and the secret API key, and the `baseUrl` when one is
     configured, since a host at a mis-pasted `baseUrl`, such as a CDN, can answer 403 too.
+    It also names the server's clock: the same list says "Keep the Date header within 5
+    minutes", and the adapter dates each request from the server's clock.
     Not sandbox-verified: the 200 body and the answer to a wrong path.
     Sandbox check: run the probe with valid credentials, then with a `baseUrl` carrying an
     extra path segment, and record both answers.

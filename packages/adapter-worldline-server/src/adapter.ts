@@ -266,7 +266,7 @@ type SettledAttempt = { info: PaymentInfo } | { after: string; replayOf: string 
 /** What the test-connection probe read (see probeStatus). */
 interface ConnectionProbe {
   status: number;
-  /** The body is the service's OK answer, `{ "result": "OK" }`. */
+  /** The body carries the service's OK answer, `"result": "OK"`. */
   answeredOk: boolean;
   /** The first error's id, when it reads as one (see firstErrorName). */
   errorName: string | undefined;
@@ -905,16 +905,17 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
    * reads the RAW HTTP status, so an auth rejection (401/403; Worldline answers
    * a key, secret or PSPID it cannot match, or keys of the other environment,
    * with a 403) is told apart from an outage (429/5xx) from the status line
-   * alone. Only a 2xx carrying the service's OK answer, `{ "result": "OK" }`,
+   * alone. Only a 2xx carrying the service's OK answer, `"result": "OK"`,
    * passes: "If you receive an OK result you know that your connection with us
    * is working correctly" (Connect S2S API reference, Test connection). Any
-   * other answer that is neither an auth rejection nor an outage
-   * means the probe never reached the service, as when a `baseUrl` override is
-   * wrong (Worldline answers a wrong endpoint with an empty body) or names a
-   * host that answers 2xx with something else: it reports `internal`, naming
-   * the HTTP status and, on a non-2xx, the first error's id when it reads as
-   * one. A single call, never retried; never mutates PSP state, never puts a
-   * credential in the result.
+   * other answer that is neither an auth rejection nor an outage means the
+   * probe did not get that answer: a `baseUrl` override is wrong (Worldline
+   * answers a wrong endpoint with an empty body), names a host that answers 2xx
+   * with something else, or the service answered a result other than OK, which
+   * no Worldline page documents. It reports `internal`, naming the HTTP status
+   * and, on a non-2xx, the first error's id when it reads as one. A single
+   * call, never retried; never mutates PSP state, never puts a credential in
+   * the result.
    */
   async verifyCredentials(): Promise<VerifyCredentialsResult> {
     let probe: ConnectionProbe;
@@ -938,7 +939,12 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       const checked = this.config.baseUrl
         ? "API key id, secret API key, merchantId, environment and baseUrl"
         : "API key id, secret API key, merchantId and environment";
-      return { ok: false, category: "auth", message: `Authentication failed — check the Worldline ${checked}.` };
+      // A request dated more than five minutes off is refused the same way (manual-authentication guide).
+      return {
+        ok: false,
+        category: "auth",
+        message: `Authentication failed — check the Worldline ${checked}, and the server's clock.`,
+      };
     }
     if (status === 429 || status >= 500) {
       return { ok: false, category: "network", message: "Could not reach Worldline — try again." };

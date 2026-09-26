@@ -31,7 +31,17 @@ interface FakeMandate {
   created_at: string;
 }
 
+interface FakeRequest {
+  method: string;
+  path: string;
+  body?: Record<string, unknown>;
+  headers: Record<string, string>;
+}
+
 const BASE_TIME = Date.parse("2026-07-07T10:00:00.000Z");
+
+/** Subscriptions API: an interval "Must result in at least one charge date per year". */
+const MAX_INTERVAL_BY_UNIT: Record<string, number> = { weekly: 52, monthly: 12, yearly: 1 };
 
 /**
  * In-memory GoCardless Billing Requests API impersonating the REST surface at
@@ -43,10 +53,13 @@ const BASE_TIME = Date.parse("2026-07-07T10:00:00.000Z");
  * the sandbox), invalid_state on bad transitions (including cancelling an
  * already-cancelled/finished subscription), the refunds feature gate (403
  * until enabled), total_amount_confirmation checking, at most 5 refunds per
- * payment (number_of_refunds_exceeded), the metadata limits on refunds (3
- * keys, 50-character names, 500-character values), the ?payment= filter on
- * GET /refunds, and cursor pagination over lists ordered newest first.
- * Actions ignore the Idempotency-Key — GoCardless documents keys for creates
+ * payment (number_of_refunds_exceeded), the metadata limits on billing
+ * requests, refunds and subscriptions (3 keys, 50-character names,
+ * 500-character values), Idempotency-Keys of at most 128 characters
+ * (idempotency_key_too_long), subscription intervals that charge at least
+ * once a year, the ?payment= filter on GET /refunds, and cursor pagination
+ * over lists ordered newest first. Every request is recorded with its
+ * headers. Actions ignore the Idempotency-Key — GoCardless documents keys for creates
  * only — so a repeated cancel answers cancellation_failed. Where the docs
  * leave a refund rule open, a flag
  * selects the reading (refundCapEnforced, totalAmountConfirmationChecked,
@@ -96,10 +109,10 @@ export class FakeGoCardlessApi {
   lastRequestUrl: string | undefined;
   readonly idempotencyKeysSeen: Array<{ path: string; key: string }> = [];
   /** Every request that reached the fake, in order — proves what the adapter did and did not send. */
-  readonly requests: Array<{ method: string; path: string; body?: Record<string, unknown> }> = [];
+  readonly requests: FakeRequest[] = [];
 
   /** Requests matching `method` and `path` exactly. */
-  requestsTo(method: string, path: string): Array<{ method: string; path: string; body?: Record<string, unknown> }> {
+  requestsTo(method: string, path: string): FakeRequest[] {
     return this.requests.filter((request) => request.method === method && request.path === path);
   }
 
@@ -133,8 +146,8 @@ export class FakeGoCardlessApi {
     const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : undefined;
     this.lastRequestUrl = url;
     this.lastRequestBody = body;
-    this.requests.push({ method, path, ...(body ? { body } : {}) });
     const headers = init?.headers as Record<string, string> | undefined;
+    this.requests.push({ method, path, ...(body ? { body } : {}), headers: { ...headers } });
     const idempotencyKey = headers?.["idempotency-key"];
     if (idempotencyKey) this.idempotencyKeysSeen.push({ path, key: idempotencyKey });
 
@@ -151,6 +164,17 @@ export class FakeGoCardlessApi {
           type: "invalid_api_usage",
           code: 401,
           errors: [{ reason: "access_token_not_found", message: "Access token not found or invalid" }],
+        },
+      });
+    }
+    // Limits: "Keys must be no longer than 128 characters".
+    if (idempotencyKey && idempotencyKey.length > 128) {
+      return json(400, {
+        error: {
+          message: "Idempotency key exceeded 128 characters.",
+          type: "invalid_api_usage",
+          code: 400,
+          errors: [{ reason: "idempotency_key_too_long", message: "Idempotency key exceeded 128 characters." }],
         },
       });
     }
@@ -292,6 +316,8 @@ export class FakeGoCardlessApi {
     if (paymentRequest && !paymentRequest.description) {
       return validationFailed("payment_request", "can't be blank", "/billing_requests/payment_request/description");
     }
+    const metadataError = metadataViolation(request?.metadata) ?? metadataViolation(paymentRequest?.metadata);
+    if (metadataError) return validationFailed("metadata", metadataError);
     const br: FakeBillingRequest = {
       id: `BRQ${String(++this.seq).padStart(6, "0")}`,
       created_at: this.nextTimestamp(),
@@ -435,13 +461,18 @@ export class FakeGoCardlessApi {
     if (request.start_date !== undefined && !/^\d{4}-\d{2}-\d{2}$/.test(request.start_date)) {
       return validationFailed("start_date", "must be formatted YYYY-MM-DD");
     }
-    if (request.metadata && Object.keys(request.metadata).length > 3) {
-      return validationFailed("metadata", "must have at most 3 keys");
-    }
+    const metadataError = metadataViolation(request.metadata);
+    if (metadataError) return validationFailed("metadata", metadataError);
     if (request.name !== undefined && request.name.length > 255) {
       return validationFailed("name", "must not exceed 255 characters");
     }
     const interval = request.interval ?? 1;
+    if (!Number.isInteger(interval) || interval < 1) {
+      return validationFailed("interval", "must be greater than or equal to 1");
+    }
+    if (interval > MAX_INTERVAL_BY_UNIT[request.interval_unit!]!) {
+      return validationFailed("interval", "must result in at least one charge date per year");
+    }
     // Real API: start_date defaults to the mandate's next_possible_charge_date.
     const start = request.start_date ?? this.nextTimestamp().slice(0, 10);
     const stepDays = request.interval_unit === "weekly" ? 7 : request.interval_unit === "monthly" ? 30 : 365;
@@ -522,6 +553,11 @@ export class FakeGoCardlessApi {
     this.mustPayment(paymentId).status = status;
   }
 
+  /** Overwrites stored payment fields (wire-shape variations: the spec types amounts as integer or string). */
+  setPaymentFields(paymentId: string, fields: Record<string, unknown>): void {
+    Object.assign(this.mustPayment(paymentId), fields);
+  }
+
   /** Forces a billing request state without side effects (fulfilled-before-payment-link races). */
   setBillingRequestStatus(billingRequestId: string, status: string): void {
     const br = this.billingRequests.get(billingRequestId);
@@ -543,7 +579,7 @@ export class FakeGoCardlessApi {
   }
 
   /** Overwrites stored refund fields (refunds an earlier adapter version created, wire variations). */
-  setRefundFields(refundId: string, fields: Partial<GoCardlessRefundLike>): void {
+  setRefundFields(refundId: string, fields: Record<string, unknown>): void {
     const refund = this.refunds.get(refundId);
     if (!refund) throw new Error(`no refund ${refundId}`);
     Object.assign(refund, fields);
@@ -581,9 +617,14 @@ export class FakeGoCardlessApi {
   }
 
   setSubscriptionStatus(subscriptionId: string, status: string): void {
+    this.setSubscriptionFields(subscriptionId, { status });
+  }
+
+  /** Overwrites stored subscription fields (wire-shape variations: amount and interval are integer or string). */
+  setSubscriptionFields(subscriptionId: string, fields: Record<string, unknown>): void {
     const subscription = this.subscriptions.get(subscriptionId);
     if (!subscription) throw new Error(`no subscription ${subscriptionId}`);
-    subscription.status = status;
+    Object.assign(subscription, fields);
   }
 
   /** Seeds a payment directly (status tables, listing tests). */
@@ -726,12 +767,16 @@ function invalidState(message: string, reason = "cancellation_failed"): Response
   });
 }
 
-/** "Up to 3 keys are permitted, with key names up to 50 characters and values up to 500 characters." */
+/**
+ * "Up to 3 keys are permitted, with key names up to 50 characters and values
+ * up to 500 characters." The unit is undocumented; this counts code points.
+ */
 function metadataViolation(metadata: Record<string, string> | undefined): string | undefined {
   if (!metadata) return undefined;
   const entries = Object.entries(metadata);
+  const characters = (text: string): number => Array.from(text).length;
   if (entries.length > 3) return "must have at most 3 keys";
-  if (entries.some(([key]) => key.length > 50)) return "key names must not exceed 50 characters";
-  if (entries.some(([, value]) => String(value).length > 500)) return "values must not exceed 500 characters";
+  if (entries.some(([key]) => characters(key) > 50)) return "key names must not exceed 50 characters";
+  if (entries.some(([, value]) => characters(String(value)) > 500)) return "values must not exceed 500 characters";
   return undefined;
 }

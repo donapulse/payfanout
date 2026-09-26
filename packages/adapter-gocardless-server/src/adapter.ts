@@ -45,6 +45,14 @@ import {
   verifyGoCardlessWebhookSignature,
   type GoCardlessEventLike,
 } from "./webhook.js";
+import {
+  assertMetadataLimits,
+  idempotencyKeyHeader,
+  METADATA_MAX_KEYS,
+  readAmount,
+  unreadableAmount,
+  wireInteger,
+} from "./wire.js";
 
 export const GOCARDLESS_PSP_NAME = "gocardless";
 
@@ -77,6 +85,11 @@ export interface GoCardlessServerAdapterConfig {
    * Lets a billing request fall back from instant bank payment to collecting
    * a Direct Debit mandate when the instant rails are unavailable. Off by
    * default: fallback payments confirm on debit timing (days), not seconds.
+   * Only `true` is sent; `false` leaves `fallback_enabled` unset, as GoCardless
+   * asks when its payment intelligence feature is used ("Should not be set
+   * if GoCardless payment intelligence feature is used"). Leave it unset with
+   * Protect+ and Verified Mandates too: "Fallbacks should not be used if you
+   * are using Protect+ with Verified Mandates."
    */
   fallbackEnabled?: boolean;
   /** Where the hosted flow sends payers who cannot proceed (e.g. unsupported bank). */
@@ -249,12 +262,14 @@ const SUBSCRIPTION_CURRENCIES = new Set(["AUD", "CAD", "DKK", "EUR", "GBP", "NZD
 
 /**
  * GoCardless subscriptions bill weekly, monthly, or yearly only — "day" has
- * no faithful projection and must reject rather than approximate.
+ * no faithful projection and must reject rather than approximate. An
+ * interval "Must result in at least one charge date per year", which caps it
+ * per unit.
  */
-const INTERVAL_UNIT_BY_INTERVAL: Partial<Record<NativeSubscriptionInterval, string>> = {
-  week: "weekly",
-  month: "monthly",
-  year: "yearly",
+const INTERVAL_UNIT_BY_INTERVAL: Partial<Record<NativeSubscriptionInterval, { unit: string; maxInterval: number }>> = {
+  week: { unit: "weekly", maxInterval: 52 },
+  month: { unit: "monthly", maxInterval: 12 },
+  year: { unit: "yearly", maxInterval: 1 },
 };
 
 const INTERVAL_BY_INTERVAL_UNIT: Record<string, NativeSubscriptionInterval> = {
@@ -411,9 +426,20 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * billing request gets a fresh authorisation URL; once the payer has
    * authorised, or the request is fulfilled or cancelled, the session carries
    * no `clientSecret`.
+   *
+   * Refused with `invalid_request` before any request: a zero amount, an
+   * idempotencyKey over 128 characters, and metadata GoCardless cannot hold
+   * (a key name over 50 characters, a value over 500, the `id` included).
+   * Metadata keys past the third are withheld, never refused.
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertMinorUnitAmount(input.amount, "amount");
+    if (input.amount === 0) {
+      throw PayFanoutError.invalidRequest(
+        "createPaymentSession requires a positive amount — this adapter does not support zero-amount payment method verification",
+        { amount: input.amount },
+      );
+    }
     const currency = normalizeCurrency(input.currency);
     if (!SUPPORTED_ONE_OFF_CURRENCIES.has(currency)) {
       // One-off billing request payments support GBP and EUR only; the other
@@ -460,9 +486,8 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
             // retrievePayment once the payment exists.
             ...(metadata ? { metadata } : {}),
           },
-          ...(this.config.fallbackEnabled !== undefined
-            ? { fallback_enabled: this.config.fallbackEnabled }
-            : {}),
+          // A false one would still be "set", which payment intelligence users must avoid.
+          ...(this.config.fallbackEnabled === true ? { fallback_enabled: true } : {}),
           ...(metadata ? { metadata } : {}),
         },
       },
@@ -606,7 +631,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       pspName: this.pspName,
       pspPaymentId: billingRequest.id,
       status: mapBillingRequestStatus(billingRequest.status),
-      amount: billingRequest.payment_request?.amount ?? 0,
+      amount: readAmount(billingRequest.payment_request?.amount, "billing request", billingRequest),
       amountRefunded: 0,
       currency: (billingRequest.payment_request?.currency ?? "").toUpperCase() || "GBP",
       paymentMethodType: mapSchemeToMethodType(billingRequest.payment_request?.scheme),
@@ -629,7 +654,8 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * the cancel it repeats went through. On any rejection the payment or
    * billing request is re-read, and one that is already cancelled resolves as
    * `canceled`; any other state rethrows the original error. The caller's key
-   * still rides the Idempotency-Key header.
+   * still rides the Idempotency-Key header, so one over 128 characters is
+   * refused (`invalid_request`) before any request.
    */
   async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
     const id = encodeURIComponent(pspPaymentId);
@@ -690,7 +716,9 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * Refunds against a fresh read of the payment; omit `amount` to refund the
    * remainder. More than the remainder, or an explicit `amount` of 0, rejects
    * locally with `invalid_request`, and a payment or refund amount GoCardless
-   * sends that is not a whole number rejects with `unknown`.
+   * sends that is not a whole number rejects with `unknown`. So do, before
+   * any request, an idempotencyKey over 128 characters and a `reason` over
+   * the 500 characters a metadata value holds.
    *
    * Each refund is created with the SHA-256 of its idempotencyKey in its
    * GoCardless metadata (`payfanout_key_sha256`, next to `reason`), so a
@@ -735,6 +763,8 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
         );
       }
     }
+    const stamp = await sha256Hex(req.idempotencyKey);
+    assertMetadataLimits(toRefundMetadata(req, stamp));
     // A fresh read anchors total_amount_confirmation — GoCardless's guard
     // against concurrent double refunds. `amount` is mandatory on POST
     // /refunds, so "full refund" is resolved here as the unrefunded remainder.
@@ -743,8 +773,8 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       `/payments/${encodeURIComponent(req.pspPaymentId)}`,
       { envelope: "payments" },
     );
-    const paymentAmount = wireAmount(payment.amount);
-    const alreadyRefunded = wireAmount(payment.amount_refunded);
+    const paymentAmount = wireInteger(payment.amount);
+    const alreadyRefunded = wireInteger(payment.amount_refunded);
     if (paymentAmount === undefined || alreadyRefunded === undefined) throw unreadableAmount("payment", payment);
     const amount = req.amount ?? Math.max(0, paymentAmount - alreadyRefunded);
     const refusal =
@@ -753,7 +783,6 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
         : alreadyRefunded + amount > paymentAmount
           ? `Refund of ${amount} exceeds the remaining refundable amount on payment ${req.pspPaymentId}`
           : undefined;
-    const stamp = await sha256Hex(req.idempotencyKey);
     let outcome: RefundOutcome | undefined;
     if (refusal !== undefined) {
       outcome = { refund: await this.resolveRefusedRefund(req, stamp, refusal, payment), replayed: true };
@@ -763,7 +792,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       outcome ??= await this.createRefund(req, amount, alreadyRefunded + amount, stamp);
     }
     const { refund, replayed, rejection } = outcome;
-    const refundedAmount = wireAmount(refund.amount);
+    const refundedAmount = wireInteger(refund.amount);
     if (refundedAmount === undefined) throw unreadableAmount("refund", refund);
     if (replayed) {
       const mismatched = refundReplayMismatches(refund, req);
@@ -930,14 +959,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       `/refunds/${encodeURIComponent(refundId)}`,
       { envelope: "refunds" },
     );
-    return {
-      refundId: refund.id,
-      status: mapGoCardlessRefundStatus(refund.status),
-      amount: refund.amount ?? 0,
-      ...(refund.links?.payment ? { pspPaymentId: refund.links.payment } : {}),
-      ...(refund.created_at ? { createdAt: refund.created_at } : {}),
-      raw: refund,
-    };
+    return this.toRefundInfo(refund);
   }
 
   /** Missed-webhook recovery: GET /events, normalized by the same mapper webhooks use. */
@@ -996,7 +1018,10 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * (`MD...`), and GoCardless derives the customer from it, so
    * `pspCustomerId` is ignored. Cadence is weekly/monthly/yearly only:
    * interval "day" and RRULE `schedule`s reject (`invalid_request`) instead
-   * of approximating. `merchantRefNum` rides the dedicated `name` field
+   * of approximating, and so does an `intervalCount` that would miss a year
+   * without a charge (over 52 weeks, 12 months or 1 year). Metadata and the
+   * idempotencyKey are held to the limits `createPaymentSession` applies.
+   * `merchantRefNum` rides the dedicated `name` field
    * (max 255 chars; GoCardless also sets it as the description on each
    * payment created) — never `payment_reference`, which is restricted to
    * accounts with their own Service User Number. `startAt` maps to the
@@ -1034,8 +1059,8 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
         { missing: "interval" },
       );
     }
-    const intervalUnit = INTERVAL_UNIT_BY_INTERVAL[input.interval];
-    if (!intervalUnit) {
+    const cadence = INTERVAL_UNIT_BY_INTERVAL[input.interval];
+    if (!cadence) {
       throw PayFanoutError.invalidRequest(
         `GoCardless subscriptions bill weekly, monthly, or yearly — interval "${input.interval}" has no faithful projection`,
         { interval: input.interval },
@@ -1048,6 +1073,12 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       throw PayFanoutError.invalidRequest(
         "createNativeSubscription intervalCount must be a positive integer",
         { intervalCount: input.intervalCount },
+      );
+    }
+    if (input.intervalCount !== undefined && input.intervalCount > cadence.maxInterval) {
+      throw PayFanoutError.invalidRequest(
+        `GoCardless subscriptions must charge at least once a year, so intervalCount is at most ${cadence.maxInterval} for interval "${input.interval}"`,
+        { interval: input.interval, intervalCount: input.intervalCount },
       );
     }
     if (input.planId !== undefined) {
@@ -1070,7 +1101,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
         subscriptions: {
           amount: input.amount,
           currency,
-          interval_unit: intervalUnit,
+          interval_unit: cadence.unit,
           ...(input.intervalCount !== undefined ? { interval: input.intervalCount } : {}),
           ...(startDate ? { start_date: startDate } : {}),
           ...(input.merchantRefNum ? { name: input.merchantRefNum } : {}),
@@ -1120,7 +1151,8 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * verified-idempotent: on any rejection the subscription is re-fetched and
    * a terminal state resolves as success — the billing stop the caller asked
    * for already holds. The caller's key rides the Idempotency-Key header,
-   * matching the adapter's other cancel actions.
+   * matching the adapter's other cancel actions, and is held to the same
+   * 128 characters.
    */
   async cancelNativeSubscription(input: CancelNativeSubscriptionInput): Promise<NativeSubscriptionRecord> {
     const path = `/subscriptions/${encodeURIComponent(input.subscriptionId)}`;
@@ -1196,8 +1228,8 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       pspName: this.pspName,
       pspPaymentId: payment.id,
       status: mapGoCardlessPaymentStatus(payment.status),
-      amount: payment.amount ?? 0,
-      amountRefunded: payment.amount_refunded ?? 0,
+      amount: readAmount(payment.amount, "payment", payment),
+      amountRefunded: readAmount(payment.amount_refunded, "payment", payment),
       currency: (payment.currency ?? "").toUpperCase() || "GBP",
       paymentMethodType: mapSchemeToMethodType(
         payment.scheme ?? extras.billingRequest?.payment_request?.scheme,
@@ -1214,7 +1246,8 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
   /**
    * Wire subscription -> unified record. GoCardless's `interval` is the count
    * of `interval_unit`s, so it lands on `intervalCount` (default 1); an
-   * unrecognized interval_unit omits the cadence pair rather than guessing.
+   * unrecognized interval_unit, or an interval that is not a whole number of
+   * at least 1, omits the cadence pair rather than guessing.
    * `currentPeriodEnd` is the earliest upcoming charge_date — when the next
    * charge is due. There is no currentPeriodStart fact to report (start_date
    * is the FIRST charge, not the running period), and the mandate is the
@@ -1222,14 +1255,15 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    */
   private toNativeSubscriptionRecord(subscription: GoCardlessSubscriptionLike): NativeSubscriptionRecord {
     const interval = INTERVAL_BY_INTERVAL_UNIT[subscription.interval_unit ?? ""];
+    const intervalCount = wireInteger(subscription.interval ?? 1);
     const currentPeriodEnd = earliestUpcomingChargeDate(subscription);
     return {
       id: subscription.id,
       pspName: this.pspName,
       status: mapGoCardlessSubscriptionStatus(subscription.status),
-      amount: subscription.amount ?? 0,
+      amount: readAmount(subscription.amount, "subscription", subscription),
       currency: (subscription.currency ?? "").toUpperCase() || "GBP",
-      ...(interval ? { interval, intervalCount: subscription.interval ?? 1 } : {}),
+      ...(interval && intervalCount !== undefined && intervalCount >= 1 ? { interval, intervalCount } : {}),
       ...(currentPeriodEnd ? { currentPeriodEnd } : {}),
       ...(subscription.links?.mandate ? { savedPaymentMethodToken: subscription.links.mandate } : {}),
       ...(subscription.name ? { merchantRefNum: subscription.name } : {}),
@@ -1241,7 +1275,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
     return {
       refundId: refund.id,
       status: mapGoCardlessRefundStatus(refund.status),
-      amount: refund.amount ?? 0,
+      amount: readAmount(refund.amount, "refund", refund),
       ...(refund.links?.payment ? { pspPaymentId: refund.links.payment } : {}),
       ...(refund.created_at ? { createdAt: refund.created_at } : {}),
       raw: refund,
@@ -1340,13 +1374,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
           cause instanceof Error ? cause : new Error("GoCardless connectivity probe failed"),
       },
       `${this.baseUrl}${path}`,
-      {
-        method: "GET",
-        headers: {
-          authorization: `Bearer ${this.config.accessToken}`,
-          "gocardless-version": this.config.goCardlessVersion ?? DEFAULT_GOCARDLESS_VERSION,
-        },
-      },
+      { method: "GET", headers: this.headers() },
     );
     const json = safeJson(text);
     const reason = response.ok ? undefined : firstErrorReason(json);
@@ -1375,10 +1403,9 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
       {
         method,
         headers: {
-          authorization: `Bearer ${this.config.accessToken}`,
-          "gocardless-version": this.config.goCardlessVersion ?? DEFAULT_GOCARDLESS_VERSION,
+          ...this.headers(),
           ...(options.body !== undefined ? { "content-type": "application/json" } : {}),
-          ...(options.idempotencyKey ? { "idempotency-key": options.idempotencyKey } : {}),
+          ...(options.idempotencyKey ? { "idempotency-key": await idempotencyKeyHeader(options.idempotencyKey) } : {}),
         },
         ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
       },
@@ -1387,6 +1414,15 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
     if (!response.ok) throw mapGoCardlessError(response.status, json ?? text, path);
     const payload = json as Record<string, unknown> | undefined;
     return (options.envelope && payload ? payload[options.envelope] : payload) as T;
+  }
+
+  /** Every request's headers. Making Requests: "Include an `Accept` header on all requests". */
+  private headers(): Record<string, string> {
+    return {
+      authorization: `Bearer ${this.config.accessToken}`,
+      "gocardless-version": this.config.goCardlessVersion ?? DEFAULT_GOCARDLESS_VERSION,
+      accept: "application/json",
+    };
   }
 }
 
@@ -1637,7 +1673,7 @@ function sessionReplayMismatches(
   const paymentRequest = billingRequest.payment_request;
   const mandateCurrency = billingRequest.mandate_request?.currency;
   return [
-    ...(wireAmount(paymentRequest?.amount) !== expected.amount ? ["amount"] : []),
+    ...(wireInteger(paymentRequest?.amount) !== expected.amount ? ["amount"] : []),
     ...((paymentRequest?.currency ?? "").toUpperCase() !== expected.currency ? ["currency"] : []),
     ...(mandateCurrency !== undefined && mandateCurrency.toUpperCase() !== expected.currency
       ? ["mandate currency"]
@@ -1650,7 +1686,7 @@ function sessionReplayMismatches(
 function refundReplayMismatches(refund: GoCardlessRefundLike, req: RefundRequest): string[] {
   return [
     ...(refund.links?.payment !== req.pspPaymentId ? ["payment"] : []),
-    ...(req.amount !== undefined && wireAmount(refund.amount) !== req.amount ? ["amount"] : []),
+    ...(req.amount !== undefined && wireInteger(refund.amount) !== req.amount ? ["amount"] : []),
   ];
 }
 
@@ -1684,24 +1720,11 @@ function idempotencyKeyReused(
   });
 }
 
-/** GoCardless types amounts as integer or string; only a non-negative whole number reads. */
-function wireAmount(value: unknown): number | undefined {
-  const amount = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
-  return typeof amount === "number" && Number.isSafeInteger(amount) && amount >= 0 ? amount : undefined;
-}
-
-/** Fails closed: no refund arithmetic, and no RefundResult, rests on an amount that does not read. */
-function unreadableAmount(resource: "payment" | "refund", raw: unknown): PayFanoutError {
-  return new PayFanoutError({
-    code: "unknown",
-    message: `GoCardless returned a ${resource} whose amount is not a whole number of minor units.`,
-    retryable: false,
-    raw,
-    pspName: GOCARDLESS_PSP_NAME,
-  });
-}
-
 /** `reason` and the key stamp take two of GoCardless's three metadata keys. */
+function toRefundMetadata(req: RefundRequest, stamp: string): Record<string, string> {
+  return { ...(req.reason ? { reason: req.reason } : {}), [REFUND_KEY_STAMP]: stamp };
+}
+
 function toRefundBody(
   req: RefundRequest,
   amount: number,
@@ -1713,7 +1736,7 @@ function toRefundBody(
       amount,
       total_amount_confirmation: totalAmountConfirmation,
       links: { payment: req.pspPaymentId },
-      metadata: { ...(req.reason ? { reason: req.reason } : {}), [REFUND_KEY_STAMP]: stamp },
+      metadata: toRefundMetadata(req, stamp),
     },
   };
 }
@@ -1723,9 +1746,10 @@ function toRefundBody(
  * on every resource that carries it — billing requests and subscriptions
  * alike. payfanout_id claims a slot first where the input has a host id so it
  * round-trips; remaining keys fill the slots and overflow is withheld rather
- * than failing the call. On sessions it is stamped on the billing request AND
- * its payment_request, so the facts survive onto the payment GoCardless
- * creates at fulfilment.
+ * than failing the call. A key name or value that is sent and over its limit
+ * is refused, never truncated. On sessions it is stamped on the billing
+ * request AND its payment_request, so the facts survive onto the payment
+ * GoCardless creates at fulfilment.
  */
 function toStampedMetadata(input: {
   id?: string;
@@ -1734,9 +1758,10 @@ function toStampedMetadata(input: {
   const metadata: Record<string, string> = {};
   if (input.id) metadata["payfanout_id"] = input.id;
   for (const [key, value] of Object.entries(input.metadata ?? {})) {
-    if (Object.keys(metadata).length >= 3) break;
+    if (Object.keys(metadata).length >= METADATA_MAX_KEYS) break;
     if (!(key in metadata)) metadata[key] = value;
   }
+  assertMetadataLimits(metadata);
   return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
 

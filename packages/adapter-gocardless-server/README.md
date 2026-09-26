@@ -105,6 +105,18 @@ rather than silently dropping events — use the recipe above for GoCardless ing
 - One-off billing request payments support **GBP and EUR** only; bank payments confirm
   **asynchronously** (seconds for instant rails, days for debit fallback) and late
   failures exist — webhooks are the source of truth.
+- **GoCardless's request limits are checked before any request**, each rejecting with
+  `invalid_request` that names the limit: metadata key names over 50 characters or
+  values over 500 (the `id` rides `payfanout_id`; keys past the third are withheld, as
+  before, and never checked), a session `amount` of 0, and a subscription
+  `intervalCount` that would skip a year (over 52 weeks, 12 months or 1 year). Amounts
+  GoCardless returns as digit strings read as integers; any other amount rejects the
+  read with `unknown`. An idempotency key over 128 characters, or one no header can
+  carry, is sent as a SHA-256 digest of itself, the same on every retry. Every request
+  sends `Accept: application/json`.
+- `fallbackEnabled` is sent only when `true`. GoCardless says `fallback_enabled` "Should
+  not be set if GoCardless payment intelligence feature is used", and that "Fallbacks
+  should not be used if you are using Protect+ with Verified Mandates".
 - **Refunds are disabled by default** on GoCardless accounts: enable them in the
   GoCardless Dashboard. Until then `refundPayment` rejects with `invalid_request`. A
   403's message follows the reason GoCardless gives (refunds not enabled, an access token
@@ -115,8 +127,9 @@ rather than silently dropping events — use the recipe above for GoCardless ing
   off-session charge. Mandates-as-vault is documented future work.
 - **Native subscriptions charge a mandate** — pass the mandate id (`MD...`) as
   `savedPaymentMethodToken`; GoCardless derives the customer from it. Cadences are
-  weekly/monthly/yearly only (`interval` week/month/year): daily billing and RRULE
-  schedules reject rather than approximate, and `planId` rejects because GoCardless
+  weekly/monthly/yearly only (`interval` week/month/year) and charge at least once a
+  year: daily billing, RRULE schedules and an `intervalCount` over 52 weeks, 12 months
+  or 1 year reject rather than approximate, and `planId` rejects because GoCardless
   subscriptions have no plan object. `merchantRefNum` rides the subscription `name`
   (max 255 chars, also set as the description on each payment created); `startAt` maps
   to the date-only `start_date`. Subscriptions bill in AUD, CAD, DKK, EUR, GBP, NZD,

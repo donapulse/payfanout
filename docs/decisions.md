@@ -469,6 +469,64 @@ choices they forced:
   `@payfanout/core`, which Worldline's connection check now shares. The adapter's own screen
   above missed such a stretch inside a longer reason (`echo_fragmenttoken` for the token
   `sandbox_fragmenttoken_1234`); one shared helper keeps the two from drifting apart.
+- **Doc-verified 2026-09-26: request limits checked locally.** Checked against the OpenAPI
+  spec, the Limits, Making Requests and Responses and Errors pages, the Fallbacks and
+  Protect+ guides (docs.gocardless.com), and the support centre's Transaction limits page
+  that the spec links from `payments.amount`.
+  - *Metadata.* Every metadata field says "Up to 3 keys are permitted, with key names up
+    to 50 characters and values up to 500 characters." A key name or value the adapter
+    sends over its limit (the `id` is the value of `payfanout_id`, and a refund's `reason`
+    is a value) is refused with `invalid_request` before any request, naming the key, and
+    never truncated. Keys past the third are still withheld, and a withheld key is not
+    checked. GoCardless does not say what it counts as a character. The adapter counts
+    code points, which are never more than the UTF-16 units or UTF-8 bytes of the same
+    text, so it refuses nothing GoCardless accepts under any of those readings; if
+    GoCardless counts units or bytes, text with characters outside ASCII can pass locally
+    and be refused by GoCardless, as before.
+  - *Idempotency keys.* The Limits page: "Keys must be no longer than 128 characters";
+    Responses and Errors: `idempotency_key_too_long`, "Idempotency key exceeded 128
+    characters." A longer key, and one a header cannot carry (fetch refuses NUL, CR, LF and
+    any character above U+00FF, so such a key used to fail before the request as a
+    retryable `psp_unavailable`), is sent as `payfanout-sha256-` and the SHA-256 digest of
+    the key, 81 characters, on every call that sends one. The PayPal and Worldline adapters
+    derive theirs the same way for their shorter limits: the same key always yields the
+    same header, so a retry replays, and a key behind the router works on every provider.
+    Neither kind could reach GoCardless before, so every key it has seen is still sent as
+    given. The unit is undocumented. The adapter counts JavaScript's `length`, which for a
+    key a header can carry is also its count of code points and of bytes.
+  - *Accept.* Making Requests: "Include an `Accept` header on all requests:" followed by
+    `Accept: application/json`. Every request sends it, the connection check included.
+  - *Amounts.* The spec types a payment's `amount` ("Amount, in the lowest denomination for
+    the currency") and `amount_refunded`, a refund's `amount`, a payment request's `amount`
+    and a subscription's `amount` and `interval` as `oneOf [string, integer]`. Reads now
+    decode them as the refund path already did: a safe non-negative integer, or a string of
+    ASCII digits naming one, and nothing else; none of these fields is documented as
+    negative. Any other amount rejects the read with a non-retryable `unknown` rather than
+    reach a minor-unit field as a string, a fraction or NaN. `unknown` leaves the outcome
+    open, so a caller retries a money-moving call only under the same key, and
+    `PaymentRouter` neither retries nor fails over on it; `processing_error` would fail
+    over, and `psp_unavailable` would be retried against an answer that does not change.
+    An amount GoCardless leaves out still reads as 0, as before: the spec marks no field
+    required. An `interval` that does not read as an integer of at least 1 omits the
+    subscription's cadence, as an unrecognised `interval_unit` does.
+  - *`fallback_enabled`.* The spec: "(Optional) If true, this billing request can fallback
+    from instant payment to direct debit. Should not be set if GoCardless payment
+    intelligence feature is used." The Fallbacks guide: "Fallbacks should not be used if
+    you are using Protect+ with Verified Mandates.", and the Protect+ guide calls Protect+
+    "our anti-fraud payment intelligence product". A `false` still sets the field, so it is
+    sent only when `fallbackEnabled` is `true`.
+  - *Zero session amounts.* Core's `assertMinorUnitAmount` refuses negative and fractional
+    amounts and accepts 0, which `PaymentService` screens out for an adapter without
+    zero-amount verification; `createPaymentSession` now refuses it too when called
+    directly. The spec gives `payment_request.amount` no minimum. `payments.amount` says
+    "Minimum and maximum amounts vary by payment scheme" and links the Transaction limits
+    page, whose table lists a minimum of 1 for Faster Payments and SEPA (Open Banking),
+    with no unit stated, beside maximums an account can ask GoCardless to raise. The
+    adapter enforces none of these values; below them, GoCardless's own refusal applies.
+  - *Subscription intervals.* `subscriptions.interval`: "Must be greater than or equal to
+    `1`. Must result in at least one charge date per year." `intervalCount` is capped at 52
+    weekly (364 days; 53 weeks can leave a calendar year without a charge), 12 monthly and
+    1 yearly.
 
 ## PayPal adapter (2026-07-07)
 

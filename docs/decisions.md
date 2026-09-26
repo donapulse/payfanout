@@ -456,6 +456,11 @@ choices they forced:
     sandbox. The fake answers the refunds gate with a 403 naming either reason
     (`refundsDisabledReason`). Sandbox check: create a refund on an account with refunds
     disabled and record the status and reason.
+- **2026-09-26: the reason screen moved to core.** A reason holding the access token, or
+  eight consecutive characters of it in any letter case, is withheld by `repeatsSecret` in
+  `@payfanout/core`, which Worldline's connection check now shares. The adapter's own screen
+  above missed such a stretch inside a longer reason (`echo_fragmenttoken` for the token
+  `sandbox_fragmenttoken_1234`); one shared helper keeps the two from drifting apart.
 
 ## PayPal adapter (2026-07-07)
 

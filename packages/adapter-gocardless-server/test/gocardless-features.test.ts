@@ -572,14 +572,33 @@ describe("GoCardless verifyCredentials (Test connection probe)", () => {
       { accessToken: codeShaped },
     );
     await expect(adapter.verifyCredentials()).resolves.toEqual(statusOnly);
-    // Nor is a stretch of the token that reads as a code, from eight characters up.
-    for (const stretch of ["fragmenttoken", "fragment"]) {
+    // Nor is a stretch of the token that reads as a code, from eight characters up, wherever it sits in the reason.
+    for (const stretch of ["fragmenttoken", "fragment", "echo_fragmenttoken", "sandbox_", "ken_1234"]) {
       const fragment = answering(
         404,
         JSON.stringify({ error: { code: 404, errors: [{ reason: stretch, message: "x" }] } }),
         { accessToken: "sandbox_fragmenttoken_1234" },
       );
       await expect(fragment.adapter.verifyCredentials(), stretch).resolves.toEqual(statusOnly);
+    }
+    // In any letter case: a reason is lower case, a token need not be.
+    const mixedCase = answering(
+      404,
+      JSON.stringify({ error: { code: 404, errors: [{ reason: "echo_fragmenttoken", message: "x" }] } }),
+      { accessToken: "sandbox_FragmentToken_1234" },
+    );
+    await expect(mixedCase.adapter.verifyCredentials()).resolves.toEqual(statusOnly);
+    // Seven characters of the token, or a reason sharing none of it, is named.
+    for (const reason of ["sandbox", "en_1234", "path_not_found"]) {
+      const named = answering(
+        404,
+        JSON.stringify({ error: { code: 404, errors: [{ reason, message: "x" }] } }),
+        { accessToken: "sandbox_fragmenttoken_1234" },
+      );
+      await expect(named.adapter.verifyCredentials(), reason).resolves.toEqual({
+        ...statusOnly,
+        message: `GoCardless rejected the connectivity check (HTTP 404, ${reason}) — check baseUrl and goCardlessVersion.`,
+      });
     }
     // A code at the 64-character limit is named.
     const longest = "a".repeat(64);

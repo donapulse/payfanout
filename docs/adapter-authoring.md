@@ -299,7 +299,11 @@ Optionally implement **`verifyCredentials()`** — a side-effect-free probe behi
 "Test connection" button. Make ONE read-only call (a vault/list read, an OAuth mint, a
 liveness endpoint) and classify: `{ ok: true }`, or `{ ok: false, category }` with `auth`
 (401/403 — wrong key), `network` (timeout/5xx/429 — transient), or `internal`. Never mutate
-PSP state, never retry an auth rejection, never log secrets.
+PSP state, never retry an auth rejection, never log secrets. Before a message quotes
+anything from the answer's body, such as an error code, check it with core's
+`repeatsSecret(text, credentials)` and leave it out when that returns true: a request sent
+to a wrong `baseUrl` carried the credentials to whatever answered, and that server wrote the
+body.
 
 ## 2. Client adapter (`@payfanout/adapter-<psp>`)
 

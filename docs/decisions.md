@@ -3115,55 +3115,117 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   authorisation process after selecting another card", and the API contract
   (payment.preprod.direct.worldline-solutions.com/v1/public-contract-definition.yaml,
   v2.507.0) describes a retriable error as one where "the same request can safely be sent
-  again with a new idempotence key": a new attempt is a new key.
+  again with a new idempotence key": a new attempt is a new key. This refines the
+  "Worldline decline codes (2026-09-25)" entry above, whose "a same-key retry only replays
+  the rejection" no longer holds for completions; the decline codes stay non-retryable,
+  since the new attempt is the customer's to make.
 - **How the walk runs.** The first attempt goes out under
   `deriveIdempotenceKey(idempotencyKey)`, unchanged, so a first attempt is exactly the
-  request sent before and a completion in flight across the upgrade keeps its key. An
-  answer is a replayed failure when it is a failure (a 4xx other than 409 and 429, or a 2xx
-  whose payment maps to failed), carries `X-GCS-Idempotence-Request-Timestamp`, and came on
-  the first send of that key within the call. The guide says "For any follow-up requests
-  made with the same idempotency key, our response includes an additional header,
+  request sent before and a completion in flight across the upgrade keeps its key. An answer
+  is a replay when it carries `X-GCS-Idempotence-Request-Timestamp` on the first send of its
+  key within the call, or on a re-send with a timestamp more than 15 minutes before that
+  first send (see the re-send item below). The guide says "For any follow-up requests made
+  with the same idempotency key, our response includes an additional header,
   X-GCS-Idempotence-Request-Timestamp. This header indicates the timestamp of the initial
   request in milliseconds since January 1st, 1970 00:00:00 UTC." Worldline's SDKs read it
   before the status code, so it can ride an error answer: the Node SDK's `handleResponse`
   (github.com/wl-online-payments-direct/sdk-nodejs, src/utils/communicator.ts) takes it
-  before computing `isSuccess` and ignores an empty value; the Java SDK's `updateContext`
-  (sdk-java, DefaultCommunicator.java) parses it with `Long.valueOf` before
-  `throwExceptionIfNecessary`, and its `ExceptionFactory` attaches it to the
-  `IdempotenceException` of a 409 whose one error is `1409`. The next attempt goes out under
-  the key `deriveIdempotenceKey` makes of `${idempotencyKey}:after:${attemptId}`, where
-  `attemptId` is the error body's `paymentResult.payment.id`, else the REJECTED payment's
-  `id`, else the replay header's value. The contract gives CreatePayment's 400, 402, 403,
-  404, 409, 502 and 503 bodies as `paymentErrorResponse` (`errorId`, `errors`, and
-  `paymentResult`, "details about the created payment if one has been generated") and its
-  201 as `createPaymentResponse` (`creationOutput`, `merchantAction`, `payment`). The walk
-  ends at a non-replayed answer, handled as before; at a replayed success, returned through
-  `retrievePayment` and never sent again; at a 409, 429 or 5xx, handled as before; or after
-  20 attempts, refused with a non-retryable `invalid_request` that asks for a new session
-  under a new key. Nothing is stored: every completion walks the replays again.
+  before computing `isSuccess`, ignores an empty value and keeps the raw string; the Java
+  SDK's `updateContext` (sdk-java, DefaultCommunicator.java) parses it with `Long.valueOf`
+  before `throwExceptionIfNecessary`, and its `ExceptionFactory` attaches it to the
+  `IdempotenceException` of a 409 whose one error is `1409`. A replay is a failed attempt,
+  walked past, once its payment ended without taking money, as the next items describe. The
+  next attempt goes out under the key `deriveIdempotenceKey` makes of
+  `${idempotencyKey}:after:${attemptId}`, where `attemptId` is the error body's
+  `paymentResult.payment.id`, else the 2xx payment's `id`, else the replay header's value.
+  The contract gives CreatePayment's 400, 402, 403, 404, 409, 502 and 503 bodies as
+  `paymentErrorResponse` (`errorId`, `errors`, and `paymentResult`, "details about the
+  created payment if one has been generated") and its 201 as `createPaymentResponse`
+  (`creationOutput`, `merchantAction`, `payment`), "The payment request was successfully
+  processed and a payment object was created". A 201 that names no payment therefore throws
+  its non-retryable `processing_error` marked `outcomeUnknown`: the key may hold a payment
+  the answer does not name. The walk ends at the call's own answer, handled as before; at a
+  replayed attempt that did not fail, returned as it now reads and never sent again; at a
+  409, 429 or 5xx, handled as before; or after 20 attempts. That last refusal is a
+  non-retryable `invalid_request` whose `raw.reason` is `"attempt_limit"`, with core's
+  catalog message: the text used to name the limit, which a card tester could read. It
+  carries no `outcomeUnknown`, because every attempt it counts was read back and failed, and
+  no completion sends a 21st, so no payment can exist under the key. Nothing is stored:
+  every completion walks the replays again.
 - **A replayed 3-D Secure challenge is read back, and only a failed or cancelled one is
   walked past.** The guide warns "Updates related to the operation, such as payment status,
   may still occur", so a replayed REDIRECT is followed by `GET /payments/{id}`. Failed or
   cancelled (1, "a final status"), the walk goes on with that payment's id; still waiting,
-  the challenge comes back as `requires_action` with its redirect URL; anything else is
-  returned as it now reads. The Statuses page says of 46: "If your customer abandons the 3-D
-  Secure check prematurely (i.e. by closing the browser window), the transaction will remain
-  in statusOutput.statusCode=46 indefinitely." An open challenge may still be authorised, so
-  walking past it could charge twice; an abandoned one therefore holds its key, and the
-  guide tells hosts a new attempt then needs a new key.
+  the challenge comes back as `requires_action` with its redirect URL; anything else,
+  `processing` included, is returned as it now reads. The Statuses page says of 46: "If your
+  customer abandons the 3-D Secure check prematurely (i.e. by closing the browser window),
+  the transaction will remain in statusOutput.statusCode=46 indefinitely." An open challenge
+  may still be authorised, so walking past it could charge twice; an abandoned one therefore
+  holds its key. The guide tells hosts to cancel it with `cancelPayment` while Worldline
+  reports it cancellable (the contract's `statusOutput.isCancellable`, "Flag indicating if
+  the payment can be cancelled") before paying under a new key, and to reconcile one they
+  cannot cancel.
+- **A replayed payment is walked past only once it ended unpaid, and never after it took
+  money (corrected in review, 2026-09-26).** The Statuses page moves 50 ("Authorised waiting
+  external result", fraud screening), 51 ("Authorisation waiting") and 52 ("Authorisation
+  not known") on to 2, 5 or 9 later, and says of 52 and 92: "As your initial request might
+  have been successful, please do not resend the initial request. This is to avoid double
+  bookings of the same order." A replayed 2xx whose payment was pending when created is read
+  back, walked past once it reads failed or cancelled, and otherwise returned as it now
+  reads, `processing` included. A payment authorised or captured when created, a
+  manual-capture authorisation (5) among them, is returned as it now reads and never walked
+  past, even once a merchant has cancelled it: a completion repeated after that must not
+  authorise again. The tests pin both, a repeated manual-capture completion authorising
+  once, and a challenge handed on to a pending authorisation being returned.
+- **A replayed refusal that reports a payment is walked past only once that payment ended
+  unpaid (corrected in review, 2026-09-26).** Walking past any replayed 4xx on its status
+  alone would let a 402 carrying a payment at AUTHORIZATION_REQUESTED (52) chain to a new
+  attempt: a second charge once 52 resolved to 9. The contract's `paymentResult` puts no
+  bound on the payment's status, and CreatePayment's description says of a rejected request
+  that "In some cases a payment object was created and you will find all the details in the
+  response as well". So a replayed refusal whose payment reads failed or cancelled, in the
+  body or read back with `GET /payments/{id}`, is walked past; one whose payment went
+  through by now is returned as that payment; one still pending throws, mapped as before,
+  marked `outcomeUnknown`. The one that went through is returned rather than thrown, because
+  a decline reported for a payment that went through would invite a host to charge again
+  under a new key. As for a 2xx, one whose payment the body reports authorised or captured
+  is never walked past, whatever that payment reads now. The call's own refusal whose
+  payment has not ended is marked `outcomeUnknown` as well. A refusal that reports no
+  payment is walked past as before.
 - **Why nothing is charged twice.** The only new sends are the later attempts, and each goes
-  out only after the previous key's first send was answered with a replayed failure: a 4xx
-  refusal, a REJECTED payment, or a challenge whose payment reads failed or cancelled, none
-  of which moved money. Each next key derives from a value Worldline replays unchanged, the
-  failed payment's id or the initial request's timestamp, so every completion derives the
-  same keys in the same order, meets a success at the key that holds it, and returns it.
-  An outcome the adapter cannot know never leads to a new attempt: a 409, a 429 or a 5xx
-  ends the call as before, and so does the answer to a re-send after a timeout or a lost
-  connection, because it carries the header whenever the first send was processed. That
-  last rule costs a customer whose decline was lost one more try, and never makes an
-  automatic second attempt with the declined card. Two completions racing on one key cannot
-  both send the next one: the second meets the first's 409, and the answer it gets once
-  that clears comes on a re-send, so it is that call's own outcome.
+  out only after the previous key answered with a replayed attempt whose payment ended
+  without taking money: a refusal with no payment, or a payment that reads failed or
+  cancelled (for a 2xx, one not authorised or captured when created). Each next key derives
+  from a value Worldline replays unchanged, the failed payment's id or the initial request's
+  timestamp, so every completion derives the same keys in the same order, meets a success at
+  the key that holds it, and returns it. An outcome the adapter cannot know never leads to a
+  new attempt: a 409, a 429 or a 5xx ends the call as before, a pending payment is returned
+  or thrown marked `outcomeUnknown`, and so is a failure on a re-send that may be the call's
+  own. The adapter never sends a second attempt with a declined card within one call. Across
+  calls it can: a duplicate POST of a completion, arriving after the first was declined,
+  finds that decline replayed and sends the same hosted tokenization, and so the same card,
+  under the next key (AMBIGUOUS 6). Two completions racing on one key cannot both send the
+  next one: the second meets the first's 409, and the answer it gets once that clears comes
+  on a re-send within the 15 minutes, so it is taken as that call's own, a failure marked
+  `outcomeUnknown`.
+- **A re-send's replay is an earlier completion's only when it is more than 15 minutes older
+  than the key's first send in the call (corrected in review, 2026-09-26).** When the first
+  send never reached Worldline (a refused connection, or a 429 the platform did not
+  process), the re-send meets an earlier completion's replay. Taking every answer to a
+  re-send as the call's own would throw a decline there as final even when a later attempt
+  under the key had succeeded, and a host that switched keys on it would charge again. The
+  call's own first request, processed but unanswered, is stamped when Worldline received it,
+  which reads as before the adapter's first send only by as much as the server's clock runs
+  ahead of Worldline's. So a replay stamped more than 15 minutes before the first send is an
+  earlier completion's, and walking on from it is exactly what the first send would have
+  done. Anything else, a timestamp within those 15 minutes, one that is not decimal
+  milliseconds, or one ahead of the first send, is taken as the call's own, and a failure
+  among them throws marked `outcomeUnknown` rather than as a final decline. A re-send
+  answered without the header is fresh processing, final as before. The margin assumes the
+  server's clock runs less than 15 minutes ahead of Worldline's: one further ahead would
+  read its own lost decline as an earlier completion's and send the next attempt with the
+  same card. The manual-authentication page ("Our platform will reject requests with a
+  timestamp older than 5 minutes") bounds only the other direction.
 - **A refusal that created no payment is named by the replay header, not by its
   `errorId`.** The contract describes `errorId` as "Unique reference, for debugging
   purposes, of this error response", and the API troubleshooting page
@@ -3174,39 +3236,73 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   initial request's timestamp, so every replay repeats it, and a replayed failure always
   carries it.
 - **The first key must outlive the session.** Every walk starts from the host key's own
-  first attempt, and Worldline promises its outcome for at least 24 hours only. A
-  completion that found it forgotten would go out as a new first attempt, and after a later
-  attempt succeeded, charge again. That happens when a per-order key serves a session
-  created about a day after its first attempt, or a session lives that long. Keys go out in
-  order, so the first is the first Worldline may forget: before sending a second attempt,
-  the adapter requires the first attempt's timestamp plus 23 hours (24 less an hour for
-  drift between Worldline's clock and the one that set the session's expiry) to fall after
-  the signed session's `expiresAt`, and otherwise refuses with a non-retryable
-  `invalid_request`. A header value that is not decimal milliseconds fails that check. The
-  refusal reads no further than the first key, so a success that a later key holds from an
-  earlier session goes unseen; the error therefore asks for a new key only once no payment
-  under the old one has succeeded. The cost is a customer who returns about a day after a
-  decline under a per-order key and meets that error, where walking on would have let them
-  pay, against a second charge that walking on would risk. What remains is outside any
-  session's reach: a completion under the key after the idempotence period, in a later
-  session, is a new first attempt at Worldline, as it was before, now counted from the first
-  attempt rather than the success. The guide tells hosts to record every completed payment
-  and never complete a paid order again.
-- **Not walked past, deliberately.** A replayed 2xx whose payment was still pending when it
-  was created (for instance 50, "Authorised waiting external result") and failed later is
-  returned as that failed payment; only REDIRECT answers are read back. This refines the
-  "Worldline decline codes (2026-09-25)" entry above, whose "a same-key retry only replays
-  the rejection" no longer holds for completions; the decline codes stay non-retryable,
-  since the new attempt is the customer's to make.
+  first attempt, and Worldline promises its outcome for at least 24 hours only. A completion
+  that found it forgotten would go out as a new first attempt, and after a later attempt
+  succeeded, charge again. That happens when a per-order key serves a session created about
+  a day after its first attempt. Keys go out in order, so the first is the first Worldline
+  may forget: before sending a second attempt, the adapter requires the first attempt's
+  timestamp plus 23 hours (24 less an hour for drift between Worldline's clock and the one
+  that set the session's expiry) to fall after the signed session's `expiresAt`, and
+  otherwise refuses with a non-retryable `invalid_request` whose `raw.reason` is
+  `"first_attempt_may_expire"`, with core's catalog message. A header value that is not
+  decimal milliseconds, or that lies more than an hour ahead of the server's clock (a value
+  in microseconds, say), fails that check too. The refusal reads no further than the first
+  key, so a success that a later key holds from an earlier session goes unseen: it is a
+  refusal of a reused key whose later attempts may hold a payment it did not read, so it
+  carries `outcomeUnknown`, and the guide tells hosts to switch keys only after their
+  records or webhooks show no payment under the old one succeeded. The cost is a customer
+  who returns about a day after a decline under a per-order key and meets that error, where
+  walking on would have let them pay, against a second charge that walking on would risk.
+  What remains is outside any session's reach: a completion under the key after the
+  idempotence period, in a later session, is a new first attempt at Worldline, as it was
+  before. That period runs from the key's first attempt, not from the success, so it can end
+  hours after a success that came late; the guide says so, and tells hosts to record every
+  completed payment and never complete a paid order again. Worldline gives a Hosted
+  Tokenization session "a maximum life span of 3 hours" (contract), so a `sessionTtlSeconds`
+  beyond that outlives the session it completes; the config's documentation now says so
+  instead of advising under 23 hours.
+- **#215's hosted tokenization direction was dropped.** The issue proposed reading the
+  session's current token with
+  `GET /v2/{merchantId}/hostedtokenizations/{hostedTokenizationId}` ("When a token has been
+  created or updated during the hosted tokenization session, the details are returned in
+  this object") and deriving the next key from it. That read lasts only while the session
+  does, "a maximum life span of 3 hours", against at least 24 hours for the key's outcome,
+  so a later completion could not derive the key again. Token-derived keys also form no
+  chain: a completion carrying a third card after a success under the second card's key
+  would derive a key no attempt used, and charge again, because nothing the first key
+  replays names the second. The chain derives each next key from what Worldline replays for
+  the key before it, so every completion meets the success.
+- **The attempt-limit test gives each attempt its own session.** Worldline issues one
+  hostedTokenizationId per Hosted Tokenization session, and the contract says temporary
+  tokens "can only be used once". The fake does not enforce that single use, so rather than
+  let one id back 20 declines, the test opens a session per attempt, each with its own
+  hosted tokenization, as a per-order key reused across sessions would.
 - **AMBIGUOUS, each with a sandbox check.** (1) Whether Worldline stores a 5xx or a 429
-  outcome under a key; the `retriable` wording above suggests a technical failure needs a new
-  key. If it does, such a key keeps answering `psp_unavailable` or `rate_limited`, and the
-  adapter still never walks past one, since that attempt's outcome is unknown. Check: replay
-  a key whose first answer was a 5xx or a 429, if the sandbox can produce one. (2) Whether
-  `errorId` is the same on every replay; the adapter does not depend on it. Check: decline
-  a payment and replay its key twice, comparing the bodies. (3) Whether a replayed 402
-  carries the header; no page shows a replayed error answer. Without it the adapter reads the
-  replay as the call's own and throws the decline, as before. Check: the same replay,
-  inspecting the headers, also confirming that the value is decimal milliseconds. (4)
-  Whether a 400 that created no payment is stored under the key at all; the fake stores it,
-  and either way no payment is at stake. No sandbox run has exercised any of this yet.
+  outcome under a key; the `retriable` wording above suggests a technical failure needs a
+  new key. If it does, such a key keeps answering `psp_unavailable` or `rate_limited`, and
+  the adapter still never walks past one, since that attempt's outcome is unknown. Check:
+  replay a key whose first answer was a 5xx or a 429, if the sandbox can produce one. (2)
+  Whether `errorId` is the same on every replay; the adapter does not depend on it. Check:
+  decline a payment and replay its key twice, comparing the bodies. (3) Whether a replayed
+  402 carries the header, and in what format; no page shows a replayed error answer. The
+  guide says milliseconds and the Java SDK parses the value with `Long.valueOf`, but the
+  Node SDK keeps it as a raw string, and its unit test (sdk-nodejs,
+  `__tests__/unit/communication/idempotence.test.ts`) uses the ISO-8601 value
+  "2024-01-01T10:00:00Z". Without the header the adapter reads the replay as the call's own
+  and throws the decline, as before. In ISO-8601, every walk past a first key would be
+  refused as `first_attempt_may_expire`, and every replay on a re-send taken as the call's
+  own: the safe failure, at the price of a customer who cannot pay again under the key.
+  Check: the same replay, inspecting the headers, also confirming that the value is decimal
+  milliseconds. (4) Whether a 400 that created no payment is stored under the key at all;
+  the fake stores it, and either way no payment is at stake. Check: send a CreatePayment the
+  platform refuses with a 400 (an unknown `hostedTokenizationId`, say), then the same key
+  with a valid one, and record whether the second answer replays the 400 with the header or
+  creates a payment. (5) Whether a 4xx `paymentResult` payment is always REJECTED; the
+  adapter reads its status either way. Check: decline payments with each sandbox decline
+  trigger and record `paymentResult.payment.status` and `statusOutput.statusCode` on every
+  4xx that carries one. (6) Whether the single-use temporary token blocks a second payment
+  with the same hosted tokenization, as in the duplicate POST above; the contract says
+  temporary tokens "can only be used once", and does not say whether a declined attempt uses
+  one. Check: decline a payment, then send CreatePayment with the same
+  `hostedTokenizationId` under a new key, and record whether Worldline refuses it, with
+  which error, or authorises the card again. No sandbox run has exercised any of this yet.

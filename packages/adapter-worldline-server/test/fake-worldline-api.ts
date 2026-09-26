@@ -24,6 +24,9 @@ import type {
  *   - card declines as HTTP 402 with { errorId, errors, paymentResult }, the
  *     REJECTED payment they create included, or, behind a lever, as a 201
  *     carrying a REJECTED payment
+ *   - authorisations the platform has not finished (50, 51, 52), answered
+ *     201 at AUTHORIZATION_REQUESTED, or behind a lever as a 402 carrying such
+ *     a payment, and settled later with settlePendingAuthorization
  */
 interface StoredPayment {
   id: string;
@@ -46,6 +49,18 @@ interface StoredPayment {
 const DECLINE_AMOUNT = 1302;
 /** hostedTokenizationId that forces a 3-D Secure challenge (REDIRECT merchantAction). */
 const THREE_DS_TOKEN = "htp_3ds";
+
+/**
+ * Statuses reference: 50 "Authorised waiting external result" (fraud
+ * screening), 51 "Authorisation waiting" (the acquirer) and 52 "Authorisation
+ * not known". GetPayment lists 50 and 51 under AUTHORIZATION_REQUESTED /
+ * PENDING_CONNECT_OR_3RD_PARTY; 52 has no row there, so it takes the same pair.
+ */
+export type PendingAuthorizationCode = 50 | 51 | 52;
+
+function pendingAuthorization(statusCode: PendingAuthorizationCode): Pick<StoredPayment, "status" | "statusCode" | "statusCategory"> {
+  return { status: "AUTHORIZATION_REQUESTED", statusCode, statusCategory: "PENDING_CONNECT_OR_3RD_PARTY" };
+}
 
 /** A CreatePayment answer stored under its idempotence key, as first sent. */
 interface StoredAnswer {
@@ -78,6 +93,14 @@ export class FakeWorldlineApi {
   rejectPayment: { errors?: WorldlineApiError[] } | undefined = undefined;
   /** Cards, by hostedTokenizationId, the issuer declines with a 402 whatever the amount. */
   readonly declinedCards = new Set<string>();
+  /** Cards, by hostedTokenizationId, whose authorisation CreatePayment answers 201 still pending, at that code. */
+  readonly pendingCards = new Map<string, PendingAuthorizationCode>();
+  /**
+   * Cards, by hostedTokenizationId, CreatePayment refuses with a 402 whose
+   * paymentResult reports the payment still pending, at that code. No page
+   * shows such an answer, and the contract does not rule one out.
+   */
+  readonly refusedWhilePending = new Map<string, PendingAuthorizationCode>();
   /** Hosted tokenizations CreatePayment refuses with a 400 that creates no payment. */
   readonly invalidTokens = new Set<string>();
   /**
@@ -85,6 +108,8 @@ export class FakeWorldlineApi {
    * answer stored, then the connection fails before the answer arrives.
    */
   lostCreatePaymentAnswers = 0;
+  /** The next CreatePayment connections to refuse: each request fails before the platform sees it. */
+  refusedCreatePaymentConnections = 0;
   /** Replays carry a new errorId, as a platform that ids every error response would send. */
   freshErrorIdOnReplay = false;
   /** The time a key's first CreatePayment is stamped with, in ms since the epoch; each one moves it on a second. */
@@ -121,6 +146,10 @@ export class FakeWorldlineApi {
       });
     }
     if (method === "POST" && /^\/v2\/[^/]+\/payments$/.test(path)) {
+      if (this.refusedCreatePaymentConnections > 0) {
+        this.refusedCreatePaymentConnections--;
+        throw new TypeError("simulated connection refused before the request reached the platform");
+      }
       const answer = this.createPayment(body ?? {}, idemKey);
       if (this.lostCreatePaymentAnswers > 0) {
         this.lostCreatePaymentAnswers--;
@@ -263,12 +292,15 @@ export class FakeWorldlineApi {
     const id = `pay_${++this.seq}`;
     const sale = (card.authorizationMode ?? "SALE").toUpperCase() !== "PRE_AUTHORIZATION";
     const merchantReference = order.references?.merchantReference;
-    if (amount === DECLINE_AMOUNT || this.declinedCards.has(hostedTokenizationId)) {
+    const refusedPendingCode = this.refusedWhilePending.get(hostedTokenizationId);
+    if (amount === DECLINE_AMOUNT || this.declinedCards.has(hostedTokenizationId) || refusedPendingCode !== undefined) {
       // Documented decline shape: HTTP 402 with errors[] and, in paymentResult,
-      // the REJECTED payment the attempt created.
+      // the payment the attempt created, REJECTED unless a lever says otherwise.
       const payment: StoredPayment = {
         id, amount, currencyCode, merchantReference,
-        status: "REJECTED", statusCode: 2, statusCategory: "UNSUCCESSFUL",
+        ...(refusedPendingCode === undefined
+          ? { status: "REJECTED", statusCode: 2, statusCategory: "UNSUCCESSFUL" }
+          : pendingAuthorization(refusedPendingCode)),
         sale, capturableRemaining: 0, captures: [], refunds: [],
       };
       this.store(payment);
@@ -283,6 +315,16 @@ export class FakeWorldlineApi {
           paymentResult: createResponse(payment),
         },
       };
+    }
+    const pendingCode = this.pendingCards.get(hostedTokenizationId);
+    if (pendingCode !== undefined) {
+      const payment: StoredPayment = {
+        id, amount, currencyCode, merchantReference,
+        ...pendingAuthorization(pendingCode),
+        sale, capturableRemaining: 0, captures: [], refunds: [],
+      };
+      this.store(payment);
+      return { status: 201, body: createResponse(payment) };
     }
     if (this.rejectPayment) {
       const payment: StoredPayment = {
@@ -344,15 +386,36 @@ export class FakeWorldlineApi {
 
   /**
    * Test helper: what became of a 3-D Secure challenge after the redirect, in
-   * the Statuses reference's terms. A challenge the customer abandons stays at
-   * REDIRECTED (46) "indefinitely", which is what leaving it alone models.
+   * the Statuses reference's terms: authorised, refused, cancelled, or handed on
+   * to an authorisation still pending at that code. A challenge the customer
+   * abandons stays at REDIRECTED (46) "indefinitely", which is what leaving it
+   * alone models.
    */
-  settleChallenge(paymentId: string, outcome: "succeeded" | "rejected" | "cancelled"): void {
+  settleChallenge(paymentId: string, outcome: "succeeded" | "rejected" | "cancelled" | PendingAuthorizationCode): void {
     const payment = this.payments.get(paymentId);
     if (!payment || payment.status !== "REDIRECTED") throw new Error(`No open challenge on payment ${paymentId}`);
+    if (typeof outcome === "number") {
+      Object.assign(payment, pendingAuthorization(outcome));
+    } else {
+      this.settle(payment, outcome, { errorCode: "40001134", category: "PAYMENT_PLATFORM_ERROR", httpStatusCode: 402, message: "Authentication failed" });
+    }
+  }
+
+  /**
+   * Test helper: the result a pending authorisation (50, 51, 52) ends with.
+   * The Statuses reference sends all three on to authorised (5) or refused (2),
+   * and 50 and 52 also to captured (9) for a sale.
+   */
+  settlePendingAuthorization(paymentId: string, outcome: "succeeded" | "rejected"): void {
+    const payment = this.payments.get(paymentId);
+    if (!payment || payment.status !== "AUTHORIZATION_REQUESTED") throw new Error(`No pending authorisation on payment ${paymentId}`);
+    this.settle(payment, outcome, { errorCode: "30051001", category: "PAYMENT_PLATFORM_ERROR", httpStatusCode: 402, message: "Do not honour" });
+  }
+
+  private settle(payment: StoredPayment, outcome: "succeeded" | "rejected" | "cancelled", refusal: WorldlineApiError): void {
     if (outcome === "rejected") {
       Object.assign(payment, { status: "REJECTED", statusCode: 2, statusCategory: "UNSUCCESSFUL" });
-      payment.errors = [{ errorCode: "40001134", category: "PAYMENT_PLATFORM_ERROR", httpStatusCode: 402, message: "Authentication failed" }];
+      payment.errors = [refusal];
     } else if (outcome === "cancelled") {
       Object.assign(payment, { status: "CANCELLED", statusCode: 1, statusCategory: "UNSUCCESSFUL", capturableRemaining: 0 });
     } else if (payment.sale) {

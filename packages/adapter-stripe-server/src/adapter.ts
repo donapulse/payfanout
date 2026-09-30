@@ -48,6 +48,7 @@ import {
   assertSendableCurrency,
   assertThreeDecimalRule,
   readStripeAmounts,
+  REFUSED_CURRENCIES,
   refusesUnconverted,
   toStripeAmount,
   type RecordUse,
@@ -135,7 +136,11 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
  * a list page holding one fails whole, its `raw` naming each such record and
  * carrying the page's `nextCursor`; and webhook and polled events in UGX carry
  * no `amount`. A zero-amount session is a SetupIntent, which carries no
- * amount or currency, and is left alone in every currency.
+ * amount or currency, and is left alone in every currency. UGX is declared in
+ * `unsupportedCurrencies`, so the router skips Stripe for a UGX session and
+ * PaymentService refuses one with `unsupported_operation`, zero-amount
+ * sessions included (from the `@payfanout/server` release that reads the
+ * field).
  *
  * Earlier releases sent UGX amounts, and MGA amounts that are not whole
  * ariary, unconverted, so a retry under the same key after the upgrade may
@@ -203,6 +208,9 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
   getCapabilities(): AdapterCapabilities {
     return {
       pspName: this.pspName,
+      // UGX: every amount in it is refused before it is sent (currency-units.ts);
+      // declared so the router skips Stripe instead of ending its cascade there.
+      unsupportedCurrencies: [...REFUSED_CURRENCIES],
       supportsPaymentRetrieval: true, // GET /v1/payment_intents/:id
       supportsRefunds: true,
       supportsPartialRefunds: true,

@@ -7,6 +7,7 @@ import {
   type UnifiedWebhookEvent,
   type UnifiedWebhookEventType,
 } from "@payfanout/core";
+import { ADYEN_EXPONENT_DEVIATIONS } from "./exponents.js";
 import { hexToBytes, hmacSha256Base64 } from "./signing.js";
 
 /**
@@ -462,11 +463,8 @@ function toUnifiedEvent(item: AdyenNotificationItem): UnifiedWebhookEvent {
   };
 }
 
-/** Currencies Adyen prices with a different exponent than ISO 4217. */
-const EXPONENT_DEVIATION_CURRENCIES = new Set(["CLP", "CVE", "IDR", "ISK"]);
-
 function hasAdyenExponentDeviation(currency: string | undefined): boolean {
-  return currency !== undefined && EXPONENT_DEVIATION_CURRENCIES.has(currency.toUpperCase());
+  return currency !== undefined && ADYEN_EXPONENT_DEVIATIONS.has(currency.toUpperCase());
 }
 
 /** Verification and parsing read the body identically. */

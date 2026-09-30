@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { isPayFanoutError, type PayFanoutError } from "@payfanout/core";
+import {
+  isPayFanoutError,
+  listNonDefaultCurrencyExponents,
+  screenSessionInput,
+  validateAdapterCapabilities,
+  type PayFanoutError,
+} from "@payfanout/core";
+import { assertSendableCurrency } from "../src/currency-units.js";
 import {
   StripeServerAdapter,
   stripeEventBodyToUnified,
@@ -14,6 +21,27 @@ import { FakeStripe, stripeError } from "./fake-stripe.js";
 // UGX is given both units. PayFanout's are ISO 4217's: ISK 0, MGA 2, UGX 0.
 
 const NOW_MS = Date.parse("2026-09-30T12:00:00Z");
+
+/**
+ * Which of `codes` createPaymentSession refuses for `amount`. Every refusal
+ * counts and must be the currency refusal itself, an invalid_request naming
+ * the currency on raw; every other outcome must be the session asked for.
+ */
+async function refusedSessions(adapter: StripeServerAdapter, codes: Iterable<string>, amount: number): Promise<string[]> {
+  const refused: string[] = [];
+  for (const currency of codes) {
+    const outcome: unknown = await adapter
+      .createPaymentSession({ amount, currency, idempotencyKey: `k-${currency}` })
+      .catch((err: unknown) => err);
+    if (isPayFanoutError(outcome)) {
+      expect(outcome, currency).toMatchObject({ code: "invalid_request", raw: { currency } });
+      refused.push(currency);
+    } else {
+      expect(outcome, currency).toMatchObject({ amount, currency });
+    }
+  }
+  return refused;
+}
 
 function makePair(config: Partial<StripeServerAdapterConfig> = {}): { adapter: StripeServerAdapter; fake: FakeStripe } {
   const fake = new FakeStripe();
@@ -695,6 +723,70 @@ describe("UGX: refused, as Stripe documents it with two units", () => {
     const polled = await adapter.fetchEvents();
     expect(polled.events[0]).toMatchObject({ type: "payment.processing", pspPaymentId: "pi_p", currency: "UGX" });
     expect(polled.events[0]).not.toHaveProperty("amount");
+  });
+});
+
+describe("the currencies the adapter declares unsupported", () => {
+  const LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+  it("declares every currency whose amounts it refuses to send, over every three-letter code, and only those", () => {
+    const { adapter } = makePair();
+    const unsendable: string[] = [];
+    for (const a of LETTERS) {
+      for (const b of LETTERS) {
+        for (const c of LETTERS) {
+          const code = `${a}${b}${c}`;
+          try {
+            assertSendableCurrency(code, { label: "amount" });
+          } catch {
+            // Refused: no amount in this currency is ever sent.
+            unsendable.push(code);
+          }
+        }
+      }
+    }
+    expect(adapter.getCapabilities().unsupportedCurrencies).toEqual(unsendable);
+    expect(unsendable).toEqual(["UGX"]);
+    expect(validateAdapterCapabilities(adapter)).toEqual([]);
+  });
+
+  it("refuses a session in exactly the declared currencies, and none whose refusal depends on the amount", async () => {
+    const { adapter } = makePair();
+    const declared = adapter.getCapabilities().unsupportedCurrencies;
+    const codes = new Set([
+      ...listNonDefaultCurrencyExponents().map(([code]) => code),
+      ...["ISK", "MGA", "UGX", "USD", "EUR", "GBP", "HUF", "TWD"],
+    ]);
+    // Whole ariary, a multiple of 10, and inside the safe range once ISK is multiplied.
+    expect(await refusedSessions(adapter, codes, 100_000)).toEqual(declared);
+    const input = { amount: 150, currency: "MGA", idempotencyKey: "k" };
+    await expect(adapter.createPaymentSession(input)).rejects.toMatchObject({ code: "invalid_request" });
+    expect(screenSessionInput(adapter.getCapabilities(), input)).toBeUndefined();
+  });
+
+  it("fails registration for a paymentMethods override whose rail takes UGX alone", () => {
+    const { adapter } = makePair({
+      paymentMethods: [
+        { type: "card", flow: "embedded", supported: true },
+        { type: "ideal", flow: "redirect", supported: true, currencies: ["UGX"] },
+      ],
+    });
+    const issues = validateAdapterCapabilities(adapter);
+    expect(issues).toContainEqual(
+      expect.stringMatching(/offers ideal in UGX but declares each of those currencies in unsupportedCurrencies/),
+    );
+    expect(validateAdapterCapabilities(makePair().adapter)).toEqual([]);
+  });
+
+  it("has screening refuse every UGX session, the zero-amount one the adapter still creates included", async () => {
+    const { adapter } = makePair();
+    const caps = adapter.getCapabilities();
+    expect(screenSessionInput(caps, { amount: 5000, currency: " ugx ", idempotencyKey: "k" })).toBe(
+      '"stripe" declares currency UGX unsupported',
+    );
+    const zero = { amount: 0, currency: "UGX", idempotencyKey: "k" };
+    expect(screenSessionInput(caps, zero)).toBe('"stripe" declares currency UGX unsupported');
+    await expect(adapter.createPaymentSession(zero)).resolves.toMatchObject({ amount: 0, currency: "UGX" });
   });
 });
 

@@ -1,7 +1,14 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { getCurrencyExponent, isPayFanoutError, utf8ToBase64Url, type PayFanoutError } from "@payfanout/core";
-import { PAYSAFE_CURRENCY_EXPONENTS } from "../src/currency-exponents.js";
+import {
+  getCurrencyExponent,
+  isPayFanoutError,
+  screenSessionInput,
+  utf8ToBase64Url,
+  validateAdapterCapabilities,
+  type PayFanoutError,
+} from "@payfanout/core";
+import { currencyRefusal, PAYSAFE_CURRENCY_EXPONENTS } from "../src/currency-exponents.js";
 import {
   encodeSessionContext,
   parsePaysafeWebhookEvent,
@@ -242,6 +249,57 @@ describe("Paysafe's currency table", () => {
     const byCode = (entries: Iterable<[string, number]>) => [...entries].sort(([a], [b]) => a.localeCompare(b));
     expect(PAYSAFE_TABLE).toHaveLength(81);
     expect(byCode(PAYSAFE_CURRENCY_EXPONENTS)).toEqual(byCode(PAYSAFE_TABLE));
+  });
+});
+
+describe("the currencies the adapter declares unsupported", () => {
+  it("declares exactly the currencies createPaymentSession refuses, over Paysafe's table and ISO 4217 list one", async () => {
+    const { adapter } = makePair();
+    const declared = adapter.getCapabilities().unsupportedCurrencies;
+    expect(declared).toEqual(REFUSED);
+    const universe = new Set([...PAYSAFE_ROWS.keys(), ...ISO_ROWS.keys()]);
+    expect(await refusedSessions(adapter, universe)).toEqual(declared);
+    expect(validateAdapterCapabilities(adapter)).toEqual([]);
+  });
+
+  it("declares every code the refusal rule refuses, putting every three-letter code to the rule", () => {
+    const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const refused: string[] = [];
+    for (const a of letters) {
+      for (const b of letters) {
+        for (const c of letters) {
+          if (currencyRefusal(`${a}${b}${c}`) !== undefined) refused.push(`${a}${b}${c}`);
+        }
+      }
+    }
+    expect(makePair().adapter.getCapabilities().unsupportedCurrencies).toEqual(refused);
+  });
+
+  it("fails registration for a paymentMethods override whose rail takes declared currencies alone", () => {
+    const { adapter } = makePair({
+      paymentMethods: [
+        { type: "card", flow: "embedded", supported: true },
+        { type: "sepa_debit", flow: "embedded", supported: true, currencies: ["CLP", "ISK"] },
+      ],
+    });
+    const issues = validateAdapterCapabilities(adapter);
+    expect(issues).toContainEqual(
+      expect.stringMatching(/offers sepa_debit in CLP\/ISK but declares each of those currencies in unsupportedCurrencies/),
+    );
+    expect(validateAdapterCapabilities(makePair().adapter)).toEqual([]);
+  });
+
+  it("is refused on every session, zero-amount ones included, by the adapter and by screening alike", async () => {
+    const { adapter } = makePair();
+    const caps = adapter.getCapabilities();
+    for (const currency of REFUSED) {
+      const zero = { amount: 0, currency, idempotencyKey: `k-${currency}` };
+      await expect(adapter.createPaymentSession(zero), currency).rejects.toMatchObject({ code: "invalid_request" });
+      expect(screenSessionInput(caps, zero)).toBe(`"paysafe" declares currency ${currency} unsupported`);
+    }
+    for (const currency of ["JPY", "KWD", "USD", "GHS"]) {
+      expect(screenSessionInput(caps, { amount: 1000, currency, idempotencyKey: "k" }), currency).toBeUndefined();
+    }
   });
 });
 

@@ -72,6 +72,19 @@ scripts. Each guide says which inline styles its SDK adds. Before a page that mo
 several PSPs gives a directive a nonce, check every PSP it can mount, and if one of them
 needs `'unsafe-inline'` there, keep `'unsafe-inline'` with no nonce or hash beside it.
 
+### Trusted Types
+
+A page that enforces Trusted Types (`require-trusted-types-for 'script'`) needs a default
+policy whose `createScriptURL` returns the URL only for the hosts each set-up guide lists,
+and nothing for any other. The client adapters insert their SDK's `<script>` with a plain
+URL, and PayFanout creates no policy of its own: when the page has no default policy, or its
+policy rejects the URL, `loadSdk()` rejects with a non-retryable `invalid_request`, carrying on
+`raw` the exception the browser threw. The directive also governs HTML and script-text
+sinks, so an SDK that writes to one goes through the same policy and fails on its own terms
+if the policy refuses it: try each PSP's SDK on a page that enforces the policy before going
+live. The specification warns that "a lax, no-op default policy defeats all the benefits of
+using Trusted Types" and advises a default policy "in a transitional period only".
+
 ## Installing a PSP we don't ship yet
 
 Another PSP is **a new adapter package, not a fork**. You implement the

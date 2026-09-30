@@ -6105,6 +6105,26 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `apiVersion` (the adapter's handling of a page's own v3) needs a confirmation in a sandbox,
   with the `Stripe-Version` of its requests read the same way.
 
+## Trusted Types and the SDK loader (2026-09-30)
+
+- **A refused script URL is an `invalid_request`.** Under `require-trusted-types-for 'script'`
+  the `src` setter of a `<script>` runs "Get Trusted Type compliant string": a policy's error is
+  rethrown, and a default policy's null or undefined result throws a TypeError, as does a page
+  with no default policy (MDN's HTMLScriptElement.src: thrown "if the property is set with a
+  string when Trusted Types are enforced by a CSP and no default policy is defined"; the W3C
+  Trusted Types draft, read 2026-09-30). Core's `injectScript` assigned the URL inside its
+  promise executor, so every client adapter's `loadSdk()` rejected with that bare exception. It
+  now rejects with a non-retryable `invalid_request` attributed to the PSP, the exception on
+  `raw`, and inserts nothing: the page's own policy refused the URL, so a retry cannot help.
+- **PayFanout creates no policy.** The adapters load their SDKs by URL and the host's default
+  policy decides; the providers page asks for one that returns the URL only for the hosts each
+  set-up guide lists. The specification warns that "a lax, no-op default policy defeats all the
+  benefits of using Trusted Types" and advises a default policy "in a transitional period
+  only", which is why the guidance names the hosts rather than accepting any URL. An opt-in
+  named policy is parked in future-designs.md. The directive also governs HTML and script-text
+  sinks, so a PSP SDK that writes to one meets the same policy on its own terms; that is the
+  PSP's code, outside the loader, so the guide asks hosts to try each SDK under enforcement.
+
 ## PayZen PSP_ codes on both halves (2026-09-30)
 
 - **The halves read PSP_ codes differently.** The server adapter maps a PSP_ code through

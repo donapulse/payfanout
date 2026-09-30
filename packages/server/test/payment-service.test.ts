@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { isPayFanoutError, PayFanoutError } from "@payfanout/core";
 import { PaymentService } from "@payfanout/server";
-import { FakeAdapter } from "./fake-adapter.js";
+import { FakeAdapter, type FakeAdapterOptions } from "./fake-adapter.js";
 
 const baseInput = {
   amount: 1000,
@@ -79,6 +79,27 @@ describe("PaymentService registry", () => {
         }),
     ).not.toThrowError();
   });
+
+  it("rejects at registration only a currency declaration that cannot work", async () => {
+    const register = (capabilities: FakeAdapterOptions["capabilities"]) =>
+      new PaymentService({ adapters: [new FakeAdapter({ capabilities })] });
+    for (const entry of [123, null, "UG"]) {
+      expect(() => register({ unsupportedCurrencies: [entry] as unknown as string[] })).toThrowError(
+        /in unsupportedCurrencies, which can never match a session's currency/,
+      );
+    }
+    expect(() => register({ supportedCurrencies: ["UGX", "USD"], unsupportedCurrencies: ["UGX"] })).toThrowError(
+      /declares UGX in both supportedCurrencies and unsupportedCurrencies/,
+    );
+    // Lowercase works (screening uppercases listed codes), so registration takes it;
+    // only the conformance suite asks for the uppercase form.
+    const lowercase = register({ unsupportedCurrencies: ["ugx"] });
+    await expectUnsupported(
+      lowercase.createPaymentSession("fake", { ...baseInput, currency: "UGX" }),
+      /^"fake" declares currency UGX unsupported$/,
+    );
+    expect(() => register({ unsupportedCurrencies: ["UGX"] })).not.toThrowError();
+  });
 });
 
 describe("PaymentService guards", () => {
@@ -137,6 +158,27 @@ describe("PaymentService guards", () => {
     // Full refund (no amount) is still allowed.
     const refund = await service.refundPayment("limited", { pspPaymentId: "p1", idempotencyKey: "k" });
     expect(refund.status).toBe("succeeded");
+  });
+
+  it("refuses a session in a currency the adapter declares unsupported, before calling it", async () => {
+    const adapter = new FakeAdapter({ capabilities: { unsupportedCurrencies: ["UGX"] } });
+    const service = new PaymentService({ adapters: [adapter] });
+    await expectUnsupported(
+      service.createPaymentSession("fake", { ...baseInput, currency: "ugx" }),
+      /^"fake" declares currency UGX unsupported$/,
+    );
+    // Zero-amount sessions too: the list refuses the currency, whatever the amount.
+    await expectUnsupported(
+      service.createPaymentSession("fake", { ...baseInput, amount: 0, currency: "UGX" }),
+      /^"fake" declares currency UGX unsupported$/,
+    );
+    await expect(
+      service.createPaymentSession("fake", { ...baseInput, currency: "UGX" }),
+    ).rejects.toMatchObject({ retryable: false, pspName: "fake" });
+    expect(adapter.calls).toHaveLength(0);
+    const session = await service.createPaymentSession("fake", baseInput);
+    expect(session.pspName).toBe("fake");
+    expect(adapter.calls.map((c) => c.method)).toEqual(["createPaymentSession"]);
   });
 
   it("rejects completePayment for confirm-on-client adapters and routes it for tokenize-first ones", async () => {

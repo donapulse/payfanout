@@ -1,5 +1,19 @@
 # @payfanout/conformance
 
+## 3.1.0
+
+### Minor Changes
+
+- 2d3cec4: The server suite now checks that each `unsupportedCurrencies` code an adapter declares is written as its bare uppercase code, as it already checks `supportedCurrencies` and each payment method's `currencies`, and, through `validateAdapterCapabilities` from `@payfanout/core`, fails an entry that can never match (not a string, or not three letters once trimmed and uppercased), a currency declared in both `supportedCurrencies` and `unsupportedCurrencies`, or a supported payment method whose `currencies` are all declared unsupported. Every new check applies only to an adapter that declares `unsupportedCurrencies`, so no existing adapter's verdict changes.
+
+### Patch Changes
+
+- Updated dependencies [114d13a]
+- Updated dependencies [2d3cec4]
+- Updated dependencies [dd0c035]
+- Updated dependencies [2d3cec4]
+  - @payfanout/core@4.5.0
+
 ## 3.0.5
 
 ### Patch Changes

@@ -1,5 +1,16 @@
 # @payfanout/adapter-gocardless-server
 
+## 3.0.1
+
+### Patch Changes
+
+- 114d13a: Report `NO_CURRENCY` instead of GBP for a billing request, payment or subscription that states no currency, or an empty or malformed one. A payment read through its billing request takes the billing request's currency when it states none of its own.
+- Updated dependencies [114d13a]
+- Updated dependencies [2d3cec4]
+- Updated dependencies [dd0c035]
+- Updated dependencies [2d3cec4]
+  - @payfanout/core@4.5.0
+
 ## 3.0.0
 
 ### Major Changes

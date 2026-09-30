@@ -180,10 +180,132 @@ describe("StripeClientAdapter and a Stripe.js tag the page added", () => {
     const tag = pageTag();
     const loading = adapter().loadSdk();
     await vi.advanceTimersByTimeAsync(10);
-    expect(vi.getTimerCount()).toBe(1);
+    // The 30-second bound and the poll for a Stripe.js another script defines.
+    expect(vi.getTimerCount()).toBe(2);
     setGlobal(pageStripe("dahlia"));
     tag.dispatchEvent(new Event("load"));
     await expect(loading).resolves.toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("resolves as soon as another script defines Stripe.js during the wait", async () => {
+    vi.useFakeTimers();
+    const tag = pageTag();
+    const calls: Calls = [];
+    const stripe = adapter();
+    const outcome = stripe.loadSdk().then(
+      () => "resolved",
+      (err: unknown) => err,
+    );
+    await vi.advanceTimersByTimeAsync(1_000);
+    // The page's own v3, from another tag, runs while the build's tag never settles.
+    setGlobal(pageStripe(3, calls));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(await Promise.race([outcome, Promise.resolve("pending")])).toBe("resolved");
+    expect(vi.getTimerCount()).toBe(0);
+    expect(tag.isConnected).toBe(true);
+    await stripe.mount(document.createElement("div"), { clientSecret: "pi_1_secret_x" });
+    expect(calls).toEqual([{ apiVersion: API_VERSION }]);
+  });
+
+  it("resolves when the page's tag fails but another script has defined Stripe.js", async () => {
+    const tag = pageTag();
+    const loading = adapter().loadSdk();
+    expect(await settled(loading)).toBe(false);
+    setGlobal(pageStripe(3));
+    tag.dispatchEvent(new Event("error"));
+    await expect(loading).resolves.toBeUndefined();
+    expect(tag.isConnected).toBe(false);
+  });
+
+  it("resolves when the wait ends just after another script defined Stripe.js", async () => {
+    vi.useFakeTimers();
+    pageTag();
+    const outcome = adapter().loadSdk().then(
+      () => "resolved",
+      (err: unknown) => err,
+    );
+    await vi.advanceTimersByTimeAsync(29_950);
+    setGlobal(pageStripe("dahlia"));
+    // The bound and the poll fall due together; the bound, set first, runs first.
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await outcome).toBe("resolved");
+  });
+
+  it("replaces a page tag that failed before it looked: the first call times out, the next injects a fresh copy", async () => {
+    vi.useFakeTimers();
+    const tag = pageTag();
+    // The page's tag failed before the adapter looked, so nothing reports it.
+    tag.dispatchEvent(new Event("error"));
+    const stripe = adapter();
+    const first = stripe.loadSdk().then(
+      () => "resolved",
+      (err: unknown) => err,
+    );
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(await first).toMatchObject({
+      code: "psp_unavailable",
+      message: `The page's Stripe.js at ${STRIPE_JS_URL} did not load within 30 seconds`,
+    });
+    expect(tag.isConnected).toBe(true);
+
+    const insertions = recordInsertions();
+    const second = stripe.loadSdk();
+    expect(tag.isConnected).toBe(false);
+    expect(insertions).toEqual([expect.objectContaining({ src: STRIPE_JS_URL, nonce: NONCE })]);
+    setGlobal(pageStripe("dahlia"));
+    document.querySelector(`script[src="${STRIPE_JS_URL}"]`)!.dispatchEvent(new Event("load"));
+    await expect(second).resolves.toBeUndefined();
+  });
+
+  it("replaces its own tag that loaded without Stripe.js instead of waiting on it", async () => {
+    vi.useFakeTimers();
+    const stripe = adapter();
+    const first = stripe.loadSdk();
+    const own = document.querySelector(`script[src="${STRIPE_JS_URL}"]`)!;
+    own.dispatchEvent(new Event("load"));
+    await expect(first).rejects.toMatchObject({ code: "psp_unavailable", message: "Stripe.js loaded but window.Stripe is missing" });
+
+    const insertions = recordInsertions();
+    // The fresh copy loads without Stripe.js too: the call fails at once, waiting on no tag.
+    const second = stripe.loadSdk().then(
+      () => "resolved",
+      (err: unknown) => err,
+    );
+    expect(own.isConnected).toBe(false);
+    expect(insertions).toHaveLength(1);
+    const fresh = document.querySelector(`script[src="${STRIPE_JS_URL}"]`)!;
+    fresh.dispatchEvent(new Event("load"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await Promise.race([second, Promise.resolve("pending")])).toMatchObject({
+      code: "psp_unavailable",
+      message: "Stripe.js loaded but window.Stripe is missing",
+    });
+
+    const third = stripe.loadSdk().then(() => "resolved");
+    expect(fresh.isConnected).toBe(false);
+    expect(insertions).toHaveLength(2);
+    setGlobal(pageStripe("dahlia"));
+    document.querySelector(`script[src="${STRIPE_JS_URL}"]`)!.dispatchEvent(new Event("load"));
+    // No timer to run: the call does not wait on a stale tag.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await Promise.race([third, Promise.resolve("pending")])).toBe("resolved");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not wait on another adapter's tag once it has loaded Stripe.js", async () => {
+    vi.useFakeTimers();
+    const first = adapter();
+    const second = adapter();
+    const a = first.loadSdk();
+    const b = second.loadSdk().then(() => "resolved");
+    // The second adapter found the first one's tag still loading.
+    expect(document.querySelectorAll(`script[src="${STRIPE_JS_URL}"]`)).toHaveLength(1);
+    setGlobal(pageStripe("dahlia"));
+    document.querySelector(`script[src="${STRIPE_JS_URL}"]`)!.dispatchEvent(new Event("load"));
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(a).resolves.toBeUndefined();
+    expect(await Promise.race([b, Promise.resolve("pending")])).toBe("resolved");
     expect(vi.getTimerCount()).toBe(0);
   });
 

@@ -92,7 +92,8 @@ export interface StripeClientAdapterConfig {
    *
    * A Stripe.js the page already runs is used instead of loading this build
    * (see `loadSdk()`). The constructor refuses with `invalid_request` a missing
-   * or malformed version, a date alone from 2024-09-30 on, a release this
+   * or malformed version, a date that does not exist, a date alone from
+   * 2024-09-30 on and a release name with an earlier date, a release this
    * adapter knows no build for, a preview version and a version carrying beta
    * headers (`"…; name=v1"`), as no Stripe.js build speaks the last two.
    */
@@ -154,6 +155,9 @@ const STRIPE_API_VERSION = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])(?:\
  */
 const PAGE_SCRIPT_WAIT_MS = 30_000;
 
+/** How often that wait looks for a Stripe.js another script defined meanwhile. */
+const PAGE_SCRIPT_POLL_MS = 100;
+
 /** The Stripe.js build an API version needs. */
 interface StripeJsBuild {
   url: string;
@@ -179,8 +183,12 @@ function stripeJsBuild(apiVersion: unknown): StripeJsBuild {
     );
   }
   const [version, release] = match;
+  const date = version.slice(0, 10);
+  if (!isCalendarDate(date)) {
+    throw PayFanoutError.invalidRequest(`StripeClientAdapter config.apiVersion "${version}" names a date that does not exist`);
+  }
   if (release === undefined) {
-    if (version >= FIRST_RELEASE_DATE) {
+    if (date >= FIRST_RELEASE_DATE) {
       throw PayFanoutError.invalidRequest(
         `StripeClientAdapter config.apiVersion "${version}" has no release name, which every Stripe API version from ${FIRST_RELEASE_DATE} on carries, as in "${FIRST_RELEASE_DATE}.acacia"`,
       );
@@ -198,7 +206,19 @@ function stripeJsBuild(apiVersion: unknown): StripeJsBuild {
       `StripeClientAdapter config.apiVersion names the release "${release}", for which this adapter knows no Stripe.js build (it knows ${STRIPE_JS_RELEASES.join(", ")}): while the server is on "${release}", pass a version of ${newest}, the newest release this adapter knows`,
     );
   }
+  if (date < FIRST_RELEASE_DATE) {
+    throw PayFanoutError.invalidRequest(
+      `StripeClientAdapter config.apiVersion "${version}" has a release name, which no Stripe API version before ${FIRST_RELEASE_DATE} carries: before it, a version is a date alone, as in "2024-06-20"`,
+    );
+  }
   return { url: `https://js.stripe.com/${release}/stripe.js`, name: release };
+}
+
+/** Whether a well-formed `YYYY-MM-DD` names a day of the Gregorian calendar. */
+function isCalendarDate(date: string): boolean {
+  const [year, month, day] = date.split("-").map(Number) as [number, number, number];
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  return day <= [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]!;
 }
 
 /**
@@ -212,31 +232,36 @@ function buildName(version: unknown): string | undefined {
 
 /**
  * Waits for a `<script>` the page added for the build, which core's
- * injectScript reuses at once whether or not it has loaded: resolves on its
- * `load`, and rejects with a retryable `psp_unavailable` on its `error`, or
- * after PAGE_SCRIPT_WAIT_MS. A tag that failed ran nothing, so it is removed
- * for the next call to fetch the file again, as Stripe's own loader does.
+ * injectScript reuses at once whether or not it has loaded. Resolves on its
+ * `load`, and as soon as `ready()` holds, which it checks every
+ * PAGE_SCRIPT_POLL_MS since another script may define a usable Stripe.js
+ * meanwhile. On the tag's `error`, and after PAGE_SCRIPT_WAIT_MS, it resolves
+ * if `ready()` holds and otherwise rejects with a retryable `psp_unavailable`.
+ * A tag that failed ran nothing, so it is removed for the next call to fetch
+ * the file again, as Stripe's own loader does.
  */
-function waitForPageScript(tag: HTMLScriptElement, url: string): Promise<void> {
+function waitForPageScript(tag: HTMLScriptElement, url: string, ready: () => boolean): Promise<void> {
   return new Promise((resolve, reject) => {
-    const unavailable = (message: string) =>
-      new PayFanoutError({ code: "psp_unavailable", message, retryable: true, raw: undefined, pspName: "stripe" });
-    const settle = (error?: PayFanoutError) => {
+    const settle = (failure?: string) => {
       clearTimeout(timer);
+      clearInterval(poll);
       tag.removeEventListener("load", onLoad);
       tag.removeEventListener("error", onError);
-      if (error) reject(error);
-      else resolve();
+      if (failure === undefined || ready()) resolve();
+      else reject(new PayFanoutError({ code: "psp_unavailable", message: failure, retryable: true, raw: undefined, pspName: "stripe" }));
     };
     const onLoad = () => settle();
     const onError = () => {
       tag.remove();
-      settle(unavailable(`Failed to load ${url}`));
+      settle(`Failed to load ${url}`);
     };
     const timer = setTimeout(
-      () => settle(unavailable(`The page's Stripe.js at ${url} did not load within ${PAGE_SCRIPT_WAIT_MS / 1000} seconds`)),
+      () => settle(`The page's Stripe.js at ${url} did not load within ${PAGE_SCRIPT_WAIT_MS / 1000} seconds`),
       PAGE_SCRIPT_WAIT_MS,
     );
+    const poll = setInterval(() => {
+      if (ready()) settle();
+    }, PAGE_SCRIPT_POLL_MS);
     tag.addEventListener("load", onLoad);
     tag.addEventListener("error", onError);
   });
@@ -275,6 +300,12 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
   private readonly build: StripeJsBuild;
   private sdkPromise?: Promise<void>;
   private warnedOtherBuild = false;
+  /**
+   * Tags for the build's URL seen settled while Stripe.js stayed missing: the
+   * adapter's own after it loaded, and a page's after the wait for it ended.
+   * Neither fires again, so the next call replaces them.
+   */
+  private readonly settledTags = new WeakSet<Element>();
 
   constructor(config: StripeClientAdapterConfig) {
     if (!config.publishableKey) {
@@ -315,10 +346,17 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
    * warns once on the console; a global whose `version` names no build is
    * used as if it were the build `config.apiVersion` names. Beside a Stripe.js
    * v2 global, the build loads and attaches itself as `window.Stripe.StripeV3`,
-   * which the adapter uses. A `<script>` the page added for the build's URL
-   * and that is still loading is waited for, for up to 30 seconds, and one
-   * that fails is removed. A load that fails or leaves the global missing is
-   * not kept: the next call loads again.
+   * which the adapter uses.
+   *
+   * A `<script>` the page added for the build's URL is waited for, for up to
+   * 30 seconds, since it may still be loading: the call resolves when it loads,
+   * or as soon as another script defines a usable Stripe.js, and otherwise
+   * rejects with a retryable `psp_unavailable` when the tag fails, which removes
+   * it, or when the wait ends. A page tag that failed before the call leaves no
+   * sign of it, so that first call waits the full 30 seconds. A load that fails
+   * or leaves Stripe.js missing is not kept: the next call loads again, and
+   * replaces a tag already seen settled without Stripe.js, the adapter's own
+   * after it loaded or a page's after its wait, with a fresh one.
    */
   async loadSdk(): Promise<void> {
     assertBrowser("StripeClientAdapter", "loadSdk");
@@ -469,11 +507,25 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
     );
   }
 
-  /** core's injectScript, then the wait for a `<script>` the page added for the same URL. */
+  /**
+   * core's injectScript, then the wait for a `<script>` the page added for the
+   * same URL. A tag already seen settled is removed first, so that injectScript
+   * injects a fresh one and reports its load or failure.
+   */
   private async injectStripeJs(url: string): Promise<void> {
-    const pageTag = document.querySelector<HTMLScriptElement>(`script[src="${url}"]`);
-    await injectScript(url, this.pspName, { nonce: this.config.cspNonce });
-    if (pageTag !== null && !this.stripeFactory()) await waitForPageScript(pageTag, url);
+    const selector = `script[src="${url}"]`;
+    const found = document.querySelector<HTMLScriptElement>(selector);
+    if (found !== null && this.settledTags.has(found)) found.remove();
+    const pageTag = found?.isConnected ? found : null;
+    try {
+      await injectScript(url, this.pspName, { nonce: this.config.cspNonce });
+      if (pageTag !== null && !this.stripeFactory()) {
+        await waitForPageScript(pageTag, url, () => this.stripeFactory() !== undefined);
+      }
+    } finally {
+      const settled = this.stripeFactory() ? null : document.querySelector(selector);
+      if (settled !== null) this.settledTags.add(settled);
+    }
   }
 
   /** The Stripe.js in use: `window.Stripe`, or beside a v2 global the build attached as `StripeV3`. */

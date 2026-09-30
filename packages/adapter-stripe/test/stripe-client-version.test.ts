@@ -196,6 +196,43 @@ describe("StripeClientAdapter apiVersion", () => {
     }
   });
 
+  it("refuses a date that does not exist", () => {
+    for (const apiVersion of [
+      "2019-02-31",
+      "2023-02-29",
+      "2100-02-29",
+      "2026-02-29.dahlia",
+      "2026-04-31.dahlia",
+      "2026-06-31.dahlia",
+      "2025-09-31.clover",
+      "2025-11-31.clover",
+    ]) {
+      expect(refusal({ apiVersion }), apiVersion).toMatchObject({
+        code: "invalid_request",
+        retryable: false,
+        message: `StripeClientAdapter config.apiVersion "${apiVersion}" names a date that does not exist`,
+      });
+    }
+    // Leap days where the Gregorian calendar has them, and every month's last day.
+    for (const apiVersion of ["2000-02-29", "2020-02-29", "2024-02-29", "2028-02-29.dahlia", "2026-04-30.dahlia", "2026-03-31.dahlia", "2026-01-31.dahlia"]) {
+      expect(refusal({ apiVersion }), apiVersion).toBeUndefined();
+    }
+  });
+
+  it("refuses a release name with a date before 2024-09-30, when versions were a date alone", () => {
+    for (const apiVersion of ["2024-06-20.dahlia", "2024-09-29.acacia", "2019-01-01.basil"]) {
+      expect(refusal({ apiVersion }), apiVersion).toMatchObject({
+        code: "invalid_request",
+        retryable: false,
+        message: `StripeClientAdapter config.apiVersion "${apiVersion}" has a release name, which no Stripe API version before 2024-09-30 carries: before it, a version is a date alone, as in "2024-06-20"`,
+      });
+    }
+    expect(refusal({ apiVersion: "2024-09-30.acacia" })).toBeUndefined();
+    // A preview version and an unknown release keep their own refusals.
+    expect(refusal({ apiVersion: "2024-06-20.preview" })).toMatchObject({ message: expect.stringContaining("is a preview API version") });
+    expect(refusal({ apiVersion: "2020-01-01.zinnia" })).toMatchObject({ message: expect.stringContaining('names the release "zinnia"') });
+  });
+
   it("refuses a release it knows no Stripe.js build for, naming the newest it knows", () => {
     for (const release of ["endive", "zinnia"]) {
       expect(refusal({ apiVersion: `2026-09-30.${release}` })).toMatchObject({

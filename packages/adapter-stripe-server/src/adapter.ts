@@ -139,7 +139,8 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
  * amount or currency, and is left alone in every currency. UGX is declared in
  * `unsupportedCurrencies`, so the router skips Stripe for a UGX session and
  * PaymentService refuses one with `unsupported_operation`, zero-amount
- * sessions included.
+ * sessions included (from the `@payfanout/server` release that reads the
+ * field).
  *
  * Earlier releases sent UGX amounts, and MGA amounts that are not whole
  * ariary, unconverted, so a retry under the same key after the upgrade may

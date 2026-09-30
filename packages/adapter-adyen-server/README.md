@@ -236,7 +236,8 @@ Customer Area settings it relies on.
   shift the decimal point. The check runs on session creation *and* on the currency carried
   by a `pspPaymentId`, so a capture or refund for a payment created elsewhere is refused too.
   The four are declared in `unsupportedCurrencies`, so the router skips Adyen for a session in
-  one and `PaymentService` refuses it with `unsupported_operation`.
+  one and `PaymentService` refuses it with `unsupported_operation` (from the
+  `@payfanout/server` release that reads the field).
 - Card vaulting, zero-amount verification, session update, listing, and native subscriptions
   are out of scope for this version (declared `false`).
 

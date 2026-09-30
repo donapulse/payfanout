@@ -230,7 +230,8 @@ that reads the field, `PaymentRouter` skips an Adyen candidate for a session in 
 tries the next one in the chain, and `PaymentService` refuses such a session for Adyen before
 calling the adapter, with a non-retryable `unsupported_operation` (`"adyen" declares currency
 CLP unsupported`) where the adapter's own refusal is `invalid_request`. An older server screens
-with its own copy of core and does neither. A `paymentMethods` override with a rail whose
+with its own copy of core and does neither, so there route these currencies with a rule placed
+before any rule that can send them to Adyen. A `paymentMethods` override with a rail whose
 `currencies` are all declared unsupported now fails registration. When no candidate in the
 chain takes the currency, the router fails with `invalid_request`, each candidate's refusal on
 `raw` ([routing and failover](/guide/server#routing-failover)).

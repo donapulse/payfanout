@@ -80,7 +80,8 @@ Pair it on the browser with [`@payfanout/adapter-stripe`](../adapter-stripe). Th
   record reject with `unsupported_operation`, list pages holding one fail whole, and UGX
   events carry no `amount`. UGX is declared in `unsupportedCurrencies`, so the router skips
   Stripe for a UGX session and `PaymentService` refuses one, zero-amount sessions included,
-  with `unsupported_operation`. On a UGX record, `cancelPayment`, a capture or refund with no
+  with `unsupported_operation` (from the `@payfanout/server` release that reads the field).
+  On a UGX record, `cancelPayment`, a capture or refund with no
   amount, a metadata-only update and `cancelNativeSubscription` take effect at Stripe and
   then reject with `unsupported_operation` marked `outcomeUnknown`, as their answer cannot
   be reported. `capturePayment` and `refundPayment` with an amount, and

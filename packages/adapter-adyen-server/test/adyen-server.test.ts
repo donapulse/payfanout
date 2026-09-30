@@ -79,13 +79,25 @@ function bareCardToken(paymentMethod: Record<string, string> = {}): string {
   return JSON.stringify({ ...CARD, ...paymentMethod });
 }
 
-/** A currency refusal: an invalid_request naming the currency on raw. */
-function isCurrencyRefusal(outcome: unknown, currency: string): boolean {
-  return (
-    isPayFanoutError(outcome) &&
-    outcome.code === "invalid_request" &&
-    (outcome.raw as { currency?: unknown } | undefined)?.currency === currency
-  );
+/**
+ * Which of `codes` createPaymentSession refuses for 1000 minor units. Every
+ * refusal counts and must be the currency refusal itself, an invalid_request
+ * naming the currency on raw; every other outcome must be the session asked for.
+ */
+async function refusedSessions(adapter: AdyenServerAdapter, codes: Iterable<string>): Promise<string[]> {
+  const refused: string[] = [];
+  for (const currency of codes) {
+    const outcome: unknown = await adapter
+      .createPaymentSession({ amount: 1000, currency, idempotencyKey: `k-${currency}` })
+      .catch((err: unknown) => err);
+    if (isPayFanoutError(outcome)) {
+      expect(outcome, currency).toMatchObject({ code: "invalid_request", raw: { currency } });
+      refused.push(currency);
+    } else {
+      expect(outcome, currency).toMatchObject({ amount: 1000, currency });
+    }
+  }
+  return refused.sort();
 }
 
 function makePair(config: Partial<AdyenServerAdapterConfig> = {}): {
@@ -865,15 +877,7 @@ describe("AdyenServerAdapter specifics", () => {
       ...listNonDefaultCurrencyExponents().map(([code]) => code),
       ...["CLP", "CVE", "IDR", "ISK", "USD", "EUR", "GBP", "CNY", "KHR", "MGA"],
     ]);
-    const refused: string[] = [];
-    for (const currency of codes) {
-      const outcome = await adapter
-        .createPaymentSession({ amount: 1000, currency, idempotencyKey: `k-${currency}` })
-        .catch((err: unknown) => err);
-      // Counted only as the currency refusal itself, never another error.
-      if (isCurrencyRefusal(outcome, currency)) refused.push(currency);
-    }
-    expect(refused.sort()).toEqual(caps.unsupportedCurrencies);
+    expect(await refusedSessions(adapter, codes)).toEqual(caps.unsupportedCurrencies);
     for (const currency of caps.unsupportedCurrencies ?? []) {
       expect(screenSessionInput(caps, { amount: 1000, currency: currency.toLowerCase(), idempotencyKey: "k" })).toBe(
         `"adyen" declares currency ${currency} unsupported`,

@@ -22,13 +22,25 @@ import { FakeStripe, stripeError } from "./fake-stripe.js";
 
 const NOW_MS = Date.parse("2026-09-30T12:00:00Z");
 
-/** A currency refusal: an invalid_request naming the currency on raw. */
-function isCurrencyRefusal(outcome: unknown, currency: string): boolean {
-  return (
-    isPayFanoutError(outcome) &&
-    outcome.code === "invalid_request" &&
-    (outcome.raw as { currency?: unknown } | undefined)?.currency === currency
-  );
+/**
+ * Which of `codes` createPaymentSession refuses for `amount`. Every refusal
+ * counts and must be the currency refusal itself, an invalid_request naming
+ * the currency on raw; every other outcome must be the session asked for.
+ */
+async function refusedSessions(adapter: StripeServerAdapter, codes: Iterable<string>, amount: number): Promise<string[]> {
+  const refused: string[] = [];
+  for (const currency of codes) {
+    const outcome: unknown = await adapter
+      .createPaymentSession({ amount, currency, idempotencyKey: `k-${currency}` })
+      .catch((err: unknown) => err);
+    if (isPayFanoutError(outcome)) {
+      expect(outcome, currency).toMatchObject({ code: "invalid_request", raw: { currency } });
+      refused.push(currency);
+    } else {
+      expect(outcome, currency).toMatchObject({ amount, currency });
+    }
+  }
+  return refused;
 }
 
 function makePair(config: Partial<StripeServerAdapterConfig> = {}): { adapter: StripeServerAdapter; fake: FakeStripe } {
@@ -745,16 +757,8 @@ describe("the currencies the adapter declares unsupported", () => {
       ...listNonDefaultCurrencyExponents().map(([code]) => code),
       ...["ISK", "MGA", "UGX", "USD", "EUR", "GBP", "HUF", "TWD"],
     ]);
-    const refused: string[] = [];
-    for (const currency of codes) {
-      // Whole ariary, a multiple of 10, and inside the safe range once ISK is multiplied.
-      const outcome = await adapter
-        .createPaymentSession({ amount: 100_000, currency, idempotencyKey: `k-${currency}` })
-        .catch((err: unknown) => err);
-      // Counted only as the currency refusal itself, never another error.
-      if (isCurrencyRefusal(outcome, currency)) refused.push(currency);
-    }
-    expect(refused).toEqual(declared);
+    // Whole ariary, a multiple of 10, and inside the safe range once ISK is multiplied.
+    expect(await refusedSessions(adapter, codes, 100_000)).toEqual(declared);
     const input = { amount: 150, currency: "MGA", idempotencyKey: "k" };
     await expect(adapter.createPaymentSession(input)).rejects.toMatchObject({ code: "invalid_request" });
     expect(screenSessionInput(adapter.getCapabilities(), input)).toBeUndefined();

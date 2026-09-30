@@ -175,14 +175,15 @@ subscription, capture, refund or update under that idempotency key before sendin
 and, like any `outcomeUnknown` error, an open one may be retried only under the same key.
 Every other refusal of an amount is final.
 
-**The router skips Stripe for UGX.** The adapter declares UGX in `unsupportedCurrencies`, so
-`PaymentRouter` skips a Stripe candidate for a UGX session and tries the next one in the
-chain, and `PaymentService` refuses a UGX session for Stripe before calling the adapter,
-zero-amount sessions included. Its refusal is a non-retryable `unsupported_operation`
-(`"stripe" declares currency UGX unsupported`), where the adapter's own is `invalid_request`.
-A `paymentMethods` override with a rail whose `currencies` are UGX alone now fails
-registration, since that rail can never be routed. The router reads the declaration from the
-`@payfanout/server` release that added `unsupportedCurrencies`.
+**The router skips Stripe for UGX.** The adapter declares UGX in `unsupportedCurrencies`.
+From the `@payfanout/server` release that reads the field, `PaymentRouter` skips a Stripe
+candidate for a UGX session and tries the next one in the chain, and `PaymentService` refuses
+a UGX session for Stripe before calling the adapter, zero-amount sessions included, with a
+non-retryable `unsupported_operation` (`"stripe" declares currency UGX unsupported`) where
+the adapter's own refusal is `invalid_request`. An older server screens with its own copy of
+core and does neither, so there route UGX with a rule placed before any rule that can send it
+to Stripe. A `paymentMethods` override with a rail whose `currencies` are UGX alone now fails
+registration, since that rail can never be routed.
 Give UGX a chain that names a provider serving it; when no candidate does, the router fails
 with `invalid_request`, each candidate's refusal on `raw`
 ([routing and failover](/guide/server#routing-failover)).

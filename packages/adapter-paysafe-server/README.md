@@ -164,7 +164,8 @@ retrieved, not a separate credential).
   subscription list pages holding one reject with `unsupported_operation`, and webhook
   events Paysafe reports in one carry no `amount`. The adapter declares these currencies in
   `unsupportedCurrencies`, so the router skips Paysafe for a session in one and
-  `PaymentService` refuses it with `unsupported_operation` (see [currencies the adapter
+  `PaymentService` refuses it with `unsupported_operation`, from the `@payfanout/server`
+  release that reads the field (see [currencies the adapter
   refuses](https://donapulse.github.io/payfanout/guide/paysafe#currencies-the-adapter-refuses)).
 - Paysafe has no public events API (`supportsEventPolling: false`), so missed-webhook
   recovery falls back to `retrievePayment` per order.

@@ -1199,7 +1199,8 @@ function defaultSleep(ms: number): Promise<void> {
  * one the table lacks that is not priced in hundredths (ISK, UYI and others;
  * see "Currencies the adapter refuses" in the setup guide), and declares
  * them in `unsupportedCurrencies`, so the router skips Paysafe for a session
- * in one and PaymentService refuses it with `unsupported_operation`.
+ * in one and PaymentService refuses it with `unsupported_operation` (from the
+ * `@payfanout/server` release that reads the field).
  * createPaymentSession and updatePaymentSession refuse one with
  * `invalid_request` before any request. completePayment,
  * chargeSavedPaymentMethod and createNativeSubscription, which earlier

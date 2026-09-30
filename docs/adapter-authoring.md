@@ -62,8 +62,9 @@ and `PaymentService` will hold you to:
   core's `NO_CURRENCY` (`"XXX"`, ISO 4217's "no currency"): never a plausible guess such
   as USD. Never send an amount in a guessed currency either: when no record states the
   currency, refuse the call with `invalid_request` before sending. An amount the PSP
-  reports with no currency anywhere cannot be scaled, so refuse it rather than read it
-  with a guessed exponent.
+  reports with no currency anywhere reads with `NO_CURRENCY`'s default exponent under a
+  record that reports `NO_CURRENCY`, so a call that went through never fails on its
+  answer; a record with no currency field to flag it (a refund read) refuses it instead.
 - **Hard currency constraints** go in `capabilities.supportedCurrencies` (uppercase
   ISO 4217; omit when unrestricted). The router pre-screens candidates with it — a
   declared constraint means a mismatched payment skips your PSP instead of aborting the

@@ -5,6 +5,7 @@ import {
   PayFanoutError,
   requestWithTimeout,
   safeJson,
+  toMinorUnits,
   utf8ToBase64,
   withTransportRetries,
   type AdapterCapabilities,
@@ -541,7 +542,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     }
     if (captureAmount !== undefined && currency === undefined) {
       throw PayFanoutError.invalidRequest(
-        `Payment "${pspPaymentId}" reports no currency for its order or authorizations, so a capture amount cannot be sent for it — capture the authorization in full without an amount, or in the PayPal dashboard`,
+        `Payment "${pspPaymentId}" states no currency for its order or authorizations, so a capture amount cannot be sent for it — capture it in the PayPal dashboard`,
         order,
       );
     }
@@ -623,7 +624,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     const currency = target.currency;
     if (req.amount !== undefined && currency === undefined) {
       throw PayFanoutError.invalidRequest(
-        `Capture ${target.captureId} of payment "${req.pspPaymentId}" reports no currency, so a partial refund amount cannot be sent for it — refund it in full, or in the PayPal dashboard`,
+        `Capture ${target.captureId} of payment "${req.pspPaymentId}" states no currency, so a partial refund amount cannot be sent for it — refund it in full, or in the PayPal dashboard`,
         { pspPaymentId: req.pspPaymentId, captureId: target.captureId },
       );
     }
@@ -638,12 +639,15 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
             : {},
       },
     );
+    // The refund has gone through: an answer whose amount states no currency,
+    // for a capture that states none either, falls back to what was asked.
+    const answered = statedCurrency(refund.amount) ?? currency;
     return {
       refundId: refund.id,
       status: mapRefundStatus(refund.status),
       amount:
-        refund.amount?.value !== undefined
-          ? minorOf(refund.amount.value, refund.amount, currency)
+        refund.amount?.value !== undefined && answered !== undefined
+          ? fromPayPalValue(refund.amount.value, answered)
           : (req.amount ?? target.amountMinor),
       raw: refund,
     };
@@ -655,11 +659,23 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       "GET",
       `/v2/payments/refunds/${encodeURIComponent(refundId)}`,
     );
+    const currency = statedCurrency(refund.amount);
+    if (refund.amount?.value !== undefined && currency === undefined) {
+      // A refund record carries no currency field that could flag the amount
+      // as unverified, so the read refuses it rather than scale it by a guess.
+      throw new PayFanoutError({
+        code: "processing_error",
+        message: `PayPal reported refund ${refund.id} of "${refund.amount.value}" without a currency`,
+        raw: refund,
+        pspName: this.pspName,
+      });
+    }
     const captureId = captureIdFromLinks(refund.links);
     return {
       refundId: refund.id,
       status: mapRefundStatus(refund.status),
-      amount: refund.amount?.value !== undefined ? minorOf(refund.amount.value, refund.amount, undefined) : 0,
+      amount:
+        refund.amount?.value !== undefined && currency !== undefined ? fromPayPalValue(refund.amount.value, currency) : 0,
       ...(captureId ? { pspPaymentId: captureId } : {}),
       ...(refund.create_time ? { createdAt: refund.create_time } : {}),
       raw: refund,
@@ -694,7 +710,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     if (input.amount !== undefined || input.currency !== undefined) {
       if (currency === undefined) {
         throw PayFanoutError.invalidRequest(
-          `Order "${input.pspSessionId}" reports no currency, so an amount cannot be sent for it without one — pass currency with the amount`,
+          `Order "${input.pspSessionId}" states no currency, so an amount cannot be sent for it without one — pass currency with the amount`,
           { pspSessionId: input.pspSessionId },
         );
       }
@@ -1502,20 +1518,15 @@ function sumPayPalAmounts(amounts: Array<PayPalMoney | undefined>, stated: strin
 
 /**
  * A PayPal value in minor units, scaled by its own currency or else by the one
- * its record states elsewhere. PayPal's money schema requires `currency_code`,
- * so a value with no currency anywhere is refused rather than scaled by a guess.
+ * its record states elsewhere. PayPal's money schema requires `currency_code`;
+ * a value with no currency anywhere reads with NO_CURRENCY's default exponent,
+ * and the record carrying it reports NO_CURRENCY, so nothing presents it in a
+ * real currency. Reading on keeps a call that went through from failing on its
+ * answer.
  */
 function minorOf(value: string, money: PayPalMoney, stated: string | undefined): MinorUnitAmount {
   const currency = statedCurrency(money) ?? stated;
-  if (currency === undefined) {
-    throw new PayFanoutError({
-      code: "processing_error",
-      message: `PayPal reported the amount "${value}" without a currency`,
-      raw: money,
-      pspName: PAYPAL_PSP_NAME,
-    });
-  }
-  return fromPayPalValue(value, currency);
+  return currency === undefined ? toMinorUnits(value, NO_CURRENCY) : fromPayPalValue(value, currency);
 }
 
 /** The order a capture settled, from supplementary data or the links[rel=up] href. */

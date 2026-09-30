@@ -5699,11 +5699,15 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   partial refund and an amount-only session update with `invalid_request` before sending
   when no record of the payment states its currency. A capture or refund in full sends no
   amount and still goes through. A PayPal value whose money object and records state no
-  currency rejects the read with `processing_error` rather than being scaled by USD's
-  exponent. A session update that only restates the order's own currency no longer sends
-  a PATCH, which re-sent the amount it read (0 when the order reported none).
+  currency reads with `NO_CURRENCY`'s default exponent under a record that reports
+  `NO_CURRENCY`: throwing instead would fail the answer of a capture, void or refund that
+  has gone through. A refund read, whose record has no currency field to flag the amount,
+  refuses such a value with `processing_error`, and a refund call's answer falls back to
+  the amount asked. A session update that only restates the order's own currency no longer
+  sends a PATCH, which re-sent the amount it read (0 when the order reported none).
 - **Not changed.** An amount a PSP omits still reads as 0, as before. Paysafe card refunds
   that state no currency keep their earlier rule (see "Card refunds and settlements may
-  state no currency: AMBIGUOUS" above): a refund reports no currency field. Seventeen
+  state no currency: AMBIGUOUS" above): a refund reports no currency field. Nineteen
   mutations (each guard dropped, each fallback set back to its old guess, the related-record
-  sources removed, the restated-currency PATCH re-enabled) each made a test fail.
+  sources removed, the restated-currency PATCH re-enabled, a currency-less value thrown on
+  instead of read, the refund read's refusal dropped) each made a test fail.

@@ -106,22 +106,70 @@ describe("PayPal never reports or sends a currency no record states", () => {
     expect(info.amount).toBe(1500); // JPY has no minor unit: never 150000
   });
 
-  it("refuses an amount no record states a currency for rather than scaling it by a guess", async () => {
+  it("reads values no record states a currency for with XXX's default exponent, under XXX", async () => {
+    const { adapter } = recordingAdapter({
+      "GET /v2/checkout/orders/5O7": {
+        id: "5O7",
+        intent: "CAPTURE",
+        status: "APPROVED",
+        purchase_units: [{ reference_id: "default", amount: { value: "10.00" } }],
+      },
+    });
+    const info = await adapter.retrievePayment("5O7");
+    expect(info.currency).toBe("XXX");
+    expect(info.amount).toBe(1000);
+  });
+
+  it("refuses a refund read whose amount states no currency, since a refund has no currency field to flag it", async () => {
     const { adapter } = recordingAdapter({
       "GET /v2/payments/refunds/R1": { id: "R1", status: "COMPLETED", amount: { value: "5.00" } },
     });
     const err = await rejection(adapter.retrieveRefund("R1"));
     expect(isPayFanoutError(err) && err.code).toBe("processing_error");
     expect(isPayFanoutError(err) && err.retryable).toBe(false);
-    expect(String((err as Error).message)).toMatch(/"5\.00" without a currency/);
+    expect(String((err as Error).message)).toMatch(/refund R1 of "5\.00" without a currency/);
   });
 
   it("refuses an explicit capture amount before sending when no record states the currency", async () => {
     const { adapter, sent } = recordingAdapter({ "GET /v2/checkout/orders/5O1": AUTHORIZED_WITHOUT_AMOUNTS });
     const err = await rejection(adapter.capturePayment("5O1", 500, "capture-key"));
     expect(isPayFanoutError(err) && err.code).toBe("invalid_request");
-    expect(String((err as Error).message)).toMatch(/reports no currency for its order or authorizations/);
+    expect(String((err as Error).message)).toMatch(/states no currency for its order or authorizations/);
     expect(sent.filter((call) => call.method === "POST")).toEqual([]);
+  });
+
+  it("refuses the capture amount it would compute when the order states amounts but no currency", async () => {
+    const { adapter, sent } = recordingAdapter({
+      "GET /v2/checkout/orders/5O8": {
+        id: "5O8",
+        intent: "AUTHORIZE",
+        status: "COMPLETED",
+        purchase_units: [
+          {
+            reference_id: "default",
+            amount: { value: "10.00" },
+            payments: { authorizations: [{ id: "A8", status: "CREATED", amount: { value: "10.00" } }] },
+          },
+        ],
+      },
+    });
+    const err = await rejection(adapter.capturePayment("5O8", undefined, "capture-key"));
+    expect(isPayFanoutError(err) && err.code).toBe("invalid_request");
+    expect(String((err as Error).message)).toMatch(/capture it in the PayPal dashboard/);
+    expect(sent.filter((call) => call.method === "POST")).toEqual([]);
+  });
+
+  it("answers a full refund whose amounts state no currency with the capture's amount, never an error", async () => {
+    const { adapter, sent } = recordingAdapter({
+      "GET /v2/payments/captures/C8": { id: "C8", status: "COMPLETED", amount: { value: "7.00" } },
+      "POST /v2/payments/captures/C8/refund": { id: "R8", status: "COMPLETED", amount: { value: "7.00" } },
+    });
+    const result = await adapter.refundPayment({ pspPaymentId: "C8", idempotencyKey: "refund-key" });
+    expect(result.refundId).toBe("R8");
+    expect(result.amount).toBe(700);
+    expect(sent.filter((call) => call.method === "POST")).toEqual([
+      { method: "POST", path: "/v2/payments/captures/C8/refund", body: {} },
+    ]);
   });
 
   it("still captures such an authorization in full, sending no amount", async () => {
@@ -141,7 +189,7 @@ describe("PayPal never reports or sends a currency no record states", () => {
     const { adapter, sent } = recordingAdapter({ "GET /v2/payments/captures/C9": { id: "C9", status: "COMPLETED" } });
     const err = await rejection(adapter.refundPayment({ pspPaymentId: "C9", amount: 500, idempotencyKey: "refund-key" }));
     expect(isPayFanoutError(err) && err.code).toBe("invalid_request");
-    expect(String((err as Error).message)).toMatch(/Capture C9 of payment "C9" reports no currency/);
+    expect(String((err as Error).message)).toMatch(/Capture C9 of payment "C9" states no currency/);
     expect(sent.filter((call) => call.method === "POST")).toEqual([]);
   });
 

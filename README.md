@@ -40,7 +40,7 @@ Two more non-negotiables baked into the design:
 | `@payfanout/server` | server | `PaymentService` over an adapter registry + framework-agnostic webhook handlers. |
 | `@payfanout/react` | client | `<PayFanoutProvider>`, `usePayFanout`, `<PaymentFields>`, `<PayButton>`. |
 | `@payfanout/adapter-stripe-server` | server | Stripe Node SDK: PaymentIntents, refunds, webhook verification. **Pins an explicit `apiVersion`.** |
-| `@payfanout/adapter-stripe` | client | Stripe.js + Payment Element. **Loads the Stripe.js build of the same pinned `apiVersion`.** |
+| `@payfanout/adapter-stripe` | client | Stripe.js + Payment Element. **Loads the Stripe.js build of the pinned `apiVersion`.** |
 | `@payfanout/adapter-paysafe-server` | server | Paysafe Payments REST API: payments, settlements, refunds, webhooks. **Edge-runtime compatible** (WebCrypto, no Node builtins), runs on Cloudflare Workers / Next.js edge routes. |
 | `@payfanout/adapter-paysafe` | client | Paysafe.js hosted iframe fields (tokenize-first). |
 | `@payfanout/adapter-gocardless-server` | server | GoCardless Billing Requests REST API: billing requests + hosted bank authorisation, refunds, events, batched webhooks. **Edge-runtime compatible** (WebCrypto, no Node builtins). |

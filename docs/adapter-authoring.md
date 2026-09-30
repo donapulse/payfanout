@@ -61,7 +61,7 @@ and `PaymentService` will hold you to:
   ISO 4217; omit when unrestricted). The router pre-screens candidates with it — a
   declared constraint means a mismatched payment skips your PSP instead of aborting the
   failover cascade on your local rejection. Keep the local validation as defense.
-- **Currencies refused wholesale** go in `capabilities.unsupportedCurrencies` (uppercase
+- **Currencies you refuse to send** go in `capabilities.unsupportedCurrencies` (uppercase
   ISO 4217; omit when there are none), for a PSP that takes too many currencies to list
   in `supportedCurrencies` while your adapter refuses a few, such as a currency the PSP
   prices with another exponent than ISO 4217; you may declare both lists. The router
@@ -76,8 +76,8 @@ and `PaymentService` will hold you to:
   from the constant or rule your local refusal reads so the two cannot drift. Registration
   rejects an entry that can never match (not a string, or not three letters once trimmed
   and uppercased), a currency in both lists, and a supported rail whose `currencies` all
-  sit on this one; the conformance suite, through `validateAdapterCapabilities`, also
-  fails an entry that works but is not written in uppercase.
+  sit on this one; the conformance suite also fails an entry that works but is not written
+  as its bare uppercase code, as it does for the other currency lists.
 - **Per-rail currency constraints** go in the same shape one level down, on the method:
   `paymentMethods: [{ type: "sepa_debit", flow: "embedded", supported: true, currencies: ["EUR"] }]`.
   Absent or empty means unrestricted, exactly as `supportedCurrencies` reads, and the

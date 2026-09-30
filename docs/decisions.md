@@ -5716,30 +5716,35 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   Only `createPaymentSession` is screened: session updates, `chargeSavedPaymentMethod`,
   `createNativeSubscription` and `SubscriptionManager` renewals still meet the adapter's own
   refusal, and an adapter called directly refuses as before and keeps its local check.
-- **Validation, in two tiers** (changed in review, 2026-09-30). `validateAdapterCapabilities`
-  reports an `unsupportedCurrencies` entry that can never match (not a string, or not three
-  letters once trimmed and uppercased); a currency in both lists (screening refuses it, so
-  declaring it supported contradicts the adapter); and a supported rail whose `currencies` are
-  all refused, which can never be routed, as the existing rule says of a rail outside
-  `supportedCurrencies`. The last two read well-formed entries only. Those three are all that
-  `PaymentService` rejects at registration, where it passes `{ registration: true }`. An entry
-  that matches but is not written in uppercase (`"ugx"`, `" UGX"`) works, so registration
-  accepts it; without the option it is reported as well, and the conformance suite, which
-  passes no options, fails the adapter on it, as it fails the other currency lists written in
-  any other form. The first version rejected such an entry at registration too, so
-  `new PaymentService()` threw over a code screening matches anyway, and a non-string entry
-  made the rail rule throw. A rail both lists shut out gets the `supportedCurrencies` diagnosis
-  alone, and a refused currency the allowlist leaves out anyway is redundant, not
-  contradictory, and passes.
-- **The conformance suite's code is unchanged; its verdicts change through core** (restated in
-  review, 2026-09-30). It asserts that `validateAdapterCapabilities`, called without options,
-  finds no issue, so the new rules reach every adapter's run through core; an assertion of the
-  suite's own would change the adapter contract. #91 released its country-shape assertions as
-  a major, on the grounds that an adapter declaring malformed codes would newly fail the suite.
-  The rules here fail only an adapter that declares `unsupportedCurrencies`, a field that does
-  not exist before this release, so no adapter that passes the suite today can fail it after:
-  `@payfanout/conformance` takes a minor. The client adapters have nothing to mirror:
-  `ClientPaymentAdapter` exposes per-method capabilities only, never a PSP-wide currency list.
+- **Validation reports only what stops a declaration from working** (changed in review,
+  2026-09-30). `validateAdapterCapabilities` reports an `unsupportedCurrencies` entry that can
+  never match (not a string, or not three letters once trimmed and uppercased); a currency in
+  both lists (screening refuses it, so declaring it supported contradicts the adapter); and a
+  supported rail whose `currencies` are all declared unsupported, which can never be routed, as
+  the existing rule says of a rail outside `supportedCurrencies`. The last two read well-formed
+  entries only, and the both-lists rule reads the allowlist as screening does: each entry
+  uppercased and not trimmed, a value that is not a string admitting nothing. `PaymentService`
+  rejects exactly these at registration. An entry that matches but is not written as its bare
+  uppercase code (`"ugx"`, `" UGX"`) works, so it registers and core does not report it. The
+  first version rejected such an entry at registration, so `new PaymentService()` threw over a
+  code screening matches anyway, and a non-string entry made the rail rule throw. An option
+  letting registration skip the form check, tried next, was dropped: a second parameter makes
+  `adapters.map(validateAdapterCapabilities)` fail to compile, a build break in a minor. A rail
+  both lists shut out gets the `supportedCurrencies` diagnosis alone, and a refused currency
+  the allowlist leaves out anyway is redundant, not contradictory, and passes.
+- **The conformance suite checks the bare uppercase form** (changed in review, 2026-09-30).
+  The suite asserts that `validateAdapterCapabilities` finds no issue, so the three rules above
+  reach every adapter's run through core. Next to its identical checks of `supportedCurrencies`
+  and each payment method's `currencies`, it now also checks that each `unsupportedCurrencies`
+  code is written as its bare uppercase code (`/^[A-Z]{3}$/`), which a working `"ugx"` is not.
+  The push-only fake in the suite's own tests declares, and refuses, XTS, the code ISO 4217
+  reserves for testing, so the check runs on a passing adapter there. `@payfanout/conformance`
+  takes a minor, and this supersedes #91's practice, which released its country-shape
+  assertions as a major because an adapter declaring malformed codes would newly fail the
+  suite: checks gated on a new optional field take a conformance minor, since an adapter that
+  passes the suite today declares no such field and keeps its verdict. The client adapters
+  have nothing to mirror: `ClientPaymentAdapter` exposes per-method capabilities only, never a
+  PSP-wide currency list.
 - **`listNonDefaultCurrencyExponents()`.** A declaration derived from an adapter's own refusal
   rule, rather than typed out beside it, needs every code the rule could refuse. Paysafe's rule
   reads core's exponents, and core kept the codes it does not read as 2 to itself, so the only
@@ -5749,8 +5754,7 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   any code outside the list reads as 2, so the codes an adapter's table and core's could
   disagree on are that table's and this list's.
 - **Release.** `@payfanout/core` takes a minor: an optional field, a screen and validation
-  rules that only read it, the `registration` option, and `listNonDefaultCurrencyExponents()`.
-  `@payfanout/server` takes a minor (changed in review, 2026-09-30; the first version shipped
-  it as a dependency patch): `PaymentService` now registers in the new mode, and since the
-  server pins its core, hosts need its release for the router to read the field.
-  `@payfanout/conformance` takes a minor, as above.
+  rules that only read it, and `listNonDefaultCurrencyExponents()`. `@payfanout/server` takes a
+  minor (changed in review, 2026-09-30; the first version shipped it as a dependency patch):
+  its router and `PaymentService` act on the field through the core it pins, so hosts need its
+  release for the router to read the field. `@payfanout/conformance` takes a minor, as above.

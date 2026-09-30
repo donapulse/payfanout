@@ -158,6 +158,14 @@ const PAGE_SCRIPT_WAIT_MS = 30_000;
 /** How often that wait looks for a Stripe.js another script defined meanwhile. */
 const PAGE_SCRIPT_POLL_MS = 100;
 
+/**
+ * Tags for a build's URL that an attempt watched settle while Stripe.js
+ * stayed missing: one core injected, after it loaded, and a page's, after the
+ * wait for it ended. Neither fires again, so the next attempt of any adapter
+ * replaces them. Shared by every adapter, as the tags belong to the page.
+ */
+const settledTags = new WeakSet<Element>();
+
 /** The Stripe.js build an API version needs. */
 interface StripeJsBuild {
   url: string;
@@ -300,12 +308,6 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
   private readonly build: StripeJsBuild;
   private sdkPromise?: Promise<void>;
   private warnedOtherBuild = false;
-  /**
-   * Tags for the build's URL seen settled while Stripe.js stayed missing: the
-   * adapter's own after it loaded, and a page's after the wait for it ended.
-   * Neither fires again, so the next call replaces them.
-   */
-  private readonly settledTags = new WeakSet<Element>();
 
   constructor(config: StripeClientAdapterConfig) {
     if (!config.publishableKey) {
@@ -355,8 +357,9 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
    * it, or when the wait ends. A page tag that failed before the call leaves no
    * sign of it, so that first call waits the full 30 seconds. A load that fails
    * or leaves Stripe.js missing is not kept: the next call loads again, and
-   * replaces a tag already seen settled without Stripe.js, the adapter's own
-   * after it loaded or a page's after its wait, with a fresh one.
+   * replaces with a fresh one a tag that an earlier call, of any adapter on the
+   * page, watched settle without Stripe.js: one the adapter injected, after it
+   * loaded, or a page's, after its wait.
    */
   async loadSdk(): Promise<void> {
     assertBrowser("StripeClientAdapter", "loadSdk");
@@ -510,21 +513,24 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
   /**
    * core's injectScript, then the wait for a `<script>` the page added for the
    * same URL. A tag already seen settled is removed first, so that injectScript
-   * injects a fresh one and reports its load or failure.
+   * injects a fresh one and reports its load or failure. Only the tag this call
+   * watched is recorded as settled, never another one for the same URL.
    */
   private async injectStripeJs(url: string): Promise<void> {
     const selector = `script[src="${url}"]`;
     const found = document.querySelector<HTMLScriptElement>(selector);
-    if (found !== null && this.settledTags.has(found)) found.remove();
+    if (found !== null && settledTags.has(found)) found.remove();
     const pageTag = found?.isConnected ? found : null;
+    const injecting = injectScript(url, this.pspName, { nonce: this.config.cspNonce });
+    // With no tag for the URL on the page, core inserts its own before returning.
+    const watched = pageTag ?? document.querySelector(selector);
     try {
-      await injectScript(url, this.pspName, { nonce: this.config.cspNonce });
+      await injecting;
       if (pageTag !== null && !this.stripeFactory()) {
         await waitForPageScript(pageTag, url, () => this.stripeFactory() !== undefined);
       }
     } finally {
-      const settled = this.stripeFactory() ? null : document.querySelector(selector);
-      if (settled !== null) this.settledTags.add(settled);
+      if (watched?.isConnected && !this.stripeFactory()) settledTags.add(watched);
     }
   }
 

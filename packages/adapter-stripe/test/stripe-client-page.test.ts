@@ -293,6 +293,47 @@ describe("StripeClientAdapter and a Stripe.js tag the page added", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("keeps a second page tag for the URL, still loading when the first failed, and waits on it next", async () => {
+    const first = pageTag();
+    const second = pageTag();
+    const stripe = adapter();
+    const attempt = stripe.loadSdk();
+    expect(await settled(attempt)).toBe(false);
+    first.dispatchEvent(new Event("error"));
+    await expect(attempt).rejects.toMatchObject({ code: "psp_unavailable", message: `Failed to load ${STRIPE_JS_URL}` });
+    expect(first.isConnected).toBe(false);
+    expect(second.isConnected).toBe(true);
+
+    const insertions = recordInsertions();
+    const retry = stripe.loadSdk();
+    expect(await settled(retry)).toBe(false);
+    // The attempt watched only the first tag, so the second is waited on, not replaced.
+    expect(second.isConnected).toBe(true);
+    expect(insertions).toHaveLength(0);
+    setGlobal(pageStripe("dahlia"));
+    second.dispatchEvent(new Event("load"));
+    await expect(retry).resolves.toBeUndefined();
+  });
+
+  it("replaces a tag another adapter saw load without Stripe.js, instead of waiting on it", async () => {
+    vi.useFakeTimers();
+    const attempt = adapter().loadSdk();
+    const loaded = document.querySelector(`script[src="${STRIPE_JS_URL}"]`)!;
+    loaded.dispatchEvent(new Event("load"));
+    await expect(attempt).rejects.toMatchObject({ message: "Stripe.js loaded but window.Stripe is missing" });
+
+    const insertions = recordInsertions();
+    const other = adapter().loadSdk().then(() => "resolved");
+    expect(loaded.isConnected).toBe(false);
+    expect(insertions).toEqual([expect.objectContaining({ src: STRIPE_JS_URL, nonce: NONCE })]);
+    setGlobal(pageStripe("dahlia"));
+    document.querySelector(`script[src="${STRIPE_JS_URL}"]`)!.dispatchEvent(new Event("load"));
+    // No timer to run: the second adapter does not wait on the tag the first saw settle.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await Promise.race([other, Promise.resolve("pending")])).toBe("resolved");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("does not wait on another adapter's tag once it has loaded Stripe.js", async () => {
     vi.useFakeTimers();
     const first = adapter();

@@ -22,7 +22,7 @@ const adapters = [
   new StripeClientAdapter({
     publishableKey: import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY ?? "pk_test_replace_me",
     environment: "sandbox",
-    apiVersion: STRIPE_API_VERSION, // the server adapter's, so both halves speak it
+    apiVersion: STRIPE_API_VERSION, // the server adapter's pin, which picks the Stripe.js build
   }),
   new PaysafeClientAdapter({
     apiKey: import.meta.env.VITE_PAYSAFE_PUBLIC_KEY ?? "replace_me_base64",

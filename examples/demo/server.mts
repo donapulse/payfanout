@@ -29,7 +29,7 @@ import { STRIPE_API_VERSION } from "./src/stripe-api-version.js";
 const stripe = new StripeServerAdapter({
   // Unset CI secrets render as EMPTY strings, not undefined — || treats them as absent.
   secretKey: process.env.STRIPE_SECRET_KEY || "sk_test_replace_me",
-  apiVersion: STRIPE_API_VERSION, // pinned — never rely on the account default; the client pins the same
+  apiVersion: STRIPE_API_VERSION, // pinned — never rely on the account default; the client picks its Stripe.js build from it
   webhookSigningSecret: process.env.STRIPE_WEBHOOK_SECRET || "whsec_replace_me",
   environment: "sandbox",
 });

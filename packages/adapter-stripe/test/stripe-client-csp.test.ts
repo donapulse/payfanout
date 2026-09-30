@@ -12,7 +12,6 @@ const NONCE = "cmFuZG9tLW5vbmNlLXZhbHVl";
 afterEach(() => {
   vi.restoreAllMocks();
   document.head.innerHTML = "";
-  delete (window as { Stripe?: unknown }).Stripe;
 });
 
 /** The attributes of every element inserted into the head, as they stood at insertion. */
@@ -99,39 +98,5 @@ describe("StripeClientAdapter cspNonce", () => {
           "StripeClientAdapter config.cspNonce must be the value of the policy's 'nonce-…' source: base64 or base64url characters",
       });
     }
-  });
-});
-
-describe("StripeClientAdapter and a window.Stripe already on the page", () => {
-  /** A global as the served Stripe.js files leave it: the initializer, carrying its build's version. */
-  function pageStripe(version: number | string): StripeJsFactory {
-    const factory: StripeJsFactory = () => ({}) as StripeJsLike;
-    factory.version = version;
-    return factory;
-  }
-
-  it("uses the page's Stripe.js when it is the pinned build, injecting nothing", async () => {
-    const insertions = recordInsertions();
-    (window as { Stripe?: unknown }).Stripe = pageStripe("dahlia");
-    const adapter = new StripeClientAdapter({ publishableKey: "pk_test_unit", environment: "sandbox", apiVersion: API_VERSION });
-    await expect(adapter.loadSdk()).resolves.toBeUndefined();
-    expect(insertions).toHaveLength(0);
-  });
-
-  it("refuses the page's v3 for a pinned release, without loading another copy", async () => {
-    const insertions = recordInsertions();
-    (window as { Stripe?: unknown }).Stripe = pageStripe(3);
-    const adapter = new StripeClientAdapter({ publishableKey: "pk_test_unit", environment: "sandbox", apiVersion: API_VERSION });
-    await expect(adapter.loadSdk()).rejects.toMatchObject({
-      code: "invalid_request",
-      retryable: false,
-      pspName: "stripe",
-      message:
-        'This page already runs Stripe.js v3, but config.apiVersion "2026-08-26.dahlia" needs Stripe.js dahlia ' +
-        "(https://js.stripe.com/dahlia/stripe.js): a page runs one Stripe.js build, so load that one or leave the loading to the adapter",
-      raw: { loadedVersion: 3, neededVersion: "dahlia" },
-    });
-    expect(insertions).toHaveLength(0);
-    expect(document.querySelector("script")).toBeNull();
   });
 });

@@ -7,7 +7,10 @@ import {
   type StripeJsLike,
 } from "../src/index.js";
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
 
 function stubBrowser(): void {
   vi.stubGlobal("window", {});
@@ -22,42 +25,64 @@ const fakeStripe: StripeJsLike = {
   retrieveSetupIntent: async () => ({ setupIntent: { status: "succeeded" } }),
 };
 
+type Calls = Array<Record<string, unknown> | undefined>;
+
 /**
  * A Stripe.js global as the served files define it: `version` names the build,
  * and a versioned build throws when `Stripe()` is given an apiVersion.
  */
-function servedGlobal(version: number | string, calls: Array<Record<string, unknown> | undefined> = []): StripeJsFactory {
+function servedGlobal(version: unknown, calls: Calls = []): StripeJsFactory {
   const factory: StripeJsFactory = (_key, options) => {
     calls.push(options);
-    if (version !== 3 && options?.["apiVersion"] !== undefined) {
-      throw new Error(`Unsupported on version [${String(version)}]: Can not provide apiVersion to Stripe()`);
+    if (version !== 3 && typeof version === "string" && options?.["apiVersion"] !== undefined) {
+      throw new Error(`Unsupported on version [${version}]: Can not provide apiVersion to Stripe()`);
     }
     return fakeStripe;
   };
-  factory.version = version;
+  (factory as { version?: unknown }).version = version;
   return factory;
 }
 
-/** An adapter whose loadScript seam records each URL and then defines `global`. */
+/** An adapter whose loadScript seam records each URL and then defines `loaded`. */
 function loadingAdapter(
   apiVersion: string,
-  global: StripeJsFactory,
+  loaded: StripeJsFactory,
   extra: Partial<StripeClientAdapterConfig> = {},
 ): { adapter: StripeClientAdapter; urls: string[] } {
   const urls: string[] = [];
-  let loaded: StripeJsFactory | undefined;
+  let global: StripeJsFactory | undefined;
   const adapter = new StripeClientAdapter({
     publishableKey: "pk_test_unit",
     environment: "sandbox",
     apiVersion,
-    getStripeGlobal: () => loaded,
+    getStripeGlobal: () => global,
     loadScript: async (url) => {
       urls.push(url);
-      loaded = global;
+      global = loaded;
     },
     ...extra,
   });
   return { adapter, urls };
+}
+
+/** An adapter over a global that is already there; `loads()` counts the loadScript calls. */
+function adapterOver(
+  apiVersion: string,
+  global: StripeJsFactory | undefined,
+  extra: Partial<StripeClientAdapterConfig> = {},
+): { adapter: StripeClientAdapter; loads: () => number } {
+  let loads = 0;
+  const adapter = new StripeClientAdapter({
+    publishableKey: "pk_test_unit",
+    environment: "sandbox",
+    apiVersion,
+    getStripeGlobal: () => global,
+    loadScript: async () => {
+      loads++;
+    },
+    ...extra,
+  });
+  return { adapter, loads: () => loads };
 }
 
 function refusal(config: Record<string, unknown>): unknown {
@@ -68,6 +93,11 @@ function refusal(config: Record<string, unknown>): unknown {
   }
   return undefined;
 }
+
+const mountAndReturn = async (adapter: StripeClientAdapter, locale?: string): Promise<void> => {
+  await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret_x", ...(locale ? { locale } : {}) });
+  await adapter.handleRedirectReturn({ search: "?payment_intent_client_secret=pi_1_secret_x" });
+};
 
 describe("StripeClientAdapter apiVersion", () => {
   it("loads the build of each release Stripe documents one for, and never gives Stripe() an apiVersion", async () => {
@@ -80,7 +110,7 @@ describe("StripeClientAdapter apiVersion", () => {
       ["2026-03-25.dahlia", "dahlia"],
       ["2026-08-26.dahlia", "dahlia"],
     ] as const) {
-      const calls: Array<Record<string, unknown> | undefined> = [];
+      const calls: Calls = [];
       const { adapter, urls } = loadingAdapter(apiVersion, servedGlobal(release, calls));
       const handle = await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret_x" });
       expect(await adapter.confirm(handle), apiVersion).toEqual({ status: "succeeded" });
@@ -93,7 +123,7 @@ describe("StripeClientAdapter apiVersion", () => {
 
   it("loads v3 for a date alone and passes the version to Stripe(), which v3 takes", async () => {
     stubBrowser();
-    const calls: Array<Record<string, unknown> | undefined> = [];
+    const calls: Calls = [];
     const { adapter, urls } = loadingAdapter("2024-06-20", servedGlobal(3, calls), { locale: "de" });
     await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret_x" });
     await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret_x", locale: "fr" });
@@ -105,10 +135,9 @@ describe("StripeClientAdapter apiVersion", () => {
       { locale: "de", apiVersion: "2024-06-20" },
     ]);
 
-    const bare: Array<Record<string, unknown> | undefined> = [];
+    const bare: Calls = [];
     const noLocale = loadingAdapter("2020-08-27", servedGlobal(3, bare)).adapter;
-    await noLocale.mount({} as HTMLElement, { clientSecret: "pi_1_secret_x" });
-    await noLocale.handleRedirectReturn({ search: "?payment_intent_client_secret=pi_1_secret_x" });
+    await mountAndReturn(noLocale);
     expect(bare).toEqual([{ apiVersion: "2020-08-27" }, { apiVersion: "2020-08-27" }]);
   });
 
@@ -134,7 +163,6 @@ describe("StripeClientAdapter apiVersion", () => {
       "2026-08-26dahlia",
       " 2026-08-26.dahlia",
       "2026-08-26.dahlia ",
-      "2026-08-26.dahlia; custom_checkout_beta=v1",
       "2026-00-26.dahlia",
       "2026-13-26.dahlia",
       "2026-08-00.dahlia",
@@ -155,12 +183,48 @@ describe("StripeClientAdapter apiVersion", () => {
     }
   });
 
-  it("refuses a release it knows no Stripe.js build for", () => {
-    for (const release of ["endive", "preview", "zinnia"]) {
+  it("refuses a date alone from 2024-09-30 on, when every version carries a release name", () => {
+    for (const apiVersion of ["2024-09-30", "2024-12-18", "2026-08-26"]) {
+      expect(refusal({ apiVersion }), apiVersion).toMatchObject({
+        code: "invalid_request",
+        retryable: false,
+        message: `StripeClientAdapter config.apiVersion "${apiVersion}" has no release name, which every Stripe API version from 2024-09-30 on carries, as in "2024-09-30.acacia"`,
+      });
+    }
+    for (const apiVersion of ["2024-09-29", "2024-06-20", "2011-01-01"]) {
+      expect(refusal({ apiVersion }), apiVersion).toBeUndefined();
+    }
+  });
+
+  it("refuses a release it knows no Stripe.js build for, naming the newest it knows", () => {
+    for (const release of ["endive", "zinnia"]) {
       expect(refusal({ apiVersion: `2026-09-30.${release}` })).toMatchObject({
         code: "invalid_request",
         retryable: false,
-        message: `StripeClientAdapter config.apiVersion names the release "${release}", which has no Stripe.js build this adapter knows (acacia, basil, clover, dahlia)`,
+        message:
+          `StripeClientAdapter config.apiVersion names the release "${release}", for which this adapter knows no Stripe.js build ` +
+          `(it knows acacia, basil, clover, dahlia): while the server is on "${release}", pass a version of dahlia, the newest release this adapter knows`,
+      });
+    }
+  });
+
+  it("refuses a preview version, which no Stripe.js build speaks", () => {
+    expect(refusal({ apiVersion: "2026-08-26.preview" })).toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      message:
+        'StripeClientAdapter config.apiVersion "2026-08-26.preview" is a preview API version, which no Stripe.js build speaks: ' +
+        "pass a generally available version, such as one of dahlia, the newest release this adapter knows",
+    });
+  });
+
+  it("refuses beta headers, which Stripe.js no longer takes in an API version", () => {
+    for (const apiVersion of ["2026-08-26.dahlia; custom_checkout_beta=v1", "2024-06-20;feature_beta=v3", "2026-08-26.preview; x=v1"]) {
+      expect(refusal({ apiVersion }), apiVersion).toMatchObject({
+        code: "invalid_request",
+        retryable: false,
+        message:
+          'StripeClientAdapter config.apiVersion carries beta headers after ";", which Stripe.js no longer takes in an API version: pass the version before the ";"',
       });
     }
   });
@@ -171,104 +235,183 @@ describe("StripeClientAdapter apiVersion", () => {
     }
   });
 
-  it("refuses the removed sdkUrl instead of ignoring it", () => {
+  it("refuses the removed sdkUrl instead of ignoring it, before looking at apiVersion", () => {
+    const message =
+      "StripeClientAdapter config.sdkUrl is no longer supported: Stripe.js loads from https://js.stripe.com in the build config.apiVersion names";
     for (const sdkUrl of ["https://js.stripe.com/dahlia/stripe.js", "https://cdn.example/stripe.js", ""]) {
       expect(refusal({ apiVersion: "2026-08-26.dahlia", sdkUrl }), sdkUrl).toMatchObject({
         code: "invalid_request",
         retryable: false,
-        message:
-          "StripeClientAdapter config.sdkUrl is no longer supported: Stripe.js loads from https://js.stripe.com in the build config.apiVersion names",
+        message,
       });
     }
+    // An upgrading config that still names sdkUrl learns that first.
+    expect(refusal({ sdkUrl: "https://js.stripe.com/v3" })).toMatchObject({ message });
     expect(() => new StripeClientAdapter({ publishableKey: "pk", environment: "sandbox", apiVersion: "2024-06-20", sdkUrl: undefined } as never)).not.toThrow();
   });
 });
 
-describe("StripeClientAdapter and a Stripe.js global already there", () => {
-  function adapterFor(apiVersion: string, global: StripeJsFactory | undefined): { adapter: StripeClientAdapter; loads: () => number } {
-    let loads = 0;
+describe("StripeClientAdapter hideTestingAssistant", () => {
+  it("hides Stripe's testing assistant through Stripe(), whichever build runs", async () => {
+    stubBrowser();
+    const hidden = { developerTools: { assistant: { enabled: false } } };
+    for (const [apiVersion, build, expected] of [
+      ["2026-08-26.dahlia", "dahlia", [hidden, { locale: "fr", ...hidden }]],
+      ["2024-06-20", 3, [{ apiVersion: "2024-06-20", ...hidden }, { locale: "fr", apiVersion: "2024-06-20", ...hidden }]],
+    ] as const) {
+      const calls: Calls = [];
+      const { adapter } = loadingAdapter(apiVersion, servedGlobal(build, calls), { hideTestingAssistant: true });
+      await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret_x" });
+      await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret_x", locale: "fr" });
+      expect(calls, apiVersion).toEqual(expected);
+    }
+  });
+
+  it("leaves Stripe's default when unset or false", async () => {
+    stubBrowser();
+    for (const extra of [{}, { hideTestingAssistant: false }]) {
+      const calls: Calls = [];
+      const { adapter } = loadingAdapter("2026-08-26.dahlia", servedGlobal("dahlia", calls), extra);
+      await mountAndReturn(adapter);
+      expect(calls, JSON.stringify(extra)).toEqual([undefined, undefined]);
+    }
+  });
+
+  it("refuses a value that is not a boolean", () => {
+    expect(refusal({ apiVersion: "2026-08-26.dahlia", hideTestingAssistant: "yes" })).toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      message: "StripeClientAdapter config.hideTestingAssistant must be a boolean",
+    });
+  });
+});
+
+describe("StripeClientAdapter and a Stripe.js already there", () => {
+  it("uses the pinned build without loading anything", async () => {
+    stubBrowser();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    for (const [apiVersion, version, expected] of [
+      ["2026-08-26.dahlia", "dahlia", undefined],
+      ["2025-03-31.basil", "basil", undefined],
+      ["2024-06-20", 3, { apiVersion: "2024-06-20" }],
+    ] as const) {
+      const calls: Calls = [];
+      const { adapter, loads } = adapterOver(apiVersion, servedGlobal(version, calls));
+      await expect(adapter.loadSdk(), apiVersion).resolves.toBeUndefined();
+      await mountAndReturn(adapter);
+      expect(loads(), apiVersion).toBe(0);
+      expect(calls, apiVersion).toEqual([expected, expected]);
+    }
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("gives the page's v3 the pinned version, a release's included, so the browser speaks exactly it", async () => {
+    stubBrowser();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    for (const apiVersion of ["2026-08-26.dahlia", "2025-01-27.acacia"]) {
+      const calls: Calls = [];
+      const { adapter, loads } = adapterOver(apiVersion, servedGlobal(3, calls), { locale: "fr" });
+      await mountAndReturn(adapter);
+      expect(loads(), apiVersion).toBe(0);
+      expect(calls, apiVersion).toEqual([
+        { locale: "fr", apiVersion },
+        { locale: "fr", apiVersion },
+      ]);
+    }
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("uses another versioned build as it is, warning once in a sandbox", async () => {
+    stubBrowser();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    for (const [apiVersion, running, needed, url] of [
+      ["2026-08-26.dahlia", "clover", "dahlia", "https://js.stripe.com/dahlia/stripe.js"],
+      ["2026-08-26.dahlia", "endive", "dahlia", "https://js.stripe.com/dahlia/stripe.js"],
+      ["2024-06-20", "dahlia", "v3", "https://js.stripe.com/v3"],
+    ] as const) {
+      warn.mockClear();
+      const calls: Calls = [];
+      const { adapter, loads } = adapterOver(apiVersion, servedGlobal(running, calls));
+      await mountAndReturn(adapter);
+      await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret_x", locale: "es" });
+      expect(loads(), running).toBe(0);
+      // A versioned build throws on an apiVersion, so it is never given one.
+      expect(calls, running).toEqual([undefined, undefined, { locale: "es" }]);
+      expect(warn, running).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        `[payfanout] This page runs Stripe.js ${running}, not ${needed} (${url}), the build config.apiVersion "${apiVersion}" names. ` +
+          `The Stripe adapter uses the page's copy, so the browser speaks the API version Stripe pins ${running} to. ` +
+          `Load ${url} on the page instead, or no Stripe.js at all and let the adapter load it.`,
+      );
+    }
+  });
+
+  it("does not warn in live mode, as Stripe's own loader warns only for test keys", async () => {
+    stubBrowser();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const calls: Calls = [];
+    const { adapter } = adapterOver("2026-08-26.dahlia", servedGlobal("clover", calls), { environment: "live" });
+    await mountAndReturn(adapter);
+    expect(calls).toEqual([undefined, undefined]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("loads the build beside a Stripe.js v2 global and uses what attached itself as StripeV3", async () => {
+    stubBrowser();
+    const calls: Calls = [];
+    const v2 = servedGlobal(2);
+    const urls: string[] = [];
     const adapter = new StripeClientAdapter({
       publishableKey: "pk_test_unit",
       environment: "sandbox",
-      apiVersion,
-      getStripeGlobal: () => global,
-      loadScript: async () => {
-        loads++;
+      apiVersion: "2026-08-26.dahlia",
+      getStripeGlobal: () => v2,
+      loadScript: async (url) => {
+        urls.push(url);
+        v2.StripeV3 = servedGlobal("dahlia", calls);
       },
     });
-    return { adapter, loads: () => loads };
-  }
+    await mountAndReturn(adapter);
+    expect(urls).toEqual(["https://js.stripe.com/dahlia/stripe.js"]);
+    expect(calls).toEqual([undefined, undefined]);
 
-  it("uses a global of the pinned build without loading anything", async () => {
-    stubBrowser();
-    for (const [apiVersion, version] of [
-      ["2026-08-26.dahlia", "dahlia"],
-      ["2025-03-31.basil", "basil"],
-      ["2024-06-20", 3],
-    ] as const) {
-      const { adapter, loads } = adapterFor(apiVersion, servedGlobal(version));
-      await expect(adapter.loadSdk(), apiVersion).resolves.toBeUndefined();
-      await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret_x" });
-      expect(loads(), apiVersion).toBe(0);
-    }
+    // A StripeV3 already attached is used without loading, by the rules for the build it is.
+    const v3Calls: Calls = [];
+    const withV3 = servedGlobal(2);
+    withV3.StripeV3 = servedGlobal(3, v3Calls);
+    const { adapter: over, loads } = adapterOver("2026-08-26.dahlia", withV3);
+    await mountAndReturn(over);
+    expect(loads()).toBe(0);
+    expect(v3Calls).toEqual([{ apiVersion: "2026-08-26.dahlia" }, { apiVersion: "2026-08-26.dahlia" }]);
   });
 
-  it("refuses a global of another build, loading nothing over it", async () => {
+  it("uses a global whose version names no build as if it were the pinned build", async () => {
     stubBrowser();
-    for (const [apiVersion, version, message] of [
-      [
-        "2026-08-26.dahlia",
-        3,
-        'This page already runs Stripe.js v3, but config.apiVersion "2026-08-26.dahlia" needs Stripe.js dahlia (https://js.stripe.com/dahlia/stripe.js)',
-      ],
-      [
-        "2026-08-26.dahlia",
-        "clover",
-        'This page already runs Stripe.js clover, but config.apiVersion "2026-08-26.dahlia" needs Stripe.js dahlia (https://js.stripe.com/dahlia/stripe.js)',
-      ],
-      [
-        "2026-08-26.dahlia",
-        "endive",
-        'This page already runs Stripe.js endive, but config.apiVersion "2026-08-26.dahlia" needs Stripe.js dahlia (https://js.stripe.com/dahlia/stripe.js)',
-      ],
-      [
-        "2024-06-20",
-        "dahlia",
-        'This page already runs Stripe.js dahlia, but config.apiVersion "2024-06-20" needs Stripe.js v3 (https://js.stripe.com/v3)',
-      ],
-      [
-        "2024-06-20",
-        2,
-        'This page already runs Stripe.js v2, but config.apiVersion "2024-06-20" needs Stripe.js v3 (https://js.stripe.com/v3)',
-      ],
-    ] as const) {
-      const { adapter, loads } = adapterFor(apiVersion, servedGlobal(version));
-      const expected = {
-        code: "invalid_request",
-        retryable: false,
-        pspName: "stripe",
-        message: `${message}: a page runs one Stripe.js build, so load that one or leave the loading to the adapter`,
-        raw: { loadedVersion: version, neededVersion: apiVersion === "2024-06-20" ? 3 : "dahlia" },
-      };
-      await expect(adapter.loadSdk(), message).rejects.toMatchObject(expected);
-      await expect(adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret_x" })).rejects.toMatchObject(expected);
-      await expect(adapter.handleRedirectReturn({ search: "?payment_intent_client_secret=pi_1_secret_x" })).rejects.toMatchObject(expected);
-      expect(loads(), message).toBe(0);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    for (const version of [undefined, "2026-03-25.dahlia", "Dahlia", "", 4, 3.5, {}]) {
+      for (const [apiVersion, expected] of [
+        ["2026-08-26.dahlia", undefined],
+        ["2024-06-20", { apiVersion: "2024-06-20" }],
+      ] as const) {
+        const calls: Calls = [];
+        const factory: StripeJsFactory = (_key, options) => {
+          calls.push(options);
+          return fakeStripe;
+        };
+        (factory as { version?: unknown }).version = version;
+        const { adapter, loads } = adapterOver(apiVersion, factory);
+        await mountAndReturn(adapter);
+        expect(loads(), JSON.stringify(version)).toBe(0);
+        expect(calls, `${JSON.stringify(version)} ${apiVersion}`).toEqual([expected, expected]);
+      }
     }
+    expect(warn).not.toHaveBeenCalled();
   });
 
-  it("uses a global whose version names no build as it is", async () => {
+  it("uses a build another script defined while its own was loading, by the same rules", async () => {
     stubBrowser();
-    const bare: StripeJsFactory = () => fakeStripe;
-    for (const global of [bare, servedGlobal("2026-03-25.dahlia"), servedGlobal("Dahlia"), servedGlobal(""), servedGlobal(3.5)]) {
-      const { adapter, loads } = adapterFor("2026-08-26.dahlia", global);
-      await expect(adapter.loadSdk(), String(global.version)).resolves.toBeUndefined();
-      expect(loads()).toBe(0);
-    }
-  });
-
-  it("refuses another build that another script defined while its own loaded, and does not load again", async () => {
-    stubBrowser();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const calls: Calls = [];
     let global: StripeJsFactory | undefined;
     let loads = 0;
     const adapter = new StripeClientAdapter({
@@ -279,12 +422,12 @@ describe("StripeClientAdapter and a Stripe.js global already there", () => {
       loadScript: async () => {
         loads++;
         // The page's own v3 ran first; the adapter's copy left the global to it.
-        global = servedGlobal(3);
+        global = servedGlobal(3, calls);
       },
     });
-    const refused = { code: "invalid_request", retryable: false, raw: { loadedVersion: 3, neededVersion: "dahlia" } };
-    await expect(adapter.loadSdk()).rejects.toMatchObject(refused);
-    await expect(adapter.loadSdk()).rejects.toMatchObject(refused);
+    await mountAndReturn(adapter);
     expect(loads).toBe(1);
+    expect(calls).toEqual([{ apiVersion: "2026-08-26.dahlia" }, { apiVersion: "2026-08-26.dahlia" }]);
+    expect(warn).not.toHaveBeenCalled();
   });
 });

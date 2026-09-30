@@ -46,8 +46,9 @@ the `clientSecret` your server created via
 version with a release name (`2026-08-26.dahlia`) loads that release's build
 (`https://js.stripe.com/dahlia/stripe.js`), which speaks the API version Stripe pins it to
 within the release, and a date alone (`2024-06-20`) loads v3 and passes the version to
-`Stripe()`, which then speaks exactly it. A page runs one Stripe.js build, so the adapter
-refuses a `window.Stripe` of another build instead of using it. See
+`Stripe()`, which then speaks exactly it. A page runs one Stripe.js build, so a Stripe.js
+the page already runs is used instead, as Stripe's own loader does: v3 is given the pinned
+version, and another release's build speaks its own. See
 [Which Stripe.js the adapter loads](https://donapulse.github.io/payfanout/guide/stripe#which-stripe-js-the-adapter-loads).
 
 ## What's inside

@@ -63,16 +63,21 @@ and `PaymentService` will hold you to:
   failover cascade on your local rejection. Keep the local validation as defense.
 - **Currencies refused wholesale** go in `capabilities.unsupportedCurrencies` (uppercase
   ISO 4217; omit when there are none), for a PSP that takes too many currencies to list
-  in `supportedCurrencies` while your adapter refuses a few outright, such as a currency
-  the PSP prices with another exponent than ISO 4217. The router pre-screens with it
-  exactly as with `supportedCurrencies`, and `PaymentService` refuses such a session with
-  `unsupported_operation` before calling you. Screening refuses every session in a listed
-  currency, zero-amount ones included, so list a currency only when your refusal does not
-  depend on the amount: a rule that refuses some amounts only (Stripe's MGA amounts that
-  are not whole ariary) stays a local check. Derive the list from the constant or rule
-  your local refusal reads so the two cannot drift, and keep the local check.
-  `validateAdapterCapabilities` rejects an entry that is not an uppercase ISO 4217 code, a
-  currency in both lists, and a supported rail whose `currencies` all sit on this one.
+  in `supportedCurrencies` while your adapter refuses a few, such as a currency the PSP
+  prices with another exponent than ISO 4217; you may declare both lists. The router
+  pre-screens session creation with it exactly as with `supportedCurrencies`, and
+  `PaymentService` refuses such a session with a non-retryable `unsupported_operation`
+  before calling you; every other call (updates, saved-method charges, native
+  subscriptions) still meets your own refusal, so keep it. Declare a currency when you
+  refuse every amount you would send in it. That is a trade-off: screening also refuses
+  zero-amount sessions in the currency, even ones your adapter still serves because they
+  send no amount, and your changeset must say so. A refusal of only some non-zero amounts
+  (Stripe's MGA amounts that are not whole ariary) stays a local check. Derive the list
+  from the constant or rule your local refusal reads so the two cannot drift. Registration
+  rejects an entry that can never match (not a string, or not three letters once trimmed
+  and uppercased), a currency in both lists, and a supported rail whose `currencies` all
+  sit on this one; the conformance suite, through `validateAdapterCapabilities`, also
+  fails an entry that works but is not written in uppercase.
 - **Per-rail currency constraints** go in the same shape one level down, on the method:
   `paymentMethods: [{ type: "sepa_debit", flow: "embedded", supported: true, currencies: ["EUR"] }]`.
   Absent or empty means unrestricted, exactly as `supportedCurrencies` reads, and the

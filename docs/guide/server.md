@@ -154,12 +154,14 @@ currency the PSP or the requested rail itself cannot settle — SEPA asked for i
 skipped without a PSP call —
 the router and `PaymentService` share one predicate, `screenSessionInput` from
 `@payfanout/core`, so a skipped candidate is exactly one the service would have rejected.
-An adapter states its currencies either as the list it takes (`supportedCurrencies`) or,
-when its PSP takes too many to list, as the few it refuses outright
-(`unsupportedCurrencies`); a session in a currency outside the first or on the second skips
-that candidate, zero-amount sessions included. A currency an adapter refuses without
-declaring it still ends the cascade with its `invalid_request`, so route it with a rule of
-its own.
+An adapter states its currencies as the list it takes (`supportedCurrencies`), as the few
+it refuses when its PSP takes too many to list (`unsupportedCurrencies`), or both. A
+session in a currency outside the first or on the second skips that candidate,
+zero-amount sessions included, and `PaymentService` refuses it with a non-retryable
+`unsupported_operation`. Only session creation is screened: a session update, a
+saved-method charge or a native subscription in such a currency meets the adapter's own
+refusal. A currency an adapter refuses without declaring it still ends the cascade with
+its `invalid_request`, so route it with a rule of its own.
 Country-bound rails (Bacs pays from UK bank accounts, Interac from Canadian ones) screen
 the same way **when the session states `customerCountry`** (ISO 3166-1 alpha-2, the
 customer's country — not `country`, which resolves the merchant account). Omit it and

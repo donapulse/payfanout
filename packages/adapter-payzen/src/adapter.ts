@@ -716,6 +716,119 @@ const AUTH_CODE_MAP: Record<string, UnifiedErrorCode> = {
   AUTH_103: "invalid_request", // 3DS Disabled
 };
 
+/**
+ * PSP_ codes → the taxonomy: the server adapter's map, where a failed
+ * cardholder authentication is authentication_required and a 3-D Secure that
+ * could not complete a processing_error. A code outside it is a
+ * processing_error, as on the server.
+ */
+const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
+  // Refusals another card may overcome.
+  PSP_003: "card_declined", // payment refused
+  PSP_091: "card_declined", // payment method refused
+  PSP_575: "card_declined", // rejected by PayPal
+  PSP_611: "card_declined", // refused without a liability shift
+  PSP_624: "card_declined", // inactive card
+  PSP_625: "card_declined", // refused by the acquirer
+  PSP_636: "card_declined", // derivative refused: no liability shift on the primary
+  PSP_534: "card_declined", // failed a verification the card requires every time
+  PSP_535: "card_declined", // failed e-Carte Bleue verification
+  PSP_572: "card_declined", // authorization declined by Cofinoga
+  PSP_573: "card_declined", // 1-euro authorization refused
+  PSP_600: "card_declined", // failed commercial card verification
+  PSP_601: "card_declined", // declined: the first installment was refused
+  PSP_042: "insufficient_funds",
+  PSP_202: "expired_card",
+  PSP_508: "expired_card",
+  PSP_112: "expired_card",
+  PSP_023: "invalid_card_data",
+  PSP_024: "invalid_card_data",
+  PSP_026: "invalid_card_data",
+  PSP_509: "invalid_card_data",
+  PSP_526: "invalid_card_data",
+  PSP_527: "invalid_card_data",
+  PSP_528: "invalid_card_data",
+  PSP_529: "invalid_card_data",
+  PSP_530: "invalid_card_data",
+  PSP_531: "invalid_card_data",
+  PSP_532: "invalid_card_data",
+  PSP_533: "invalid_card_data",
+  PSP_136: "authentication_required", // 3-D Secure session expired
+  PSP_539: "authentication_required", // challenge failed, abandoned or timed out
+  PSP_649: "authentication_required", // 3-D Secure left unfinished at the ACS
+  PSP_716: "authentication_required", // OTP expired
+  PSP_717: "authentication_required", // invalid OTP
+  PSP_722: "authentication_required", // authentication canceled
+  PSP_707: "card_declined", // the issuer refused the authentication
+  PSP_708: "processing_error", // the issuer could not authenticate
+  PSP_052: "processing_error", // invalid ACS signature (AUTH_100)
+  PSP_053: "processing_error", // 3DS technical error (AUTH_101)
+  PSP_054: "invalid_request", // incorrect 3DS parameter (AUTH_102)
+  PSP_055: "invalid_request", // 3DS disabled (AUTH_103)
+  PSP_718: "invalid_request", // invalid authentication settings
+  PSP_203: "fraud_suspected",
+  PSP_204: "fraud_suspected",
+  PSP_205: "fraud_suspected",
+  PSP_536: "fraud_suspected",
+  PSP_641: "fraud_suspected", // declined by the risk analyzer
+  PSP_647: "fraud_suspected", // declined at the risk module's request
+  // HTTP-200 rate limiting — the envelope is the only signal.
+  PSP_099: "rate_limited",
+  PSP_106: "rate_limited",
+  // "Technical error.", "A technical error has occurred." and "Due to a
+  // technical problem, we are unable to process your request.", every code
+  // the page gives one of these texts.
+  PSP_996: "psp_unavailable",
+  PSP_999: "psp_unavailable",
+  PSP_594: "psp_unavailable",
+  PSP_513: "psp_unavailable",
+  PSP_514: "psp_unavailable",
+  PSP_515: "psp_unavailable",
+  PSP_516: "psp_unavailable",
+  PSP_525: "psp_unavailable",
+  PSP_538: "psp_unavailable",
+  PSP_540: "psp_unavailable",
+  PSP_541: "psp_unavailable",
+  PSP_555: "psp_unavailable",
+  PSP_569: "psp_unavailable",
+  PSP_577: "psp_unavailable",
+  PSP_585: "psp_unavailable",
+  PSP_587: "psp_unavailable",
+  PSP_608: "psp_unavailable",
+  PSP_643: "psp_unavailable",
+  PSP_648: "psp_unavailable",
+  PSP_650: "psp_unavailable",
+  PSP_652: "psp_unavailable",
+  PSP_658: "psp_unavailable",
+  PSP_010: "invalid_request", // transaction not found
+  PSP_015: "invalid_request", // too many results (Order/Get > 30 transactions)
+  // Token / subscription lookups and state rejections.
+  PSP_030: "invalid_request", // token not found
+  PSP_031: "invalid_request", // invalid token (canceled, empty, …)
+  PSP_032: "invalid_request", // subscriptionId not found
+  PSP_033: "invalid_request", // rrule invalid or recurring payment already canceled
+  PSP_563: "invalid_request", // recurring payment already exists
+  PSP_564: "invalid_request", // recurring payment already terminated
+  PSP_565: "invalid_request", // invalid recurring payment
+  PSP_566: "invalid_request", // invalid recurrence rule
+  PSP_567: "processing_error", // recurring payment creation failed (cause unstated — never retryable)
+  PSP_100: "invalid_request", // REST API not enabled on the shop
+  PSP_108: "session_expired", // formToken outlived its ~15 min — create a fresh session
+  PSP_109: "invalid_request", // production mode not activated
+  PSP_610: "invalid_request", // no acceptance agreement (currency/config)
+  // State-machine rejections: retrying cannot succeed — never retryable.
+  PSP_011: "invalid_request",
+  PSP_503: "invalid_request",
+  PSP_075: "invalid_request", // captured — cancel impossible, refund instead
+  PSP_083: "invalid_request", // unpaid — nothing to refund
+  PSP_104: "invalid_request", // already fully refunded
+  PSP_105: "invalid_request", // already cancelled
+  PSP_510: "invalid_request", // refund amount too high
+  PSP_511: "invalid_request", // refund amount exceeds remainder
+  // Capture pending — the refund becomes possible once capture lands.
+  PSP_076: "processing_error",
+};
+
 /** Looks a code up among the map's own keys only. */
 function ownCodeFor(
   map: Record<string, UnifiedErrorCode>,
@@ -733,10 +846,16 @@ function isTechnicalError(errorCode: string | null | undefined): boolean {
 
 /**
  * The error for PayZen's answer on a transaction: an unpaid order's last
- * transaction, or an ACQ_ or AUTH_ error from KR.onError. A technical error
- * is a psp_unavailable, which core makes always retryable; any other answer
- * refused the transaction, and no refusal maps to a retryable code. The
- * message is core's: the form's own texts describe its CLIENT_ errors.
+ * transaction, or an ACQ_, AUTH_ or PSP_ error from KR.onError, read as the
+ * server adapter reads them. On a payment answer a PSP_ code's
+ * detailedErrorCode is PayZen's own (39 for PSP_539), not an acquirer's, so
+ * only ACQ_ answers read the acquirer map; PSP_101, a refund refusal carrying
+ * the acquirer's code, never reaches the browser. A PSP_ code the map does not
+ * list reads as a processing_error, as on the server. A technical error or a
+ * rate limit is retryable, as core makes psp_unavailable and rate_limited;
+ * any other answer refused the transaction, and no refusal maps to a
+ * retryable code. The message is core's: the form's own texts describe its
+ * CLIENT_ errors.
  */
 function transactionError(
   errorCode: string | null | undefined,
@@ -746,11 +865,12 @@ function transactionError(
   let code: UnifiedErrorCode;
   if (isTechnicalError(errorCode)) code = "psp_unavailable";
   else if (errorCode?.startsWith("AUTH_")) code = ownCodeFor(AUTH_CODE_MAP, errorCode) ?? "processing_error";
+  else if (errorCode?.startsWith("PSP_")) code = ownCodeFor(PAYZEN_PSP_CODE_MAP, errorCode) ?? "processing_error";
   else code = ownCodeFor(ACQUIRER_CODE_MAP, detailedErrorCode) ?? "card_declined";
   return new PayFanoutError({
     code,
     message: getUserMessage(code),
-    retryable: code === "psp_unavailable",
+    retryable: code === "psp_unavailable" || code === "rate_limited",
     raw,
     pspName: "payzen",
   });
@@ -769,13 +889,12 @@ const KR_CLIENT_CODE_MAP: Record<string, UnifiedErrorCode> = {
   CLIENT_997: "invalid_request", // endpoint/platform mismatch — the formToken came from a sister platform
   CLIENT_998: "invalid_request", // demo formToken used against a real shop
   CLIENT_999: "psp_unavailable",
-  PSP_108: "session_expired", // formToken outlived its ~15 min — create a fresh session
 };
 
 function mapKrError(err: unknown): UnifiedError {
   const e = err as KrErrorLike | undefined;
   const rawCode = e?.errorCode ?? "";
-  if (rawCode.startsWith("ACQ_") || rawCode.startsWith("AUTH_")) {
+  if (rawCode.startsWith("ACQ_") || rawCode.startsWith("AUTH_") || rawCode.startsWith("PSP_")) {
     return transactionError(rawCode, e?.detailedErrorCode, err);
   }
   let code: UnifiedErrorCode;

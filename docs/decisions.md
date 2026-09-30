@@ -4264,6 +4264,7 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `detailedErrorCode` (PSP_707's 207 is not in the acquirer map, so `card_declined`). "3DS
   disabled" is therefore `invalid_request` as AUTH_103 and `processing_error` as PSP_055.
   Mapping them belongs with one PSP_ map for both halves (#247), not with this change.
+  (Resolved 2026-09-30 by #247: see "PayZen PSP_ codes on both halves (2026-09-30)".)
 - **Doc-derived only.** No sandbox run has produced any of these codes.
 
 ## Stripe: one card-error classification on both halves (2026-09-26)
@@ -6167,6 +6168,111 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   named policy is parked in future-designs.md. The directive also governs HTML and script-text
   sinks, so a PSP SDK that writes to one meets the same policy on its own terms; that is the
   PSP's code, outside the loader, so the guide asks hosts to try each SDK under enforcement.
+
+## PayZen PSP_ codes on both halves (2026-09-30)
+
+- **The halves read PSP_ codes differently.** The server adapter maps a PSP_ code through
+  its PSP code map, a code outside it being a non-retryable `processing_error`. The browser
+  adapter sent a PSP_ code from `KR.onError` to the form's generic branch, a retryable
+  `processing_error`, and read one on an unpaid order's last transaction by its
+  `detailedErrorCode` through the acquirer map, else `card_declined`. On a payment answer a
+  PSP_ code's `detailedErrorCode` is PayZen's own (39 for PSP_539, 207 for PSP_707, 208 for
+  PSP_708 in the use cases below), not an acquirer's, so a 51 there would have read as
+  `insufficient_funds`; PSP_101, a refund refusal that carries the acquirer's code there, as
+  the page says and the server reads it, never reaches the browser. Both halves now hold one
+  PSP code map, kept identical by the server suite's map-parity test beside the acquirer and
+  AUTH_ maps, and the browser's transaction-error helper reads PSP_ answers from either source
+  through it: a refusal is never retryable, and an outage or a rate limit is, as core makes
+  `psp_unavailable` and `rate_limited`. A PSP_ code the map does not list reads as
+  `processing_error` on both halves; on an unpaid transaction it read as `card_declined`
+  before, which is why the map now holds every payment refusal the page documents but one
+  whose class the page leaves open (below). A smartForm
+  host that retries on a retryable failure stops retrying on PSP_ answers from `KR.onError`,
+  which were retryable before. `PSP_108` moved from the browser's CLIENT_ map into the shared
+  map, with the same `session_expired`. The parity test reads every entry of a map, comments
+  dropped and several entries on one line included (changed in review, 2026-09-30: it read one
+  entry per line, so two entries on one line of one map passed unnoticed).
+- **Doc-verified 2026-09-30** through PayZen's content API against the PSP_ error page
+  (payzen.io/en-EN/rest/V4.0/api/errors_psp.html) and the 3-D Secure use cases, none marked
+  deprecated: "Challenge authentication, without the 3DS Method" (pci/createtoken/3ds2/
+  challenge.html) answers a failed authentication with PSP_539 "3D Secure refusal for the
+  transaction" and detail 39; "Authentication Challenge failed or abandoned during the
+  challenge" (pci/v2/createpayment/external-authentication/3ds2/challenge_failed.html) and
+  "Challenge authentication timeout" (pci/v2/createpayment/3ds2/timeout.html) answer the same;
+  "Authentication rejected" (pci/v2/createpayment/3ds2/rejected.html) answers PSP_707
+  "Authentication refused by the issuer", detail 207 "Authentication refusal from emisor for
+  this transaction"; "Authentification impossible" (pci/v2/createpayment/
+  external-authentication/3ds2/challenge_unavailable.html, authentication status
+  UNAVAILABLE) answers PSP_708, detail 208 "3D Secure - Refusal because the emisor could not
+  authenticate". The error page reads PSP_539 "3D Secure refused for the transaction.", PSP_707
+  "3D Secure - Refusal of the authentication by the issuer.", PSP_708 "3D Secure - Refusal as
+  authentication by the issuer is impossible.", PSP_052 "The ACS signature is invalid.",
+  PSP_053 "3DS technical error.", PSP_054 "Incorrect 3DS parameter." and PSP_055 "3DS
+  disabled.".
+- **Classified by the rule the other adapters follow** ("A failed cardholder authentication
+  is `authentication_required`; a 3-D Secure that could not complete is `processing_error`",
+  above). PSP_539, a challenge the cardholder failed, abandoned or let time out, stays
+  `authentication_required`, as PSP_136 (a 3-D Secure session that expired) does. PSP_707 is
+  `card_declined`: the issuer refused the authentication, so authenticating again with the same
+  card cannot succeed and another card can. That is a third category beside the rule's two.
+  The page's one example is a frictionless authentication with status REJECTED,
+  `transStatusReason` "10" and reason `STOLEN_CARD`, which the ACQ_ codes would read as
+  `fraud_suspected` (41/43); the code covers every reason an issuer rejects for, so it stays
+  `card_declined`, whose message the customer sees either way. PSP_708 is `processing_error`:
+  the issuer could not run the authentication. PSP_052 to PSP_055 describe what AUTH_100 to
+  AUTH_103 do and read the same way: `processing_error` for the invalid ACS signature and the
+  technical error, `invalid_request` for the incorrect parameter and a disabled 3-D Secure.
+  None is retryable.
+- **The page's other refusals and technical errors, mapped** (added in review, 2026-09-30).
+  `card_declined`: PSP_003 "Payment refused.", PSP_091 "Payment method refused.", PSP_575 "The
+  operation has been rejected by PayPal.", PSP_624 "Inactive card.", PSP_625 "Payment refused
+  by the acquirer.", PSP_534 "Failed verification of the card requiring systematic
+  verification.", PSP_535 "Failed e-Carte Bleue verification.", PSP_572 "The authorization has
+  been declined by Cofinoga.", PSP_573 "Refusal of authorization for 1 euro (or request for
+  information from the CB network if supported by the acquirer).", PSP_600 "Failed commercial
+  card verification.", PSP_601 "Declined due the refusal of the first installment.", and the
+  merchant's liability-shift rules PSP_611 "Refusal of transactions without Liability shift"
+  and PSP_636 "Refusal of derivative transactions, without a Liability shift for the primary
+  transaction.". The page gives no remedy for these two; the adapter reads them as refusals,
+  not `authentication_required`, as nothing on the page says a new authentication of the same
+  card would obtain the liability shift. `fraud_suspected`, as PSP_536: PSP_641 "The
+  transaction has been declined by the risk analyzer." and PSP_647 "The risk management module has requested for
+  this transaction to be declined.". `authentication_required`: PSP_649 "The payment session has
+  expired (the buyer has been redirected to the ACS and has not finalized the 3D Secure
+  authentication).", PSP_716 "OTP expired.", PSP_717 "Invalid OTP." and PSP_722 "The
+  authentication has been canceled.". `invalid_request`: PSP_718 "Invalid authentication
+  settings.". `psp_unavailable`: every other code the page gives "Technical error." (PSP_996,
+  as PSP_999), "A technical error has occurred." (PSP_594) or "Due to a technical problem, we
+  are unable to process your request." (PSP_555, 569, 577, 585, 587, 608, 643, 648, 650, 652
+  and 658, as PSP_513; 648 and 650 add "Transaction has not been created."). The suite checks
+  each of those codes.
+- **Left to the default `processing_error`, whose class the page leaves open**
+  (2026-09-30). PSP_642 "The card type used is not valid for the requested payment mode." may
+  be a card another card replaces or a shop setting for that mode. PSP_609 "The timeout has
+  been exceeded during buyer redirection." names nothing that timed out. PSP_639 "Refund
+  refused." names no refuser, unlike PSP_101, whose issuer refusal reads as `card_declined`.
+  PSP_679 "The transaction status is unknown." says the outcome is not known, which a code
+  alone cannot carry: it wants `outcomeUnknown` (#282). The page's 3-D Secure technical
+  errors (PSP_605, 713, 719, 720 and 997) already read as the rule's `processing_error`
+  through the default.
+- **Every other mapped PSP_ code re-read against the page.** Each definition supports its
+  mapping except these, left as they were. PSP_203 ("An error occurred while adding to the
+  grey list"), PSP_204 ("An error occurred during the verification of the data in the grey
+  list") and PSP_205 ("Data already present in the grey list") are mapped to
+  `fraud_suspected`, but the page describes grey-list operations, not refusals, and nothing
+  says when a payment answers one. PSP_099 ("Too many attempts.") is mapped to a retryable
+  `rate_limited`, but CreatePayment's `transactionOptions.cardOptions.retry` reads "Number of
+  new attempts available in case the payment is rejected (1 by default)."
+  (payzen.io/en-EN/rest/V4.0/api/playground/Charge/CreatePayment), and the server sets none, so
+  the code may mean a form token's attempts are spent, which no retry recovers. AMBIGUOUS: a
+  sandbox payment with a card on the shop's grey list, and two refused attempts on one sandbox
+  form token, would show which codes those answers carry; until then they keep their mapping.
+- **Eight mutations** (the browser's PSP_ branch dropped, PSP_ codes kept out of it on
+  `KR.onError`, a rate limit made non-retryable, the acquirer map read first for PSP_ codes,
+  PSP_707 dropped, PSP_708 read as a decline, the browser's map diverging from the server's,
+  and two extra entries on one line of the browser's map) each made a test fail, and so did
+  six on the review's additions (a new refusal or technical-error entry dropped or
+  reclassified, on both halves or on one, and a computed entry in the browser's map).
 
 ## No invented currencies (2026-09-30)
 

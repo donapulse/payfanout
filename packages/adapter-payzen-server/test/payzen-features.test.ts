@@ -165,6 +165,36 @@ describe("detailedStatus mapping (complete catalog)", () => {
   });
 });
 
+/**
+ * Every PSP_ code PayZen's error page (rest/V4.0/api/errors/psp.html, read
+ * 2026-09-30) gives "Technical error.", "A technical error has occurred." or
+ * "Due to a technical problem, we are unable to process your request.".
+ */
+const PAYZEN_TECHNICAL_ERROR_CODES = [
+  "PSP_996",
+  "PSP_999",
+  "PSP_594",
+  "PSP_513",
+  "PSP_514",
+  "PSP_515",
+  "PSP_516",
+  "PSP_525",
+  "PSP_538",
+  "PSP_540",
+  "PSP_541",
+  "PSP_555",
+  "PSP_569",
+  "PSP_577",
+  "PSP_585",
+  "PSP_587",
+  "PSP_608",
+  "PSP_643",
+  "PSP_648",
+  "PSP_650",
+  "PSP_652",
+  "PSP_658",
+];
+
 describe("mapPayZenError (envelope taxonomy)", () => {
   const cases: Array<[string | undefined, string | null | undefined, UnifiedErrorCode, boolean]> = [
     ["INT_905", null, "invalid_request", false],
@@ -218,14 +248,48 @@ describe("mapPayZenError (envelope taxonomy)", () => {
     ["PSP_112", null, "expired_card", false],
     ["PSP_026", null, "invalid_card_data", false],
     ["PSP_530", null, "invalid_card_data", false],
-    ["PSP_539", null, "authentication_required", false],
+    ["PSP_539", "39", "authentication_required", false], // challenge failed, abandoned or timed out
     ["PSP_136", null, "authentication_required", false],
+    ["PSP_707", "207", "card_declined", false], // the issuer refused the authentication
+    ["PSP_708", "208", "processing_error", false], // the issuer could not authenticate
+    // PSP_052 to PSP_055 read as AUTH_100 to AUTH_103 do.
+    ["PSP_052", null, "processing_error", false],
+    ["PSP_053", null, "processing_error", false],
+    ["PSP_054", null, "invalid_request", false],
+    ["PSP_055", null, "invalid_request", false],
+    // Refusals the error page documents: another card, a new authentication or
+    // the merchant's settings, never a retry.
+    ["PSP_003", null, "card_declined", false], // payment refused
+    ["PSP_091", null, "card_declined", false],
+    ["PSP_575", null, "card_declined", false], // rejected by PayPal
+    ["PSP_611", null, "card_declined", false], // refused without a liability shift
+    ["PSP_624", null, "card_declined", false], // inactive card
+    ["PSP_625", null, "card_declined", false],
+    ["PSP_636", null, "card_declined", false],
+    ["PSP_641", null, "fraud_suspected", false], // declined by the risk analyzer
+    ["PSP_647", null, "fraud_suspected", false],
+    ["PSP_649", null, "authentication_required", false], // 3-D Secure left unfinished
+    ["PSP_716", null, "authentication_required", false], // OTP expired
+    ["PSP_717", null, "authentication_required", false],
+    ["PSP_722", null, "authentication_required", false],
+    ["PSP_718", null, "invalid_request", false], // invalid authentication settings
+    ["PSP_534", null, "card_declined", false], // failed a verification the card requires every time
+    ["PSP_535", null, "card_declined", false], // failed e-Carte Bleue verification
+    ["PSP_572", null, "card_declined", false], // declined by Cofinoga
+    ["PSP_573", null, "card_declined", false], // 1-euro authorization refused
+    ["PSP_600", null, "card_declined", false], // failed commercial card verification
+    ["PSP_601", null, "card_declined", false], // the first installment was refused
+    // Every code the page gives a technical-error text, retryable as an outage.
+    ...PAYZEN_TECHNICAL_ERROR_CODES.map((code): [string, null, UnifiedErrorCode, boolean] => [
+      code,
+      null,
+      "psp_unavailable",
+      true,
+    ]),
     ["PSP_536", null, "fraud_suspected", false],
     ["PSP_204", null, "fraud_suspected", false],
     ["PSP_099", null, "rate_limited", true], // HTTP-200 rate limit — envelope is the only signal
     ["PSP_106", null, "rate_limited", true],
-    ["PSP_999", null, "psp_unavailable", true],
-    ["PSP_514", null, "psp_unavailable", true],
     ["PSP_010", null, "invalid_request", false],
     ["PSP_030", null, "invalid_request", false], // token not found
     ["PSP_031", null, "invalid_request", false], // invalid token
@@ -266,17 +330,20 @@ describe("mapPayZenError (envelope taxonomy)", () => {
     expect(mapPayZenError({ errorCode: "INT_905" }, {}).message).toMatch(/shopId, password/);
   });
 
-  it("holds the same acquirer and AUTH_ maps as the browser adapter", async () => {
+  it("holds the same acquirer, AUTH_ and PSP_ maps as the browser adapter", async () => {
     const { readFile } = await import("node:fs/promises");
     const { fileURLToPath } = await import("node:url");
     const entries = async (path: string, map: string): Promise<string[]> => {
       const source = await readFile(fileURLToPath(new URL(path, import.meta.url)), "utf8");
       const start = source.indexOf(`const ${map}:`);
       if (start === -1) return [];
-      const block = source.slice(start, source.indexOf("\n};", start));
-      return [...block.matchAll(/^\s*["']?(\w+)["']?\s*:\s*["']([a-z_]+)["'],?/gm)].map((m) => `${m[1]}=${m[2]}`).sort();
+      // Every entry, wherever it sits: comments dropped, several per line read too.
+      const block = source.slice(source.indexOf("{", start), source.indexOf("\n};", start)).replace(/\/\/.*$/gm, "");
+      // A computed or spread entry would escape the reading below.
+      expect(block, map).not.toMatch(/\[|\.\.\./);
+      return [...block.matchAll(/["']?(\w+)["']?\s*:\s*["']([a-z_]+)["']/g)].map((m) => `${m[1]}=${m[2]}`).sort();
     };
-    for (const map of ["ACQUIRER_CODE_MAP", "AUTH_CODE_MAP"]) {
+    for (const map of ["ACQUIRER_CODE_MAP", "AUTH_CODE_MAP", "PAYZEN_PSP_CODE_MAP"]) {
       const server = await entries("../src/adapter.ts", map);
       expect(server.length, map).toBeGreaterThan(0);
       expect(await entries("../../adapter-payzen/src/adapter.ts", map), map).toEqual(server);

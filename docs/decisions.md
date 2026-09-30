@@ -5516,13 +5516,16 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   - Both messages ask the host to check the Stripe Dashboard for a capture or refund under
     the key before acting there, never to act first, and a final refusal asks it too (added
     in the second review, 2026-09-30, for the MGA refusal the UGX one already had it for).
-  - `updatePaymentSession` whenever UGX is refused (changed in review, 2026-09-30, twice):
-    an update sending an amount for a UGX PaymentIntent, and, since the second review, one
-    naming UGX, with or without an amount. Always `outcomeUnknown`, as an earlier release
-    sent such updates unconverted under the same key and no read through the adapter can
-    show whether one went through (`retrievePayment` refuses a UGX PaymentIntent); the
-    message asks for a check under the key. An MGA update's refusal stays final: it moves
-    no money, and `retrievePayment` reports the amount the PaymentIntent holds.
+  - `updatePaymentSession` when the update names UGX or sends an amount for a UGX
+    PaymentIntent (changed in review, 2026-09-30, twice): an update sending an amount for a
+    UGX PaymentIntent, and, since the second review, one naming UGX, with or without an
+    amount. A currency change away from a UGX PaymentIntent, whose amount cannot be kept,
+    stays a final `invalid_request` asking for the amount with the currency. The first two
+    are always `outcomeUnknown`, as an earlier release sent such updates unconverted under
+    the same key and no read through the adapter can show whether one went through
+    (`retrievePayment` refuses a UGX PaymentIntent); the message asks for a check under the
+    key. An MGA update's refusal stays final: it moves no money, and `retrievePayment`
+    reports the amount the PaymentIntent holds.
   - The other send refusals stay final: session creation, which makes a new PaymentIntent
     and moves no money; an MGA update, as above; the ISK overflow, which only amounts past
     Stripe's 12-digit maximum reach, so no earlier attempt of it went through; and the
@@ -5585,17 +5588,24 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   reaching the test double) and whether it leaves the outcome open; the list-page failures
   with their `raw`; event amounts; same-key retries of a currency change, a capture and a
   refund whose first answer was lost; and the refund-list rule for each refund status, an
-  empty list, another page and a list that cannot be read. The test double keeps Stripe's
-  idempotency on every keyed write, creates included: it saves the first result under a
-  key, an error as well as an answer ("regardless of whether it succeeds or fails"),
-  replays it to a same-key request with the same parameters, and refuses the key when they
-  differ. Each mutation tried (ISK multiplied by 10, MGA or one send path left unconverted,
-  UGX treated as zero-decimal, the whole-ariary, overflow and multiple-of-100 checks
-  dropped, a page check made a no-op, `outcomeUnknown` dropped from answers or from the
-  refusals above, the nothing-moved exceptions widened, the refund list's statuses or its
-  `has_more` ignored, a named UGX update made final, the kept amount sent only when it
-  changes, the three-decimal rule extended to captures) made a test fail. The conformance
-  suite passes unchanged.
+  empty list, another page, a list that does not say whether another page follows, and a
+  list that cannot be read. The test double keeps Stripe's idempotency on every keyed
+  write, creates and cancellations included: it saves the first result under a key, an
+  error as well as an answer ("regardless of whether it succeeds or fails"), replays it to
+  a same-key request with the same parameters, and refuses the key when they differ. It
+  saves nothing for parameters that fail validation, which it checks before the write, as
+  the same page says (re-fetched 2026-09-30): "We save results only after the execution of
+  an endpoint begins. If incoming parameters fail validation, or the request conflicts with
+  another request that’s executing concurrently, we don’t save the idempotent result
+  because no API endpoint initiates the execution." Declines and other execution errors are
+  saved (added in the final review, 2026-09-30). Each mutation tried (ISK multiplied by 10,
+  MGA or one send path left unconverted, UGX treated as zero-decimal, the whole-ariary,
+  overflow and multiple-of-100 checks dropped, a page check made a no-op, `outcomeUnknown`
+  dropped from answers or from the refusals above, the nothing-moved exceptions widened,
+  the refund list's statuses or its `has_more` ignored, a named UGX update made final, the
+  kept amount sent only when it changes, the three-decimal rule extended to captures, and in
+  the test double a validation failure saved or a cancellation left unkeyed) made a test
+  fail. The conformance suite passes unchanged.
 - **Sandbox checks, not run.** No Stripe sandbox run backs these facts; each check needs an
   account whose presentment currencies include the currency.
   - **UGX.** Charge `amount: 500` in UGX and read the payment in the Stripe Dashboard: UGX 5

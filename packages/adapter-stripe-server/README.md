@@ -88,8 +88,9 @@ Pair it on the browser with [`@payfanout/adapter-stripe`](../adapter-stripe). Th
   and `createNativeSubscription`; on `capturePayment` unless the PaymentIntent is still
   `requires_capture`; on `refundPayment` unless the PaymentIntent's refunds, listed on the
   way to the refusal, are all failed or canceled (or none); and on `updatePaymentSession`
-  whenever UGX is refused. Each of these refusals asks you to check the Stripe Dashboard for
-  the request under its idempotency key before sending another. The three-decimal
+  when the update names UGX or sends an amount for a UGX PaymentIntent. Each of these
+  refusals asks you to check the Stripe Dashboard for the request under its idempotency key
+  before sending another. The three-decimal
   multiple-of-10 rule applies to session creation, an update naming amount and currency,
   saved-method charges and subscriptions. See [currencies with Stripe-specific
   units](https://donapulse.github.io/payfanout/guide/stripe#currencies-with-stripe-specific-units).

@@ -163,8 +163,9 @@ refusal of such an amount is therefore marked `outcomeUnknown` on:
   moved: the list must be complete and hold only `failed` or `canceled` refunds, or none.
   A `pending` or `requires_action` refund keeps it open, and so does a list that cannot be
   read. A refund that is sent lists nothing;
-- `updatePaymentSession` whenever UGX is refused, whether the update names UGX or sends an
-  amount for a UGX PaymentIntent.
+- `updatePaymentSession` when the update names UGX or sends an amount for a UGX
+  PaymentIntent. A currency change away from a UGX PaymentIntent, whose amount cannot be
+  kept, is refused final.
 
 Each of these refusals, final or open, asks you to check the Stripe Dashboard for a charge,
 subscription, capture, refund or update under that idempotency key before sending another,

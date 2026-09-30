@@ -24,6 +24,32 @@ export function stripeError(init: {
   return { ...init };
 }
 
+/** A parameter validation failure: Stripe answers it before any endpoint runs, and saves nothing for it. */
+function missingParam(name: string): object {
+  return stripeError({ type: "StripeInvalidRequestError", statusCode: 400, message: `Missing required param: ${name}.` });
+}
+
+/** A subscription's first item, validated as Stripe validates parameters: before any endpoint runs. */
+type SubscriptionItem =
+  | { price: string }
+  | { priceData: Record<string, unknown>; productId: string; recurring: Record<string, unknown> };
+
+function subscriptionItem(params: Record<string, unknown>): SubscriptionItem {
+  const firstItem = (params["items"] as Array<Record<string, unknown>> | undefined)?.[0];
+  if (!firstItem) throw missingParam("items");
+  if (typeof firstItem["price"] === "string") return { price: firstItem["price"] };
+  // Real Stripe requires an EXISTING product id inside price_data —
+  // subscription items accept no inline product_data.
+  const priceData = firstItem["price_data"] as Record<string, unknown> | undefined;
+  const productId = priceData?.["product"];
+  if (!priceData || typeof productId !== "string") throw missingParam("items[0][price_data][product]");
+  const recurring = priceData["recurring"] as Record<string, unknown> | undefined;
+  if (!recurring || typeof recurring["interval"] !== "string") {
+    throw missingParam("items[0][price_data][recurring][interval]");
+  }
+  return { priceData, productId, recurring };
+}
+
 /**
  * In-memory Stripe mock. Implements idempotency the way Stripe does (same key
  * -> same object, no duplicate side effect) so the conformance suite can prove
@@ -74,12 +100,18 @@ export class FakeStripe implements StripeClientLike {
 
   /**
    * Stripe's idempotency for every keyed write (creates, updates, captures,
-   * refunds): the first result under a key is saved "regardless of whether it
-   * succeeds or fails", a request with the same key and the same parameters
-   * gets it back, and one with other parameters is refused ("The idempotency
-   * layer compares incoming parameters to those of the original request and
-   * errors if they're not the same"). An error thrown before the write, by
-   * failNextWith, never reached Stripe and saves nothing.
+   * cancellations, refunds): the first result under a key is saved
+   * "regardless of whether it succeeds or fails", a request with the same key
+   * and the same parameters gets it back, and one with other parameters is
+   * refused ("The idempotency layer compares incoming parameters to those of
+   * the original request and errors if they're not the same"). A request whose
+   * parameters fail validation saves nothing: "We save results only after the
+   * execution of an endpoint begins. If incoming parameters fail validation,
+   * or the request conflicts with another request that’s executing
+   * concurrently, we don’t save the idempotent result because no API endpoint
+   * initiates the execution." Writes therefore check their parameters
+   * (missingParam) before they call this, and an error thrown before the
+   * write, by failNextWith, never reached Stripe and saves nothing either.
    */
   private async keyedWrite<T>(
     opts: StripeRequestOptions | undefined,
@@ -203,50 +235,23 @@ export class FakeStripe implements StripeClientLike {
     return pi;
   }
 
-  private createSubscription(params: Record<string, unknown>): StripeSubscriptionLike {
+  private createSubscription(params: Record<string, unknown>, item: SubscriptionItem): StripeSubscriptionLike {
     const customerId = params["customer"] as string | undefined;
     if (!customerId || !this.storedCustomers.has(customerId)) this.notFound("customer", String(customerId));
-    const items = params["items"] as Array<Record<string, unknown>> | undefined;
-    const firstItem = items?.[0];
-    if (!firstItem) {
-      throw stripeError({
-        type: "StripeInvalidRequestError",
-        statusCode: 400,
-        message: "Missing required param: items.",
-      });
-    }
     let price: StripePriceLike;
-    if (typeof firstItem["price"] === "string") {
-      const existing = this.storedPrices.get(firstItem["price"]);
-      if (!existing) this.notFound("price", firstItem["price"]);
+    if ("price" in item) {
+      const existing = this.storedPrices.get(item.price);
+      if (!existing) this.notFound("price", item.price);
       price = existing;
     } else {
-      // Real Stripe requires an EXISTING product id inside price_data —
-      // subscription items accept no inline product_data.
-      const priceData = firstItem["price_data"] as Record<string, unknown> | undefined;
-      const productId = priceData?.["product"];
-      if (typeof productId !== "string") {
-        throw stripeError({
-          type: "StripeInvalidRequestError",
-          statusCode: 400,
-          message: "Missing required param: items[0][price_data][product].",
-        });
-      }
+      const { priceData, productId, recurring } = item;
       if (!this.storedProducts.has(productId)) this.notFound("product", productId);
-      const recurring = priceData?.["recurring"] as Record<string, unknown> | undefined;
-      if (typeof recurring?.["interval"] !== "string") {
-        throw stripeError({
-          type: "StripeInvalidRequestError",
-          statusCode: 400,
-          message: "Missing required param: items[0][price_data][recurring][interval].",
-        });
-      }
       price = {
         id: `price_${++this.seq}`,
-        currency: priceData?.["currency"] as string,
-        unit_amount: priceData?.["unit_amount"] as number,
+        currency: priceData["currency"] as string,
+        unit_amount: priceData["unit_amount"] as number,
         recurring: {
-          interval: recurring["interval"],
+          interval: recurring["interval"] as string,
           ...(typeof recurring["interval_count"] === "number"
             ? { interval_count: recurring["interval_count"] }
             : {}),
@@ -393,20 +398,26 @@ export class FakeStripe implements StripeClientLike {
         return pi;
       });
     },
-    cancel: async (id: string): Promise<StripePaymentIntentLike> => {
+    cancel: async (
+      id: string,
+      params?: Record<string, unknown>,
+      opts?: StripeRequestOptions,
+    ): Promise<StripePaymentIntentLike> => {
       this.throwPending();
-      const pi = this.intents.get(id);
-      if (!pi) this.notFound("payment_intent", id);
-      if (pi.status === "succeeded" || pi.status === "canceled") {
-        throw stripeError({
-          type: "StripeInvalidRequestError",
-          statusCode: 400,
-          message: `You cannot cancel this PaymentIntent because it has a status of ${pi.status}.`,
-        });
-      }
-      pi.status = "canceled";
-      pi.amount_capturable = 0;
-      return pi;
+      return this.keyedWrite(opts, { cancel: id, params: params ?? {} }, async () => {
+        const pi = this.intents.get(id);
+        if (!pi) this.notFound("payment_intent", id);
+        if (pi.status === "succeeded" || pi.status === "canceled") {
+          throw stripeError({
+            type: "StripeInvalidRequestError",
+            statusCode: 400,
+            message: `You cannot cancel this PaymentIntent because it has a status of ${pi.status}.`,
+          });
+        }
+        pi.status = "canceled";
+        pi.amount_capturable = 0;
+        return pi;
+      });
     },
   };
 
@@ -579,15 +590,10 @@ export class FakeStripe implements StripeClientLike {
     create: async (params: Record<string, unknown>, opts?: StripeRequestOptions): Promise<StripeProductLike> => {
       this.throwPending();
       this.lastProductParams = params;
+      const name = params["name"];
+      if (typeof name !== "string" || name.length === 0) throw missingParam("name");
       return this.keyedWrite(opts, { createProduct: params }, async () => {
-        if (typeof params["name"] !== "string" || params["name"].length === 0) {
-          throw stripeError({
-            type: "StripeInvalidRequestError",
-            statusCode: 400,
-            message: "Missing required param: name.",
-          });
-        }
-        const product: StripeProductLike = { id: `prod_${++this.seq}`, name: params["name"] };
+        const product: StripeProductLike = { id: `prod_${++this.seq}`, name };
         this.storedProducts.set(product.id, product);
         this.uniqueProductCreations++;
         return product;
@@ -599,7 +605,8 @@ export class FakeStripe implements StripeClientLike {
     create: async (params: Record<string, unknown>, opts?: StripeRequestOptions): Promise<StripeSubscriptionLike> => {
       this.throwPending();
       this.lastSubscriptionParams = params;
-      return this.keyedWrite(opts, { createSubscription: params }, async () => this.createSubscription(params));
+      const item = subscriptionItem(params);
+      return this.keyedWrite(opts, { createSubscription: params }, async () => this.createSubscription(params, item));
     },
     retrieve: async (id: string): Promise<StripeSubscriptionLike> => {
       this.throwPending();

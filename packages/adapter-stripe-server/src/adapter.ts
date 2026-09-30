@@ -145,9 +145,11 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
  * unless the PaymentIntent it reads is still `requires_capture`; on
  * `refundPayment`, unless the PaymentIntent's refund list, read on the way to
  * the refusal, is complete and holds only failed or canceled refunds; and on
- * `updatePaymentSession` whenever UGX is refused, named or read. These
- * refusals, final or not, ask the host to check the Stripe Dashboard for that
- * request under the idempotency key before sending another.
+ * `updatePaymentSession` when the update names UGX or sends an amount for a
+ * UGX PaymentIntent (a currency change away from a UGX PaymentIntent, whose
+ * amount cannot be kept, is refused final). These refusals, final or not, ask
+ * the host to check the Stripe Dashboard for that request under the
+ * idempotency key before sending another.
  *
  * `updatePaymentSession`, `capturePayment` and `refundPayment` read the
  * PaymentIntent first whenever the currency of the amount they send is not

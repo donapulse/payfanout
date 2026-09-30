@@ -950,6 +950,14 @@ describe("a refused refund's outcome, read from the PaymentIntent's refund list"
     expect(err.outcomeUnknown).toBe(true);
   });
 
+  it("is left open when the list does not say whether another page follows", async () => {
+    const { adapter, fake } = makePair();
+    const pi = await stripeIntent(fake, 1500, "mga", "succeeded");
+    fake.refunds.list = async () => ({ data: [] });
+    const err = await rejectionOf(adapter.refundPayment({ pspPaymentId: pi.id, amount: 1050, idempotencyKey: "r" }));
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false, outcomeUnknown: true });
+  });
+
   it("is left open when the list cannot be read", async () => {
     const { adapter, fake } = makePair();
     const pi = await stripeIntent(fake, 1500, "mga", "succeeded");
@@ -1005,6 +1013,46 @@ describe("the test double keeps Stripe's idempotency on every keyed write", () =
     const again = await rejectionOf(adapter.chargeSavedPaymentMethod(input));
     expect(again).toMatchObject({ code: "insufficient_funds", message: first.message });
     expect(fake.uniquePaymentIntentCreations).toBe(created);
+  });
+
+  it("saves nothing for parameters that fail validation, so the key stays free for a valid request", async () => {
+    const fake = new FakeStripe();
+    const customer = fake.seedCustomer();
+    const pm = fake.seedPaymentMethod(customer.id);
+    await expect(fake.products.create({ name: "" }, { idempotencyKey: "p" })).rejects.toMatchObject({
+      message: "Missing required param: name.",
+    });
+    await expect(fake.products.create({ name: "Gold" }, { idempotencyKey: "p" })).resolves.toMatchObject({ name: "Gold" });
+
+    const product = await fake.products.create({ name: "Plan" }, { idempotencyKey: "prod" });
+    const valid = {
+      customer: customer.id,
+      default_payment_method: pm.id,
+      items: [{ price_data: { currency: "usd", product: product.id, recurring: { interval: "month" }, unit_amount: 1000 } }],
+    };
+    const invalid: Array<[Record<string, unknown>, string]> = [
+      [{ ...valid, items: [] }, "Missing required param: items."],
+      [{ ...valid, items: [{ price_data: { currency: "usd" } }] }, "Missing required param: items[0][price_data][product]."],
+      [
+        { ...valid, items: [{ price_data: { currency: "usd", product: product.id } }] },
+        "Missing required param: items[0][price_data][recurring][interval].",
+      ],
+    ];
+    for (const [index, [params, message]] of invalid.entries()) {
+      const key = `s-${index}`;
+      await expect(fake.subscriptions.create(params, { idempotencyKey: key })).rejects.toMatchObject({ message });
+      await expect(fake.subscriptions.create(valid, { idempotencyKey: key })).resolves.toMatchObject({ status: "active" });
+    }
+  });
+
+  it("replays a cancellation to a retry under its key", async () => {
+    const { adapter, fake } = makePair();
+    const pi = await stripeIntent(fake, 1000, "usd", "authorized");
+    const first = await adapter.cancelPayment(pi.id, "void");
+    const replayed = await adapter.cancelPayment(pi.id, "void");
+    expect(replayed).toMatchObject({ status: "canceled", pspPaymentId: pi.id });
+    expect(replayed).toEqual(first);
+    expect(await rejectionOf(adapter.cancelPayment(pi.id, "void-2"))).toMatchObject({ code: "invalid_request" });
   });
 });
 

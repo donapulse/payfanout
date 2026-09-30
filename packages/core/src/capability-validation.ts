@@ -6,12 +6,11 @@ import { listedCurrencyCode } from "./screening.js";
  * backed by the matching implemented surface. The two retrieval flags are
  * checked BOTH ways — they gate conformance assertions rather than only
  * describing the provider, so denying an implemented read would buy silence.
- * Returns one message per violation, in rule order, empty when coherent. It
- * reports only what stops a declaration from working. `@payfanout/server`'s
- * PaymentService rejects registration on the first violation and the
- * conformance suite asserts an empty result, both from this single
- * implementation, so the two differ only by the suite's own checks of the
- * form currency and country codes are written in.
+ * Returns one message per violation, in rule order, empty when coherent. Of
+ * the currency lists it reports only what stops a declaration from working.
+ * `@payfanout/server`'s PaymentService rejects registration on the first
+ * violation and the conformance suite asserts an empty result, both from this
+ * single implementation, so the two differ by the suite's own shape checks.
  */
 export function validateAdapterCapabilities(adapter: ServerPaymentAdapter): string[] {
   const caps = adapter.getCapabilities();

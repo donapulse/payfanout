@@ -70,7 +70,7 @@ class PushOnlyAdapter implements ServerPaymentAdapter {
     const pspSessionId = this.nextId("ref");
     const currency = input.currency.toUpperCase();
     if (REFUSED_CURRENCIES.includes(currency)) {
-      throw PayFanoutError.invalidRequest(`The push-only adapter refuses ${currency}`);
+      throw PayFanoutError.invalidRequest(`The push-only adapter refuses ${currency}`, { currency });
     }
     const id = input.id ?? pspSessionId;
     this.payments.set(pspSessionId, { id, amount: input.amount, currency });
@@ -215,6 +215,12 @@ runServerAdapterConformanceTests("push-only", () => new PushOnlyAdapter(), {
     cancelablePayment: (adapter) => reference(adapter, 1099),
   },
   failingCalls: [
+    {
+      name: "createPaymentSession in a currency the adapter declares unsupported",
+      invoke: (adapter) =>
+        adapter.createPaymentSession({ amount: 1099, currency: "XTS", idempotencyKey: "conformance-push-only-xts" }),
+      expectedCode: "invalid_request",
+    },
     {
       name: "cancelPayment on an unknown reference",
       invoke: (adapter) => adapter.cancelPayment("ref_missing", "conformance-push-only-cancel-missing"),

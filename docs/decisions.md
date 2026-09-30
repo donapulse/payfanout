@@ -5722,8 +5722,9 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   both lists (screening refuses it, so declaring it supported contradicts the adapter); and a
   supported rail whose `currencies` are all declared unsupported, which can never be routed, as
   the existing rule says of a rail outside `supportedCurrencies`. The last two read well-formed
-  entries only, and the both-lists rule reads the allowlist as screening does: each entry
-  uppercased and not trimmed, a value that is not a string admitting nothing. `PaymentService`
+  entries only, and the both-lists rule reads the allowlist as screening does, each entry
+  uppercased and not trimmed, except that a value that is not a string is skipped here, where
+  screening would throw on it. `PaymentService`
   rejects exactly these at registration. An entry that matches but is not written as its bare
   uppercase code (`"ugx"`, `" UGX"`) works, so it registers and core does not report it. The
   first version rejected such an entry at registration, so `new PaymentService()` threw over a

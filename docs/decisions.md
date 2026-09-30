@@ -489,27 +489,35 @@ choices they forced:
     they used to be withheld silently.
   - *Idempotency keys.* The Limits page: "Keys must be no longer than 128 characters";
     Responses and Errors: `idempotency_key_too_long`, "Idempotency key exceeded 128
-    characters." The rule keeps every key GoCardless ever received as it was: `fetch` trims
-    HTTP whitespace (tab, LF, CR, space) from both ends of a header value, so earlier
-    releases sent `"order-42\n"` as `order-42` and 128 characters plus a space as the 128,
-    and such a key is still passed to `fetch` as given (changed in review, 2026-09-30: a
-    first version judged the untrimmed key and would have keyed those replays differently).
-    A key GoCardless never received is sent as `payfanout-sha256-` and the SHA-256 digest of
-    the key, 81 characters: one over 128 characters once trimmed, which GoCardless refuses,
-    and one the Fetch standard lets no header carry (a character above U+00FF, or a NUL, CR
-    or LF inside the trimmed value), which every `fetch` refuses before sending, so it used
-    to fail as a retryable `psp_unavailable`. The same key always yields the same header,
-    so a retry replays; the Worldline adapter hashes every key, and PayPal passes a key of
-    at most 38 bytes as given and hashes a longer one. Other control characters (BEL, DEL
-    and the like) pass the Fetch standard, so a runtime may have sent them, and such a key
-    is still passed as given; Node's `fetch` refuses them before sending (observed
-    2026-09-30 on Node 24.21.0 against a local server), so on Node that call still fails
-    as the transport error it always did. A key holding a lone surrogate is refused with
-    `invalid_request` before any request: no `fetch` can carry it, and UTF-8 encoding would
-    give it the digest, and the refund stamp, of every key that differs from it only by
-    another lone surrogate. The refund stamp stays the SHA-256 of the key as given. The
-    unit of the 128 is undocumented; the adapter counts JavaScript's `length` of the trimmed
-    value, which for a value `fetch` can carry is also its count of code points and bytes.
+    characters." Neither page, nor the OpenAPI spec (which defines no Idempotency-Key
+    parameter), states a character set or the unit of the 128. The rule keeps every key
+    GoCardless can have taken as it was, on every runtime the adapter runs on, so a replay
+    across the upgrade keeps its key. `fetch` trims HTTP whitespace (tab, LF, CR, space)
+    from both ends of a header value, so earlier releases sent `"order-42\n"` as `order-42`
+    and 128 characters plus a space as the 128, and such a key is still passed as given
+    (changed in review, 2026-09-30: a first version judged the untrimmed key and would have
+    keyed those replays differently). A key is sent as `payfanout-sha256-` and the SHA-256
+    digest of the key, 81 characters, only when GoCardless never took it: one over 128 code
+    points once trimmed, which GoCardless refused however it counts, as code points are the
+    smallest count, and one holding a NUL, CR or LF inside the trimmed value, which no
+    runtime sends (the Fetch standard, Node and Cloudflare's workerd all refuse them). The
+    same key always yields the same header, so a retry replays; the Worldline adapter
+    hashes every key, and PayPal passes a key of at most 38 bytes as given and hashes a
+    longer one. Every other key is passed as given, as before (changed in review,
+    2026-09-30). A second version also digested keys holding a character above U+00FF,
+    which the Fetch standard's Headers refuse. workerd sends them as UTF-8, however
+    (`api/headers.c++` `normalizeHeaderValue`, `util/header-validation.h`: only NUL, CR and
+    LF are refused), so a Workers host retrying a create across the upgrade would have sent
+    a new key and created the resource twice. Node's `fetch` refuses such a key, or one
+    holding a control character other than tab, before sending (observed 2026-09-30 on
+    Node 24.21.0 against a local server), so on Node that call still fails as the retryable
+    transport error it always did; the guide advises ASCII keys. A lone surrogate is
+    refused where UTF-8 encoding would make a key share its hash with every key that
+    differs from it only by another lone surrogate: in a key sent as its digest, which
+    GoCardless never took, and in any refund key, whose stamp is the SHA-256 of the key as
+    given. The refund refusal is marked `outcomeUnknown`, since earlier releases stamped
+    such keys and Workers sent them; a shorter key holding one elsewhere goes as given, as
+    Workers always sent it (changed in review, 2026-09-30).
   - *Accept.* Making Requests: "Include an `Accept` header on all requests:" followed by
     `Accept: application/json`. Every request sends it, the connection check included.
   - *Amounts.* The spec types a payment's `amount` ("Amount, in the lowest denomination for

@@ -139,14 +139,19 @@ integer, or a string of ASCII digits, as integer minor units. Any other amount, 
 0.
 
 An idempotency key goes out as the `Idempotency-Key` header exactly as earlier releases sent
-it whenever that reached GoCardless: `fetch` trims whitespace from both ends of a header
-value, so `"order-42\n"` still goes out as `order-42`, and a replay across an upgrade keeps
-its key. A key GoCardless never received goes out as `payfanout-sha256-` followed by its
-SHA-256 digest instead of failing: one over GoCardless's 128 characters once trimmed ("Keys
-must be no longer than 128 characters"), and one no `fetch` can put in a header (a character
-above U+00FF, or a NUL, CR or LF inside it). The same key always yields the same header, so
-a retry replays. A key holding a lone surrogate is refused with `invalid_request`, since it
-is not well-formed text.
+it whenever GoCardless can have taken it, so a replay across an upgrade keeps its key on
+every runtime: `fetch` trims whitespace from both ends of a header value, so `"order-42\n"`
+still goes out as `order-42`. A key GoCardless never took goes out as `payfanout-sha256-`
+followed by its SHA-256 digest instead of failing: one over GoCardless's 128 characters
+("Keys must be no longer than 128 characters") once trimmed, counted in code points, and one
+holding a NUL, CR or LF, which no runtime sends. The same key always yields the same header,
+so a retry replays. Every other key goes out as given, as before. Cloudflare Workers sends a
+character above U+00FF as UTF-8, but Node's `fetch` refuses a key holding one, or a control
+character other than tab, before sending: on Node such a call fails with a retryable
+`psp_unavailable` that no retry fixes, so use ASCII keys there. A key holding a lone
+surrogate is refused with `invalid_request` when it would go out as its digest, and on
+refunds, whose stamp hashes every key (marked `outcomeUnknown`, as an earlier release may
+have refunded under it): UTF-8 encoding would give it the hash of other keys.
 
 ### Replays and idempotency keys
 

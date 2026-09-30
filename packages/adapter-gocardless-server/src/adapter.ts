@@ -47,7 +47,8 @@ import {
 } from "./webhook.js";
 import {
   assertMetadataLimits,
-  assertWellFormedIdempotencyKey,
+  assertDigestibleIdempotencyKey,
+  assertStampableRefundKey,
   idempotencyKeyHeader,
   METADATA_MAX_KEYS,
   readAmount,
@@ -434,16 +435,16 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * authorised, or the request is fulfilled or cancelled, the session carries
    * no `clientSecret`.
    *
-   * Refused with `invalid_request` before any request: a zero amount, an
-   * idempotencyKey holding a lone surrogate, and metadata GoCardless cannot
-   * hold (a key name over 50 characters, a value over 500, the `id` included).
-   * An idempotencyKey GoCardless could not take as given, over 128
-   * characters or one no request header can carry, is sent as a SHA-256
-   * digest of itself (see idempotencyKeyHeader).
+   * Refused with `invalid_request` before any request: a zero amount,
+   * metadata GoCardless cannot hold (a key name over 50 characters, a value
+   * over 500, the `id` included), and an idempotencyKey sent as its digest
+   * that holds a lone surrogate. An idempotencyKey GoCardless cannot have
+   * taken as given, over 128 code points once trimmed or holding a NUL, CR or
+   * LF, is sent as a SHA-256 digest of itself (see idempotencyKeyHeader).
    * Metadata keys past the third are withheld, never refused.
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
-    assertWellFormedIdempotencyKey(input.idempotencyKey);
+    assertDigestibleIdempotencyKey(input.idempotencyKey);
     assertMinorUnitAmount(input.amount, "amount");
     if (input.amount === 0) {
       throw PayFanoutError.invalidRequest(
@@ -666,10 +667,10 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * billing request is re-read, and one that is already cancelled resolves as
    * `canceled`; any other state rethrows the original error. The caller's key
    * still rides the Idempotency-Key header, as its digest when GoCardless
-   * could not take it as given (see idempotencyKeyHeader).
+   * cannot have taken it as given (see idempotencyKeyHeader).
    */
   async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
-    assertWellFormedIdempotencyKey(idempotencyKey);
+    assertDigestibleIdempotencyKey(idempotencyKey);
     const id = encodeURIComponent(pspPaymentId);
     if (pspPaymentId.startsWith("BRQ")) {
       const toInfo = (billingRequest: GoCardlessBillingRequestLike): PaymentInfo =>
@@ -731,8 +732,9 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * sends that is not a whole number rejects with `unknown`. Before any
    * request, a `reason` over the 500 characters a metadata value holds, and
    * an idempotencyKey holding a lone surrogate, reject with
-   * `invalid_request`. The refund's stamp is the SHA-256 of the key as given,
-   * whatever header carries it.
+   * `invalid_request`, the latter marked outcomeUnknown, as an earlier release
+   * may have refunded under it. The refund's stamp is the SHA-256 of the key
+   * as given, whatever header carries it.
    *
    * Each refund is created with the SHA-256 of its idempotencyKey in its
    * GoCardless metadata (`payfanout_key_sha256`, next to `reason`), so a
@@ -768,7 +770,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
     if (typeof req.idempotencyKey !== "string" || req.idempotencyKey.trim() === "") {
       throw PayFanoutError.invalidRequest("refundPayment requires a non-empty idempotencyKey");
     }
-    assertWellFormedIdempotencyKey(req.idempotencyKey);
+    assertStampableRefundKey(req.idempotencyKey);
     if (req.amount !== undefined) {
       assertMinorUnitAmount(req.amount, "refund amount");
       if (req.amount === 0) {
@@ -1045,7 +1047,7 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * rejects: GoCardless subscriptions have no plan object.
    */
   async createNativeSubscription(input: CreateNativeSubscriptionInput): Promise<NativeSubscriptionRecord> {
-    assertWellFormedIdempotencyKey(input.idempotencyKey);
+    assertDigestibleIdempotencyKey(input.idempotencyKey);
     assertMinorUnitAmount(input.amount, "amount");
     if (input.amount === 0) {
       throw PayFanoutError.invalidRequest("createNativeSubscription requires a positive amount", { input });
@@ -1168,10 +1170,10 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * a terminal state resolves as success — the billing stop the caller asked
    * for already holds. The caller's key rides the Idempotency-Key header,
    * matching the adapter's other cancel actions, as its digest when
-   * GoCardless could not take it as given (see idempotencyKeyHeader).
+   * GoCardless cannot have taken it as given (see idempotencyKeyHeader).
    */
   async cancelNativeSubscription(input: CancelNativeSubscriptionInput): Promise<NativeSubscriptionRecord> {
-    assertWellFormedIdempotencyKey(input.idempotencyKey);
+    assertDigestibleIdempotencyKey(input.idempotencyKey);
     const path = `/subscriptions/${encodeURIComponent(input.subscriptionId)}`;
     try {
       const subscription = await this.request<GoCardlessSubscriptionLike>(

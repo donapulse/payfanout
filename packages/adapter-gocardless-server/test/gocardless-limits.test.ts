@@ -273,19 +273,24 @@ describe("GoCardless idempotency keys", () => {
     const again = await adapter.createPaymentSession(sessionInput({ idempotencyKey: "order-42\n" }));
     expect(again.pspSessionId).toBe(first.pspSessionId);
     expect(new Set(fake.idempotencyKeysSeen.map(({ key }) => key))).toEqual(new Set(["order-42"]));
-    // 128 characters and a trailing space went out as the 128, which GoCardless takes.
+    const tabbed = await adapter.createPaymentSession(sessionInput({ idempotencyKey: "\torder-42" }));
+    expect(tabbed.pspSessionId).toBe(first.pspSessionId);
+    // 128 characters and trailing whitespace went out as the 128, which GoCardless takes.
     const long = "k".repeat(128);
     const third = await adapter.createPaymentSession(sessionInput({ idempotencyKey: long }));
-    const fourth = await adapter.createPaymentSession(sessionInput({ idempotencyKey: `${long} ` }));
-    expect(fourth.pspSessionId).toBe(third.pspSessionId);
+    for (const edge of [" ", "\t", "\r\n"]) {
+      const again = await adapter.createPaymentSession(sessionInput({ idempotencyKey: `${long}${edge}` }));
+      expect(again.pspSessionId, JSON.stringify(edge)).toBe(third.pspSessionId);
+    }
+    expect(new Set(fake.idempotencyKeysSeen.map(({ key }) => key))).toEqual(new Set(["order-42", long]));
   });
 
   for (const [name, setUp] of cases) {
-    it(`${name} refuses a key holding a lone surrogate before any request`, async () => {
+    it(`${name} refuses a key sent as its digest that holds a lone surrogate, before any request`, async () => {
       const { adapter, fake } = makePair();
       const call = await setUp(adapter, fake);
       const sent = fake.requests.length;
-      await expect(call("order-\uD800")).rejects.toMatchObject({
+      await expect(call(`${"k".repeat(128)}\uD800`)).rejects.toMatchObject({
         code: "invalid_request",
         retryable: false,
         message: expect.stringMatching(/lone surrogate/),
@@ -293,6 +298,32 @@ describe("GoCardless idempotency keys", () => {
       expect(fake.requests).toHaveLength(sent);
     });
   }
+
+  for (const [name, setUp] of cases.filter(([caseName]) => caseName !== "refundPayment")) {
+    it(`${name} sends a short key holding a lone surrogate as given, as Cloudflare Workers always did`, async () => {
+      const { adapter, fake } = makePair();
+      fake.headerRules = "workerd";
+      const call = await setUp(adapter, fake);
+      await call("order-\uD800");
+      expect(fake.idempotencyKeysSeen.map(({ key }) => key)).toContain("order-\uD800");
+    });
+  }
+
+  it("refuses a refund key holding any lone surrogate before any request, leaving the outcome open", async () => {
+    const { adapter, fake } = makePair();
+    fake.headerRules = "workerd";
+    const paymentId = await confirmedPayment(adapter, fake);
+    const sent = fake.requests.length;
+    await expect(
+      adapter.refundPayment({ pspPaymentId: paymentId, amount: 100, idempotencyKey: "refund-\uD800" }),
+    ).rejects.toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      outcomeUnknown: true,
+      message: expect.stringMatching(/lone surrogate/),
+    });
+    expect(fake.requests).toHaveLength(sent);
+  });
 
   it("stamps a refund with the digest of the key as given, whatever header carries it, and replays it", async () => {
     const { adapter, fake } = makePair();
@@ -317,12 +348,30 @@ describe("GoCardless idempotency keys", () => {
     expect(headers.size).toBe(1);
   });
 
-  it("sends a key no header can carry as its digest, instead of failing before the request", async () => {
+  it("sends a key holding characters above U+00FF as given, so a replay on Workers meets what it created", async () => {
     const { adapter, fake } = makePair();
-    await expect(adapter.createPaymentSession(sessionInput({ idempotencyKey: "order-€-42" }))).resolves.toMatchObject({
-      status: "requires_action",
-    });
-    expect(fake.idempotencyKeysSeen.at(-1)?.key).toMatch(/^payfanout-sha256-[0-9a-f]{64}$/);
+    fake.headerRules = "workerd";
+    const mandate = fake.seedMandate();
+    const input = { savedPaymentMethodToken: mandate.id, amount: 1000, currency: "GBP", interval: "month" as const };
+    for (const key of ["sub-Łódź-42", "注文-42", "😀".repeat(65)]) {
+      const first = await adapter.createNativeSubscription({ ...input, idempotencyKey: key });
+      // An earlier release sent this key as given; the retry after the upgrade must send the same one.
+      const again = await adapter.createNativeSubscription({ ...input, idempotencyKey: key });
+      expect(again.id, key).toBe(first.id);
+      expect(fake.idempotencyKeysSeen.filter(({ key: seen }) => seen === key), key).toHaveLength(2);
+    }
+    expect(fake.uniqueSubscriptionCreations).toBe(3);
+  });
+
+  it("leaves Node's fetch to refuse a key it cannot carry before sending, as it always did", async () => {
+    for (const key of ["order-€-42", "bell\u0007"]) {
+      const { adapter, fake } = makePair();
+      await expect(adapter.createPaymentSession(sessionInput({ idempotencyKey: key })), key).rejects.toMatchObject({
+        code: "psp_unavailable",
+        retryable: true,
+      });
+      expect(fake.requests, key).toHaveLength(0);
+    }
   });
 
   it("leaves a missing key to the caller's contract instead of failing on it", async () => {

@@ -1,24 +1,39 @@
 import { describe, expect, it } from "vitest";
-import { assertWellFormedIdempotencyKey, idempotencyKeyHeader, readAmount, wireInteger } from "../src/wire.js";
+import {
+  assertDigestibleIdempotencyKey,
+  assertStampableRefundKey,
+  idempotencyKeyHeader,
+  readAmount,
+  wireInteger,
+} from "../src/wire.js";
 
 describe("idempotencyKeyHeader", () => {
   const DIGEST = /^payfanout-sha256-[0-9a-f]{64}$/;
 
-  it("sends every key an earlier release could send exactly as it sent it", async () => {
+  it("sends every key GoCardless can have taken exactly as earlier releases sent it", async () => {
     const asGiven = [
       "k",
       "k".repeat(128),
       "order-42:capture",
       "clé-é-ÿ",
-      "a b c",
+      "a b c",
       "tab\tkey",
       // fetch trims edge whitespace, so these went out, and still go out, as "order-42" or 128 characters.
       "order-42\n",
       "\r\norder-42",
       " order-42 ",
+      "\torder-42",
       `${"k".repeat(128)} `,
+      `${"k".repeat(128)}\t`,
       `${"k".repeat(128)}\r\n`,
-      // The Fetch standard lets a header carry these, so a runtime may have sent them; Node's fetch refuses them.
+      // Cloudflare Workers sends these as UTF-8, and other control characters as given; Node's fetch refuses them.
+      "key-€-1",
+      "key-—",
+      "sub-Łódź-42",
+      "注文-42",
+      "😀".repeat(65),
+      "😀".repeat(128),
+      "order-\uD800",
       "bell\u0007",
       "del\u007f",
     ];
@@ -27,13 +42,13 @@ describe("idempotencyKeyHeader", () => {
     }
   });
 
-  it("sends a key over 128 characters once trimmed, or one no fetch can carry, as a digest of itself", async () => {
+  it("sends a key GoCardless never took, over 128 code points once trimmed or holding NUL, CR or LF, as its digest", async () => {
     const digested = [
       "k".repeat(129),
       ` ${"k".repeat(129)}`,
       "x".repeat(4000),
-      "key-€-1",
-      "key-—",
+      "😀".repeat(129),
+      "€".repeat(129),
       "line\nbreak",
       "cr\rkey",
       "nul\u0000",
@@ -51,18 +66,40 @@ describe("idempotencyKeyHeader", () => {
   });
 });
 
-describe("assertWellFormedIdempotencyKey", () => {
-  it("refuses a key holding a lone surrogate, which would share its digest and refund stamp with others", () => {
-    for (const key of ["order-\uD800", "order-\uDC00", "\uDE00\uD83D"]) {
-      expect(() => assertWellFormedIdempotencyKey(key), JSON.stringify(key)).toThrowError(/lone surrogate/);
+describe("assertDigestibleIdempotencyKey", () => {
+  it("refuses a key sent as its digest that holds a lone surrogate, which would share the digest of other keys", () => {
+    for (const key of [`\uD800${"k".repeat(128)}`, `${"k".repeat(200)}\uDC00`, "line\n\uD800"]) {
+      expect(() => assertDigestibleIdempotencyKey(key), JSON.stringify(key)).toThrowError(/lone surrogate/);
     }
   });
 
-  it("accepts well-formed text, astral characters included, and leaves a missing key to the caller's contract", () => {
-    for (const key of ["order-42", "order-😀", "order-�", "", "clé"]) {
-      expect(() => assertWellFormedIdempotencyKey(key), key).not.toThrow();
+  it("accepts a key sent as given, lone surrogates included, and a well-formed key sent as its digest", () => {
+    for (const key of ["order-\uD800", "\uDE00\uD83D", "order-42", "😀".repeat(129), "k".repeat(4000), ""]) {
+      expect(() => assertDigestibleIdempotencyKey(key), JSON.stringify(key)).not.toThrow();
     }
-    expect(() => assertWellFormedIdempotencyKey(undefined as never)).not.toThrow();
+    expect(() => assertDigestibleIdempotencyKey(undefined as never)).not.toThrow();
+  });
+});
+
+describe("assertStampableRefundKey", () => {
+  it("refuses a refund key holding a lone surrogate, leaving open whether an earlier release refunded under it", () => {
+    for (const key of ["order-\uD800", "order-\uDC00", "\uDE00\uD83D", `${"k".repeat(200)}\uD800`]) {
+      expect(() => assertStampableRefundKey(key), JSON.stringify(key)).toThrow(
+        expect.objectContaining({
+          code: "invalid_request",
+          retryable: false,
+          outcomeUnknown: true,
+          pspName: "gocardless",
+          message: expect.stringMatching(/lone surrogate.*check the payment's refunds/),
+        }),
+      );
+    }
+  });
+
+  it("accepts well-formed text, astral characters included", () => {
+    for (const key of ["order-42", "order-😀", "order-�", "clé", "k".repeat(4000)]) {
+      expect(() => assertStampableRefundKey(key), key).not.toThrow();
+    }
   });
 });
 

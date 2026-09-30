@@ -112,10 +112,12 @@ rather than silently dropping events — use the recipe above for GoCardless ing
   `intervalCount` that would skip a year (over 52 weeks, 12 months or 1 year). Amounts
   GoCardless returns as digit strings read as integers; any other amount rejects the
   read with `unknown`. An idempotency key goes out exactly as earlier releases sent it
-  whenever that reached GoCardless; one over 128 characters once `fetch` trims it, or
-  one no `fetch` can put in a header, is sent as a SHA-256 digest of itself, the same on
-  every retry, and one holding a lone surrogate is refused. Every request sends
-  `Accept: application/json`.
+  whenever GoCardless can have taken it; one over 128 code points once `fetch` trims it,
+  or holding a NUL, CR or LF, is sent as a SHA-256 digest of itself, the same on every
+  retry. Node's `fetch` refuses a key holding a character above U+00FF, or a control
+  character other than tab, before sending, as it always has: use ASCII keys there. A
+  lone surrogate is refused in a key sent as its digest and in a refund key. Every
+  request sends `Accept: application/json`.
 - `fallbackEnabled` is sent only when `true`. GoCardless says `fallback_enabled` "Should
   not be set if GoCardless payment intelligence feature is used", and that "Fallbacks
   should not be used if you are using Protect+ with Verified Mandates".

@@ -103,6 +103,13 @@ export class FakeGoCardlessApi {
   uniqueBillingRequestCreations = 0;
   uniqueRefundCreations = 0;
   uniqueSubscriptionCreations = 0;
+  /**
+   * Whose fetch sends the headers. "node": the Headers constructor refuses
+   * NUL, CR, LF and characters above U+00FF, and Node every other control
+   * character but tab. "workerd" (Cloudflare Workers): only NUL, CR and LF
+   * are refused, and other values go out as UTF-8. Both trim edge whitespace.
+   */
+  headerRules: "node" | "workerd" = "node";
   /** Total fetch invocations — asserts the verifyCredentials probe is single-shot. */
   callCount = 0;
   lastRequestBody: Record<string, unknown> | undefined;
@@ -147,13 +154,14 @@ export class FakeGoCardlessApi {
     this.lastRequestUrl = url;
     this.lastRequestBody = body;
     const headers = init?.headers as Record<string, string> | undefined;
-    // As Node's fetch sends headers: each value trimmed of edge whitespace, and
-    // one it cannot carry refused before anything is sent, which the Headers
-    // constructor does for NUL, CR, LF and characters above U+00FF, and Node
-    // for every other control character but tab.
-    const sent = new Headers(headers);
-    for (const [name, value] of sent) {
-      if (/[^\t\x20-\x7e\x80-\xff]/.test(value)) throw new TypeError(`invalid ${name} header`);
+    // Each value is trimmed of edge whitespace, and one the runtime cannot
+    // carry is refused before anything is sent (see headerRules).
+    const refused = this.headerRules === "node" ? /[^\t\x20-\x7e\x80-\xff]/ : /[\0\r\n]/;
+    const sent = new Map<string, string>();
+    for (const [name, value] of Object.entries(headers ?? {})) {
+      const trimmed = value.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+      if (refused.test(trimmed)) throw new TypeError(`invalid ${name} header`);
+      sent.set(name.toLowerCase(), trimmed);
     }
     this.requests.push({ method, path, ...(body ? { body } : {}), headers: { ...headers } });
     const idempotencyKey = sent.get("idempotency-key") || undefined;
@@ -175,8 +183,8 @@ export class FakeGoCardlessApi {
         },
       });
     }
-    // Limits: "Keys must be no longer than 128 characters".
-    if (idempotencyKey && idempotencyKey.length > 128) {
+    // Limits: "Keys must be no longer than 128 characters", counted here in code points, the smallest count.
+    if (idempotencyKey && Array.from(idempotencyKey).length > 128) {
       return json(400, {
         error: {
           message: "Idempotency key exceeded 128 characters.",

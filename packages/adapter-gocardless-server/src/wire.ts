@@ -49,39 +49,38 @@ export function assertMetadataLimits(metadata: Record<string, string>): void {
 const HEADER_EDGE_WHITESPACE = /^[\t\n\r ]+|[\t\n\r ]+$/g;
 
 /**
- * Whether the Fetch standard lets a header carry the value: no character
- * above U+00FF anywhere, and no NUL, CR or LF once fetch has trimmed it. Any
- * fetch refuses a value that fails this, so no such key ever reached
- * GoCardless. Other control characters pass the standard, and a runtime may
- * send them, although Node's fetch refuses them.
+ * Whether GoCardless can have taken a key, with fetch's edge whitespace
+ * trimmed, as given: no NUL, CR or LF inside it, which no runtime sends in a
+ * header, and at most 128 code points. Code points are the smallest count
+ * GoCardless could use, so a longer key was answered
+ * `idempotency_key_too_long` however it counts. Any other key may have gone
+ * out and created something: Cloudflare Workers sends characters above U+00FF
+ * as UTF-8, and other control characters, while Node's fetch refuses both
+ * before sending.
  */
-function fetchCanCarry(value: string, trimmed: string): boolean {
-  for (let i = 0; i < value.length; i++) {
-    if (value.charCodeAt(i) > 0xff) return false;
-  }
-  for (let i = 0; i < trimmed.length; i++) {
-    const code = trimmed.charCodeAt(i);
-    if (code === 0 || code === 10 || code === 13) return false;
+function takenAsGiven(trimmed: string): boolean {
+  let codePoints = 0;
+  for (const char of trimmed) {
+    codePoints += 1;
+    const code = char.charCodeAt(0);
+    if (code === 0 || code === 10 || code === 13 || codePoints > IDEMPOTENCY_KEY_MAX_CHARACTERS) return false;
   }
   return true;
 }
 
+function sentAsGiven(idempotencyKey: string): boolean {
+  return takenAsGiven(idempotencyKey.replace(HEADER_EDGE_WHITESPACE, ""));
+}
+
 /**
- * The Idempotency-Key header for an idempotencyKey. A key fetch can carry,
- * and whose trimmed value GoCardless takes (at most 128 characters), goes as
- * given, exactly as earlier releases sent it, so a replay of an earlier
- * request keeps its key. Any other key, one over 128 characters once trimmed
- * (GoCardless answers `idempotency_key_too_long`) or one no fetch can carry,
- * never reached GoCardless, and is sent as `payfanout-sha256-` and the
- * SHA-256 digest of itself: the same key always yields the same header. The
- * 128 counts JavaScript's `length`, which for a value fetch can carry is
- * also its count of code points and of bytes.
+ * The Idempotency-Key header for an idempotencyKey. A key GoCardless can have
+ * taken (see takenAsGiven) goes as given, exactly as earlier releases sent it,
+ * so a replay of an earlier request keeps its key on every runtime. Any other
+ * key never created anything, and is sent as `payfanout-sha256-` and the
+ * SHA-256 digest of itself: the same key always yields the same header.
  */
 export async function idempotencyKeyHeader(idempotencyKey: string): Promise<string> {
-  const trimmed = idempotencyKey.replace(HEADER_EDGE_WHITESPACE, "");
-  if (trimmed.length <= IDEMPOTENCY_KEY_MAX_CHARACTERS && fetchCanCarry(idempotencyKey, trimmed)) {
-    return idempotencyKey;
-  }
+  if (sentAsGiven(idempotencyKey)) return idempotencyKey;
   return `payfanout-sha256-${await sha256Hex(idempotencyKey)}`;
 }
 
@@ -89,17 +88,40 @@ export async function idempotencyKeyHeader(idempotencyKey: string): Promise<stri
 const LONE_SURROGATE = /\p{Cs}/u;
 
 /**
- * Refuses an idempotencyKey holding a lone surrogate. No fetch can carry it,
- * and its digest, like its refund stamp, would be the digest of every key
- * that differs from it only by another lone surrogate, as UTF-8 encoding
- * replaces each with U+FFFD: two different requests would share one key.
+ * Refuses an idempotencyKey that is sent as its digest while holding a lone
+ * surrogate. UTF-8 encoding replaces each lone surrogate with U+FFFD before
+ * hashing, so every key that differs from it only by another lone surrogate
+ * would share its digest, and two different requests one key. A key sent as
+ * given keeps its lone surrogates as the runtime sends them, as it always did.
  */
-export function assertWellFormedIdempotencyKey(idempotencyKey: string): void {
-  if (typeof idempotencyKey === "string" && LONE_SURROGATE.test(idempotencyKey)) {
-    throw PayFanoutError.invalidRequest(
-      "The idempotencyKey holds a lone surrogate, so it is not well-formed Unicode and no request can carry it",
-    );
+export function assertDigestibleIdempotencyKey(idempotencyKey: string): void {
+  if (typeof idempotencyKey !== "string" || !LONE_SURROGATE.test(idempotencyKey) || sentAsGiven(idempotencyKey)) {
+    return;
   }
+  throw PayFanoutError.invalidRequest(
+    "The idempotencyKey is sent as its digest, being over GoCardless's 128 characters or holding a NUL, CR or LF, " +
+      "and it holds a lone surrogate, which would give it the digest of other keys",
+  );
+}
+
+/**
+ * Refuses a refund idempotencyKey holding a lone surrogate: a refund's stamp
+ * is the SHA-256 of its key, which such a key would share with every key that
+ * differs from it only by another lone surrogate. Earlier releases stamped
+ * such keys, and a runtime that sends them may have created the refund, so
+ * the refusal leaves the outcome open.
+ */
+export function assertStampableRefundKey(idempotencyKey: string): void {
+  if (!LONE_SURROGATE.test(idempotencyKey)) return;
+  throw new PayFanoutError({
+    code: "invalid_request",
+    message:
+      "The refund idempotencyKey holds a lone surrogate, so its refund stamp would match other keys' stamps; " +
+      "an earlier release may already have refunded under it: check the payment's refunds before refunding again",
+    retryable: false,
+    pspName: "gocardless",
+    outcomeUnknown: true,
+  });
 }
 
 /**

@@ -56,6 +56,7 @@ export { lowercaseKeys, normalizeSecrets, normalizeTime } from "./webhook-util.j
 export type { InjectScriptOptions, InjectStylesheetOptions } from "./sdk-loader.js";
 export { assertBrowser, injectScript, injectStylesheet, isValidCspNonce } from "./sdk-loader.js";
 
+export type { ValidateAdapterCapabilitiesOptions } from "./capability-validation.js";
 export { validateAdapterCapabilities } from "./capability-validation.js";
 
 export type {

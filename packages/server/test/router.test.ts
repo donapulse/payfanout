@@ -306,7 +306,7 @@ describe("PaymentRouter failover cascade", () => {
     expect(result.attempts).toHaveLength(1);
     expect(result.attempts[0]).toMatchObject({ pspName: "refusing", skipped: true });
     expect(result.attempts[0]?.error).toMatchObject({ code: "unsupported_operation", retryable: false });
-    expect(result.attempts[0]?.error.message).toBe('"refusing" does not support currency  ugx ');
+    expect(result.attempts[0]?.error.message).toBe('"refusing" declares currency UGX unsupported');
     expect(refusing.calls).toHaveLength(0);
     // Every other currency still goes to it first.
     expect((await router.createPaymentSession(input({ currency: "USD" }))).pspName).toBe("refusing");
@@ -318,9 +318,10 @@ describe("PaymentRouter failover cascade", () => {
     const router = new PaymentRouter({ service: new PaymentService({ adapters: [a, b] }) });
     await expect(router.createPaymentSession(input({ currency: "CLP" }))).rejects.toMatchObject({
       code: "invalid_request",
+      retryable: false,
       message: "No PSP in the routing chain [psp-a, psp-b] can serve this payment",
       raw: [
-        { pspName: "psp-a", code: "unsupported_operation", message: '"psp-a" does not support currency CLP' },
+        { pspName: "psp-a", code: "unsupported_operation", message: '"psp-a" declares currency CLP unsupported' },
         { pspName: "psp-b", code: "unsupported_operation", message: '"psp-b" does not support currency CLP' },
       ],
     });

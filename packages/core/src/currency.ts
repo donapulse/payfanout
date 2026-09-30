@@ -36,9 +36,10 @@ export function getCurrencyExponent(currency: string): number {
 /**
  * Every currency getCurrencyExponent gives an exponent other than 2, with
  * that exponent, in code order: the 0-, 3- and 4-decimal codes of ISO 4217
- * list one. Any code not listed reads as 2, so an adapter comparing its PSP's
- * currency table with PayFanout's minor units can enumerate every code the
- * comparison turns on from these and that table. A fresh array on each call.
+ * list one. Any other valid code reads as 2 (an invalid one throws), so an
+ * adapter comparing its PSP's currency table with PayFanout's minor units can
+ * enumerate every code the comparison turns on from these and that table. A
+ * fresh array on each call.
  */
 export function listNonDefaultCurrencyExponents(): Array<[currency: string, exponent: number]> {
   return Object.entries(CURRENCY_EXPONENT_OVERRIDES).sort(([a], [b]) => (a < b ? -1 : 1));

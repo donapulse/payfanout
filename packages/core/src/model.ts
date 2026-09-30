@@ -134,23 +134,31 @@ export interface AdapterCapabilities {
    * without it, a PSP-local currency rejection (invalid_request) aborts the
    * failover cascade before an eligible PSP is tried. An adapter whose PSP
    * takes too many currencies to list declares the few it refuses in
-   * `unsupportedCurrencies` instead.
+   * `unsupportedCurrencies` instead, or declares both.
    */
   supportedCurrencies?: string[];
   /**
-   * Currencies the adapter refuses outright (ISO 4217, uppercase). ABSENT or
-   * empty means none. A PSP that takes most currencies cannot be given a
-   * `supportedCurrencies` list without refusing some it takes, yet its adapter
-   * may still refuse a few wholesale, such as a currency the PSP prices with
-   * another exponent than ISO 4217. The router pre-screens candidates by this
-   * list as it does by `supportedCurrencies`, so a session in one of these
-   * currencies skips the adapter instead of aborting the failover cascade on
-   * its local invalid_request, and PaymentService refuses the session with
-   * unsupported_operation. Screening applies it to every session in the
-   * currency, zero-amount ones included, so list a currency only when the
-   * refusal does not depend on the amount; one that does (a whole-unit rule)
-   * stays a local check. Keep the local check either way: hosts can call an
-   * adapter without PaymentService.
+   * Currencies the adapter refuses to send any amount in (ISO 4217,
+   * uppercase). ABSENT or empty means none. A PSP that takes most currencies
+   * cannot be given a `supportedCurrencies` list without refusing some it
+   * takes, yet its adapter may still refuse a few, such as a currency the PSP
+   * prices with another exponent than ISO 4217. An adapter may declare either
+   * list or both; a session's currency must pass each one declared.
+   *
+   * Only session creation is screened: the router skips the adapter for a
+   * session in one of these currencies instead of aborting the failover
+   * cascade on its local invalid_request, and PaymentService refuses such a
+   * session with a non-retryable unsupported_operation. Session updates,
+   * saved-method charges and native subscriptions still meet the adapter's
+   * own refusal, so keep the local check: hosts can also call an adapter
+   * without PaymentService.
+   *
+   * Declare a currency when the adapter refuses every amount it would send in
+   * it. The declaration is a trade-off: screening also refuses zero-amount
+   * sessions in the currency, even ones the adapter itself still serves
+   * because they send no amount, and the adapter's changeset must say so. A
+   * refusal of only some non-zero amounts (a whole-unit rule) stays a local
+   * check. Listed codes are compared trimmed and uppercased.
    */
   unsupportedCurrencies?: string[];
   /**

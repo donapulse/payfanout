@@ -1,4 +1,17 @@
 import type { ServerPaymentAdapter } from "./adapters.js";
+import { listedCurrencyCode } from "./screening.js";
+
+/** Options for validateAdapterCapabilities. */
+export interface ValidateAdapterCapabilitiesOptions {
+  /**
+   * Report only what stops the adapter from working, as PaymentService does
+   * at registration. A declaration that works but is not written in its
+   * canonical form (an `unsupportedCurrencies` code in lowercase) is then left
+   * out; without this option it is reported too, and the conformance suite,
+   * which passes no options, fails the adapter on it.
+   */
+  registration?: boolean;
+}
 
 /**
  * The capability coherence rule table: every flag an adapter claims must be
@@ -7,10 +20,14 @@ import type { ServerPaymentAdapter } from "./adapters.js";
  * describing the provider, so denying an implemented read would buy silence.
  * Returns one message per violation, in rule order, empty when coherent.
  * `@payfanout/server`'s PaymentService rejects registration on the first
- * violation and the conformance suite asserts an empty result — both consume
- * this single implementation so the two can never drift.
+ * violation (in `registration` mode) and the conformance suite asserts an
+ * empty result — both consume this single implementation so the two can never
+ * drift.
  */
-export function validateAdapterCapabilities(adapter: ServerPaymentAdapter): string[] {
+export function validateAdapterCapabilities(
+  adapter: ServerPaymentAdapter,
+  options: ValidateAdapterCapabilitiesOptions = {},
+): string[] {
   const caps = adapter.getCapabilities();
   const issues: string[] = [];
   if (caps.pspName !== adapter.pspName) {
@@ -59,20 +76,33 @@ export function validateAdapterCapabilities(adapter: ServerPaymentAdapter): stri
   if (caps.supportsMultiCapture && !caps.supportsManualCapture) {
     issues.push(`Adapter "${adapter.pspName}" claims multi-capture without manual capture support`);
   }
-  // unsupportedCurrencies is a router pre-screen input: a code that is not
-  // three letters never matches, and the adapter's own refusal of the
-  // currency it meant would end the cascade. The rule sits here, where both
-  // registration and the conformance suite apply it, and asks for the
-  // uppercase form the suite asks of the other currency lists.
+  // unsupportedCurrencies is a router pre-screen input, read here as
+  // screening reads it (listedCurrencyCode). An entry that can never match
+  // fails everywhere: the adapter's own refusal of the currency it meant would
+  // end the cascade. One that matches in another form ("ugx") works, so only
+  // the conformance suite, which passes no options, asks for the uppercase form
+  // it asks of the other currency lists. The rules below it read well-formed
+  // entries only.
   const declared = caps.supportedCurrencies ?? [];
-  const refused = caps.unsupportedCurrencies ?? [];
-  for (const code of refused) {
-    if (!/^[A-Z]{3}$/.test(code)) {
+  const refused: string[] = [];
+  for (const entry of caps.unsupportedCurrencies ?? []) {
+    const code = listedCurrencyCode(entry);
+    if (code === undefined) {
       issues.push(
-        `Adapter "${adapter.pspName}" declares "${String(code)}" in unsupportedCurrencies, which is not an ` +
-          "uppercase ISO 4217 code",
+        `Adapter "${adapter.pspName}" declares ${describeEntry(entry)} in unsupportedCurrencies, which can ` +
+          "never match a session's currency: it is not a three-letter code",
       );
-    } else if (listsCode(declared, code)) {
+      continue;
+    }
+    refused.push(code);
+    if (!options.registration && entry !== code) {
+      issues.push(
+        `Adapter "${adapter.pspName}" declares "${entry}" in unsupportedCurrencies; write it "${code}", the ` +
+          "uppercase ISO 4217 form",
+      );
+    }
+    // Compared as screening reads the allowlist: each entry uppercased.
+    if (declared.some((listed) => typeof listed === "string" && listed.toUpperCase() === code)) {
       issues.push(`Adapter "${adapter.pspName}" declares ${code} in both supportedCurrencies and unsupportedCurrencies`);
     }
   }
@@ -170,4 +200,9 @@ export function validateAdapterCapabilities(adapter: ServerPaymentAdapter): stri
 /** Whether `codes` lists `code`, compared case-insensitively as screening compares. */
 function listsCode(codes: readonly string[], code: string): boolean {
   return codes.some((listed) => listed.toUpperCase() === code.toUpperCase());
+}
+
+/** A declared entry as a message quotes it: a string in quotes, anything else as it prints. */
+function describeEntry(entry: unknown): string {
+  return typeof entry === "string" ? `"${entry}"` : String(entry);
 }

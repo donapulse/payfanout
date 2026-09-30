@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { isPayFanoutError, PayFanoutError } from "@payfanout/core";
 import { PaymentService } from "@payfanout/server";
-import { FakeAdapter } from "./fake-adapter.js";
+import { FakeAdapter, type FakeAdapterOptions } from "./fake-adapter.js";
 
 const baseInput = {
   amount: 1000,
@@ -80,21 +80,25 @@ describe("PaymentService registry", () => {
     ).not.toThrowError();
   });
 
-  it("rejects an incoherent currency declaration at registration", () => {
-    expect(
-      () => new PaymentService({ adapters: [new FakeAdapter({ capabilities: { unsupportedCurrencies: ["ugx"] } })] }),
-    ).toThrowError(/"ugx" in unsupportedCurrencies, which is not an uppercase ISO 4217 code/);
-    expect(
-      () =>
-        new PaymentService({
-          adapters: [
-            new FakeAdapter({ capabilities: { supportedCurrencies: ["UGX", "USD"], unsupportedCurrencies: ["UGX"] } }),
-          ],
-        }),
-    ).toThrowError(/declares UGX in both supportedCurrencies and unsupportedCurrencies/);
-    expect(
-      () => new PaymentService({ adapters: [new FakeAdapter({ capabilities: { unsupportedCurrencies: ["UGX"] } })] }),
-    ).not.toThrowError();
+  it("rejects at registration only a currency declaration that cannot work", async () => {
+    const register = (capabilities: FakeAdapterOptions["capabilities"]) =>
+      new PaymentService({ adapters: [new FakeAdapter({ capabilities })] });
+    for (const entry of [123, null, "UG"]) {
+      expect(() => register({ unsupportedCurrencies: [entry] as unknown as string[] })).toThrowError(
+        /in unsupportedCurrencies, which can never match a session's currency/,
+      );
+    }
+    expect(() => register({ supportedCurrencies: ["UGX", "USD"], unsupportedCurrencies: ["UGX"] })).toThrowError(
+      /declares UGX in both supportedCurrencies and unsupportedCurrencies/,
+    );
+    // Lowercase works (screening uppercases listed codes), so registration takes it;
+    // only the conformance suite asks for the uppercase form.
+    const lowercase = register({ unsupportedCurrencies: ["ugx"] });
+    await expectUnsupported(
+      lowercase.createPaymentSession("fake", { ...baseInput, currency: "UGX" }),
+      /^"fake" declares currency UGX unsupported$/,
+    );
+    expect(() => register({ unsupportedCurrencies: ["UGX"] })).not.toThrowError();
   });
 });
 
@@ -161,12 +165,12 @@ describe("PaymentService guards", () => {
     const service = new PaymentService({ adapters: [adapter] });
     await expectUnsupported(
       service.createPaymentSession("fake", { ...baseInput, currency: "ugx" }),
-      /^"fake" does not support currency ugx$/,
+      /^"fake" declares currency UGX unsupported$/,
     );
     // Zero-amount sessions too: the list refuses the currency, whatever the amount.
     await expectUnsupported(
       service.createPaymentSession("fake", { ...baseInput, amount: 0, currency: "UGX" }),
-      /does not support currency UGX/,
+      /^"fake" declares currency UGX unsupported$/,
     );
     await expect(
       service.createPaymentSession("fake", { ...baseInput, currency: "UGX" }),

@@ -526,9 +526,10 @@ function ensurePspName(error: PayFanoutError, pspName: string): PayFanoutError {
  * Fails fast at registration if capability flags contradict the implemented
  * surface. The rule table lives in core (`validateAdapterCapabilities`) — the
  * same one the conformance suite asserts — so the two can never drift; the
- * service rejects on the first violation.
+ * service rejects on the first violation. Registration mode leaves out what
+ * works but is not written in its canonical form, which only the suite fails.
  */
 function assertCapabilityCoherence(adapter: ServerPaymentAdapter): void {
-  const issues = validateAdapterCapabilities(adapter);
+  const issues = validateAdapterCapabilities(adapter, { registration: true });
   if (issues.length > 0) throw PayFanoutError.invalidRequest(issues[0]!);
 }

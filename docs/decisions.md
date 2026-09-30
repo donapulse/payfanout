@@ -5029,7 +5029,8 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   2026-09-30, with core's `getCurrencyExponent` and with the ISO 4217 lists SIX publishes (list
   one of 2026-09-17, list three of 2026-01-01): 79 rows agree with core, two do not.
   - **CLP** has the exponent 2 at Paysafe and 0 in ISO 4217 and core. Sent unchanged, CLP 10,000
-    (`amount: 10000`) was charged as CLP 100.00, a hundredth of the price.
+    (`amount: 10000`) would be charged, per the table, as CLP 100.00, a hundredth of the price
+    (not observed: see the sandbox checks below).
   - **BYR** has 0 at Paysafe and 2 in core, which does not list the code and reads it with its
     default 2: list three gives BYR as withdrawn in 2017-01, and list three publishes no minor
     units. A BYR amount in core minor units would be charged a hundred times over. A check
@@ -5078,19 +5079,22 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
 - **Refused, never converted.** A conversion would rest on a table no sandbox run has
   confirmed, and a wrong entry would charge a hundred times the price. Every call that would
   send the caller's amount in these currencies, or sign one for sending, refuses with a
-  non-retryable `invalid_request` before any request: `createPaymentSession` on every rail,
-  `updatePaymentSession` (the new currency, or the context's), `completePayment` for a context
-  an earlier release signed or one made with the exported `encodeSessionContext` (card and
-  bank-debit paths), `chargeSavedPaymentMethod` and `createNativeSubscription` (inline plan or
-  `planId`). `capturePayment` and `refundPayment` with an amount read the payment and refuse one
-  Paysafe holds in these currencies with `invalid_request` before any settlement or refund
-  request, sending the host to the Paysafe portal; a capture of the authorized amount states an
-  amount too. `verifyPaymentMethod` sends no amount and reports 0, so it is left alone. The
-  messages name Paysafe's exponent and PayFanout's, and `raw` carries `currency`,
-  `paysafeExponent` when the table has a row, and `payfanoutExponent`. They no longer credit
-  core's default to ISO 4217 (changed in review, 2026-09-30): BYR's reads "PayFanout reads BYR, a code ISO 4217
-  withdrew, with the exponent 2", and the `raw` field `isoExponent`, which carried core's value,
-  became `payfanoutExponent`.
+  non-retryable `invalid_request` before any write: `createPaymentSession` on every rail and
+  `updatePaymentSession` (the new currency, or the context's) before any request;
+  `completePayment` for a context an earlier release signed or one made with the exported
+  `encodeSessionContext` (card and bank-debit paths), `chargeSavedPaymentMethod` and
+  `createNativeSubscription` (inline plan or `planId`) once their key is looked up (below).
+  An update that moves a session signed in one to a currency the adapter sends is allowed, as
+  nothing was sent in the refused one. `capturePayment` and `refundPayment` with an amount
+  read the payment and refuse one Paysafe holds in these currencies with `invalid_request`
+  before any settlement or refund request, sending the host to the Paysafe portal; a capture
+  of the authorized amount states an amount too. `verifyPaymentMethod` sends no amount and
+  reports 0, so it is left alone. The messages name Paysafe's exponent and PayFanout's, and
+  `raw` carries `currency`, `paysafeExponent` when the table has a row, and
+  `payfanoutExponent`. They no longer credit core's default to ISO 4217 (changed in review,
+  2026-09-30): BYR's reads "PayFanout reads BYR, a code ISO 4217 withdrew, with the exponent
+  2", and the `raw` field `isoExponent`, which carried core's value, became
+  `payfanoutExponent`.
 - **Voids, and captures and refunds with no amount, refuse with `unsupported_operation`**
   (changed in review, 2026-09-30). The first version refused them with `invalid_request` as
   calls that would send an amount in these currencies. They send none of the caller's: a void
@@ -5103,9 +5107,10 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `currencyCode` names one of these currencies (below), and `listNativeSubscriptions` (below).
   Webhook events whose payload `currencyCode` names one carry no `amount` and keep `currency`,
   as the Adyen adapter's do.
-- **Card refunds may state no currency: AMBIGUOUS** (added in review, 2026-09-30). The refund
-  refusal reads the refund's own `currencyCode`, and the webhook omission the payload's, and
-  Paysafe does not promise either on a card refund. The spec's `refunds` schema, which answers
+- **Card refunds and settlements may state no currency: AMBIGUOUS** (added in review,
+  2026-09-30; settlements added in the second review). The refund refusal reads the refund's
+  own `currencyCode`, and the webhook omission the payload's, and Paysafe does not promise
+  either on a card refund. The spec's `refunds` schema, which answers
   `POST /v1/settlements/{settlementId}/refunds`, `GET /v1/refunds/{refundId}` and the
   `GET /v1/refunds` lookup, requires `merchantRefNum` alone. Its one card refund example, the
   "Card" answer to that POST, carries `id`, `merchantRefNum`, `txnTime`, `status` and `amount`,
@@ -5117,7 +5122,10 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   reported as it comes, with Paysafe's amount: tests pin both, and the test double answers card
   refunds that way under a lever. The first version's claim that `retrieveRefund` reads the
   currency "which the spec's 'Look Up Refund' example carries" held for Paysafecash only. The
-  sandbox check below settles it.
+  same holds wider: the spec's settlement "Card" example carries no `currencyCode` either, nor
+  do the refund examples "Process a Refund with Split Payouts" and "Purchase Return
+  Authorization", so a `SETTLEMENT_*` webhook for a payment in a refused currency that states
+  no currency keeps Paysafe's own amount too. The sandbox check below settles both.
 - **`cancelNativeSubscription` reads the subscription first.** The cancel sends no amount but
   answers with the record, so it reads the subscription before its PATCH and refuses one in
   these currencies with `unsupported_operation`, since a cancel that went through and then
@@ -5142,16 +5150,27 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   move those subscriptions first. A browser session signed in one before the upgrade still
   passes its amount to Paysafe.js `tokenize` (the client adapter's `confirm`), so a 3-D Secure
   screen could show CLP 100.00 until the session TTL ends; `completePayment` refuses the
-  session, and the client adapter is not changed. That refusal is `invalid_request` marked
-  `outcomeUnknown` (changed in review, 2026-09-30): only a session signed before the upgrade
-  reaches it, and the release that signed it may already have completed it, for instance a
-  completion whose answer was lost and that is retried after the upgrade. A plain
-  `invalid_request` reads as definitive and would let a host charge the customer through
-  another provider; the message sends the host to the Paysafe portal first. The other
-  refusals stay definitive: a saved-method charge or native subscription retried across the
-  upgrade may have gone through too, but nothing in those calls tells a retry from a first
-  attempt, and marking every such refusal would report first attempts, the common case, as
-  possibly charged.
+  session, and the client adapter is not changed.
+- **A retry across the upgrade is never read as money that did not move** (changed in the
+  second review, 2026-09-30). A completion, a saved-method charge or a native subscription
+  create that an earlier release sent, whose answer was lost, is retried under the same key
+  after the upgrade: a `SubscriptionManager` renewal replays for 24 hours, and the engine
+  (`packages/server/src/subscriptions.ts`) reads a plain `invalid_request` as "the PSP
+  answered, and no money moved", closing the attempt and dunning a paid period, or charging it
+  again once the host moves the customer. `docs/adapter-authoring.md` asks for `outcomeUnknown`
+  on "a refusal you cannot resolve" of a call that moves money. So these three calls look their
+  key up before refusing, a read that moves no money: the payments filed under the
+  merchantRefNum (and, for a bank debit, whose handle is minted at completion, a spent handle
+  that no payment which moved no money accounts for, as `hiddenSpend` reads it), or the
+  scheduler's subscriptions under it. A record that may have moved money, any subscription,
+  or a lookup that fails marks the refusal `outcomeUnknown`, with the records on `raw.earlier`
+  (or `raw.lookupFailed`) and a message that sends the host to the Paysafe portal; a key that
+  holds nothing, or only failed, voided, cancelled or expired records, keeps it final, as a
+  first attempt's. A first version marked every completion refusal `outcomeUnknown` and none
+  of the others, on the reasoning that nothing tells a retry from a first attempt; the
+  merchantRefNum lookup the replay machinery already uses does. Refunds and partial captures
+  retried under a reused key have the same gap, but their messages already send the host to
+  the portal to act there, and they are left as they are.
 - **`supportedCurrencies` stays undeclared**, as for Adyen: the capability is an allowlist, and
   the table does not list every currency Paysafe processes ("and many more", and the Account
   Manager line), so a declared list would refuse currencies Paysafe takes. The router therefore
@@ -5168,9 +5187,10 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   already had passed. Each mutation of the rule (a row that disagrees sent, a currency without a
   row priced off hundredths sent, one priced in hundredths refused), of the
   `unsupported_operation` split, of the stopped-subscription message, of the list failure's
-  `raw`, of the read before the cancel, and of the completion refusal's `outcomeUnknown`
-  (dropped, or given to every refusal) made a test fail. The conformance suite passes
-  unchanged.
+  `raw`, and of the read before the cancel made a test fail. In the second review, tests were
+  added that seed an earlier release's COMPLETED charge, a declined one, a subscription and a
+  spent bank-debit handle under the retried key, and fail the lookup, and that assert every
+  other refusal kind final (`outcomeUnknown` absent). The conformance suite passes unchanged.
 - **Sandbox checks, not run.** The first two need a merchant account provisioned in the
   currency; the reference sandbox account is CAD-only. The API reads back the integer it was
   sent in either case, so the witness is the Paysafe portal, which shows the major-unit amount,
@@ -5180,11 +5200,12 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
     2: ISK stays refused, as a documented deviation like CLP.
   - **CLP.** The same with `amount: 1000`: CLP 10.00 confirms the table. CLP stays refused
     either way unless a conversion is decided.
-  - **A card refund's currency.** Refund a card payment, read the refund
-    (`GET /v1/refunds/{refundId}`) and receive its `REFUND_COMPLETED` webhook, and record
-    whether each carries `currencyCode`. Without it, a card refund in a refused currency is
-    reported with Paysafe's amount, and refusing it would need the currency of the payment the
-    host refunded, which the refund does not name.
+  - **A card refund's and settlement's currency.** Refund a card payment, read the refund
+    (`GET /v1/refunds/{refundId}`) and receive its `REFUND_COMPLETED` webhook, and the
+    settlement's `SETTLEMENT_COMPLETED` one, and record whether each carries `currencyCode`.
+    Without it, a card refund in a refused currency is reported with Paysafe's amount, and
+    refusing it would need the currency of the payment the host refunded, which the refund
+    does not name.
 - **Open, not changed here.** The scheduler spec's plan `amount`, like the Payments API's
   `purchaseReturnAuthorization` `amount`, adds "If the merchant account is set up for a currency
   that has 3 decimal units, our system will half round up the least significant digit.", which

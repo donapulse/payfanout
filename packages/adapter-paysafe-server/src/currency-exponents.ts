@@ -65,29 +65,42 @@ export function currencyRefusal(currency: unknown): CurrencyRefusal | undefined 
 /** Refuses a call that would send, or sign for sending, an amount in a refused currency. */
 export function assertSendableCurrency(currency: string): void {
   const refusal = currencyRefusal(currency);
-  if (refusal === undefined) return;
-  throw refusalError(
-    "invalid_request",
-    `${refuses(refusal)}. Take ${refusal.currency} payments with another provider`,
-    { ...refusal },
-  );
+  if (refusal !== undefined) throw sendRefusal(refusal);
 }
 
 /**
- * Refuses to complete a session signed in a refused currency. Only a context
- * an earlier release signed, or one made with encodeSessionContext, carries
- * one, and that release may already have completed the session: the refusal
- * leaves the outcome open, so no host charges the customer twice.
+ * What the lookup of a refused call's key found: the records filed under it
+ * that may have moved money, or none when the lookup failed.
  */
-export function assertCompletableCurrency(currency: string): void {
-  const refusal = currencyRefusal(currency);
-  if (refusal === undefined) return;
-  throw refusalError(
+export interface EarlierAttempt {
+  /** What the key files: "payment" or "subscription". */
+  noun: string;
+  /** Absent when the lookup failed. */
+  records?: readonly unknown[];
+}
+
+/**
+ * The refusal of a call that would send an amount in a refused currency.
+ * Earlier releases sent such calls, so a call that moves money looks its key
+ * up first: `earlier` leaves the outcome open, as that release may already
+ * have made what this call asks for.
+ */
+export function sendRefusal(refusal: CurrencyRefusal, earlier?: EarlierAttempt): PayFanoutError {
+  const code = refusal.currency;
+  if (earlier === undefined) {
+    return refusalError("invalid_request", `${refuses(refusal)}. Take ${code} payments with another provider`, {
+      ...refusal,
+    });
+  }
+  const { noun, records } = earlier;
+  const why =
+    records !== undefined
+      ? `Paysafe already holds a ${noun} under this key, which an earlier release may have made`
+      : `the lookup of this key failed, so an earlier release may already have made this ${noun}`;
+  return refusalError(
     "invalid_request",
-    `${refuses(refusal)}. This session was signed in ${refusal.currency} before the adapter refused it, and an ` +
-      "earlier release may already have completed it: look for its payment in the Paysafe portal before charging " +
-      "the customer elsewhere",
-    { ...refusal },
+    `${refuses(refusal)}. But ${why}: check the Paysafe portal before taking it with another provider`,
+    { ...refusal, ...(records !== undefined ? { earlier: records } : { lookupFailed: true }) },
     true,
   );
 }

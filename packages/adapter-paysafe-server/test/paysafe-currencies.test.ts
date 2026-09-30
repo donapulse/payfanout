@@ -207,6 +207,17 @@ function context(currency: string, extra: Partial<PaysafeSessionContextV1> = {})
   );
 }
 
+/** The bank details confirm() sends for an ACH session: "paysafe-bank." + base64url(JSON). */
+const ACH_ENVELOPE = `paysafe-bank.${utf8ToBase64Url(
+  JSON.stringify({
+    v: 1,
+    paymentType: "ACH",
+    accountHolderName: "Pat Doe",
+    routingNumber: "123456789",
+    accountNumber: "1234567890",
+  }),
+)}`;
+
 /** A delivery's raw body in the documented envelope; ids and values are made up. */
 function webhookIn(currencyCode: string | undefined, eventName = "PAYMENT_COMPLETED"): string {
   return JSON.stringify({
@@ -301,7 +312,7 @@ describe("currencies whose Paysafe exponent may not be PayFanout's", () => {
     ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringMatching(/does not convert/) });
   });
 
-  it("refuses an update into one, and any update of a session signed in one", async () => {
+  it("refuses an update into one, and one that keeps a session signed in one, but lets it move out", async () => {
     const { adapter } = makePair();
     const session = await adapter.createPaymentSession({ amount: 10_000, currency: "USD", idempotencyKey: "k" });
     await expect(
@@ -310,44 +321,91 @@ describe("currencies whose Paysafe exponent may not be PayFanout's", () => {
     await expect(
       adapter.updatePaymentSession({ pspSessionId: await context("ISK"), amount: 5000, idempotencyKey: "u2" }),
     ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringMatching(/ISK/) });
+    // Moving the session to a currency the adapter sends is allowed: nothing was sent in ISK.
+    await expect(
+      adapter.updatePaymentSession({ pspSessionId: await context("ISK"), currency: "USD", idempotencyKey: "u3" }),
+    ).resolves.toMatchObject({ currency: "USD", amount: 10_000 });
   });
 
-  it("refuses to complete a session signed in one before any request, on the card and bank-debit paths", async () => {
+  it("refuses to complete a session signed in one as final once its key holds nothing, on the card and bank-debit paths", async () => {
     const { adapter, fake } = makePair();
-    // Only a session signed before the upgrade gets here, and the release that
-    // signed it may already have completed it: a host must not charge again.
-    const signedEarlier = {
+    // Only a session signed before the upgrade gets here, so its key is read
+    // first; nothing under it means that release never completed it.
+    const card = await rejection(
+      adapter.completePayment({ pspSessionId: await context("CLP"), clientToken: "tok_clp", idempotencyKey: "c1" }),
+    );
+    expect(card).toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      message: expect.stringMatching(/does not convert.*Take CLP payments with another provider/),
+      raw: { currency: "CLP", paysafeExponent: 2, payfanoutExponent: 0 },
+    });
+    expect(card.outcomeUnknown).toBeUndefined();
+    const ach = await rejection(
+      adapter.completePayment({
+        pspSessionId: await context("CLP", { paymentType: "ACH" }),
+        clientToken: ACH_ENVELOPE,
+        idempotencyKey: "c2",
+      }),
+    );
+    expect(ach).toMatchObject({ code: "invalid_request", retryable: false });
+    expect(ach.outcomeUnknown).toBeUndefined();
+    // Reads only: the payments under each key, and the bank debit's handles.
+    expect(sentSince(fake, 0)).toEqual([
+      "GET /paymenthub/v1/payments",
+      "GET /paymenthub/v1/payments",
+      "GET /paymenthub/v1/paymenthandles",
+    ]);
+  });
+
+  it("leaves a completion's refusal open when its key holds a payment an earlier release may have made", async () => {
+    const { adapter, fake } = makePair();
+    await paysafeCall(fake, "POST", "/paymenthub/v1/payments", {
+      merchantRefNum: "c1",
+      dupCheck: false,
+      amount: 10_000,
+      currencyCode: "CLP",
+      paymentHandleToken: "tok_clp",
+      settleWithAuth: true,
+    });
+    const before = fake.requests.length;
+    const err = await rejection(
+      adapter.completePayment({ pspSessionId: await context("CLP"), clientToken: "tok_clp", idempotencyKey: "c1" }),
+    );
+    expect(err).toMatchObject({
       code: "invalid_request",
       retryable: false,
       outcomeUnknown: true,
-      message: expect.stringMatching(/does not convert.*look for its payment in the Paysafe portal/),
-      raw: { currency: "CLP", paysafeExponent: 2, payfanoutExponent: 0 },
-    };
-    await expect(
-      adapter.completePayment({ pspSessionId: await context("CLP"), clientToken: "tok_clp", idempotencyKey: "c1" }),
-    ).rejects.toMatchObject(signedEarlier);
-    const achEnvelope = `paysafe-bank.${utf8ToBase64Url(
-      JSON.stringify({
-        v: 1,
-        paymentType: "ACH",
-        accountHolderName: "Pat Doe",
-        routingNumber: "123456789",
-        accountNumber: "1234567890",
-      }),
-    )}`;
-    await expect(
-      adapter.completePayment({
-        pspSessionId: await context("CLP", { paymentType: "ACH" }),
-        clientToken: achEnvelope,
-        idempotencyKey: "c2",
-      }),
-    ).rejects.toMatchObject(signedEarlier);
-    expect(fake.requests).toEqual([]);
+      message: expect.stringMatching(/already holds a payment under this key.*check the Paysafe portal/),
+      raw: { currency: "CLP", earlier: [expect.objectContaining({ merchantRefNum: "c1", currencyCode: "CLP" })] },
+    });
+    expect(sentSince(fake, before)).toEqual(["GET /paymenthub/v1/payments"]);
   });
 
-  it("refuses a saved-method charge and a native subscription in one before any request", async () => {
+  it("leaves a bank debit's completion refusal open when its key holds a spent handle whose payment the lookup hides", async () => {
     const { adapter, fake } = makePair();
-    await expect(
+    const session = await adapter.createPaymentSession({
+      amount: 10_000,
+      currency: "USD",
+      paymentMethodTypes: ["ach"],
+      idempotencyKey: "s-ach",
+    });
+    await adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken: ACH_ENVELOPE, idempotencyKey: "c2" });
+    fake.hideFromLookups("payments", "c2");
+    const err = await rejection(
+      adapter.completePayment({
+        pspSessionId: await context("CLP", { paymentType: "ACH" }),
+        clientToken: ACH_ENVELOPE,
+        idempotencyKey: "c2",
+      }),
+    );
+    expect(err).toMatchObject({ code: "invalid_request", outcomeUnknown: true });
+    expect(err.raw).toMatchObject({ earlier: [expect.objectContaining({ merchantRefNum: "c2", status: "COMPLETED" })] });
+  });
+
+  it("refuses a saved-method charge and a native subscription in one as final once their keys hold nothing", async () => {
+    const { adapter, fake } = makePair();
+    const charge = await rejection(
       adapter.chargeSavedPaymentMethod({
         pspCustomerId: "cust_1",
         savedPaymentMethodToken: SEEDED_MULTI_USE_TOKEN,
@@ -355,27 +413,105 @@ describe("currencies whose Paysafe exponent may not be PayFanout's", () => {
         currency: "CLP",
         idempotencyKey: "charge-1",
       }),
-    ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringMatching(/does not convert/) });
-    await expect(
-      adapter.createNativeSubscription({
+    );
+    expect(charge).toMatchObject({ code: "invalid_request", message: expect.stringMatching(/does not convert/) });
+    expect(charge.outcomeUnknown).toBeUndefined();
+    for (const [currency, extra] of [
+      ["ISK", {}],
+      ["CLP", { planId: "plan_host_managed" }],
+    ] as const) {
+      const sub = await rejection(
+        adapter.createNativeSubscription({
+          savedPaymentMethodToken: SEEDED_MULTI_USE_TOKEN,
+          amount: 10_000,
+          currency,
+          interval: "month",
+          idempotencyKey: `sub-${currency}`,
+          ...extra,
+        }),
+      );
+      expect(sub, currency).toMatchObject({ code: "invalid_request", message: expect.stringMatching(currency) });
+      expect(sub.outcomeUnknown, currency).toBeUndefined();
+    }
+    // Reads only: no plan, payment or subscription was created.
+    expect(sentSince(fake, 0)).toEqual([
+      "GET /paymenthub/v1/payments",
+      "GET /subscriptionsplans/v1/subscriptions",
+      "GET /subscriptionsplans/v1/subscriptions",
+    ]);
+  });
+
+  it("leaves a retried charge's refusal open when its key holds a payment that may have moved money", async () => {
+    const { adapter, fake } = makePair();
+    const charge = (idempotencyKey: string) =>
+      adapter.chargeSavedPaymentMethod({
+        pspCustomerId: "cust_1",
         savedPaymentMethodToken: SEEDED_MULTI_USE_TOKEN,
         amount: 10_000,
-        currency: "ISK",
-        interval: "month",
-        idempotencyKey: "sub-1",
-      }),
-    ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringMatching(/ISK/) });
-    await expect(
+        currency: "CLP",
+        idempotencyKey,
+      });
+    // A renewal an earlier release sent, whose answer was lost.
+    await paysafeCall(fake, "POST", "/paymenthub/v1/payments", {
+      merchantRefNum: "renewal-a0",
+      dupCheck: true,
+      amount: 10_000,
+      currencyCode: "CLP",
+      paymentHandleToken: SEEDED_MULTI_USE_TOKEN,
+      settleWithAuth: true,
+    });
+    const retried = await rejection(charge("renewal-a0"));
+    expect(retried).toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      outcomeUnknown: true,
+      raw: { earlier: [expect.objectContaining({ merchantRefNum: "renewal-a0", status: "COMPLETED" })] },
+    });
+    // A declined earlier attempt moved no money: the refusal stays final.
+    const declined = await paysafeCall<{ id: string }>(fake, "POST", "/paymenthub/v1/payments", {
+      merchantRefNum: "renewal-a1",
+      dupCheck: true,
+      amount: 10_000,
+      currencyCode: "CLP",
+      paymentHandleToken: SEEDED_MULTI_USE_TOKEN,
+      settleWithAuth: true,
+    });
+    fake.failLater(declined.id, { code: "3009", message: "Your request has been declined by the issuing bank." });
+    const final = await rejection(charge("renewal-a1"));
+    expect(final).toMatchObject({ code: "invalid_request", retryable: false });
+    expect(final.outcomeUnknown).toBeUndefined();
+    // A lookup that fails leaves it open too.
+    fake.networkFailure = true;
+    const unreadable = await rejection(charge("renewal-a2"));
+    fake.networkFailure = false;
+    expect(unreadable).toMatchObject({
+      code: "invalid_request",
+      outcomeUnknown: true,
+      message: expect.stringMatching(/lookup of this key failed/),
+      raw: { lookupFailed: true },
+    });
+    expect(fake.uniqueSettlementCreations).toBe(0);
+  });
+
+  it("leaves a retried native subscription's refusal open when its key holds a subscription", async () => {
+    const { adapter, fake } = makePair();
+    await subscriptionMadeElsewhere(fake, "CLP");
+    const err = await rejection(
       adapter.createNativeSubscription({
         savedPaymentMethodToken: SEEDED_MULTI_USE_TOKEN,
         amount: 10_000,
         currency: "CLP",
         interval: "month",
-        planId: "plan_host_managed",
-        idempotencyKey: "sub-2",
+        idempotencyKey: "k",
+        merchantRefNum: "sub-CLP",
       }),
-    ).rejects.toMatchObject({ code: "invalid_request" });
-    expect(fake.requests).toEqual([]);
+    );
+    expect(err).toMatchObject({
+      code: "invalid_request",
+      outcomeUnknown: true,
+      message: expect.stringMatching(/already holds a subscription under this key/),
+      raw: { earlier: [expect.objectContaining({ merchantRefNum: "sub-CLP" })] },
+    });
   });
 
   it("refuses a capture or refund of a stated amount with invalid_request, once the payment is read", async () => {
@@ -518,6 +654,20 @@ describe("currencies whose Paysafe exponent may not be PayFanout's", () => {
     await expect(adapter.listNativeSubscriptions({ limit: 1, cursor: "3" })).resolves.toEqual({ subscriptions: [] });
   });
 
+  it("names a currency once on a page holding several subscriptions in it, however each spells it", async () => {
+    const { adapter, fake } = makePair();
+    const upper = await subscriptionMadeElsewhere(fake, "CLP");
+    const lower = await subscriptionMadeElsewhere(fake, "clp");
+    const err = await rejection(adapter.listNativeSubscriptions({ limit: 50 }));
+    expect(err.raw).toEqual({
+      currencies: [{ currency: "CLP", paysafeExponent: 2, payfanoutExponent: 0 }],
+      records: [
+        { id: upper, currency: "CLP" },
+        { id: lower, currency: "CLP" },
+      ],
+    });
+  });
+
   it("refuses to cancel a subscription billing in one before the PATCH, saying so when it is already stopped", async () => {
     const { adapter, fake } = makePair();
     const active = await subscriptionMadeElsewhere(fake, "CLP");
@@ -542,12 +692,43 @@ describe("currencies whose Paysafe exponent may not be PayFanout's", () => {
     expect(sentSince(fake, before)).toEqual([`GET /subscriptionsplans/v1/subscriptions/${stopped}`]);
   });
 
+  it("leaves every other refusal final: only a looked-up key that holds something, or cannot be read, stays open", async () => {
+    const { adapter, fake } = makePair();
+    const authorized = await paymentMadeElsewhere(fake, "CLP", false);
+    const settled = await paymentMadeElsewhere(fake, "CLP", true);
+    const refundId = await refundMadeElsewhere(fake, settled);
+    const active = await subscriptionMadeElsewhere(fake, "CLP");
+    const stopped = await subscriptionMadeElsewhere(fake, "ISK");
+    await paysafeCall(fake, "PATCH", `/subscriptionsplans/v1/subscriptions/${stopped}`, { status: "CANCELLED" });
+    const session = await adapter.createPaymentSession({ amount: 10_000, currency: "USD", idempotencyKey: "k" });
+    const calls: Array<[string, () => Promise<unknown>]> = [
+      ["session", () => adapter.createPaymentSession({ amount: 10_000, currency: "CLP", idempotencyKey: "k1" })],
+      ["update", () => adapter.updatePaymentSession({ pspSessionId: session.pspSessionId, currency: "XOF", idempotencyKey: "u" })],
+      ["capture of an amount", () => adapter.capturePayment(authorized.id, 500_000, "cap-1")],
+      ["capture", () => adapter.capturePayment(authorized.id, undefined, "cap-2")],
+      ["void", () => adapter.cancelPayment(authorized.id, "void-1")],
+      ["refund of an amount", () => adapter.refundPayment({ pspPaymentId: settled.id, amount: 100, idempotencyKey: "r-1" })],
+      ["refund", () => adapter.refundPayment({ pspPaymentId: settled.id, idempotencyKey: "r-2" })],
+      ["payment read", () => adapter.retrievePayment(settled.id)],
+      ["refund read", () => adapter.retrieveRefund(refundId)],
+      ["subscription read", () => adapter.retrieveNativeSubscription({ subscriptionId: active })],
+      ["subscription cancel", () => adapter.cancelNativeSubscription({ subscriptionId: active, idempotencyKey: "c-1" })],
+      ["stopped cancel", () => adapter.cancelNativeSubscription({ subscriptionId: stopped, idempotencyKey: "c-2" })],
+      ["subscription page", () => adapter.listNativeSubscriptions({ limit: 10 })],
+    ];
+    for (const [name, call] of calls) {
+      const err = await rejection(call());
+      expect(err.retryable, name).toBe(false);
+      expect(err.outcomeUnknown, name).toBeUndefined();
+    }
+  });
+
   it("reports a webhook in one without its amount, and everything else as it would for any currency", async () => {
     const { adapter } = makePair();
     for (const parse of [(raw: string) => adapter.parseWebhookEvent(raw), parsePaysafeWebhookEvent]) {
       const usd = await parse(webhookIn("USD"));
       expect(usd.amount).toBe(1_000_000);
-      for (const currency of ["CLP", "isk", "BYR", "UYI", "XOF"]) {
+      for (const currency of ["CLP", "isk", " clp ", "BYR", "UYI", "XOF"]) {
         const event = await parse(webhookIn(currency));
         expect(event, currency).not.toHaveProperty("amount");
         expect(event).toMatchObject({

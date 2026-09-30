@@ -148,11 +148,15 @@ manager before you take it (§13).
 
 In the refused currencies:
 
-- `createPaymentSession`, `updatePaymentSession`, `chargeSavedPaymentMethod` and
-  `createNativeSubscription` reject with a non-retryable `invalid_request` before calling
-  Paysafe, and so does `completePayment` for a session an earlier release signed in one,
-  marked `outcomeUnknown`: that release may already have completed the session, so look
-  for its payment in the Paysafe portal before charging the customer elsewhere.
+- `createPaymentSession` and `updatePaymentSession` reject with a non-retryable
+  `invalid_request` before calling Paysafe.
+- `chargeSavedPaymentMethod`, `createNativeSubscription`, and `completePayment` for a session
+  an earlier release signed in one, first look their key up (a read, which moves no money),
+  since an earlier release sent such calls, then reject with a non-retryable
+  `invalid_request`. The refusal is marked `outcomeUnknown` when Paysafe holds a payment
+  under the key that may have moved money (or a spent bank-debit handle whose payment it
+  does not show yet), or a subscription, or when the lookup fails: check the Paysafe portal
+  before charging the customer elsewhere. Otherwise it is final.
 - `capturePayment`, `cancelPayment` and `refundPayment` on a payment Paysafe holds in one (made
   by an earlier release, or by another integration on the account) read the payment, then
   reject before any settlement, void or refund request. A capture or refund that states an
@@ -163,8 +167,8 @@ In the refused currencies:
 - `retrievePayment` and `retrieveNativeSubscription` reject with `unsupported_operation`,
   since the amounts cannot be reported in PayFanout's minor units: read them in the Paysafe
   portal. So does `retrieveRefund` for a refund Paysafe reports in one. Paysafe does not
-  promise a `currencyCode` on a refund (its card refund example carries none), and a refund
-  names no payment, so a refund that states no currency is reported as it comes, with
+  promise a `currencyCode` on a refund or a settlement (its card examples carry none), and a
+  refund names no payment, so a refund that states no currency is reported as it comes, with
   Paysafe's amount.
 - `cancelNativeSubscription` rejects a subscription in one with `unsupported_operation`
   before cancelling it, even one already stopped, whose cancel would otherwise succeed.
@@ -183,7 +187,14 @@ Before upgrading from a release that sent these currencies to Paysafe:
 
 - `SubscriptionManager` renewals on Paysafe in these currencies now fail with
   `invalid_request`, a definitive failure, so they would run dunning to cancellation: move
-  those subscriptions to another provider first.
+  those subscriptions to another provider first. A renewal an earlier release sent whose
+  answer was lost is the exception: its retry finds the payment under its key and leaves
+  the outcome open.
+- A subscription list page holding a subscription in one of them fails whole, the other
+  subscriptions on it included: step past it with a `limit` of 1, as above.
+- The currencies the table does not list are refused as a precaution, since their exponent
+  at Paysafe is undocumented: traffic in them that Paysafe priced correctly until now stops
+  too, and the adapter has no option to allow them.
 - Native subscriptions created in them keep billing at Paysafe's exponent (a CLP 10,000 plan
   bills CLP 100.00 every cycle), and the adapter can no longer read, list or cancel them:
   cancel them in the Paysafe portal and re-create them elsewhere.

@@ -47,10 +47,11 @@ import {
   type VerifyPaymentMethodInput,
 } from "@payfanout/core";
 import {
-  assertCompletableCurrency,
   assertReportablePage,
   assertSendableCurrency,
   assertUsableRecord,
+  currencyRefusal,
+  sendRefusal,
 } from "./currency-exponents.js";
 import {
   decodeSessionContext,
@@ -1195,17 +1196,19 @@ function defaultSleep(ms: number): Promise<void> {
  * currency the table gives another exponent than PayFanout (CLP, BYR), or
  * one the table lacks that is not priced in hundredths (ISK, UYI and others;
  * see "Currencies the adapter refuses" in the setup guide).
- * createPaymentSession, updatePaymentSession, completePayment,
- * chargeSavedPaymentMethod and createNativeSubscription refuse one with
- * `invalid_request` before any request; completePayment's refusal, which
- * only a session signed before the upgrade meets, is outcomeUnknown, as an
- * earlier release may already have completed it. capturePayment and
- * refundPayment read the payment first and refuse with `invalid_request`
- * when they carry an amount, which is in PayFanout's minor units, and with
- * `unsupported_operation` when they carry none, as cancelPayment does: those
- * send Paysafe's own amounts, or none, but answer with amounts that cannot be
- * reported in PayFanout's minor units. cancelNativeSubscription reads the
- * subscription first and refuses the same way. retrievePayment,
+ * createPaymentSession and updatePaymentSession refuse one with
+ * `invalid_request` before any request. completePayment,
+ * chargeSavedPaymentMethod and createNativeSubscription, which earlier
+ * releases sent in such currencies, look their key up first, a read that
+ * moves no money, and refuse with `invalid_request`, marked outcomeUnknown
+ * when Paysafe holds something under the key or the lookup fails.
+ * capturePayment and refundPayment read the payment first and refuse with
+ * `invalid_request` when they carry an amount, which is in PayFanout's minor
+ * units, and with `unsupported_operation` when they carry none, as
+ * cancelPayment does: those send Paysafe's own amounts, or none, but answer
+ * with amounts that cannot be reported in PayFanout's minor units.
+ * cancelNativeSubscription reads the subscription first and refuses the same
+ * way. retrievePayment,
  * retrieveRefund (for a refund Paysafe reports in such a currency),
  * retrieveNativeSubscription and listNativeSubscriptions refuse with
  * `unsupported_operation`, and webhook events in one carry no `amount`.
@@ -1511,10 +1514,13 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    */
   async completePayment(input: CompletePaymentInput): Promise<PaymentInfo> {
     const context = await this.decodeContext(input.pspSessionId);
-    assertCompletableCurrency(context.currency);
+    // Only a session an earlier release signed carries a refused currency.
+    const bankPaymentType = context.paymentType;
+    await this.refuseAfterLookup(context.currency, input.idempotencyKey, "payment", (key) =>
+      this.chargesUnder(key, isBankDebitPaymentType(bankPaymentType)),
+    );
     // Bank-debit sessions have no handle yet at all: it is minted here, from
     // the bank details the client's envelope carries.
-    const bankPaymentType = context.paymentType;
     if (isBankDebitPaymentType(bankPaymentType)) {
       return this.completeBankDebitPayment(context, bankPaymentType, input);
     }
@@ -2285,7 +2291,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   async chargeSavedPaymentMethod(input: ChargeSavedPaymentMethodInput): Promise<PaymentInfo> {
     assertMinorUnitAmount(input.amount, "amount");
     const currency = normalizeCurrency(input.currency);
-    assertSendableCurrency(currency);
+    await this.refuseAfterLookup(currency, input.idempotencyKey, "payment", (key) => this.chargesUnder(key));
     const merchantAccountId = this.config.merchantAccountResolver(currency, undefined) || undefined;
     const occurrence = input.occurrence ?? "recurring";
     const replay = paymentWrite(input.idempotencyKey, input.amount, currency, input.savedPaymentMethodToken, false);
@@ -2405,7 +2411,9 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       throw PayFanoutError.invalidRequest("Paysafe subscription installments must be at least 1 minor unit");
     }
     const currency = normalizeCurrency(input.currency);
-    assertSendableCurrency(currency);
+    await this.refuseAfterLookup(currency, input.merchantRefNum ?? input.idempotencyKey, "subscription", (key) =>
+      this.subscriptionsByRefNum(key),
+    );
     if (!input.savedPaymentMethodToken) {
       throw PayFanoutError.invalidRequest(
         "createNativeSubscription requires savedPaymentMethodToken — the MULTI_USE token savePaymentMethod returned",
@@ -2580,16 +2588,60 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     merchantRefNum: string,
   ): Promise<PaysafeSubscriptionLike | undefined> {
     try {
-      const result = await this.request<{ subscriptions?: PaysafeSubscriptionLike[] }>(
-        "GET",
-        `${SCHEDULER_BASE}/subscriptions?merchantRefNum=${encodeURIComponent(merchantRefNum)}&${SUBSCRIPTION_FIELDS}`,
-      );
-      const matches = result.subscriptions ?? [];
+      const matches = await this.subscriptionsByRefNum(merchantRefNum);
       return matches.length === 1 ? matches[0] : undefined;
     } catch {
       // Recovery is best-effort; the caller rethrows the original rejection.
       return undefined;
     }
+  }
+
+  private async subscriptionsByRefNum(merchantRefNum: string): Promise<PaysafeSubscriptionLike[]> {
+    const result = await this.request<{ subscriptions?: PaysafeSubscriptionLike[] }>(
+      "GET",
+      `${SCHEDULER_BASE}/subscriptions?merchantRefNum=${encodeURIComponent(merchantRefNum)}&${SUBSCRIPTION_FIELDS}`,
+    );
+    return result.subscriptions ?? [];
+  }
+
+  /**
+   * Refuses a call in a currency the adapter refuses once `read` has looked
+   * its key up, a read that moves no money. Earlier releases sent such calls:
+   * records under the key, or a lookup that fails, leave the refusal's
+   * outcome open (see sendRefusal), so a retry across the upgrade is never
+   * read as money that did not move. A call with no key is refused as is.
+   */
+  private async refuseAfterLookup(
+    currency: string,
+    merchantRefNum: string | undefined,
+    noun: string,
+    read: (merchantRefNum: string) => Promise<readonly unknown[]>,
+  ): Promise<void> {
+    const refusal = currencyRefusal(currency);
+    if (refusal === undefined) return;
+    if (!merchantRefNum) throw sendRefusal(refusal);
+    let records: readonly unknown[];
+    try {
+      records = await read(merchantRefNum);
+    } catch {
+      throw sendRefusal(refusal, { noun });
+    }
+    throw sendRefusal(refusal, records.length > 0 ? { noun, records } : undefined);
+  }
+
+  /**
+   * What an earlier attempt may have charged under a payment key: the
+   * payments filed under it that may have moved money, and for a bank debit,
+   * whose handle is minted at completion, a spent handle no payment that
+   * moved no money accounts for (see hiddenSpend).
+   */
+  private async chargesUnder(merchantRefNum: string, bankDebit = false): Promise<RefNumRecord[]> {
+    const payments = await this.recordsByRefNum<PaysafePaymentLike>({ lookup: "payment", merchantRefNum }, false);
+    const live: RefNumRecord[] = payments.filter((payment) => !movedNoMoney(payment));
+    if (!bankDebit || live.length > 0) return live;
+    const handles = await this.recordsByRefNum<PaysafePaymentHandleLike>({ lookup: "paymentHandle", merchantRefNum }, false);
+    const spent = hiddenSpend(handles, payments);
+    return spent ? [spent] : [];
   }
 
   /**

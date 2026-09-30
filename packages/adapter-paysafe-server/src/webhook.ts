@@ -10,7 +10,7 @@ import {
   type UnifiedWebhookEvent,
   type UnifiedWebhookEventType,
 } from "@payfanout/core";
-import { excludedCurrency } from "./currency-exponents.js";
+import { currencyRefusal } from "./currency-exponents.js";
 
 /**
  * Paysafe webhook signature: base64(HMAC_SHA256(hmacKey, rawJsonBody)) carried
@@ -115,9 +115,11 @@ type JsonObject = Record<string, unknown>;
  * - handle, settlement and every other resource leave it unset (correlate those
  *   by the payload `merchantRefNum` on `raw`).
  *
- * `amount` is left out when the payload's currency is CLP, ISK or BYR, whose
- * Paysafe minor units are not the ISO 4217 ones; `currency` and every other
- * field are reported as for any currency.
+ * `amount` is left out when the payload's currency is one the adapter refuses
+ * (see PaysafeServerAdapter), whose Paysafe minor units may not be
+ * PayFanout's; `currency` and every other field are reported as for any
+ * currency. A payload that states no currency, as Paysafe does not promise one
+ * on card refunds, keeps its `amount` as delivered.
  *
  * `id` survives Paysafe's redeliveries. Paysafe sends no event id and repeats a
  * notification with the next `attemptNumber` ("1", "2", "3"), so a hash of the
@@ -183,8 +185,8 @@ export async function parsePaysafeWebhookEvent(rawBody: string): Promise<Unified
     pspName: "paysafe",
     type: mapEventType(name),
     ...(pspPaymentId !== undefined ? { pspPaymentId } : {}),
-    // An amount in an excluded currency is not in ISO 4217 minor units.
-    ...(typeof amount === "number" && Number.isSafeInteger(amount) && excludedCurrency(currency) === undefined
+    // An amount in a currency the adapter refuses is not in PayFanout's minor units.
+    ...(typeof amount === "number" && Number.isSafeInteger(amount) && currencyRefusal(currency) === undefined
       ? { amount }
       : {}),
     ...(typeof currency === "string" && currency !== "" ? { currency: currency.toUpperCase() } : {}),

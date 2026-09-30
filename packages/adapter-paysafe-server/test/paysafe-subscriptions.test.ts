@@ -488,6 +488,27 @@ describe("Paysafe native subscriptions: cancel (verified-idempotent)", () => {
       adapter.cancelNativeSubscription({ subscriptionId: "", idempotencyKey: "k" }),
     ).rejects.toMatchObject({ code: "invalid_request" });
   });
+
+  it("fails the cancel before any PATCH when the read before it fails, as that read's own error", async () => {
+    const answers: Array<[() => Response, string]> = [
+      [() => json(503, { error: { code: "1000", message: "down" } }), "psp_unavailable"],
+      [() => json(404, { error: { code: "5269", message: "No such subscription" } }), "invalid_request"],
+    ];
+    for (const [answer, code] of answers) {
+      const read = scripted([answer]);
+      const readError = await read.adapter.retrieveNativeSubscription({ subscriptionId: "sub_1" }).catch((e: unknown) => e);
+      const { adapter, requests } = scripted([answer]);
+      const cancelError = await adapter
+        .cancelNativeSubscription({ subscriptionId: "sub_1", idempotencyKey: "k" })
+        .catch((e: unknown) => e);
+      expect(isPayFanoutError(cancelError) && isPayFanoutError(readError)).toBe(true);
+      if (isPayFanoutError(cancelError) && isPayFanoutError(readError)) {
+        expect(readError.code).toBe(code);
+        expect(cancelError).toMatchObject({ code: readError.code, retryable: readError.retryable, raw: readError.raw });
+      }
+      expect(requests.map((r) => r.method)).toEqual(["GET"]);
+    }
+  });
 });
 
 describe("Paysafe native subscriptions: error normalization and capabilities", () => {

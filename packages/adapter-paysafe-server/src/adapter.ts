@@ -46,12 +46,7 @@ import {
   type VerifyCredentialsResult,
   type VerifyPaymentMethodInput,
 } from "@payfanout/core";
-import {
-  assertActionableRecord,
-  assertReportableRecord,
-  assertReportableRecords,
-  assertSendableCurrency,
-} from "./currency-exponents.js";
+import { assertReportablePage, assertSendableCurrency, assertUsableRecord } from "./currency-exponents.js";
 import {
   decodeSessionContext,
   encodeSessionContext,
@@ -650,6 +645,11 @@ function mapSubscriptionStatus(status: string | undefined): NativeSubscriptionSt
   return SUBSCRIPTION_STATUS_MAP[(status ?? "").toUpperCase()] ?? "unknown";
 }
 
+/** Billing already stopped: CANCELLED is final, and COMPLETED ran all its cycles. */
+function isStopped(status: NativeSubscriptionStatus): boolean {
+  return status === "canceled" || status === "completed";
+}
+
 /** The scheduler cadence a create input resolves to: plan billingCycle terms. */
 interface SchedulerCadence {
   frequency: string;
@@ -1181,6 +1181,28 @@ function defaultSleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * The Paysafe server adapter: the Payments API, Customer Vault and Payment
+ * Scheduler over REST, tokenize-first.
+ *
+ * Paysafe reads amounts in the minor units of its currency table, and the
+ * adapter sends PayFanout's unchanged and converts none, so it refuses a
+ * currency the table gives another exponent than PayFanout (CLP, BYR), or
+ * one the table lacks that is not priced in hundredths (ISK, UYI and others;
+ * see "Currencies the adapter refuses" in the setup guide).
+ * createPaymentSession, updatePaymentSession, completePayment,
+ * chargeSavedPaymentMethod and createNativeSubscription refuse one with
+ * `invalid_request` before any request. capturePayment and refundPayment
+ * read the payment first and refuse with `invalid_request` when they carry
+ * an amount, which is in PayFanout's minor units, and with
+ * `unsupported_operation` when they carry none, as cancelPayment does: those
+ * send Paysafe's own amounts, or none, but answer with amounts that cannot be
+ * reported in PayFanout's minor units. cancelNativeSubscription reads the
+ * subscription first and refuses the same way. retrievePayment,
+ * retrieveRefund (for a refund Paysafe reports in such a currency),
+ * retrieveNativeSubscription and listNativeSubscriptions refuse with
+ * `unsupported_operation`, and webhook events in one carry no `amount`.
+ */
 export class PaysafeServerAdapter implements ServerPaymentAdapter {
   readonly pspName = PAYSAFE_PSP_NAME;
   private readonly config: PaysafeServerAdapterConfig;
@@ -1258,10 +1280,6 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * account, webhookUrl, ...) that completePayment later verifies and trusts.
    * Paysafe's per-session webhook registration requirement is honored by
    * carrying webhookUrl in this context into the /payments request.
-   *
-   * CLP, ISK and BYR are refused with `invalid_request`: Paysafe's minor
-   * units for them are not the ISO 4217 ones PayFanout amounts are in, and
-   * the adapter does not convert.
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertMinorUnitAmount(input.amount, "amount");
@@ -1487,7 +1505,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   async completePayment(input: CompletePaymentInput): Promise<PaymentInfo> {
     const context = await this.decodeContext(input.pspSessionId);
     // A context signed by an earlier release, or with encodeSessionContext,
-    // can still carry an excluded currency.
+    // can still carry a currency the adapter refuses.
     assertSendableCurrency(context.currency);
     // Bank-debit sessions have no handle yet at all: it is minted here, from
     // the bank details the client's envelope carries.
@@ -1687,13 +1705,9 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     return (this.config.sessionTtlSeconds ?? 3600) * 1000;
   }
 
-  /**
-   * A payment in CLP, ISK or BYR is refused with `unsupported_operation`:
-   * its Paysafe amounts cannot be reported in ISO 4217 minor units.
-   */
   async retrievePayment(pspPaymentId: string): Promise<PaymentInfo> {
     const payment = await this.fetchPayment(pspPaymentId);
-    assertReportableRecord(payment.currencyCode, `Payment ${pspPaymentId}`, payment);
+    assertUsableRecord(payment.currencyCode, `Payment ${pspPaymentId}`, payment, { kind: "read" });
     return this.toPaymentInfo({ ...payment, settlements: await this.findSettlements(payment) });
   }
 
@@ -1737,7 +1751,11 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   ): Promise<PaymentInfo> {
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
     const payment = await this.fetchPayment(pspPaymentId);
-    assertActionableRecord(payment.currencyCode, `Payment ${pspPaymentId}`, "Capture", payment);
+    // With no amount, the capture sends Paysafe's own remainder.
+    assertUsableRecord(payment.currencyCode, `Payment ${pspPaymentId}`, payment, {
+      kind: amount === undefined ? "answer" : "send",
+      action: "capture",
+    });
     // Whether this is a full capture cannot change on a replay: `amount` is
     // the caller's, and the authorized amount is fixed.
     if (amount === undefined || amount === payment.amount) return this.captureInFull(pspPaymentId, payment, amount);
@@ -1900,7 +1918,8 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    */
   async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
     const payment = await this.fetchPayment(pspPaymentId);
-    assertActionableRecord(payment.currencyCode, `Payment ${pspPaymentId}`, "Void", payment);
+    // The void sends Paysafe's own availableToSettle, but answers with amounts.
+    assertUsableRecord(payment.currencyCode, `Payment ${pspPaymentId}`, payment, { kind: "answer", action: "void" });
     // Voidauths also require an explicit amount (full remaining authorization).
     const remaining = remainingToSettle(payment);
     // Voidauths take no dupCheck, so a replay is caught by lookup alone: an
@@ -2011,7 +2030,11 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
     if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
     const payment = await this.fetchPayment(req.pspPaymentId);
-    assertActionableRecord(payment.currencyCode, `Payment ${req.pspPaymentId}`, "Refund", payment);
+    // Only a stated amount is the caller's; with none, the refund sends none.
+    assertUsableRecord(payment.currencyCode, `Payment ${req.pspPaymentId}`, payment, {
+      kind: req.amount === undefined ? "answer" : "send",
+      action: "refund",
+    });
     const rail = NON_REFUNDABLE_RAILS[(payment.paymentType ?? "").toUpperCase()];
     if (rail) {
       throw new PayFanoutError({
@@ -2072,6 +2095,10 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   /**
    * Polls an async refund to a terminal state — sandbox refunds in particular
    * sit PENDING until the overnight settlement batch runs.
+   *
+   * A refund that states no `currencyCode` is reported as it comes: Paysafe
+   * does not require one (its card refund example carries none), and a
+   * refund names no payment or settlement to read the currency from.
    */
   async retrieveRefund(refundId: string): Promise<RefundInfo> {
     const refund = await this.request<{
@@ -2082,7 +2109,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       txnTime?: string;
       paymentId?: string;
     }>("GET", `/paymenthub/v1/refunds/${encodeURIComponent(refundId)}`);
-    assertReportableRecord(refund.currencyCode, `Refund ${refundId}`, refund);
+    assertUsableRecord(refund.currencyCode, `Refund ${refundId}`, refund, { kind: "read" });
     const createdAt = paysafeTime(refund.txnTime);
     return {
       refundId: refund.id,
@@ -2303,6 +2330,11 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * follow-up page comes back empty with none — because the spec does not pin
    * whether meta.numberOfRecords counts the total or the page, and a wrong
    * guess would either drop records or never terminate.
+   *
+   * A page holding a subscription in a currency the adapter refuses fails
+   * whole with `unsupported_operation`: `raw.records` names each such
+   * subscription, and `raw.nextCursor` is the cursor the page would have
+   * carried, so later pages stay reachable (a `limit` of 1 steps past each).
    */
   async listNativeSubscriptions(
     input?: ListNativeSubscriptionsInput,
@@ -2314,14 +2346,15 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       `${SCHEDULER_BASE}/subscriptions?limit=${limit}&offset=${offset}&${SUBSCRIPTION_FIELDS}`,
     );
     const records = result.subscriptions ?? [];
-    assertReportableRecords(
+    const nextCursor = records.length === limit ? String(offset + records.length) : undefined;
+    assertReportablePage(
       records.map((s) => ({ id: s.id, currency: s.plan?.currencyCode })),
       "subscription",
-      result,
+      nextCursor,
     );
     return {
       subscriptions: records.map((s) => this.toNativeSubscription(s)),
-      ...(records.length === limit ? { nextCursor: String(offset + records.length) } : {}),
+      ...(nextCursor !== undefined ? { nextCursor } : {}),
     };
   }
 
@@ -2434,13 +2467,17 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * used here. Verified-idempotent: the scheduler does not document patching
    * an already-terminal subscription, so on any rejection the adapter
    * re-fetches and treats CANCELLED/COMPLETED as success — billing that is
-   * already stopped can never fail a replayed cancel. The PATCH carries no
+   * already stopped never fails a replayed cancel, except in a currency the
+   * adapter refuses (below). The PATCH carries no
    * merchantRefNum (the scheduler has none there); replay safety comes from
    * CANCELLED being absorbing plus that re-fetch, which is why the required
-   * idempotencyKey has no wire mapping on this call. The subscription is
-   * read first, and one billing in CLP, ISK or BYR is refused with
-   * `unsupported_operation` before the PATCH: the answer could not report
-   * its amounts.
+   * idempotencyKey has no wire mapping on this call.
+   *
+   * The subscription is read before the PATCH, one more request on every
+   * cancel, and a failed read fails the cancel before anything is sent. One
+   * in a currency the adapter refuses is refused there with
+   * `unsupported_operation`, since the answer could not report its amounts,
+   * even when it is already stopped and its cancel would otherwise succeed.
    */
   async cancelNativeSubscription(
     input: CancelNativeSubscriptionInput,
@@ -2448,15 +2485,14 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     if (!input.subscriptionId) {
       throw PayFanoutError.invalidRequest("cancelNativeSubscription requires subscriptionId");
     }
-    // The cancel sends no amount, but its answer reports them: a subscription
-    // in an excluded currency is refused before it is cancelled, not after.
     const current = await this.fetchSubscription(input.subscriptionId);
-    assertActionableRecord(
+    assertUsableRecord(
       current.plan?.currencyCode,
       `Subscription ${input.subscriptionId}`,
-      "Cancel",
       current,
-      "unsupported_operation",
+      isStopped(mapSubscriptionStatus(current.status))
+        ? { kind: "stopped", status: (current.status ?? "").toUpperCase() }
+        : { kind: "answer", action: "cancel" },
     );
     try {
       const patched = await this.request<PaysafeSubscriptionLike>(
@@ -2476,15 +2512,15 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       }
     } catch (err) {
       if (!(err instanceof PayFanoutError)) throw err;
-      let current: PaysafeSubscriptionLike;
+      let refetched: PaysafeSubscriptionLike;
       try {
-        current = await this.fetchSubscription(input.subscriptionId);
+        refetched = await this.fetchSubscription(input.subscriptionId);
       } catch {
         // The re-fetch failing adds nothing — the PATCH rejection is the fact.
         throw err;
       }
-      const record = this.toNativeSubscription(current);
-      if (record.status === "canceled" || record.status === "completed") return record;
+      const record = this.toNativeSubscription(refetched);
+      if (isStopped(record.status)) return record;
       throw err;
     }
   }
@@ -2562,7 +2598,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     fallbackPlan?: PaysafePlanLike,
   ): NativeSubscriptionRecord {
     const plan = sub.plan ?? fallbackPlan;
-    assertReportableRecord(plan?.currencyCode, `Subscription ${sub.id}`, sub);
+    assertUsableRecord(plan?.currencyCode, `Subscription ${sub.id}`, sub, { kind: "read" });
     const interval = FREQUENCY_TO_INTERVAL[(plan?.billingCycle?.frequency ?? "").toUpperCase()];
     const planInterval = plan?.billingCycle?.interval;
     const intervalCount =

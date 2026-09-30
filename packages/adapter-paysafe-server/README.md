@@ -149,16 +149,20 @@ retrieved, not a separate credential).
 - Paysafe refunds neither SEPA nor Bacs direct debits, so `refundPayment` rejects a
   payment on either rail with a non-retryable `unsupported_operation` once it has read the
   payment, before any refund request.
-- CLP, ISK and BYR are refused. Paysafe reads `amount` in the minor units of its currency
-  table, which gives CLP the exponent 2 where ISO 4217 gives 0, gives BYR 0 where PayFanout
-  reads 2, and has no row for ISK (0 in ISO 4217), and the adapter does not convert. Sessions,
-  saved-method charges and native subscriptions in these currencies reject with a
-  non-retryable `invalid_request` before any request, and so do captures, voids and refunds
-  of a payment Paysafe holds in one, once the payment is read: make those in the Paysafe
-  portal. Reads of such a payment, refund or subscription, a subscription cancel and a
-  subscription list page holding one reject with `unsupported_operation`, and webhook events
-  in them carry no `amount`. The adapter declares no `supportedCurrencies`, so route these
-  currencies to another provider (see [currencies the adapter
+- Currencies whose Paysafe exponent may not be PayFanout's are refused, as Paysafe reads
+  `amount` in the minor units of its currency table and the adapter converts nothing: CLP
+  and BYR, which the table prices with another exponent (CLP 2, where ISO 4217 gives 0), and
+  currencies the table lacks that are not priced in hundredths (ISK, UYI and others).
+  Sessions, saved-method charges and native subscriptions in them reject with a
+  non-retryable `invalid_request` before any request. Captures, voids and refunds of a
+  payment Paysafe holds in one read the payment, then reject before any settlement, void or
+  refund request: with `invalid_request` when they state an amount, with
+  `unsupported_operation` otherwise. Reads of such a payment or subscription, or of a refund
+  Paysafe reports in one, subscription cancels (which read the subscription first) and
+  subscription list pages holding one reject with `unsupported_operation`, and webhook
+  events Paysafe reports in one carry no `amount`. The adapter declares no
+  `supportedCurrencies`, so route these currencies to another provider (see
+  [currencies the adapter
   refuses](https://donapulse.github.io/payfanout/guide/paysafe#currencies-the-adapter-refuses)).
 - Paysafe has no public events API (`supportsEventPolling: false`), so missed-webhook
   recovery falls back to `retrievePayment` per order.

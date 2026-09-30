@@ -121,21 +121,39 @@ const payzen = new PayZenClientAdapter({
 - Card number, expiry, and CVV render as **Lyra-hosted iframes** (SAQ-A eligible); 3DS2
   challenges run in an inline pop-in, never a navigation.
 - The script loads in SPA mode (`kr-spa-mode`) and without `async`, a conservative
-  choice: PayZen's current pages do not mention async loading. The theme stylesheet
-  (`cssUrl`) is added once the script has loaded, since PayZen
+  choice: PayZen's current pages do not mention async loading. The theme files are added
+  once the script has loaded, since PayZen
   [requires](https://payzen.io/en-EN/rest/V4.0/javascript/guide/payment_form.html) theme
-  files to load after the library, and `loadSdk()` does not wait for it: the default theme
-  imports Google Fonts, whose loading would otherwise hold up the first mount on each page
-  load. An empty
-  `cssUrl` loads no theme stylesheet, which PayZen describes as optional. KR is a single
-  page-global: one PayZen form per page, and a second adapter instance waits for the
-  script another one is still loading.
+  files to load after the library: the stylesheet (`cssUrl`, `neon-reset.min.css` by
+  default) and the theme script (`themeScriptUrl`), which PayZen's
+  [themes page](https://payzen.io/en-EN/rest/V4.0/javascript/redirection/themes.html) calls
+  the theme's "Active part": for neon, its button template, field icons and form settings,
+  for the embedded form, the smartForm and their pop-ins. `loadSdk()` waits for the theme
+  script, because krypton-client reads its settings when `mount()` sets a form up; one
+  that fails to load only leaves them out. It does not wait for the stylesheet: the
+  default theme imports Google Fonts, whose loading would otherwise hold up the first
+  mount on each page load.
+- The theme script defaults to `neon.js` only while `scriptUrl` and `cssUrl` are the
+  default files, as the three come as a set. If you point either elsewhere (PayZen's
+  theme-less `no-theme.min.css`, your own stylesheet), no theme script loads unless you set
+  `themeScriptUrl` too, so neon's settings are not laid over your styling. If your Back
+  Office "JavaScript URL" puts the library on another domain, set `cssUrl` and
+  `themeScriptUrl` together, to the theme files next to it (`.../ext/neon-reset.min.css`
+  and `.../ext/neon.js`, or the classic pair), since the theme checks below compare both
+  with the library's domain. An empty `cssUrl` or `themeScriptUrl` loads none, which PayZen
+  describes as optional. When a theme script loads,
+  krypton-client checks that the theme's version is the library's and that the theme's
+  stylesheet and script, found by their file names (`neon.js`, `classic.js`,
+  `material.js`), come from the library's domain, and reports a mismatch to the console and
+  to PayZen. The material theme's script turns the smartForm off (`CLIENT_505`).
+- KR is a single page-global: one PayZen form per page, and a second adapter instance waits
+  for the script another one is still loading.
 - `fieldOptions` passes through to `KR.setFormConfig` (`kr-placeholder-*`,
   `kr-hide-debug-toolbar`, …). Protected keys the host cannot override: `formToken`,
   `kr-public-key`, `kr-spa-mode`, and `language` when a `locale` is given.
 - `appearance` has no JS hook on PayZen: krypton mirrors your page's CSS into its
-  iframes automatically, so style the fields with plain CSS (or swap the `cssUrl`
-  stylesheet).
+  iframes automatically, so style the fields with plain CSS, or swap the theme with the
+  `cssUrl` stylesheet and its `themeScriptUrl` script.
 - The signed browser answer is **not** verified client-side (the validation keys are
   server secrets) — treat the client outcome as UX feedback and confirm server-side via
   the IPN or `retrievePayment`.
@@ -157,17 +175,20 @@ detection engine (monitor+, ClearSale, …). The adapter also loads the theme st
 from `https://static.payzen.eu`, so allow it under `style-src` too. That stylesheet
 imports its fonts from Google Fonts (`style-src https://fonts.googleapis.com`,
 `font-src https://fonts.gstatic.com`), and krypton-client adds an inline `<style>`
-element, so `style-src` also needs `'unsafe-inline'`. If you override the URLs with
-`scriptUrl` / `cssUrl` (your Back Office "JavaScript URL"), allow those hosts instead.
+element, so `style-src` also needs `'unsafe-inline'`. The theme script comes from
+`https://static.payzen.eu` as well, which `script-src` already allows. If you override the
+URLs with `scriptUrl` / `cssUrl` / `themeScriptUrl` (your Back Office "JavaScript URL"),
+allow those hosts instead.
 The onboarding descriptor (`payzenOnboarding.csp`) also lists `https://api.payzen.eu`
 under `connect`: the served krypton-client names that host, and PayZen's list does not.
 
 **Nonce-based policies.** Pass the nonce your server put in the page's policy as
 `cspNonce` (the adapter never reads one from the page), and the adapter sets it as the
-`nonce` attribute of both tags it injects, the krypton-client `<script>` and the theme
-stylesheet `<link>`. For the script, that matters only for a `script-src` that allows
-scripts by nonce without `'strict-dynamic'`: under `'strict-dynamic'` the script-created
-tag loads without one, and `https://static.payzen.eu` in `script-src` allows it anyway.
+`nonce` attribute of the three tags it injects, the krypton-client `<script>`, the theme
+stylesheet `<link>` and the theme `<script>`. For the scripts, that matters only for a
+`script-src` that allows scripts by nonce without `'strict-dynamic'`: under
+`'strict-dynamic'` a script-created tag loads without one, and `https://static.payzen.eu`
+in `script-src` allows them anyway.
 For the stylesheet, it matters for any `style-src` that allows stylesheets by nonce, since
 `'strict-dynamic'` never applies to styles. krypton-client reads no nonce itself, and the
 scripts it adds to your page carry none: its `kr-asset-*` chunks from
@@ -262,8 +283,8 @@ Worth knowing:
   on `status`, in smartForm mode.
 - A smartForm whose session/shop resolves to **cards only** renders the plain card
   fields directly — `form: "smartform"` is safe before any wallet contract exists.
-- The **material theme is incompatible** with the smartForm (`CLIENT_505`); the
-  default neon reset works.
+- The **material theme is incompatible** with the smartForm (`CLIENT_505`): its script
+  turns the smartForm off. The default neon theme works.
 - `payzenClient.fetchAvailablePaymentMethods()` returns the shop's **live** method
   list (via `KR.getPaymentMethods()`) as `{ types, methods, cardBrands }` — build a
   dynamic method chooser from it instead of hard-coding enablement.

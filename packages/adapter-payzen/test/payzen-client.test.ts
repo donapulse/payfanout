@@ -1487,11 +1487,24 @@ describe("PayZenClientAdapter asset injection", () => {
     const loading = adapter.loadSdk();
     kr = makeFakeKr();
     tagOf(page, "script").onload!();
-    await loadPageTheme(page);
     await expect(loading).resolves.toBeUndefined();
     await tick();
-    // The library and the theme script, and no stylesheet.
-    expect(page.head.map((tag) => tag.tagName)).toEqual(["script", "script"]);
+    // The library alone: no stylesheet, and no default theme script beside a stylesheet the host chose.
+    expect(page.head.map((tag) => tag.tagName)).toEqual(["script"]);
+  });
+
+  it("loads no default theme script beside a host's own library or stylesheet", async () => {
+    for (const own of [{ scriptUrl: "https://assets.example/kr.js" }, { cssUrl: "https://assets.example/no-theme.min.css" }]) {
+      const page = stubPage();
+      let kr: KrLike | undefined = undefined;
+      const adapter = new PayZenClientAdapter({ publicKey: PUBLIC_KEY, environment: "sandbox", ...own, getKrGlobal: () => kr });
+      const loading = adapter.loadSdk();
+      kr = makeFakeKr();
+      tagOf(page, "script").onload!();
+      await expect(loading).resolves.toBeUndefined();
+      await tick();
+      expect(page.head.filter((tag) => tag.tagName === "script"), JSON.stringify(own)).toHaveLength(1);
+    }
   });
 
   it("loads the SDK when the stylesheet cannot be injected, leaving no rejection unhandled", async () => {
@@ -1511,12 +1524,11 @@ describe("PayZenClientAdapter asset injection", () => {
       const loading = adapter.loadSdk();
       kr = makeFakeKr();
       tagOf(page, "script").onload!();
-      await loadPageTheme(page);
       await expect(loading).resolves.toBeUndefined();
       await tick();
       await tick();
       expect(unhandled).toEqual([]);
-      expect(page.head.map((tag) => tag.tagName)).toEqual(["script", "script"]);
+      expect(page.head.map((tag) => tag.tagName)).toEqual(["script"]);
     } finally {
       process.off("unhandledRejection", onUnhandled);
     }

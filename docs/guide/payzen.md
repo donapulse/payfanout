@@ -125,24 +125,33 @@ const payzen = new PayZenClientAdapter({
   once the script has loaded, since PayZen
   [requires](https://payzen.io/en-EN/rest/V4.0/javascript/guide/payment_form.html) theme
   files to load after the library: the stylesheet (`cssUrl`, `neon-reset.min.css` by
-  default) and the theme script (`themeScriptUrl`, `neon.js` by default), which PayZen's
+  default) and the theme script (`themeScriptUrl`), which PayZen's
   [themes page](https://payzen.io/en-EN/rest/V4.0/javascript/redirection/themes.html) calls
-  the "Active part of the neon theme": its button template, field icons and form settings.
-  `loadSdk()` waits for the theme script, because krypton-client reads its settings when
-  `mount()` sets a form up; one that fails to load only leaves them out. It does not wait
-  for the stylesheet: the default theme imports Google Fonts, whose loading would
-  otherwise hold up the first mount on each page load. An empty `cssUrl` or
-  `themeScriptUrl` loads none, which PayZen describes as optional. To use the classic
-  theme, set both, to `classic-reset.min.css` and `classic.js` from the same folder:
-  krypton-client reports a theme whose files disagree, or that is loaded from another
-  domain than the library. KR is a single page-global: one PayZen form per page, and a
-  second adapter instance waits for the script another one is still loading.
+  the theme's "Active part": for neon, its button template, field icons and form settings,
+  for the embedded form, the smartForm and their pop-ins. `loadSdk()` waits for the theme
+  script, because krypton-client reads its settings when `mount()` sets a form up; one
+  that fails to load only leaves them out. It does not wait for the stylesheet: the
+  default theme imports Google Fonts, whose loading would otherwise hold up the first
+  mount on each page load.
+- The theme script defaults to `neon.js` only while `scriptUrl` and `cssUrl` keep their
+  defaults, as the three come as a set. If you set either (your Back Office "JavaScript
+  URL", PayZen's theme-less `no-theme.min.css`, your own stylesheet), no theme script loads
+  unless you set `themeScriptUrl` too, so neon's settings are not laid over your styling;
+  point it at the theme's script next to your library, such as `.../ext/neon.js` or
+  `.../ext/classic.js` beside `classic-reset.min.css`. An empty `cssUrl` or `themeScriptUrl`
+  loads none, which PayZen describes as optional. When a theme script loads,
+  krypton-client checks that the theme's version is the library's and that the theme's
+  stylesheet and script, found by their file names (`neon.js`, `classic.js`,
+  `material.js`), come from the library's domain, and reports a mismatch to the console and
+  to PayZen. The material theme's script turns the smartForm off (`CLIENT_505`).
+- KR is a single page-global: one PayZen form per page, and a second adapter instance waits
+  for the script another one is still loading.
 - `fieldOptions` passes through to `KR.setFormConfig` (`kr-placeholder-*`,
   `kr-hide-debug-toolbar`, …). Protected keys the host cannot override: `formToken`,
   `kr-public-key`, `kr-spa-mode`, and `language` when a `locale` is given.
 - `appearance` has no JS hook on PayZen: krypton mirrors your page's CSS into its
-  iframes automatically, so style the fields with plain CSS (or swap the `cssUrl`
-  stylesheet).
+  iframes automatically, so style the fields with plain CSS, or swap the theme with the
+  `cssUrl` stylesheet and its `themeScriptUrl` script.
 - The signed browser answer is **not** verified client-side (the validation keys are
   server secrets) — treat the client outcome as UX feedback and confirm server-side via
   the IPN or `retrievePayment`.

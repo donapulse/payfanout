@@ -9,9 +9,10 @@ It implements the `ClientPaymentAdapter` contract from `@payfanout/core` and plu
 `@payfanout/react`, which renders the fields and drives the pay flow. krypton-client is
 **loaded lazily via a `<script>` tag** (non-async, a conservative choice: PayZen's current
 pages do not mention async loading), followed by its theme stylesheet and theme script
-(neon by default), only when this adapter is actually mounted — nothing extra to install
-and no SDK download during SSR. On a nonce-based Content-Security-Policy, pass the nonce as
-`cspNonce` and all three tags carry it.
+(neon by default, beside the default library and stylesheet), only when this adapter is
+actually mounted — nothing extra to install and no SDK download during SSR. On a
+nonce-based Content-Security-Policy, pass the nonce as `cspNonce` and all three tags carry
+it.
 
 📖 **Documentation:** <https://donapulse.github.io/payfanout/>
 · [React usage](https://donapulse.github.io/payfanout/guide/react)

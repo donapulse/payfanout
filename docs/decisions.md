@@ -5024,7 +5024,7 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   for the default neon theme, `neon-reset.min.css` ("Applies the neon theme by forcing the
   styles (!important)"), `neon.css` and `neon.js` ("Active part of the neon theme"). The
   adapter loaded the library and `neon-reset.min.css` only (`injectKrAssets`), so the
-  embedded form rendered without the theme's active part.
+  payment form, embedded or smartForm, rendered without the theme's active part.
 - **What the script is, from the served files** (read 2026-09-30).
   `https://static.payzen.eu/static/js/krypton-client/V4.0/ext/neon.js` (Last-Modified
   2026-09-09) assigns `window.KR_CONFIGURATION`, with the button template and animation, the
@@ -5032,10 +5032,14 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   and loads nothing else (its only URLs are SVG namespaces). The library,
   `.../V4.0/stable/kr-payment-form.min.js` (V4.21.2), reads `window.KR_CONFIGURATION` in the
   configuration setup it runs when a form token is set up (`setupInitialConfig`, which also
-  reads the form token), not when the script loads. Its theme handler then checks that the
-  theme version matches the library's and that the theme's stylesheet and script come from
-  the library's domain, and reports a mismatch as a console warning and to PayZen's error
-  tracking.
+  reads the form token), not when the script loads. When that configuration exists, its
+  theme handler (`checkConflicts`) checks that the theme's name is neon, classic or
+  material, that its version equals the library's, that a stylesheet on the page whose name
+  ends with the theme's (`neon-reset.min.css` and the like) comes from the library's domain,
+  and that a script whose name ends with `neon.js` (or the theme's) is on the page, from that
+  domain; it reports a failure as a console warning and to PayZen's error tracking. It never
+  compares the stylesheet with the script (corrected in review, 2026-09-30: the first
+  version said it reports files that disagree).
 - **Load order: after the library, before the first form.** The themes page's prose says
   the JS theme file "must be loaded before the main JavaScript library", while its own code
   samples, like the display guide the setup guide already cites, load it after the library.
@@ -5049,17 +5053,27 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   resolves it all the same and only leaves the theme's active part out. The stylesheet stays
   unawaited, as before (its Google Fonts imports would hold up the first mount).
 - **Configuration.** `themeScriptUrl` overrides the script, and an empty string loads none,
-  as `cssUrl` does for the stylesheet. Another theme needs both set to matching files from
-  the library's folder (classic: `classic-reset.min.css` and `classic.js`), or krypton-client
-  reports the mismatch. The `loadScript` test seam now receives the theme script URL as a
-  third argument. The script comes from `https://static.payzen.eu`, which `script-src`
-  already allows, so the setup guide's CSP tip gains no host. `@payfanout/adapter-payzen`
-  takes a minor release for the new option.
+  as `cssUrl` does for the stylesheet. The default, `neon.js`, applies only while `scriptUrl`
+  and `cssUrl` keep their defaults, as the three come as a set (changed in review,
+  2026-09-30). A host that set `cssUrl` (its own styling, PayZen's theme-less
+  `no-theme.min.css`, or `""`) would otherwise have had neon's configuration laid over it,
+  with its field icons, button template, `form.wrapper` and smartForm settings, on a minor
+  release; and a host that set `scriptUrl` to another domain would have had a V4.21.2 theme
+  from `static.payzen.eu` checked against its library on every form, failing the domain
+  check. Such a host sets `themeScriptUrl` to the theme's script next to its library.
+  Another theme needs both theme files set (classic: `classic-reset.min.css` and
+  `classic.js`); the material theme's script turns the smartForm off (`CLIENT_505`). The
+  `loadScript` test seam now receives the theme script URL as a third argument; a
+  two-parameter seam still type-checks and loads no theme. The script comes from
+  `https://static.payzen.eu`, which `script-src` already allows, so the setup guide's CSP
+  tip gains no host. `@payfanout/adapter-payzen` takes a minor release for the new option.
 - **Tests.** The loader tests fire the theme script's load and pin its order (after the
   library), its `async = false`, its nonce, the wait in `loadSdk()`, a failure that resolves,
-  the empty-string opt-out, the overrides and the seam's three arguments. Each of eight
-  mutations (not awaited, failure propagated, nonce or `async = false` dropped, no empty-string
-  guard, no theme script, a wrong default, the override ignored) made a test fail.
+  the empty-string opt-out, the overrides, no default beside a host's own library or
+  stylesheet, and the seam's three arguments. Each mutation tried (not awaited, failure
+  propagated, nonce or `async = false` dropped, no empty-string guard, no theme script, a
+  wrong default, the override ignored, the default kept beside a host's files) made a test
+  fail.
 - **Not verified in a sandbox.** How the rendered form differs with and without the theme
   script needs a form token, which only the PayZen API issues; the check is to mount the
   embedded form in the sandbox and compare the pay button and field icons.

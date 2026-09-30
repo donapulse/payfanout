@@ -85,7 +85,8 @@ export interface GoCardlessServerAdapterConfig {
   goCardlessVersion?: string;
   /**
    * Lets a billing request fall back from instant bank payment to collecting
-   * a Direct Debit mandate when the instant rails are unavailable. Off by
+   * a Direct Debit mandate: GoCardless offers the payer that option when they
+   * cannot find their bank or their bank authorisation fails. Off by
    * default: fallback payments confirm on debit timing (days), not seconds.
    * Only `true` is sent; `false` leaves `fallback_enabled` unset, as GoCardless
    * asks when its payment intelligence feature is used ("Should not be set
@@ -96,7 +97,12 @@ export interface GoCardlessServerAdapterConfig {
   fallbackEnabled?: boolean;
   /** Where the hosted flow sends payers who cannot proceed (e.g. unsupported bank). */
   exitUri?: string;
-  /** Scheme enablement varies per account — override the conservative defaults. */
+  /**
+   * The methods a session declares. Override only to narrow the defaults (to
+   * what your account enables): every session is a one-off Pay by Bank
+   * payment, so declaring `sepa_debit` or `bacs_debit` supported would not
+   * make one collect by Direct Debit.
+   */
   paymentMethods?: PaymentMethodCapability[];
   baseUrl?: string;
   /** Injected for tests. */
@@ -245,18 +251,22 @@ interface RefundOutcome {
 }
 
 /**
- * One-off billing request payments (Instant Bank Pay / "Pay by Bank") are
- * GBP/EUR only; the classic debit schemes list what the fulfilled payment can
- * report. Everything is flow "redirect": bank authorisation is only permitted
- * from GoCardless-hosted UIs, so an embedded flow cannot honestly be claimed.
+ * What a session takes. A session is a billing request's payment_request, "a
+ * one-off strongly authorised payment" over Open Banking (Instant Bank Pay,
+ * "Pay by Bank"): `faster_payments` in GBP, SEPA credit transfers in EUR. So
+ * bank_redirect_generic is the one method it takes. SEPA Direct Debit and Bacs
+ * collect against a mandate, which no session can be asked for, so they are
+ * declared unsupported here, even with fallbackEnabled: with it, a payer who
+ * cannot find their bank, or whose bank authorisation fails, may choose to
+ * continue by Direct Debit, and such a payment still reports its scheme (see
+ * mapSchemeToMethodType). Everything is flow "redirect": bank authorisation is
+ * only permitted from GoCardless-hosted UIs, so an embedded flow cannot
+ * honestly be claimed.
  */
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "bank_redirect_generic", flow: "redirect", supported: true },
-  // Bacs is GB-only ("GBP from UK bank accounts" per GoCardless). SEPA is a
-  // zone, not a country — GoCardless states "the Eurozone" — so it carries no
-  // country gate; a stale membership list would screen out valid payments.
-  { type: "sepa_debit", flow: "redirect", supported: true, currencies: ["EUR"] },
-  { type: "bacs_debit", flow: "redirect", supported: true, currencies: ["GBP"], countries: ["GB"] },
+  { type: "sepa_debit", flow: "redirect", supported: false },
+  { type: "bacs_debit", flow: "redirect", supported: false },
   { type: "ach", flow: "redirect", supported: false },
 ];
 
@@ -468,10 +478,13 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
         { missing: "returnUrl" },
       );
     }
-    if (input.paymentMethodTypes?.some((type) => !this.isSupportedMethodType(type))) {
+    // Every session is Pay by Bank, so a list naming any supported type is
+    // served, as core's screening reads a list; one naming none rejects.
+    const requested = input.paymentMethodTypes;
+    if (requested && requested.length > 0 && !requested.some((type) => this.isSupportedMethodType(type))) {
       throw PayFanoutError.invalidRequest(
-        `GoCardless adapter does not support one of the requested payment method types: ${input.paymentMethodTypes.join(", ")}`,
-        { paymentMethodTypes: input.paymentMethodTypes },
+        `GoCardless adapter supports none of the requested payment method types: ${requested.join(", ")}`,
+        { paymentMethodTypes: requested },
       );
     }
 

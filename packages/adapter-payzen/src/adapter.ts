@@ -114,17 +114,18 @@ export interface PayZenClientAdapterConfig {
    * sets the button template, the field icons and the theme's form settings
    * as `window.KR_CONFIGURATION`, which krypton-client reads when a form is
    * set up (a form, a smartForm and their pop-ins). It defaults to `neon.js`
-   * only while `scriptUrl` and `cssUrl` keep their defaults, as the three
-   * come as a set; a host that sets either loads no theme script unless it
-   * sets this too, so its own styling is not overlaid. Injected once the
-   * script has loaded, as PayZen's pages load it, and waited for before
-   * loadSdk() resolves; one that fails to load only leaves the theme's active
-   * part out. An empty string loads none. When a theme script sets one,
-   * krypton-client checks that the theme's version is the library's, that a
-   * stylesheet named after the theme on the page and the script, found by
-   * its file name (`neon.js`, `classic.js`, `material.js`), come from the
-   * library's domain, and reports a mismatch. `material.js` also turns the
-   * smartForm off (CLIENT_505).
+   * only while `scriptUrl` and `cssUrl` are the default files, as the three
+   * come as a set; a host that points either elsewhere loads no theme script
+   * unless it sets this too, so its own styling is not overlaid. A host with
+   * its own library sets `cssUrl` and this together, next to that library.
+   * Injected once the script has loaded, as PayZen's pages load it, and
+   * waited for before loadSdk() resolves; one that fails to load only leaves
+   * the theme's active part out. An empty string loads none. When a theme
+   * script has set `window.KR_CONFIGURATION`, krypton-client checks that the
+   * theme's version is the library's, that a stylesheet named after the
+   * theme on the page and the script, found by its file name (`neon.js`,
+   * `classic.js`, `material.js`), come from the library's domain, and reports
+   * a mismatch. `material.js` also turns the smartForm off (CLIENT_505).
    */
   themeScriptUrl?: string;
   /**
@@ -171,12 +172,15 @@ const KR_CSS_URL = "https://static.payzen.eu/static/js/krypton-client/V4.0/ext/n
 const KR_THEME_SCRIPT_URL = "https://static.payzen.eu/static/js/krypton-client/V4.0/ext/neon.js";
 
 /**
- * neon.js is the default only beside the default library and stylesheet: a
- * host that set either chose its own files, and neon's configuration would be
- * laid over them, or come from another domain than its library.
+ * neon.js is the default only beside the default library and stylesheet,
+ * passed or not: a host that chose other files would have neon's
+ * configuration laid over them, or checked against a library on another
+ * domain.
  */
 function defaultThemeScriptUrl(config: PayZenClientAdapterConfig): string {
-  return config.scriptUrl === undefined && config.cssUrl === undefined ? KR_THEME_SCRIPT_URL : "";
+  const defaultFiles =
+    (config.scriptUrl ?? KR_SCRIPT_URL) === KR_SCRIPT_URL && (config.cssUrl ?? KR_CSS_URL) === KR_CSS_URL;
+  return defaultFiles ? KR_THEME_SCRIPT_URL : "";
 }
 
 /**

@@ -5372,8 +5372,9 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   unawaited, as before (its Google Fonts imports would hold up the first mount).
 - **Configuration.** `themeScriptUrl` overrides the script, and an empty string loads none,
   as `cssUrl` does for the stylesheet. The default, `neon.js`, applies only while `scriptUrl`
-  and `cssUrl` keep their defaults, as the three come as a set (changed in review,
-  2026-09-30). A host that set `cssUrl` (its own styling, PayZen's theme-less
+  and `cssUrl` are the default files, passed or left out, as the three come as a set
+  (changed in review, 2026-09-30; the values are compared, so a host that copies the
+  default "JavaScript URL" from its Back Office still gets the theme). A host that set `cssUrl` (its own styling, PayZen's theme-less
   `no-theme.min.css`, or `""`) would otherwise have had neon's configuration laid over it,
   with its field icons, button template, `form.wrapper` and smartForm settings, on a minor
   release; and a host that set `scriptUrl` to another domain would have had a V4.21.2 theme

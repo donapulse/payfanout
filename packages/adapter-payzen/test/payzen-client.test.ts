@@ -1493,6 +1493,25 @@ describe("PayZenClientAdapter asset injection", () => {
     expect(page.head.map((tag) => tag.tagName)).toEqual(["script"]);
   });
 
+  it("loads the default theme script beside default files passed explicitly, and one named beside no stylesheet", async () => {
+    for (const config of [
+      { scriptUrl: KR_SCRIPT_URL, cssUrl: KR_CSS_URL },
+      { cssUrl: "", themeScriptUrl: KR_THEME_URL },
+    ]) {
+      const page = stubPage();
+      let kr: KrLike | undefined = undefined;
+      const adapter = new PayZenClientAdapter({ publicKey: PUBLIC_KEY, environment: "sandbox", ...config, getKrGlobal: () => kr });
+      const loading = adapter.loadSdk();
+      kr = makeFakeKr();
+      tagOf(page, "script").onload!();
+      await tick();
+      // loadSdk() waits for the theme script in both cases.
+      expect(await hasSettled(loading), JSON.stringify(config)).toBe(false);
+      await loadPageTheme(page);
+      await expect(loading).resolves.toBeUndefined();
+    }
+  });
+
   it("loads no default theme script beside a host's own library or stylesheet", async () => {
     for (const own of [{ scriptUrl: "https://assets.example/kr.js" }, { cssUrl: "https://assets.example/no-theme.min.css" }]) {
       const page = stubPage();

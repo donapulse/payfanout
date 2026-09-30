@@ -133,13 +133,15 @@ const payzen = new PayZenClientAdapter({
   that fails to load only leaves them out. It does not wait for the stylesheet: the
   default theme imports Google Fonts, whose loading would otherwise hold up the first
   mount on each page load.
-- The theme script defaults to `neon.js` only while `scriptUrl` and `cssUrl` keep their
-  defaults, as the three come as a set. If you set either (your Back Office "JavaScript
-  URL", PayZen's theme-less `no-theme.min.css`, your own stylesheet), no theme script loads
-  unless you set `themeScriptUrl` too, so neon's settings are not laid over your styling;
-  point it at the theme's script next to your library, such as `.../ext/neon.js` or
-  `.../ext/classic.js` beside `classic-reset.min.css`. An empty `cssUrl` or `themeScriptUrl`
-  loads none, which PayZen describes as optional. When a theme script loads,
+- The theme script defaults to `neon.js` only while `scriptUrl` and `cssUrl` are the
+  default files, as the three come as a set. If you point either elsewhere (PayZen's
+  theme-less `no-theme.min.css`, your own stylesheet), no theme script loads unless you set
+  `themeScriptUrl` too, so neon's settings are not laid over your styling. If your Back
+  Office "JavaScript URL" puts the library on another domain, set `cssUrl` and
+  `themeScriptUrl` together, to the theme files next to it (`.../ext/neon-reset.min.css`
+  and `.../ext/neon.js`, or the classic pair), since the theme checks below compare both
+  with the library's domain. An empty `cssUrl` or `themeScriptUrl` loads none, which PayZen
+  describes as optional. When a theme script loads,
   krypton-client checks that the theme's version is the library's and that the theme's
   stylesheet and script, found by their file names (`neon.js`, `classic.js`,
   `material.js`), come from the library's domain, and reports a mismatch to the console and
@@ -281,8 +283,8 @@ Worth knowing:
   on `status`, in smartForm mode.
 - A smartForm whose session/shop resolves to **cards only** renders the plain card
   fields directly — `form: "smartform"` is safe before any wallet contract exists.
-- The **material theme is incompatible** with the smartForm (`CLIENT_505`); the
-  default neon reset works.
+- The **material theme is incompatible** with the smartForm (`CLIENT_505`): its script
+  turns the smartForm off. The default neon theme works.
 - `payzenClient.fetchAvailablePaymentMethods()` returns the shop's **live** method
   list (via `KR.getPaymentMethods()`) as `{ types, methods, cardBrands }` — build a
   dynamic method chooser from it instead of hard-coding enablement.

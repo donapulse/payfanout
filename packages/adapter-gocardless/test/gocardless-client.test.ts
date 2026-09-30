@@ -50,10 +50,20 @@ function makeAdapter(): GoCardlessClientAdapter {
 }
 
 runClientAdapterConformanceTests("gocardless", makeAdapter, {
-  expectedMethodTypes: ["bank_redirect_generic", "sepa_debit", "bacs_debit"],
+  expectedMethodTypes: ["bank_redirect_generic"],
 });
 
 describe("GoCardlessClientAdapter", () => {
+  it("declares bank_redirect_generic the one method a session takes, as the server adapter does", () => {
+    const methods = makeAdapter().listPaymentMethodCapabilities();
+    expect(methods.filter((method) => method.supported).map((method) => method.type)).toEqual(["bank_redirect_generic"]);
+    expect(methods.filter((method) => !method.supported).map((method) => method.type)).toEqual([
+      "sepa_debit",
+      "bacs_debit",
+      "ach",
+    ]);
+  });
+
   it("validates its config eagerly", () => {
     expect(() => new GoCardlessClientAdapter({ environment: "prod" as never })).toThrowError(
       /sandbox.*live/,
@@ -180,15 +190,14 @@ describe("GoCardlessClientAdapter", () => {
     expect(() => adapter.unmount({} as never)).toThrowError(/not produced by GoCardlessClientAdapter/);
   });
 
-  it("honors a per-account capability override", () => {
+  it("honors a per-account capability override that narrows the list", () => {
+    // An account taking EUR alone narrows Pay by Bank to that currency.
     const adapter = new GoCardlessClientAdapter({
       environment: "sandbox",
-      paymentMethods: [
-        { type: "bank_redirect_generic", flow: "redirect", supported: true },
-        { type: "ach", flow: "redirect", supported: true },
-      ],
+      paymentMethods: [{ type: "bank_redirect_generic", flow: "redirect", supported: true, currencies: ["EUR"] }],
     });
-    expect(adapter.listPaymentMethodCapabilities()).toHaveLength(2);
-    expect(adapter.listPaymentMethodCapabilities()[1]).toMatchObject({ type: "ach", supported: true });
+    expect(adapter.listPaymentMethodCapabilities()).toEqual([
+      { type: "bank_redirect_generic", flow: "redirect", supported: true, currencies: ["EUR"] },
+    ]);
   });
 });

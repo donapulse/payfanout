@@ -5753,7 +5753,10 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   reading "Unsupported on version [dahlia]: …"), so only v3 gets it, and v3 keeps its URL,
   `https://js.stripe.com/v3`, which pages that include it already carry. A date alone from
   2024-09-30 on is refused (added in review, 2026-09-30): every version since carries a
-  release name, and the changelog lists none without one.
+  release name, and the changelog lists none without one. So is the mirror case, a release
+  name with an earlier date (`2024-06-20.dahlia`), and a date that does not exist
+  (`2019-02-31`, `2023-02-29`), by the Gregorian calendar's month lengths and leap years
+  (added in the second review, 2026-09-30).
 - **What a release build speaks: AMBIGUOUS in the docs, read from the served files.** The
   versioning page: "each versioned Stripe.js automatically uses the API version associated
   with the Stripe.js version. That is, the Stripe.js `acacia` version uses a compatible API
@@ -5829,8 +5832,31 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   such a tag (`script.addEventListener('load', …)` and `'error'`, with no bound), and before
   loading again after an error removes it and injects a new one. The adapter waits for the
   page tag's `load` or `error` for up to 30 seconds, the bound the REST adapters give a
-  request by default, then confirms the global. A tag that fails ran nothing and is removed,
-  so the next call injects the file again; one that neither loads nor fails in time is kept.
+  request by default, then confirms the global. Precisely (changed in the second review,
+  2026-09-30, after the first version could wait 30 seconds on a tag that would never fire
+  again, and fail while another script had defined a usable Stripe.js):
+  - The call resolves when the tag loads (the global is then confirmed), and as soon as
+    Stripe.js is there, which it checks every 100 ms, since another script, such as the
+    page's own v3 tag, may define it meanwhile.
+  - When the tag fails, it ran nothing and is removed; when 30 seconds pass, it is kept. In
+    both cases the call resolves if Stripe.js is there by then, and otherwise rejects with a
+    retryable `psp_unavailable`.
+  - Each adapter records the tags for the build's URL it saw settle while Stripe.js stayed
+    missing: its own after it loaded, and a page's after the wait ended. The next call
+    removes such a tag, only while Stripe.js is still missing, so that core's
+    `injectScript` injects a fresh one and reports its load or failure instead of the
+    adapter waiting on a tag that fires nothing more.
+  - A page tag that failed before the adapter looked leaves no trace on the element, so the
+    first call waits the full 30 seconds; the next one replaces it. Resource Timing could
+    tell a finished fetch sooner: the Fetch standard marks resource timing for a network
+    error too ("This covers the case of response being a network error",
+    fetch.spec.whatwg.org, fetch response handover), but which engines report failed
+    script loads, and how long after its entry a fetched script runs, could not be verified
+    here, and a wrong reading would remove a tag still loading, so the adapter does not rely
+    on it (decided in implementation).
+  - Two adapters on one page: the second one, finding the first one's tag still loading,
+    waits with core's `injectScript` and, once that tag has loaded Stripe.js, does not wait
+    again.
 - **The adapter's calls exist in every build.** The dahlia changelog
   (docs.stripe.com/changelog/dahlia/2026-03-25/remove-legacy-stripejs-methods) removes
   `handleCardPayment`, `confirmPaymentIntent`, `handleFpxPayment`, `handleCardSetup`,
@@ -5853,7 +5879,11 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
     (changelog/clover/2025-09-30/postal_code_in_card_form_for_non_us_countries), and
     "Elements validates the Intent state and returns an error to your integration instead of
     rendering a non-functional payment form" (changelog/clover/2025-09-30/client-secret-reuse),
-    which reaches the host's `onError` through the Payment Element's `loaderror`.
+    which reaches the host's `onError` through the Payment Element's `loaderror`. That check
+    follows the API version, not the build ("This validation only applies when using API
+    version `2025-09-30.clover` or later"), so a page's v3 given a clover or later version
+    makes it too; the guide and the changeset say so (added in the second review,
+    2026-09-30).
   - dahlia: "Attempting to set `options.layout.radios` to a value not on its enum list now
     throws an integration error." (changelog/dahlia/2026-03-25/disallow-booleans-for-radios),
     so a boolean in `fieldOptions.layout.radios` makes `mount()` reject.
@@ -5866,10 +5896,16 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   lists the `Stripe()` option `developerTools.assistant.enabled`: "Set to `false` to disable
   the sandbox assistant UI."; the testing assistant page: "To hide the testing assistant, set
   the `developerTools.assistant.enabled` option to `false` when you set up Elements." The
-  served files validate `developerTools` as `{ assistant: { enabled } }`, `enabled`
-  defaulting to true. `hideTestingAssistant: true` passes `developerTools: { assistant: {
-  enabled: false } }` on every build; unset or `false` passes nothing and leaves Stripe's
-  default, since only `false` has a documented effect.
+  served files (read 2026-09-30; corrected in the second review, as the first version said
+  `enabled` defaults to true) validate `developerTools` as `{ assistant: { enabled } }` with
+  the default `{assistant:{enabled:void 0}}`, and decide when Elements is created: the
+  host's `enabled` if it gave one, otherwise enabled for Elements with Checkout Sessions
+  (`"custom_checkout"===t?_o`, `_o` being `{assistant:{enabled:!0}}`), and otherwise the
+  build's `isEaselDefaultOn`, false in v3, acacia and basil and true from clover on (the
+  clover entry of the builds' table sets `isEaselDefaultOn:!0`). `hideTestingAssistant:
+  true` passes `developerTools: { assistant: { enabled: false } }` on every build; unset or
+  `false` passes nothing and leaves Stripe's default, since only `false` has a documented
+  effect.
 - **CSP re-verified.** docs.stripe.com/security/guide lists for Stripe.js "`connect-src`,
   `https://api.stripe.com`, `https://maps.googleapis.com`", "`frame-src`,
   `https://*.js.stripe.com`, `https://js.stripe.com`, `https://hooks.stripe.com`" and
@@ -5888,8 +5924,11 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   speak versions older than 2026-08-26.dahlia, which added `authentication_failure`,
   `expired_payment_method`, `incorrect_postal_code` and `payment_method_restricted`
   (docs.stripe.com/changelog/dahlia/2026-08-26/adds-payment-method-error-codes: "This change
-  does not remove any error codes"), and a v3 page speaks the pinned dated version, so the
-  browser meets the older codes today; both forms are mapped. The browser tests now also pin
+  does not remove any error codes"), so on a build the adapter loads the browser meets the
+  older codes today, while v3 speaks whatever version it is given: a dated one where the
+  adapter loads v3, and on a page that runs its own v3 the pinned version, a release's
+  included, so a page's v3 given `2026-08-26.dahlia` meets the new codes (corrected in the
+  second review, 2026-09-30). Both forms are mapped. The browser tests now also pin
   `payment_method_restricted` (a decline, or `fraud_suspected` with `lost_card`) and
   `expired_card` as an error code, as the server's do. Not changed, as it does not depend on
   the version: the halves read error *types* differently (the server maps rate limits,
@@ -5914,10 +5953,17 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   another release's build used as it is with one warning in a sandbox and none in live mode,
   a v2 global beside which the build loads and its `StripeV3` is used, a `version` naming no
   build used as the pinned build, and a build another script defined while the adapter's
-  loaded. `test/stripe-client-page.test.ts` runs in jsdom: a real `window.Stripe` of the
-  pinned build or of v3, a v2 global, and a page's own tag waited for until it loads, failing
-  and removed so the retry injects the file again, given up on after 30 seconds and kept, no
-  timer left once it loads, and no wait on the adapter's own tag.
+  loaded. The second review added the dates that do not exist (February 29 outside leap
+  years, a 31st in a 30-day month, next to the leap days and last days that do) and release
+  names dated before 2024-09-30. `test/stripe-client-page.test.ts` runs in jsdom: a real
+  `window.Stripe` of the pinned build or of v3, a v2 global, and a page's own tag waited for
+  until it loads, failing and removed so the retry injects the file again, given up on after
+  30 seconds and kept, no timer left once it loads, and no wait on the adapter's own tag;
+  since the second review also another script's Stripe.js ending the wait early, or making
+  the tag's failure or the end of the wait resolve the call, a page tag that failed before
+  the adapter looked replaced by the next call after the first one timed out, the adapter's
+  own tag that loaded without Stripe.js replaced at once, twice, and a second adapter that
+  found the first one's tag loading not waiting once it has loaded Stripe.js.
   `test/stripe-client-csp.test.ts` pins the nonce on both URLs. The first version's 33
   mutations each made a test fail (every release loading v3, a release URL without
   `/stripe.js`, v3 with a trailing slash, the dated version not passed to `Stripe()` or a
@@ -5935,7 +5981,14 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   not recognised, the release pattern unanchored, a v2 global used as it is or detected on
   another number, a page tag not waited for, the adapter's own tag waited for, a page tag's
   error ignored, a failed page tag kept, the wait bound shortened, its timer left running
-  after a load, and a load read as a failure.
+  after a load, and a load read as a failure. The second review's 20 did too: the calendar
+  check removed, the century or 400-year leap rule dropped, February always or never given
+  29 days, April or every 30-day month given 31, the month read one off, a month's last day
+  refused, a release name before 2024-09-30 accepted or the boundary moved, the version not
+  cut to its date, the poll for another script's Stripe.js removed, slowed to a second or
+  left running, a failed or ended wait resolving nothing, settled tags not recorded or not
+  removed, a removed tag still waited on, and the second adapter waiting on a tag that
+  loaded Stripe.js.
 - **Sandbox checks, not run.** In a sandbox page on the dahlia build, the `Stripe-Version` of
   Stripe.js's requests (the browser's network panel) shows which version the build speaks. A
   confirmation with the expired-card test card under v3 with `2024-06-20` and under dahlia

@@ -270,18 +270,19 @@ browser follows your pin rather than the account's default version:
   can still reach the server and not the browser; where one added a general code beside an
   older one (`2026-08-26.dahlia`'s `authentication_failure` beside
   `payment_intent_authentication_failure`), both halves map the two codes the same way.
-- **v3 serves dates alone.** It is the one build that takes an `apiVersion` option, and
-  Stripe no longer recommends it, though it still supports it. The versioned builds need your
-  server on a release version, an API upgrade like any other: read
-  [Stripe's changelog](https://docs.stripe.com/changelog) for the gap first.
+- **The adapter loads v3 only for dates alone.** It is the one build that takes an
+  `apiVersion` option, and Stripe no longer recommends it, though it still supports it. The
+  versioned builds need your server on a release version, an API upgrade like any other:
+  read [Stripe's changelog](https://docs.stripe.com/changelog) for the gap first.
 - **What to pass.** The server adapter's `apiVersion`. While the server is on a release this
   version of the adapter does not know yet, one Stripe published after it, pass a version of
   the newest release it knows: Stripe calls upgrading the server and Stripe.js at different
   times safe, which covers such a lag. The constructor refuses with `invalid_request`, and
-  says what to pass instead: a missing or malformed `apiVersion`; a date alone from
-  `2024-09-30` on, as every version since carries a release name; a release it knows no build
-  for; a preview version (`2026-08-26.preview`), which no Stripe.js build speaks; and beta
-  headers (`2026-08-26.dahlia; name=v1`), which Stripe.js no longer takes in an API version.
+  says what to pass instead: a missing or malformed `apiVersion`, or one whose date does not
+  exist; a date alone from `2024-09-30` on, as every version since carries a release name,
+  and a release name with an earlier date; a release it knows no build for; a preview
+  version (`2026-08-26.preview`), which no Stripe.js build speaks; and beta headers
+  (`2026-08-26.dahlia; name=v1`), which Stripe.js no longer takes in an API version.
 - **A Stripe.js the page already runs is used, never refused.** A page runs one Stripe.js
   build, since a second copy leaves `window.Stripe` to the first, and Stripe suggests
   including Stripe.js on every page for its fraud signals. So `loadSdk()`, `mount()` and
@@ -297,11 +298,18 @@ browser follows your pin rather than the account's default version:
   - **A global whose `version` names no build** is used as if it were the build your
     `apiVersion` names.
 
-  If a `<script>` your page added for the build the adapter loads has not loaded yet, the
-  adapter waits for it, for up to 30 seconds, and if it fails, removes it so that the next
-  attempt fetches the file again. For the browser to speak your pin, load that build or no
-  Stripe.js at all, and give every `StripeClientAdapter` on a page the same release, or
-  dates alone.
+  If your page added a `<script>` for the build the adapter loads and Stripe.js is not there
+  yet, the adapter waits for that tag, for up to 30 seconds: the call resolves when the tag
+  loads, or as soon as another script defines Stripe.js, and otherwise rejects with a
+  retryable `psp_unavailable` when the tag fails, which removes it, or when the 30 seconds
+  run out. A tag that failed before the adapter looked gives no sign of it, so that first
+  attempt waits the full 30 seconds. The next attempt fetches the file again, replacing a
+  tag already seen settled without Stripe.js, the adapter's own after it loaded or a page's
+  after its wait.
+
+  For the browser to follow your pin, have the page load that build, or v3, which the
+  adapter gives your version, or no Stripe.js at all, and give every `StripeClientAdapter`
+  on a page the same release, or dates alone.
 - **`@stripe/stripe-js`.** Each major of Stripe's npm loader loads one build: v6 acacia,
   v7 basil, v8 clover, v9 dahlia, and the majors before v6 load v3. On a page that also uses
   it, take the major whose build your `apiVersion` names.
@@ -317,7 +325,9 @@ browser follows your pin rather than the account's default version:
     Canada, the United Kingdom and Puerto Rico. Elements refuses the client secret of an
     intent that is already `succeeded`, `canceled`, `processing` or `requires_capture` (and
     of some in `requires_action`), which reaches your `onError` through the Payment
-    Element's `loaderror`. In a sandbox, Stripe's
+    Element's `loaderror`; that check follows the API version, as Stripe applies it "when
+    using API version `2025-09-30.clover` or later", so a page's v3 given a clover or later
+    version gets it too. In a sandbox, Stripe's
     [testing assistant](https://docs.stripe.com/sdks/stripejs-testing-assistant) shows at the
     bottom right of the page; `hideTestingAssistant: true` hides it, and live mode never
     shows it.

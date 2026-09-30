@@ -195,6 +195,12 @@ export interface InjectScriptOptions {
  * attribute name rejects with a non-retryable invalid_request attributed to
  * `pspName` whatever the page holds, and nothing is injected.
  *
+ * A page that enforces Trusted Types (`require-trusted-types-for 'script'`)
+ * must accept `url` in its default policy: without one the browser refuses
+ * the string URL, and the call rejects with a non-retryable invalid_request
+ * attributed to `pspName`, carrying the browser's `TypeError` on `raw`, and
+ * injects nothing.
+ *
  * This is not a trust boundary: every shipped client adapter's `loadSdk()`
  * returns before calling `injectScript` once the SDK global exists, so a copy
  * the host page already loaded is used without any check.
@@ -278,7 +284,17 @@ export function injectScript(url: string, pspName: string, options: InjectScript
       else resolve();
       return;
     }
-    script.src = url;
+    try {
+      script.src = url;
+    } catch (err) {
+      // A page enforcing Trusted Types refuses a plain string here unless its
+      // default policy accepts it.
+      refuse(
+        `The page refused ${url} as a script URL, as an enforced Trusted Types policy does unless a default policy accepts it; nothing was injected`,
+        err,
+      );
+      return;
+    }
     // A failed tag must not satisfy the next lookup, or the file would never be
     // fetched again.
     watchLoad(script, settle, true);

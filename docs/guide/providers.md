@@ -72,6 +72,12 @@ scripts. Each guide says which inline styles its SDK adds. Before a page that mo
 several PSPs gives a directive a nonce, check every PSP it can mount, and if one of them
 needs `'unsafe-inline'` there, keep `'unsafe-inline'` with no nonce or hash beside it.
 
+A page that enforces Trusted Types (`require-trusted-types-for 'script'`) also needs a
+default policy that accepts each SDK URL a client adapter loads, and the scripts that SDK
+loads itself: the adapters insert their SDK's `<script>` with a plain URL, which the browser
+refuses without one, and `loadSdk()` then rejects with a non-retryable `invalid_request`.
+Each set-up guide lists the hosts its SDK loads from.
+
 ## Installing a PSP we don't ship yet
 
 Another PSP is **a new adapter package, not a fork**. You implement the

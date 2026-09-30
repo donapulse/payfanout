@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { formatMinorUnits, fromMinorUnits, getCurrencyExponent, toMinorUnits } from "@payfanout/core";
+import {
+  formatMinorUnits,
+  fromMinorUnits,
+  getCurrencyExponent,
+  listNonDefaultCurrencyExponents,
+  toMinorUnits,
+} from "@payfanout/core";
 
 /**
  * ISO 4217 list one (SIX, published 2026-09-17): every active code with its
@@ -65,5 +71,25 @@ describe("currency exponents against ISO 4217 list one", () => {
     for (const code of ["XAG", "XAU", "XBA", "XBB", "XBC", "XBD", "XDR", "XPD", "XPT", "XSU", "XTS", "XUA", "XXX"]) {
       expect(getCurrencyExponent(code), code).toBe(2);
     }
+  });
+
+  it("lists exactly the codes list one gives other minor units than 2, in code order", () => {
+    const expected = ISO_4217_MINOR_UNITS.filter(([units]) => units !== 2)
+      .flatMap(([units, codes]) => codes.map((code): [string, number] => [code, units]))
+      .sort(([a], [b]) => (a < b ? -1 : 1));
+    const listed = listNonDefaultCurrencyExponents();
+    expect(listed).toEqual(expected);
+    for (const [code, exponent] of listed) expect(getCurrencyExponent(code), code).toBe(exponent);
+  });
+
+  it("hands out a list whose changes reach nothing else", () => {
+    const listed = listNonDefaultCurrencyExponents();
+    const [code, exponent] = listed[0]!;
+    listed[0]![1] = 7;
+    listed.push(["USD", 0]);
+    expect(getCurrencyExponent(code)).toBe(exponent);
+    expect(listNonDefaultCurrencyExponents()[0]).toEqual([code, exponent]);
+    expect(getCurrencyExponent("USD")).toBe(2);
+    expect(listNonDefaultCurrencyExponents()).not.toContainEqual(["USD", 0]);
   });
 });

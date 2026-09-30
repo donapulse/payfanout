@@ -5,6 +5,7 @@ export {
   formatMinorUnits,
   fromMinorUnits,
   getCurrencyExponent,
+  listNonDefaultCurrencyExponents,
   normalizeCurrency,
   toMinorUnits,
 } from "./currency.js";

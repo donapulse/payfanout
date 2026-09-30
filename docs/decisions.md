@@ -5718,5 +5718,14 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   no issue, so the new rules reach every adapter's run through core; an assertion of the suite's
   own would change the adapter contract. The client adapters have nothing to mirror:
   `ClientPaymentAdapter` exposes per-method capabilities only, never a PSP-wide currency list.
-- **Release.** `@payfanout/core` takes a minor: an optional field, and a screen and validation
-  rules that only read it. `@payfanout/server`'s code does not change; it screens through core.
+- **`listNonDefaultCurrencyExponents()`.** A declaration derived from an adapter's own refusal
+  rule, rather than typed out beside it, needs every code the rule could refuse. Paysafe's rule
+  reads core's exponents, and core kept the codes it does not read as 2 to itself, so the only
+  complete list was every three-letter code put to the rule: 17,576 calls, measured at 10 to
+  20 ms of CPU on first use under Node 24, too much for an adapter that runs on edge runtimes.
+  Core now lists those codes with their exponents, in code order, as a fresh array on each call;
+  any code outside the list reads as 2, so the codes an adapter's table and core's could
+  disagree on are that table's and this list's.
+- **Core release.** `@payfanout/core` takes a minor: an optional field, a screen and validation
+  rules that only read it, and `listNonDefaultCurrencyExponents()`. `@payfanout/server`'s code
+  does not change; it screens through core.

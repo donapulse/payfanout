@@ -71,6 +71,17 @@ Pair it on the browser with [`@payfanout/adapter-stripe`](../adapter-stripe). Th
   PaymentMethod on every path** to honor the no-storage constraint; set
   `verifyPaymentMethodStrategy: "disabled"` to turn the capability off instead.
 - Webhook signing secrets accept an **array** so you can rotate without cutover.
+- Amounts are converted where Stripe's units differ from PayFanout's minor units: ISK is
+  sent multiplied by 100 (Stripe represents it as a two-decimal value whose decimals are
+  always `00`) and MGA divided by 100 (a zero-decimal currency at Stripe, so amounts that
+  are not whole ariary are refused), and both convert back on every read. UGX, which
+  Stripe's currencies page documents with both units, is refused: calls that would send a
+  UGX amount reject with `invalid_request` before the request carrying it, reads of a UGX
+  record reject with `unsupported_operation`, list pages holding one fail whole, and UGX
+  events carry no `amount`. `capturePayment` and `refundPayment` with an amount, and
+  `updatePaymentSession` with only one of `amount` and `currency`, read the PaymentIntent
+  first. See [currencies with Stripe-specific
+  units](https://donapulse.github.io/payfanout/guide/stripe#currencies-with-stripe-specific-units).
 
 ## Documentation
 

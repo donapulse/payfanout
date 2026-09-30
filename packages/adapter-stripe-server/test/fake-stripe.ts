@@ -375,6 +375,7 @@ export class FakeStripe implements StripeClientLike {
       const refund: StripeRefundLike = {
         id: `re_${++this.seq}`,
         amount,
+        currency: pi.currency,
         status: "succeeded",
         payment_intent: pi.id,
         created: 1_780_000_200,
@@ -662,6 +663,7 @@ export class FakeStripe implements StripeClientLike {
     const stored: StripeRefundLike = {
       id: refund.id ?? `re_${++this.seq}`,
       amount: refund.amount ?? 1000,
+      ...(refund.currency !== undefined ? { currency: refund.currency } : {}),
       status: refund.status,
       payment_intent: refund.payment_intent ?? null,
       created: refund.created ?? 1_780_000_200,

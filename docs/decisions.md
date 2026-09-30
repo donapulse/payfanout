@@ -5015,3 +5015,117 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   regional units of account, the testing code and "no currency") still read as 2, as any code
   outside core's table does, and a test pins that. None is a currency a payment is taken in,
   and refusing them in core would be a separate, breaking decision.
+
+## Stripe: currencies whose API units differ from PayFanout's (2026-09-30)
+
+- **Stripe reads `amount` in its own units for three currencies.** Doc-verified 2026-09-30
+  against docs.stripe.com/currencies, fetched in English (`Accept-Language: en-US`; without
+  it the page answers in French). The `.md` variant carries the prose; the zero-decimal list
+  is rendered only in the HTML page. "Currencies are two-decimal currencies unless otherwise
+  specified. All API requests expect `amount` values in the currency's minor unit". The
+  zero-decimal list reads BIF, CLP, DJF, GNF, JPY, KMF, KRW, MGA, PYG, RWF, UGX, VND, VUV,
+  XAF, XOF and XPF, for which "the charge and the amount are the same, without requiring
+  multiplication". The "Special cases" table gives "Icelandic Króna (ISK) | ISK transitioned
+  to a zero-decimal currency, but backward compatibility requires you to represent it as a
+  two-decimal value, where the decimal amount is always `00`. For example, to charge 5 ISK,
+  provide an `amount` value of `500`. You can't charge fractions of ISK." Its HUF and TWD
+  rows concern payouts only ("even though you can charge two-decimal amounts"), so their
+  charges stay two-decimal, as core has them. The API reference gives every amount the
+  adapter sends or reads in "the smallest currency unit" and links that page: PaymentIntent
+  `amount` (create, update and object), `amount_to_capture` on capture, Refund `amount`
+  (create and object), Charge `amount_refunded`, and `unit_amount` on Price and on
+  `items[].price_data`; the PaymentIntent, Charge, Refund, Subscription and Price objects
+  each carry `currency`.
+- **Compared with core, currency by currency.** The HTML page embeds its per-country
+  presentment lists as JSON: 45 countries, 139 distinct currencies. Each was given Stripe's
+  decimals by the page's own rules (the zero-decimal list, ISK's special case, two
+  otherwise) and compared with core's `getCurrencyExponent`. ISK (two decimals at Stripe,
+  always 0; core and ISO 4217 give 0) and MGA (none at Stripe; core and ISO 4217 give 2)
+  disagree. UGX is on the zero-decimal list, where core agrees with it, and in the special
+  cases, where it does not (below). The rule of two decimals "unless otherwise specified"
+  would also put BHD, JOD, KWD, OMR and TND at two (below). Every zero-decimal code is in
+  the presentment lists.
+- **What the adapter did until now.** It sent PayFanout's amounts unchanged, so ISK 1,000
+  (`amount: 1000`) was charged as ISK 10, and MGA 10.00 (`amount: 1000`) as MGA 1,000.
+- **ISK and MGA convert both ways**, in `src/currency-units.ts`, which holds Stripe's
+  decimals for the two and reads PayFanout's from core at call time. ISK is sent multiplied
+  by 100, an amount whose product leaves the safe integer range refused with
+  `invalid_request`, and read divided by 100. A Stripe ISK amount that is not a multiple of
+  100 cannot be reported: reads fail with `unsupported_operation`, the record on
+  `raw.record`, and events omit `amount`. MGA is sent divided by 100, an amount that is not a
+  multiple of 100 (Stripe charges whole ariary) refused with `invalid_request` before any
+  request, and read multiplied by 100. The conversion covers every amount sent (PaymentIntent
+  `amount` on session creation, update and saved-method charges, `amount_to_capture`, refund
+  `amount`, `price_data.unit_amount`) and every amount reported (`PaymentSession.amount`;
+  `PaymentInfo.amount`, `amountRefunded`, `amountCaptured` and `amountCapturable`; the
+  subscription installment, Σ `unit_amount` × `quantity` converted as a total; refund
+  amounts; webhook and polled event amounts).
+- **UGX: AMBIGUOUS, refused.** The special cases give UGX the ISK text ("UGX transitioned to
+  a zero-decimal currency, but backwards compatibility requires you to represent it as a
+  two-decimal value, where the decimal amount is always `00`. For example, to charge 5 UGX,
+  provide an `amount` value of `500`. You can't charge fractions of UGX. For invoices where
+  the `amount` is fractional after prorations, coupons, or taxes, Stripe automatically rounds
+  that amount to the nearest number evenly divisible by 100."), while the zero-decimal list
+  names UGX too. Either reading charges a hundredth or a hundred times the price if it is
+  the wrong one, so the adapter sends and reports no UGX amount. Sends reject with
+  `invalid_request` before the request that would carry the amount; reads of a UGX record
+  reject with `unsupported_operation`; list pages holding one fail whole, `raw` naming each
+  record and carrying the page's `nextCursor`; events keep `currency` and omit `amount`. A
+  zero-amount session is a SetupIntent, which carries neither an amount nor a currency, and
+  is left alone (decided in implementation).
+- **Three-decimal currencies: AMBIGUOUS, guard kept.** The page no longer has the section on
+  three-decimal currencies the multiple-of-10 guard was built on (already missing on
+  2026-07-17, see "PSP-native subscriptions across the contract (2026-07-17)"). BHD, JOD,
+  KWD, OMR and TND appear only in the AE presentment list, and the page's meta description
+  still advertises "zero-decimal and three-decimal currency support". Read literally, the
+  page's "two-decimal currencies unless otherwise specified" would make them two-decimal at
+  Stripe, which nothing else on the page supports. They keep core's three decimals and the
+  guard, whose rule is unchanged; it now lives with the conversions, replacing four copies
+  in the adapter.
+- **Calls that name no currency read the PaymentIntent first.** A capture or refund that
+  states an amount, and an update carrying `amount` without `currency`, read the
+  PaymentIntent to learn the currency the amount is sent in: one more request, only when an
+  amount is given. The three-decimal guard, skipped until now for such updates and never
+  applied to captures or refunds, covers them too. An update carrying `currency` without
+  `amount` reads it as well (decided in implementation): Stripe keeps its own integer across
+  a currency change, so a session of `amount: 1000` moved from ISK (Stripe's `100000`) to
+  USD would otherwise ask for USD 1,000.00. The adapter reads the current amount in the old
+  currency's units and re-sends it in the new currency's whenever Stripe's figure changes,
+  so "fields omitted are left unchanged" holds in PayFanout's minor units. A kept amount the
+  new currency cannot take is refused before the update, and so is a currency change of a
+  UGX session, whose amount cannot be read, with `invalid_request` asking for the amount with
+  the currency.
+- **Calls that send no amount are not read first** (decided in implementation, keeping the
+  extra request to calls that send an amount). A capture, cancellation or refund without an
+  amount, an update of other fields and a subscription cancellation go through at Stripe
+  even for a UGX record; the answer is refused with `unsupported_operation` marked
+  `outcomeUnknown`, since the call took effect, and a retry under the same key gets the same
+  record and the same refusal. Reading first on every such call would refuse them before any
+  request instead, at the cost of one more request on every capture, cancellation and
+  refund in every currency.
+- **Records made by earlier releases.** They were sent ISK and MGA amounts unchanged, and
+  reads now report what Stripe holds (an ISK 1,000 payment from then reads as ISK 10). The
+  changeset and the setup guide send hosts to the Stripe Dashboard to reconcile those
+  payments and the Billing subscriptions created in them, which keep billing the price they
+  were created with.
+- **The browser adapter is unchanged.** It mounts the Payment Element from the session's
+  `clientSecret` and confirms with `elements`, `redirect` and `return_url` alone: no amount
+  or currency passes through it.
+- **Tests.** `test/stripe-currencies.test.ts` pins the exact wire amount on every send path
+  and the reported amount on every read path for ISK, MGA, USD, JPY and KWD; each MGA, UGX,
+  ISK and three-decimal refusal with the exact sequence of requests made (a log of every call
+  reaching the test double); the list-page failures with their `raw`; and event amounts. Each
+  mutation tried (ISK multiplied by 10, MGA or one send path left unconverted, UGX treated as
+  zero-decimal, the whole-ariary, overflow and multiple-of-100 checks dropped, a page check
+  made a no-op, `outcomeUnknown` dropped from answers) made a test fail. The conformance
+  suite passes unchanged.
+- **Sandbox checks, not run.** No Stripe sandbox run backs these facts; each check needs an
+  account whose presentment currencies include the currency.
+  - **UGX.** Charge `amount: 500` in UGX and read the payment in the Stripe Dashboard: UGX 5
+    means the special case holds and UGX can convert as ISK does; UGX 500 means the
+    zero-decimal list holds and UGX can pass unchanged. Either lifts the refusal.
+  - **ISK and MGA.** Charge ISK 1,000 and MGA 10.00 through the adapter (`amount: 1000` in
+    both) and confirm the Dashboard shows ISK 1,000 and MGA 10.
+  - **Three-decimal.** From an account whose presentment list has KWD (only the AE list
+    does), send `amount: 1235` in KWD straight to the PaymentIntents API, as the adapter
+    refuses it locally, and record whether Stripe refuses it too.

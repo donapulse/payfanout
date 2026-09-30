@@ -99,6 +99,11 @@ export interface StripeSetupIntentLike {
 export interface StripeRefundLike {
   id: string;
   amount: number;
+  /**
+   * Lowercase ISO 4217; Stripe's Refund object always carries it. The adapter
+   * reads `amount` in its units (ISK, MGA and UGX differ from PayFanout's).
+   */
+  currency?: string;
   status: "succeeded" | "pending" | "failed" | "canceled" | "requires_action" | null;
   payment_intent?: string | { id: string } | null;
   created?: number;

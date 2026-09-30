@@ -98,6 +98,84 @@ Zero-amount verification sessions are SetupIntents, which carry no currency —
 they are never narrowed. An overridden `config.paymentMethods` list carries its
 own gates: a rail declared without `currencies` is forwarded unnarrowed.
 
+### Currencies with Stripe-specific units
+
+PayFanout amounts are in the minor units `getCurrencyExponent` from `@payfanout/core` gives
+each currency, which follow ISO 4217 (JPY 0, BHD 3). Stripe's
+[currencies page](https://docs.stripe.com/currencies) also asks for `amount` "in the
+currency's minor unit", but departs from ISO 4217 for two currencies it accepts, and the
+adapter converts both, on every call that sends an amount and on every amount it reports:
+
+| Currency | PayFanout's decimals | Stripe's `amount` | Sent to Stripe | Reported back |
+| --- | --- | --- | --- | --- |
+| ISK | 0 | two decimals, always `00` | × 100: ISK 1,000 (`amount: 1000`) goes out as `100000` | ÷ 100 |
+| MGA | 2 | no decimals, whole ariary | ÷ 100: MGA 10.00 (`amount: 1000`) goes out as `10` | × 100 |
+
+- An MGA amount that is not whole ariary (a multiple of 100 in PayFanout's units) cannot be
+  charged at Stripe, and is refused with a non-retryable `invalid_request` before any
+  request.
+- An ISK amount Stripe reports that is not a multiple of 100 has no value in whole krónur:
+  the read meeting one rejects with `unsupported_operation`, with the record on
+  `raw.record`, and a webhook event carrying one has no `amount`.
+- Three-decimal amounts (BHD, JOD, KWD, OMR, TND) must still be multiples of 10, a rule from
+  an earlier version of Stripe's currencies page that the adapter keeps.
+- Every other currency is sent and reported unchanged.
+
+**UGX is refused.** Stripe's page lists UGX among its zero-decimal currencies and, in its
+special cases, asks for UGX amounts as two-decimal values ending in `00` ("to charge 5 UGX,
+provide an `amount` value of `500`"). Which unit Stripe reads a UGX amount in is therefore
+unknown, and the wrong guess charges a hundred times too much or too little, so the adapter
+neither sends nor reports UGX amounts:
+
+- `createPaymentSession`, `updatePaymentSession`, `chargeSavedPaymentMethod` and
+  `createNativeSubscription` in UGX reject with a non-retryable `invalid_request` before any
+  request. `updatePaymentSession`, `capturePayment` and `refundPayment` that send an amount
+  for a UGX payment reject the same way once they have read the payment (below).
+- `retrievePayment`, `retrieveRefund` and `retrieveNativeSubscription` of a UGX record
+  reject with `unsupported_operation`: read it in the Stripe Dashboard.
+- A capture, cancellation or refund without an amount, an update that changes neither
+  amount nor currency, and a subscription cancellation go through at Stripe even for a UGX
+  record, but their answer cannot be reported: they reject with `unsupported_operation`
+  marked `outcomeUnknown`. Check the record in the Stripe Dashboard before acting on it.
+- `listPayments`, `listRefunds` and `listNativeSubscriptions` fail a page holding a UGX
+  record, or an ISK amount that is not a multiple of 100, with `unsupported_operation`.
+  `raw.records` names each such record, and `raw.nextCursor` carries the cursor the page
+  would have had, so later pages stay reachable; a `limit` of 1 steps past each one.
+- Webhook and `fetchEvents` events in UGX carry no `amount`; `currency` and every other
+  field stay.
+- A zero-amount session is a SetupIntent, which carries neither an amount nor a currency, so
+  it works in every currency, UGX included.
+
+The adapter declares no `supportedCurrencies`, so the router cannot skip Stripe for UGX on
+its own, and a Stripe candidate that refuses it ends the cascade. Route UGX to another
+provider with a rule of its own, placed before any rule that can send it to Stripe, since
+the first matching rule wins: `{ when: { currency: ["UGX"] }, use: ["<psp>"] }`
+([routing and failover](/guide/server#routing-failover)).
+
+**Some calls read the payment first.** Stripe's units depend on the currency, so
+`capturePayment` and `refundPayment` that state an amount, and `updatePaymentSession` that
+carries `amount` without `currency` or `currency` without `amount`, first read the
+PaymentIntent (`GET /v1/payment_intents/:id`): one more request on each such call. A
+currency change without an amount keeps the session's amount in PayFanout's minor units: a
+session of `amount: 1000` moved from ISK to USD asks for USD 10.00, not the USD 1,000.00
+Stripe's own `100000` would mean. Those calls now also apply the three-decimal rule.
+
+::: warning Upgrading from a release that sent these amounts unchanged
+Earlier releases sent ISK and MGA amounts to Stripe as they were: ISK 1,000
+(`amount: 1000`) was charged as ISK 10, and MGA 10.00 (`amount: 1000`) as MGA 1,000. Reads
+now report what Stripe holds, so such a payment reads back as ISK 10 (`amount: 10`) or
+MGA 1,000.00 (`amount: 100000`). Reconcile ISK and MGA payments made before the upgrade in
+the Stripe Dashboard, and check the Stripe Billing subscriptions created in them, which keep
+billing the price they were created with. A session created before the upgrade still charges
+the amount it was created with when the customer confirms it: cancel open ISK and MGA
+sessions, or re-send their amount with `updatePaymentSession`, right after upgrading.
+`SubscriptionManager` renewals on Stripe in UGX, and in MGA amounts that are not whole
+ariary, now fail with `invalid_request`, a definitive failure that runs dunning to
+cancellation: move those subscriptions to another provider first. UGX payments and
+subscriptions made before the upgrade can no longer be read through the adapter: read them
+in the Stripe Dashboard.
+:::
+
 ## 5. Wire the client adapter
 
 ```tsx
@@ -224,6 +302,8 @@ Nothing in your PayFanout code changes except credentials and one string:
 - [ ] Switch the Dashboard to **live mode** and swap in the **live** keys (`sk_live_…`,
       `pk_live_…`) via your production secrets.
 - [ ] Set `environment: "live"` on **both** the server and client adapters.
+- [ ] If you take UGX, route it to another provider with a routing rule placed before any
+      rule that can send it to Stripe (§4, "Currencies with Stripe-specific units").
 - [ ] Add a **live** webhook endpoint in the Dashboard and use its **new** `whsec_…` signing
       secret (test and live endpoints have different secrets).
 - [ ] Set a `statementDescriptor` on your sessions so the charge is recognizable on the

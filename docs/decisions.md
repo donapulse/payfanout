@@ -6273,3 +6273,83 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   and two extra entries on one line of the browser's map) each made a test fail, and so did
   six on the review's additions (a new refusal or technical-error entry dropped or
   reclassified, on both halves or on one, and a computed entry in the browser's map).
+
+## No invented currencies (2026-09-30)
+
+- **The gap.** When a PSP record stated no currency, four server adapters reported one
+  anyway: PayPal `USD` (seven sites, three of them the currency of an amount it sends: a
+  capture, a partial refund and an amount-only session update), GoCardless `GBP` (three),
+  Paysafe `USD` (two), and Stripe `USD` on the amountless answer of `verifyPaymentMethod`.
+  PayPal's subscription projection, PayZen's payment and subscription reads and Stripe's
+  subscription read reported `""`, which core's `normalizeCurrency` rejects. A Paysafe JPY
+  1,500 payment read without its currency reported as USD 15.00.
+- **The provider schemas.** PayPal's Orders v2 and Payments v2 schemas
+  (`developer.paypal.com/api/orders/v2/schema.json` and `/api/payments/v2/schema.json`,
+  read 2026-09-30) make `amount` optional on purchase units, authorizations, captures and
+  refunds, and require `currency_code` on every money object. Paysafe's Payments API spec
+  (`paysafe-ph-payments-api.yaml`, read 2026-09-30) requires `currencyCode` on the payment
+  POST /payments returns (201) and GET /payments/{paymentId} returns (200). GoCardless's
+  OpenAPI spec (`openapi-schema-public.json`, read 2026-09-30) marks no response field
+  required, `id` included, so it settles nothing either way.
+- **The rule.** A record reports the PSP's own currency, else one the adapter trusts
+  (PayPal: any money object of the same purchase unit, whose records share the order's one
+  currency, and for a capture or refund read on its own, the capture's order; GoCardless:
+  a payment's billing request `payment_request`; PayZen: a transaction's
+  `orderDetails.orderCurrency`, which the V4 Transaction schema requires; Worldline: on a
+  3-D Secure challenge, the session's currency), else core's new `NO_CURRENCY` (`"XXX"`,
+  ISO 4217's code for "no currency involved"), which the Adyen and Worldline adapters
+  already reported and now take from core. A SetupIntent moves no money, so Stripe's
+  verification answer reports it too. The record reads this change touches go through
+  core's new `firstCurrencyCode`, the first candidate that is three letters once trimmed
+  and uppercased, so an empty or malformed code (`""`, `"EURO"`) falls through to the next
+  source instead of being reported; so does Worldline's check that a completion's payment
+  is the session's. Stripe scales a subscription's amount by that same reading, so a
+  subscription stating `""` over an ISK price reports ISK with its amount converted from
+  Stripe's units. Webhook mappers and Stripe's PaymentIntent reads, whose currency the
+  providers require, read the field as before.
+- **Why a related record can stand in.** PayPal's Orders v2 error messages refuse
+  `MULTI_CURRENCY_ORDER` ("Entire Order request must have the same currency_code") and
+  `AUTHORIZATION_CURRENCY_MISMATCH` (an authorization in another currency than the
+  order's) (`developer.paypal.com/api/orders/v2/error-messages`), and its Payments v2
+  schema says "Currency of capture must be the same as currency of authorization" and
+  "Refund must be in the same currency as the capture"
+  (`developer.paypal.com/api/payments/v2/schema.json`), both read 2026-09-30. GoCardless
+  describes a billing request's `payment_request_payment` link as the "ID of the payment
+  that was created from this payment request"; the adapter reads the billing request's
+  currency only for a payment it reached through that link.
+- **Nothing is sent in a guessed currency.** When no record of the payment states its
+  currency, PayPal refuses a capture amount, a partial refund and an amount-only session
+  update with `invalid_request` before sending. A refund in full sends no amount and still
+  goes through, and so does a capture of all of an authorization nothing was taken from,
+  which PayPal captures in full when no amount is sent; the remainder of a partly captured
+  one is refused, because without an amount PayPal would take the authorization's full
+  amount. A PayPal value whose money object and records state no currency reads with
+  `NO_CURRENCY`'s default exponent under a record that reports `NO_CURRENCY`: throwing
+  instead would fail the answer of a capture, void or refund that has gone through. A
+  refund read, whose record has no currency field to flag the amount, first reads the
+  refunded capture and then its order, and refuses a value none of them gives a currency
+  with `processing_error`; a refund call's answer reads its value like any other and falls
+  back to the amount asked when it has none. A session update that only restates the
+  order's own currency no longer sends a PATCH, which re-sent the amount it read (0 when
+  the order reported none). A full refund sends no amount, so a failed read of its
+  capture's order does not stop it; a partial refund or a refund read keeps that failure,
+  retryable. Worldline refuses a refund of a payment that states no currency instead of
+  sending `XXX`: the contract's `amountOfMoney` requires a `currencyCode`, and it does not
+  say what a refund sent without `amountOfMoney` takes. PayZen refuses such a partial
+  refund and sends a full one without the `currency` its V4 schema makes optional (only
+  `uuid` is required on RefundRequest and CancelOrRefundRequest, read 2026-09-30) instead
+  of sending `""`. Core does not screen `XXX` as an input currency: a session in it goes
+  to the adapter, whose PSP refuses it as it would any code it does not take.
+- **Not changed.** An amount a PSP omits still reads as 0, as before. Paysafe card refunds
+  that state no currency keep their earlier rule (see "Card refunds and settlements may
+  state no currency: AMBIGUOUS" above): a refund reports no currency field. Nineteen
+  mutations of the first version (each guard dropped, each fallback set back to its old
+  guess, the related-record sources removed, the restated-currency PATCH re-enabled, a
+  currency-less value thrown on instead of read, the refund read's refusal dropped) each
+  made a test fail, and so did twenty-two of the final one (`firstCurrencyCode`'s shape
+  check, trim or fall-through dropped, each adapter's read set back to its old form, each
+  capture and order lookup removed or made to throw on a 404, the untouched-authorization
+  exemption widened or removed), and thirteen more in review (the exemption's check that
+  the whole authorization is captured, each lookup's retryable failure and the full
+  refund's tolerance of one, the Worldline session fallback, session check and refund
+  refusal, PayZen's order currency and refund paths).

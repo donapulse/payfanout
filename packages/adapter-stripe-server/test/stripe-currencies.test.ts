@@ -1206,7 +1206,7 @@ describe("amounts in no known currency pass unchanged", () => {
     expect(rest.amount).toBe(60_000);
   });
 
-  it("reads a subscription's units from its first price when it states no currency of its own", async () => {
+  it("reads a subscription's units from its first price when it states no currency code of its own", async () => {
     const { adapter, fake } = makePair();
     const price = fake.seedPrice({ currency: "isk", unitAmount: 250_000 });
     price.recurring = null;
@@ -1223,6 +1223,21 @@ describe("amounts in no known currency pass unchanged", () => {
     const empty = fake.seedSubscription({ currency: "isk" });
     delete empty.items;
     expect(await adapter.retrieveNativeSubscription({ subscriptionId: empty.id })).toMatchObject({ amount: 0, currency: "ISK" });
+
+    // The amount's units and the reported currency come from the same code.
+    const blank = fake.seedSubscription({
+      currency: "",
+      items: [{ price: fake.seedPrice({ currency: "isk", unitAmount: 250_000 }) }],
+    });
+    expect(await adapter.retrieveNativeSubscription({ subscriptionId: blank.id })).toMatchObject({
+      amount: 2500,
+      currency: "ISK",
+    });
+    const none = fake.seedSubscription({ currency: "", items: [{ price: fake.seedPrice({ currency: "", unitAmount: 700 }) }] });
+    expect(await adapter.retrieveNativeSubscription({ subscriptionId: none.id })).toMatchObject({
+      amount: 700,
+      currency: "XXX",
+    });
   });
 
   it("sends an amount unchanged for a PaymentIntent whose currency is no currency code", async () => {

@@ -4,6 +4,7 @@ import {
   getCurrencyExponent,
   getUserMessage,
   isPayFanoutError,
+  NO_CURRENCY,
   isTransportRetryable,
   normalizeCurrency,
   normalizeSecrets,
@@ -822,8 +823,8 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
       status: "processing",
       amount,
       amountRefunded: 0,
-      // XXX is ISO 4217's "no currency": a bare pspReference carries none.
-      currency: ref.currency ?? "XXX",
+      // A bare pspReference carries no currency.
+      currency: ref.currency ?? NO_CURRENCY,
       paymentMethodType: "card",
       createdAt: UNKNOWN_CREATED_AT,
       raw: acknowledgement,

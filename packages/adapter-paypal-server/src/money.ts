@@ -1,5 +1,6 @@
 import {
   assertMinorUnitAmount,
+  firstCurrencyCode,
   formatMinorUnits,
   getCurrencyExponent,
   normalizeCurrency,
@@ -31,6 +32,11 @@ const PAYPAL_RETIRED_CURRENCIES: ReadonlySet<string> = new Set(["RUB"]);
  * whole-unit rule is a PayPal quirk their minor-unit amounts must satisfy.
  */
 const WHOLE_UNIT_CURRENCIES: ReadonlySet<string> = new Set(["HUF", "JPY", "TWD"]);
+
+/** The first currency the money objects state, uppercased; undefined when none states one. */
+export function statedCurrency(...moneys: Array<{ currency_code?: string } | undefined>): string | undefined {
+  return firstCurrencyCode(...moneys.map((money) => money?.currency_code));
+}
 
 /** A currency PayPal accepts for a new payment. */
 export function assertPayPalCurrency(currency: string): string {

@@ -340,7 +340,9 @@ describe("PayPal retrieveNativeSubscription", () => {
     delete body.billing_info;
     const record = paypalSubscriptionToRecord(body);
     expect(record.amount).toBe(0); // never an invented 900
-    expect(record.currency).toBe(""); // no money object carries a currency fact
+    // No money object carries a currency fact: ISO 4217's "no currency", a
+    // code core's helpers still read, never an invented or empty one.
+    expect(record.currency).toBe("XXX");
     expect(record.raw).toBe(body);
   });
 });

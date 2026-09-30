@@ -1,4 +1,4 @@
-import { PayFanoutError, sha256Hex } from "@payfanout/core";
+import { firstCurrencyCode, NO_CURRENCY, PayFanoutError, sha256Hex } from "@payfanout/core";
 
 /**
  * Every metadata field: "Up to 3 keys are permitted, with key names up to 50
@@ -178,4 +178,12 @@ export function readAmount(value: unknown, resource: AmountResource, raw: unknow
   const amount = wireInteger(value);
   if (amount === undefined) throw unreadableAmount(resource, raw);
   return amount;
+}
+
+/**
+ * The currency a read reports: the first of `codes` that is an ISO 4217 code,
+ * uppercased, else NO_CURRENCY rather than a guess such as GBP.
+ */
+export function readCurrency(...codes: Array<string | undefined>): string {
+  return firstCurrencyCode(...codes) ?? NO_CURRENCY;
 }

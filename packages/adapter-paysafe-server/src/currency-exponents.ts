@@ -1,6 +1,8 @@
 import {
+  firstCurrencyCode,
   getCurrencyExponent,
   listNonDefaultCurrencyExponents,
+  NO_CURRENCY,
   PayFanoutError,
   type UnifiedErrorCode,
 } from "@payfanout/core";
@@ -179,6 +181,14 @@ export function assertUsableRecord(currency: unknown, subject: string, record: u
         raw,
       );
   }
+}
+
+/**
+ * The currency a read reports: the record's own ISO 4217 code, uppercased,
+ * else NO_CURRENCY rather than a guess such as USD.
+ */
+export function reportedCurrency(code: string | undefined): string {
+  return firstCurrencyCode(code) ?? NO_CURRENCY;
 }
 
 /**

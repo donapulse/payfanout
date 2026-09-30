@@ -65,3 +65,46 @@ describe("transport edge cases", () => {
     expect(() => makeAdapter({ merchantId: "" })).toThrowError(/merchantId/);
   });
 });
+
+describe("currencies a payment states", () => {
+  /** An adapter whose reads answer `payment` with no captures or refunds; the paths it POSTs to land in `posts`. */
+  function readingPayment(payment: unknown, posts: string[] = []): WorldlineServerAdapter {
+    return makeAdapter({
+      fetch: async (input, init) => {
+        const path = new URL(String(input)).pathname;
+        if (init?.method === "POST") posts.push(path);
+        const body = path.endsWith("/captures") ? { captures: [] } : path.endsWith("/refunds") ? { refunds: [] } : payment;
+        return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    });
+  }
+
+  /** A captured payment of 2500 whose amountOfMoney states `currencyCode`, or none when undefined. */
+  function captured(currencyCode: string | undefined): Record<string, unknown> {
+    return {
+      id: "pay_read",
+      status: "CAPTURED",
+      statusOutput: { statusCode: 9, statusCategory: "COMPLETED" },
+      paymentOutput: { amountOfMoney: { amount: 2500, ...(currencyCode === undefined ? {} : { currencyCode }) } },
+    };
+  }
+
+  it("reads a missing, empty or malformed currency code as XXX, never passing it on", async () => {
+    for (const currencyCode of [undefined, "", "EURO"]) {
+      const info = await readingPayment(captured(currencyCode)).retrievePayment("pay_read");
+      expect(info.currency, String(currencyCode)).toBe("XXX");
+    }
+  });
+
+  it("refuses a refund before any refund request when the payment states no currency", async () => {
+    for (const currencyCode of [undefined, "EURO"]) {
+      const posts: string[] = [];
+      const adapter = readingPayment(captured(currencyCode), posts);
+      await expect(
+        adapter.refundPayment({ pspPaymentId: "pay_read", idempotencyKey: "r" }),
+        String(currencyCode),
+      ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringContaining("states no currency") as string });
+      expect(posts, String(currencyCode)).toEqual([]);
+    }
+  });
+});

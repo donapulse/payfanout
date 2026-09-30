@@ -216,7 +216,11 @@ while another under the same key is still in progress. Retry all of them only un
 Amounts are **integer minor units, always**, and minor units are currency-dependent, JPY
 has 0 decimals (`¥500` → `500`), BHD has 3 (`BD 1.234` → `1234`). Use
 `toMinorUnits(major, currency)` / `formatMinorUnits(minor, currency)` from
-`@payfanout/core`. Refund state is **derived**, never a payment status:
+`@payfanout/core`. A record whose PSP states no currency, which the adapter cannot source
+from a related record either, reports `NO_CURRENCY` (`"XXX"`, ISO 4217's "no currency
+involved"): its amount reads with the default exponent 2, so reconcile it with the PSP
+before booking it, and never send `XXX` back as a payment's currency. Refund state is
+**derived**, never a payment status:
 `getRefundState(info)` → `"none" | "partial" | "full"`.
 
 ## Observability

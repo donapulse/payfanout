@@ -1,7 +1,9 @@
 import {
   assertMinorUnitAmount,
+  firstCurrencyCode,
   lowercaseKeys,
   NATIVE_SUBSCRIPTION_INTERVALS,
+  NO_CURRENCY,
   normalizeCurrency,
   normalizeSecrets,
   PayFanoutError,
@@ -704,7 +706,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
         status: seti.status === "succeeded" ? "succeeded" : seti.last_setup_error ? "failed" : mapSetupIntentStatus(seti),
         amount: 0,
         amountRefunded: 0,
-        currency: "USD",
+        currency: NO_CURRENCY,
         paymentMethodType: "card",
         ...(seti.status === "succeeded" && paymentMethodId
           ? { savedPaymentMethodToken: paymentMethodId }
@@ -743,7 +745,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       status: seti.status === "succeeded" ? "succeeded" : seti.last_setup_error ? "failed" : mapSetupIntentStatus(seti),
       amount: 0,
       amountRefunded: 0,
-      currency: "USD", // verification is amountless; currency is not meaningful here
+      currency: NO_CURRENCY, // a SetupIntent moves no money and states no currency
       paymentMethodType: "card",
       createdAt: new Date(seti.created * 1000).toISOString(),
       raw: seti,
@@ -1065,7 +1067,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       pspName: this.pspName,
       status: mapSubscriptionStatus(sub.status),
       amount,
-      currency: (sub.currency ?? price?.currency ?? "").toUpperCase(),
+      currency: subscriptionCurrency(sub) ?? NO_CURRENCY,
       ...(interval ? { interval } : {}),
       ...(interval && recurring?.interval_count !== undefined ? { intervalCount: recurring.interval_count } : {}),
       ...(periodStart !== undefined ? { currentPeriodStart: new Date(periodStart * 1000).toISOString() } : {}),
@@ -1301,8 +1303,9 @@ function installment(sub: StripeSubscriptionLike): number {
   return total;
 }
 
+/** One reading serves both the unit conversion and the reported currency, so the two never disagree. */
 function subscriptionCurrency(sub: StripeSubscriptionLike): string | undefined {
-  return sub.currency ?? sub.items?.data[0]?.price?.currency;
+  return firstCurrencyCode(sub.currency, sub.items?.data[0]?.price?.currency);
 }
 
 function pageCursor(page: StripeListLike<{ id: string }>): string | undefined {

@@ -1,5 +1,6 @@
 import type { AdapterCapabilities } from "./model.js";
 import type { CreatePaymentSessionInput } from "./adapters.js";
+import { firstCurrencyCode } from "./currency.js";
 
 /**
  * An `unsupportedCurrencies` entry as screening compares it, trimmed and
@@ -9,9 +10,7 @@ import type { CreatePaymentSessionInput } from "./adapters.js";
  * screening could never match.
  */
 export function listedCurrencyCode(entry: unknown): string | undefined {
-  if (typeof entry !== "string") return undefined;
-  const code = entry.trim().toUpperCase();
-  return /^[A-Z]{3}$/.test(code) ? code : undefined;
+  return firstCurrencyCode(entry);
 }
 
 /**

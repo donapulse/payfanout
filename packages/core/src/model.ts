@@ -240,7 +240,7 @@ export interface PaymentSession {
   /** Token the client SDK needs to mount/confirm. */
   clientSecret?: string;
   amount: MinorUnitAmount;
-  /** ISO 4217. */
+  /** Uppercase ISO 4217; {@link NO_CURRENCY} when the PSP states none. */
   currency: string;
   status: UnifiedPaymentStatus;
   metadata?: Record<string, string>;
@@ -278,6 +278,7 @@ export interface PaymentInfo {
   amountCaptured?: MinorUnitAmount;
   /** Authorized-but-uncaptured remainder, when the PSP reports it. */
   amountCapturable?: MinorUnitAmount;
+  /** Uppercase ISO 4217; {@link NO_CURRENCY} when the PSP states none. */
   currency: string;
   paymentMethodType: UnifiedPaymentMethodType;
   /**
@@ -426,7 +427,7 @@ export interface NativeSubscriptionRecord {
   status: NativeSubscriptionStatus;
   /** Amount of each installment. Integer minor units. */
   amount: MinorUnitAmount;
-  /** Uppercase ISO 4217. */
+  /** Uppercase ISO 4217; {@link NO_CURRENCY} when the PSP states none. */
   currency: string;
   /** Absent when the source cadence has no faithful day/week/month/year projection. */
   interval?: NativeSubscriptionInterval;

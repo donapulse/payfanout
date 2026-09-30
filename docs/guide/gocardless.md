@@ -78,13 +78,20 @@ const payments = new PaymentService({ adapters: [gocardless] });
 | `environment` | ✅ | - | Exactly `"sandbox"` or `"live"`; selects the API host. Never inferred. |
 | `webhookSecret` | ✅ | - | The endpoint's signing secret. Pass a **`string[]`** to rotate with no cutover. |
 | `goCardlessVersion` | - | `2015-07-06` | Pinned `GoCardless-Version` header on every request. |
-| `fallbackEnabled` | - | unset | Lets the flow fall back from instant payment to a Direct Debit mandate. Fallback payments confirm on **debit timing (days)**, not seconds. |
+| `fallbackEnabled` | - | unset | Lets the flow fall back from instant payment to a Direct Debit mandate. Fallback payments confirm on **debit timing (days)**, not seconds. Only `true` is sent; see the note below. |
 | `exitUri` | - | unset | Where the hosted flow sends payers who cannot proceed (e.g. unsupported bank). |
 | `requestTimeoutMs` | - | `30000` | Abort a hung connection; surfaces as a retryable `psp_unavailable`. |
 | `maxNetworkRetries` | - | `2` | Retries transport trouble (network/timeout/5xx/429) only, never business errors. |
 
+`fallbackEnabled: false` sends nothing, the same as leaving it unset. Leave it unset if your
+account uses GoCardless's payment intelligence (Protect+, which GoCardless calls its
+"anti-fraud payment intelligence product"): the API reference says `fallback_enabled`
+"Should not be set if GoCardless payment intelligence feature is used", and the Fallbacks
+guide says "Fallbacks should not be used if you are using Protect+ with Verified Mandates."
+
 `createPaymentSession` **requires `returnUrl`** (the hosted flow redirects the payer back
-to it) and returns:
+to it) and an `amount` above 0 (a zero-amount session would be a payment method
+verification, which this adapter does not offer), and returns:
 
 - `pspSessionId` — the billing request id (`BRQ…`). Store it: `retrievePayment` accepts
   it directly (and the payment id `PM…` once one exists).
@@ -106,7 +113,48 @@ Two checkout-field mappings to know:
   `id`) claims the first slot — only the **first two** session `metadata` keys, in
   insertion order, are forwarded; later keys are withheld rather than failing the
   payment, and a host key named `payfanout_id` never overrides the session id. Without
-  a session `id`, three host keys fit.
+  a session `id`, three host keys fit. Forwarded key names and values have length
+  limits too; see [Limits checked before any request](#limits-checked-before-any-request).
+
+### Limits checked before any request
+
+GoCardless documents limits that the adapter checks itself. A request GoCardless would
+refuse rejects with a non-retryable `invalid_request` that names the limit, and nothing is
+sent:
+
+- **Metadata** on sessions and subscriptions: key names of at most 50 characters and
+  values of at most 500, your `id` included, since it is the value of `payfanout_id`. A
+  key or value over its limit is refused, never truncated. Keys past the third are still
+  withheld, and a withheld key is not checked. GoCardless does not say what it counts as
+  a character; the adapter counts code points, so an emoji counts once.
+- **A session `amount` of 0**, as a refund `amount` of 0 already was.
+- **Subscription cadence.** GoCardless requires an interval that results "in at least one
+  charge date per year", so `intervalCount` is at most 52 for `interval: "week"`, 12 for
+  `"month"` and 1 for `"year"`.
+
+GoCardless types the amounts it returns as an integer or a string. The adapter reads an
+integer, or a string of ASCII digits, as integer minor units. Any other amount, such as
+`"10.50"`, rejects the read with a non-retryable `unknown` instead of reaching `amount` or
+`amountRefunded` as a string or a fraction. An amount GoCardless leaves out still reads as
+0.
+
+An idempotency key goes out as the `Idempotency-Key` header exactly as earlier releases sent
+it whenever GoCardless can have taken it, so a replay across an upgrade keeps its key on
+every runtime: `fetch` trims whitespace from both ends of a header value, so `"order-42\n"`
+still goes out as `order-42`. A key GoCardless never took goes out as `payfanout-sha256-`
+followed by its SHA-256 digest instead of failing: one over GoCardless's 128 characters
+("Keys must be no longer than 128 characters") once trimmed, however GoCardless can have
+read them (below), and one holding a NUL, CR or LF inside the trimmed value, which no
+runtime sends. The same key always
+yields the same header, so a retry replays. Every other key goes out as given, as before.
+Runtimes send non-ASCII keys differently: Cloudflare Workers sends every character as UTF-8,
+while Node's `fetch` sends U+0080 to U+00FF as one byte each (so a key of such characters
+counts as those bytes read as UTF-8) and refuses a key holding a character above U+00FF, or
+an ASCII control character other than tab, before sending. On Node such a call fails with a
+retryable `psp_unavailable` that no retry fixes, so use ASCII keys. A key holding a lone
+surrogate is refused with `invalid_request` when it would go out as its digest, and on
+refunds, whose stamp hashes every key (marked `outcomeUnknown`, as an earlier release may
+have refunded under it): UTF-8 encoding would give it the hash of other keys.
 
 ### Replays and idempotency keys
 

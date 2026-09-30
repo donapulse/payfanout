@@ -47,6 +47,13 @@ import {
   type VerifyPaymentMethodInput,
 } from "@payfanout/core";
 import {
+  assertReportablePage,
+  assertSendableCurrency,
+  assertUsableRecord,
+  currencyRefusal,
+  sendRefusal,
+} from "./currency-exponents.js";
+import {
   decodeSessionContext,
   encodeSessionContext,
   type PaysafeSessionContextV1,
@@ -644,6 +651,11 @@ function mapSubscriptionStatus(status: string | undefined): NativeSubscriptionSt
   return SUBSCRIPTION_STATUS_MAP[(status ?? "").toUpperCase()] ?? "unknown";
 }
 
+/** Billing already stopped: CANCELLED is final, and COMPLETED ran all its cycles. */
+function isStopped(status: NativeSubscriptionStatus): boolean {
+  return status === "canceled" || status === "completed";
+}
+
 /** The scheduler cadence a create input resolves to: plan billingCycle terms. */
 interface SchedulerCadence {
   frequency: string;
@@ -1107,10 +1119,11 @@ function movedNoMoney(record: RefNumRecord): boolean {
 }
 
 /**
- * A spent handle under a bank-debit key that none of the key's failed
- * payments accounts for, so a payment the lookup may not show yet. Paysafe
- * marks a handle COMPLETED "regardless of the payments call response status",
- * and a failed payment that names no handle accounts for one spent handle.
+ * A spent handle under a bank-debit key that none of `failed`, the key's
+ * payments that moved no money, accounts for, so a payment the lookup may not
+ * show yet. Paysafe marks a handle COMPLETED "regardless of the payments call
+ * response status", and such a payment that names no handle accounts for one
+ * spent handle.
  */
 function hiddenSpend(
   handles: PaysafePaymentHandleLike[],
@@ -1175,6 +1188,31 @@ function defaultSleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * The Paysafe server adapter: the Payments API, Customer Vault and Payment
+ * Scheduler over REST, tokenize-first.
+ *
+ * Paysafe reads amounts in the minor units of its currency table, and the
+ * adapter sends PayFanout's unchanged and converts none, so it refuses a
+ * currency the table gives another exponent than PayFanout (CLP, BYR), or
+ * one the table lacks that is not priced in hundredths (ISK, UYI and others;
+ * see "Currencies the adapter refuses" in the setup guide).
+ * createPaymentSession and updatePaymentSession refuse one with
+ * `invalid_request` before any request. completePayment,
+ * chargeSavedPaymentMethod and createNativeSubscription, which earlier
+ * releases sent in such currencies, look their key up first, a read that
+ * moves no money, and refuse with `invalid_request`, marked outcomeUnknown
+ * when Paysafe holds something under the key or the lookup fails.
+ * capturePayment and refundPayment read the payment first and refuse with
+ * `invalid_request` when they carry an amount, which is in PayFanout's minor
+ * units, and with `unsupported_operation` when they carry none, as
+ * cancelPayment does: those send Paysafe's own amounts, or none, but answer
+ * with amounts that cannot be reported in PayFanout's minor units.
+ * cancelNativeSubscription reads the subscription first and refuses the same
+ * way. retrievePayment, retrieveRefund (for a refund Paysafe reports in such
+ * a currency), retrieveNativeSubscription and listNativeSubscriptions refuse
+ * with `unsupported_operation`, and webhook events in one carry no `amount`.
+ */
 export class PaysafeServerAdapter implements ServerPaymentAdapter {
   readonly pspName = PAYSAFE_PSP_NAME;
   private readonly config: PaysafeServerAdapterConfig;
@@ -1256,6 +1294,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertMinorUnitAmount(input.amount, "amount");
     const currency = normalizeCurrency(input.currency);
+    assertSendableCurrency(currency);
     if (input.paymentMethodTypes?.some((t) => !this.isKnownMethodType(t))) {
       throw PayFanoutError.invalidRequest(
         `Paysafe adapter does not support one of the requested payment method types: ${input.paymentMethodTypes.join(", ")}`,
@@ -1413,6 +1452,9 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     }
     if (input.amount !== undefined) assertMinorUnitAmount(input.amount, "amount");
     const currency = input.currency !== undefined ? normalizeCurrency(input.currency) : context.currency;
+    // The context's own currency too: an earlier release may have signed
+    // one the adapter now refuses.
+    assertSendableCurrency(currency);
     // A bank-debit session keeps its rail across updates, so the rail's
     // currency guard must hold for the NEW currency too — otherwise an update
     // slips past the creation guard and dies at Paysafe instead of here.
@@ -1472,9 +1514,13 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    */
   async completePayment(input: CompletePaymentInput): Promise<PaymentInfo> {
     const context = await this.decodeContext(input.pspSessionId);
+    // Only a session an earlier release signed carries a refused currency.
+    const bankPaymentType = context.paymentType;
+    await this.refuseAfterLookup(context.currency, input.idempotencyKey, "payment", (key) =>
+      this.chargesUnder(key, isBankDebitPaymentType(bankPaymentType)),
+    );
     // Bank-debit sessions have no handle yet at all: it is minted here, from
     // the bank details the client's envelope carries.
-    const bankPaymentType = context.paymentType;
     if (isBankDebitPaymentType(bankPaymentType)) {
       return this.completeBankDebitPayment(context, bankPaymentType, input);
     }
@@ -1672,6 +1718,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
 
   async retrievePayment(pspPaymentId: string): Promise<PaymentInfo> {
     const payment = await this.fetchPayment(pspPaymentId);
+    assertUsableRecord(payment.currencyCode, `Payment ${pspPaymentId}`, payment, { kind: "read" });
     return this.toPaymentInfo({ ...payment, settlements: await this.findSettlements(payment) });
   }
 
@@ -1715,6 +1762,11 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   ): Promise<PaymentInfo> {
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
     const payment = await this.fetchPayment(pspPaymentId);
+    // With no amount, the capture sends Paysafe's own remainder.
+    assertUsableRecord(payment.currencyCode, `Payment ${pspPaymentId}`, payment, {
+      kind: amount === undefined ? "answer" : "send",
+      action: "capture",
+    });
     // Whether this is a full capture cannot change on a replay: `amount` is
     // the caller's, and the authorized amount is fixed.
     if (amount === undefined || amount === payment.amount) return this.captureInFull(pspPaymentId, payment, amount);
@@ -1877,6 +1929,8 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    */
   async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
     const payment = await this.fetchPayment(pspPaymentId);
+    // The void sends Paysafe's own availableToSettle, but answers with amounts.
+    assertUsableRecord(payment.currencyCode, `Payment ${pspPaymentId}`, payment, { kind: "answer", action: "void" });
     // Voidauths also require an explicit amount (full remaining authorization).
     const remaining = remainingToSettle(payment);
     // Voidauths take no dupCheck, so a replay is caught by lookup alone: an
@@ -1987,6 +2041,11 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
     if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
     const payment = await this.fetchPayment(req.pspPaymentId);
+    // Only a stated amount is the caller's; with none, the refund sends none.
+    assertUsableRecord(payment.currencyCode, `Payment ${req.pspPaymentId}`, payment, {
+      kind: req.amount === undefined ? "answer" : "send",
+      action: "refund",
+    });
     const rail = NON_REFUNDABLE_RAILS[(payment.paymentType ?? "").toUpperCase()];
     if (rail) {
       throw new PayFanoutError({
@@ -2047,15 +2106,21 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   /**
    * Polls an async refund to a terminal state — sandbox refunds in particular
    * sit PENDING until the overnight settlement batch runs.
+   *
+   * A refund that states no `currencyCode` is reported as it comes: Paysafe
+   * does not require one (its card refund example carries none), and a
+   * refund names no payment or settlement to read the currency from.
    */
   async retrieveRefund(refundId: string): Promise<RefundInfo> {
     const refund = await this.request<{
       id: string;
       status?: string;
       amount?: number;
+      currencyCode?: string;
       txnTime?: string;
       paymentId?: string;
     }>("GET", `/paymenthub/v1/refunds/${encodeURIComponent(refundId)}`);
+    assertUsableRecord(refund.currencyCode, `Refund ${refundId}`, refund, { kind: "read" });
     const createdAt = paysafeTime(refund.txnTime);
     return {
       refundId: refund.id,
@@ -2226,6 +2291,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   async chargeSavedPaymentMethod(input: ChargeSavedPaymentMethodInput): Promise<PaymentInfo> {
     assertMinorUnitAmount(input.amount, "amount");
     const currency = normalizeCurrency(input.currency);
+    await this.refuseAfterLookup(currency, input.idempotencyKey, "payment", (key) => this.chargesUnder(key));
     const merchantAccountId = this.config.merchantAccountResolver(currency, undefined) || undefined;
     const occurrence = input.occurrence ?? "recurring";
     const replay = paymentWrite(input.idempotencyKey, input.amount, currency, input.savedPaymentMethodToken, false);
@@ -2275,6 +2341,11 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * follow-up page comes back empty with none — because the spec does not pin
    * whether meta.numberOfRecords counts the total or the page, and a wrong
    * guess would either drop records or never terminate.
+   *
+   * A page holding a subscription in a currency the adapter refuses fails
+   * whole with `unsupported_operation`: `raw.records` names each such
+   * subscription, and `raw.nextCursor` is the cursor the page would have
+   * carried, so later pages stay reachable (a `limit` of 1 steps past each).
    */
   async listNativeSubscriptions(
     input?: ListNativeSubscriptionsInput,
@@ -2286,9 +2357,15 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       `${SCHEDULER_BASE}/subscriptions?limit=${limit}&offset=${offset}&${SUBSCRIPTION_FIELDS}`,
     );
     const records = result.subscriptions ?? [];
+    const nextCursor = records.length === limit ? String(offset + records.length) : undefined;
+    assertReportablePage(
+      records.map((s) => ({ id: s.id, currency: s.plan?.currencyCode })),
+      "subscription",
+      nextCursor,
+    );
     return {
       subscriptions: records.map((s) => this.toNativeSubscription(s)),
-      ...(records.length === limit ? { nextCursor: String(offset + records.length) } : {}),
+      ...(nextCursor !== undefined ? { nextCursor } : {}),
     };
   }
 
@@ -2334,6 +2411,9 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       throw PayFanoutError.invalidRequest("Paysafe subscription installments must be at least 1 minor unit");
     }
     const currency = normalizeCurrency(input.currency);
+    await this.refuseAfterLookup(currency, input.merchantRefNum ?? input.idempotencyKey, "subscription", (key) =>
+      this.subscriptionsByRefNum(key),
+    );
     if (!input.savedPaymentMethodToken) {
       throw PayFanoutError.invalidRequest(
         "createNativeSubscription requires savedPaymentMethodToken — the MULTI_USE token savePaymentMethod returned",
@@ -2400,10 +2480,17 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * used here. Verified-idempotent: the scheduler does not document patching
    * an already-terminal subscription, so on any rejection the adapter
    * re-fetches and treats CANCELLED/COMPLETED as success — billing that is
-   * already stopped can never fail a replayed cancel. The PATCH carries no
+   * already stopped never fails a replayed cancel, except in a currency the
+   * adapter refuses (below). The PATCH carries no
    * merchantRefNum (the scheduler has none there); replay safety comes from
    * CANCELLED being absorbing plus that re-fetch, which is why the required
    * idempotencyKey has no wire mapping on this call.
+   *
+   * The subscription is read before the PATCH, one more request on every
+   * cancel, and a failed read fails the cancel before anything is sent. One
+   * in a currency the adapter refuses is refused there with
+   * `unsupported_operation`, since the answer could not report its amounts,
+   * even when it is already stopped and its cancel would otherwise succeed.
    */
   async cancelNativeSubscription(
     input: CancelNativeSubscriptionInput,
@@ -2411,6 +2498,15 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     if (!input.subscriptionId) {
       throw PayFanoutError.invalidRequest("cancelNativeSubscription requires subscriptionId");
     }
+    const current = await this.fetchSubscription(input.subscriptionId);
+    assertUsableRecord(
+      current.plan?.currencyCode,
+      `Subscription ${input.subscriptionId}`,
+      current,
+      isStopped(mapSubscriptionStatus(current.status))
+        ? { kind: "stopped", status: (current.status ?? "").toUpperCase() }
+        : { kind: "answer", action: "cancel" },
+    );
     try {
       const patched = await this.request<PaysafeSubscriptionLike>(
         "PATCH",
@@ -2429,15 +2525,15 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       }
     } catch (err) {
       if (!(err instanceof PayFanoutError)) throw err;
-      let current: PaysafeSubscriptionLike;
+      let refetched: PaysafeSubscriptionLike;
       try {
-        current = await this.fetchSubscription(input.subscriptionId);
+        refetched = await this.fetchSubscription(input.subscriptionId);
       } catch {
         // The re-fetch failing adds nothing — the PATCH rejection is the fact.
         throw err;
       }
-      const record = this.toNativeSubscription(current);
-      if (record.status === "canceled" || record.status === "completed") return record;
+      const record = this.toNativeSubscription(refetched);
+      if (isStopped(record.status)) return record;
       throw err;
     }
   }
@@ -2492,16 +2588,68 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     merchantRefNum: string,
   ): Promise<PaysafeSubscriptionLike | undefined> {
     try {
-      const result = await this.request<{ subscriptions?: PaysafeSubscriptionLike[] }>(
-        "GET",
-        `${SCHEDULER_BASE}/subscriptions?merchantRefNum=${encodeURIComponent(merchantRefNum)}&${SUBSCRIPTION_FIELDS}`,
-      );
-      const matches = result.subscriptions ?? [];
+      const matches = await this.subscriptionsByRefNum(merchantRefNum);
       return matches.length === 1 ? matches[0] : undefined;
     } catch {
       // Recovery is best-effort; the caller rethrows the original rejection.
       return undefined;
     }
+  }
+
+  private async subscriptionsByRefNum(merchantRefNum: string): Promise<PaysafeSubscriptionLike[]> {
+    const result = await this.request<{ subscriptions?: PaysafeSubscriptionLike[] }>(
+      "GET",
+      `${SCHEDULER_BASE}/subscriptions?merchantRefNum=${encodeURIComponent(merchantRefNum)}&${SUBSCRIPTION_FIELDS}`,
+    );
+    return result.subscriptions ?? [];
+  }
+
+  /**
+   * Refuses a call in a currency the adapter refuses once `read` has looked
+   * its key up, a read that moves no money. Earlier releases sent such calls:
+   * records under the key, or a lookup that fails, leave the refusal's
+   * outcome open (see sendRefusal), so a retry whose earlier attempt the
+   * lookup shows is not read as money that did not move. The lookup can trail
+   * the write it indexes, so a key that holds nothing is read up to three
+   * times before the refusal is final; an earlier attempt still in flight, or
+   * older than the lookup's 30-day window, can still go unseen. A call with
+   * no key is refused as is.
+   */
+  private async refuseAfterLookup(
+    currency: string,
+    merchantRefNum: string | undefined,
+    noun: string,
+    read: (merchantRefNum: string) => Promise<readonly unknown[]>,
+  ): Promise<void> {
+    const refusal = currencyRefusal(currency);
+    if (refusal === undefined) return;
+    if (!merchantRefNum) throw sendRefusal(refusal);
+    let records: readonly unknown[];
+    try {
+      records = await read(merchantRefNum);
+      for (let attempt = 1; records.length === 0 && attempt < REPLAY_READ_ATTEMPTS; attempt += 1) {
+        await this.backoff(attempt);
+        records = await read(merchantRefNum);
+      }
+    } catch (err) {
+      throw sendRefusal(refusal, { noun, failure: err });
+    }
+    throw sendRefusal(refusal, records.length > 0 ? { noun, records } : undefined);
+  }
+
+  /**
+   * What an earlier attempt may have charged under a payment key: the
+   * payments filed under it that may have moved money, and for a bank debit,
+   * whose handle is minted at completion, a spent handle no payment that
+   * moved no money accounts for (see hiddenSpend).
+   */
+  private async chargesUnder(merchantRefNum: string, bankDebit = false): Promise<RefNumRecord[]> {
+    const payments = await this.recordsByRefNum<PaysafePaymentLike>({ lookup: "payment", merchantRefNum }, false);
+    const live: RefNumRecord[] = payments.filter((payment) => !movedNoMoney(payment));
+    if (!bankDebit || live.length > 0) return live;
+    const handles = await this.recordsByRefNum<PaysafePaymentHandleLike>({ lookup: "paymentHandle", merchantRefNum }, false);
+    const spent = hiddenSpend(handles, payments);
+    return spent ? [spent] : [];
   }
 
   /**
@@ -2515,6 +2663,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     fallbackPlan?: PaysafePlanLike,
   ): NativeSubscriptionRecord {
     const plan = sub.plan ?? fallbackPlan;
+    assertUsableRecord(plan?.currencyCode, `Subscription ${sub.id}`, sub, { kind: "read" });
     const interval = FREQUENCY_TO_INTERVAL[(plan?.billingCycle?.frequency ?? "").toUpperCase()];
     const planInterval = plan?.billingCycle?.interval;
     const intervalCount =

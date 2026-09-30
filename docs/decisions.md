@@ -469,6 +469,99 @@ choices they forced:
   `@payfanout/core`, which Worldline's connection check now shares. The adapter's own screen
   above missed such a stretch inside a longer reason (`echo_fragmenttoken` for the token
   `sandbox_fragmenttoken_1234`); one shared helper keeps the two from drifting apart.
+- **Doc-verified 2026-09-26: request limits checked locally.** Checked against the OpenAPI
+  spec, the Limits, Making Requests and Responses and Errors pages, the Fallbacks and
+  Protect+ guides (docs.gocardless.com), and the support centre's Transaction limits page
+  that the spec links from `payments.amount`.
+  - *Metadata.* Every metadata field says "Up to 3 keys are permitted, with key names up
+    to 50 characters and values up to 500 characters." A key name or value the adapter
+    sends over its limit (the `id` is the value of `payfanout_id`, and a refund's `reason`
+    is a value) is refused with `invalid_request` before any request, naming the key, and
+    never truncated. Keys past the third are still withheld, and a withheld key is not
+    checked. GoCardless does not say what it counts as a character. The adapter counts
+    code points, which are never more than the UTF-16 units or UTF-8 bytes of the same
+    text, so it refuses nothing GoCardless accepts under any of those readings; if
+    GoCardless counts units or bytes, text with characters outside ASCII can pass locally
+    and be refused by GoCardless, as before. The spec types the metadata object's values
+    no further, so a value that is not a string (which the TypeScript types do not allow)
+    is sent as it is and measured as the JSON it goes out as. The metadata object has no
+    prototype, so a host key such as `constructor` or `__proto__` is sent like any other;
+    they used to be withheld silently.
+  - *Idempotency keys.* The Limits page: "Keys must be no longer than 128 characters";
+    Responses and Errors: `idempotency_key_too_long`, "Idempotency key exceeded 128
+    characters." Neither page, nor the OpenAPI spec (which defines no Idempotency-Key
+    parameter), states a character set or the unit of the 128. The rule keeps every key
+    GoCardless can have taken as it was, on every runtime the adapter runs on, so a replay
+    across the upgrade keeps its key. `fetch` trims HTTP whitespace (tab, LF, CR, space)
+    from both ends of a header value, so earlier releases sent `"order-42\n"` as `order-42`
+    and 128 characters plus a space as the 128, and such a key is still passed as given
+    (changed in review, 2026-09-30: a first version judged the untrimmed key and would have
+    keyed those replays differently). A key is sent as `payfanout-sha256-` and the SHA-256
+    digest of the key, 81 characters, only when GoCardless never took it: one over 128 code
+    points once trimmed, which GoCardless refused however it counts, as code points are the
+    smallest count of what Workers sends, and one holding a NUL, CR or LF inside the trimmed
+    value, which no runtime sends (the Fetch standard, Node and Cloudflare's workerd all
+    refuse them). Node sends U+0080 to U+00FF as one byte each, which GoCardless may read
+    as UTF-8 (Making Requests: "All requests and responses are JSON-formatted and UTF-8
+    encoded."), so a key of characters up to U+00FF counts as those bytes decoded as UTF-8
+    (`"Ã©"` repeated 65 times is 65 characters so read), and is digested only when that
+    count is over 128 (added in the third review, 2026-09-30). The decoding counts each
+    invalid sequence as one U+FFFD, as `TextDecoder` and common lossy decoders do; a
+    decoder at GoCardless that dropped invalid bytes would count fewer, and could have
+    taken a key the adapter now digests. That is an assumption, as GoCardless documents no
+    decoding. The trim is a linear scan: a regular expression anchored at the end
+    re-scanned a whitespace run from every position, quadratic on a caller's key (flagged
+    by code scanning in the third review). The
+    same key always yields the same header, so a retry replays; the Worldline adapter
+    hashes every key, and PayPal passes a key of at most 38 bytes as given and hashes a
+    longer one. Every other key is passed as given, as before (changed in review,
+    2026-09-30). A second version also digested keys holding a character above U+00FF,
+    which the Fetch standard's Headers refuse. workerd sends them as UTF-8, however
+    (`api/headers.c++` `normalizeHeaderValue`, `util/header-validation.h`: only NUL, CR and
+    LF are refused), so a Workers host retrying a create across the upgrade would have sent
+    a new key and created the resource twice. Node's `fetch` refuses such a key, or one
+    holding an ASCII control character other than tab, or DEL, before sending (observed
+    2026-09-30 on Node 24.21.0 against a local server), so on Node that call still fails as
+    the retryable transport error it always did; the guide advises ASCII keys. A lone
+    surrogate is refused where UTF-8 encoding would make a key share its hash with every
+    key that differs from it only by another lone surrogate: in a key sent as its digest,
+    which GoCardless never took, and in any refund key, whose stamp is the SHA-256 of the
+    key as given. The refund refusal is marked `outcomeUnknown`, since earlier releases
+    stamped such keys and Workers sent them; a shorter key holding one elsewhere goes as
+    given, as Workers always sent it (changed in review, 2026-09-30).
+  - *Accept.* Making Requests: "Include an `Accept` header on all requests:" followed by
+    `Accept: application/json`. Every request sends it, the connection check included.
+  - *Amounts.* The spec types a payment's `amount` ("Amount, in the lowest denomination for
+    the currency") and `amount_refunded`, a refund's `amount`, a payment request's `amount`
+    and a subscription's `amount` and `interval` as `oneOf [string, integer]`. Reads now
+    decode them as the refund path already did: a safe non-negative integer, or a string of
+    ASCII digits naming one, and nothing else; none of these fields is documented as
+    negative. Any other amount rejects the read with a non-retryable `unknown` rather than
+    reach a minor-unit field as a string, a fraction or NaN. `unknown` leaves the outcome
+    open, so a caller retries a money-moving call only under the same key, and
+    `PaymentRouter` neither retries nor fails over on it; `processing_error` would fail
+    over, and `psp_unavailable` would be retried against an answer that does not change.
+    An amount GoCardless leaves out still reads as 0, as before: the spec marks no field
+    required. An `interval` that does not read as an integer of at least 1 omits the
+    subscription's cadence, as an unrecognised `interval_unit` does.
+  - *`fallback_enabled`.* The spec: "(Optional) If true, this billing request can fallback
+    from instant payment to direct debit. Should not be set if GoCardless payment
+    intelligence feature is used." The Fallbacks guide: "Fallbacks should not be used if
+    you are using Protect+ with Verified Mandates.", and the Protect+ guide calls Protect+
+    "our anti-fraud payment intelligence product". A `false` still sets the field, so it is
+    sent only when `fallbackEnabled` is `true`.
+  - *Zero session amounts.* Core's `assertMinorUnitAmount` refuses negative and fractional
+    amounts and accepts 0, which `PaymentService` screens out for an adapter without
+    zero-amount verification; `createPaymentSession` now refuses it too when called
+    directly. The spec gives `payment_request.amount` no minimum. `payments.amount` says
+    "Minimum and maximum amounts vary by payment scheme" and links the Transaction limits
+    page, whose table lists a minimum of 1 for Faster Payments and SEPA (Open Banking),
+    with no unit stated, beside maximums an account can ask GoCardless to raise. The
+    adapter enforces none of these values; below them, GoCardless's own refusal applies.
+  - *Subscription intervals.* `subscriptions.interval`: "Must be greater than or equal to
+    `1`. Must result in at least one charge date per year." `intervalCount` is capped at 52
+    weekly (364 days; 53 weeks can leave a calendar year without a charge), 12 monthly and
+    1 yearly.
 
 ## PayPal adapter (2026-07-07)
 
@@ -5001,6 +5094,231 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   - **Whether the portals' merchant transaction ID is the Payments API's `merchantRefNum`.**
     Search the Business Portal for a settlement by the reference it was made under, and
     record whether it finds it.
+
+## Paysafe: currencies whose exponent may not be PayFanout's (2026-09-27)
+
+- **Paysafe's minor units are those of its own currency table.** Doc-verified 2026-09-26 and
+  re-read unchanged 2026-09-30. The Payments API spec
+  (developer.paysafe.com/fileadmin/openapi-spec/payments-api/apis/paysafe-ph-payments-api.yaml)
+  gives `amount` on `POST /v1/payments` as "This is the amount of the request, in minor units.
+  For example, to process US $10.99, this value should be 1099. See [Currency
+  Codes](https://developer.paysafe.com/en/support/reference-information/codes/#currency-codes).",
+  and links the same table from `amount` on voidauths and payment handles and from
+  `currencyCode`. The Payment Scheduler spec
+  (developer.paysafe.com/fileadmin/openapi-spec/subscriptionsplans-api/apis/paysafe-psp-subscriptionsplans-api.yaml)
+  gives the plan `amount` "in minor units" and links the table from the plan's `currencyCode`.
+  Paysafe.js `tokenize` (developer.paysafe.com/en/api-docs/paysafe-js/tokenize/) takes an
+  `amount` that "is in minor units to charge the customer's card. Use the correct minor units
+  amount for the merchant account currency." The table
+  (developer.paysafe.com/en/support/reference-information/codes/#currency-codes; columns
+  Currency, ISO Code, Exponent Number) has 81 rows. Its introduction reads "The currencies
+  listed in the table below are those in which transaction requests are processed.", "Before
+  going live, ensure to test the end-to-end payment flow, from transaction request to
+  settlement, to verify the right exponent is applied to the currencies." and "If the currency
+  you need for the merchant account is not included in this table, speak to your Account
+  Manager." One `currencyCode` in the spec links an `iso-standards` page instead, which answers
+  404 (again on 2026-09-30).
+- **The table against core, row by row.** Compared programmatically on 2026-09-26, and again on
+  2026-09-30, with core's `getCurrencyExponent` and with the ISO 4217 lists SIX publishes (list
+  one of 2026-09-17, list three of 2026-01-01): 79 rows agree with core, two do not.
+  - **CLP** has the exponent 2 at Paysafe and 0 in ISO 4217 and core. Sent unchanged, CLP 10,000
+    (`amount: 10000`) would be charged, per the table, as CLP 100.00, a hundredth of the price
+    (not observed: see the sandbox checks below).
+  - **BYR** has 0 at Paysafe and 2 in core, which does not list the code and reads it with its
+    default 2: list three gives BYR as withdrawn in 2017-01, and list three publishes no minor
+    units. A BYR amount in core minor units would be charged a hundred times over. A check
+    against ISO 4217 alone misses the row, as list one no longer carries BYR, but the adapter's
+    amounts are core's minor units, so it is refused on the same grounds as CLP.
+  - HRK, LVL and VEF, also withdrawn, and BGN, withdrawn in 2026-01, have 2 on both sides, as do
+    the table's other two-exponent rows. Its other zero-exponent rows (JPY, KRW, PYG, RWF, VND)
+    and every three-exponent row (BHD, JOD, KWD, LYD, OMR, TND) match core.
+- **ISK is a processing currency with no documented exponent.** The card payments page
+  (developer.paysafe.com/en/api-docs/payments-api/add-payment-methods/cards/about-card-payments/)
+  lists "Processing currencies USD, CAD, AUD, EUR, GBP, NOK, ISK, PLN, …, and many more.
+  Please contact your Relationship/ Account manager." ISK is the one currency there, of 31
+  processing and 15 settlement currencies, that the table has no row for, which contradicts
+  the table's own introduction. ISO 4217 gives ISK 0; Adyen prices it with 2 (see the Adyen
+  exclusion above), so an exponent of 2 at Paysafe is plausible, and ISK 10,000 sent as 10000
+  would then be charged as ISK 100.00.
+- **Every currency without a row is the same unknown as ISK** (changed in review, 2026-09-30).
+  The first version refused ISK alone of the currencies the table lacks, and its PR said the
+  others were recorded here, which they were not. The table's introduction makes each of them
+  as unknown as ISK: it lists the currencies "in which transaction requests are processed" and
+  asks merchants to "verify the right exponent is applied". A currency is now refused when its
+  row gives another exponent than core's `getCurrencyExponent`, or when it has no row and core
+  does not price it in hundredths. Against list one of 2026-09-17 (compared 2026-09-30), the
+  currencies without a row that are not priced in hundredths are ISK, BIF, DJF, GNF, KMF, UGX,
+  UYI, VUV, XAF, XOF and XPF (0), IQD (3), and CLF and UYW (4). Core read UYI, which it did not
+  list, with its default 2, the one code of list one whose numeric minor units it misread; the
+  first review round took list one's 0 for UYI from a one-entry map in the adapter, and once
+  core followed list one (see "Core currency exponents checked against ISO 4217" below) the map
+  went, and the rule asks core alone. The refused set is BIF, BYR, CLF, CLP, DJF, GNF, IQD, ISK,
+  KMF, UGX, UYI, UYW, VUV, XAF, XOF and XPF. The rule reads core at call time, so it follows
+  core's exponents if they change, and the only list kept by hand is Paysafe's table, one
+  constant in `src/currency-exponents.ts` cited to the Codes page, which replaces the
+  three-entry exclusion map.
+- **The residual risk: a currency outside the table that is priced in hundredths is sent
+  unchanged** (added in review, 2026-09-30). The table is not exhaustive: the card payments
+  page lists processing currencies "and many more", ISK among them without a row. Refusing every
+  currency without a row would refuse currencies Paysafe may process at the exponent 2 most of
+  its table uses; sending them assumes Paysafe prices them in hundredths too, which no page
+  states. The setup guide's go-live checklist asks the merchant to confirm the exponent of any
+  such currency with the Paysafe account manager, as the Codes page itself asks. ISO 4217 gives
+  XAG, XAU, XBA, XBB, XBC, XBD, XDR, XPD, XPT, XSU, XTS, XUA and XXX no minor unit, and core
+  reads them with 2: they are taken at core's exponent and sent like any code it prices in
+  hundredths, and neither the table nor the card payments page lists any of them. A code ISO
+  4217 withdrew that core does not list and the table lacks (LTL, say) is read with 2 and sent
+  the same way.
+- **Refused, never converted.** A conversion would rest on a table no sandbox run has
+  confirmed, and a wrong entry would charge a hundred times the price. Every call that would
+  send the caller's amount in these currencies, or sign one for sending, refuses with a
+  non-retryable `invalid_request` before any write: `createPaymentSession` on every rail and
+  `updatePaymentSession` (the new currency, or the context's) before any request;
+  `completePayment` for a context an earlier release signed or one made with the exported
+  `encodeSessionContext` (card and bank-debit paths), `chargeSavedPaymentMethod` and
+  `createNativeSubscription` (inline plan or `planId`) once their key is looked up (below).
+  An update that moves a session signed in one to a currency the adapter sends is allowed, as
+  nothing was sent in the refused one. `capturePayment` and `refundPayment` with an amount
+  read the payment and refuse one Paysafe holds in these currencies with `invalid_request`
+  before any settlement or refund request, sending the host to the Paysafe portal; a capture
+  of the authorized amount states an amount too. `verifyPaymentMethod` sends no amount and
+  reports 0, so it is left alone. The messages name Paysafe's exponent and PayFanout's, and
+  `raw` carries `currency`, `paysafeExponent` when the table has a row, and
+  `payfanoutExponent`. They no longer credit core's default to ISO 4217 (changed in review,
+  2026-09-30): BYR's reads "PayFanout reads BYR, a code ISO 4217 withdrew, with the exponent
+  2", and the `raw` field `isoExponent`, which carried core's value, became
+  `payfanoutExponent`.
+- **Voids, and captures and refunds with no amount, refuse with `unsupported_operation`**
+  (changed in review, 2026-09-30). The first version refused them with `invalid_request` as
+  calls that would send an amount in these currencies. They send none of the caller's: a void
+  sends Paysafe's own `availableToSettle`, a capture with no amount Paysafe's own remainder, and
+  a refund with no amount no amount at all. What they cannot do is report their answer, whose
+  amounts are Paysafe's. They refuse once the payment is read, before any settlement, void or
+  refund request, as the subscription cancel does.
+- **Reads refuse with `unsupported_operation`:** `retrievePayment` (before its settlement
+  lookups), `retrieveNativeSubscription`, `retrieveRefund` for a refund whose own
+  `currencyCode` names one of these currencies (below), and `listNativeSubscriptions` (below).
+  Webhook events whose payload `currencyCode` names one carry no `amount` and keep `currency`,
+  as the Adyen adapter's do.
+- **Card refunds and settlements may state no currency: AMBIGUOUS** (added in review,
+  2026-09-30; settlements added in the second review). The refund refusal reads the refund's
+  own `currencyCode`, and the webhook omission the payload's, and Paysafe does not promise
+  either on a card refund. The spec's `refunds` schema, which answers
+  `POST /v1/settlements/{settlementId}/refunds`, `GET /v1/refunds/{refundId}` and the
+  `GET /v1/refunds` lookup, requires `merchantRefNum` alone. Its one card refund example, the
+  "Card" answer to that POST, carries `id`, `merchantRefNum`, `txnTime`, `status` and `amount`,
+  and no `currencyCode`; the lookup examples that carry one ("Look Up Refund", "Look Up Refund
+  Using Merchant Reference Number") are Paysafecash refunds, and the refund webhook examples on
+  the EPS webhooks page carry `currencyCode: "EUR"`. No page shows a card refund webhook. A
+  refund names no payment or settlement (the schema has neither field), so the currency cannot
+  be read from elsewhere. A card refund, read or delivered, that states no currency is therefore
+  reported as it comes, with Paysafe's amount: tests pin both, and the test double answers card
+  refunds that way under a lever. The first version's claim that `retrieveRefund` reads the
+  currency "which the spec's 'Look Up Refund' example carries" held for Paysafecash only. The
+  same holds wider: the spec's settlement "Card" example carries no `currencyCode` either, nor
+  do the refund examples "Process a Refund with Split Payouts" and "Purchase Return
+  Authorization", so a `SETTLEMENT_*` webhook for a payment in a refused currency that states
+  no currency keeps Paysafe's own amount too. The sandbox check below settles both.
+- **`cancelNativeSubscription` reads the subscription first.** The cancel sends no amount but
+  answers with the record, so it reads the subscription before its PATCH and refuses one in
+  these currencies with `unsupported_operation`, since a cancel that went through and then
+  failed to report would fail every retry too. Every cancel pays that read, and a read that
+  fails fails the cancel before anything is sent, with that read's own error. A subscription
+  already stopped (CANCELLED or COMPLETED) in these currencies is refused as well, although its
+  cancel would otherwise succeed through the verified-idempotent re-fetch; its message says it
+  is already stopped and sends the host to read it in the portal (changed in review,
+  2026-09-30).
+- **A subscription list page holding such a subscription fails whole.** The scheduler lists
+  cancelled subscriptions too. Leaving such records off the page was rejected: it would drop
+  them silently. The failure's `raw` names each such subscription with its currency, and no
+  longer carries the whole page with its customer profiles; it carries the `nextCursor` the page
+  would have had, and a `limit` of 1 steps past each such subscription, so the rest of the
+  account stays listable (changed in review, 2026-09-30).
+- **Money in flight at the upgrade** (added in review, 2026-09-30). Native subscriptions an
+  earlier release created in these currencies keep billing at Paysafe's exponent (a CLP 10,000
+  plan bills CLP 100.00 every cycle), and the adapter can no longer read, list or cancel them:
+  the guide and the changeset send the host to the Paysafe portal. `SubscriptionManager`
+  renewals on Paysafe in them now fail with `invalid_request`, which the engine counts as a
+  definitive failure (`DEFINITIVE_FAILURE_CODES`), so they run dunning to cancellation; hosts
+  move those subscriptions first. A browser session signed in one before the upgrade still
+  passes its amount to Paysafe.js `tokenize` (the client adapter's `confirm`), so a 3-D Secure
+  screen could show CLP 100.00 until the session TTL ends; `completePayment` refuses the
+  session, and the client adapter is not changed.
+- **A retry whose earlier attempt the lookup shows is not read as money that did not move**
+  (changed in the second review, 2026-09-30). A completion, a saved-method charge or a
+  native subscription create that an earlier release sent, whose answer was lost, is
+  retried under the same key after the upgrade: a `SubscriptionManager` renewal replays for
+  24 hours, and the engine (`packages/server/src/subscriptions.ts`) reads a plain
+  `invalid_request` as "the PSP answered, and no money moved", closing the attempt and
+  dunning a paid period, or charging it again once the host moves the customer.
+  `docs/adapter-authoring.md` asks for `outcomeUnknown` on "a refusal you cannot resolve" of
+  a call that moves money. So these three calls look their key up before refusing, a read
+  that moves no money: the payments filed under the
+  merchantRefNum (and, for a bank debit, whose handle is minted at completion, a spent handle
+  that no payment which moved no money accounts for, as `hiddenSpend` reads it), or the
+  scheduler's subscriptions under it. A record that may have moved money, any subscription,
+  or a lookup that fails marks the refusal `outcomeUnknown`, with the records on `raw.earlier`
+  (or `raw.lookupFailed` and the failure on `raw.lookupError`) and a message that sends the
+  host to the Paysafe portal; a key that holds nothing, or only failed, voided, cancelled or
+  expired records, keeps it final, as a first attempt's. The lookup goes through the usual
+  transport retries, and, since it can trail the write it indexes, a key that holds nothing
+  is read up to three times, as `readBackPatiently` reads an original, before the refusal is
+  final (added in the third review). What it cannot see stays a residual risk: an earlier
+  attempt still in flight (a rolling deploy, a host's fast retry), or one older than the
+  lookup's 30-day window, meets a final refusal; the changeset's advice to route these
+  currencies away before upgrading covers both. In a `SubscriptionManager` run, a pinned
+  renewal whose key holds a live payment is classified uncertain on every replay and ends
+  frozen, never under a new key, for the host to settle with `resolvePendingRenewal`. A
+  first version marked every completion refusal `outcomeUnknown` and none of the others, on
+  the reasoning that nothing tells a retry from a first attempt; the merchantRefNum lookup
+  the replay machinery already uses does. Refunds and partial captures retried under a
+  reused key have the same gap, but their messages already send the host to the portal to
+  act there, and they are left as they are.
+- **A major release** (decided in the third review, 2026-09-30). CLP and BYR are a mispricing
+  fixed, but the precautionary refusal of the currencies without a row stops traffic Paysafe
+  may have priced correctly, with no option to allow it, so the change is breaking for a
+  merchant who took them; the major keeps it out of `^2` ranges until the host has read the
+  upgrade notes.
+- **`supportedCurrencies` stays undeclared**, as for Adyen: the capability is an allowlist, and
+  the table does not list every currency Paysafe processes ("and many more", and the Account
+  Manager line), so a declared list would refuse currencies Paysafe takes. The router therefore
+  cannot pre-screen these currencies: a Paysafe candidate asked for one refuses with
+  `invalid_request`, which ends the cascade, and hosts route them elsewhere with a currency rule
+  placed before any rule that can send them to Paysafe, since the router takes the first rule
+  that matches (setup guide). A core capability listing the currencies an adapter refuses would
+  let the router skip it; that is a contract change, and a follow-up of its own.
+- **Tests.** Paysafe's table and SIX's list one ship as test fixtures. The table is compared row
+  for row with the constant in `src`; with list one it drives the expected refusals, and every
+  code of either goes through `createPaymentSession`, the refused set computed from the rule and
+  asserted as the set above. JPY, KWD and USD round-trip unchanged. In review (2026-09-30), the
+  new tests were run against the first version: 13 failed, and those that pin behaviour it
+  already had passed. Each mutation of the rule (a row that disagrees sent, a currency without a
+  row priced off hundredths sent, one priced in hundredths refused), of the
+  `unsupported_operation` split, of the stopped-subscription message, of the list failure's
+  `raw`, and of the read before the cancel made a test fail. In the second review, tests were
+  added that seed an earlier release's COMPLETED charge, a declined one, a subscription and a
+  spent bank-debit handle under the retried key, and fail the lookup, and that assert every
+  other refusal kind final (`outcomeUnknown` absent). The conformance suite passes unchanged.
+- **Sandbox checks, not run.** The first two need a merchant account provisioned in the
+  currency; the reference sandbox account is CAD-only. The API reads back the integer it was
+  sent in either case, so the witness is the Paysafe portal, which shows the major-unit amount,
+  or the cardholder's 3-D Secure screen.
+  - **ISK.** Pay and settle `amount: 1000` in ISK, then read the transaction in the portal. ISK
+    1,000 means Paysafe uses the exponent 0, and ISK can leave the refused set. ISK 10.00 means
+    2: ISK stays refused, as a documented deviation like CLP.
+  - **CLP.** The same with `amount: 1000`: CLP 10.00 confirms the table. CLP stays refused
+    either way unless a conversion is decided.
+  - **A card refund's and settlement's currency.** Refund a card payment, read the refund
+    (`GET /v1/refunds/{refundId}`) and receive its `REFUND_COMPLETED` webhook, and the
+    settlement's `SETTLEMENT_COMPLETED` one, and record whether each carries `currencyCode`.
+    Without it, a card refund in a refused currency is reported with Paysafe's amount, and
+    refusing it would need the currency of the payment the host refunded, which the refund
+    does not name.
+- **Open, not changed here.** The scheduler spec's plan `amount`, like the Payments API's
+  `purchaseReturnAuthorization` `amount`, adds "If the merchant account is set up for a currency
+  that has 3 decimal units, our system will half round up the least significant digit.", which
+  the latter completes with "Therefore, a transaction of 10.139 Tunisian dinar would be
+  processed as 10.14." How the scheduler bills a three-decimal plan is a question of its own.
 
 ## Core currency exponents checked against ISO 4217 (2026-09-30)
 

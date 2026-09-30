@@ -1,33 +1,19 @@
 import type { ServerPaymentAdapter } from "./adapters.js";
 import { listedCurrencyCode } from "./screening.js";
 
-/** Options for validateAdapterCapabilities. */
-export interface ValidateAdapterCapabilitiesOptions {
-  /**
-   * Report only what stops the adapter from working, as PaymentService does
-   * at registration. A declaration that works but is not written in its
-   * canonical form (an `unsupportedCurrencies` code in lowercase) is then left
-   * out; without this option it is reported too, and the conformance suite,
-   * which passes no options, fails the adapter on it.
-   */
-  registration?: boolean;
-}
-
 /**
  * The capability coherence rule table: every flag an adapter claims must be
  * backed by the matching implemented surface. The two retrieval flags are
  * checked BOTH ways — they gate conformance assertions rather than only
  * describing the provider, so denying an implemented read would buy silence.
- * Returns one message per violation, in rule order, empty when coherent.
- * `@payfanout/server`'s PaymentService rejects registration on the first
- * violation (in `registration` mode) and the conformance suite asserts an
- * empty result — both consume this single implementation so the two can never
- * drift.
+ * Returns one message per violation, in rule order, empty when coherent. It
+ * reports only what stops a declaration from working. `@payfanout/server`'s
+ * PaymentService rejects registration on the first violation and the
+ * conformance suite asserts an empty result, both from this single
+ * implementation, so the two differ only by the suite's own checks of the
+ * form currency and country codes are written in.
  */
-export function validateAdapterCapabilities(
-  adapter: ServerPaymentAdapter,
-  options: ValidateAdapterCapabilitiesOptions = {},
-): string[] {
+export function validateAdapterCapabilities(adapter: ServerPaymentAdapter): string[] {
   const caps = adapter.getCapabilities();
   const issues: string[] = [];
   if (caps.pspName !== adapter.pspName) {
@@ -77,12 +63,11 @@ export function validateAdapterCapabilities(
     issues.push(`Adapter "${adapter.pspName}" claims multi-capture without manual capture support`);
   }
   // unsupportedCurrencies is a router pre-screen input, read here as
-  // screening reads it (listedCurrencyCode). An entry that can never match
-  // fails everywhere: the adapter's own refusal of the currency it meant would
-  // end the cascade. One that matches in another form ("ugx") works, so only
-  // the conformance suite, which passes no options, asks for the uppercase form
-  // it asks of the other currency lists. The rules below it read well-formed
-  // entries only.
+  // screening reads it (listedCurrencyCode). An entry that can never match is
+  // reported: the adapter's own refusal of the currency it meant would end the
+  // cascade. One that matches in another form ("ugx") works and passes here;
+  // the conformance suite checks the bare uppercase form, as it does for the
+  // other currency lists. The rules below read well-formed entries only.
   const declared = caps.supportedCurrencies ?? [];
   const refused: string[] = [];
   for (const entry of caps.unsupportedCurrencies ?? []) {
@@ -95,12 +80,6 @@ export function validateAdapterCapabilities(
       continue;
     }
     refused.push(code);
-    if (!options.registration && entry !== code) {
-      issues.push(
-        `Adapter "${adapter.pspName}" declares "${entry}" in unsupportedCurrencies; write it "${code}", the ` +
-          "uppercase ISO 4217 form",
-      );
-    }
     // Compared as screening reads the allowlist: each entry uppercased.
     if (declared.some((listed) => typeof listed === "string" && listed.toUpperCase() === code)) {
       issues.push(`Adapter "${adapter.pspName}" declares ${code} in both supportedCurrencies and unsupportedCurrencies`);

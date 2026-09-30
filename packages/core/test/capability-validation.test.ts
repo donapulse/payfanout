@@ -284,40 +284,48 @@ describe("validateAdapterCapabilities", () => {
   const neverMatches = (entry: string) =>
     `Adapter "fake" declares ${entry} in unsupportedCurrencies, which can never match a session's currency: ` +
     "it is not a three-letter code";
-  const notUppercase = (entry: string, code: string) =>
-    `Adapter "fake" declares "${entry}" in unsupportedCurrencies; write it "${code}", the uppercase ISO 4217 form`;
+  const both = (code: string) => `Adapter "fake" declares ${code} in both supportedCurrencies and unsupportedCurrencies`;
 
-  it("flags an unsupportedCurrencies entry that can never match, at registration too", () => {
-    const adapter = makeAdapter({ unsupportedCurrencies: ["UGX", 123, null, "UG", "UGXX", ""] as unknown as string[] });
-    const expected = [
+  it("flags an unsupportedCurrencies entry that can never match", () => {
+    expect(
+      validateAdapterCapabilities(
+        makeAdapter({ unsupportedCurrencies: ["UGX", 123, null, "UG", "UGXX", ""] as unknown as string[] }),
+      ),
+    ).toEqual([
       neverMatches("123"),
       neverMatches("null"),
       neverMatches('"UG"'),
       neverMatches('"UGXX"'),
       neverMatches('""'),
-    ];
-    expect(validateAdapterCapabilities(adapter)).toEqual(expected);
-    expect(validateAdapterCapabilities(adapter, { registration: true })).toEqual(expected);
-  });
-
-  it("asks for the uppercase form, except at registration, which accepts any form screening matches", () => {
-    const adapter = makeAdapter({ unsupportedCurrencies: ["ugx", " CLP", "Isk", "JPY"] });
-    expect(validateAdapterCapabilities(adapter)).toEqual([
-      notUppercase("ugx", "UGX"),
-      notUppercase(" CLP", "CLP"),
-      notUppercase("Isk", "ISK"),
     ]);
-    expect(validateAdapterCapabilities(adapter, { registration: true })).toEqual([]);
   });
 
-  it("flags a currency declared in both supportedCurrencies and unsupportedCurrencies, at registration too", () => {
-    const adapter = makeAdapter({
-      supportedCurrencies: ["GBP", "ugx", "EUR"],
-      unsupportedCurrencies: ["UGX", "eur", "USD"],
-    });
-    const both = (code: string) => `Adapter "fake" declares ${code} in both supportedCurrencies and unsupportedCurrencies`;
-    expect(validateAdapterCapabilities(adapter, { registration: true })).toEqual([both("UGX"), both("EUR")]);
-    expect(validateAdapterCapabilities(adapter)).toEqual([both("UGX"), notUppercase("eur", "EUR"), both("EUR")]);
+  it("accepts an entry screening matches in another form; its bare uppercase form is the suite's check", () => {
+    expect(
+      validateAdapterCapabilities(makeAdapter({ unsupportedCurrencies: ["ugx", " CLP", "Isk", "JPY"] })),
+    ).toEqual([]);
+  });
+
+  it("flags a currency declared in both supportedCurrencies and unsupportedCurrencies", () => {
+    expect(
+      validateAdapterCapabilities(
+        makeAdapter({ supportedCurrencies: ["GBP", "ugx", "EUR"], unsupportedCurrencies: ["UGX", "eur", "USD"] }),
+      ),
+    ).toEqual([both("UGX"), both("EUR")]);
+  });
+
+  it("reads supportedCurrencies as screening does when comparing the two lists", () => {
+    // Screening uppercases allowlist entries without trimming them, so " UGX"
+    // admits no UGX session and contradicts nothing on the other list.
+    expect(
+      validateAdapterCapabilities(makeAdapter({ supportedCurrencies: [" UGX"], unsupportedCurrencies: ["UGX"] })),
+    ).toEqual([]);
+    // An allowlist entry that is not a string admits nothing and throws nothing.
+    expect(
+      validateAdapterCapabilities(
+        makeAdapter({ supportedCurrencies: [123, "gbp"] as unknown as string[], unsupportedCurrencies: ["GBP", "UGX"] }),
+      ),
+    ).toEqual([both("GBP")]);
   });
 
   it("reads well-formed entries only in the rail rule, and never throws on another one", () => {
@@ -330,7 +338,6 @@ describe("validateAdapterCapabilities", () => {
             { type: "interac_etransfer", flow: "redirect", supported: true, currencies: ["UG"] },
           ],
         }),
-        { registration: true },
       ),
     ).toEqual([
       neverMatches("123"),

@@ -18,6 +18,13 @@ import { runServerAdapterConformanceTests } from "../src/index.js";
 const HMAC_KEY = "push-only-conformance-key";
 const SIGNATURE_HEADER = "x-push-only-signature";
 
+/**
+ * XTS, the code ISO 4217 reserves for testing: refused on every session and
+ * declared in unsupportedCurrencies, as a provider refusing a few currencies
+ * declares them, so the suite's check of that list runs on a passing adapter.
+ */
+const REFUSED_CURRENCIES = ["XTS"];
+
 interface StoredPayment {
   id: string;
   amount: MinorUnitAmount;
@@ -55,12 +62,16 @@ class PushOnlyAdapter implements ServerPaymentAdapter {
       webhookSignatureScope: "raw-bytes", // HMAC over the delivered body
       requiresServerCompletion: false,
       paymentMethods: [{ type: "card", flow: "embedded", supported: true }],
+      unsupportedCurrencies: [...REFUSED_CURRENCIES],
     };
   }
 
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     const pspSessionId = this.nextId("ref");
     const currency = input.currency.toUpperCase();
+    if (REFUSED_CURRENCIES.includes(currency)) {
+      throw PayFanoutError.invalidRequest(`The push-only adapter refuses ${currency}`);
+    }
     const id = input.id ?? pspSessionId;
     this.payments.set(pspSessionId, { id, amount: input.amount, currency });
     return {

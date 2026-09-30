@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { StripeClientAdapter, type StripeJsLike } from "../src/index.js";
 
+const API_VERSION = "2026-08-26.dahlia";
+
 afterEach(() => vi.unstubAllGlobals());
 
 function stubBrowser(): void {
@@ -20,6 +22,7 @@ function makeAdapter(fake: Partial<StripeJsLike>): StripeClientAdapter {
   return new StripeClientAdapter({
     publishableKey: "pk_test",
     environment: "sandbox",
+    apiVersion: API_VERSION,
     getStripeGlobal: () => () => full,
     loadScript: async () => {},
   });

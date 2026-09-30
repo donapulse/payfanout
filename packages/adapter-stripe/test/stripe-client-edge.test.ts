@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { getUserMessage } from "@payfanout/core";
 import { StripeClientAdapter, type StripeJsFactory, type StripeJsLike } from "../src/index.js";
 
+const API_VERSION = "2026-08-26.dahlia";
+
 afterEach(() => vi.unstubAllGlobals());
 
 function stubBrowser(): void {
@@ -12,21 +14,22 @@ function stubBrowser(): void {
 describe("StripeClientAdapter edge cases", () => {
   it("validates its config eagerly", () => {
     expect(
-      () => new StripeClientAdapter({ publishableKey: "", environment: "sandbox" }),
+      () => new StripeClientAdapter({ publishableKey: "", environment: "sandbox", apiVersion: API_VERSION }),
     ).toThrowError(/publishableKey/);
     expect(
-      () => new StripeClientAdapter({ publishableKey: "pk", environment: "test" as never }),
+      () => new StripeClientAdapter({ publishableKey: "pk", environment: "test" as never, apiVersion: API_VERSION }),
     ).toThrowError(/sandbox.*live/);
   });
 
   it("loadSdk rejects during SSR and when the script loads but the global is missing", async () => {
-    const noDom = new StripeClientAdapter({ publishableKey: "pk", environment: "sandbox" });
+    const noDom = new StripeClientAdapter({ publishableKey: "pk", environment: "sandbox", apiVersion: API_VERSION });
     await expect(noDom.loadSdk()).rejects.toThrowError(/browser-only/);
 
     stubBrowser();
     const adapter = new StripeClientAdapter({
       publishableKey: "pk",
       environment: "sandbox",
+      apiVersion: API_VERSION,
       loadScript: async () => {}, // "loads" but never defines window.Stripe
       getStripeGlobal: () => undefined,
     });
@@ -45,6 +48,7 @@ describe("StripeClientAdapter edge cases", () => {
     const adapter = new StripeClientAdapter({
       publishableKey: "pk",
       environment: "sandbox",
+      apiVersion: API_VERSION,
       getStripeGlobal: () => undefined,
       loadScript: () => (++loads === 1 ? firstLoad : new Promise<void>(() => {})),
     });
@@ -67,6 +71,7 @@ describe("StripeClientAdapter edge cases", () => {
     const adapter = new StripeClientAdapter({
       publishableKey: "pk",
       environment: "sandbox",
+      apiVersion: API_VERSION,
       getStripeGlobal: () => stripe,
       loadScript: async () => {
         loads++;
@@ -91,6 +96,7 @@ describe("StripeClientAdapter edge cases", () => {
     const adapter = new StripeClientAdapter({
       publishableKey: "pk",
       environment: "sandbox",
+      apiVersion: API_VERSION,
       getStripeGlobal: () => stripe,
       loadScript: async () => {
         loads++;
@@ -123,6 +129,7 @@ describe("StripeClientAdapter edge cases", () => {
     const adapter = new StripeClientAdapter({
       publishableKey: "pk",
       environment: "sandbox",
+      apiVersion: API_VERSION,
       returnUrl: "https://host.example/return",
       getStripeGlobal: () => () => fake,
       loadScript: async () => {},
@@ -140,6 +147,7 @@ describe("StripeClientAdapter edge cases", () => {
       new StripeClientAdapter({
         publishableKey: "pk",
         environment: "sandbox",
+        apiVersion: API_VERSION,
         getStripeGlobal: () => () => ({
           elements: () => ({ create: () => element }),
           confirmPayment: async () => ({ error }),
@@ -181,6 +189,7 @@ describe("StripeClientAdapter edge cases", () => {
       const adapter = new StripeClientAdapter({
         publishableKey: "pk",
         environment: "sandbox",
+        apiVersion: API_VERSION,
         getStripeGlobal: () => () => ({
           elements: () => ({ create: () => ({ mount: () => {}, unmount: () => {}, destroy: () => {}, on: () => {} }) }),
           confirmPayment: async () => ({ error }),
@@ -194,7 +203,12 @@ describe("StripeClientAdapter edge cases", () => {
     };
     const cases: Array<[Record<string, string>, string, boolean]> = [
       // 2026-08-26.dahlia's payment-method spellings, and the region-specific incorrect_zip.
+      [{ type: "card_error", code: "expired_card" }, "expired_card", false],
       [{ type: "card_error", code: "expired_payment_method" }, "expired_card", false],
+      // 2026-08-26.dahlia's restriction code is a plain decline, unless a fraud decline code
+      // comes with it, as on the server.
+      [{ type: "card_error", code: "payment_method_restricted" }, "card_declined", false],
+      [{ type: "card_error", code: "payment_method_restricted", decline_code: "lost_card" }, "fraud_suspected", false],
       [{ type: "card_error", code: "incorrect_postal_code" }, "invalid_card_data", false],
       [{ type: "card_error", code: "incorrect_zip" }, "invalid_card_data", false],
       // A wrong address, as an error code or the issuer's decline code, like incorrect_zip.
@@ -272,6 +286,7 @@ describe("StripeClientAdapter edge cases", () => {
       const adapter = new StripeClientAdapter({
         publishableKey: "pk",
         environment: "sandbox",
+        apiVersion: API_VERSION,
         ...(locale === undefined ? {} : { locale }),
         getStripeGlobal: () => factory,
         loadScript: async () => {},
@@ -285,6 +300,7 @@ describe("StripeClientAdapter edge cases", () => {
     const noBrowserLocale = new StripeClientAdapter({
       publishableKey: "pk",
       environment: "sandbox",
+      apiVersion: API_VERSION,
       getStripeGlobal: () => factory,
       loadScript: async () => {},
     });
@@ -306,6 +322,7 @@ describe("StripeClientAdapter edge cases", () => {
     const adapter = new StripeClientAdapter({
       publishableKey: "pk",
       environment: "sandbox",
+      apiVersion: API_VERSION,
       locale: "de",
       getStripeGlobal: () => factory,
       loadScript: async () => {},
@@ -333,6 +350,7 @@ describe("StripeClientAdapter edge cases", () => {
     const adapter = new StripeClientAdapter({
       publishableKey: "pk",
       environment: "sandbox",
+      apiVersion: API_VERSION,
       getStripeGlobal: () => () => ({
         elements: () => ({ create: () => element }),
         confirmPayment: async () => ({ paymentIntent: { status: "succeeded" } }),
@@ -363,6 +381,7 @@ describe("StripeClientAdapter edge cases", () => {
     const adapter = new StripeClientAdapter({
       publishableKey: "pk",
       environment: "sandbox",
+      apiVersion: API_VERSION,
       locale: "en", // config default…
       getStripeGlobal: () => (_key, factoryOptions) => {
         factoryCalls.push(factoryOptions);
@@ -399,6 +418,7 @@ describe("StripeClientAdapter edge cases", () => {
     const adapter = new StripeClientAdapter({
       publishableKey: "pk",
       environment: "sandbox",
+      apiVersion: API_VERSION,
       paymentMethods: [{ type: "card", flow: "embedded", supported: true }],
     });
     expect(adapter.listPaymentMethodCapabilities()).toEqual([

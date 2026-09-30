@@ -283,6 +283,51 @@ describe("PaymentRouter failover cascade", () => {
     expect(sepaPsp.calls.length).toBe(0); // screened out before any adapter call
   });
 
+  it("skips a candidate that refuses the currency outright and reaches the next one", async () => {
+    // A PSP that takes most currencies cannot list them in supportedCurrencies.
+    // Undeclared, its local refusal is a business rejection that ends the
+    // cascade before the next PSP is tried.
+    const undeclared = new FakeAdapter({ pspName: "undeclared" });
+    failWith(undeclared, PayFanoutError.invalidRequest("The adapter refuses UGX"));
+    const fallback = new FakeAdapter({ pspName: "fallback" });
+    const before = new PaymentRouter({ service: new PaymentService({ adapters: [undeclared, fallback] }) });
+    await expect(before.createPaymentSession(input({ currency: "UGX" }))).rejects.toMatchObject({
+      code: "invalid_request",
+      pspName: "undeclared",
+    });
+    expect(fallback.calls).toHaveLength(0);
+
+    // Declared, the router skips it without a PSP call.
+    const refusing = new FakeAdapter({ pspName: "refusing", capabilities: { unsupportedCurrencies: ["UGX"] } });
+    const serving = new FakeAdapter({ pspName: "serving" });
+    const router = new PaymentRouter({ service: new PaymentService({ adapters: [refusing, serving] }) });
+    const result = await router.createPaymentSession(input({ currency: " ugx " }));
+    expect(result.pspName).toBe("serving");
+    expect(result.attempts).toHaveLength(1);
+    expect(result.attempts[0]).toMatchObject({ pspName: "refusing", skipped: true });
+    expect(result.attempts[0]?.error).toMatchObject({ code: "unsupported_operation", retryable: false });
+    expect(result.attempts[0]?.error.message).toBe('"refusing" declares currency UGX unsupported');
+    expect(refusing.calls).toHaveLength(0);
+    // Every other currency still goes to it first.
+    expect((await router.createPaymentSession(input({ currency: "USD" }))).pspName).toBe("refusing");
+  });
+
+  it("fails with the diagnostic error when every candidate refuses the currency", async () => {
+    const a = new FakeAdapter({ pspName: "psp-a", capabilities: { unsupportedCurrencies: ["CLP"] } });
+    const b = new FakeAdapter({ pspName: "psp-b", capabilities: { supportedCurrencies: ["USD"] } });
+    const router = new PaymentRouter({ service: new PaymentService({ adapters: [a, b] }) });
+    await expect(router.createPaymentSession(input({ currency: "CLP" }))).rejects.toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      message: "No PSP in the routing chain [psp-a, psp-b] can serve this payment",
+      raw: [
+        { pspName: "psp-a", code: "unsupported_operation", message: '"psp-a" declares currency CLP unsupported' },
+        { pspName: "psp-b", code: "unsupported_operation", message: '"psp-b" does not support currency CLP' },
+      ],
+    });
+    expect([...a.calls, ...b.calls]).toHaveLength(0);
+  });
+
   it("fails a country-ineligible rail over to a PSP that can serve the customer", async () => {
     // A Canadian customer paying by bank debit. Both PSPs offer a CAD debit
     // rail, but one is Bacs — UK bank accounts only. Stated customerCountry

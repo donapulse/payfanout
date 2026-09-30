@@ -1,6 +1,12 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { isPayFanoutError, type ServerPaymentAdapter } from "@payfanout/core";
+import {
+  isPayFanoutError,
+  listNonDefaultCurrencyExponents,
+  screenSessionInput,
+  validateAdapterCapabilities,
+  type ServerPaymentAdapter,
+} from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
 import {
   adyenOnboarding,
@@ -71,6 +77,27 @@ const CLIENT_TOKEN = cardToken();
 /** The bare paymentMethod earlier client adapters send, which carries no browser data. */
 function bareCardToken(paymentMethod: Record<string, string> = {}): string {
   return JSON.stringify({ ...CARD, ...paymentMethod });
+}
+
+/**
+ * Which of `codes` createPaymentSession refuses for 1000 minor units. Every
+ * refusal counts and must be the currency refusal itself, an invalid_request
+ * naming the currency on raw; every other outcome must be the session asked for.
+ */
+async function refusedSessions(adapter: AdyenServerAdapter, codes: Iterable<string>): Promise<string[]> {
+  const refused: string[] = [];
+  for (const currency of codes) {
+    const outcome: unknown = await adapter
+      .createPaymentSession({ amount: 1000, currency, idempotencyKey: `k-${currency}` })
+      .catch((err: unknown) => err);
+    if (isPayFanoutError(outcome)) {
+      expect(outcome, currency).toMatchObject({ code: "invalid_request", raw: { currency } });
+      refused.push(currency);
+    } else {
+      expect(outcome, currency).toMatchObject({ amount: 1000, currency });
+    }
+  }
+  return refused.sort();
 }
 
 function makePair(config: Partial<AdyenServerAdapterConfig> = {}): {
@@ -647,22 +674,30 @@ describe("AdyenServerAdapter specifics", () => {
     expect(refused.code).toBe("card_declined");
   });
 
-  it("omits a webhook amount priced on a deviating exponent", async () => {
+  it("omits a webhook amount priced on a deviating exponent, for every currency it declares", async () => {
     const { adapter } = makePair();
-    const item = signed({
-      amount: { currency: "ISK", value: 1000 },
-      eventCode: "AUTHORISATION",
-      eventDate: "2026-08-02T10:00:00+02:00",
-      merchantAccountCode: "TestMerchant",
-      merchantReference: "outside-payfanout",
-      pspReference: "8836100000000099",
-      success: "true",
-    });
-    const event = await adapter.parseWebhookEvent(envelope(item));
+    const item = (currency: string) =>
+      signed({
+        amount: { currency, value: 1000 },
+        eventCode: "AUTHORISATION",
+        eventDate: "2026-08-02T10:00:00+02:00",
+        merchantAccountCode: "TestMerchant",
+        merchantReference: "outside-payfanout",
+        pspReference: "8836100000000099",
+        success: "true",
+      });
     // ISK is 0-decimal in ISO 4217 and 2-decimal at Adyen; reporting the raw
-    // value would be off by a factor of 100.
-    expect(event.amount).toBeUndefined();
-    expect(event.currency).toBe("ISK");
+    // value would be off by a factor of 100. The webhook reads the same map as
+    // the declaration, so each declared currency omits its amount.
+    const declared = adapter.getCapabilities().unsupportedCurrencies ?? [];
+    expect(declared).toEqual(["CLP", "CVE", "IDR", "ISK"]);
+    for (const currency of declared) {
+      const event = await adapter.parseWebhookEvent(envelope(item(currency)));
+      expect(event.amount, currency).toBeUndefined();
+      expect(event.currency).toBe(currency);
+    }
+    const usd = await adapter.parseWebhookEvent(envelope(item("USD")));
+    expect(usd.amount).toBe(1000);
   });
 
   it("maps refusal reason codes onto the taxonomy and never marks them retryable", async () => {
@@ -817,6 +852,38 @@ describe("AdyenServerAdapter specifics", () => {
         adapter.createPaymentSession({ amount: 1000, currency, idempotencyKey: "k" }),
       ).rejects.toMatchObject({ code: "invalid_request" });
     }
+  });
+
+  it("fails registration for a paymentMethods override whose rail takes declared currencies alone", () => {
+    const { adapter } = makePair({
+      paymentMethods: [
+        { type: "card", flow: "embedded", supported: true },
+        { type: "ideal", flow: "redirect", supported: true, currencies: ["ISK"] },
+      ],
+    });
+    const issues = validateAdapterCapabilities(adapter);
+    expect(issues).toContainEqual(
+      expect.stringMatching(/offers ideal in ISK but declares each of those currencies in unsupportedCurrencies/),
+    );
+    expect(validateAdapterCapabilities(makePair().adapter)).toEqual([]);
+  });
+
+  it("declares exactly the currencies createPaymentSession refuses, so screening refuses them first", async () => {
+    const { adapter } = makePair();
+    const caps = adapter.getCapabilities();
+    expect(caps.unsupportedCurrencies).toEqual(["CLP", "CVE", "IDR", "ISK"]);
+    expect(validateAdapterCapabilities(adapter)).toEqual([]);
+    const codes = new Set([
+      ...listNonDefaultCurrencyExponents().map(([code]) => code),
+      ...["CLP", "CVE", "IDR", "ISK", "USD", "EUR", "GBP", "CNY", "KHR", "MGA"],
+    ]);
+    expect(await refusedSessions(adapter, codes)).toEqual(caps.unsupportedCurrencies);
+    for (const currency of caps.unsupportedCurrencies ?? []) {
+      expect(screenSessionInput(caps, { amount: 1000, currency: currency.toLowerCase(), idempotencyKey: "k" })).toBe(
+        `"adyen" declares currency ${currency} unsupported`,
+      );
+    }
+    expect(screenSessionInput(caps, { amount: 1000, currency: "JPY", idempotencyKey: "k" })).toBeUndefined();
   });
 
   it("targets the pinned Checkout version, and the live host only with a live URL prefix", async () => {

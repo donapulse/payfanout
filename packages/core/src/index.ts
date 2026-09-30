@@ -5,6 +5,7 @@ export {
   formatMinorUnits,
   fromMinorUnits,
   getCurrencyExponent,
+  listNonDefaultCurrencyExponents,
   NO_CURRENCY,
   normalizeCurrency,
   toMinorUnits,

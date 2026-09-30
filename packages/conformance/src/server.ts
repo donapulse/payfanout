@@ -206,6 +206,12 @@ export function runServerAdapterConformanceTests(
       for (const currency of caps.supportedCurrencies ?? []) {
         expect(currency).toMatch(/^[A-Z]{3}$/);
       }
+      // unsupportedCurrencies is the same input, inverted. Core already fails
+      // an entry that can never match; a working one is held here to the bare
+      // uppercase form of the lists above.
+      for (const currency of caps.unsupportedCurrencies ?? []) {
+        expect(currency).toMatch(/^[A-Z]{3}$/);
+      }
     });
 
     if (fixtures.onboarding) {

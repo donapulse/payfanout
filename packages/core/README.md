@@ -33,7 +33,7 @@ it explicitly to use its helpers directly.
   `CreatePaymentSessionInput`, `CompletePaymentInput`, `RefundRequest`, `MountOptions`, …).
 - **Currency helpers**, integer minor units done right per currency (JPY has 0 decimals, BHD
   has 3): `toMinorUnits`, `fromMinorUnits`, `formatMinorUnits`, `getCurrencyExponent`,
-  `normalizeCurrency`, `assertMinorUnitAmount`.
+  `listNonDefaultCurrencyExponents`, `normalizeCurrency`, `assertMinorUnitAmount`.
 - **Errors**, one `PayFanoutError` (a real `Error` subclass) with a unified `code`, user-safe
   `message`, a `retryable` flag, and the untouched PSP error kept on `raw`. Plus
   `isPayFanoutError`, and localization via `registerErrorMessages` / `localizeError`.

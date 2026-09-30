@@ -49,23 +49,37 @@ export function currencyUnits(currency: unknown): CurrencyUnits | undefined {
 export interface SendTarget {
   /** How the message names the amount: the request field (`amount_to_capture`), or a phrase. */
   label: string;
+  /** The record the call read to learn the currency, having been given none. */
+  record?: RecordTarget;
   /**
-   * The record the call read to learn the currency, having been given none:
-   * `action` names the call ("capture") and `remedy` ends the message.
+   * Set on a call an earlier release sent unconverted, when the adapter cannot
+   * tell that nothing moved under the same key: it names what that release may
+   * already have done ("a charge", "a capture"). The refusals that release
+   * would not have made, UGX and an amount that is not whole in Stripe's
+   * units, then leave the outcome open, and ask the host to look for it under
+   * the key in the Stripe Dashboard before sending another.
    */
-  record?: { subject: string; raw: unknown; action: string; remedy: string };
-  /**
-   * A charge or subscription create, which earlier releases sent in this
-   * currency unconverted: one under the same key may already have charged,
-   * and the adapter cannot read it back, so a refusal that release would not
-   * have made leaves the outcome open.
-   */
-  sentBefore?: boolean;
+  sentBefore?: string;
 }
 
-const SENT_BEFORE =
-  ". An earlier release sent such requests unconverted, so check the Stripe Dashboard for a charge under this " +
-  "idempotency key before sending another";
+/** A record read first; the refusal of an amount for a UGX one names it. */
+export interface RecordTarget {
+  /** How messages name it: "PaymentIntent pi_1". */
+  subject: string;
+  /** The record itself, carried on the refusal's `raw.record`. */
+  raw: unknown;
+  /** The call, as the refusal names it: "capture". */
+  action: string;
+  /** How that refusal ends: what to check in the Stripe Dashboard before acting on the record another way. */
+  remedy: string;
+  /**
+   * Whether that refusal leaves the outcome open: an earlier release sent the
+   * call unconverted, and the record does not show that nothing moved.
+   */
+  outcomeUnknown: boolean;
+}
+
+const SENT_BEFORE = ". An earlier release sent such requests unconverted";
 
 /**
  * Refuses a call that would send an amount in `currency`, before any request:
@@ -79,11 +93,9 @@ export function assertSendableCurrency(currency: string, target: SendTarget): vo
  * The `amount` to send Stripe for a PayFanout amount in `currency`. Throws a
  * non-retryable invalid_request, for the call to reject before the request
  * that would carry it, when Stripe cannot be sent the amount: any UGX amount;
- * an MGA amount that is not whole ariary (a multiple of 100); an ISK amount
- * that leaves the safe integer range once multiplied by 100; and a
- * three-decimal amount that is not a multiple of 10, a rule from an earlier
- * version of Stripe's currencies page, which no longer covers three-decimal
- * currencies.
+ * an MGA amount that is not whole ariary (a multiple of 100); and an ISK
+ * amount that leaves the safe integer range once multiplied by 100. See
+ * `SendTarget` for the refusals that leave the outcome open.
  */
 export function toStripeAmount(amount: MinorUnitAmount, currency: string, target: SendTarget): number {
   const units = sendableUnits(currency, target);
@@ -91,9 +103,8 @@ export function toStripeAmount(amount: MinorUnitAmount, currency: string, target
   const { currency: code, payfanoutExponent, stripeExponent } = units;
   const raw = { ...units, amount, ...(target.record ? { record: target.record.raw } : {}) };
   const shift = stripeExponent - payfanoutExponent;
-  let stripeAmount = amount;
   if (shift > 0) {
-    stripeAmount = amount * 10 ** shift;
+    const stripeAmount = amount * 10 ** shift;
     if (!Number.isSafeInteger(stripeAmount)) {
       throw refusal(
         "invalid_request",
@@ -102,28 +113,39 @@ export function toStripeAmount(amount: MinorUnitAmount, currency: string, target
         raw,
       );
     }
-  } else if (shift < 0) {
+    return stripeAmount;
+  }
+  if (shift < 0) {
     const divisor = 10 ** -shift;
     if (amount % divisor !== 0) {
       throw refusal(
         "invalid_request",
         `Stripe takes ${code} amounts with ${stripeExponent} decimals where PayFanout has ${payfanoutExponent}, so ` +
-          `${target.label} must be a multiple of ${divisor} minor units, got ${amount}` +
-          (target.sentBefore === true ? SENT_BEFORE : ""),
+          `${target.label} must be a multiple of ${divisor} minor units, got ${amount}${sentBefore(target)}`,
         raw,
-        target.sentBefore === true,
+        target.sentBefore !== undefined,
       );
     }
-    stripeAmount = amount / divisor;
+    return amount / divisor;
   }
-  if (stripeExponent === 3 && stripeAmount % 10 !== 0) {
-    throw refusal(
-      "invalid_request",
-      `Stripe requires three-decimal ${code} amounts to be a multiple of 10 minor units, got ${amount}`,
-      raw,
-    );
-  }
-  return stripeAmount;
+  return amount;
+}
+
+/**
+ * Refuses a three-decimal amount that is not a multiple of 10, a rule from an
+ * earlier version of Stripe's currencies page, which no longer covers
+ * three-decimal currencies. It applies where the adapter applied it before it
+ * converted amounts: session creation, an update naming both amount and
+ * currency, saved-method charges and native subscriptions.
+ */
+export function assertThreeDecimalRule(amount: MinorUnitAmount, currency: string): void {
+  const units = currencyUnits(currency);
+  if (units?.stripeExponent !== 3 || amount % 10 === 0) return;
+  throw refusal(
+    "invalid_request",
+    `Stripe requires three-decimal ${units.currency} amounts to be a multiple of 10 minor units, got ${amount}`,
+    { ...units, amount },
+  );
 }
 
 function sendableUnits(currency: string, target: SendTarget): Required<CurrencyUnits> | undefined {
@@ -133,20 +155,29 @@ function sendableUnits(currency: string, target: SendTarget): Required<CurrencyU
   if (stripeExponent !== undefined) return { ...units, stripeExponent };
   const why = contradiction(units.currency);
   if (target.record) {
-    const { subject, raw, action, remedy } = target.record;
+    const { subject, raw, action, remedy, outcomeUnknown } = target.record;
     throw refusal(
       "invalid_request",
-      `${subject} is in ${units.currency}, so no amount can be sent for its ${action}: ${why}. ${remedy}`,
+      `${subject} is in ${units.currency}, so no amount can be sent for its ${action}: ${why}` +
+        `${outcomeUnknown ? SENT_BEFORE : ""}. ${remedy}`,
       { ...units, record: raw },
+      outcomeUnknown,
     );
   }
   throw refusal(
     "invalid_request",
     `The Stripe adapter refuses ${units.currency}: ${why}. Take ${units.currency} payments with another provider` +
-      (target.sentBefore === true ? SENT_BEFORE : ""),
+      sentBefore(target),
     { ...units },
-    target.sentBefore === true,
+    target.sentBefore !== undefined,
   );
+}
+
+function sentBefore(target: SendTarget): string {
+  return target.sentBefore === undefined
+    ? ""
+    : `${SENT_BEFORE}, so check the Stripe Dashboard for ${target.sentBefore} under this idempotency key before ` +
+        "sending another";
 }
 
 type Reading = { amount: number; reason?: undefined } | { amount?: undefined; reason: string };

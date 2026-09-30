@@ -5030,12 +5030,31 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   two-decimal value, where the decimal amount is always `00`. For example, to charge 5 ISK,
   provide an `amount` value of `500`. You can't charge fractions of ISK." Its HUF and TWD
   rows concern payouts only ("even though you can charge two-decimal amounts"), so their
-  charges stay two-decimal, as core has them. The API reference gives every amount the
-  adapter sends or reads in "the smallest currency unit" and links that page: PaymentIntent
-  `amount` (create, update and object), `amount_to_capture` on capture, Refund `amount`
-  (create and object), Charge `amount_refunded`, and `unit_amount` on Price and on
-  `items[].price_data`; the PaymentIntent, Charge, Refund, Subscription and Price objects
-  each carry `currency`.
+  charges stay two-decimal, as core has them. The API reference gives PaymentIntent `amount`
+  (create, update and object), Refund `amount` (create and object), Charge `amount_refunded`
+  and Price `unit_amount` in "the smallest currency unit", linking that page, and
+  `items[].price_data.unit_amount` in the currency's sub-unit; the PaymentIntent, Charge,
+  Refund, Subscription and Price objects each carry `currency`.
+- **Capture amounts: unit inferred, AMBIGUOUS** (corrected in review, 2026-09-30; the first
+  version of this entry quoted "the smallest currency unit" for them too). The capture
+  endpoint's `amount_to_capture` ("The amount to capture from the PaymentIntent, which must
+  be less than or equal to the original amount. Defaults to the full `amount_capturable` if
+  it's not provided.") and the PaymentIntent's `amount_capturable` ("Amount that can be
+  captured from this PaymentIntent.") and `amount_received` ("Amount that this PaymentIntent
+  collects.") carry no unit wording. The adapter converts them with `amount`, which they are
+  compared with and default from; no page states it, and the ISK and MGA sandbox checks
+  below would show it.
+- **Stripe's idempotency compares parameters.** Doc-verified 2026-09-30 against
+  docs.stripe.com/api/idempotent_requests: "Stripe's idempotency works by saving the
+  resulting status code and body of the first request made for any given idempotency key,
+  regardless of whether it succeeds or fails. Subsequent requests with the same key return
+  the same result, including `500` errors." and "You can remove keys from the system
+  automatically after they're at least 24 hours old. We generate a new request if a key is
+  reused after the original is pruned. The idempotency layer compares incoming parameters to
+  those of the original request and errors if they're not the same to prevent accidental
+  misuse." A retry must therefore send the very parameters of the first attempt, whatever
+  state that attempt left behind (below), and the test double now compares them on a
+  same-key update, capture and refund.
 - **Compared with core, currency by currency.** The HTML page embeds its per-country
   presentment lists as JSON: 45 countries, 139 distinct currencies. Each was given Stripe's
   decimals by the page's own rules (the zero-decimal list, ISK's special case, two
@@ -5053,13 +5072,13 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `invalid_request`, and read divided by 100. A Stripe ISK amount that is not a multiple of
   100 cannot be reported: reads fail with `unsupported_operation`, the record on
   `raw.record`, and events omit `amount`. MGA is sent divided by 100, an amount that is not a
-  multiple of 100 (Stripe charges whole ariary) refused with `invalid_request` before any
-  request, and read multiplied by 100. The conversion covers every amount sent (PaymentIntent
-  `amount` on session creation, update and saved-method charges, `amount_to_capture`, refund
-  `amount`, `price_data.unit_amount`) and every amount reported (`PaymentSession.amount`;
-  `PaymentInfo.amount`, `amountRefunded`, `amountCaptured` and `amountCapturable`; the
-  subscription installment, Σ `unit_amount` × `quantity` converted as a total; refund
-  amounts; webhook and polled event amounts).
+  multiple of 100 (Stripe charges whole ariary) refused with `invalid_request` before the
+  request that would carry it, and read multiplied by 100. The conversion covers every
+  amount sent (PaymentIntent `amount` on session creation, update and saved-method charges,
+  `amount_to_capture`, refund `amount`, `price_data.unit_amount`) and every amount reported
+  (`PaymentSession.amount`; `PaymentInfo.amount`, `amountRefunded`, `amountCaptured` and
+  `amountCapturable`; the subscription installment, Σ `unit_amount` × `quantity` converted
+  as a total; refund amounts; webhook and polled event amounts).
 - **UGX: AMBIGUOUS, refused.** The special cases give UGX the ISK text ("UGX transitioned to
   a zero-decimal currency, but backwards compatibility requires you to represent it as a
   two-decimal value, where the decimal amount is always `00`. For example, to charge 5 UGX,
@@ -5072,17 +5091,41 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   reject with `unsupported_operation`; list pages holding one fail whole, `raw` naming each
   record and carrying the page's `nextCursor`; events keep `currency` and omit `amount`. A
   zero-amount session is a SetupIntent, which carries neither an amount nor a currency, and
-  is left alone (decided in implementation). The refusal of a `chargeSavedPaymentMethod` or
-  `createNativeSubscription` in UGX, or in an MGA amount that is not whole ariary, is marked
-  `outcomeUnknown` (decided before review, 2026-09-30): an earlier release sent such
-  requests unconverted, a `SubscriptionManager` renewal retried across the upgrade reuses
-  its key, and the adapter cannot read the earlier attempt back (Stripe looks PaymentIntents
-  up by id, not by idempotency key), so `docs/adapter-authoring.md`'s rule for a refusal it
-  cannot resolve on a call that moves money applies; a plain `invalid_request` would read as
-  "no money moved" and let a host charge again elsewhere. The other send refusals move no
-  money or send the host to the Dashboard, and stay final. ISK and MGA sends whose amount
-  converts are sent, and a retry whose converted amount differs from the earlier release's
-  meets Stripe's own idempotency check, which the adapter already maps to `outcomeUnknown`.
+  is left alone (decided in implementation).
+- **Refusals an earlier release would not have made leave the outcome open.** Earlier
+  releases sent UGX amounts, and MGA amounts that are not whole ariary, unconverted, so a
+  call retried under the same key after the upgrade may meet money its first attempt already
+  moved, and `docs/adapter-authoring.md`'s rule for a refusal the adapter cannot resolve
+  applies: a plain `invalid_request` would read as "no money moved" and let a host move it
+  again elsewhere.
+  - `chargeSavedPaymentMethod` and `createNativeSubscription` (decided before review,
+    2026-09-30): a `SubscriptionManager` renewal retried across the upgrade reuses its key,
+    and the adapter cannot read the earlier attempt back (Stripe looks PaymentIntents up by
+    id, not by idempotency key), so their refusal is always `outcomeUnknown`, asking the
+    host to check the Stripe Dashboard for a charge under the key before sending another.
+  - `capturePayment` and `refundPayment` with an amount (changed in review, 2026-09-30; the
+    first version made these refusals final and told the host to capture or refund in the
+    Dashboard, which could repeat money a retried call had already moved). They read the
+    PaymentIntent anyway, so the refusal is final only when that read shows nothing moved:
+    for a capture, a PaymentIntent still `requires_capture`; for a refund, a latest charge
+    (expanded on that read) whose `amount_refunded` is 0. Anything else, a PaymentIntent
+    captured or cancelled, a charge with a refund, or no charge at all, leaves the refusal
+    `outcomeUnknown`. Either way the message asks the host to check the Stripe Dashboard for
+    a capture or refund under the key before capturing or refunding there, never to act
+    first.
+  - `updatePaymentSession` with an amount for a UGX PaymentIntent (changed in review,
+    2026-09-30): always `outcomeUnknown`, as no read through the adapter can show whether an
+    earlier update went through (`retrievePayment` refuses a UGX PaymentIntent); the message
+    asks for a check under the key, then a cancellation. An MGA update's refusal stays
+    final: it moves no money, and `retrievePayment` reports the amount the PaymentIntent
+    holds.
+  - The other send refusals stay final: session creation and updates naming the currency,
+    which move no money; the ISK overflow, which only amounts past Stripe's 12-digit maximum
+    reach, so no earlier attempt of it went through; and the three-decimal rule, which
+    earlier releases applied too.
+  ISK and MGA sends whose amount converts are sent, and a retry whose converted amount
+  differs from the earlier release's meets Stripe's own idempotency check, which the adapter
+  already maps to `outcomeUnknown`.
 - **Three-decimal currencies: AMBIGUOUS, guard kept.** The page no longer has the section on
   three-decimal currencies the multiple-of-10 guard was built on (already missing on
   2026-07-17, see "PSP-native subscriptions across the contract (2026-07-17)"). BHD, JOD,
@@ -5090,21 +5133,30 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   still advertises "zero-decimal and three-decimal currency support". Read literally, the
   page's "two-decimal currencies unless otherwise specified" would make them two-decimal at
   Stripe, which nothing else on the page supports. They keep core's three decimals and the
-  guard, whose rule is unchanged; it now lives with the conversions, replacing four copies
-  in the adapter.
+  guard, unchanged in rule and in reach: it applies to session creation, an update naming
+  both amount and currency, saved-method charges and native subscriptions, from one
+  function in `src/currency-units.ts` that replaces the four copies in the adapter. Captures,
+  refunds, amount-only updates and the amount a currency change keeps are left to Stripe, as
+  before (changed in review, 2026-09-30: the first version extended the guard to them once
+  they read the currency).
 - **Calls that name no currency read the PaymentIntent first.** A capture or refund that
   states an amount, and an update carrying `amount` without `currency`, read the
   PaymentIntent to learn the currency the amount is sent in: one more request, only when an
-  amount is given. The three-decimal guard, skipped until now for such updates and never
-  applied to captures or refunds, covers them too. An update carrying `currency` without
-  `amount` reads it as well (decided in implementation): Stripe keeps its own integer across
-  a currency change, so a session of `amount: 1000` moved from ISK (Stripe's `100000`) to
-  USD would otherwise ask for USD 1,000.00. The adapter reads the current amount in the old
-  currency's units and re-sends it in the new currency's whenever Stripe's figure changes,
-  so "fields omitted are left unchanged" holds in PayFanout's minor units. A kept amount the
-  new currency cannot take is refused before the update, and so is a currency change of a
-  UGX session, whose amount cannot be read, with `invalid_request` asking for the amount with
-  the currency.
+  amount is given (the refund's read expands the latest charge, for the rule above). An
+  update carrying `currency` without `amount` reads it as well (decided in implementation):
+  Stripe keeps its own integer across a currency change, so a session of `amount: 1000`
+  moved from ISK (Stripe's `100000`) to USD would otherwise ask for USD 1,000.00. The
+  adapter reads the current amount in the old currency's units and always sends it
+  converted for the new currency, so "fields omitted are left unchanged" holds in
+  PayFanout's minor units and the parameters depend only on the state asked for (changed in
+  review, 2026-09-30: the first version sent the amount only when Stripe's figure changed,
+  so a same-key retry after a lost answer read the PaymentIntent already converted, sent
+  `currency` alone, and met Stripe's parameter check). A kept amount the new currency cannot
+  take is refused before the update, and so is a currency change of a UGX session, whose
+  amount cannot be read, with `invalid_request` asking for the amount with the currency.
+  A capture's or refund's parameters depend on the caller's amount and the payment's
+  currency, which no longer changes once the payment is authorized, so their retries send
+  the same request too.
 - **Calls that send no amount are not read first** (decided in implementation, keeping the
   extra request to calls that send an amount). A capture, cancellation or refund without an
   amount, an update of other fields and a subscription cancellation go through at Stripe
@@ -5124,18 +5176,26 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
 - **Tests.** `test/stripe-currencies.test.ts` pins the exact wire amount on every send path
   and the reported amount on every read path for ISK, MGA, USD, JPY and KWD; each MGA, UGX,
   ISK and three-decimal refusal with the exact sequence of requests made (a log of every call
-  reaching the test double); the list-page failures with their `raw`; and event amounts. Each
-  mutation tried (ISK multiplied by 10, MGA or one send path left unconverted, UGX treated as
-  zero-decimal, the whole-ariary, overflow and multiple-of-100 checks dropped, a page check
-  made a no-op, `outcomeUnknown` dropped from answers) made a test fail. The conformance
-  suite passes unchanged.
+  reaching the test double) and whether it leaves the outcome open; the list-page failures
+  with their `raw`; event amounts; and same-key retries of a currency change, a capture and
+  a refund whose first answer was lost. The test double saves a keyed update's, capture's
+  and refund's answer and refuses the key when the parameters differ, as Stripe does. Each
+  mutation tried (ISK multiplied by 10, MGA or one send path left unconverted, UGX treated
+  as zero-decimal, the whole-ariary, overflow and multiple-of-100 checks dropped, a page
+  check made a no-op, `outcomeUnknown` dropped from answers or from the refusals above, the
+  nothing-moved exceptions widened, the kept amount sent only when it changes, the
+  three-decimal rule extended to captures) made a test fail. The conformance suite passes
+  unchanged.
 - **Sandbox checks, not run.** No Stripe sandbox run backs these facts; each check needs an
   account whose presentment currencies include the currency.
   - **UGX.** Charge `amount: 500` in UGX and read the payment in the Stripe Dashboard: UGX 5
     means the special case holds and UGX can convert as ISK does; UGX 500 means the
     zero-decimal list holds and UGX can pass unchanged. Either lifts the refusal.
   - **ISK and MGA.** Charge ISK 1,000 and MGA 10.00 through the adapter (`amount: 1000` in
-    both) and confirm the Dashboard shows ISK 1,000 and MGA 10.
+    both) and confirm the Dashboard shows ISK 1,000 and MGA 10. Then authorize ISK 1,000
+    with manual capture, capture ISK 600 through the adapter (`amount_to_capture: 60000`),
+    and confirm the Dashboard shows ISK 600 captured and the PaymentIntent's
+    `amount_received` reads `60000`, which settles the unit of the capture fields.
   - **Three-decimal.** From an account whose presentment list has KWD (only the AE list
     does), send `amount: 1235` in KWD straight to the PaymentIntents API, as the adapter
     refuses it locally, and record whether Stripe refuses it too.

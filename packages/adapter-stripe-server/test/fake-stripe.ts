@@ -40,7 +40,8 @@ export class FakeStripe implements StripeClientLike {
   private readonly storedPrices = new Map<string, StripePriceLike>();
   private readonly storedProducts = new Map<string, StripeProductLike>();
   private readonly idempotentCreates = new Map<string, StripePaymentIntentLike>();
-  private readonly idempotentRefunds = new Map<string, StripeRefundLike>();
+  /** Update, capture and refund answers by idempotency key, with the request each answered. */
+  private readonly keyedWrites = new Map<string, { request: string; answer: string }>();
   private readonly idempotentSubscriptions = new Map<string, StripeSubscriptionLike>();
   private readonly idempotentProducts = new Map<string, StripeProductLike>();
   private seq = 0;
@@ -60,9 +61,52 @@ export class FakeStripe implements StripeClientLike {
   /** Params of the last products.create call — for mapping assertions. */
   lastProductParams: Record<string, unknown> | undefined;
   private nextError: object | undefined;
+  private lostAnswer: object | undefined;
 
   failNextWith(err: object): void {
     this.nextError = err;
+  }
+
+  /** The next keyed update, capture or refund takes effect, then its answer is lost to `err`. */
+  loseNextAnswer(err: object): void {
+    this.lostAnswer = err;
+  }
+
+  /**
+   * Stripe's idempotency for update, capture and refund: a key's first
+   * answer is saved, a request with the same key and the same parameters gets
+   * it back, and one with other parameters is refused ("The idempotency layer
+   * compares incoming parameters to those of the original request and errors
+   * if they're not the same"). Only answers are saved: an error is thrown
+   * again by a retry that meets it again.
+   */
+  private async keyedWrite<T>(
+    opts: StripeRequestOptions | undefined,
+    request: unknown,
+    write: () => Promise<T>,
+  ): Promise<T> {
+    const key = opts?.idempotencyKey;
+    if (!key) return write();
+    const signature = canonical(request);
+    const saved = this.keyedWrites.get(key);
+    if (saved) {
+      if (saved.request !== signature) {
+        throw stripeError({
+          type: "StripeIdempotencyError",
+          statusCode: 400,
+          message: `Keys for idempotent requests can only be used with the same parameters they were first used with. Try using a key other than '${key}' if you meant to execute a different request.`,
+        });
+      }
+      return JSON.parse(saved.answer) as T;
+    }
+    const answer = await write();
+    this.keyedWrites.set(key, { request: signature, answer: JSON.stringify(answer) });
+    if (this.lostAnswer) {
+      const err = this.lostAnswer;
+      this.lostAnswer = undefined;
+      throw err;
+    }
+    return answer;
   }
 
   private throwPending(): void {
@@ -171,54 +215,66 @@ export class FakeStripe implements StripeClientLike {
       if (!pi) this.notFound("payment_intent", id);
       return pi;
     },
-    update: async (id: string, params: Record<string, unknown>): Promise<StripePaymentIntentLike> => {
+    update: async (
+      id: string,
+      params: Record<string, unknown>,
+      opts?: StripeRequestOptions,
+    ): Promise<StripePaymentIntentLike> => {
       this.throwPending();
       this.lastPaymentIntentParams = params;
-      const pi = this.intents.get(id);
-      if (!pi) this.notFound("payment_intent", id);
-      if (pi.status !== "requires_payment_method" && pi.status !== "requires_confirmation") {
-        throw stripeError({
-          type: "StripeInvalidRequestError",
-          statusCode: 400,
-          message: `PaymentIntent ${id} cannot be updated in status ${pi.status}`,
-        });
-      }
-      if (typeof params["amount"] === "number") pi.amount = params["amount"];
-      if (typeof params["currency"] === "string") pi.currency = params["currency"];
-      if (params["metadata"]) pi.metadata = { ...pi.metadata, ...(params["metadata"] as Record<string, string>) };
-      return pi;
+      return this.keyedWrite(opts, { update: id, params }, async () => {
+        const pi = this.intents.get(id);
+        if (!pi) this.notFound("payment_intent", id);
+        if (pi.status !== "requires_payment_method" && pi.status !== "requires_confirmation") {
+          throw stripeError({
+            type: "StripeInvalidRequestError",
+            statusCode: 400,
+            message: `PaymentIntent ${id} cannot be updated in status ${pi.status}`,
+          });
+        }
+        if (typeof params["amount"] === "number") pi.amount = params["amount"];
+        if (typeof params["currency"] === "string") pi.currency = params["currency"];
+        if (params["metadata"]) pi.metadata = { ...pi.metadata, ...(params["metadata"] as Record<string, string>) };
+        return pi;
+      });
     },
     list: async (params?: Record<string, unknown>): Promise<StripeListLike<StripePaymentIntentLike>> => {
       this.throwPending();
       return paginate([...this.intents.values()].reverse(), params, (pi) => pi.id, (pi) => pi.created);
     },
-    capture: async (id: string, params?: Record<string, unknown>): Promise<StripePaymentIntentLike> => {
+    capture: async (
+      id: string,
+      params?: Record<string, unknown>,
+      opts?: StripeRequestOptions,
+    ): Promise<StripePaymentIntentLike> => {
       this.throwPending();
-      const pi = this.intents.get(id);
-      if (!pi) this.notFound("payment_intent", id);
-      if (pi.status !== "requires_capture") {
-        throw stripeError({
-          type: "StripeInvalidRequestError",
-          statusCode: 400,
-          message: `PaymentIntent ${id} is not capturable (status: ${pi.status})`,
-        });
-      }
-      const captureAmount = (params?.["amount_to_capture"] as number | undefined) ?? pi.amount;
-      if (captureAmount > (pi.amount_capturable ?? pi.amount)) {
-        throw stripeError({
-          type: "StripeInvalidRequestError",
-          statusCode: 400,
-          message: `Amount to capture (${captureAmount}) is greater than the amount authorized (${pi.amount_capturable ?? pi.amount})`,
-        });
-      }
-      pi.status = "succeeded";
-      // Real Stripe semantics: `amount` stays at the authorized value; the
-      // collected funds land in amount_received and nothing stays capturable
-      // (single capture releases the remainder of the authorization).
-      pi.amount_received = captureAmount;
-      pi.amount_capturable = 0;
-      if (typeof pi.latest_charge === "object" && pi.latest_charge) pi.latest_charge.captured = true;
-      return pi;
+      return this.keyedWrite(opts, { capture: id, params: params ?? {} }, async () => {
+        const pi = this.intents.get(id);
+        if (!pi) this.notFound("payment_intent", id);
+        if (pi.status !== "requires_capture") {
+          throw stripeError({
+            type: "StripeInvalidRequestError",
+            statusCode: 400,
+            message: `PaymentIntent ${id} is not capturable (status: ${pi.status})`,
+          });
+        }
+        const captureAmount = (params?.["amount_to_capture"] as number | undefined) ?? pi.amount;
+        if (captureAmount > (pi.amount_capturable ?? pi.amount)) {
+          throw stripeError({
+            type: "StripeInvalidRequestError",
+            statusCode: 400,
+            message: `Amount to capture (${captureAmount}) is greater than the amount authorized (${pi.amount_capturable ?? pi.amount})`,
+          });
+        }
+        pi.status = "succeeded";
+        // Real Stripe semantics: `amount` stays at the authorized value; the
+        // collected funds land in amount_received and nothing stays capturable
+        // (single capture releases the remainder of the authorization).
+        pi.amount_received = captureAmount;
+        pi.amount_capturable = 0;
+        if (typeof pi.latest_charge === "object" && pi.latest_charge) pi.latest_charge.captured = true;
+        return pi;
+      });
     },
     cancel: async (id: string): Promise<StripePaymentIntentLike> => {
       this.throwPending();
@@ -346,44 +402,42 @@ export class FakeStripe implements StripeClientLike {
   refunds = {
     create: async (params: Record<string, unknown>, opts?: StripeRequestOptions): Promise<StripeRefundLike> => {
       this.throwPending();
-      if (opts?.idempotencyKey && this.idempotentRefunds.has(opts.idempotencyKey)) {
-        return this.idempotentRefunds.get(opts.idempotencyKey)!;
-      }
-      const pi = this.intents.get(params["payment_intent"] as string);
-      if (!pi) this.notFound("payment_intent", String(params["payment_intent"]));
-      const charge = typeof pi.latest_charge === "object" && pi.latest_charge ? pi.latest_charge : undefined;
-      if (!charge || pi.status !== "succeeded") {
-        throw stripeError({
-          type: "StripeInvalidRequestError",
-          statusCode: 400,
-          message: "Charge has not been captured or does not exist",
-        });
-      }
-      const collected = pi.amount_received && pi.amount_received > 0 ? pi.amount_received : pi.amount;
-      const unrefunded = collected - (charge.amount_refunded ?? 0);
-      const amount = (params["amount"] as number | undefined) ?? unrefunded;
-      // Real Stripe rejects refunding more than what remains on the charge.
-      if (amount > unrefunded) {
-        throw stripeError({
-          type: "StripeInvalidRequestError",
-          statusCode: 400,
-          message: `Refund amount (${amount}) is greater than unrefunded amount on charge (${unrefunded})`,
-        });
-      }
-      charge.amount_refunded = (charge.amount_refunded ?? 0) + amount;
-      charge.refunded = charge.amount_refunded >= collected;
-      const refund: StripeRefundLike = {
-        id: `re_${++this.seq}`,
-        amount,
-        currency: pi.currency,
-        status: "succeeded",
-        payment_intent: pi.id,
-        created: 1_780_000_200,
-      };
-      this.storedRefunds.set(refund.id, refund);
-      this.uniqueRefundCreations++;
-      if (opts?.idempotencyKey) this.idempotentRefunds.set(opts.idempotencyKey, refund);
-      return refund;
+      return this.keyedWrite(opts, { refund: params }, async () => {
+        const pi = this.intents.get(params["payment_intent"] as string);
+        if (!pi) this.notFound("payment_intent", String(params["payment_intent"]));
+        const charge = typeof pi.latest_charge === "object" && pi.latest_charge ? pi.latest_charge : undefined;
+        if (!charge || pi.status !== "succeeded") {
+          throw stripeError({
+            type: "StripeInvalidRequestError",
+            statusCode: 400,
+            message: "Charge has not been captured or does not exist",
+          });
+        }
+        const collected = pi.amount_received && pi.amount_received > 0 ? pi.amount_received : pi.amount;
+        const unrefunded = collected - (charge.amount_refunded ?? 0);
+        const amount = (params["amount"] as number | undefined) ?? unrefunded;
+        // Real Stripe rejects refunding more than what remains on the charge.
+        if (amount > unrefunded) {
+          throw stripeError({
+            type: "StripeInvalidRequestError",
+            statusCode: 400,
+            message: `Refund amount (${amount}) is greater than unrefunded amount on charge (${unrefunded})`,
+          });
+        }
+        charge.amount_refunded = (charge.amount_refunded ?? 0) + amount;
+        charge.refunded = charge.amount_refunded >= collected;
+        const refund: StripeRefundLike = {
+          id: `re_${++this.seq}`,
+          amount,
+          currency: pi.currency,
+          status: "succeeded",
+          payment_intent: pi.id,
+          created: 1_780_000_200,
+        };
+        this.storedRefunds.set(refund.id, refund);
+        this.uniqueRefundCreations++;
+        return refund;
+      });
     },
     retrieve: async (id: string): Promise<StripeRefundLike> => {
       this.throwPending();
@@ -738,6 +792,18 @@ export class FakeStripe implements StripeClientLike {
     });
     return id;
   }
+}
+
+/** JSON with object keys sorted and undefined ones left out, as parameters compare whatever their order. */
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
 }
 
 /** Stripe-style cursor pagination: newest-first, starting_after skips past the cursor. */

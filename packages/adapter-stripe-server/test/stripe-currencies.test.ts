@@ -6,7 +6,7 @@ import {
   type StripePaymentIntentLike,
   type StripeServerAdapterConfig,
 } from "../src/index.js";
-import { FakeStripe } from "./fake-stripe.js";
+import { FakeStripe, stripeError } from "./fake-stripe.js";
 
 // Stripe's units per docs.stripe.com/currencies (read 2026-09-30): ISK is a
 // two-decimal value whose decimals are always 00, MGA is zero-decimal, and
@@ -127,7 +127,7 @@ describe.each(CASES)("$currency amounts on every path", ({ currency, amount, par
       idempotencyKey: "k2",
     });
     expect(names(log)).toEqual(["paymentIntents.update"]);
-    expect(fake.lastPaymentIntentParams).toEqual({ amount: stripePartial, currency: lower });
+    expect(log[0]!.args).toEqual([session.pspSessionId, { amount: stripePartial, currency: lower }, { idempotencyKey: "k2" }]);
     expect(named.amount).toBe(partial);
 
     log.length = 0;
@@ -137,13 +137,14 @@ describe.each(CASES)("$currency amounts on every path", ({ currency, amount, par
       idempotencyKey: "k3",
     });
     expect(names(log)).toEqual(["paymentIntents.retrieve", "paymentIntents.update"]);
-    expect(fake.lastPaymentIntentParams).toEqual({ amount: stripe });
+    expect(log[0]!.args).toEqual([session.pspSessionId]);
+    expect(log[1]!.args).toEqual([session.pspSessionId, { amount: stripe }, { idempotencyKey: "k3" }]);
     expect(unnamed).toMatchObject({ amount, currency });
 
     log.length = 0;
     await adapter.updatePaymentSession({ pspSessionId: session.pspSessionId, metadata: { a: "1" }, idempotencyKey: "k4" });
     expect(names(log)).toEqual(["paymentIntents.update"]);
-    expect(fake.lastPaymentIntentParams).toEqual({ metadata: { a: "1" } });
+    expect(log[0]!.args).toEqual([session.pspSessionId, { metadata: { a: "1" } }, { idempotencyKey: "k4" }]);
   });
 
   it("capturePayment reads the PaymentIntent before a partial capture, not before a full one", async () => {
@@ -162,13 +163,14 @@ describe.each(CASES)("$currency amounts on every path", ({ currency, amount, par
     const log = recordCalls(fake);
     const captured = await adapter.capturePayment(first.pspSessionId, partial, "cap-1");
     expect(names(log)).toEqual(["paymentIntents.retrieve", "paymentIntents.capture"]);
-    expect(log[1]!.args[1]).toEqual({ amount_to_capture: stripePartial });
+    expect(log[0]!.args).toEqual([first.pspSessionId]);
+    expect(log[1]!.args).toEqual([first.pspSessionId, { amount_to_capture: stripePartial }, { idempotencyKey: "cap-1" }]);
     expect(captured).toMatchObject({ status: "succeeded", amount: partial, amountCaptured: partial, amountCapturable: 0 });
 
     log.length = 0;
     const full = await adapter.capturePayment(second.pspSessionId, undefined, "cap-2");
     expect(names(log)).toEqual(["paymentIntents.capture"]);
-    expect(log[0]!.args[1]).toEqual({});
+    expect(log[0]!.args).toEqual([second.pspSessionId, {}, { idempotencyKey: "cap-2" }]);
     expect(full).toMatchObject({ amount, amountCaptured: amount });
   });
 
@@ -190,13 +192,14 @@ describe.each(CASES)("$currency amounts on every path", ({ currency, amount, par
     const log = recordCalls(fake);
     const refunded = await adapter.refundPayment({ pspPaymentId: first.pspSessionId, amount: partial, idempotencyKey: "r1" });
     expect(names(log)).toEqual(["paymentIntents.retrieve", "refunds.create"]);
-    expect(log[1]!.args[0]).toEqual({ payment_intent: first.pspSessionId, amount: stripePartial });
+    expect(log[0]!.args).toEqual([first.pspSessionId, { expand: ["latest_charge"] }]);
+    expect(log[1]!.args).toEqual([{ payment_intent: first.pspSessionId, amount: stripePartial }, { idempotencyKey: "r1" }]);
     expect(refunded).toMatchObject({ status: "succeeded", amount: partial });
 
     log.length = 0;
     const full = await adapter.refundPayment({ pspPaymentId: second.pspSessionId, idempotencyKey: "r2" });
     expect(names(log)).toEqual(["refunds.create"]);
-    expect(log[0]!.args[0]).toEqual({ payment_intent: second.pspSessionId });
+    expect(log[0]!.args).toEqual([{ payment_intent: second.pspSessionId }, { idempotencyKey: "r2" }]);
     expect(full.amount).toBe(amount);
 
     expect(await adapter.retrievePayment(first.pspSessionId)).toMatchObject({ amount, amountRefunded: partial });
@@ -286,43 +289,75 @@ describe("MGA: Stripe charges whole ariary", () => {
     const open = await stripeIntent(fake, 1500, "mga");
     const paid = await stripeIntent(fake, 1500, "mga", "succeeded");
     const authorized = await stripeIntent(fake, 1500, "mga", "authorized");
+    // Money already moved on these: a capture, and a refund of part of the charge.
+    const captured = await stripeIntent(fake, 1500, "mga", "authorized");
+    await fake.paymentIntents.capture(captured.id, {});
+    const refunded = await stripeIntent(fake, 1500, "mga", "succeeded");
+    await fake.refunds.create({ payment_intent: refunded.id, amount: 500 });
+    // No longer requires_capture: only that status shows nothing was captured.
+    const voided = await stripeIntent(fake, 1500, "mga", "authorized");
+    await fake.paymentIntents.cancel(voided.id);
     const vault = vaulted(fake);
     const log = recordCalls(fake);
-    // A charge or subscription create an earlier release sent unconverted may already have charged.
-    const calls: Array<[() => Promise<unknown>, string[], boolean]> = [
-      [() => adapter.createPaymentSession({ amount: 1050, currency: "MGA", idempotencyKey: "a" }), [], false],
+    // What an earlier release, which sent these unconverted, may already have done under the key.
+    const calls: Array<[() => Promise<unknown>, string[], string | undefined]> = [
+      [() => adapter.createPaymentSession({ amount: 1050, currency: "MGA", idempotencyKey: "a" }), [], undefined],
       [
         () => adapter.updatePaymentSession({ pspSessionId: open.id, amount: 1050, currency: "MGA", idempotencyKey: "b" }),
         [],
-        false,
+        undefined,
       ],
       [
         () => adapter.updatePaymentSession({ pspSessionId: open.id, amount: 1050, idempotencyKey: "c" }),
         ["paymentIntents.retrieve"],
-        false,
+        undefined,
       ],
-      [() => adapter.capturePayment(authorized.id, 1050, "d"), ["paymentIntents.retrieve"], false],
+      // Still requires_capture: nothing was captured, so the refusal is final.
+      [() => adapter.capturePayment(authorized.id, 1050, "d"), ["paymentIntents.retrieve"], undefined],
+      [() => adapter.capturePayment(captured.id, 1050, "d2"), ["paymentIntents.retrieve"], "a capture"],
+      [() => adapter.capturePayment(voided.id, 1050, "d3"), ["paymentIntents.retrieve"], "a capture"],
+      // A charge with nothing refunded: the refusal is final.
       [
         () => adapter.refundPayment({ pspPaymentId: paid.id, amount: 1050, idempotencyKey: "e" }),
         ["paymentIntents.retrieve"],
-        false,
+        undefined,
       ],
-      [() => adapter.chargeSavedPaymentMethod({ ...vault, amount: 1050, currency: "MGA", idempotencyKey: "f" }), [], true],
+      [
+        () => adapter.refundPayment({ pspPaymentId: refunded.id, amount: 1050, idempotencyKey: "e2" }),
+        ["paymentIntents.retrieve"],
+        "a refund",
+      ],
+      [
+        () => adapter.refundPayment({ pspPaymentId: open.id, amount: 1050, idempotencyKey: "e3" }),
+        ["paymentIntents.retrieve"],
+        "a refund",
+      ],
+      [
+        () => adapter.chargeSavedPaymentMethod({ ...vault, amount: 1050, currency: "MGA", idempotencyKey: "f" }),
+        [],
+        "a charge",
+      ],
       [
         () =>
           adapter.createNativeSubscription({ ...vault, amount: 1050, currency: "MGA", interval: "month", idempotencyKey: "g" }),
         [],
-        true,
+        "a charge",
       ],
     ];
     for (const [call, expected, sentBefore] of calls) {
       log.length = 0;
       const err = await rejectionOf(call());
       expect(err).toMatchObject({ code: "invalid_request", retryable: false, pspName: "stripe" });
-      expect(err.message).toMatch(/MGA amounts with 0 decimals where PayFanout has 2, so .* must be a multiple of 100 minor units, got 1050/);
+      expect(err.message).toMatch(/^Stripe takes MGA amounts with 0 decimals where PayFanout has 2, so .* must be a multiple of 100 minor units, got 1050/);
       expect(err.raw).toMatchObject({ currency: "MGA", payfanoutExponent: 2, stripeExponent: 0, amount: 1050 });
-      expect(err.outcomeUnknown).toBe(sentBefore ? true : undefined);
-      expect(err.message.includes("check the Stripe Dashboard for a charge under this idempotency key")).toBe(sentBefore);
+      expect(err.outcomeUnknown).toBe(sentBefore === undefined ? undefined : true);
+      expect(err.message).toMatch(
+        sentBefore === undefined
+          ? /, got 1050$/
+          : new RegExp(
+              `, got 1050\\. An earlier release sent such requests unconverted, so check the Stripe Dashboard for ${sentBefore} under this idempotency key before sending another$`,
+            ),
+      );
       expect(names(log)).toEqual(expected);
     }
   });
@@ -459,30 +494,37 @@ describe("UGX: refused, as Stripe documents it with two units", () => {
     expect(names(log)).toEqual([]);
   });
 
-  it("refuses an amount for a UGX PaymentIntent after reading it, before the request that would carry it", async () => {
+  it("refuses an amount for a UGX PaymentIntent after reading it, open unless the read shows nothing moved", async () => {
     const { adapter, fake } = makePair();
     const open = await stripeIntent(fake, 5000, "ugx");
     const authorized = await stripeIntent(fake, 5000, "ugx", "authorized");
+    const captured = await stripeIntent(fake, 5000, "ugx", "authorized");
+    await fake.paymentIntents.capture(captured.id, {});
+    const voided = await stripeIntent(fake, 5000, "ugx", "authorized");
+    await fake.paymentIntents.cancel(voided.id);
     const paid = await stripeIntent(fake, 5000, "ugx", "succeeded");
+    const refunded = await stripeIntent(fake, 5000, "ugx", "succeeded");
+    await fake.refunds.create({ payment_intent: refunded.id, amount: 1000 });
     const log = recordCalls(fake);
-    const calls: Array<[() => Promise<unknown>, StripePaymentIntentLike, string]> = [
-      [
-        () => adapter.updatePaymentSession({ pspSessionId: open.id, amount: 6000, idempotencyKey: "a" }),
-        open,
-        "update: .*\\. Cancel it and take the payment with another provider",
-      ],
-      [() => adapter.capturePayment(authorized.id, 1000, "b"), authorized, "capture: .*\\. Capture it in the Stripe Dashboard"],
-      [
-        () => adapter.refundPayment({ pspPaymentId: paid.id, amount: 1000, idempotencyKey: "c" }),
-        paid,
-        "refund: .*\\. Refund it in the Stripe Dashboard",
-      ],
+    const UPDATE = "update: .*\\. Check the Stripe Dashboard for an update under this idempotency key, then cancel it and take the payment with another provider";
+    const CAPTURE = "capture: .*\\. Check the Stripe Dashboard for a capture under this idempotency key before capturing it there";
+    const REFUND = "refund: .*\\. Check the Stripe Dashboard for a refund under this idempotency key before refunding it there";
+    const calls: Array<[() => Promise<unknown>, StripePaymentIntentLike, string, boolean]> = [
+      [() => adapter.updatePaymentSession({ pspSessionId: open.id, amount: 6000, idempotencyKey: "a" }), open, UPDATE, true],
+      [() => adapter.capturePayment(authorized.id, 1000, "b"), authorized, CAPTURE, false],
+      [() => adapter.capturePayment(captured.id, 1000, "b2"), captured, CAPTURE, true],
+      [() => adapter.capturePayment(voided.id, 1000, "b3"), voided, CAPTURE, true],
+      [() => adapter.refundPayment({ pspPaymentId: paid.id, amount: 1000, idempotencyKey: "c" }), paid, REFUND, false],
+      [() => adapter.refundPayment({ pspPaymentId: refunded.id, amount: 1000, idempotencyKey: "c2" }), refunded, REFUND, true],
     ];
-    for (const [call, pi, message] of calls) {
+    for (const [call, pi, message, outcomeOpen] of calls) {
       log.length = 0;
       const err = await rejectionOf(call());
       expect(err).toMatchObject({ code: "invalid_request", retryable: false, pspName: "stripe" });
+      expect(err.outcomeUnknown).toBe(outcomeOpen ? true : undefined);
       expect(err.message).toMatch(new RegExp(`^PaymentIntent ${pi.id} is in UGX, so no amount can be sent for its ${message}$`));
+      expect(err.message.includes("unknown. An earlier release sent such requests unconverted. Check")).toBe(outcomeOpen);
+      expect(err.message).not.toMatch(/(Capture|Refund) it in the Stripe Dashboard/);
       expect(err.raw).toEqual({ currency: "UGX", payfanoutExponent: 0, record: pi });
       expect(names(log)).toEqual(["paymentIntents.retrieve"]);
     }
@@ -564,6 +606,29 @@ describe("UGX: refused, as Stripe documents it with two units", () => {
       new RegExp(`^PaymentIntent ${open.id} is in UGX, so the amount a currency change keeps cannot be reported .* Send the amount with the currency$`),
     );
     expect(names(log)).toEqual(["paymentIntents.retrieve"]);
+  });
+
+  it("creates a subscription whose Price turns out to be in UGX, then refuses its answer marked outcomeUnknown", async () => {
+    const { adapter, fake } = makePair();
+    const vault = vaulted(fake);
+    const price = fake.seedPrice({ currency: "ugx", unitAmount: 5000 });
+    const log = recordCalls(fake);
+    const err = await rejectionOf(
+      adapter.createNativeSubscription({
+        ...vault,
+        amount: 5000,
+        currency: "USD",
+        interval: "month",
+        planId: price.id,
+        idempotencyKey: "s",
+      }),
+    );
+    expect(names(log)).toEqual(["subscriptions.create"]);
+    expect(fake.uniqueSubscriptionCreations).toBe(1);
+    expect(err).toMatchObject({ code: "unsupported_operation", retryable: false, pspName: "stripe", outcomeUnknown: true });
+    expect(err.message).toMatch(
+      /^Stripe answered the subscription creation with (Subscription sub_\d+), which is in UGX, .*\. The subscription creation may have taken effect: check \1 in the Stripe Dashboard$/,
+    );
   });
 
   it("leaves a zero-amount verification session alone: a SetupIntent carries no amount or currency", async () => {
@@ -684,29 +749,99 @@ describe("list pages holding a record whose amounts cannot be reported", () => {
   });
 });
 
+describe("list pages holding an ISK amount that is not a multiple of 100", () => {
+  it("listPayments fails the page when the only odd amount is amount_capturable", async () => {
+    const { adapter, fake } = makePair();
+    await stripeIntent(fake, 1000, "usd");
+    const odd = await stripeIntent(fake, 100_000, "isk", "authorized");
+    odd.amount_capturable = 99_950;
+    await stripeIntent(fake, 2000, "usd");
+    const err = await rejectionOf(adapter.listPayments({ limit: 2 }));
+    expect(err).toMatchObject({ code: "unsupported_operation", retryable: false, pspName: "stripe" });
+    expect(err.raw).toEqual({
+      records: [{ id: odd.id, currency: "ISK", reason: expect.stringMatching(/, and 99950 is not a multiple of 100$/) as string }],
+      nextCursor: odd.id,
+    });
+  });
+
+  it("listRefunds fails the page holding an ISK refund of 150", async () => {
+    const { adapter, fake } = makePair();
+    fake.seedRefund({ status: "succeeded", amount: 1000, currency: "usd" });
+    const odd = fake.seedRefund({ status: "succeeded", amount: 150, currency: "isk" });
+    fake.seedRefund({ status: "succeeded", amount: 2000, currency: "usd" });
+    const err = await rejectionOf(adapter.listRefunds({ limit: 2 }));
+    expect(err).toMatchObject({ code: "unsupported_operation", retryable: false, pspName: "stripe" });
+    expect(err.raw).toEqual({
+      records: [{ id: odd.id, currency: "ISK", reason: expect.stringMatching(/, and 150 is not a multiple of 100$/) as string }],
+      nextCursor: odd.id,
+    });
+  });
+
+  it("listNativeSubscriptions fails the page holding an installment that is not a multiple of 100", async () => {
+    const { adapter, fake } = makePair();
+    fake.seedSubscription({ currency: "usd" });
+    const odd = fake.seedSubscription({
+      currency: "isk",
+      items: [{ price: fake.seedPrice({ currency: "isk", unitAmount: 150 }) }],
+    });
+    fake.seedSubscription({ currency: "usd" });
+    const err = await rejectionOf(adapter.listNativeSubscriptions({ limit: 2 }));
+    expect(err).toMatchObject({ code: "unsupported_operation", retryable: false, pspName: "stripe" });
+    expect(err.raw).toEqual({
+      records: [{ id: odd.id, currency: "ISK", reason: expect.stringMatching(/, and 150 is not a multiple of 100$/) as string }],
+      nextCursor: odd.id,
+    });
+  });
+});
+
 describe("currency-only updates keep the session's amount in PayFanout's minor units", () => {
-  it("re-sends the amount when Stripe's figure for it changes, and only then", async () => {
+  it("always sends the kept amount converted for the new currency", async () => {
     const { adapter, fake } = makePair();
     const usd = await adapter.createPaymentSession({ amount: 1000, currency: "USD", idempotencyKey: "a" });
     const log = recordCalls(fake);
     const toIsk = await adapter.updatePaymentSession({ pspSessionId: usd.pspSessionId, currency: "ISK", idempotencyKey: "b" });
     expect(names(log)).toEqual(["paymentIntents.retrieve", "paymentIntents.update"]);
-    expect(fake.lastPaymentIntentParams).toEqual({ amount: 100_000, currency: "isk" });
+    expect(log[1]!.args).toEqual([usd.pspSessionId, { amount: 100_000, currency: "isk" }, { idempotencyKey: "b" }]);
     expect(toIsk).toMatchObject({ amount: 1000, currency: "ISK" });
 
     const backToUsd = await adapter.updatePaymentSession({ pspSessionId: usd.pspSessionId, currency: "USD", idempotencyKey: "c" });
     expect(fake.lastPaymentIntentParams).toEqual({ amount: 1000, currency: "usd" });
     expect(backToUsd).toMatchObject({ amount: 1000, currency: "USD" });
 
+    // Stripe's figure stays 1000, and is sent all the same.
     log.length = 0;
     const toEur = await adapter.updatePaymentSession({ pspSessionId: usd.pspSessionId, currency: "EUR", idempotencyKey: "d" });
     expect(names(log)).toEqual(["paymentIntents.retrieve", "paymentIntents.update"]);
-    expect(fake.lastPaymentIntentParams).toEqual({ currency: "eur" });
+    expect(fake.lastPaymentIntentParams).toEqual({ amount: 1000, currency: "eur" });
     expect(toEur).toMatchObject({ amount: 1000, currency: "EUR" });
 
     const toMga = await adapter.updatePaymentSession({ pspSessionId: usd.pspSessionId, currency: "MGA", idempotencyKey: "e" });
     expect(fake.lastPaymentIntentParams).toEqual({ amount: 10, currency: "mga" });
     expect(toMga).toMatchObject({ amount: 1000, currency: "MGA" });
+  });
+
+  it("sends the same request again when a currency change that went through is retried under its key", async () => {
+    const { adapter, fake } = makePair();
+    const usd = await adapter.createPaymentSession({ amount: 1000, currency: "USD", idempotencyKey: "a" });
+    fake.loseNextAnswer(stripeError({ type: "StripeConnectionError", message: "socket hang up" }));
+    const lost = await rejectionOf(adapter.updatePaymentSession({ pspSessionId: usd.pspSessionId, currency: "ISK", idempotencyKey: "b" }));
+    expect(lost).toMatchObject({ code: "psp_unavailable", retryable: true });
+    expect((await fake.paymentIntents.retrieve(usd.pspSessionId)).currency).toBe("isk");
+
+    const log = recordCalls(fake);
+    const retried = await adapter.updatePaymentSession({ pspSessionId: usd.pspSessionId, currency: "ISK", idempotencyKey: "b" });
+    expect(log[1]!.args).toEqual([usd.pspSessionId, { amount: 100_000, currency: "isk" }, { idempotencyKey: "b" }]);
+    expect(retried).toMatchObject({ amount: 1000, currency: "ISK" });
+  });
+
+  it("meets Stripe's refusal of a reused key when the parameters differ", async () => {
+    const { adapter } = makePair();
+    const session = await adapter.createPaymentSession({ amount: 1000, currency: "USD", idempotencyKey: "a" });
+    await adapter.updatePaymentSession({ pspSessionId: session.pspSessionId, amount: 1500, idempotencyKey: "b" });
+    const err = await rejectionOf(
+      adapter.updatePaymentSession({ pspSessionId: session.pspSessionId, amount: 2000, idempotencyKey: "b" }),
+    );
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false, outcomeUnknown: true });
   });
 
   it("refuses a kept amount the new currency cannot take, after the read and before the update", async () => {
@@ -715,10 +850,9 @@ describe("currency-only updates keep the session's amount in PayFanout's minor u
     const log = recordCalls(fake);
     const mga = await rejectionOf(adapter.updatePaymentSession({ pspSessionId: usd.pspSessionId, currency: "MGA", idempotencyKey: "b" }));
     expect(mga).toMatchObject({ code: "invalid_request" });
-    expect(mga.message).toMatch(/the amount the currency change keeps must be a multiple of 100 minor units, got 1055/);
-    const kwd = await rejectionOf(adapter.updatePaymentSession({ pspSessionId: usd.pspSessionId, currency: "KWD", idempotencyKey: "c" }));
-    expect(kwd.message).toMatch(/three-decimal KWD amounts to be a multiple of 10 minor units, got 1055/);
-    expect(names(log)).toEqual(["paymentIntents.retrieve", "paymentIntents.retrieve"]);
+    expect(mga.outcomeUnknown).toBeUndefined();
+    expect(mga.message).toMatch(/the amount the currency change keeps must be a multiple of 100 minor units, got 1055$/);
+    expect(names(log)).toEqual(["paymentIntents.retrieve"]);
 
     const odd = await stripeIntent(fake, 150, "isk");
     const keep = await rejectionOf(adapter.updatePaymentSession({ pspSessionId: odd.id, currency: "USD", idempotencyKey: "d" }));
@@ -727,27 +861,68 @@ describe("currency-only updates keep the session's amount in PayFanout's minor u
   });
 });
 
-describe("three-decimal amounts: the multiple-of-10 rule now also reaches calls that name no currency", () => {
-  it("refuses a KWD amount that is not a multiple of 10 on update, capture and refund, after the read", async () => {
+describe("same-key retries of a capture or refund that went through", () => {
+  it("send the same request again and get Stripe's saved answer", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({
+      amount: 1000,
+      currency: "ISK",
+      captureMethod: "manual",
+      idempotencyKey: "a",
+    });
+    fake.simulateClientConfirm(session.pspSessionId);
+    fake.loseNextAnswer(stripeError({ type: "StripeConnectionError", message: "socket hang up" }));
+    expect(await rejectionOf(adapter.capturePayment(session.pspSessionId, 600, "cap"))).toMatchObject({
+      code: "psp_unavailable",
+    });
+    const captured = await adapter.capturePayment(session.pspSessionId, 600, "cap");
+    expect(captured).toMatchObject({ status: "succeeded", amount: 600, amountCaptured: 600 });
+
+    fake.loseNextAnswer(stripeError({ type: "StripeConnectionError", message: "socket hang up" }));
+    const refund = { pspPaymentId: session.pspSessionId, amount: 200, idempotencyKey: "re" };
+    expect(await rejectionOf(adapter.refundPayment(refund))).toMatchObject({ code: "psp_unavailable" });
+    expect(await adapter.refundPayment(refund)).toMatchObject({ status: "succeeded", amount: 200 });
+    expect(fake.uniqueRefundCreations).toBe(1);
+    expect((await adapter.retrievePayment(session.pspSessionId)).amountRefunded).toBe(200);
+  });
+});
+
+describe("three-decimal amounts: the multiple-of-10 rule stays where it ran before", () => {
+  it("refuses a KWD amount that is not a multiple of 10 on creation, a named update, charges and subscriptions", async () => {
+    const { adapter, fake } = makePair();
+    const open = await stripeIntent(fake, 1230, "kwd");
+    const vault = vaulted(fake);
+    const log = recordCalls(fake);
+    for (const call of [
+      () => adapter.createPaymentSession({ amount: 1235, currency: "KWD", idempotencyKey: "a" }),
+      () => adapter.updatePaymentSession({ pspSessionId: open.id, amount: 1235, currency: "KWD", idempotencyKey: "b" }),
+      () => adapter.chargeSavedPaymentMethod({ ...vault, amount: 1235, currency: "KWD", idempotencyKey: "c" }),
+      () => adapter.createNativeSubscription({ ...vault, amount: 1235, currency: "KWD", interval: "month", idempotencyKey: "d" }),
+    ]) {
+      const err = await rejectionOf(call());
+      expect(err).toMatchObject({ code: "invalid_request", retryable: false, pspName: "stripe" });
+      expect(err.outcomeUnknown).toBeUndefined();
+      expect(err.message).toBe("Stripe requires three-decimal KWD amounts to be a multiple of 10 minor units, got 1235");
+      expect(err.raw).toEqual({ currency: "KWD", payfanoutExponent: 3, stripeExponent: 3, amount: 1235 });
+    }
+    expect(names(log)).toEqual([]);
+  });
+
+  it("leaves captures, refunds, amount-only updates and a currency change's kept amount to Stripe", async () => {
     const { adapter, fake } = makePair();
     const open = await stripeIntent(fake, 1230, "kwd");
     const authorized = await stripeIntent(fake, 1230, "kwd", "authorized");
     const paid = await stripeIntent(fake, 1230, "kwd", "succeeded");
+    const usd = await stripeIntent(fake, 1235, "usd");
     const log = recordCalls(fake);
-    for (const call of [
-      () => adapter.updatePaymentSession({ pspSessionId: open.id, amount: 1235, idempotencyKey: "a" }),
-      () => adapter.capturePayment(authorized.id, 1235, "b"),
-      () => adapter.refundPayment({ pspPaymentId: paid.id, amount: 1235, idempotencyKey: "c" }),
-    ]) {
-      log.length = 0;
-      const err = await rejectionOf(call());
-      expect(err).toMatchObject({ code: "invalid_request", retryable: false, pspName: "stripe" });
-      expect(err.message).toBe("Stripe requires three-decimal KWD amounts to be a multiple of 10 minor units, got 1235");
-      expect(names(log)).toEqual(["paymentIntents.retrieve"]);
-    }
-    log.length = 0;
-    await rejectionOf(adapter.createPaymentSession({ amount: 1235, currency: "KWD", idempotencyKey: "d" }));
-    expect(names(log)).toEqual([]);
+    await adapter.updatePaymentSession({ pspSessionId: open.id, amount: 1235, idempotencyKey: "a" });
+    expect(log.at(-1)!.args[1]).toEqual({ amount: 1235 });
+    await adapter.capturePayment(authorized.id, 1225, "b");
+    expect(log.at(-1)!.args[1]).toEqual({ amount_to_capture: 1225 });
+    await adapter.refundPayment({ pspPaymentId: paid.id, amount: 1225, idempotencyKey: "c" });
+    expect(log.at(-1)!.args[0]).toEqual({ payment_intent: paid.id, amount: 1225 });
+    await adapter.updatePaymentSession({ pspSessionId: usd.id, currency: "KWD", idempotencyKey: "d" });
+    expect(log.at(-1)!.args[1]).toEqual({ amount: 1235, currency: "kwd" });
   });
 });
 

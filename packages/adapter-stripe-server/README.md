@@ -80,7 +80,15 @@ Pair it on the browser with [`@payfanout/adapter-stripe`](../adapter-stripe). Th
   record reject with `unsupported_operation`, list pages holding one fail whole, and UGX
   events carry no `amount`. `capturePayment` and `refundPayment` with an amount, and
   `updatePaymentSession` with only one of `amount` and `currency`, read the PaymentIntent
-  first. See [currencies with Stripe-specific
+  first. Earlier releases sent UGX amounts, and MGA amounts that are not whole ariary,
+  unconverted, so their refusal is marked `outcomeUnknown` on `chargeSavedPaymentMethod`
+  and `createNativeSubscription`, on `capturePayment` and `refundPayment` unless the
+  PaymentIntent read shows nothing moved (still `requires_capture`, or a latest charge with
+  nothing refunded), and on `updatePaymentSession` for a UGX PaymentIntent: check the
+  Stripe Dashboard for the request under its idempotency key before sending another. The
+  three-decimal multiple-of-10 rule applies to session creation, an update naming amount
+  and currency, saved-method charges and subscriptions. See [currencies with
+  Stripe-specific
   units](https://donapulse.github.io/payfanout/guide/stripe#currencies-with-stripe-specific-units).
 
 ## Documentation

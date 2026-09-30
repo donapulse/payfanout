@@ -112,13 +112,16 @@ adapter converts both, on every call that sends an amount and on every amount it
 | MGA | 2 | no decimals, whole ariary | ÷ 100: MGA 10.00 (`amount: 1000`) goes out as `10` | × 100 |
 
 - An MGA amount that is not whole ariary (a multiple of 100 in PayFanout's units) cannot be
-  charged at Stripe, and is refused with a non-retryable `invalid_request` before any
-  request.
+  charged at Stripe, and is refused with a non-retryable `invalid_request` before the
+  request that would carry it (see below for when that refusal is marked `outcomeUnknown`).
 - An ISK amount Stripe reports that is not a multiple of 100 has no value in whole krónur:
   the read meeting one rejects with `unsupported_operation`, with the record on
   `raw.record`, and a webhook event carrying one has no `amount`.
-- Three-decimal amounts (BHD, JOD, KWD, OMR, TND) must still be multiples of 10, a rule from
-  an earlier version of Stripe's currencies page that the adapter keeps.
+- Three-decimal amounts (BHD, JOD, KWD, OMR, TND) must still be multiples of 10 on
+  `createPaymentSession`, an `updatePaymentSession` naming both amount and currency,
+  `chargeSavedPaymentMethod` and `createNativeSubscription`, a rule from an earlier version
+  of Stripe's currencies page that the adapter keeps where it always applied it. Captures,
+  refunds, amount-only updates and the amount a currency change keeps are left to Stripe.
 - Every other currency is sent and reported unchanged.
 
 **UGX is refused.** Stripe's page lists UGX among its zero-decimal currencies and, in its
@@ -131,10 +134,6 @@ neither sends nor reports UGX amounts:
   `createNativeSubscription` in UGX reject with a non-retryable `invalid_request` before any
   request. `updatePaymentSession`, `capturePayment` and `refundPayment` that send an amount
   for a UGX payment reject the same way once they have read the payment (below).
-- The refusal of a `chargeSavedPaymentMethod` or `createNativeSubscription` in UGX, or in an
-  MGA amount that is not whole ariary, is marked `outcomeUnknown`: an earlier release sent
-  such requests unconverted, and one under the same idempotency key may already have
-  charged. Check the Stripe Dashboard before charging the customer elsewhere.
 - `retrievePayment`, `retrieveRefund` and `retrieveNativeSubscription` of a UGX record
   reject with `unsupported_operation`: read it in the Stripe Dashboard.
 - A capture, cancellation or refund without an amount, an update that changes neither
@@ -150,6 +149,23 @@ neither sends nor reports UGX amounts:
 - A zero-amount session is a SetupIntent, which carries neither an amount nor a currency, so
   it works in every currency, UGX included.
 
+**Refusals that leave the outcome open.** Earlier releases sent UGX amounts, and MGA amounts
+that are not whole ariary, to Stripe unconverted, so a call retried under the same
+idempotency key after the upgrade may meet money that an earlier attempt already moved. The
+refusal of such an amount is therefore marked `outcomeUnknown` on:
+
+- `chargeSavedPaymentMethod` and `createNativeSubscription`, whose earlier attempt the
+  adapter cannot read back;
+- `capturePayment` and `refundPayment` with an amount, unless the PaymentIntent they read
+  shows nothing moved: a capture's refusal stays final while the PaymentIntent is still
+  `requires_capture`, and a refund's while its latest charge has nothing refunded;
+- `updatePaymentSession` with an amount for a UGX PaymentIntent.
+
+The message then asks you to check the Stripe Dashboard for a charge, capture, refund or
+update under that idempotency key before sending another, and, like any `outcomeUnknown`
+error, the call may be retried only under the same key. Every other refusal of an amount is
+final.
+
 The adapter declares no `supportedCurrencies`, so the router cannot skip Stripe for UGX on
 its own, and a Stripe candidate that refuses it ends the cascade. Route UGX to another
 provider with a rule of its own, placed before any rule that can send it to Stripe, since
@@ -159,10 +175,11 @@ the first matching rule wins: `{ when: { currency: ["UGX"] }, use: ["<psp>"] }`
 **Some calls read the payment first.** Stripe's units depend on the currency, so
 `capturePayment` and `refundPayment` that state an amount, and `updatePaymentSession` that
 carries `amount` without `currency` or `currency` without `amount`, first read the
-PaymentIntent (`GET /v1/payment_intents/:id`): one more request on each such call. A
-currency change without an amount keeps the session's amount in PayFanout's minor units: a
-session of `amount: 1000` moved from ISK to USD asks for USD 10.00, not the USD 1,000.00
-Stripe's own `100000` would mean. Those calls now also apply the three-decimal rule.
+PaymentIntent (`GET /v1/payment_intents/:id`, with its latest charge for a refund): one more
+request on each such call. A currency change without an amount keeps the session's amount in
+PayFanout's minor units, and always sends it converted for the new currency, so a retry
+under the same key sends the same request: a session of `amount: 1000` moved from ISK to USD
+asks for USD 10.00, not the USD 1,000.00 Stripe's own `100000` would mean.
 
 ::: warning Upgrading from a release that sent these amounts unchanged
 Earlier releases sent ISK and MGA amounts to Stripe as they were: ISK 1,000
@@ -174,10 +191,14 @@ billing the price they were created with. A session created before the upgrade s
 the amount it was created with when the customer confirms it: cancel open ISK and MGA
 sessions, or re-send their amount with `updatePaymentSession`, right after upgrading.
 `SubscriptionManager` renewals on Stripe in UGX, and in MGA amounts that are not whole
-ariary, now fail with `invalid_request`, a definitive failure that runs dunning to
-cancellation: move those subscriptions to another provider first. UGX payments and
-subscriptions made before the upgrade can no longer be read through the adapter: read them
-in the Stripe Dashboard.
+ariary, are now refused before they reach Stripe, marked `outcomeUnknown`, which the
+manager treats as a charge
+[without a definitive answer](/guide/recurring#renewals-without-a-definitive-answer): the
+renewal is pinned to its key and the subscription goes `past_due`, the replays on
+`replayDelaysMinutes` meet the same refusal, and the charge is then frozen until you settle
+it with `resolvePendingRenewal`. Move those subscriptions to another provider before
+upgrading. UGX payments and subscriptions made before the upgrade can no longer be read
+through the adapter: read them in the Stripe Dashboard.
 :::
 
 ## 5. Wire the client adapter

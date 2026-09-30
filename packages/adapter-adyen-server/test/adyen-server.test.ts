@@ -1,6 +1,12 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { isPayFanoutError, type ServerPaymentAdapter } from "@payfanout/core";
+import {
+  isPayFanoutError,
+  listNonDefaultCurrencyExponents,
+  screenSessionInput,
+  validateAdapterCapabilities,
+  type ServerPaymentAdapter,
+} from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
 import {
   adyenOnboarding,
@@ -817,6 +823,31 @@ describe("AdyenServerAdapter specifics", () => {
         adapter.createPaymentSession({ amount: 1000, currency, idempotencyKey: "k" }),
       ).rejects.toMatchObject({ code: "invalid_request" });
     }
+  });
+
+  it("declares exactly the currencies createPaymentSession refuses, so screening refuses them first", async () => {
+    const { adapter } = makePair();
+    const caps = adapter.getCapabilities();
+    expect(caps.unsupportedCurrencies).toEqual(["CLP", "CVE", "IDR", "ISK"]);
+    expect(validateAdapterCapabilities(adapter)).toEqual([]);
+    const codes = new Set([
+      ...listNonDefaultCurrencyExponents().map(([code]) => code),
+      ...["CLP", "CVE", "IDR", "ISK", "USD", "EUR", "GBP", "CNY", "KHR", "MGA"],
+    ]);
+    const refused: string[] = [];
+    for (const currency of codes) {
+      const outcome = await adapter
+        .createPaymentSession({ amount: 1000, currency, idempotencyKey: `k-${currency}` })
+        .catch((err: unknown) => err);
+      if (isPayFanoutError(outcome)) refused.push(currency);
+    }
+    expect(refused.sort()).toEqual(caps.unsupportedCurrencies);
+    for (const currency of caps.unsupportedCurrencies ?? []) {
+      expect(screenSessionInput(caps, { amount: 1000, currency: currency.toLowerCase(), idempotencyKey: "k" })).toBe(
+        `"adyen" does not support currency ${currency.toLowerCase()}`,
+      );
+    }
+    expect(screenSessionInput(caps, { amount: 1000, currency: "JPY", idempotencyKey: "k" })).toBeUndefined();
   });
 
   it("targets the pinned Checkout version, and the live host only with a live URL prefix", async () => {

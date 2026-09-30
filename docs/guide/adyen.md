@@ -225,6 +225,14 @@ round-trip normally. `capturePayment` and `refundPayment` apply the same rule to
 currency carried by the `pspPaymentId` you hand them, so a payment created outside
 PayFanout cannot slip a mispriced modification through either.
 
+The adapter declares the four in `unsupportedCurrencies`, so `PaymentRouter` skips an Adyen
+candidate for a session in one of them and tries the next one in the chain, and
+`PaymentService` refuses such a session for Adyen before calling the adapter, with a
+non-retryable `unsupported_operation` (`"adyen" does not support currency CLP`) where the
+adapter's own refusal is `invalid_request`. When no candidate in the chain takes the
+currency, the router fails with `invalid_request`, each candidate's refusal on `raw`
+([routing and failover](/guide/server#routing-failover)).
+
 ### Ids the adapter refuses
 
 The `id` you pass to `createPaymentSession` becomes Adyen's `merchantReference`, which comes

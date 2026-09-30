@@ -2038,7 +2038,9 @@ sandbox round-trip before production use, and the setup guide carries that warni
   leading, so pass-through would shift the decimal point. Same shape as the PayZen CNY/KHR
   exclusion. `supportedCurrencies` is left undeclared: the capability is an allowlist and no
   complete, verified Adyen currency list was available, so declaring one would be a guess —
-  the cost is that the router cannot pre-screen those four.
+  the cost is that the router cannot pre-screen those four. (Superseded 2026-09-30 for the
+  router by "Currency denylist capability (2026-09-30)": the four are declared in
+  `unsupportedCurrencies`, and `supportedCurrencies` stays undeclared.)
 - **Webhook verification requires a second factor, and that is deliberate.** Adyen's HMAC-SHA256
   covers eight colon-joined values (`pspReference:originalReference:merchantAccountCode:`
   `merchantReference:value:currency:eventCode:success`), base64, carried inside the payload
@@ -5780,6 +5782,21 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   over every three-letter code. A host `paymentMethods` override with a rail whose `currencies`
   are all declared unsupported now fails registration. `@payfanout/adapter-paysafe-server`
   takes a patch.
+- **Adyen declares CLP, CVE, IDR and ISK**, the keys of the map its refusal reads. Re-read
+  2026-09-30 at docs.adyen.com/development-resources/currency-codes: of the table's 169 rows,
+  those four alone are marked "differs from standard" (CLP 2, CVE 0, IDR 0, ISK 2), under the
+  note "For CLP, CVE, IDR, and ISK the ISO 4217 standard has a different number of decimals than
+  shown in our currency codes table. When submitting amounts in minor units, the decimals in the
+  table on this page are leading." `createPaymentSession` refuses them on every session, and the
+  adapter declares no zero-amount verification, so screening refuses nothing it would take. The
+  webhook mapper, which kept its own copy of the four codes, now reads the same map. A host
+  `paymentMethods` override with a rail whose `currencies` are all declared unsupported now fails
+  registration. `@payfanout/adapter-adyen-server` takes a patch.
+- **Nothing to declare elsewhere.** PayZen's CNY and KHR (and BHD) are already outside the
+  `supportedCurrencies` it declares, so the router skips PayZen for them. PayPal and GoCardless
+  refuse no currency their allowlists admit; PayPal's whole-unit rule for HUF and TWD refuses
+  some amounts only. Worldline refuses no currency for a session, only a partial capture in a
+  currency not priced in hundredths.
 - **Release.** `@payfanout/core` takes a minor: an optional field, a screen and validation
   rules that only read it, and `listNonDefaultCurrencyExponents()`. `@payfanout/server` takes a
   minor (changed in review, 2026-09-30; the first version shipped it as a dependency patch):

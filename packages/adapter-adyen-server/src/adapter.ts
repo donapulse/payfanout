@@ -174,7 +174,8 @@ const CARD_PAYMENT_METHOD_TYPE = "scheme";
  * as leading, so passing core minor units through would silently shift the
  * decimal point (100 ISK in core minor units is 1.00 ISK, but Adyen would read
  * 100 ISK). Rejected locally rather than mis-charged; the same shape as the
- * PayZen CNY/KHR exclusion.
+ * PayZen CNY/KHR exclusion. Declared as `unsupportedCurrencies`, so the router
+ * skips Adyen for them.
  */
 const ADYEN_EXPONENT_DEVIATIONS = new Map<string, number>([
   ["CLP", 2],
@@ -324,6 +325,9 @@ export class AdyenServerAdapter implements ServerPaymentAdapter {
   getCapabilities(): AdapterCapabilities {
     return {
       pspName: this.pspName,
+      // Refused on every session; declared so the router skips Adyen instead
+      // of ending its cascade there.
+      unsupportedCurrencies: [...ADYEN_EXPONENT_DEVIATIONS.keys()],
       // Adyen exposes no read for a payment: the pspReference is a write target,
       // and payment state reaches the host over webhooks alone.
       supportsPaymentRetrieval: false,

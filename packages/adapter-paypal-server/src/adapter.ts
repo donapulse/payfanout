@@ -494,6 +494,9 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     const authorized = authorizedAmount(authorization, currency);
     let captureAmount = amount;
     let finalCapture: boolean;
+    // The computed capture is all of an authorization nothing was taken from,
+    // which PayPal captures in full when no amount is sent.
+    let wholeUntouched = false;
     if (authorized === undefined || orderLeft === undefined) {
       // PayPal would take the reauthorization's full amount, and nothing says
       // how it compares with the order.
@@ -515,6 +518,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       // known: without an amount PayPal takes the authorization's full amount,
       // which a reauthorization can hold past the order. Knowing neither
       // amount, PayPal takes it all, which leaves nothing to keep open.
+      wholeUntouched = captureAmount === undefined && orderHeld === 0 && authorization === original;
       captureAmount ??= orderLeft;
       finalCapture = captureAmount === undefined || (orderLeft !== undefined && captureAmount >= orderLeft);
     } else {
@@ -532,6 +536,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
           );
         }
         captureAmount = remainder;
+        wholeUntouched = held === 0 && captureAmount === authorized && !estimated;
       }
       // An estimate that sets the remainder may miss money left on the
       // authorization, so it never closes it: only a capture of all the order
@@ -540,11 +545,18 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       // been this hold's, so only a capture of all the order has left closes it.
       finalCapture = captureAmount >= (estimated ? orderLeft : remainder);
     }
-    if (captureAmount !== undefined && currency === undefined) {
-      throw PayFanoutError.invalidRequest(
-        `Payment "${pspPaymentId}" states no currency for its order or authorizations, so a capture amount cannot be sent for it — capture it in the PayPal dashboard`,
-        order,
-      );
+    let sendAmount = captureAmount;
+    if (sendAmount !== undefined && currency === undefined) {
+      // No amount can be sent without a currency. All of an untouched
+      // authorization needs none: PayPal then captures the full authorized
+      // amount, the same money.
+      if (!wholeUntouched) {
+        throw PayFanoutError.invalidRequest(
+          `Payment "${pspPaymentId}" states no currency for its order or authorizations, so a capture amount cannot be sent for it — capture it in the PayPal dashboard`,
+          order,
+        );
+      }
+      sendAmount = undefined;
     }
     await this.request<PayPalCaptureLike>(
       "POST",
@@ -552,9 +564,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       {
         requestId: await derivePayPalRequestId(idempotencyKey),
         json: {
-          ...(captureAmount !== undefined && currency !== undefined
-            ? { amount: { currency_code: currency, value: toPayPalValue(captureAmount, currency) } }
-            : {}),
+          ...(sendAmount !== undefined ? { amount: sendableMoney(sendAmount, currency) } : {}),
           final_capture: finalCapture,
         },
       },
@@ -633,21 +643,18 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       `/v2/payments/captures/${encodeURIComponent(target.captureId)}/refund`,
       {
         requestId: await derivePayPalRequestId(req.idempotencyKey),
-        json:
-          req.amount !== undefined && currency !== undefined
-            ? { amount: { currency_code: currency, value: toPayPalValue(req.amount, currency) } }
-            : {},
+        json: req.amount !== undefined ? { amount: sendableMoney(req.amount, currency) } : {},
       },
     );
-    // The refund has gone through: an answer whose amount states no currency,
-    // for a capture that states none either, falls back to what was asked.
-    const answered = statedCurrency(refund.amount) ?? currency;
+    // The refund has gone through, so its answer never fails for want of a
+    // currency: its own value reads as a PaymentInfo amount would, and an
+    // answer with no value falls back to what was asked.
     return {
       refundId: refund.id,
       status: mapRefundStatus(refund.status),
       amount:
-        refund.amount?.value !== undefined && answered !== undefined
-          ? fromPayPalValue(refund.amount.value, answered)
+        refund.amount?.value !== undefined
+          ? minorOf(refund.amount.value, refund.amount, currency)
           : (req.amount ?? target.amountMinor),
       raw: refund,
     };
@@ -659,7 +666,11 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       "GET",
       `/v2/payments/refunds/${encodeURIComponent(refundId)}`,
     );
-    const currency = statedCurrency(refund.amount);
+    const captureId = captureIdFromLinks(refund.links);
+    let currency = statedCurrency(refund.amount);
+    if (refund.amount?.value !== undefined && currency === undefined && captureId) {
+      currency = await this.captureCurrency(captureId);
+    }
     if (refund.amount?.value !== undefined && currency === undefined) {
       // A refund record carries no currency field that could flag the amount
       // as unverified, so the read refuses it rather than scale it by a guess.
@@ -670,7 +681,6 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
         pspName: this.pspName,
       });
     }
-    const captureId = captureIdFromLinks(refund.links);
     return {
       refundId: refund.id,
       status: mapRefundStatus(refund.status),
@@ -701,7 +711,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       `/v2/checkout/orders/${encodeURIComponent(input.pspSessionId)}`,
     );
     const unit = order.purchase_units?.[0];
-    const currentCurrency = statedCurrency(unit?.amount);
+    const currentCurrency = unitCurrency(unit);
     const currency = input.currency !== undefined ? normalizeCurrency(input.currency) : currentCurrency;
     // Moving an order to another currency is a new choice: it must be one PayPal accepts now.
     if (currency !== undefined && currency !== currentCurrency) assertPayPalCurrency(currency);
@@ -1125,6 +1135,35 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     }
   }
 
+  /**
+   * The currency of a capture's order, for a capture that states none: every
+   * record of an order shares its one currency. Undefined when the capture
+   * names no order or the order no longer reads.
+   */
+  private async parentOrderCurrency(capture: PayPalCaptureLike): Promise<string | undefined> {
+    const orderId = parentOrderId(capture);
+    if (!orderId) return undefined;
+    try {
+      const order = await this.request<PayPalOrderLike>("GET", `/v2/checkout/orders/${encodeURIComponent(orderId)}`);
+      return unitCurrency(order.purchase_units?.[0]);
+    } catch (err) {
+      if (isNotFound(err)) return undefined;
+      throw err;
+    }
+  }
+
+  /** The currency a capture states, else the one its order states; undefined when neither reads. */
+  private async captureCurrency(captureId: string): Promise<string | undefined> {
+    let capture: PayPalCaptureLike;
+    try {
+      capture = await this.request<PayPalCaptureLike>("GET", `/v2/payments/captures/${encodeURIComponent(captureId)}`);
+    } catch (err) {
+      if (isNotFound(err)) return undefined;
+      throw err;
+    }
+    return statedCurrency(capture.amount) ?? (await this.parentOrderCurrency(capture));
+  }
+
   private async resolveCapture(pspPaymentId: string): Promise<CaptureTarget> {
     let order: PayPalOrderLike | undefined;
     try {
@@ -1139,7 +1178,10 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
         "GET",
         `/v2/payments/captures/${encodeURIComponent(pspPaymentId)}`,
       );
-      return captureTarget(capture);
+      return captureTarget(
+        capture,
+        statedCurrency(capture.amount) === undefined ? await this.parentOrderCurrency(capture) : undefined,
+      );
     }
     const captures = (order.purchase_units?.[0]?.payments?.captures ?? []).filter(
       (c) => !isFailedCaptureStatus(c.status),
@@ -1514,6 +1556,19 @@ function sumPayPalAmounts(amounts: Array<PayPalMoney | undefined>, stated: strin
     total += minorOf(amount.value, amount, stated);
   }
   return total;
+}
+
+/**
+ * The money object a capture or refund sends. Its callers refuse an amount no
+ * record states a currency for before they get here; sending one without it
+ * would read as a request for the full amount, so this refuses rather than
+ * drop it.
+ */
+function sendableMoney(minor: MinorUnitAmount, currency: string | undefined): { currency_code: string; value: string } {
+  if (currency === undefined) {
+    throw PayFanoutError.invalidRequest("PayPal needs a currency to send an amount, and no record states one");
+  }
+  return { currency_code: currency, value: toPayPalValue(minor, currency) };
 }
 
 /**

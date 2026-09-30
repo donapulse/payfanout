@@ -65,3 +65,24 @@ describe("transport edge cases", () => {
     expect(() => makeAdapter({ merchantId: "" })).toThrowError(/merchantId/);
   });
 });
+
+describe("currency reads", () => {
+  it("reads a missing, empty or malformed currency code as XXX, never passing it on", async () => {
+    for (const currencyCode of [undefined, "", "EURO"]) {
+      const payment = {
+        id: "pay_read",
+        status: "CAPTURED",
+        statusOutput: { statusCode: 9, statusCategory: "COMPLETED" },
+        paymentOutput: { amountOfMoney: { amount: 2500, ...(currencyCode === undefined ? {} : { currencyCode }) } },
+      };
+      const adapter = makeAdapter({
+        fetch: async (input) => {
+          const path = new URL(String(input)).pathname;
+          const body = path.endsWith("/captures") ? { captures: [] } : path.endsWith("/refunds") ? { refunds: [] } : payment;
+          return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+        },
+      });
+      expect((await adapter.retrievePayment("pay_read")).currency, String(currencyCode)).toBe("XXX");
+    }
+  });
+});

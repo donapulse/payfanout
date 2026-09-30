@@ -422,6 +422,16 @@ describe("PayZenServerAdapter sessions", () => {
     expect(kwdInfo.amount).toBe(1234); // KWD 1.234 — integer minor units at every boundary
     expect(kwdInfo.currency).toBe("KWD");
   });
+
+  it("reads a missing or malformed transaction currency as XXX, never a guess", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({ amount: 1099, currency: "EUR", idempotencyKey: "k" });
+    const tx = fake.payOrder(session.pspSessionId);
+    tx.currency = "EURO";
+    expect((await adapter.retrievePayment(tx.uuid)).currency).toBe("XXX");
+    Reflect.deleteProperty(tx, "currency");
+    expect((await adapter.retrievePayment(tx.uuid)).currency).toBe("XXX");
+  });
 });
 
 describe("PayZenServerAdapter payment method selection", () => {
@@ -1446,6 +1456,18 @@ describe("PayZenServerAdapter native subscriptions", () => {
     fake.getSubscription(openEnded.id)!.pastPaymentsNumber = 5;
     record = await adapter.retrieveNativeSubscription({ subscriptionId: openEnded.id, savedPaymentMethodToken: MUT });
     expect(record.status).toBe("active");
+  });
+
+  it("reads a missing or malformed subscription currency as XXX, never a guess", async () => {
+    const { adapter, fake } = makeSubPair();
+    const created = await adapter.createNativeSubscription(createInput());
+    const read = (): Promise<{ currency: string }> =>
+      adapter.retrieveNativeSubscription({ subscriptionId: created.id, savedPaymentMethodToken: MUT });
+    const sub = fake.getSubscription(created.id)!;
+    sub.currency = "EURO";
+    expect((await read()).currency).toBe("XXX");
+    Reflect.deleteProperty(sub, "currency");
+    expect((await read()).currency).toBe("XXX");
   });
 
   it("cancels via Subscription/Cancel and reads the terminated record back", async () => {

@@ -1,4 +1,4 @@
-import { NO_CURRENCY, PayFanoutError, sha256Hex } from "@payfanout/core";
+import { firstCurrencyCode, NO_CURRENCY, PayFanoutError, sha256Hex } from "@payfanout/core";
 
 /**
  * Every metadata field: "Up to 3 keys are permitted, with key names up to 50
@@ -185,9 +185,5 @@ export function readAmount(value: unknown, resource: AmountResource, raw: unknow
  * uppercased, else NO_CURRENCY rather than a guess such as GBP.
  */
 export function readCurrency(...codes: Array<string | undefined>): string {
-  for (const code of codes) {
-    const upper = code?.trim().toUpperCase();
-    if (upper && /^[A-Z]{3}$/.test(upper)) return upper;
-  }
-  return NO_CURRENCY;
+  return firstCurrencyCode(...codes) ?? NO_CURRENCY;
 }

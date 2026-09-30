@@ -2,6 +2,7 @@ export type { MinorUnitAmount } from "./currency.js";
 export {
   allocate,
   assertMinorUnitAmount,
+  firstCurrencyCode,
   formatMinorUnits,
   fromMinorUnits,
   getCurrencyExponent,

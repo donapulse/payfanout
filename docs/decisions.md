@@ -6127,11 +6127,12 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
 ## No invented currencies (2026-09-30)
 
 - **The gap.** When a PSP record stated no currency, four server adapters reported one
-  anyway: PayPal `USD` (seven sites, two of them the currency of a capture or partial
-  refund amount it sends), GoCardless `GBP` (three), Paysafe `USD` (two), and Stripe `USD`
-  on the amountless answer of `verifyPaymentMethod`. PayPal's subscription projection
-  reported `""`, which core's `normalizeCurrency` rejects. A Paysafe JPY 1,500 payment
-  read without its currency reported as USD 15.00.
+  anyway: PayPal `USD` (seven sites, three of them the currency of an amount it sends: a
+  capture, a partial refund and an amount-only session update), GoCardless `GBP` (three),
+  Paysafe `USD` (two), and Stripe `USD` on the amountless answer of `verifyPaymentMethod`.
+  PayPal's subscription projection, PayZen's payment and subscription reads and Stripe's
+  subscription read reported `""`, which core's `normalizeCurrency` rejects. A Paysafe JPY
+  1,500 payment read without its currency reported as USD 15.00.
 - **The provider schemas.** PayPal's Orders v2 and Payments v2 schemas
   (`developer.paypal.com/api/orders/v2/schema.json` and `/api/payments/v2/schema.json`,
   read 2026-09-30) make `amount` optional on purchase units, authorizations, captures and
@@ -6142,23 +6143,47 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   required, `id` included, so it settles nothing either way.
 - **The rule.** A record reports the PSP's own currency, else one the adapter trusts
   (PayPal: any money object of the same purchase unit, whose records share the order's one
-  currency; GoCardless: a payment's billing request `payment_request`), else core's new
-  `NO_CURRENCY` (`"XXX"`, ISO 4217's code for "no currency involved"), which the Adyen and
-  Worldline adapters already reported and now take from core. A SetupIntent moves no money,
-  so Stripe's verification answer reports it too.
-- **Nothing is sent in a guessed currency.** PayPal refuses an explicit capture amount, a
-  partial refund and an amount-only session update with `invalid_request` before sending
-  when no record of the payment states its currency. A capture or refund in full sends no
-  amount and still goes through. A PayPal value whose money object and records state no
-  currency reads with `NO_CURRENCY`'s default exponent under a record that reports
-  `NO_CURRENCY`: throwing instead would fail the answer of a capture, void or refund that
-  has gone through. A refund read, whose record has no currency field to flag the amount,
-  refuses such a value with `processing_error`, and a refund call's answer falls back to
-  the amount asked. A session update that only restates the order's own currency no longer
-  sends a PATCH, which re-sent the amount it read (0 when the order reported none).
+  currency, and for a capture or refund read on its own, the capture's order; GoCardless:
+  a payment's billing request `payment_request`), else core's new `NO_CURRENCY` (`"XXX"`,
+  ISO 4217's code for "no currency involved"), which the Adyen and Worldline adapters
+  already reported and now take from core. A SetupIntent moves no money, so Stripe's
+  verification answer reports it too. Every read goes through core's new
+  `firstCurrencyCode`, the first candidate that is three letters once trimmed and
+  uppercased, so an empty or malformed code (`""`, `"EURO"`) falls through to the next
+  source instead of being reported. Stripe scales a subscription's amount by that same
+  reading, so a subscription stating `""` over an ISK price reports ISK with its amount
+  converted from Stripe's units.
+- **Why a related record can stand in.** PayPal's Orders v2 error messages refuse
+  `MULTI_CURRENCY_ORDER` ("Entire Order request must have the same currency_code") and
+  `AUTHORIZATION_CURRENCY_MISMATCH` (an authorization in another currency than the
+  order's), and its Payments v2 schema says "Currency of capture must be the same as
+  currency of authorization" and "Refund must be in the same currency as the capture"
+  (`developer.paypal.com/api/orders/v2/error-messages`, read 2026-09-30). GoCardless
+  describes a billing request's `payment_request_payment` link as the "ID of the payment
+  that was created from this payment request"; the adapter reads the billing request's
+  currency only for a payment it reached through that link.
+- **Nothing is sent in a guessed currency.** When no record of the payment states its
+  currency, PayPal refuses a capture amount, a partial refund and an amount-only session
+  update with `invalid_request` before sending. A refund in full sends no amount and still
+  goes through, and so does a capture of all of an authorization nothing was taken from,
+  which PayPal captures in full when no amount is sent; the remainder of a partly captured
+  one is refused, because without an amount PayPal would take the authorization's full
+  amount. A PayPal value whose money object and records state no currency reads with
+  `NO_CURRENCY`'s default exponent under a record that reports `NO_CURRENCY`: throwing
+  instead would fail the answer of a capture, void or refund that has gone through. A
+  refund read, whose record has no currency field to flag the amount, first reads the
+  refunded capture and then its order, and refuses a value none of them gives a currency
+  with `processing_error`; a refund call's answer reads its value like any other and falls
+  back to the amount asked when it has none. A session update that only restates the
+  order's own currency no longer sends a PATCH, which re-sent the amount it read (0 when
+  the order reported none).
 - **Not changed.** An amount a PSP omits still reads as 0, as before. Paysafe card refunds
   that state no currency keep their earlier rule (see "Card refunds and settlements may
   state no currency: AMBIGUOUS" above): a refund reports no currency field. Nineteen
-  mutations (each guard dropped, each fallback set back to its old guess, the related-record
-  sources removed, the restated-currency PATCH re-enabled, a currency-less value thrown on
-  instead of read, the refund read's refusal dropped) each made a test fail.
+  mutations of the first version (each guard dropped, each fallback set back to its old
+  guess, the related-record sources removed, the restated-currency PATCH re-enabled, a
+  currency-less value thrown on instead of read, the refund read's refusal dropped) each
+  made a test fail, and so did twenty-two of the final one (`firstCurrencyCode`'s shape
+  check, trim or fall-through dropped, each adapter's read set back to its old form, each
+  capture and order lookup removed or made to throw on a 404, the untouched-authorization
+  exemption widened or removed).

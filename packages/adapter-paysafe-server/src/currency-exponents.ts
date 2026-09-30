@@ -1,4 +1,4 @@
-import { getCurrencyExponent, NO_CURRENCY, PayFanoutError, type UnifiedErrorCode } from "@payfanout/core";
+import { firstCurrencyCode, getCurrencyExponent, NO_CURRENCY, PayFanoutError, type UnifiedErrorCode } from "@payfanout/core";
 
 /**
  * Paysafe's Currency Codes table, its 81 rows grouped by exponent, as
@@ -164,8 +164,7 @@ export function assertUsableRecord(currency: unknown, subject: string, record: u
  * else NO_CURRENCY rather than a guess such as USD.
  */
 export function reportedCurrency(code: string | undefined): string {
-  const upper = code?.trim().toUpperCase();
-  return upper && /^[A-Z]{3}$/.test(upper) ? upper : NO_CURRENCY;
+  return firstCurrencyCode(code) ?? NO_CURRENCY;
 }
 
 /**

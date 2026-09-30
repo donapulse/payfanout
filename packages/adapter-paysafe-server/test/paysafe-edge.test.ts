@@ -61,6 +61,11 @@ describe("Paysafe currency reporting", () => {
     expect(info.amount).toBe(100);
   });
 
+  it("reads a malformed currencyCode as no currency", async () => {
+    const info = await adapterWithPayment({ currencyCode: "EURO", status: "PENDING" }).retrievePayment("pay_1");
+    expect(info.currency).toBe("XXX");
+  });
+
   it("reports the currencyCode a payment states, uppercased", async () => {
     const info = await adapterWithPayment({ currencyCode: "eur", status: "PENDING" }).retrievePayment("pay_1");
     expect(info.currency).toBe("EUR");

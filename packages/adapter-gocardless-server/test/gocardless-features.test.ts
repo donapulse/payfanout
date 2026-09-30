@@ -267,6 +267,13 @@ describe("GoCardless status mapping", () => {
     expect(info.currency).toBe("EUR");
   });
 
+  it("reads a malformed currency as no currency", async () => {
+    const { adapter, fake } = makePair();
+    const payment = fake.seedPayment({ currency: "EURO" });
+    const info = await adapter.retrievePayment(payment.id);
+    expect(info.currency).toBe("XXX");
+  });
+
   it("reports a billing request that states no currency as XXX", async () => {
     const { adapter, fake } = makePair();
     const session = await adapter.createPaymentSession({

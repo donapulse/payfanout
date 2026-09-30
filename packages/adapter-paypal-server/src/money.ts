@@ -1,5 +1,6 @@
 import {
   assertMinorUnitAmount,
+  firstCurrencyCode,
   formatMinorUnits,
   getCurrencyExponent,
   normalizeCurrency,
@@ -34,11 +35,7 @@ const WHOLE_UNIT_CURRENCIES: ReadonlySet<string> = new Set(["HUF", "JPY", "TWD"]
 
 /** The first currency the money objects state, uppercased; undefined when none states one. */
 export function statedCurrency(...moneys: Array<{ currency_code?: string } | undefined>): string | undefined {
-  for (const money of moneys) {
-    const code = money?.currency_code?.trim().toUpperCase();
-    if (code && /^[A-Z]{3}$/.test(code)) return code;
-  }
-  return undefined;
+  return firstCurrencyCode(...moneys.map((money) => money?.currency_code));
 }
 
 /** A currency PayPal accepts for a new payment. */

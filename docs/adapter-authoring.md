@@ -60,7 +60,10 @@ and `PaymentService` will hold you to:
 - **Currencies you report** come from the PSP record, else from a source your adapter
   trusts (the currency it sent, or one another record of the same payment states), else
   core's `NO_CURRENCY` (`"XXX"`, ISO 4217's "no currency"): never a plausible guess such
-  as USD. Never send an amount in a guessed currency either: when no record states the
+  as USD. Read them with core's `firstCurrencyCode(own, fallback, …)`, which takes the
+  first candidate that is three letters once trimmed and uppercased, so an empty or
+  malformed code falls through to the next source; scale the amount by that same reading.
+  Never send an amount in a guessed currency either: when no record states the
   currency, refuse the call with `invalid_request` before sending. An amount the PSP
   reports with no currency anywhere reads with `NO_CURRENCY`'s default exponent under a
   record that reports `NO_CURRENCY`, so a call that went through never fails on its

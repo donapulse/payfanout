@@ -18,6 +18,20 @@ export type MinorUnitAmount = number;
 export const NO_CURRENCY = "XXX";
 
 /**
+ * The first of `codes` that is an ISO 4217 code once trimmed and uppercased,
+ * or undefined when none is: how an adapter reads the currency a PSP record
+ * states, reporting {@link NO_CURRENCY} when it states none.
+ */
+export function firstCurrencyCode(...codes: unknown[]): string | undefined {
+  for (const code of codes) {
+    if (typeof code !== "string") continue;
+    const upper = code.trim().toUpperCase();
+    if (/^[A-Z]{3}$/.test(upper)) return upper;
+  }
+  return undefined;
+}
+
+/**
  * ISO 4217 currencies whose exponent is not the default 2, as ISO 4217 list
  * one gives their minor units.
  */

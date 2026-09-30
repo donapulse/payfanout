@@ -1,7 +1,9 @@
 import {
   assertMinorUnitAmount,
   classifyHttpFallback,
+  firstCurrencyCode,
   getUserMessage,
+  NO_CURRENCY,
   normalizeCurrency,
   normalizeSecrets,
   PayFanoutError,
@@ -836,8 +838,8 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       pspName: this.pspName,
       status: derivePayZenSubscriptionStatus(sub, this.nowMs()),
       amount: sub.amount ?? 0,
-      // Never fabricate a currency: empty is more honest when PayZen omits it.
-      currency: (sub.currency ?? "").toUpperCase(),
+      // A currency PayZen omits reads as NO_CURRENCY, never a guessed one.
+      currency: firstCurrencyCode(sub.currency) ?? NO_CURRENCY,
       ...(cadence ? { interval: cadence.interval, intervalCount: cadence.intervalCount } : {}),
       // The source cadence, verbatim as PayZen reports it.
       ...(sub.rrule ? { schedule: sub.rrule } : {}),
@@ -1085,8 +1087,8 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       amountRefunded,
       ...(captured ? { amountCaptured: tx.amount ?? 0 } : {}),
       ...(detailedStatus === "AUTHORISED_TO_VALIDATE" ? { amountCapturable: tx.amount ?? 0 } : {}),
-      // Never fabricate a currency: empty is more honest when PayZen omits it.
-      currency: (tx.currency ?? "").toUpperCase(),
+      // A currency PayZen omits reads as NO_CURRENCY, never a guessed one.
+      currency: firstCurrencyCode(tx.currency) ?? NO_CURRENCY,
       // Absent on some snapshots — card is the only method that predates the
       // field on this platform, so it stays the honest fallback.
       paymentMethodType: !tx.paymentMethodType

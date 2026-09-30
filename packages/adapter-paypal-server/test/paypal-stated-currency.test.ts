@@ -138,7 +138,7 @@ describe("PayPal never reports or sends a currency no record states", () => {
     expect(sent.filter((call) => call.method === "POST")).toEqual([]);
   });
 
-  it("refuses the capture amount it would compute when the order states amounts but no currency", async () => {
+  it("captures all of an untouched authorization whose amounts state no currency, sending no amount", async () => {
     const { adapter, sent } = recordingAdapter({
       "GET /v2/checkout/orders/5O8": {
         id: "5O8",
@@ -152,8 +152,179 @@ describe("PayPal never reports or sends a currency no record states", () => {
           },
         ],
       },
+      "POST /v2/payments/authorizations/A8/capture": { id: "C8", status: "COMPLETED" },
     });
-    const err = await rejection(adapter.capturePayment("5O8", undefined, "capture-key"));
+    await adapter.capturePayment("5O8", undefined, "capture-key");
+    // PayPal captures the full authorized amount when none is sent: the same money.
+    expect(sent.filter((call) => call.method === "POST")).toEqual([
+      { method: "POST", path: "/v2/payments/authorizations/A8/capture", body: { final_capture: true } },
+    ]);
+  });
+
+  it("sends a partial refund by capture id in the currency its parent order states", async () => {
+    const { adapter, sent } = recordingAdapter({
+      "GET /v2/payments/captures/C1": {
+        id: "C1",
+        status: "COMPLETED",
+        amount: { value: "10.00" },
+        supplementary_data: { related_ids: { order_id: "O1" } },
+      },
+      "GET /v2/checkout/orders/O1": {
+        id: "O1",
+        intent: "CAPTURE",
+        status: "COMPLETED",
+        purchase_units: [{ reference_id: "default", amount: { currency_code: "EUR", value: "10.00" } }],
+      },
+      "POST /v2/payments/captures/C1/refund": {
+        id: "R1",
+        status: "COMPLETED",
+        amount: { currency_code: "EUR", value: "5.00" },
+      },
+    });
+    const result = await adapter.refundPayment({ pspPaymentId: "C1", amount: 500, idempotencyKey: "refund-key" });
+    expect(result.amount).toBe(500);
+    expect(sent.filter((call) => call.method === "POST")).toEqual([
+      { method: "POST", path: "/v2/payments/captures/C1/refund", body: { amount: { currency_code: "EUR", value: "5.00" } } },
+    ]);
+  });
+
+  it("answers a full refund with the value PayPal reports, not the whole capture", async () => {
+    // What was left after an earlier partial refund: 7.00 of the 10.00 captured.
+    const { adapter } = recordingAdapter({
+      "GET /v2/payments/captures/C2": { id: "C2", status: "PARTIALLY_REFUNDED", amount: { value: "10.00" } },
+      "POST /v2/payments/captures/C2/refund": { id: "R2", status: "COMPLETED", amount: { value: "7.00" } },
+    });
+    const result = await adapter.refundPayment({ pspPaymentId: "C2", idempotencyKey: "refund-key" });
+    expect(result.amount).toBe(700);
+  });
+
+  it("scales a refund answer missing its currency_code by the capture's currency", async () => {
+    const { adapter } = recordingAdapter({
+      "GET /v2/payments/captures/C3": {
+        id: "C3",
+        status: "PARTIALLY_REFUNDED",
+        amount: { currency_code: "JPY", value: "1500" },
+      },
+      "POST /v2/payments/captures/C3/refund": { id: "R3", status: "COMPLETED", amount: { value: "1000" } },
+    });
+    const result = await adapter.refundPayment({ pspPaymentId: "C3", idempotencyKey: "refund-key" });
+    expect(result.amount).toBe(1000); // JPY has no minor unit: never 100000
+  });
+
+  it("reads a refund whose amount states no currency by the currency of its capture", async () => {
+    const { adapter } = recordingAdapter({
+      "GET /v2/payments/refunds/R4": {
+        id: "R4",
+        status: "COMPLETED",
+        amount: { value: "5.00" },
+        links: [{ rel: "up", href: "https://api-m.sandbox.paypal.com/v2/payments/captures/C4" }],
+      },
+      "GET /v2/payments/captures/C4": { id: "C4", status: "PARTIALLY_REFUNDED", amount: { currency_code: "EUR", value: "10.00" } },
+    });
+    const info = await adapter.retrieveRefund("R4");
+    expect(info.amount).toBe(500);
+    expect(info.pspPaymentId).toBe("C4");
+  });
+
+  it("reads such a refund by its capture's order when the capture states no currency either", async () => {
+    const { adapter } = recordingAdapter({
+      "GET /v2/payments/refunds/R5": {
+        id: "R5",
+        status: "COMPLETED",
+        amount: { value: "500" },
+        links: [{ rel: "up", href: "https://api-m.sandbox.paypal.com/v2/payments/captures/C5" }],
+      },
+      "GET /v2/payments/captures/C5": {
+        id: "C5",
+        status: "PARTIALLY_REFUNDED",
+        supplementary_data: { related_ids: { order_id: "O5" } },
+      },
+      "GET /v2/checkout/orders/O5": {
+        id: "O5",
+        status: "COMPLETED",
+        purchase_units: [{ amount: { currency_code: "JPY", value: "1000" } }],
+      },
+    });
+    expect((await adapter.retrieveRefund("R5")).amount).toBe(500);
+  });
+
+  it("refuses a refund read whose capture no longer reads, as when nothing states its currency", async () => {
+    const { adapter, sent } = recordingAdapter({
+      "GET /v2/payments/refunds/R11": {
+        id: "R11",
+        status: "COMPLETED",
+        amount: { value: "5.00" },
+        links: [{ rel: "up", href: "https://api-m.sandbox.paypal.com/v2/payments/captures/C11" }],
+      },
+    });
+    const err = await rejection(adapter.retrieveRefund("R11"));
+    expect(isPayFanoutError(err) && err.code).toBe("processing_error");
+    expect(String((err as Error).message)).toMatch(/refund R11 of "5\.00" without a currency/);
+    expect(sent.map((call) => call.path)).toEqual(["/v2/payments/refunds/R11", "/v2/payments/captures/C11"]);
+  });
+
+  it("takes the currency a refund of the order states when nothing else states one", async () => {
+    const { adapter } = recordingAdapter({
+      "GET /v2/checkout/orders/5O10": {
+        id: "5O10",
+        intent: "CAPTURE",
+        status: "COMPLETED",
+        purchase_units: [
+          {
+            reference_id: "default",
+            payments: {
+              captures: [{ id: "C10", status: "REFUNDED" }],
+              refunds: [{ id: "R10", status: "COMPLETED", amount: { currency_code: "EUR", value: "10.00" } }],
+            },
+          },
+        ],
+      },
+    });
+    const info = await adapter.retrievePayment("5O10");
+    expect(info.currency).toBe("EUR");
+    expect(info.amountRefunded).toBe(1000);
+  });
+
+  it("reads a malformed currency_code as no currency, never throwing", async () => {
+    const { adapter } = recordingAdapter({
+      "GET /v2/checkout/orders/5O11": {
+        id: "5O11",
+        intent: "CAPTURE",
+        status: "APPROVED",
+        purchase_units: [{ reference_id: "default", amount: { currency_code: "EURO", value: "10.00" } }],
+      },
+    });
+    const info = await adapter.retrievePayment("5O11");
+    expect(info.currency).toBe("XXX");
+    expect(info.amount).toBe(1000);
+  });
+
+  it("refuses the remainder it would compute when the order states amounts but no currency", async () => {
+    const { adapter, sent } = recordingAdapter({
+      "GET /v2/checkout/orders/5O9": {
+        id: "5O9",
+        intent: "AUTHORIZE",
+        status: "COMPLETED",
+        purchase_units: [
+          {
+            reference_id: "default",
+            amount: { value: "10.00" },
+            payments: {
+              authorizations: [{ id: "A9", status: "PARTIALLY_CAPTURED", amount: { value: "10.00" } }],
+              captures: [
+                {
+                  id: "C9a",
+                  status: "COMPLETED",
+                  amount: { value: "4.00" },
+                  supplementary_data: { related_ids: { authorization_id: "A9" } },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    });
+    const err = await rejection(adapter.capturePayment("5O9", undefined, "capture-key"));
     expect(isPayFanoutError(err) && err.code).toBe("invalid_request");
     expect(String((err as Error).message)).toMatch(/capture it in the PayPal dashboard/);
     expect(sent.filter((call) => call.method === "POST")).toEqual([]);
@@ -190,6 +361,51 @@ describe("PayPal never reports or sends a currency no record states", () => {
     const err = await rejection(adapter.refundPayment({ pspPaymentId: "C9", amount: 500, idempotencyKey: "refund-key" }));
     expect(isPayFanoutError(err) && err.code).toBe("invalid_request");
     expect(String((err as Error).message)).toMatch(/Capture C9 of payment "C9" states no currency/);
+    expect(sent.filter((call) => call.method === "POST")).toEqual([]);
+  });
+
+  it("refuses such a partial refund the same way when the capture's order no longer reads", async () => {
+    const { adapter, sent } = recordingAdapter({
+      "GET /v2/payments/captures/C10": {
+        id: "C10",
+        status: "COMPLETED",
+        supplementary_data: { related_ids: { order_id: "O10" } },
+      },
+    });
+    const err = await rejection(adapter.refundPayment({ pspPaymentId: "C10", amount: 500, idempotencyKey: "refund-key" }));
+    expect(isPayFanoutError(err) && err.code).toBe("invalid_request");
+    expect(String((err as Error).message)).toMatch(/Capture C10 of payment "C10" states no currency/);
+    expect(sent.map((call) => `${call.method} ${call.path}`)).toEqual([
+      "GET /v2/checkout/orders/C10",
+      "GET /v2/payments/captures/C10",
+      "GET /v2/checkout/orders/O10",
+    ]);
+  });
+
+  it("refuses to capture the order's amount on a reauthorization when nothing states the currency", async () => {
+    const { adapter, sent } = recordingAdapter({
+      "GET /v2/checkout/orders/5O7": {
+        id: "5O7",
+        intent: "AUTHORIZE",
+        status: "COMPLETED",
+        purchase_units: [
+          {
+            reference_id: "default",
+            amount: { value: "10.00" },
+            payments: {
+              authorizations: [
+                { id: "A7", status: "CREATED", create_time: "2026-09-01T10:00:00Z" },
+                { id: "A7r", status: "CREATED", create_time: "2026-09-05T10:00:00Z" },
+              ],
+            },
+          },
+        ],
+      },
+    });
+    // Sending no amount would let PayPal take all of the reauthorization, which can hold more than the order.
+    const err = await rejection(adapter.capturePayment("5O7", undefined, "capture-key"));
+    expect(isPayFanoutError(err) && err.code).toBe("invalid_request");
+    expect(String((err as Error).message)).toMatch(/capture it in the PayPal dashboard/);
     expect(sent.filter((call) => call.method === "POST")).toEqual([]);
   });
 
@@ -303,5 +519,30 @@ describe("PayPal never reports or sends a currency no record states", () => {
     expect(sent.filter((call) => call.method !== "GET")).toEqual([]);
     expect(session.currency).toBe("EUR");
     expect(session.amount).toBe(1000);
+  });
+
+  it("compares a restated currency with the one the order's records state when its amount states none", async () => {
+    const { adapter, sent } = recordingAdapter({
+      "GET /v2/checkout/orders/5O8": {
+        id: "5O8",
+        intent: "AUTHORIZE",
+        status: "COMPLETED",
+        purchase_units: [
+          {
+            reference_id: "default",
+            payments: {
+              authorizations: [{ id: "A8", status: "CREATED", amount: { currency_code: "EUR", value: "10.00" } }],
+            },
+          },
+        ],
+      },
+    });
+    const session = await adapter.updatePaymentSession({
+      pspSessionId: "5O8",
+      currency: "EUR",
+      idempotencyKey: "update-key",
+    });
+    expect(sent.filter((call) => call.method !== "GET")).toEqual([]);
+    expect(session.currency).toBe("EUR");
   });
 });

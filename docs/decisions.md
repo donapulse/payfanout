@@ -5676,6 +5676,93 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
     does), send `amount: 1235` in KWD straight to the PaymentIntents API, as the adapter
     refuses it locally, and record whether Stripe refuses it too.
 
+## Currency denylist capability (2026-09-30)
+
+- **The gap.** `AdapterCapabilities.supportedCurrencies` is an allowlist, and adapters whose
+  PSP takes most currencies refuse a few: Paysafe the currencies its table prices with another
+  exponent or lacks ("Paysafe: currencies whose exponent may not be PayFanout's (2026-09-27)")
+  and Adyen CLP, CVE, IDR and ISK ("Adyen adapter (2026-08-02)"), both on every session, and
+  Stripe every UGX amount it would send ("Stripe: currencies whose API units differ from
+  PayFanout's (2026-09-30)"). None of them can declare an allowlist without refusing
+  currencies its PSP takes, so the router could not pre-screen these currencies: a candidate
+  asked for one refused with `invalid_request`, a business rejection that ends the cascade
+  before the next PSP is tried, and hosts had to route them with a rule of their own. The
+  Paysafe entry named the fix, a capability listing the currencies an adapter refuses, as "a
+  contract change, and a follow-up of its own"; this is that follow-up.
+- **`AdapterCapabilities.unsupportedCurrencies?: string[]`**: uppercase ISO 4217 codes the
+  adapter refuses to send any amount in, absent or empty meaning none; an adapter may declare
+  this list, `supportedCurrencies`, or both. `screenSessionInput` refuses a session in a listed
+  currency after the `supportedCurrencies` check, with a message of its own, `"<psp>" declares
+  currency <code> unsupported`, since the list is the adapter's declaration rather than a fact
+  about its PSP (changed in review, 2026-09-30: the first version reused the allowlist's
+  `"<psp>" does not support currency <input>`, which is unchanged). The input is trimmed and
+  uppercased as for the allowlist, and each listed code is trimmed and uppercased too
+  (`listedCurrencyCode`), so that registration can reject exactly the entries that can never
+  match; the allowlist's own comparison is unchanged. `PaymentRouter` skips the candidate
+  without a PSP call and tries the next one; `PaymentService` refuses the session with a
+  non-retryable `unsupported_operation` before calling the adapter.
+- **Every session in a listed currency, zero-amount ones included: a trade-off** (restated in
+  review, 2026-09-30). The list is read as the allowlist has always been read, whatever the
+  amount. An adapter declares a currency when it refuses every amount it would send in it;
+  declaring it also refuses zero-amount sessions in that currency, even ones the adapter
+  itself still serves because they send no amount, and that adapter's changeset must say so.
+  A refusal of only some non-zero amounts (Stripe's MGA amounts that are not whole ariary)
+  stays a local check. Reading the list only for sessions that carry an amount was rejected:
+  Paysafe refuses its currencies on zero-amount sessions too, and such a session would again
+  end the cascade. Stripe bears the cost: its zero-amount UGX sessions are SetupIntents, which
+  carry no currency and so serve any, and with UGX declared a host creates them in another
+  currency.
+- **What `PaymentService` answers changes.** The adapters refuse these sessions with
+  `invalid_request` and a `raw` naming the currency's units; once an adapter declares a
+  currency, `PaymentService` answers first, with `unsupported_operation`, the screening message
+  and no `raw`, as it already does for a currency outside `supportedCurrencies` (PayPal's RUB).
+  Only `createPaymentSession` is screened: session updates, `chargeSavedPaymentMethod`,
+  `createNativeSubscription` and `SubscriptionManager` renewals still meet the adapter's own
+  refusal, and an adapter called directly refuses as before and keeps its local check.
+- **Validation reports only what stops a declaration from working** (changed in review,
+  2026-09-30). `validateAdapterCapabilities` reports an `unsupportedCurrencies` entry that can
+  never match (not a string, or not three letters once trimmed and uppercased); a currency in
+  both lists (screening refuses it, so declaring it supported contradicts the adapter); and a
+  supported rail whose `currencies` are all declared unsupported, which can never be routed, as
+  the existing rule says of a rail outside `supportedCurrencies`. The last two read well-formed
+  entries only, and the both-lists rule reads the allowlist as screening does, each entry
+  uppercased and not trimmed, except that a value that is not a string is skipped here, where
+  screening would throw on it. `PaymentService`
+  rejects exactly these at registration. An entry that matches but is not written as its bare
+  uppercase code (`"ugx"`, `" UGX"`) works, so it registers and core does not report it. The
+  first version rejected such an entry at registration, so `new PaymentService()` threw over a
+  code screening matches anyway, and a non-string entry made the rail rule throw. An option
+  letting registration skip the form check, tried next, was dropped: a second parameter makes
+  `adapters.map(validateAdapterCapabilities)` fail to compile, a build break in a minor. A rail
+  both lists shut out gets the `supportedCurrencies` diagnosis alone, and a refused currency
+  the allowlist leaves out anyway is redundant, not contradictory, and passes.
+- **The conformance suite checks the bare uppercase form** (changed in review, 2026-09-30).
+  The suite asserts that `validateAdapterCapabilities` finds no issue, so the three rules above
+  reach every adapter's run through core. Next to its identical checks of `supportedCurrencies`
+  and each payment method's `currencies`, it now also checks that each `unsupportedCurrencies`
+  code is written as its bare uppercase code (`/^[A-Z]{3}$/`), which a working `"ugx"` is not.
+  The push-only fake in the suite's own tests declares, and refuses, XTS, the code ISO 4217
+  reserves for testing, so the check runs on a passing adapter there. `@payfanout/conformance`
+  takes a minor, and this supersedes #91's practice, which released its country-shape
+  assertions as a major because an adapter declaring malformed codes would newly fail the
+  suite: checks gated on a new optional field take a conformance minor, since an adapter that
+  passes the suite today declares no such field and keeps its verdict. The client adapters
+  have nothing to mirror: `ClientPaymentAdapter` exposes per-method capabilities only, never a
+  PSP-wide currency list.
+- **`listNonDefaultCurrencyExponents()`.** A declaration derived from an adapter's own refusal
+  rule, rather than typed out beside it, needs every code the rule could refuse. Paysafe's rule
+  reads core's exponents, and core kept the codes it does not read as 2 to itself, so the only
+  complete list was every three-letter code put to the rule: 17,576 calls, measured at 10 to
+  20 ms of CPU on first use under Node 24, too much for an adapter that runs on edge runtimes.
+  Core now lists those codes with their exponents, in code order, as a fresh array on each call;
+  any code outside the list reads as 2, so the codes an adapter's table and core's could
+  disagree on are that table's and this list's.
+- **Release.** `@payfanout/core` takes a minor: an optional field, a screen and validation
+  rules that only read it, and `listNonDefaultCurrencyExponents()`. `@payfanout/server` takes a
+  minor (changed in review, 2026-09-30; the first version shipped it as a dependency patch):
+  its router and `PaymentService` act on the field through the core it pins, so hosts need its
+  release for the router to read the field. `@payfanout/conformance` takes a minor, as above.
+
 ## Stripe.js version follows the pinned API version (2026-09-30)
 
 - **Why.** `@payfanout/adapter-stripe` always loaded `https://js.stripe.com/v3` and created

@@ -630,7 +630,7 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
    */
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
     if (req.amount !== undefined) assertPositiveAmount(req.amount, "refund amount");
-    const target = await this.resolveCapture(req.pspPaymentId);
+    const target = await this.resolveCapture(req.pspPaymentId, req.amount !== undefined);
     const currency = target.currency;
     if (req.amount !== undefined && currency === undefined) {
       throw PayFanoutError.invalidRequest(
@@ -667,25 +667,27 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
       `/v2/payments/refunds/${encodeURIComponent(refundId)}`,
     );
     const captureId = captureIdFromLinks(refund.links);
-    let currency = statedCurrency(refund.amount);
-    if (refund.amount?.value !== undefined && currency === undefined && captureId) {
-      currency = await this.captureCurrency(captureId);
-    }
-    if (refund.amount?.value !== undefined && currency === undefined) {
-      // A refund record carries no currency field that could flag the amount
-      // as unverified, so the read refuses it rather than scale it by a guess.
-      throw new PayFanoutError({
-        code: "processing_error",
-        message: `PayPal reported refund ${refund.id} of "${refund.amount.value}" without a currency`,
-        raw: refund,
-        pspName: this.pspName,
-      });
+    const value = refund.amount?.value;
+    let amount: MinorUnitAmount = 0;
+    if (value !== undefined) {
+      const currency =
+        statedCurrency(refund.amount) ?? (captureId ? await this.captureCurrency(captureId) : undefined);
+      if (currency === undefined) {
+        // A refund record carries no currency field that could flag the amount
+        // as unverified, so the read refuses it rather than scale it by a guess.
+        throw new PayFanoutError({
+          code: "processing_error",
+          message: `PayPal reported refund ${refund.id} of "${value}" without a currency`,
+          raw: refund,
+          pspName: this.pspName,
+        });
+      }
+      amount = fromPayPalValue(value, currency);
     }
     return {
       refundId: refund.id,
       status: mapRefundStatus(refund.status),
-      amount:
-        refund.amount?.value !== undefined && currency !== undefined ? fromPayPalValue(refund.amount.value, currency) : 0,
+      amount,
       ...(captureId ? { pspPaymentId: captureId } : {}),
       ...(refund.create_time ? { createdAt: refund.create_time } : {}),
       raw: refund,
@@ -1164,7 +1166,12 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
     return statedCurrency(capture.amount) ?? (await this.parentOrderCurrency(capture));
   }
 
-  private async resolveCapture(pspPaymentId: string): Promise<CaptureTarget> {
+  /**
+   * `sendsAmount`: the refund sends an amount, which needs the currency. A
+   * full refund sends none, so a failed read of a capture's order, which only
+   * scales its answer, never stops it.
+   */
+  private async resolveCapture(pspPaymentId: string, sendsAmount: boolean): Promise<CaptureTarget> {
     let order: PayPalOrderLike | undefined;
     try {
       order = await this.request<PayPalOrderLike>(
@@ -1178,10 +1185,15 @@ export class PayPalServerAdapter implements ServerPaymentAdapter {
         "GET",
         `/v2/payments/captures/${encodeURIComponent(pspPaymentId)}`,
       );
-      return captureTarget(
-        capture,
-        statedCurrency(capture.amount) === undefined ? await this.parentOrderCurrency(capture) : undefined,
-      );
+      let orderCurrency: string | undefined;
+      if (statedCurrency(capture.amount) === undefined) {
+        try {
+          orderCurrency = await this.parentOrderCurrency(capture);
+        } catch (lookupErr) {
+          if (sendsAmount) throw lookupErr;
+        }
+      }
+      return captureTarget(capture, orderCurrency);
     }
     const captures = (order.purchase_units?.[0]?.payments?.captures ?? []).filter(
       (c) => !isFailedCaptureStatus(c.status),

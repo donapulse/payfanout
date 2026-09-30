@@ -423,13 +423,16 @@ describe("PayZenServerAdapter sessions", () => {
     expect(kwdInfo.currency).toBe("KWD");
   });
 
-  it("reads a missing or malformed transaction currency as XXX, never a guess", async () => {
+  it("reads a transaction's currency from its order when it states none, else as XXX, never a guess", async () => {
     const { adapter, fake } = makePair();
-    const session = await adapter.createPaymentSession({ amount: 1099, currency: "EUR", idempotencyKey: "k" });
+    const session = await adapter.createPaymentSession({ amount: 1099, currency: "JPY", idempotencyKey: "k" });
     const tx = fake.payOrder(session.pspSessionId);
     tx.currency = "EURO";
+    expect((await adapter.retrievePayment(tx.uuid)).currency).toBe("JPY"); // orderDetails.orderCurrency
+    tx.orderDetails.orderCurrency = "";
     expect((await adapter.retrievePayment(tx.uuid)).currency).toBe("XXX");
     Reflect.deleteProperty(tx, "currency");
+    Reflect.deleteProperty(tx.orderDetails, "orderCurrency");
     expect((await adapter.retrievePayment(tx.uuid)).currency).toBe("XXX");
   });
 });
@@ -1005,6 +1008,41 @@ describe("PayZenServerAdapter refunds", () => {
     });
   });
 
+  it("sends a partial refund in its order's currency when the transaction states none", async () => {
+    const { adapter, fake } = makePair();
+    const uuid = await capturedPayment(adapter, fake);
+    fake.getTransaction(uuid)!.currency = "";
+    await adapter.refundPayment({ pspPaymentId: uuid, amount: 500, idempotencyKey: "r" });
+    expect(fake.lastOperation).toBe("Transaction/Refund");
+    expect(fake.lastRequestBody).toMatchObject({ uuid, amount: 500, currency: "EUR" });
+  });
+
+  it("refuses a partial refund before any refund call when neither the transaction nor its order states a currency", async () => {
+    const { adapter, fake } = makePair();
+    const uuid = await capturedPayment(adapter, fake);
+    const tx = fake.getTransaction(uuid)!;
+    tx.currency = "";
+    Reflect.deleteProperty(tx.orderDetails, "orderCurrency");
+    await expect(adapter.refundPayment({ pspPaymentId: uuid, amount: 500, idempotencyKey: "r" })).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringContaining("states no currency") as string,
+    });
+    expect(fake.lastOperation).toBe("Transaction/Get");
+    expect(fake.uniqueRefundCreations).toBe(0);
+  });
+
+  it("refunds such a payment in full, sending no currency", async () => {
+    const { adapter, fake } = makePair();
+    const uuid = await capturedPayment(adapter, fake, 1000);
+    const tx = fake.getTransaction(uuid)!;
+    tx.currency = "";
+    Reflect.deleteProperty(tx.orderDetails, "orderCurrency");
+    await adapter.refundPayment({ pspPaymentId: uuid, idempotencyKey: "r" });
+    expect(fake.lastOperation).toBe("Transaction/CancelOrRefund");
+    expect(fake.lastRequestBody).toMatchObject({ uuid, amount: 1000, resolutionMode: "AUTO" });
+    expect(fake.lastRequestBody).not.toHaveProperty("currency");
+  });
+
   it("a fully refunded payment rejects further full refunds locally", async () => {
     const { adapter, fake } = makePair();
     const uuid = await capturedPayment(adapter, fake, 1000);
@@ -1456,6 +1494,20 @@ describe("PayZenServerAdapter native subscriptions", () => {
     fake.getSubscription(openEnded.id)!.pastPaymentsNumber = 5;
     record = await adapter.retrieveNativeSubscription({ subscriptionId: openEnded.id, savedPaymentMethodToken: MUT });
     expect(record.status).toBe("active");
+  });
+
+  it("reports the currency it sent when the create answer states an empty one", async () => {
+    const fake = new FakePayZenApi();
+    const { adapter } = makeSubPair({
+      fetch: async (input, init) => {
+        const response = await fake.fetch(input, init);
+        if (!String(input).endsWith("/Charge/CreateSubscription")) return response;
+        const envelope = (await response.json()) as { answer?: { currency?: string } };
+        if (envelope.answer) envelope.answer.currency = "";
+        return new Response(JSON.stringify(envelope), { status: response.status, headers: response.headers });
+      },
+    });
+    expect((await adapter.createNativeSubscription(createInput({ currency: "JPY", amount: 990 }))).currency).toBe("JPY");
   });
 
   it("reads a missing or malformed subscription currency as XXX, never a guess", async () => {

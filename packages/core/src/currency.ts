@@ -18,9 +18,10 @@ export type MinorUnitAmount = number;
 export const NO_CURRENCY = "XXX";
 
 /**
- * The first of `codes` that is an ISO 4217 code once trimmed and uppercased,
- * or undefined when none is: how an adapter reads the currency a PSP record
- * states, reporting {@link NO_CURRENCY} when it states none.
+ * The first of `codes` that is three letters once trimmed and uppercased, the
+ * shape of an ISO 4217 code (the code itself is not looked up), or undefined
+ * when none is: how an adapter reads the currency a PSP record states,
+ * reporting {@link NO_CURRENCY} when it states none.
  */
 export function firstCurrencyCode(...codes: unknown[]): string | undefined {
   for (const code of codes) {

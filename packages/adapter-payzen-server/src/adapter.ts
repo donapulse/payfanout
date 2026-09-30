@@ -133,7 +133,7 @@ export interface PayZenTransactionLike {
   errorCode?: string | null;
   detailedErrorCode?: string | null;
   metadata?: Record<string, string> | null;
-  orderDetails?: { orderId?: string | null; metadata?: Record<string, string> | null };
+  orderDetails?: { orderId?: string | null; orderCurrency?: string | null; metadata?: Record<string, string> | null };
   transactionDetails?: {
     parentTransactionUuid?: string | null;
     creationContext?: string;
@@ -154,6 +154,14 @@ export interface PayZenOrderLike {
   orderStatus?: string;
   orderDetails?: { orderId?: string | null };
   transactions?: PayZenTransactionLike[];
+}
+
+/**
+ * A transaction's own currency, else its order's (`orderDetails.orderCurrency`,
+ * which the V4 Transaction schema requires); undefined when neither is a code.
+ */
+function transactionCurrency(tx: PayZenTransactionLike): string | undefined {
+  return firstCurrencyCode(tx.currency, tx.orderDetails?.orderCurrency);
 }
 
 /** Structural subset of the Charge/CreateSubscription answer (V4/SubscriptionCreated). */
@@ -546,10 +554,16 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
     if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
     const { transaction, order } = await this.resolveTransaction(req.pspPaymentId);
-    const currency = (transaction.currency ?? "").toUpperCase();
+    const currency = transactionCurrency(transaction);
     const comment = req.reason ? { comment: req.reason } : {};
     let answer: PayZenTransactionLike;
     if (req.amount !== undefined) {
+      if (currency === undefined) {
+        throw PayFanoutError.invalidRequest(
+          `Payment ${transaction.uuid ?? req.pspPaymentId} states no currency, so a partial refund amount cannot be sent for it — refund it in full, or in the PayZen back office`,
+          transaction,
+        );
+      }
       answer = await this.call<PayZenTransactionLike>(
         "Transaction/Refund",
         { uuid: transaction.uuid, amount: req.amount, currency, ...comment },
@@ -566,7 +580,14 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       }
       answer = await this.call<PayZenTransactionLike>(
         "Transaction/CancelOrRefund",
-        { uuid: transaction.uuid, amount: remaining, currency, resolutionMode: "AUTO", ...comment },
+        // `currency` is optional here, and `remaining` is PayZen's own amount.
+        {
+          uuid: transaction.uuid,
+          amount: remaining,
+          ...(currency !== undefined ? { currency } : {}),
+          resolutionMode: "AUTO",
+          ...comment,
+        },
         { retryTransport: false },
       );
     }
@@ -716,7 +737,7 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
         subscriptionId: answer.subscriptionId,
         rrule: answer.rrule ?? rrule,
         amount: answer.amount ?? input.amount,
-        currency: answer.currency ?? currency,
+        currency: firstCurrencyCode(answer.currency) ?? currency,
         effectDate: answer.effectDate ?? effectDate,
         orderId,
       },
@@ -1087,8 +1108,8 @@ export class PayZenServerAdapter implements ServerPaymentAdapter {
       amountRefunded,
       ...(captured ? { amountCaptured: tx.amount ?? 0 } : {}),
       ...(detailedStatus === "AUTHORISED_TO_VALIDATE" ? { amountCapturable: tx.amount ?? 0 } : {}),
-      // A currency PayZen omits reads as NO_CURRENCY, never a guessed one.
-      currency: firstCurrencyCode(tx.currency) ?? NO_CURRENCY,
+      // A currency PayZen states nowhere reads as NO_CURRENCY, never a guessed one.
+      currency: transactionCurrency(tx) ?? NO_CURRENCY,
       // Absent on some snapshots — card is the only method that predates the
       // field on this platform, so it stays the honest fallback.
       paymentMethodType: !tx.paymentMethodType

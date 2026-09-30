@@ -10,7 +10,7 @@ interface Sent {
   body: unknown;
 }
 
-/** Serves `routes` keyed "METHOD /path" (null answers 204) and records every API call but OAuth. */
+/** Serves `routes` keyed "METHOD /path" (null answers 204, a Response answers as given) and records every API call but OAuth. */
 function recordingAdapter(routes: Record<string, unknown>): { adapter: PayPalServerAdapter; sent: Sent[] } {
   const sent: Sent[] = [];
   const adapter = new PayPalServerAdapter({
@@ -29,6 +29,7 @@ function recordingAdapter(routes: Record<string, unknown>): { adapter: PayPalSer
         return new Response(JSON.stringify({ name: "RESOURCE_NOT_FOUND", message: "missing" }), { status: 404 });
       }
       const body = routes[key];
+      if (body instanceof Response) return body.clone();
       return body === null ? new Response(null, { status: 204 }) : new Response(JSON.stringify(body), { status: 200 });
     }) as typeof fetch,
   });
@@ -544,5 +545,102 @@ describe("PayPal never reports or sends a currency no record states", () => {
     });
     expect(sent.filter((call) => call.method !== "GET")).toEqual([]);
     expect(session.currency).toBe("EUR");
+  });
+});
+
+describe("PayPal reads a currency from related records only as far as it needs one", () => {
+  const unavailable = (): Response =>
+    new Response(JSON.stringify({ name: "SERVICE_UNAVAILABLE", message: "down" }), { status: 503 });
+  /** A capture that states no currency and names its order. */
+  const bareCapture = (id: string, orderId: string): Record<string, unknown> => ({
+    id,
+    status: "COMPLETED",
+    amount: { value: "10.00" },
+    supplementary_data: { related_ids: { order_id: orderId } },
+  });
+
+  it("refuses to capture what a reauthorization holds past the order after a capture, when nothing states the currency", async () => {
+    const { adapter, sent } = recordingAdapter({
+      "GET /v2/checkout/orders/5O15": {
+        id: "5O15",
+        intent: "AUTHORIZE",
+        status: "COMPLETED",
+        purchase_units: [
+          {
+            reference_id: "default",
+            amount: { value: "10.00" },
+            payments: {
+              authorizations: [
+                { id: "A15", status: "PARTIALLY_CAPTURED", amount: { value: "10.00" }, create_time: "2026-09-01T10:00:00Z" },
+                { id: "A15r", status: "CREATED", amount: { value: "10.00" }, create_time: "2026-09-05T10:00:00Z" },
+              ],
+              captures: [
+                {
+                  id: "C15",
+                  status: "COMPLETED",
+                  amount: { value: "4.00" },
+                  create_time: "2026-09-02T10:00:00Z",
+                  supplementary_data: { related_ids: { authorization_id: "A15" } },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    });
+    // 6.00 is left on the order; sending no amount would let PayPal take all 10.00 of A15r.
+    const err = await rejection(adapter.capturePayment("5O15", undefined, "capture-key"));
+    expect(isPayFanoutError(err) && err.code).toBe("invalid_request");
+    expect(String((err as Error).message)).toMatch(/capture it in the PayPal dashboard/);
+    expect(sent.filter((call) => call.method === "POST")).toEqual([]);
+  });
+
+  it("keeps an outage on the order read retryable for a partial refund, which needs the currency", async () => {
+    const { adapter, sent } = recordingAdapter({
+      "GET /v2/payments/captures/C12": bareCapture("C12", "O12"),
+      "GET /v2/checkout/orders/O12": unavailable(),
+    });
+    const err = await rejection(adapter.refundPayment({ pspPaymentId: "C12", amount: 500, idempotencyKey: "refund-key" }));
+    expect(err).toMatchObject({ code: "psp_unavailable", retryable: true });
+    expect(sent.filter((call) => call.method === "POST")).toEqual([]);
+  });
+
+  it("still refunds in full when the order read fails, as a full refund sends no amount", async () => {
+    const { adapter, sent } = recordingAdapter({
+      "GET /v2/payments/captures/C12": bareCapture("C12", "O12"),
+      "GET /v2/checkout/orders/O12": unavailable(),
+      "POST /v2/payments/captures/C12/refund": { id: "R12", status: "COMPLETED" },
+    });
+    const result = await adapter.refundPayment({ pspPaymentId: "C12", idempotencyKey: "refund-key" });
+    expect(result.refundId).toBe("R12");
+    expect(sent.filter((call) => call.method === "POST")).toEqual([
+      { method: "POST", path: "/v2/payments/captures/C12/refund", body: {} },
+    ]);
+  });
+
+  it("keeps an outage on the capture read retryable for a refund read", async () => {
+    const { adapter } = recordingAdapter({
+      "GET /v2/payments/refunds/R13": {
+        id: "R13",
+        status: "COMPLETED",
+        amount: { value: "5.00" },
+        links: [{ rel: "up", href: "https://api-m.sandbox.paypal.com/v2/payments/captures/C13" }],
+      },
+      "GET /v2/payments/captures/C13": unavailable(),
+    });
+    expect(await rejection(adapter.retrieveRefund("R13"))).toMatchObject({ code: "psp_unavailable", retryable: true });
+  });
+
+  it("reads a refund that states no amount as 0 without reading its capture", async () => {
+    const { adapter, sent } = recordingAdapter({
+      "GET /v2/payments/refunds/R14": {
+        id: "R14",
+        status: "PENDING",
+        links: [{ rel: "up", href: "https://api-m.sandbox.paypal.com/v2/payments/captures/C14" }],
+      },
+    });
+    const info = await adapter.retrieveRefund("R14");
+    expect(info).toMatchObject({ refundId: "R14", status: "pending", amount: 0, pspPaymentId: "C14" });
+    expect(sent.map((call) => call.path)).toEqual(["/v2/payments/refunds/R14"]);
   });
 });

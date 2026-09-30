@@ -245,10 +245,40 @@ describe("GoCardless status mapping", () => {
     expect(info).toMatchObject({
       amount: 0,
       amountRefunded: 0,
-      currency: "GBP",
+      // ISO 4217's "no currency", never a guess such as GBP.
+      currency: "XXX",
       status: "processing",
       createdAt: "1970-01-01T00:00:00.000Z",
     });
+  });
+
+  it("reports a payment that states no currency in its billing request's currency", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({
+      amount: 1000,
+      currency: "EUR",
+      returnUrl: RETURN_URL,
+      idempotencyKey: "k",
+    });
+    const { paymentId } = fake.fulfilBillingRequest(session.pspSessionId);
+    fake.setPaymentFields(paymentId, { currency: undefined });
+    const info = await adapter.retrievePayment(session.pspSessionId);
+    expect(info.pspPaymentId).toBe(paymentId);
+    expect(info.currency).toBe("EUR");
+  });
+
+  it("reports a billing request that states no currency as XXX", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({
+      amount: 1000,
+      currency: "EUR",
+      returnUrl: RETURN_URL,
+      idempotencyKey: "k",
+    });
+    fake.setBillingRequestFields(session.pspSessionId, { payment_request: { amount: 1000 } });
+    const info = await adapter.retrievePayment(session.pspSessionId);
+    expect(info.pspPaymentId).toBe(session.pspSessionId);
+    expect(info.currency).toBe("XXX");
   });
 });
 

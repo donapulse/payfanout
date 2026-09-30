@@ -54,6 +54,19 @@ describe("Paysafe status mapping", () => {
   }
 });
 
+describe("Paysafe currency reporting", () => {
+  it("reads a payment that states no currencyCode as XXX, never USD", async () => {
+    const info = await adapterWithPayment({ currencyCode: undefined, status: "PENDING" }).retrievePayment("pay_1");
+    expect(info.currency).toBe("XXX");
+    expect(info.amount).toBe(100);
+  });
+
+  it("reports the currencyCode a payment states, uppercased", async () => {
+    const info = await adapterWithPayment({ currencyCode: "eur", status: "PENDING" }).retrievePayment("pay_1");
+    expect(info.currency).toBe("EUR");
+  });
+});
+
 describe("Paysafe verification status mapping", () => {
   const cases: Array<[string, UnifiedPaymentStatus]> = [
     ["COMPLETED", "succeeded"],

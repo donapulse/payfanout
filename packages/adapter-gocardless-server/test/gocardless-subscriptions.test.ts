@@ -261,7 +261,8 @@ describe("GoCardless native subscription retrieve", () => {
       links: undefined,
     });
     const record = await adapter.retrieveNativeSubscription({ subscriptionId: seeded.id });
-    expect(record).toMatchObject({ amount: 0, currency: "GBP", status: "unknown" });
+    // ISO 4217's "no currency", never a guess such as GBP.
+    expect(record).toMatchObject({ amount: 0, currency: "XXX", status: "unknown" });
     expect(record.interval).toBeUndefined();
     expect(record.intervalCount).toBeUndefined();
     expect(record.savedPaymentMethodToken).toBeUndefined();

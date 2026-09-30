@@ -32,6 +32,15 @@ const PAYPAL_RETIRED_CURRENCIES: ReadonlySet<string> = new Set(["RUB"]);
  */
 const WHOLE_UNIT_CURRENCIES: ReadonlySet<string> = new Set(["HUF", "JPY", "TWD"]);
 
+/** The first currency the money objects state, uppercased; undefined when none states one. */
+export function statedCurrency(...moneys: Array<{ currency_code?: string } | undefined>): string | undefined {
+  for (const money of moneys) {
+    const code = money?.currency_code?.trim().toUpperCase();
+    if (code && /^[A-Z]{3}$/.test(code)) return code;
+  }
+  return undefined;
+}
+
 /** A currency PayPal accepts for a new payment. */
 export function assertPayPalCurrency(currency: string): string {
   const code = normalizeCurrency(currency);

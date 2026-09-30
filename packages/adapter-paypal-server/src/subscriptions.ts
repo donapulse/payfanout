@@ -1,4 +1,5 @@
 import {
+  NO_CURRENCY,
   normalizeCurrency,
   PayFanoutError,
   type NativeSubscriptionInterval,
@@ -6,7 +7,7 @@ import {
   type NativeSubscriptionStatus,
 } from "@payfanout/core";
 import { PAYPAL_PSP_NAME } from "./error-map.js";
-import { fromPayPalValue } from "./money.js";
+import { fromPayPalValue, statedCurrency } from "./money.js";
 
 /**
  * The reason sent with every POST /v1/billing/subscriptions/{id}/cancel: the
@@ -206,21 +207,18 @@ function moneyToMinor(
   }
 }
 
-/** Best currency fact for the 0-amount projection; "" when the subscription carries no money object at all. */
+/** Best currency fact for the 0-amount projection; NO_CURRENCY when the subscription carries no money object at all. */
 function fallbackCurrency(
   subscription: PayPalSubscriptionLike,
   fixedPrice: PayPalSubscriptionMoney | undefined,
 ): string {
-  const candidates = [
-    fixedPrice?.currency_code,
-    subscription.billing_info?.last_payment?.amount?.currency_code,
-    subscription.billing_info?.outstanding_balance?.currency_code,
-  ];
-  for (const candidate of candidates) {
-    const code = candidate?.trim().toUpperCase();
-    if (code && /^[A-Z]{3}$/.test(code)) return code;
-  }
-  return "";
+  return (
+    statedCurrency(
+      fixedPrice,
+      subscription.billing_info?.last_payment?.amount,
+      subscription.billing_info?.outstanding_balance,
+    ) ?? NO_CURRENCY
+  );
 }
 
 /** The first REGULAR cycle by sequence — trial cycles run first and are temporary, never the recurring price. */

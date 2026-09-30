@@ -658,6 +658,9 @@ describe("Stripe vaulting (Customers + saved PaymentMethods)", () => {
     });
     expect(saved.status).toBe("succeeded");
     expect(saved.savedPaymentMethodToken).toBe(pm.id);
+    // A SetupIntent moves no money and states no currency: ISO 4217's "no
+    // currency", never an invented USD.
+    expect(saved.currency).toBe("XXX");
     expect(fake.detachedPaymentMethods).not.toContain(pm.id); // stays vaulted
 
     // Plain verification (no customer) keeps the detach guarantee.
@@ -668,6 +671,7 @@ describe("Stripe vaulting (Customers + saved PaymentMethods)", () => {
       idempotencyKey: "k-verify-only",
     });
     expect(verified.savedPaymentMethodToken).toBeUndefined();
+    expect(verified.currency).toBe("XXX");
     expect(fake.detachedPaymentMethods).toContain(verifyPm.id);
   });
 

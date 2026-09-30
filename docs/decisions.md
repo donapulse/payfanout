@@ -5672,3 +5672,38 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   - **Three-decimal.** From an account whose presentment list has KWD (only the AE list
     does), send `amount: 1235` in KWD straight to the PaymentIntents API, as the adapter
     refuses it locally, and record whether Stripe refuses it too.
+
+## No invented currencies (2026-09-30)
+
+- **The gap.** When a PSP record stated no currency, four server adapters reported one
+  anyway: PayPal `USD` (seven sites, two of them the currency of a capture or partial
+  refund amount it sends), GoCardless `GBP` (three), Paysafe `USD` (two), and Stripe `USD`
+  on the amountless answer of `verifyPaymentMethod`. PayPal's subscription projection
+  reported `""`, which core's `normalizeCurrency` rejects. A Paysafe JPY 1,500 payment
+  read without its currency reported as USD 15.00.
+- **The provider schemas.** PayPal's Orders v2 and Payments v2 schemas
+  (`developer.paypal.com/api/orders/v2/schema.json` and `/api/payments/v2/schema.json`,
+  read 2026-09-30) make `amount` optional on purchase units, authorizations, captures and
+  refunds, and require `currency_code` on every money object. Paysafe's Payments API spec
+  (`paysafe-ph-payments-api.yaml`, read 2026-09-30) requires `currencyCode` on the payment
+  POST /payments returns (201) and GET /payments/{paymentId} returns (200). GoCardless's
+  OpenAPI spec (`openapi-schema-public.json`, read 2026-09-30) marks no response field
+  required, `id` included, so it settles nothing either way.
+- **The rule.** A record reports the PSP's own currency, else one the adapter trusts
+  (PayPal: any money object of the same purchase unit, whose records share the order's one
+  currency; GoCardless: a payment's billing request `payment_request`), else core's new
+  `NO_CURRENCY` (`"XXX"`, ISO 4217's code for "no currency involved"), which the Adyen and
+  Worldline adapters already reported and now take from core. A SetupIntent moves no money,
+  so Stripe's verification answer reports it too.
+- **Nothing is sent in a guessed currency.** PayPal refuses an explicit capture amount, a
+  partial refund and an amount-only session update with `invalid_request` before sending
+  when no record of the payment states its currency. A capture or refund in full sends no
+  amount and still goes through. A PayPal value whose money object and records state no
+  currency rejects the read with `processing_error` rather than being scaled by USD's
+  exponent. A session update that only restates the order's own currency no longer sends
+  a PATCH, which re-sent the amount it read (0 when the order reported none).
+- **Not changed.** An amount a PSP omits still reads as 0, as before. Paysafe card refunds
+  that state no currency keep their earlier rule (see "Card refunds and settlements may
+  state no currency: AMBIGUOUS" above): a refund reports no currency field. Seventeen
+  mutations (each guard dropped, each fallback set back to its old guess, the related-record
+  sources removed, the restated-currency PATCH re-enabled) each made a test fail.

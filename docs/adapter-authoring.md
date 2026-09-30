@@ -57,6 +57,13 @@ and `PaymentService` will hold you to:
   `getCurrencyExponent` / `assertMinorUnitAmount` from core. PSP-specific quirks (e.g.
   Stripe's three-decimal multiples-of-10) stay inside your adapter and reject with
   `invalid_request`, never leak them to callers.
+- **Currencies you report** come from the PSP record, else from a source your adapter
+  trusts (the currency it sent, or one another record of the same payment states), else
+  core's `NO_CURRENCY` (`"XXX"`, ISO 4217's "no currency"): never a plausible guess such
+  as USD. Never send an amount in a guessed currency either: when no record states the
+  currency, refuse the call with `invalid_request` before sending. An amount the PSP
+  reports with no currency anywhere cannot be scaled, so refuse it rather than read it
+  with a guessed exponent.
 - **Hard currency constraints** go in `capabilities.supportedCurrencies` (uppercase
   ISO 4217; omit when unrestricted). The router pre-screens candidates with it — a
   declared constraint means a mismatched payment skips your PSP instead of aborting the

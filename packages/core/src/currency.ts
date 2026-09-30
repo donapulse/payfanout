@@ -9,6 +9,15 @@ import { PayFanoutError } from "./errors.js";
 export type MinorUnitAmount = number;
 
 /**
+ * ISO 4217's code for "no currency involved". A session, payment or
+ * subscription record carries it when the PSP stated no currency for it and
+ * the adapter had no other source it trusts, instead of a plausible guess such
+ * as USD. It reads with the default exponent 2; reconcile such a record with
+ * the PSP before relying on its amounts.
+ */
+export const NO_CURRENCY = "XXX";
+
+/**
  * ISO 4217 currencies whose exponent is not the default 2, as ISO 4217 list
  * one gives their minor units.
  */

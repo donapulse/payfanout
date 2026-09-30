@@ -51,6 +51,7 @@ import {
   assertSendableCurrency,
   assertUsableRecord,
   currencyRefusal,
+  reportedCurrency,
   sendRefusal,
 } from "./currency-exponents.js";
 import {
@@ -2687,7 +2688,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       pspName: this.pspName,
       status: mapSubscriptionStatus(sub.status),
       amount: nextPayment?.amount ?? plan?.amount ?? 0,
-      currency: (plan?.currencyCode ?? "").toUpperCase() || "USD",
+      currency: reportedCurrency(plan?.currencyCode),
       // An unrecognized frequency yields NO interval (absent = "no faithful
       // projection"), and intervalCount only rides along with one.
       ...(interval ? { interval } : {}),
@@ -2808,7 +2809,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       ...(typeof payment.availableToSettle === "number"
         ? { amountCapturable: fullyCaptured ? 0 : payment.availableToSettle }
         : {}),
-      currency: (payment.currencyCode ?? "").toUpperCase() || "USD",
+      currency: reportedCurrency(payment.currencyCode),
       paymentMethodType: toUnifiedMethodType(payment.paymentType),
       ...(methodDetails ? { paymentMethodDetails: methodDetails } : {}),
       ...(mandateReference ? { mandateReference } : {}),

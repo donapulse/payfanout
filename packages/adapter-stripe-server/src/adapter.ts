@@ -2,6 +2,7 @@ import {
   assertMinorUnitAmount,
   lowercaseKeys,
   NATIVE_SUBSCRIPTION_INTERVALS,
+  NO_CURRENCY,
   normalizeCurrency,
   normalizeSecrets,
   PayFanoutError,
@@ -696,7 +697,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
         status: seti.status === "succeeded" ? "succeeded" : seti.last_setup_error ? "failed" : mapSetupIntentStatus(seti),
         amount: 0,
         amountRefunded: 0,
-        currency: "USD",
+        currency: NO_CURRENCY,
         paymentMethodType: "card",
         ...(seti.status === "succeeded" && paymentMethodId
           ? { savedPaymentMethodToken: paymentMethodId }
@@ -735,7 +736,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       status: seti.status === "succeeded" ? "succeeded" : seti.last_setup_error ? "failed" : mapSetupIntentStatus(seti),
       amount: 0,
       amountRefunded: 0,
-      currency: "USD", // verification is amountless; currency is not meaningful here
+      currency: NO_CURRENCY, // a SetupIntent moves no money and states no currency
       paymentMethodType: "card",
       createdAt: new Date(seti.created * 1000).toISOString(),
       raw: seti,

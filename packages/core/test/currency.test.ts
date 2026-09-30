@@ -7,6 +7,8 @@ import {
   fromMinorUnits,
   getCurrencyExponent,
   isPayFanoutError,
+  NO_CURRENCY,
+  normalizeCurrency,
   toMinorUnits,
 } from "@payfanout/core";
 
@@ -24,6 +26,13 @@ describe("currency exponents", () => {
   it("knows three-decimal currencies", () => {
     expect(getCurrencyExponent("BHD")).toBe(3);
     expect(getCurrencyExponent("KWD")).toBe(3);
+  });
+
+  it("reads NO_CURRENCY, ISO 4217's XXX, as a well-formed code with the default exponent", () => {
+    expect(NO_CURRENCY).toBe("XXX");
+    expect(normalizeCurrency(NO_CURRENCY)).toBe("XXX");
+    expect(getCurrencyExponent(NO_CURRENCY)).toBe(2);
+    expect(formatMinorUnits(1050, NO_CURRENCY)).toBe("10.50");
   });
 
   it("rejects malformed codes", () => {

@@ -1,5 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { PayFanoutError, type UnifiedWebhookEvent, type UnifiedWebhookEventType } from "@payfanout/core";
+import { fromStripeAmount } from "./currency-units.js";
 
 /**
  * Stripe webhook signature scheme: `Stripe-Signature: t=<ts>,v1=<hex>,...`
@@ -133,6 +134,13 @@ export function stripeEventBodyToUnified(body: StripeEventBody): UnifiedWebhookE
  * charge's cumulative amount_refunded; payment_intent events report the
  * intent amount. A stateless host acts on these without a retrievePayment
  * round-trip.
+ *
+ * `amount` is in PayFanout's minor units, converted from Stripe's by the
+ * object's `currency` (ISK and MGA differ), and left out when it cannot be
+ * reported: any UGX amount, whose unit Stripe's documentation contradicts,
+ * and an ISK amount that is not a multiple of 100. `currency` and every
+ * other field are reported as for any currency. An object that states no
+ * currency keeps its amount as delivered.
  */
 function moneyFacts(body: StripeEventBody): Pick<UnifiedWebhookEvent, "amount" | "currency" | "refundId"> {
   const object = body.data?.object;
@@ -141,9 +149,13 @@ function moneyFacts(body: StripeEventBody): Pick<UnifiedWebhookEvent, "amount" |
     typeof object.currency === "string" && object.currency.length > 0
       ? { currency: object.currency.toUpperCase() }
       : {};
+  const amountOf = (stripeAmount: unknown): Pick<UnifiedWebhookEvent, "amount"> => {
+    const amount = typeof stripeAmount === "number" ? fromStripeAmount(stripeAmount, object.currency) : undefined;
+    return amount !== undefined ? { amount } : {};
+  };
   if (object.object === "refund") {
     return {
-      ...(typeof object.amount === "number" ? { amount: object.amount } : {}),
+      ...amountOf(object.amount),
       ...currency,
       ...(typeof object.id === "string" ? { refundId: object.id } : {}),
     };
@@ -151,14 +163,14 @@ function moneyFacts(body: StripeEventBody): Pick<UnifiedWebhookEvent, "amount" |
   if (body.type === "charge.refunded") {
     const lastRefundId = object.refunds?.data?.[0]?.id;
     return {
-      ...(typeof object.amount_refunded === "number" ? { amount: object.amount_refunded } : {}),
+      ...amountOf(object.amount_refunded),
       ...currency,
       ...(typeof lastRefundId === "string" ? { refundId: lastRefundId } : {}),
     };
   }
   if (object.object === "payment_intent") {
     return {
-      ...(typeof object.amount === "number" ? { amount: object.amount } : {}),
+      ...amountOf(object.amount),
       ...currency,
     };
   }

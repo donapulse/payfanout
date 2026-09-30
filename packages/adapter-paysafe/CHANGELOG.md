@@ -1,5 +1,15 @@
 # @payfanout/adapter-paysafe
 
+## 0.4.3
+
+### Patch Changes
+
+- Updated dependencies [114d13a]
+- Updated dependencies [2d3cec4]
+- Updated dependencies [dd0c035]
+- Updated dependencies [2d3cec4]
+  - @payfanout/core@4.5.0
+
 ## 0.4.2
 
 ### Patch Changes

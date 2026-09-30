@@ -1,5 +1,17 @@
 # @payfanout/adapter-payzen-server
 
+## 2.0.8
+
+### Patch Changes
+
+- 650a0fe: Map more of the `PSP_` codes PayZen documents instead of reading them as the default `processing_error`: `PSP_707` (the issuer refused the authentication) and the payment refusals such as `PSP_003`, `PSP_091`, `PSP_572`, `PSP_601`, `PSP_624` and `PSP_625` to `card_declined`, the risk-module declines `PSP_641` and `PSP_647` to `fraud_suspected`, the OTP and unfinished 3-D Secure failures (`PSP_649`, `PSP_716`, `PSP_717`, `PSP_722`) to `authentication_required`, `PSP_054`, `PSP_055` and `PSP_718` to `invalid_request`, and every code PayZen's error page gives "Technical error.", "A technical error has occurred." or "Due to a technical problem, we are unable to process your request." to a retryable `psp_unavailable`.
+- 114d13a: Report a payment's order currency (`orderDetails.orderCurrency`), else `NO_CURRENCY`, instead of an empty string when the transaction states no currency, and `NO_CURRENCY` for a subscription that states none or a malformed one. A partial refund of a payment that states no currency anywhere is refused with `invalid_request` before any request, a full refund is sent without a currency instead of an empty one, and a subscription whose create answer states an empty currency reports the one sent.
+- Updated dependencies [114d13a]
+- Updated dependencies [2d3cec4]
+- Updated dependencies [dd0c035]
+- Updated dependencies [2d3cec4]
+  - @payfanout/core@4.5.0
+
 ## 2.0.7
 
 ### Patch Changes

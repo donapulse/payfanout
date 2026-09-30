@@ -1,5 +1,17 @@
 # @payfanout/core
 
+## 4.5.0
+
+### Minor Changes
+
+- 114d13a: Export `NO_CURRENCY` (`"XXX"`, ISO 4217's code for "no currency involved") and `firstCurrencyCode(...codes)`, which returns the first candidate that is three letters once trimmed and uppercased. Adapters report `NO_CURRENCY` as a session's, payment's or subscription's currency when the provider states none and they have no other source they trust, instead of guessing one. It reads with the default exponent 2, so reconcile such a record with the provider before relying on its amounts.
+- 2d3cec4: Add `listNonDefaultCurrencyExponents()`, the currencies whose exponent is not the default 2, each with its exponent and in code order, so an adapter can compare its provider's currency table with PayFanout's minor units without enumerating every code; any currency it does not list reads as 2.
+- 2d3cec4: Add `AdapterCapabilities.unsupportedCurrencies`, the currencies an adapter refuses to send any amount in (uppercase ISO 4217), for providers that take too many currencies to declare `supportedCurrencies`; an adapter may declare either list or both. `screenSessionInput` refuses a session in one of them, zero-amount sessions included, with the message `"<psp>" declares currency <code> unsupported`, so the router can skip that adapter instead of stopping on its `invalid_request`. `validateAdapterCapabilities` now reports an entry that can never match (not a string, or not three letters once trimmed and uppercased), a currency declared in both lists, and a supported payment method whose `currencies` are all declared unsupported; an entry that works but is not written as its bare uppercase code passes it, and the conformance suite checks that form.
+
+### Patch Changes
+
+- dd0c035: Reject with a non-retryable `invalid_request` from `injectScript` when a page that enforces Trusted Types refuses the script URL, instead of with the browser's bare `TypeError`, which now rides on `raw`; nothing is injected. Such a page needs a default policy that accepts the SDK's URL.
+
 ## 4.4.1
 
 ### Patch Changes

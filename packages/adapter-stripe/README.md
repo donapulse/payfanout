@@ -29,6 +29,7 @@ import { StripeClientAdapter } from "@payfanout/adapter-stripe";
 const stripe = new StripeClientAdapter({
   publishableKey: "pk_test_…",   // browser-safe
   environment: "sandbox",        // never inferred from the key prefix
+  apiVersion: "2024-06-20",      // required: the server adapter's apiVersion
 });
 
 <PayFanoutProvider adapters={[stripe]} initialPsp="stripe">
@@ -40,6 +41,15 @@ const stripe = new StripeClientAdapter({
 This is a **confirm-on-client** PSP: the client confirms the PaymentIntent (inline 3DS) with
 the `clientSecret` your server created via
 [`@payfanout/adapter-stripe-server`](../adapter-stripe-server).
+
+`apiVersion` picks the Stripe.js build, always loaded from `https://js.stripe.com`: a
+version with a release name (`2026-08-26.dahlia`) loads that release's build
+(`https://js.stripe.com/dahlia/stripe.js`), which speaks the API version Stripe pins it to
+within the release, and a date alone (`2024-06-20`) loads v3 and passes the version to
+`Stripe()`, which then speaks exactly it. A page runs one Stripe.js build, so a Stripe.js
+the page already runs is used instead, as Stripe's own loader does: v3 is given the pinned
+version, and another release's build speaks its own. See
+[Which Stripe.js the adapter loads](https://donapulse.github.io/payfanout/guide/stripe#which-stripe-js-the-adapter-loads).
 
 ## What's inside
 

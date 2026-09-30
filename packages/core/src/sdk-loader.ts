@@ -196,10 +196,10 @@ export interface InjectScriptOptions {
  * `pspName` whatever the page holds, and nothing is injected.
  *
  * A page that enforces Trusted Types (`require-trusted-types-for 'script'`)
- * must accept `url` in its default policy: without one the browser refuses
- * the string URL, and the call rejects with a non-retryable invalid_request
- * attributed to `pspName`, carrying the browser's `TypeError` on `raw`, and
- * injects nothing.
+ * must accept `url` in its default policy: when the page has none, or its
+ * policy rejects the URL or throws, the call rejects with a non-retryable
+ * invalid_request attributed to `pspName`, carrying on `raw` the exception
+ * the assignment threw, and injects nothing.
  *
  * This is not a trust boundary: every shipped client adapter's `loadSdk()`
  * returns before calling `injectScript` once the SDK global exists, so a copy

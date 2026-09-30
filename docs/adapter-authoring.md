@@ -64,10 +64,13 @@ and `PaymentService` will hold you to:
   first candidate that is three letters once trimmed and uppercased, so an empty or
   malformed code falls through to the next source; scale the amount by that same reading.
   Never send an amount in a guessed currency either: when no record states the
-  currency, refuse the call with `invalid_request` before sending. An amount the PSP
-  reports with no currency anywhere reads with `NO_CURRENCY`'s default exponent under a
-  record that reports `NO_CURRENCY`, so a call that went through never fails on its
-  answer; a record with no currency field to flag it (a refund read) refuses it instead.
+  currency, refuse the call with `invalid_request` before sending, unless the amount is
+  one the PSP itself reported and its API makes the currency optional on that call (a
+  full refund of the PSP's own remaining amount), which then goes without one. An
+  amount the PSP reports with no currency anywhere reads with `NO_CURRENCY`'s default
+  exponent under a record that reports `NO_CURRENCY`, so a call that went through never
+  fails on its answer; a record with no currency field to flag it (a refund read)
+  refuses it instead.
 - **Hard currency constraints** go in `capabilities.supportedCurrencies` (uppercase
   ISO 4217; omit when unrestricted). The router pre-screens candidates with it — a
   declared constraint means a mismatched payment skips your PSP instead of aborting the

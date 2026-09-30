@@ -147,7 +147,9 @@ neither sends nor reports UGX amounts:
 - Webhook and `fetchEvents` events in UGX carry no `amount`; `currency` and every other
   field stay.
 - A zero-amount session is a SetupIntent, which carries neither an amount nor a currency, so
-  it works in every currency, UGX included.
+  the adapter creates it in every currency, UGX included, when you call it directly.
+  `PaymentService` and the router refuse it in UGX all the same (below); since a SetupIntent
+  is the same in any currency, create it in another one.
 
 **Refusals that leave the outcome open.** Earlier releases sent UGX amounts, and MGA amounts
 that are not whole ariary, to Stripe unconverted, so a call retried under the same
@@ -172,10 +174,13 @@ subscription, capture, refund or update under that idempotency key before sendin
 and, like any `outcomeUnknown` error, an open one may be retried only under the same key.
 Every other refusal of an amount is final.
 
-The adapter declares no `supportedCurrencies`, so the router cannot skip Stripe for UGX on
-its own, and a Stripe candidate that refuses it ends the cascade. Route UGX to another
-provider with a rule of its own, placed before any rule that can send it to Stripe, since
-the first matching rule wins: `{ when: { currency: ["UGX"] }, use: ["<psp>"] }`
+**The router skips Stripe for UGX.** The adapter declares UGX in `unsupportedCurrencies`, so
+`PaymentRouter` skips a Stripe candidate for a UGX session and tries the next one in the
+chain, and `PaymentService` refuses a UGX session for Stripe before calling the adapter,
+zero-amount sessions included. Its refusal is a non-retryable `unsupported_operation`
+(`"stripe" does not support currency UGX`), where the adapter's own is `invalid_request`.
+Give UGX a chain that names a provider serving it; when no candidate does, the router fails
+with `invalid_request`, each candidate's refusal on `raw`
 ([routing and failover](/guide/server#routing-failover)).
 
 **Some calls read the payment first.** Stripe's units depend on the currency, so

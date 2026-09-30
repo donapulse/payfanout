@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { isPayFanoutError, type PayFanoutError } from "@payfanout/core";
+import {
+  isPayFanoutError,
+  listNonDefaultCurrencyExponents,
+  screenSessionInput,
+  validateAdapterCapabilities,
+  type PayFanoutError,
+} from "@payfanout/core";
+import { assertSendableCurrency } from "../src/currency-units.js";
 import {
   StripeServerAdapter,
   stripeEventBodyToUnified,
@@ -695,6 +702,63 @@ describe("UGX: refused, as Stripe documents it with two units", () => {
     const polled = await adapter.fetchEvents();
     expect(polled.events[0]).toMatchObject({ type: "payment.processing", pspPaymentId: "pi_p", currency: "UGX" });
     expect(polled.events[0]).not.toHaveProperty("amount");
+  });
+});
+
+describe("the currencies the adapter declares unsupported", () => {
+  const LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+  it("declares every currency whose amounts it refuses to send, over every three-letter code, and only those", () => {
+    const { adapter } = makePair();
+    const unsendable: string[] = [];
+    for (const a of LETTERS) {
+      for (const b of LETTERS) {
+        for (const c of LETTERS) {
+          const code = `${a}${b}${c}`;
+          try {
+            assertSendableCurrency(code, { label: "amount" });
+          } catch {
+            // Refused: no amount in this currency is ever sent.
+            unsendable.push(code);
+          }
+        }
+      }
+    }
+    expect(adapter.getCapabilities().unsupportedCurrencies).toEqual(unsendable);
+    expect(unsendable).toEqual(["UGX"]);
+    expect(validateAdapterCapabilities(adapter)).toEqual([]);
+  });
+
+  it("refuses a session in exactly the declared currencies, and none whose refusal depends on the amount", async () => {
+    const { adapter } = makePair();
+    const declared = adapter.getCapabilities().unsupportedCurrencies;
+    const codes = new Set([
+      ...listNonDefaultCurrencyExponents().map(([code]) => code),
+      ...["ISK", "MGA", "UGX", "USD", "EUR", "GBP", "HUF", "TWD"],
+    ]);
+    const refused: string[] = [];
+    for (const currency of codes) {
+      // Whole ariary, a multiple of 10, and inside the safe range once ISK is multiplied.
+      const outcome = await adapter
+        .createPaymentSession({ amount: 100_000, currency, idempotencyKey: `k-${currency}` })
+        .catch((err: unknown) => err);
+      if (isPayFanoutError(outcome)) refused.push(currency);
+    }
+    expect(refused).toEqual(declared);
+    const input = { amount: 150, currency: "MGA", idempotencyKey: "k" };
+    await expect(adapter.createPaymentSession(input)).rejects.toMatchObject({ code: "invalid_request" });
+    expect(screenSessionInput(adapter.getCapabilities(), input)).toBeUndefined();
+  });
+
+  it("has screening refuse every UGX session, the zero-amount one the adapter still creates included", async () => {
+    const { adapter } = makePair();
+    const caps = adapter.getCapabilities();
+    expect(screenSessionInput(caps, { amount: 5000, currency: " ugx ", idempotencyKey: "k" })).toBe(
+      '"stripe" does not support currency  ugx ',
+    );
+    const zero = { amount: 0, currency: "UGX", idempotencyKey: "k" };
+    expect(screenSessionInput(caps, zero)).toBe('"stripe" does not support currency UGX');
+    await expect(adapter.createPaymentSession(zero)).resolves.toMatchObject({ amount: 0, currency: "UGX" });
   });
 });
 

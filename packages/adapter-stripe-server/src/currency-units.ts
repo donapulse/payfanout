@@ -26,6 +26,15 @@ const STRIPE_EXPONENTS: Readonly<Record<string, number>> = { ISK: 2, MGA: 0 };
  */
 const CONTRADICTED: ReadonlySet<string> = new Set(["UGX"]);
 
+/**
+ * The currencies the adapter refuses outright, which it declares as
+ * `unsupportedCurrencies` so that the router skips Stripe for them: any
+ * amount in them is refused before it is sent. The one session the adapter
+ * still creates in them when called directly is a zero-amount one, a
+ * SetupIntent carrying no currency, and screening refuses that with the rest.
+ */
+export const REFUSED_CURRENCIES: readonly string[] = [...CONTRADICTED];
+
 /** A currency's units on either side; every refusal's `raw` carries them. */
 export interface CurrencyUnits {
   /** Uppercase ISO 4217 code. */

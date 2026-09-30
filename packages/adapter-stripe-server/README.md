@@ -78,7 +78,9 @@ Pair it on the browser with [`@payfanout/adapter-stripe`](../adapter-stripe). Th
   Stripe's currencies page documents with both units, is refused: calls that would send a
   UGX amount reject with `invalid_request` before the request carrying it, reads of a UGX
   record reject with `unsupported_operation`, list pages holding one fail whole, and UGX
-  events carry no `amount`. On a UGX record, `cancelPayment`, a capture or refund with no
+  events carry no `amount`. UGX is declared in `unsupportedCurrencies`, so the router skips
+  Stripe for a UGX session and `PaymentService` refuses one, zero-amount sessions included,
+  with `unsupported_operation`. On a UGX record, `cancelPayment`, a capture or refund with no
   amount, a metadata-only update and `cancelNativeSubscription` take effect at Stripe and
   then reject with `unsupported_operation` marked `outcomeUnknown`, as their answer cannot
   be reported. `capturePayment` and `refundPayment` with an amount, and

@@ -5754,6 +5754,18 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   Core now lists those codes with their exponents, in code order, as a fresh array on each call;
   any code outside the list reads as 2, so the codes an adapter's table and core's could
   disagree on are that table's and this list's.
+- **Stripe declares UGX**, from `REFUSED_CURRENCIES` in `src/currency-units.ts`, the set the
+  send refusal reads, so the two cannot drift; a test puts every three-letter code to that
+  refusal and compares. MGA is not declared, as only MGA amounts that are not whole ariary are
+  refused. The one UGX session the adapter creates is a zero-amount one, a SetupIntent that
+  carries no currency, and screening now refuses it with the rest: through `PaymentService` or
+  the router, a verification or save-card session labelled UGX is refused, and the guide says to
+  create it in another currency, since the SetupIntent is the same in any. Leaving UGX
+  undeclared to keep that label was rejected: every UGX payment would still end the cascade on
+  a Stripe candidate. A host `paymentMethods` override with a rail whose `currencies` are UGX
+  alone now fails registration, as a rail that can never be routed. `@payfanout/adapter-stripe-server`
+  takes a patch; the router skips Stripe for UGX from the `@payfanout/server` release that reads
+  the field.
 - **Release.** `@payfanout/core` takes a minor: an optional field, a screen and validation
   rules that only read it, and `listNonDefaultCurrencyExponents()`. `@payfanout/server` takes a
   minor (changed in review, 2026-09-30; the first version shipped it as a dependency patch):

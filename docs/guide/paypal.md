@@ -88,9 +88,12 @@ OAuth tokens are minted and cached inside the adapter — nothing to configure.
 
 ### Idempotency keys
 
-Each mutating call sends your `idempotencyKey` as the `PayPal-Request-Id` header: as given
-when its UTF-8 encoding is at most 38 bytes, and otherwise as the first 36 hex characters
-of its SHA-256 digest, so the same key always yields the same header and a retry replays.
+`createPaymentSession`, `completePayment`, `capturePayment`, `cancelPayment`,
+`refundPayment`, and `cancelNativeSubscription` send your `idempotencyKey` as the
+`PayPal-Request-Id` header: as given when its UTF-8 encoding is at most 38 bytes, and
+otherwise as the first 36 hex characters of its SHA-256 digest, so the same key always
+yields the same header and a retry replays. `updatePaymentSession` sends none: it re-reads
+the order before building its patch, so a replay writes the same values again.
 Two runtime details apply to the key as given:
 
 - `fetch` trims whitespace from both ends of a header value, so keys that differ only in

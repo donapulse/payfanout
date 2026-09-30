@@ -38,9 +38,15 @@ export function screenSessionInput(
     }
   }
   // Worded as the adapter's own declaration: the adapter refuses the currency,
-  // which says nothing about what its PSP takes.
-  if (caps.unsupportedCurrencies?.some((c) => listedCurrencyCode(c) === currency)) {
-    return `"${psp}" declares currency ${String(currency)} unsupported`;
+  // which says nothing about what its PSP takes. An entry that can never match
+  // must not match a session that states no currency either.
+  if (
+    caps.unsupportedCurrencies?.some((c) => {
+      const code = listedCurrencyCode(c);
+      return code !== undefined && code === currency;
+    })
+  ) {
+    return `"${psp}" declares currency ${currency} unsupported`;
   }
   if (input.captureMethod === "manual" && !caps.supportsManualCapture) {
     return `"${psp}" does not support manual capture`;

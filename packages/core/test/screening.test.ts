@@ -116,6 +116,14 @@ describe("screenSessionInput — unsupportedCurrencies", () => {
     expect(screenSessionInput(mixed, input({ currency: "UGX" }))).toBe(declared("UGX"));
   });
 
+  it("never matches a session that states no currency, whatever an entry that cannot match holds", () => {
+    const noCurrency = input({ currency: undefined as unknown as string });
+    expect(screenSessionInput(caps({ unsupportedCurrencies: ["UG"] }), noCurrency)).toBeUndefined();
+    expect(
+      screenSessionInput(caps({ unsupportedCurrencies: [123] as unknown as string[] }), noCurrency),
+    ).toBeUndefined();
+  });
+
   it("absent or empty refuses nothing", () => {
     expect(screenSessionInput(caps(), input({ currency: "UGX" }))).toBeUndefined();
     expect(screenSessionInput(caps({ unsupportedCurrencies: [] }), input({ currency: "UGX" }))).toBeUndefined();

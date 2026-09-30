@@ -50,7 +50,7 @@ function makeAdapter(): GoCardlessClientAdapter {
 }
 
 runClientAdapterConformanceTests("gocardless", makeAdapter, {
-  expectedMethodTypes: ["bank_redirect_generic", "sepa_debit", "bacs_debit"],
+  expectedMethodTypes: ["bank_redirect_generic"],
 });
 
 describe("GoCardlessClientAdapter", () => {

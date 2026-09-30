@@ -5333,3 +5333,32 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   regional units of account, the testing code and "no currency") still read as 2, as any code
   outside core's table does, and a test pins that. None is a currency a payment is taken in,
   and refusing them in core would be a separate, breaking decision.
+
+## GoCardless sessions declare Pay by Bank only (2026-09-30)
+
+- **What a session is.** `createPaymentSession` creates a billing request with a
+  `payment_request` and nothing else. GoCardless's OpenAPI spec (docs.gocardless.com/
+  openapi-schema-public.json, read 2026-09-30) describes `BillingRequestPaymentRequest` as
+  "Request for a one-off strongly authorised payment", and its `scheme` as "A scheme used for
+  Open Banking payments. Currently `faster_payments` is supported in the UK (GBP) and
+  `sepa_credit_transfer` and `sepa_instant_credit_transfer` are supported in supported
+  Eurozone countries (EUR)." Bacs and SEPA Core are mandate schemes (`BillingRequestScheme`,
+  "Optional for mandate only requests"), and no session sets up a mandate.
+- **The capability list said otherwise.** Both GoCardless adapters declared `sepa_debit` and
+  `bacs_debit` supported for sessions, on the reasoning that "the classic debit schemes list
+  what the fulfilled payment can report". A session asked for either was created all the
+  same, as a Pay by Bank payment, and the router could send a session asking for SEPA Direct
+  Debit to GoCardless. Both are now declared `supported: false`, so such a session rejects
+  with `invalid_request` and the router skips GoCardless for it; `bank_redirect_generic` is
+  the one method a session takes (audit finding G-F9, 2026-09-24).
+- **The fallback does not change it.** With `fallbackEnabled`, GoCardless may settle a
+  payment over Bacs or SEPA Core when the payer's bank cannot pay instantly, and
+  `retrievePayment` keeps reporting such a payment as `bacs_debit` or `sepa_debit`
+  (`mapSchemeToMethodType`). That is GoCardless's choice for a payer, never something a host
+  can ask a session for, so it does not make the method supported.
+- **Release.** A host that named `sepa_debit` or `bacs_debit` in a GoCardless session got a
+  Pay by Bank payment and now gets `invalid_request`, and a routing rule for those methods
+  no longer reaches GoCardless, so `@payfanout/adapter-gocardless-server` takes a major and
+  `@payfanout/adapter-gocardless`, whose capability list mirrors it, a minor (0.x). A real
+  Direct Debit session, a mandate request followed by a payment against the mandate, is a
+  design of its own (future-designs.md).

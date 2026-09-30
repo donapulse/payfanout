@@ -245,18 +245,22 @@ interface RefundOutcome {
 }
 
 /**
- * One-off billing request payments (Instant Bank Pay / "Pay by Bank") are
- * GBP/EUR only; the classic debit schemes list what the fulfilled payment can
- * report. Everything is flow "redirect": bank authorisation is only permitted
- * from GoCardless-hosted UIs, so an embedded flow cannot honestly be claimed.
+ * What a session takes. A session is a billing request's payment_request, "a
+ * one-off strongly authorised payment" over Open Banking (Instant Bank Pay,
+ * "Pay by Bank"): `faster_payments` in GBP, SEPA credit transfers in EUR. So
+ * bank_redirect_generic is the one method it takes. SEPA Direct Debit and Bacs
+ * collect against a mandate, which no session can be asked for, so they are
+ * declared unsupported here, even with fallbackEnabled: GoCardless falls back
+ * to a mandate only when the payer's bank cannot pay instantly. Such a
+ * payment still reports its scheme (see mapSchemeToMethodType). Everything is
+ * flow "redirect": bank
+ * authorisation is only permitted from GoCardless-hosted UIs, so an embedded
+ * flow cannot honestly be claimed.
  */
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "bank_redirect_generic", flow: "redirect", supported: true },
-  // Bacs is GB-only ("GBP from UK bank accounts" per GoCardless). SEPA is a
-  // zone, not a country — GoCardless states "the Eurozone" — so it carries no
-  // country gate; a stale membership list would screen out valid payments.
-  { type: "sepa_debit", flow: "redirect", supported: true, currencies: ["EUR"] },
-  { type: "bacs_debit", flow: "redirect", supported: true, currencies: ["GBP"], countries: ["GB"] },
+  { type: "sepa_debit", flow: "redirect", supported: false },
+  { type: "bacs_debit", flow: "redirect", supported: false },
   { type: "ach", flow: "redirect", supported: false },
 ];
 

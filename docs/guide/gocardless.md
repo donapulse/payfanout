@@ -385,6 +385,15 @@ with `invalid_request`:
 | Direct Debit fallback (`fallbackEnabled`, reported by `retrievePayment`) | `bacs` | GBP | ~3 business days |
 | Direct Debit fallback (`fallbackEnabled`, reported by `retrievePayment`) | `sepa_core` | EUR | ~1–2 business days |
 
+A session therefore takes one payment method, `bank_redirect_generic`, and the adapter
+declares `sepa_debit` and `bacs_debit` unsupported: GoCardless calls a billing request's
+payment request "a one-off strongly authorised payment" over Open Banking, and Direct Debit
+collects against a mandate, which no session can be asked for. A `paymentMethodTypes`
+naming either rejects with `invalid_request`, and the router skips GoCardless for a session
+that asks for one. With `fallbackEnabled`, GoCardless may still settle a payment over Bacs
+or SEPA Core when the payer's bank cannot pay instantly, and `retrievePayment` reports it as
+`bacs_debit` or `sepa_debit`; that is GoCardless's choice, never the host's.
+
 GoCardless the **platform** also collects USD, CAD, AUD, NZD, SEK and DKK over `ach`,
 `pad`, `becs`, `becs_nz`, `autogiro`, `betalingsservice` and `pay_to` — those are
 **mandate-based flows this adapter's one-off sessions cannot reach** (mandate work is

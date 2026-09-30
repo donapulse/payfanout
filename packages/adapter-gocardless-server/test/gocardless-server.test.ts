@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { getRefundState, isPayFanoutError } from "@payfanout/core";
+import { getRefundState, isPayFanoutError, screenSessionInput } from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
 import { GoCardlessServerAdapter, gocardlessOnboarding, type GoCardlessServerAdapterConfig } from "../src/index.js";
 import { FakeGoCardlessApi } from "./fake-gocardless-api.js";
@@ -514,8 +514,34 @@ describe("GoCardlessServerAdapter specifics", () => {
     await expect(
       adapter.createPaymentSession({ ...base, paymentMethodTypes: ["ach"], idempotencyKey: "k2" }),
     ).rejects.toMatchObject({ code: "invalid_request" });
+    // A session is a one-off Open Banking payment: it never collects by Direct Debit.
+    for (const [type, key] of [
+      ["bacs_debit", "k3"],
+      ["sepa_debit", "k4"],
+    ] as const) {
+      await expect(
+        adapter.createPaymentSession({ ...base, paymentMethodTypes: [type], idempotencyKey: key }),
+        type,
+      ).rejects.toMatchObject({ code: "invalid_request" });
+    }
     await expect(
-      adapter.createPaymentSession({ ...base, paymentMethodTypes: ["bacs_debit"], idempotencyKey: "k3" }),
+      adapter.createPaymentSession({ ...base, paymentMethodTypes: ["bank_redirect_generic"], idempotencyKey: "k5" }),
     ).resolves.toMatchObject({ status: "requires_action" });
+  });
+
+  it("declares bank_redirect_generic the one method a session takes, so the router skips a Direct Debit session", () => {
+    for (const fallbackEnabled of [false, true]) {
+      const { adapter } = makePair({ fallbackEnabled });
+      const caps = adapter.getCapabilities();
+      const supported = caps.paymentMethods.filter((method) => method.supported).map((method) => method.type);
+      expect(supported).toEqual(["bank_redirect_generic"]);
+      const session = { amount: 1000, currency: "EUR", idempotencyKey: "k", returnUrl: RETURN_URL } as const;
+      for (const type of ["sepa_debit", "bacs_debit"] as const) {
+        expect(screenSessionInput(caps, { ...session, paymentMethodTypes: [type] }), type).toMatch(
+          /supports none of the requested payment method types/,
+        );
+      }
+      expect(screenSessionInput(caps, { ...session, paymentMethodTypes: ["bank_redirect_generic"] })).toBeUndefined();
+    }
   });
 });

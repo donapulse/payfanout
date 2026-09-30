@@ -8,9 +8,10 @@ krypton-client embedded card fields, confirm-on-client, 3DS2 inline in a pop-in.
 It implements the `ClientPaymentAdapter` contract from `@payfanout/core` and plugs into
 `@payfanout/react`, which renders the fields and drives the pay flow. krypton-client is
 **loaded lazily via a `<script>` tag** (non-async, a conservative choice: PayZen's current
-pages do not mention async loading), followed by its theme stylesheet, only when this
-adapter is actually mounted — nothing extra to install and no SDK download during SSR. On
-a nonce-based Content-Security-Policy, pass the nonce as `cspNonce` and both tags carry it.
+pages do not mention async loading), followed by its theme stylesheet and theme script
+(neon by default), only when this adapter is actually mounted — nothing extra to install
+and no SDK download during SSR. On a nonce-based Content-Security-Policy, pass the nonce as
+`cspNonce` and all three tags carry it.
 
 📖 **Documentation:** <https://donapulse.github.io/payfanout/>
 · [React usage](https://donapulse.github.io/payfanout/guide/react)
@@ -46,8 +47,8 @@ server-side (IPN / `retrievePayment`) — the browser never holds the validation
 
 Card number, expiry, and CVV render as **Lyra-hosted iframes** (SAQ-A eligible). Styling
 is plain CSS: krypton mirrors your page's styles into the iframes automatically, so
-`appearance` has no JS hook to land on (documented no-op) — theme with CSS or swap the
-`cssUrl` stylesheet.
+`appearance` has no JS hook to land on (documented no-op) — theme with CSS, or swap the
+theme with the `cssUrl` stylesheet and its matching `themeScriptUrl` script.
 
 ## What's inside
 

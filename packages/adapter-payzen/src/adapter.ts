@@ -109,6 +109,19 @@ export interface PayZenClientAdapterConfig {
    */
   cssUrl?: string;
   /**
+   * Theme script URL; defaults to the neon theme's `neon.js`, which PayZen
+   * calls the "Active part of the neon theme": it sets the button template,
+   * the field icons and the theme's form settings as `window.KR_CONFIGURATION`,
+   * which krypton-client reads when a form is set up. Injected once the script
+   * has loaded, as PayZen's pages load it, and waited for before loadSdk()
+   * resolves; one that fails to load only leaves the form without the theme's
+   * active part. An empty string loads none. Serve it from the library's
+   * domain and pair it with `cssUrl` (classic.js with classic-reset.min.css):
+   * krypton-client reports a theme loaded from another domain, or whose
+   * stylesheet and script disagree.
+   */
+  themeScriptUrl?: string;
+  /**
    * Form to render on mount — see PayZenFormMode. Default "embedded"
    * (card-only, host-button-driven), the pre-smartForm behavior.
    */
@@ -120,9 +133,10 @@ export interface PayZenClientAdapterConfig {
    */
   paymentMethods?: PaymentMethodCapability[];
   /**
-   * A Content-Security-Policy nonce for the two tags the adapter injects, the
-   * krypton-client `<script>` and, once it has loaded, the theme stylesheet
-   * `<link>`, set as their `nonce` attribute before insertion, so a
+   * A Content-Security-Policy nonce for the three tags the adapter injects,
+   * the krypton-client `<script>` and, once it has loaded, the theme
+   * stylesheet `<link>` and theme `<script>`, set as their `nonce` attribute
+   * before insertion, so a
    * `script-src` or `style-src` that allows them by nonce alone loads them.
    * krypton-client reads no nonce itself. It adds scripts to the page without
    * one: its `kr-asset-*` chunks, Apple's Apple Pay SDK when the smartForm
@@ -133,21 +147,22 @@ export interface PayZenClientAdapterConfig {
    * nonce in `style-src` therefore blocks. Pass the value alone, as in the
    * policy's `'nonce-<value>'` source; the constructor refuses anything else.
    * The adapter never reads a nonce from the page, and a `loadScript` seam
-   * loads both files without it.
+   * loads the files without it.
    */
   cspNonce?: string;
   /**
-   * Test seam: full asset injection (script + stylesheet) override. Called again
-   * by the next loadSdk() after an attempt that rejects or leaves the KR global
-   * missing, so it must be safe to call more than once.
+   * Test seam: full asset injection (script, stylesheet and theme script)
+   * override. Called again by the next loadSdk() after an attempt that rejects
+   * or leaves the KR global missing, so it must be safe to call more than once.
    */
-  loadScript?: (scriptUrl: string, cssUrl: string) => Promise<void>;
+  loadScript?: (scriptUrl: string, cssUrl: string, themeScriptUrl: string) => Promise<void>;
   /** Test seam: KR global lookup override. */
   getKrGlobal?: () => KrLike | undefined;
 }
 
 const KR_SCRIPT_URL = "https://static.payzen.eu/static/js/krypton-client/V4.0/stable/kr-payment-form.min.js";
 const KR_CSS_URL = "https://static.payzen.eu/static/js/krypton-client/V4.0/ext/neon-reset.min.css";
+const KR_THEME_SCRIPT_URL = "https://static.payzen.eu/static/js/krypton-client/V4.0/ext/neon.js";
 
 /**
  * Mirror of the server adapter's declaration: card is on every shop;
@@ -270,6 +285,7 @@ export class PayZenClientAdapter implements ClientPaymentAdapter {
     this.sdkPromise ??= (this.config.loadScript ?? injectKrAssets(this.config.publicKey, this.config.cspNonce))(
       this.config.scriptUrl ?? KR_SCRIPT_URL,
       this.config.cssUrl ?? KR_CSS_URL,
+      this.config.themeScriptUrl ?? KR_THEME_SCRIPT_URL,
     );
     const loading = this.sdkPromise;
     try {
@@ -796,25 +812,27 @@ function asRedirectHandle(handle: MountedFieldsHandle): PayZenRedirectHandle | u
 }
 
 /**
- * Default asset injection: the krypton script, then the theme stylesheet once
- * the script has loaded, since PayZen requires theme files to load after the
- * library. Both go through core's injectScript and injectStylesheet, one tag
- * each per page: KR is a single global, so a second adapter instance reuses the
- * script another one injected, waiting for it while it loads and failing with
- * it, and loadSdk() then confirms the KR global. A script that fails to load is
- * removed, so a later call fetches it again, and the stylesheet waits for that
- * later load. The returned promise settles with the script: the stylesheet is
- * injected without being awaited, and an empty cssUrl injects none. The script
- * carries kr-public-key and kr-spa-mode, the latter keeping the library from
- * scanning the DOM before mount(), and loads with async = false, a
+ * Default asset injection: the krypton script, then the theme stylesheet and
+ * theme script once the script has loaded, since PayZen requires theme files
+ * to load after the library. They go through core's injectScript and
+ * injectStylesheet, one tag each per page: KR is a single global, so a second
+ * adapter instance reuses the script another one injected, waiting for it
+ * while it loads and failing with it, and loadSdk() then confirms the KR
+ * global. A script that fails to load is removed, so a later call fetches it
+ * again, and the theme files wait for that later load. The returned promise
+ * settles with the script and the theme script: the stylesheet is injected
+ * without being awaited, a theme script that fails to load resolves it all the
+ * same, and an empty cssUrl or themeScriptUrl injects none. The script carries
+ * kr-public-key and kr-spa-mode, the latter keeping the library from scanning
+ * the DOM before mount(), and both scripts load with async = false, a
  * conservative choice: dynamically injected scripts are async by default, and
  * PayZen's current pages do not mention async loading.
  */
 function injectKrAssets(
   publicKey: string,
   nonce: string | undefined,
-): (scriptUrl: string, cssUrl: string) => Promise<void> {
-  return async (scriptUrl, cssUrl) => {
+): (scriptUrl: string, cssUrl: string, themeScriptUrl: string) => Promise<void> {
+  return async (scriptUrl, cssUrl, themeScriptUrl) => {
     await injectScript(scriptUrl, "payzen", {
       nonce,
       attributes: { "kr-public-key": publicKey, "kr-spa-mode": "true" },
@@ -825,5 +843,8 @@ function injectKrAssets(
     // hold up the first mount on each page load. A stylesheet that cannot be
     // injected only leaves the form unstyled.
     void injectStylesheet(cssUrl, "payzen", { nonce }).catch(() => undefined);
+    // Awaited: krypton-client reads the theme's KR_CONFIGURATION when mount()
+    // sets a form up. A theme script that cannot load only leaves the theme out.
+    if (themeScriptUrl) await injectScript(themeScriptUrl, "payzen", { nonce, async: false }).catch(() => undefined);
   };
 }

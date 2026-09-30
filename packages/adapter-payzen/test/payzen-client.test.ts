@@ -1007,10 +1007,16 @@ describe("PayZenClientAdapter loadSdk", () => {
     expect(created.some((el) => el.rel === "stylesheet")).toBe(false);
     kr = makeFakeKr();
     script.onload?.();
-    await expect(loading).resolves.toBeUndefined();
+    await tick();
     const link = created.find((el) => el.rel === "stylesheet")!;
     expect(link.href).toContain("neon-reset.min.css");
-    expect(head.children).toEqual([script, link]);
+    const theme = created.find((el) => el.src === KR_THEME_URL)!;
+    expect(theme.async).toBe(false);
+    expect(head.children).toEqual([script, link, theme]);
+    // krypton-client reads the theme's configuration when a form is set up, so loadSdk() waits for it.
+    expect(await hasSettled(loading)).toBe(false);
+    theme.onload?.();
+    await expect(loading).resolves.toBeUndefined();
   });
 
   it("reuses already-injected assets instead of adding a second script (single KR global per page)", async () => {
@@ -1023,6 +1029,7 @@ describe("PayZenClientAdapter loadSdk", () => {
       'link[rel~="stylesheet"][href="https://static.payzen.eu/static/js/krypton-client/V4.0/ext/neon-reset.min.css"]',
       fakeElement(),
     );
+    existing.set('script[src="https://static.payzen.eu/static/js/krypton-client/V4.0/ext/neon.js"]', fakeElement());
     const kr = makeFakeKr();
     let lookups = 0;
     const adapter = new PayZenClientAdapter({
@@ -1133,10 +1140,11 @@ describe("PayZenClientAdapter loadSdk", () => {
     expect(fresh.async).toBe(false);
     expect(fresh.attributes).toEqual({ "kr-public-key": PUBLIC_KEY, "kr-spa-mode": "true" });
     expect(head).toContain(fresh);
-    // The stylesheet waits for a script that loads.
+    // The theme files wait for a script that loads.
     expect(created.filter((el) => el.rel === "stylesheet")).toHaveLength(0);
     kr = makeFakeKr();
     fresh.onload?.();
+    await loadTheme(created);
     await expect(second).resolves.toBeUndefined();
     expect(created.filter((el) => el.rel === "stylesheet")).toHaveLength(1);
   });
@@ -1160,27 +1168,30 @@ describe("PayZenClientAdapter loadSdk", () => {
     await expect(loading).rejects.toMatchObject({ code: "psp_unavailable", retryable: true });
   });
 
-  it("honors scriptUrl/cssUrl overrides", async () => {
+  it("honors scriptUrl, cssUrl and themeScriptUrl overrides", async () => {
     const { created } = stubBrowser();
     let kr: KrLike | undefined = undefined;
     const adapter = new PayZenClientAdapter({
       publicKey: PUBLIC_KEY,
       environment: "sandbox",
       scriptUrl: "https://assets.example/kr.js",
-      cssUrl: "https://assets.example/kr.css",
+      cssUrl: "https://assets.example/classic-reset.min.css",
+      themeScriptUrl: "https://assets.example/classic.js",
       getKrGlobal: () => kr,
     });
     const loading = adapter.loadSdk();
     expect(created.find((el) => el.src)!.src).toBe("https://assets.example/kr.js");
     kr = makeFakeKr();
     created.find((el) => el.src)!.onload?.();
+    await loadTheme(created, "https://assets.example/classic.js");
     await loading;
-    expect(created.find((el) => el.rel === "stylesheet")!.href).toBe("https://assets.example/kr.css");
+    expect(created.find((el) => el.rel === "stylesheet")!.href).toBe("https://assets.example/classic-reset.min.css");
   });
 });
 
 const KR_SCRIPT_URL = "https://static.payzen.eu/static/js/krypton-client/V4.0/stable/kr-payment-form.min.js";
 const KR_CSS_URL = "https://static.payzen.eu/static/js/krypton-client/V4.0/ext/neon-reset.min.css";
+const KR_THEME_URL = "https://static.payzen.eu/static/js/krypton-client/V4.0/ext/neon.js";
 /** A per-response Content-Security-Policy nonce, as a host server would mint it. */
 const NONCE = "cmFuZG9tLW5vbmNlLXZhbHVl";
 
@@ -1301,6 +1312,24 @@ function tagOf(page: FakePage, tagName: "script" | "link"): FakeTag {
   return tag;
 }
 
+/** Once the library has loaded: lets the adapter inject the theme script, then fires its load. */
+async function loadPageTheme(page: FakePage): Promise<FakeTag> {
+  await tick();
+  const theme = page.head.find((tag) => tag.tagName === "script" && tag.src === KR_THEME_URL);
+  if (!theme) throw new Error("no theme script on the page");
+  theme.onload!();
+  return theme;
+}
+
+/** loadPageTheme for the element doubles of stubBrowser(). */
+async function loadTheme(created: FakeElement[], url = KR_THEME_URL): Promise<FakeElement> {
+  await tick();
+  const theme = created.find((el) => el.src === url);
+  if (!theme) throw new Error(`no theme script ${url}`);
+  theme.onload?.();
+  return theme;
+}
+
 describe("PayZenClientAdapter asset injection", () => {
   it("makes a second adapter instance wait for the krypton script the first is still loading", async () => {
     const page = stubPage();
@@ -1313,10 +1342,11 @@ describe("PayZenClientAdapter asset injection", () => {
     expect(page.head.map((tag) => tag.tagName)).toEqual(["script"]);
     kr = makeFakeKr();
     tagOf(page, "script").onload!();
+    await loadPageTheme(page);
     await expect(first).resolves.toBeUndefined();
     await expect(second).resolves.toBeUndefined();
-    // One stylesheet for both instances, injected once the library has loaded.
-    expect(page.head.map((tag) => tag.tagName)).toEqual(["script", "link"]);
+    // One stylesheet and one theme script for both instances, injected once the library has loaded.
+    expect(page.head.map((tag) => tag.tagName)).toEqual(["script", "link", "script"]);
   });
 
   it("fails a second adapter instance with the krypton script it waited on, injecting no stylesheet", async () => {
@@ -1350,12 +1380,14 @@ describe("PayZenClientAdapter asset injection", () => {
     expect([script.asyncWhenUrlSet, script.asyncWhenInserted]).toEqual([false, false]);
     kr = makeFakeKr();
     script.onload!();
+    const theme = await loadPageTheme(page);
     await expect(loading).resolves.toBeUndefined();
     const link = tagOf(page, "link");
     expect([link.href, link.rel, link.insertedWith]).toEqual([KR_CSS_URL, "stylesheet", {}]);
+    expect([theme.insertedWith, theme.asyncWhenUrlSet, theme.asyncWhenInserted]).toEqual([{}, false, false]);
   });
 
-  it("puts cspNonce on the krypton script and on the stylesheet link, before their URL and insertion", async () => {
+  it("puts cspNonce on the krypton script, the stylesheet link and the theme script, before their URL and insertion", async () => {
     const page = stubPage();
     let kr: KrLike | undefined = undefined;
     const adapter = new PayZenClientAdapter({
@@ -1370,22 +1402,58 @@ describe("PayZenClientAdapter asset injection", () => {
     expect([script.urlSetWith, script.insertedWith]).toEqual([scriptAttributes, scriptAttributes]);
     kr = makeFakeKr();
     script.onload!();
+    const theme = await loadPageTheme(page);
     await expect(loading).resolves.toBeUndefined();
     const link = tagOf(page, "link");
     expect([link.urlSetWith, link.insertedWith]).toEqual([{ nonce: NONCE }, { nonce: NONCE }]);
+    expect([theme.urlSetWith, theme.insertedWith]).toEqual([{ nonce: NONCE }, { nonce: NONCE }]);
   });
 
-  it("resolves once the script has loaded and KR exists, without waiting for the theme stylesheet", async () => {
+  it("resolves once both scripts have loaded and KR exists, without waiting for the theme stylesheet", async () => {
     const page = stubPage();
     let kr: KrLike | undefined = undefined;
     const adapter = new PayZenClientAdapter({ publicKey: PUBLIC_KEY, environment: "sandbox", getKrGlobal: () => kr });
     const loading = adapter.loadSdk();
     kr = makeFakeKr();
     tagOf(page, "script").onload!();
+    expect(await hasSettled(loading)).toBe(false);
+    await loadPageTheme(page);
     // The link never fires here, as when a slow or blocked host holds up one of its @imports.
     expect(await hasSettled(loading)).toBe(true);
     await expect(loading).resolves.toBeUndefined();
     expect(tagOf(page, "link").href).toBe(KR_CSS_URL);
+  });
+
+  it("resolves when the theme script fails to load, which only leaves the theme out", async () => {
+    const page = stubPage();
+    let kr: KrLike | undefined = undefined;
+    const adapter = new PayZenClientAdapter({ publicKey: PUBLIC_KEY, environment: "sandbox", getKrGlobal: () => kr });
+    const loading = adapter.loadSdk();
+    kr = makeFakeKr();
+    tagOf(page, "script").onload!();
+    await tick();
+    const theme = page.head.find((tag) => tag.src === KR_THEME_URL)!;
+    theme.onerror!();
+    await expect(loading).resolves.toBeUndefined();
+    // Removed like any script that failed, so a later page load fetches it again.
+    expect(theme.remove).toHaveBeenCalledTimes(1);
+    expect(page.head.map((tag) => tag.tagName)).toEqual(["script", "link"]);
+  });
+
+  it("injects no theme script for an empty themeScriptUrl", async () => {
+    const page = stubPage();
+    let kr: KrLike | undefined = undefined;
+    const adapter = new PayZenClientAdapter({
+      publicKey: PUBLIC_KEY,
+      environment: "sandbox",
+      themeScriptUrl: "",
+      getKrGlobal: () => kr,
+    });
+    const loading = adapter.loadSdk();
+    kr = makeFakeKr();
+    tagOf(page, "script").onload!();
+    await expect(loading).resolves.toBeUndefined();
+    expect(page.head.map((tag) => tag.tagName)).toEqual(["script", "link"]);
   });
 
   it("keeps the theme stylesheet on the page when its error event fires", async () => {
@@ -1397,12 +1465,13 @@ describe("PayZenClientAdapter asset injection", () => {
     const loading = adapter.loadSdk();
     kr = makeFakeKr();
     tagOf(page, "script").onload!();
+    const theme = await loadPageTheme(page);
     await expect(loading).resolves.toBeUndefined();
     const link = tagOf(page, "link");
     link.onerror!();
     await tick();
     expect(link.remove).not.toHaveBeenCalled();
-    expect(page.head).toEqual([tagOf(page, "script"), link]);
+    expect(page.head).toEqual([tagOf(page, "script"), link, theme]);
   });
 
   it("injects no stylesheet for an empty cssUrl", async () => {
@@ -1418,9 +1487,11 @@ describe("PayZenClientAdapter asset injection", () => {
     const loading = adapter.loadSdk();
     kr = makeFakeKr();
     tagOf(page, "script").onload!();
+    await loadPageTheme(page);
     await expect(loading).resolves.toBeUndefined();
     await tick();
-    expect(page.head.map((tag) => tag.tagName)).toEqual(["script"]);
+    // The library and the theme script, and no stylesheet.
+    expect(page.head.map((tag) => tag.tagName)).toEqual(["script", "script"]);
   });
 
   it("loads the SDK when the stylesheet cannot be injected, leaving no rejection unhandled", async () => {
@@ -1440,17 +1511,18 @@ describe("PayZenClientAdapter asset injection", () => {
       const loading = adapter.loadSdk();
       kr = makeFakeKr();
       tagOf(page, "script").onload!();
+      await loadPageTheme(page);
       await expect(loading).resolves.toBeUndefined();
       await tick();
       await tick();
       expect(unhandled).toEqual([]);
-      expect(page.head.map((tag) => tag.tagName)).toEqual(["script"]);
+      expect(page.head.map((tag) => tag.tagName)).toEqual(["script", "script"]);
     } finally {
       process.off("unhandledRejection", onUnhandled);
     }
   });
 
-  it("hands a loadScript seam only the two URLs, so it loads without the nonce", async () => {
+  it("hands a loadScript seam only the three URLs, so it loads without the nonce", async () => {
     const calls: unknown[][] = [];
     let kr: KrLike | undefined;
     const adapter = new PayZenClientAdapter({
@@ -1465,7 +1537,7 @@ describe("PayZenClientAdapter asset injection", () => {
     });
     stubPage();
     await adapter.loadSdk();
-    expect(calls).toEqual([[KR_SCRIPT_URL, KR_CSS_URL]]);
+    expect(calls).toEqual([[KR_SCRIPT_URL, KR_CSS_URL, KR_THEME_URL]]);
   });
 
   it("refuses a malformed cspNonce at construction, without echoing it", () => {

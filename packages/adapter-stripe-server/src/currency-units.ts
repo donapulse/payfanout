@@ -27,7 +27,7 @@ const STRIPE_EXPONENTS: Readonly<Record<string, number>> = { ISK: 2, MGA: 0 };
 const CONTRADICTED: ReadonlySet<string> = new Set(["UGX"]);
 
 /**
- * The currencies the adapter refuses outright, which it declares as
+ * The currencies the adapter refuses to send, which it declares as
  * `unsupportedCurrencies` so that the router skips Stripe for them: any
  * amount in them is refused before it is sent. The one session the adapter
  * still creates in them when called directly is a zero-amount one, a

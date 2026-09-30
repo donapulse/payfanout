@@ -832,11 +832,11 @@ describe("AdyenServerAdapter specifics", () => {
         { type: "ideal", flow: "redirect", supported: true, currencies: ["ISK"] },
       ],
     });
-    const issues = validateAdapterCapabilities(adapter, { registration: true });
+    const issues = validateAdapterCapabilities(adapter);
     expect(issues).toContainEqual(
       expect.stringMatching(/offers ideal in ISK but declares each of those currencies in unsupportedCurrencies/),
     );
-    expect(validateAdapterCapabilities(makePair().adapter, { registration: true })).toEqual([]);
+    expect(validateAdapterCapabilities(makePair().adapter)).toEqual([]);
   });
 
   it("declares exactly the currencies createPaymentSession refuses, so screening refuses them first", async () => {

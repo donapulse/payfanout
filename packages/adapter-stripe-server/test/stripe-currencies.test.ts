@@ -757,11 +757,11 @@ describe("the currencies the adapter declares unsupported", () => {
         { type: "ideal", flow: "redirect", supported: true, currencies: ["UGX"] },
       ],
     });
-    const issues = validateAdapterCapabilities(adapter, { registration: true });
+    const issues = validateAdapterCapabilities(adapter);
     expect(issues).toContainEqual(
       expect.stringMatching(/offers ideal in UGX but declares each of those currencies in unsupportedCurrencies/),
     );
-    expect(validateAdapterCapabilities(makePair().adapter, { registration: true })).toEqual([]);
+    expect(validateAdapterCapabilities(makePair().adapter)).toEqual([]);
   });
 
   it("has screening refuse every UGX session, the zero-amount one the adapter still creates included", async () => {

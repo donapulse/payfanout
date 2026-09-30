@@ -282,11 +282,11 @@ describe("the currencies the adapter declares unsupported", () => {
         { type: "sepa_debit", flow: "embedded", supported: true, currencies: ["CLP", "ISK"] },
       ],
     });
-    const issues = validateAdapterCapabilities(adapter, { registration: true });
+    const issues = validateAdapterCapabilities(adapter);
     expect(issues).toContainEqual(
       expect.stringMatching(/offers sepa_debit in CLP\/ISK but declares each of those currencies in unsupportedCurrencies/),
     );
-    expect(validateAdapterCapabilities(makePair().adapter, { registration: true })).toEqual([]);
+    expect(validateAdapterCapabilities(makePair().adapter)).toEqual([]);
   });
 
   it("is refused on every session, zero-amount ones included, by the adapter and by screening alike", async () => {

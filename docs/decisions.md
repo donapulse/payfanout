@@ -5718,9 +5718,10 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   adapter does not list is refused at construction with `invalid_request` instead, and the
   message names the remedy: while the server is on that release, a version of the newest
   release the adapter knows (added in review, 2026-09-30). Not yet listed: `endive`.
-  `/endive/stripe.js` answers 200 and the served files know it
-  (`pinnedApiVersion:"2026-09-30.endive"`), but docs.stripe.com has no page for it
-  (`/changelog/endive` answers 404), so it waits for a release that reads its changelog. The
+  `/endive/stripe.js` answers 200 and the served files know it, pinning it to
+  `2026-09-30.endive`, but docs.stripe.com has no page for it (`/changelog/endive` answers
+  404, checked again after Stripe re-served the builds on 2026-09-30), so it waits for a
+  release that reads its changelog. The
   versioning page calls upgrading the two halves at different times safe ("Gradual updates
   are safe, so you don’t need to release both at the same time."), which covers the lag of a
   client kept on the newest release it knows while the server moves first; it is not a
@@ -5749,8 +5750,8 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   docs.stripe.com/js/initializing: "`apiVersion` Override your account's API version. **This
   option is only available on Stripe.js v3.** For versions after `v3` such as `acacia`, the
   API version is pinned to the Stripe.js version." The served versioned builds throw on it
-  (`if(n.apiVersion)throw Ty("Can not provide apiVersion to Stripe()")`, a `VersionError`
-  reading "Unsupported on version [dahlia]: …"), so only v3 gets it, and v3 keeps its URL,
+  ("Can not provide apiVersion to Stripe()", reported as "Unsupported on version [dahlia]:
+  …"), so only v3 gets it, and v3 keeps its URL,
   `https://js.stripe.com/v3`, which pages that include it already carry. A date alone from
   2024-09-30 on is refused (added in review, 2026-09-30): every version since carries a
   release name, and the changelog lists none without one. So is the mirror case, a release
@@ -5765,11 +5766,14 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   keep the Stripe.js version and server-side API version on the same release train. For
   example, if you use Stripe.js `acacia`, you can safely use `2025-02-24.acacia` or another
   `acacia` minor version on your application server." Which dated version a build uses is not
-  stated. The served files (Last-Modified 2026-09-29; the five are byte-identical but for a
-  padded build name) pin acacia to `2025-01-27.acacia`, basil to `2025-03-31.basil`, clover
-  to `2025-09-30.clover` and dahlia to `2026-03-25.dahlia`: each release's first version
-  except acacia, and not the page's example `2024-12-18.acacia`. Stripe can move them within
-  a release. So the browser speaks the release, not the server's date: the monthly versions
+  stated. The served files pin acacia to `2025-01-27.acacia`, basil to `2025-03-31.basil`,
+  clover to `2025-09-30.clover` and dahlia to `2026-03-25.dahlia`: each release's first
+  version except acacia, and not the page's example `2024-12-18.acacia`. Stripe can move them
+  within a release. Every statement here about the served files was read on 2026-09-30,
+  first in the files last modified on 2026-09-29 and again after Stripe re-served every
+  build that day (Last-Modified 2026-09-30 14:43 GMT, basil 14:03); the builds are identical
+  but for the build name each carries, and nothing described here changed between the two
+  reads. Their minified code is not quoted, as its names change with every build. So the browser speaks the release, not the server's date: the monthly versions
   of a release add no breaking change, but a field or code a later one added can reach the
   server and not the browser. The guide gives the dahlia value as observed on this date.
 - **Rejected: v3 with the exact version for a release pin** (review, 2026-09-30), when the
@@ -5799,8 +5803,8 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   global they add themselves as `window.Stripe.StripeV3`, and beside any other they only warn
   ("[Stripe.js] It looks like Stripe.js was loaded more than one time. Please only load it
   once per page."), so loading the pinned build over another would still run the other. They
-  set `version` on the global to `3` for v3 and to the release name otherwise
-  (`xy.version="v3"===Iy?3:Iy`). Stripe's pages do not describe the property, but Stripe's
+  set `version` on the global to `3` for v3 and to the release name otherwise. Stripe's
+  pages do not describe the property, but Stripe's
   own loader reads it: `@stripe/stripe-js` (github.com/stripe/stripe-js, `src/shared.ts`,
   read 2026-09-30 at 10.0.0-rc.4; the tags v6.0.0 to v9.0.0 hold the same lines) resolves
   `window.Stripe` whenever it exists, maps the marker with `version === 3 ? 'v3' : version`,
@@ -5841,11 +5845,24 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   - When the tag fails, it ran nothing and is removed; when 30 seconds pass, it is kept. In
     both cases the call resolves if Stripe.js is there by then, and otherwise rejects with a
     retryable `psp_unavailable`.
-  - Each adapter records the tags for the build's URL it saw settle while Stripe.js stayed
-    missing: its own after it loaded, and a page's after the wait ended. The next call
-    removes such a tag, only while Stripe.js is still missing, so that core's
-    `injectScript` injects a fresh one and reports its load or failure instead of the
+  - The tags for the build's URL that an attempt watched settle while Stripe.js stayed
+    missing are recorded: one core injected, after it loaded, and a page's, after the wait
+    ended. The next call removes such a tag, only while Stripe.js is still missing, so that
+    core's `injectScript` injects a fresh one and reports its load or failure instead of the
     adapter waiting on a tag that fires nothing more.
+  - Only the watched tag is recorded (changed after approval, 2026-09-30: the first version
+    recorded whichever tag for the URL came first once the attempt ended, so when the page's
+    first tag failed and was removed, a second one still loading was recorded and replaced).
+    The watched tag is the page's, or, with none on the page, the one core inserts before
+    `injectScript` returns.
+  - The record is one for the whole page, shared by every adapter (changed after approval,
+    2026-09-30: it was one per adapter, so a second adapter waited 30 seconds on a tag the
+    first had already seen settle). The tags belong to the page, and a `WeakSet` of them
+    keeps none alive, as core's own record of loading tags does.
+  - A page tag that timed out may still be loading when the next call replaces it. If both
+    copies run, they are the same build, and the second to run finds the global set and
+    only logs Stripe.js's warning about a second copy, "[Stripe.js] It looks like Stripe.js
+    was loaded more than one time. Please only load it once per page.".
   - A page tag that failed before the adapter looked leaves no trace on the element, so the
     first call waits the full 30 seconds; the next one replaces it. Resource Timing could
     tell a finished fetch sooner: the Fetch standard marks resource timing for a network
@@ -5896,25 +5913,22 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   lists the `Stripe()` option `developerTools.assistant.enabled`: "Set to `false` to disable
   the sandbox assistant UI."; the testing assistant page: "To hide the testing assistant, set
   the `developerTools.assistant.enabled` option to `false` when you set up Elements." The
-  served files (read 2026-09-30; corrected in the second review, as the first version said
-  `enabled` defaults to true) validate `developerTools` as `{ assistant: { enabled } }` with
-  the default `{assistant:{enabled:void 0}}`, and decide when Elements is created: the
-  host's `enabled` if it gave one, otherwise enabled for Elements with Checkout Sessions
-  (`"custom_checkout"===t?_o`, `_o` being `{assistant:{enabled:!0}}`), and otherwise the
-  build's `isEaselDefaultOn`, false in v3, acacia and basil and true from clover on (the
-  clover entry of the builds' table sets `isEaselDefaultOn:!0`). `hideTestingAssistant:
-  true` passes `developerTools: { assistant: { enabled: false } }` on every build; unset or
-  `false` passes nothing and leaves Stripe's default, since only `false` has a documented
-  effect.
+  served files (corrected in the second review, as the first version said `enabled` defaults
+  to true) validate `developerTools` as `{ assistant: { enabled } }`, leaving `enabled` unset
+  by default, and decide when Elements is created: the host's `enabled` if it gave one;
+  otherwise shown for Elements with Checkout Sessions; otherwise the build's own default,
+  which their table of builds sets off for v3, acacia and basil and on from clover, dahlia
+  inheriting it. `hideTestingAssistant: true` passes `developerTools: { assistant: { enabled:
+  false } }` on every build; unset or `false` passes nothing and leaves Stripe's default,
+  since only `false` has a documented effect.
 - **CSP re-verified.** docs.stripe.com/security/guide lists for Stripe.js "`connect-src`,
   `https://api.stripe.com`, `https://maps.googleapis.com`", "`frame-src`,
   `https://*.js.stripe.com`, `https://js.stripe.com`, `https://hooks.stripe.com`" and
   "`script-src`, `https://*.js.stripe.com`, `https://js.stripe.com`,
   `https://maps.googleapis.com`", as on 2026-09-26, so the onboarding descriptor and the
   guide's list stand. A build loads from `/<release>/stripe.js`, and the served files take
-  their lazy chunks (`e.p="https://js.stripe.com/v3/"`) and frames (base
-  `"https://js.stripe.com/v3/"`) from `/v3/`: host sources cover both, a path-narrowed source
-  cannot, and the guide now says to list hosts. The same page says "If you’re using Trusted
+  their lazy chunks and their frames from `https://js.stripe.com/v3/`: host sources cover
+  both, a path-narrowed source cannot, and the guide now says to list hosts. The same page says "If you’re using Trusted
   Types, you must allow dynamic scripts to be loaded from `https://js.stripe.com` and
   `https://*.js.stripe.com`", which the guide now repeats: the adapter's own `<script>` needs
   it.
@@ -5963,7 +5977,10 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   the tag's failure or the end of the wait resolve the call, a page tag that failed before
   the adapter looked replaced by the next call after the first one timed out, the adapter's
   own tag that loaded without Stripe.js replaced at once, twice, and a second adapter that
-  found the first one's tag loading not waiting once it has loaded Stripe.js.
+  found the first one's tag loading not waiting once it has loaded Stripe.js; and after
+  approval, a second page tag for the URL, still loading when the first failed, waited on by
+  the next call rather than replaced, and a tag one adapter saw load without Stripe.js
+  replaced at once by another adapter.
   `test/stripe-client-csp.test.ts` pins the nonce on both URLs. The first version's 33
   mutations each made a test fail (every release loading v3, a release URL without
   `/stripe.js`, v3 with a trailing slash, the dated version not passed to `Stripe()` or a
@@ -5988,7 +6005,9 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   cut to its date, the poll for another script's Stripe.js removed, slowed to a second or
   left running, a failed or ended wait resolving nothing, settled tags not recorded or not
   removed, a removed tag still waited on, and the second adapter waiting on a tag that
-  loaded Stripe.js.
+  loaded Stripe.js. The five after approval did too: the record kept per adapter, whichever
+  tag came first recorded instead of the watched one, the tag core injected never recorded,
+  and a recorded tag not removed or nothing recorded.
 - **Sandbox checks, not run.** In a sandbox page on the dahlia build, the `Stripe-Version` of
   Stripe.js's requests (the browser's network panel) shows which version the build speaks. A
   confirmation with the expired-card test card under v3 with `2024-06-20` and under dahlia

@@ -303,9 +303,9 @@ browser follows your pin rather than the account's default version:
   loads, or as soon as another script defines Stripe.js, and otherwise rejects with a
   retryable `psp_unavailable` when the tag fails, which removes it, or when the 30 seconds
   run out. A tag that failed before the adapter looked gives no sign of it, so that first
-  attempt waits the full 30 seconds. The next attempt fetches the file again, replacing a
-  tag already seen settled without Stripe.js, the adapter's own after it loaded or a page's
-  after its wait.
+  attempt waits the full 30 seconds. The next attempt, by any `StripeClientAdapter` on the
+  page, fetches the file again, replacing a tag an earlier attempt watched settle without
+  Stripe.js: one the adapter injected, after it loaded, or your page's, after its wait.
 
   For the browser to follow your pin, have the page load that build, or v3, which the
   adapter gives your version, or no Stripe.js at all, and give every `StripeClientAdapter`

@@ -24,6 +24,9 @@ export function screenSessionInput(
       return `"${psp}" does not support currency ${String(input.currency)}`;
     }
   }
+  if (caps.unsupportedCurrencies?.some((c) => c.toUpperCase() === currency)) {
+    return `"${psp}" does not support currency ${String(input.currency)}`;
+  }
   if (input.captureMethod === "manual" && !caps.supportsManualCapture) {
     return `"${psp}" does not support manual capture`;
   }

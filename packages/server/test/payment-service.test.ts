@@ -79,6 +79,23 @@ describe("PaymentService registry", () => {
         }),
     ).not.toThrowError();
   });
+
+  it("rejects an incoherent currency declaration at registration", () => {
+    expect(
+      () => new PaymentService({ adapters: [new FakeAdapter({ capabilities: { unsupportedCurrencies: ["ugx"] } })] }),
+    ).toThrowError(/"ugx" in unsupportedCurrencies, which is not an uppercase ISO 4217 code/);
+    expect(
+      () =>
+        new PaymentService({
+          adapters: [
+            new FakeAdapter({ capabilities: { supportedCurrencies: ["UGX", "USD"], unsupportedCurrencies: ["UGX"] } }),
+          ],
+        }),
+    ).toThrowError(/declares UGX in both supportedCurrencies and unsupportedCurrencies/);
+    expect(
+      () => new PaymentService({ adapters: [new FakeAdapter({ capabilities: { unsupportedCurrencies: ["UGX"] } })] }),
+    ).not.toThrowError();
+  });
 });
 
 describe("PaymentService guards", () => {
@@ -137,6 +154,27 @@ describe("PaymentService guards", () => {
     // Full refund (no amount) is still allowed.
     const refund = await service.refundPayment("limited", { pspPaymentId: "p1", idempotencyKey: "k" });
     expect(refund.status).toBe("succeeded");
+  });
+
+  it("refuses a session in a currency the adapter declares unsupported, before calling it", async () => {
+    const adapter = new FakeAdapter({ capabilities: { unsupportedCurrencies: ["UGX"] } });
+    const service = new PaymentService({ adapters: [adapter] });
+    await expectUnsupported(
+      service.createPaymentSession("fake", { ...baseInput, currency: "ugx" }),
+      /^"fake" does not support currency ugx$/,
+    );
+    // Zero-amount sessions too: the list refuses the currency, whatever the amount.
+    await expectUnsupported(
+      service.createPaymentSession("fake", { ...baseInput, amount: 0, currency: "UGX" }),
+      /does not support currency UGX/,
+    );
+    await expect(
+      service.createPaymentSession("fake", { ...baseInput, currency: "UGX" }),
+    ).rejects.toMatchObject({ retryable: false, pspName: "fake" });
+    expect(adapter.calls).toHaveLength(0);
+    const session = await service.createPaymentSession("fake", baseInput);
+    expect(session.pspName).toBe("fake");
+    expect(adapter.calls.map((c) => c.method)).toEqual(["createPaymentSession"]);
   });
 
   it("rejects completePayment for confirm-on-client adapters and routes it for tokenize-first ones", async () => {

@@ -59,25 +59,42 @@ export function validateAdapterCapabilities(adapter: ServerPaymentAdapter): stri
   if (caps.supportsMultiCapture && !caps.supportsManualCapture) {
     issues.push(`Adapter "${adapter.pspName}" claims multi-capture without manual capture support`);
   }
-  // A rail gated to currencies the adapter itself does not accept can never be
-  // routed: screening rejects the session on supportedCurrencies before the
-  // method rule is ever consulted. Offering it is dead capability, not a gate.
-  // Scoped to the ADAPTER, not the provider — supportedCurrencies is often the
-  // narrower thing an adapter's flow reaches (GoCardless declares its one-off
-  // currencies, while the platform collects more over flows it cannot reach).
+  // unsupportedCurrencies is a router pre-screen input: a code that is not
+  // three letters never matches, and the adapter's own refusal of the
+  // currency it meant would end the cascade. The rule sits here, where both
+  // registration and the conformance suite apply it, and asks for the
+  // uppercase form the suite asks of the other currency lists.
   const declared = caps.supportedCurrencies ?? [];
-  if (declared.length > 0) {
-    for (const method of caps.paymentMethods) {
-      if (!method.supported || !method.currencies?.length) continue;
-      const reachable = method.currencies.some((c) =>
-        declared.some((s) => s.toUpperCase() === c.toUpperCase()),
+  const refused = caps.unsupportedCurrencies ?? [];
+  for (const code of refused) {
+    if (!/^[A-Z]{3}$/.test(code)) {
+      issues.push(
+        `Adapter "${adapter.pspName}" declares "${String(code)}" in unsupportedCurrencies, which is not an ` +
+          "uppercase ISO 4217 code",
       );
-      if (!reachable) {
-        issues.push(
-          `Adapter "${adapter.pspName}" offers ${method.type} in ${method.currencies.join("/")} but declares ` +
-            `supportedCurrencies ${declared.join("/")} — the method can never be routed`,
-        );
-      }
+    } else if (listsCode(declared, code)) {
+      issues.push(`Adapter "${adapter.pspName}" declares ${code} in both supportedCurrencies and unsupportedCurrencies`);
+    }
+  }
+  // A rail gated to currencies the adapter itself does not accept can never be
+  // routed: screening rejects the session on supportedCurrencies or
+  // unsupportedCurrencies before the method rule is ever consulted. Offering
+  // it is dead capability, not a gate. Scoped to the ADAPTER, not the provider
+  // — supportedCurrencies is often the narrower thing an adapter's flow reaches
+  // (GoCardless declares its one-off currencies, while the platform collects
+  // more over flows it cannot reach).
+  for (const method of caps.paymentMethods) {
+    if (!method.supported || !method.currencies?.length) continue;
+    if (declared.length > 0 && !method.currencies.some((c) => listsCode(declared, c))) {
+      issues.push(
+        `Adapter "${adapter.pspName}" offers ${method.type} in ${method.currencies.join("/")} but declares ` +
+          `supportedCurrencies ${declared.join("/")} — the method can never be routed`,
+      );
+    } else if (method.currencies.every((c) => listsCode(refused, c))) {
+      issues.push(
+        `Adapter "${adapter.pspName}" offers ${method.type} in ${method.currencies.join("/")} but declares ` +
+          "each of those currencies in unsupportedCurrencies — the method can never be routed",
+      );
     }
   }
   if (caps.supportsSessionUpdate && typeof adapter.updatePaymentSession !== "function") {
@@ -148,4 +165,9 @@ export function validateAdapterCapabilities(adapter: ServerPaymentAdapter): stri
     }
   }
   return issues;
+}
+
+/** Whether `codes` lists `code`, compared case-insensitively as screening compares. */
+function listsCode(codes: readonly string[], code: string): boolean {
+  return codes.some((listed) => listed.toUpperCase() === code.toUpperCase());
 }

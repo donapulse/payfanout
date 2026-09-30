@@ -88,6 +88,60 @@ describe("screenSessionInput — supportedCurrencies", () => {
   });
 });
 
+describe("screenSessionInput — unsupportedCurrencies", () => {
+  const refusing = caps({ unsupportedCurrencies: ["UGX", "CLP"] });
+
+  it("refuses a listed currency in the allowlist's words, trimming and uppercasing the input", () => {
+    expect(screenSessionInput(refusing, input({ currency: "UGX" }))).toBe('"psp-x" does not support currency UGX');
+    expect(screenSessionInput(refusing, input({ currency: " clp " }))).toBe('"psp-x" does not support currency  clp ');
+    expect(screenSessionInput(caps({ supportedCurrencies: ["USD"] }), input({ currency: "UGX" }))).toBe(
+      screenSessionInput(refusing, input({ currency: "UGX" })),
+    );
+    expect(screenSessionInput(refusing, input({ currency: "USD" }))).toBeUndefined();
+    expect(screenSessionInput(refusing, input({ currency: "UGXX" }))).toBeUndefined();
+  });
+
+  it("compares listed codes case-insensitively, as the allowlist does", () => {
+    expect(screenSessionInput(caps({ unsupportedCurrencies: ["ugx"] }), input({ currency: "UGX" }))).toMatch(
+      /does not support currency UGX/,
+    );
+  });
+
+  it("absent or empty refuses nothing", () => {
+    expect(screenSessionInput(caps(), input({ currency: "UGX" }))).toBeUndefined();
+    expect(screenSessionInput(caps({ unsupportedCurrencies: [] }), input({ currency: "UGX" }))).toBeUndefined();
+  });
+
+  it("refuses zero-amount sessions in a listed currency too", () => {
+    const verifying = caps({ unsupportedCurrencies: ["UGX"], supportsPaymentMethodVerification: true });
+    expect(screenSessionInput(verifying, input({ amount: 0, currency: "UGX" }))).toMatch(
+      /does not support currency UGX/,
+    );
+    expect(screenSessionInput(verifying, input({ amount: 0, currency: "USD" }))).toBeUndefined();
+  });
+
+  it("applies on top of supportedCurrencies: a currency must pass both lists", () => {
+    // UGX on both lists is incoherent (validateAdapterCapabilities rejects it
+    // at registration); screening still refuses it rather than trust the allowlist.
+    const both = caps({ supportedCurrencies: ["GBP", "EUR", "UGX"], unsupportedCurrencies: ["UGX", "USD"] });
+    expect(screenSessionInput(both, input({ currency: "GBP" }))).toBeUndefined();
+    expect(screenSessionInput(both, input({ currency: "eur" }))).toBeUndefined();
+    expect(screenSessionInput(both, input({ currency: "USD" }))).toMatch(/does not support currency USD/);
+    expect(screenSessionInput(both, input({ currency: "JPY" }))).toMatch(/does not support currency JPY/);
+    expect(screenSessionInput(both, input({ currency: "UGX" }))).toMatch(/does not support currency UGX/);
+  });
+
+  it("refuses before the per-method rules are consulted", () => {
+    const rails = caps({
+      unsupportedCurrencies: ["EUR"],
+      paymentMethods: [{ type: "sepa_debit", flow: "embedded", supported: true, currencies: ["EUR"] }],
+    });
+    expect(screenSessionInput(rails, input({ currency: "EUR", paymentMethodTypes: ["sepa_debit"] }))).toBe(
+      '"psp-x" does not support currency EUR',
+    );
+  });
+});
+
 describe("screenSessionInput — per-method currencies", () => {
   const rails = caps({
     paymentMethods: [

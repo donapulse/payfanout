@@ -61,6 +61,18 @@ and `PaymentService` will hold you to:
   ISO 4217; omit when unrestricted). The router pre-screens candidates with it — a
   declared constraint means a mismatched payment skips your PSP instead of aborting the
   failover cascade on your local rejection. Keep the local validation as defense.
+- **Currencies refused wholesale** go in `capabilities.unsupportedCurrencies` (uppercase
+  ISO 4217; omit when there are none), for a PSP that takes too many currencies to list
+  in `supportedCurrencies` while your adapter refuses a few outright, such as a currency
+  the PSP prices with another exponent than ISO 4217. The router pre-screens with it
+  exactly as with `supportedCurrencies`, and `PaymentService` refuses such a session with
+  `unsupported_operation` before calling you. Screening refuses every session in a listed
+  currency, zero-amount ones included, so list a currency only when your refusal does not
+  depend on the amount: a rule that refuses some amounts only (Stripe's MGA amounts that
+  are not whole ariary) stays a local check. Derive the list from the constant or rule
+  your local refusal reads so the two cannot drift, and keep the local check.
+  `validateAdapterCapabilities` rejects an entry that is not an uppercase ISO 4217 code, a
+  currency in both lists, and a supported rail whose `currencies` all sit on this one.
 - **Per-rail currency constraints** go in the same shape one level down, on the method:
   `paymentMethods: [{ type: "sepa_debit", flow: "embedded", supported: true, currencies: ["EUR"] }]`.
   Absent or empty means unrestricted, exactly as `supportedCurrencies` reads, and the
@@ -441,7 +453,7 @@ suite proves plumbing, then validate against the PSP sandbox manually before goi
 - [ ] Full + partial refund, over-refund rejection, cancel-before-capture, manual
       capture / multi-capture (if supported) exercised against the PSP sandbox
 - [ ] JPY and BHD amounts round-trip correctly end-to-end (or the constraint is
-      declared via `supportedCurrencies`)
+      declared via `supportedCurrencies` or `unsupportedCurrencies`)
 - [ ] Registered in the demo app (`examples/demo`) and payable behind the unchanged
       `<PayButton>`, if the demo needed edits beyond adding your adapter to the two
       registries, something leaked

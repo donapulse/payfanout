@@ -5672,3 +5672,51 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   - **Three-decimal.** From an account whose presentment list has KWD (only the AE list
     does), send `amount: 1235` in KWD straight to the PaymentIntents API, as the adapter
     refuses it locally, and record whether Stripe refuses it too.
+
+## Currency denylist capability (2026-09-30)
+
+- **The gap.** `AdapterCapabilities.supportedCurrencies` is an allowlist, and adapters whose
+  PSP takes most currencies refuse a few outright: Stripe refuses UGX ("Stripe: currencies
+  whose API units differ from PayFanout's (2026-09-30)"), Paysafe the currencies its table
+  prices with another exponent or lacks ("Paysafe: currencies whose exponent may not be
+  PayFanout's (2026-09-27)"), and Adyen CLP, CVE, IDR and ISK ("Adyen adapter (2026-08-02)").
+  None of them can declare an allowlist without refusing currencies its PSP takes, so the
+  router could not pre-screen these currencies: a candidate asked for one refused with
+  `invalid_request`, a business rejection that ends the cascade before the next PSP is tried,
+  and hosts had to route them with a rule of their own. The Paysafe entry named the fix, a
+  capability listing the currencies an adapter refuses, as "a contract change, and a follow-up
+  of its own"; this is that follow-up.
+- **`AdapterCapabilities.unsupportedCurrencies?: string[]`**: uppercase ISO 4217 codes the
+  adapter refuses outright, absent or empty meaning none. `screenSessionInput` refuses a
+  session in a listed currency after the `supportedCurrencies` check, in the same words
+  (`"<psp>" does not support currency <input>`) and comparing the same way (the input trimmed
+  and uppercased, each listed code uppercased). `PaymentRouter` skips the candidate without a
+  PSP call and tries the next one; `PaymentService` refuses the session with a non-retryable
+  `unsupported_operation` before calling the adapter.
+- **Every session in a listed currency, zero-amount ones included.** The list is read as the
+  allowlist has always been read, whatever the amount. Reading it only for sessions that carry
+  an amount was rejected: Paysafe refuses its currencies on zero-amount sessions too, and such a
+  session would again end the cascade. An adapter lists a currency only when its refusal does not
+  depend on the amount; a refusal of some amounts only (Stripe's MGA amounts that are not whole
+  ariary) stays a local check.
+- **What `PaymentService` answers changes.** The adapters refuse these sessions with
+  `invalid_request` and a `raw` naming the currency's units; once an adapter declares a
+  currency, `PaymentService` answers first, with `unsupported_operation`, the screening message
+  and no `raw`, as it already does for a currency outside `supportedCurrencies` (PayPal's RUB).
+  An adapter called directly refuses as before and keeps its local check, since hosts can drive
+  an adapter without `PaymentService`, and `SubscriptionManager` renewals, which charge saved
+  methods and are never screened, meet the adapter's own refusal as before.
+- **Validation.** `validateAdapterCapabilities`, which registration and the conformance suite
+  both apply, now reports an `unsupportedCurrencies` entry that is not an uppercase three-letter
+  code (a malformed entry never matches, and the suite checks the shape of the other currency
+  lists itself); a currency in both lists (screening refuses it, so declaring it supported
+  contradicts the adapter); and a supported rail whose `currencies` are all on the list, which
+  can never be routed, as the existing rule says of a rail outside `supportedCurrencies`. A rail
+  both lists shut out gets the `supportedCurrencies` diagnosis alone. A refused currency that the
+  allowlist leaves out anyway is redundant, not contradictory, and passes.
+- **The conformance suite is unchanged.** It asserts that `validateAdapterCapabilities` finds
+  no issue, so the new rules reach every adapter's run through core; an assertion of the suite's
+  own would change the adapter contract. The client adapters have nothing to mirror:
+  `ClientPaymentAdapter` exposes per-method capabilities only, never a PSP-wide currency list.
+- **Release.** `@payfanout/core` takes a minor: an optional field, and a screen and validation
+  rules that only read it. `@payfanout/server`'s code does not change; it screens through core.

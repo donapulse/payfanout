@@ -132,9 +132,27 @@ export interface AdapterCapabilities {
    * Hard PSP currency constraints (ISO 4217, uppercase). ABSENT means
    * unrestricted. When present, the router pre-screens candidates by it —
    * without it, a PSP-local currency rejection (invalid_request) aborts the
-   * failover cascade before an eligible PSP is tried.
+   * failover cascade before an eligible PSP is tried. An adapter whose PSP
+   * takes too many currencies to list declares the few it refuses in
+   * `unsupportedCurrencies` instead.
    */
   supportedCurrencies?: string[];
+  /**
+   * Currencies the adapter refuses outright (ISO 4217, uppercase). ABSENT or
+   * empty means none. A PSP that takes most currencies cannot be given a
+   * `supportedCurrencies` list without refusing some it takes, yet its adapter
+   * may still refuse a few wholesale, such as a currency the PSP prices with
+   * another exponent than ISO 4217. The router pre-screens candidates by this
+   * list as it does by `supportedCurrencies`, so a session in one of these
+   * currencies skips the adapter instead of aborting the failover cascade on
+   * its local invalid_request, and PaymentService refuses the session with
+   * unsupported_operation. Screening applies it to every session in the
+   * currency, zero-amount ones included, so list a currency only when the
+   * refusal does not depend on the amount; one that does (a whole-unit rule)
+   * stays a local check. Keep the local check either way: hosts can call an
+   * adapter without PaymentService.
+   */
+  unsupportedCurrencies?: string[];
   /**
    * The PSP exposes a read for a single payment (retrievePayment). False is the
    * push-only declaration — the payment reference is a write target only, and

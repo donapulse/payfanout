@@ -280,4 +280,74 @@ describe("validateAdapterCapabilities", () => {
       ),
     ).toEqual([]);
   });
+
+  it("flags each unsupportedCurrencies entry that is not an uppercase ISO 4217 code", () => {
+    const shape = (code: string) =>
+      `Adapter "fake" declares "${code}" in unsupportedCurrencies, which is not an uppercase ISO 4217 code`;
+    expect(
+      validateAdapterCapabilities(makeAdapter({ unsupportedCurrencies: ["UGX", "ugx", "UG", "UGXX", " CLP", ""] })),
+    ).toEqual([shape("ugx"), shape("UG"), shape("UGXX"), shape(" CLP"), shape("")]);
+  });
+
+  it("flags a currency declared in both supportedCurrencies and unsupportedCurrencies", () => {
+    expect(
+      validateAdapterCapabilities(
+        makeAdapter({ supportedCurrencies: ["GBP", "ugx", "EUR"], unsupportedCurrencies: ["UGX", "EUR", "USD"] }),
+      ),
+    ).toEqual([
+      'Adapter "fake" declares UGX in both supportedCurrencies and unsupportedCurrencies',
+      'Adapter "fake" declares EUR in both supportedCurrencies and unsupportedCurrencies',
+    ]);
+  });
+
+  it("a rail gated to currencies the adapter refuses can never be routed", () => {
+    expect(
+      validateAdapterCapabilities(
+        makeAdapter({
+          unsupportedCurrencies: ["CAD", "USD"],
+          paymentMethods: [
+            { type: "card", flow: "embedded", supported: true },
+            { type: "pad", flow: "redirect", supported: true, currencies: ["cad", "USD"] },
+          ],
+        }),
+      ),
+    ).toEqual([
+      'Adapter "fake" offers pad in cad/USD but declares each of those currencies in unsupportedCurrencies — ' +
+        "the method can never be routed",
+    ]);
+  });
+
+  it("reports the supportedCurrencies diagnosis alone for a rail both lists shut out", () => {
+    expect(
+      validateAdapterCapabilities(
+        makeAdapter({
+          supportedCurrencies: ["GBP"],
+          unsupportedCurrencies: ["CAD"],
+          paymentMethods: [{ type: "pad", flow: "redirect", supported: true, currencies: ["CAD"] }],
+        }),
+      ),
+    ).toEqual([expect.stringMatching(/offers pad in CAD but declares supportedCurrencies GBP — /)]);
+  });
+
+  it("accepts coherent unsupportedCurrencies declarations", () => {
+    const refusingCad = (caps: Partial<AdapterCapabilities> = {}) =>
+      validateAdapterCapabilities(makeAdapter({ unsupportedCurrencies: ["CAD"], ...caps }));
+    expect(refusingCad()).toEqual([]);
+    expect(validateAdapterCapabilities(makeAdapter({ unsupportedCurrencies: [] }))).toEqual([]);
+    // One currency left to a rail keeps it routable.
+    expect(
+      refusingCad({
+        paymentMethods: [{ type: "pad", flow: "redirect", supported: true, currencies: ["CAD", "USD"] }],
+      }),
+    ).toEqual([]);
+    // An unsupported rail's gate is inert, and an unrestricted rail is always reachable.
+    expect(
+      refusingCad({ paymentMethods: [{ type: "pad", flow: "redirect", supported: false, currencies: ["CAD"] }] }),
+    ).toEqual([]);
+    expect(
+      refusingCad({ paymentMethods: [{ type: "card", flow: "embedded", supported: true, currencies: [] }] }),
+    ).toEqual([]);
+    // A refused currency the allowlist already leaves out is redundant, not contradictory.
+    expect(refusingCad({ supportedCurrencies: ["GBP", "EUR"] })).toEqual([]);
+  });
 });

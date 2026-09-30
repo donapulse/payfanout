@@ -13,19 +13,25 @@ import {
 export interface GoCardlessClientAdapterConfig {
   /** Explicit, mirrors the server adapter — never inferred. */
   environment: "sandbox" | "live";
-  /** Scheme enablement varies per account — override the conservative defaults. */
+  /**
+   * The methods a session declares, mirroring the server adapter. Override
+   * only to narrow the defaults: a session is a one-off Pay by Bank payment,
+   * whatever this list says.
+   */
   paymentMethods?: PaymentMethodCapability[];
 }
 
 /**
- * Same honest list as the server adapter: GoCardless bank authorisation is
- * only permitted from GoCardless-hosted UIs, so every method is flow
- * "redirect" — an embedded flow cannot be claimed.
+ * Same honest list as the server adapter: a session is a one-off Open Banking
+ * payment, so bank_redirect_generic is the one method it takes, and SEPA
+ * Direct Debit and Bacs, which collect against a mandate, are unsupported.
+ * GoCardless bank authorisation is only permitted from GoCardless-hosted UIs,
+ * so every method is flow "redirect" — an embedded flow cannot be claimed.
  */
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "bank_redirect_generic", flow: "redirect", supported: true },
-  { type: "sepa_debit", flow: "redirect", supported: true, currencies: ["EUR"] },
-  { type: "bacs_debit", flow: "redirect", supported: true, currencies: ["GBP"], countries: ["GB"] },
+  { type: "sepa_debit", flow: "redirect", supported: false },
+  { type: "bacs_debit", flow: "redirect", supported: false },
   { type: "ach", flow: "redirect", supported: false },
 ];
 

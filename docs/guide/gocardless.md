@@ -385,6 +385,21 @@ with `invalid_request`:
 | Direct Debit fallback (`fallbackEnabled`, reported by `retrievePayment`) | `bacs` | GBP | ~3 business days |
 | Direct Debit fallback (`fallbackEnabled`, reported by `retrievePayment`) | `sepa_core` | EUR | ~1–2 business days |
 
+A session therefore takes one payment method, `bank_redirect_generic`, and the adapter
+declares `sepa_debit` and `bacs_debit` unsupported: GoCardless calls a billing request's
+payment request "a one-off strongly authorised payment" over Open Banking, and Direct Debit
+collects against a mandate, which no session can be asked for. A `paymentMethodTypes` that
+names only types the adapter does not take (`["sepa_debit"]`, say) rejects with
+`invalid_request`, and the router skips GoCardless for it. A list that also names
+`bank_redirect_generic` is served, as a Pay by Bank session, as the router's screen reads a
+list. With `fallbackEnabled`, a payer who cannot find their bank, or whose bank
+authorisation fails, can choose to continue by Direct Debit ([Retain customers with
+Fallbacks](https://docs.gocardless.com/docs/optimise/retain-customers-with-fallbacks)), and
+`retrievePayment` then reports the payment as `bacs_debit` or `sepa_debit`. A Pro or
+Enterprise account with custom payment pages can also trigger that fallback itself, which
+the adapter never does. Declaring `sepa_debit` or `bacs_debit` in `paymentMethods` does not
+change what a session is: override the list only to narrow it.
+
 GoCardless the **platform** also collects USD, CAD, AUD, NZD, SEK and DKK over `ach`,
 `pad`, `becs`, `becs_nz`, `autogiro`, `betalingsservice` and `pay_to` — those are
 **mandate-based flows this adapter's one-off sessions cannot reach** (mandate work is
@@ -429,8 +444,8 @@ webhooks. "Send test webhook" in the dashboard exercises your endpoint end to en
 - [ ] Create the **live** webhook endpoint and use its **live** secret.
 - [ ] If you refund, confirm refunds are enabled on the **live** account too (GoCardless
       Dashboard).
-- [ ] Re-check scheme/currency enablement for your account and override
-      `paymentMethods` if it differs from the defaults.
+- [ ] Re-check scheme/currency enablement for your account, and narrow `paymentMethods` if
+      your account takes less than the defaults.
 
 Then continue with [Server usage](/guide/server), [React usage](/guide/react), and
 [Webhooks](/guide/webhooks).

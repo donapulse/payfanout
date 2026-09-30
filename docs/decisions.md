@@ -1550,9 +1550,11 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   bank account"; support matrix customer country "US"), Stripe Bacs → GB
   (payments/payment-methods/bacs-debit, "customers who hold a British bank account"),
   GoCardless Bacs → GB (support.gocardless.com Schemes-and-Requirements, "GBP from UK
-  bank accounts"), Paysafe Interac → CA (interac-e-transfer page, "Supported region:
-  Canada"). SEPA stays undeclared on both Stripe and GoCardless: the providers state a
-  zone, not a country (Stripe "Europe", GoCardless "the Eurozone" on the support page,
+  bank accounts"; superseded 2026-09-30: GoCardless sessions no longer declare Bacs, see
+  "GoCardless sessions declare Pay by Bank only"), Paysafe Interac → CA
+  (interac-e-transfer page, "Supported region: Canada"). SEPA stays undeclared on both
+  Stripe and GoCardless: the providers state a zone, not a country (Stripe "Europe",
+  GoCardless "the Eurozone" on the support page,
   while collecting from non-Eurozone SEPA countries per the API docs — the two GoCardless
   statements do not even agree on the zone's edge), and a hardcoded membership list would
   screen out valid payments the day it drifts. No PSP-wide `supportedCountries` exists,
@@ -5396,3 +5398,54 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
 - **Not verified in a sandbox.** How the rendered form differs with and without the theme
   script needs a form token, which only the PayZen API issues; the check is to mount the
   embedded form in the sandbox and compare the pay button and field icons.
+
+## GoCardless sessions declare Pay by Bank only (2026-09-30)
+
+- **What a session is.** `createPaymentSession` creates a billing request with a
+  `payment_request` and nothing else. GoCardless's OpenAPI spec (docs.gocardless.com/
+  openapi-schema-public.json, read 2026-09-30) describes `BillingRequestPaymentRequest` as
+  "Request for a one-off strongly authorised payment", and its `scheme` as "A scheme used for
+  Open Banking payments. Currently `faster_payments` is supported in the UK (GBP) and
+  `sepa_credit_transfer` and `sepa_instant_credit_transfer` are supported in supported
+  Eurozone countries (EUR)." Bacs and SEPA Core are mandate schemes (`BillingRequestScheme`,
+  "Optional for mandate only requests"), and no session sets up a mandate.
+- **The capability list said otherwise.** Both GoCardless adapters declared `sepa_debit` and
+  `bacs_debit` supported for sessions, on the reasoning that "the classic debit schemes list
+  what the fulfilled payment can report". A session asked for either was created all the
+  same, as a Pay by Bank payment, and the router could send a session asking for SEPA Direct
+  Debit to GoCardless. Both are now declared `supported: false`; `bank_redirect_generic` is
+  the one method a session takes.
+- **A list is read as the router reads it** (changed in review, 2026-09-30). Core's
+  `screenSessionInput` passes a session when any requested type is supported, while the
+  adapter refused one naming any unsupported type. With `sepa_debit` and `bacs_debit`
+  unsupported, `["sepa_debit", "bank_redirect_generic"]` would have passed the screen, then
+  been refused by GoCardless with a non-retryable `invalid_request`, ending the cascade before
+  a PSP that serves SEPA was tried, where it used to create a Pay by Bank session. The
+  adapter now refuses only a list naming no type it takes (`["sepa_debit"]`, or
+  `["card"]`), as "Stripe: explicit payment_method_types vs intent currency (2026-07-15)"
+  reasons for mixed lists; a list that also names
+  `bank_redirect_generic` is served, as every session is Pay by Bank. A list such as
+  `["card", "bank_redirect_generic"]`, refused before, is served too.
+- **The fallback does not change it** (corrected in review, 2026-09-30). The Fallbacks guide
+  (docs.gocardless.com/docs/optimise/retain-customers-with-fallbacks): with
+  `fallback_enabled`, "The option to pay via Direct Debit will only be shown if either the
+  customer is unable to find" their bank "or" fails an "attempt to authorise through their
+  bank", and the payer then chooses "Continue payment using Direct Debit". The spec's
+  `POST /billing_requests/{billing_request_id}/actions/fallback` "Triggers a fallback from
+  the open-banking flow to direct debit", restricted to GoCardless Pro and Enterprise
+  accounts with the custom payment pages upgrade, and `fallback_occurred` is "True if the
+  billing request was completed with direct debit". `retrievePayment` keeps reporting such a
+  payment as `bacs_debit` or `sepa_debit` (`mapSchemeToMethodType`). Direct Debit is the
+  payer's choice after a failure, or the fallback action's, which the adapter never calls;
+  no session can be asked for it, so the method stays unsupported. A first version said the
+  fallback happens when "the payer's bank cannot pay instantly" and is "never the host's",
+  which the guide and the action contradict.
+- **Overrides only narrow.** `paymentMethods` still overrides the list on both adapters, but
+  declaring `sepa_debit` or `bacs_debit` supported would not make a session collect by
+  Direct Debit; the JSDoc and the guide say to override only to narrow the list.
+- **Release.** A host that named only `sepa_debit` or `bacs_debit` in a GoCardless session
+  got a Pay by Bank payment and now gets `invalid_request`, and a routing rule for those
+  methods alone no longer reaches GoCardless, so `@payfanout/adapter-gocardless-server` takes
+  a major and `@payfanout/adapter-gocardless`, whose capability list mirrors it, a minor
+  (0.x). A real Direct Debit session, a mandate request followed by a payment against the
+  mandate, is a design of its own (future-designs.md).

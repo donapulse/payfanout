@@ -165,6 +165,36 @@ describe("detailedStatus mapping (complete catalog)", () => {
   });
 });
 
+/**
+ * Every PSP_ code PayZen's error page (rest/V4.0/api/errors/psp.html, read
+ * 2026-09-30) gives "Technical error.", "A technical error has occurred." or
+ * "Due to a technical problem, we are unable to process your request.".
+ */
+const PAYZEN_TECHNICAL_ERROR_CODES = [
+  "PSP_996",
+  "PSP_999",
+  "PSP_594",
+  "PSP_513",
+  "PSP_514",
+  "PSP_515",
+  "PSP_516",
+  "PSP_525",
+  "PSP_538",
+  "PSP_540",
+  "PSP_541",
+  "PSP_555",
+  "PSP_569",
+  "PSP_577",
+  "PSP_585",
+  "PSP_587",
+  "PSP_608",
+  "PSP_643",
+  "PSP_648",
+  "PSP_650",
+  "PSP_652",
+  "PSP_658",
+];
+
 describe("mapPayZenError (envelope taxonomy)", () => {
   const cases: Array<[string | undefined, string | null | undefined, UnifiedErrorCode, boolean]> = [
     ["INT_905", null, "invalid_request", false],
@@ -243,17 +273,23 @@ describe("mapPayZenError (envelope taxonomy)", () => {
     ["PSP_717", null, "authentication_required", false],
     ["PSP_722", null, "authentication_required", false],
     ["PSP_718", null, "invalid_request", false], // invalid authentication settings
-    // The page's technical-error texts, retryable as an outage.
-    ["PSP_996", null, "psp_unavailable", true],
-    ["PSP_555", null, "psp_unavailable", true],
-    ["PSP_648", null, "psp_unavailable", true],
-    ["PSP_658", null, "psp_unavailable", true],
+    ["PSP_534", null, "card_declined", false], // failed a verification the card requires every time
+    ["PSP_535", null, "card_declined", false], // failed e-Carte Bleue verification
+    ["PSP_572", null, "card_declined", false], // declined by Cofinoga
+    ["PSP_573", null, "card_declined", false], // 1-euro authorization refused
+    ["PSP_600", null, "card_declined", false], // failed commercial card verification
+    ["PSP_601", null, "card_declined", false], // the first installment was refused
+    // Every code the page gives a technical-error text, retryable as an outage.
+    ...PAYZEN_TECHNICAL_ERROR_CODES.map((code): [string, null, UnifiedErrorCode, boolean] => [
+      code,
+      null,
+      "psp_unavailable",
+      true,
+    ]),
     ["PSP_536", null, "fraud_suspected", false],
     ["PSP_204", null, "fraud_suspected", false],
     ["PSP_099", null, "rate_limited", true], // HTTP-200 rate limit — envelope is the only signal
     ["PSP_106", null, "rate_limited", true],
-    ["PSP_999", null, "psp_unavailable", true],
-    ["PSP_514", null, "psp_unavailable", true],
     ["PSP_010", null, "invalid_request", false],
     ["PSP_030", null, "invalid_request", false], // token not found
     ["PSP_031", null, "invalid_request", false], // invalid token
@@ -303,6 +339,8 @@ describe("mapPayZenError (envelope taxonomy)", () => {
       if (start === -1) return [];
       // Every entry, wherever it sits: comments dropped, several per line read too.
       const block = source.slice(source.indexOf("{", start), source.indexOf("\n};", start)).replace(/\/\/.*$/gm, "");
+      // A computed or spread entry would escape the reading below.
+      expect(block, map).not.toMatch(/\[|\.\.\./);
       return [...block.matchAll(/["']?(\w+)["']?\s*:\s*["']([a-z_]+)["']/g)].map((m) => `${m[1]}=${m[2]}`).sort();
     };
     for (const map of ["ACQUIRER_CODE_MAP", "AUTH_CODE_MAP", "PAYZEN_PSP_CODE_MAP"]) {

@@ -1523,6 +1523,12 @@ const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
   PSP_624: "card_declined", // inactive card
   PSP_625: "card_declined", // refused by the acquirer
   PSP_636: "card_declined", // derivative refused: no liability shift on the primary
+  PSP_534: "card_declined", // failed a verification the card requires every time
+  PSP_535: "card_declined", // failed e-Carte Bleue verification
+  PSP_572: "card_declined", // authorization declined by Cofinoga
+  PSP_573: "card_declined", // 1-euro authorization refused
+  PSP_600: "card_declined", // failed commercial card verification
+  PSP_601: "card_declined", // declined: the first installment was refused
   PSP_042: "insufficient_funds",
   PSP_202: "expired_card",
   PSP_508: "expired_card",
@@ -1561,10 +1567,12 @@ const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
   // HTTP-200 rate limiting — the envelope is the only signal.
   PSP_099: "rate_limited",
   PSP_106: "rate_limited",
-  // "Technical error." and "Due to a technical problem, we are unable to
-  // process your request.", every code the page gives either text.
+  // "Technical error.", "A technical error has occurred." and "Due to a
+  // technical problem, we are unable to process your request.", every code
+  // the page gives one of these texts.
   PSP_996: "psp_unavailable",
   PSP_999: "psp_unavailable",
+  PSP_594: "psp_unavailable",
   PSP_513: "psp_unavailable",
   PSP_514: "psp_unavailable",
   PSP_515: "psp_unavailable",

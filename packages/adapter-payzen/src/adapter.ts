@@ -731,6 +731,12 @@ const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
   PSP_624: "card_declined", // inactive card
   PSP_625: "card_declined", // refused by the acquirer
   PSP_636: "card_declined", // derivative refused: no liability shift on the primary
+  PSP_534: "card_declined", // failed a verification the card requires every time
+  PSP_535: "card_declined", // failed e-Carte Bleue verification
+  PSP_572: "card_declined", // authorization declined by Cofinoga
+  PSP_573: "card_declined", // 1-euro authorization refused
+  PSP_600: "card_declined", // failed commercial card verification
+  PSP_601: "card_declined", // declined: the first installment was refused
   PSP_042: "insufficient_funds",
   PSP_202: "expired_card",
   PSP_508: "expired_card",
@@ -769,10 +775,12 @@ const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
   // HTTP-200 rate limiting — the envelope is the only signal.
   PSP_099: "rate_limited",
   PSP_106: "rate_limited",
-  // "Technical error." and "Due to a technical problem, we are unable to
-  // process your request.", every code the page gives either text.
+  // "Technical error.", "A technical error has occurred." and "Due to a
+  // technical problem, we are unable to process your request.", every code
+  // the page gives one of these texts.
   PSP_996: "psp_unavailable",
   PSP_999: "psp_unavailable",
+  PSP_594: "psp_unavailable",
   PSP_513: "psp_unavailable",
   PSP_514: "psp_unavailable",
   PSP_515: "psp_unavailable",
@@ -844,10 +852,10 @@ function isTechnicalError(errorCode: string | null | undefined): boolean {
  * only ACQ_ answers read the acquirer map; PSP_101, a refund refusal carrying
  * the acquirer's code, never reaches the browser. A PSP_ code the map does not
  * list reads as a processing_error, as on the server. A technical error or a
- * rate limit is retryable, as core makes
- * psp_unavailable and rate_limited; any other answer refused the transaction,
- * and no refusal maps to a retryable code. The message is core's: the form's
- * own texts describe its CLIENT_ errors.
+ * rate limit is retryable, as core makes psp_unavailable and rate_limited;
+ * any other answer refused the transaction, and no refusal maps to a
+ * retryable code. The message is core's: the form's own texts describe its
+ * CLIENT_ errors.
  */
 function transactionError(
   errorCode: string | null | undefined,

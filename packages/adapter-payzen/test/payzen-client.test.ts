@@ -782,6 +782,7 @@ describe("PayZenClientAdapter error mapping", () => {
       [{ errorCode: "PSP_055" }, "invalid_request", false],
       [{ errorCode: "PSP_999" }, "psp_unavailable", true],
       [{ errorCode: "PSP_996" }, "psp_unavailable", true],
+      [{ errorCode: "PSP_594" }, "psp_unavailable", true],
       [{ errorCode: "PSP_106" }, "rate_limited", true],
       [{ errorCode: "PSP_641" }, "fraud_suspected", false],
       [{ errorCode: "PSP_722" }, "authentication_required", false],
@@ -838,6 +839,8 @@ describe("PayZenClientAdapter error mapping", () => {
       // processing error: a declined card, a risk decision, a failed OTP.
       ["PSP_003", undefined, "card_declined"],
       ["PSP_625", undefined, "card_declined"],
+      ["PSP_572", undefined, "card_declined"],
+      ["PSP_601", undefined, "card_declined"],
       ["PSP_647", undefined, "fraud_suspected"],
       ["PSP_717", undefined, "authentication_required"],
       ["PSP_777", "51", "processing_error"], // a code the map does not list

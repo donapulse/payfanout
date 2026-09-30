@@ -1,5 +1,0 @@
----
-"@payfanout/adapter-paysafe-server": patch
----
-
-Declare the currencies the adapter refuses (CLP, BYR and the currencies Paysafe's table lacks that are not priced in hundredths) in `unsupportedCurrencies`, derived once from the same rule as the refusal. From the `@payfanout/server` release that reads the field, `PaymentRouter` skips Paysafe for a session in one of them and tries the next candidate instead of stopping on the adapter's `invalid_request`, and `PaymentService` refuses such a session for Paysafe before calling the adapter, zero-amount sessions included, with a non-retryable `unsupported_operation`, the message `"paysafe" declares currency CLP unsupported` and no `raw`, where the adapter's refusal was an `invalid_request` naming the currency and PayFanout's exponent on `raw`, and Paysafe's where its table lists the currency. The adapter called directly refuses as before. A `paymentMethods` override with a rail whose `currencies` are all declared unsupported now fails registration.

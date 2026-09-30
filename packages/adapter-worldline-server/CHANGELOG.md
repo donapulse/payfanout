@@ -1,5 +1,16 @@
 # @payfanout/adapter-worldline-server
 
+## 3.0.3
+
+### Patch Changes
+
+- 114d13a: Report `NO_CURRENCY` instead of passing on a malformed currency code that a payment record states, and report the session's currency for a 3-D Secure challenge whose payment states an empty or malformed one, which was refused as another session's payment. A refund of a payment that states no currency is refused with `invalid_request` before any request, instead of being sent in `XXX`.
+- Updated dependencies [114d13a]
+- Updated dependencies [2d3cec4]
+- Updated dependencies [dd0c035]
+- Updated dependencies [2d3cec4]
+  - @payfanout/core@4.5.0
+
 ## 3.0.2
 
 ### Patch Changes

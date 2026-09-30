@@ -1,5 +1,16 @@
 # @payfanout/adapter-paypal-server
 
+## 2.0.8
+
+### Patch Changes
+
+- 114d13a: Stop reporting or sending USD for PayPal records that state no currency: a read takes the currency another record of the same order states (for a capture or refund read on its own, the capture's order), else reports `NO_CURRENCY`, and the subscription projection reports `NO_CURRENCY` instead of an empty string. When no record states the currency, a capture amount other than all of an untouched authorization, a partial refund and an amount-only `updatePaymentSession` are refused with `invalid_request` before any request, `retrieveRefund` rejects with `processing_error` instead of reading the amount as USD, and a full refund still goes through, even when the read of its capture's order fails. An update that only restates the order's own currency no longer sends a PATCH.
+- Updated dependencies [114d13a]
+- Updated dependencies [2d3cec4]
+- Updated dependencies [dd0c035]
+- Updated dependencies [2d3cec4]
+  - @payfanout/core@4.5.0
+
 ## 2.0.7
 
 ### Patch Changes

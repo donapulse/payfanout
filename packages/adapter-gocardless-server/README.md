@@ -113,9 +113,10 @@ rather than silently dropping events — use the recipe above for GoCardless ing
   GoCardless returns as digit strings read as integers; any other amount rejects the
   read with `unknown`. An idempotency key goes out exactly as earlier releases sent it
   whenever GoCardless can have taken it; one over 128 code points once `fetch` trims it,
-  or holding a NUL, CR or LF, is sent as a SHA-256 digest of itself, the same on every
-  retry. Node's `fetch` refuses a key holding a character above U+00FF, or a control
-  character other than tab, before sending, as it always has: use ASCII keys there. A
+  or holding a NUL, CR or LF inside the trimmed value, is sent as a SHA-256 digest of
+  itself, the same on every retry. Node's `fetch` refuses a key holding a character above
+  U+00FF, or an ASCII control character other than tab, before sending, as it always has,
+  and sends U+0080 to U+00FF as one byte each where Workers sends UTF-8: use ASCII keys. A
   lone surrogate is refused in a key sent as its digest and in a refund key. Every
   request sends `Accept: application/json`.
 - `fallbackEnabled` is sent only when `true`. GoCardless says `fallback_enabled` "Should

@@ -105,9 +105,10 @@ export class FakeGoCardlessApi {
   uniqueSubscriptionCreations = 0;
   /**
    * Whose fetch sends the headers. "node": the Headers constructor refuses
-   * NUL, CR, LF and characters above U+00FF, and Node every other control
-   * character but tab. "workerd" (Cloudflare Workers): only NUL, CR and LF
-   * are refused, and other values go out as UTF-8. Both trim edge whitespace.
+   * NUL, CR, LF and characters above U+00FF, and Node every other ASCII
+   * control character but tab, and DEL. "workerd" (Cloudflare Workers): only
+   * NUL, CR and LF are refused, and other values go out as UTF-8. Both trim
+   * edge whitespace.
    */
   headerRules: "node" | "workerd" = "node";
   /** Total fetch invocations — asserts the verifyCredentials probe is single-shot. */
@@ -159,7 +160,11 @@ export class FakeGoCardlessApi {
     const refused = this.headerRules === "node" ? /[^\t\x20-\x7e\x80-\xff]/ : /[\0\r\n]/;
     const sent = new Map<string, string>();
     for (const [name, value] of Object.entries(headers ?? {})) {
-      const trimmed = value.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+      let start = 0;
+      let end = value.length;
+      while (start < end && "\t\n\r ".includes(value.charAt(start))) start += 1;
+      while (end > start && "\t\n\r ".includes(value.charAt(end - 1))) end -= 1;
+      const trimmed = value.slice(start, end);
       if (refused.test(trimmed)) throw new TypeError(`invalid ${name} header`);
       sent.set(name.toLowerCase(), trimmed);
     }

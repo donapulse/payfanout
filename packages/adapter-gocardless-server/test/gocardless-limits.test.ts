@@ -273,14 +273,16 @@ describe("GoCardless idempotency keys", () => {
     const again = await adapter.createPaymentSession(sessionInput({ idempotencyKey: "order-42\n" }));
     expect(again.pspSessionId).toBe(first.pspSessionId);
     expect(new Set(fake.idempotencyKeysSeen.map(({ key }) => key))).toEqual(new Set(["order-42"]));
-    const tabbed = await adapter.createPaymentSession(sessionInput({ idempotencyKey: "\torder-42" }));
-    expect(tabbed.pspSessionId).toBe(first.pspSessionId);
+    for (const both of ["\torder-42", "\norder-42\n"]) {
+      const again = await adapter.createPaymentSession(sessionInput({ idempotencyKey: both }));
+      expect(again.pspSessionId, JSON.stringify(both)).toBe(first.pspSessionId);
+    }
     // 128 characters and trailing whitespace went out as the 128, which GoCardless takes.
     const long = "k".repeat(128);
     const third = await adapter.createPaymentSession(sessionInput({ idempotencyKey: long }));
-    for (const edge of [" ", "\t", "\r\n"]) {
-      const again = await adapter.createPaymentSession(sessionInput({ idempotencyKey: `${long}${edge}` }));
-      expect(again.pspSessionId, JSON.stringify(edge)).toBe(third.pspSessionId);
+    for (const edged of [`${long} `, `${long}\t`, `${long}\r\n`, ` ${long} `]) {
+      const again = await adapter.createPaymentSession(sessionInput({ idempotencyKey: edged }));
+      expect(again.pspSessionId, JSON.stringify(edged)).toBe(third.pspSessionId);
     }
     expect(new Set(fake.idempotencyKeysSeen.map(({ key }) => key))).toEqual(new Set(["order-42", long]));
   });

@@ -45,31 +45,53 @@ export function assertMetadataLimits(metadata: Record<string, string>): void {
   }
 }
 
-/** HTTP whitespace, which fetch trims from both ends of a header value before it is sent. */
-const HEADER_EDGE_WHITESPACE = /^[\t\n\r ]+|[\t\n\r ]+$/g;
+/** HTTP whitespace (tab, LF, CR, space), which fetch trims from both ends of a header value before it is sent. */
+function isHeaderWhitespace(code: number): boolean {
+  return code === 9 || code === 10 || code === 13 || code === 32;
+}
+
+/** The value fetch sends for a header: `value` with its edge HTTP whitespace trimmed, in one linear pass. */
+function trimHeaderWhitespace(value: string): string {
+  let start = 0;
+  let end = value.length;
+  while (start < end && isHeaderWhitespace(value.charCodeAt(start))) start += 1;
+  while (end > start && isHeaderWhitespace(value.charCodeAt(end - 1))) end -= 1;
+  return value.slice(start, end);
+}
 
 /**
  * Whether GoCardless can have taken a key, with fetch's edge whitespace
  * trimmed, as given: no NUL, CR or LF inside it, which no runtime sends in a
- * header, and at most 128 code points. Code points are the smallest count
- * GoCardless could use, so a longer key was answered
- * `idempotency_key_too_long` however it counts. Any other key may have gone
- * out and created something: Cloudflare Workers sends characters above U+00FF
- * as UTF-8, and other control characters, while Node's fetch refuses both
- * before sending.
+ * header, and at most 128 characters as GoCardless may have read them.
+ * Cloudflare Workers sends every character as UTF-8, and code points are the
+ * smallest count of those, so a longer key was answered
+ * `idempotency_key_too_long` however GoCardless counts. Node's fetch refuses
+ * characters above U+00FF and ASCII control characters other than tab before
+ * sending, and sends U+0080 to U+00FF as one byte each, which GoCardless may
+ * decode as UTF-8 into fewer characters: such a key counts as that decoding.
  */
 function takenAsGiven(trimmed: string): boolean {
   let codePoints = 0;
+  let oneBytePerCharacter = true;
   for (const char of trimmed) {
-    codePoints += 1;
     const code = char.charCodeAt(0);
-    if (code === 0 || code === 10 || code === 13 || codePoints > IDEMPOTENCY_KEY_MAX_CHARACTERS) return false;
+    if (code === 0 || code === 10 || code === 13) return false;
+    if (code > 0xff) oneBytePerCharacter = false;
+    codePoints += 1;
   }
-  return true;
+  if (codePoints <= IDEMPOTENCY_KEY_MAX_CHARACTERS) return true;
+  return oneBytePerCharacter && characters(decodedAsUtf8(trimmed)) <= IDEMPOTENCY_KEY_MAX_CHARACTERS;
+}
+
+/** The text a value of characters up to U+00FF reads as when its one byte per character is decoded as UTF-8. */
+function decodedAsUtf8(latin1: string): string {
+  const bytes = new Uint8Array(latin1.length);
+  for (let i = 0; i < latin1.length; i++) bytes[i] = latin1.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
 }
 
 function sentAsGiven(idempotencyKey: string): boolean {
-  return takenAsGiven(idempotencyKey.replace(HEADER_EDGE_WHITESPACE, ""));
+  return takenAsGiven(trimHeaderWhitespace(idempotencyKey));
 }
 
 /**
@@ -95,9 +117,7 @@ const LONE_SURROGATE = /\p{Cs}/u;
  * given keeps its lone surrogates as the runtime sends them, as it always did.
  */
 export function assertDigestibleIdempotencyKey(idempotencyKey: string): void {
-  if (typeof idempotencyKey !== "string" || !LONE_SURROGATE.test(idempotencyKey) || sentAsGiven(idempotencyKey)) {
-    return;
-  }
+  if (!LONE_SURROGATE.test(idempotencyKey) || sentAsGiven(idempotencyKey)) return;
   throw PayFanoutError.invalidRequest(
     "The idempotencyKey is sent as its digest, being over GoCardless's 128 characters or holding a NUL, CR or LF, " +
       "and it holds a lone surrogate, which would give it the digest of other keys",

@@ -23,7 +23,9 @@ describe("idempotencyKeyHeader", () => {
       "\r\norder-42",
       " order-42 ",
       "\torder-42",
+      "\norder-42\n",
       `${"k".repeat(128)} `,
+      ` ${"k".repeat(128)} `,
       `${"k".repeat(128)}\t`,
       `${"k".repeat(128)}\r\n`,
       // Cloudflare Workers sends these as UTF-8, and other control characters as given; Node's fetch refuses them.
@@ -36,6 +38,9 @@ describe("idempotencyKeyHeader", () => {
       "order-\uD800",
       "bell\u0007",
       "del\u007f",
+      // Node sends these one byte each, which read as UTF-8 are 65 characters ("é" 65 times), and a C1 control.
+      "Ã©".repeat(65),
+      "\u0085-order",
     ];
     for (const key of asGiven) {
       expect(await idempotencyKeyHeader(key), JSON.stringify(key)).toBe(key);
@@ -49,6 +54,10 @@ describe("idempotencyKeyHeader", () => {
       "x".repeat(4000),
       "😀".repeat(129),
       "€".repeat(129),
+      // One byte each on Node, and no shorter as UTF-8: each lone 0xE9 decodes to one U+FFFD.
+      "é".repeat(129),
+      // Above U+00FF, so never one byte each: their low bytes would read as 65 "é" if truncated.
+      "ǃƩ".repeat(65),
       "line\nbreak",
       "cr\rkey",
       "nul\u0000",
@@ -61,6 +70,8 @@ describe("idempotencyKeyHeader", () => {
       expect(await idempotencyKeyHeader(key)).toBe(header);
     }
     expect(await idempotencyKeyHeader("k".repeat(129))).not.toBe(await idempotencyKeyHeader("k".repeat(130)));
+    // A long run of whitespace inside a key is read once, not once per position.
+    expect(await idempotencyKeyHeader(`a${"\t".repeat(1_000_000)}a`)).toMatch(DIGEST);
     // Keys that differ only in their edge whitespace are different keys once digested.
     expect(await idempotencyKeyHeader(` ${"k".repeat(129)}`)).not.toBe(await idempotencyKeyHeader("k".repeat(129)));
   });
@@ -68,13 +79,18 @@ describe("idempotencyKeyHeader", () => {
 
 describe("assertDigestibleIdempotencyKey", () => {
   it("refuses a key sent as its digest that holds a lone surrogate, which would share the digest of other keys", () => {
-    for (const key of [`\uD800${"k".repeat(128)}`, `${"k".repeat(200)}\uDC00`, "line\n\uD800"]) {
+    for (const key of [
+      `\uD800${"k".repeat(128)}`,
+      `${"k".repeat(200)}\uDC00`,
+      "line\n\uD800",
+      `\uD800${"\t".repeat(1_000_000)}a`,
+    ]) {
       expect(() => assertDigestibleIdempotencyKey(key), JSON.stringify(key)).toThrowError(/lone surrogate/);
     }
   });
 
   it("accepts a key sent as given, lone surrogates included, and a well-formed key sent as its digest", () => {
-    for (const key of ["order-\uD800", "\uDE00\uD83D", "order-42", "😀".repeat(129), "k".repeat(4000), ""]) {
+    for (const key of ["order-\uD800", "order-\uD800\n", "\uDE00\uD83D", "order-42", "😀".repeat(129), "k".repeat(4000), ""]) {
       expect(() => assertDigestibleIdempotencyKey(key), JSON.stringify(key)).not.toThrow();
     }
     expect(() => assertDigestibleIdempotencyKey(undefined as never)).not.toThrow();

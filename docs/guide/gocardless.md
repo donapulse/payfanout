@@ -144,11 +144,13 @@ every runtime: `fetch` trims whitespace from both ends of a header value, so `"o
 still goes out as `order-42`. A key GoCardless never took goes out as `payfanout-sha256-`
 followed by its SHA-256 digest instead of failing: one over GoCardless's 128 characters
 ("Keys must be no longer than 128 characters") once trimmed, counted in code points, and one
-holding a NUL, CR or LF, which no runtime sends. The same key always yields the same header,
-so a retry replays. Every other key goes out as given, as before. Cloudflare Workers sends a
-character above U+00FF as UTF-8, but Node's `fetch` refuses a key holding one, or a control
-character other than tab, before sending: on Node such a call fails with a retryable
-`psp_unavailable` that no retry fixes, so use ASCII keys there. A key holding a lone
+holding a NUL, CR or LF inside the trimmed value, which no runtime sends. The same key always
+yields the same header, so a retry replays. Every other key goes out as given, as before.
+Runtimes send non-ASCII keys differently: Cloudflare Workers sends every character as UTF-8,
+while Node's `fetch` sends U+0080 to U+00FF as one byte each (so a key of such characters
+counts as those bytes read as UTF-8) and refuses a key holding a character above U+00FF, or
+an ASCII control character other than tab, before sending. On Node such a call fails with a
+retryable `psp_unavailable` that no retry fixes, so use ASCII keys. A key holding a lone
 surrogate is refused with `invalid_request` when it would go out as its digest, and on
 refunds, whose stamp hashes every key (marked `outcomeUnknown`, as an earlier release may
 have refunded under it): UTF-8 encoding would give it the hash of other keys.

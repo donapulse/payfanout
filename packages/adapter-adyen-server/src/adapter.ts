@@ -26,6 +26,7 @@ import {
   type UnifiedPaymentStatus,
   type UnifiedWebhookEvent,
 } from "@payfanout/core";
+import { ADYEN_EXPONENT_DEVIATIONS } from "./exponents.js";
 import { deriveAdyenIdempotencyKey, derivePaymentIdempotencyKey, hexToBytes } from "./signing.js";
 import { decodeSessionContext, encodeSessionContext, type AdyenSessionContextV1 } from "./session-context.js";
 import {
@@ -167,22 +168,6 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [{ type: "card", flow: "embed
 
 /** Adyen's payment method type string for cards. */
 const CARD_PAYMENT_METHOD_TYPE = "scheme";
-
-/**
- * Currencies Adyen prices with a different number of fractional digits than
- * ISO 4217, which is core's minor-unit contract. Adyen documents its own table
- * as leading, so passing core minor units through would silently shift the
- * decimal point (100 ISK in core minor units is 1.00 ISK, but Adyen would read
- * 100 ISK). Rejected locally rather than mis-charged; the same shape as the
- * PayZen CNY/KHR exclusion. Declared as `unsupportedCurrencies`, so the router
- * skips Adyen for them.
- */
-const ADYEN_EXPONENT_DEVIATIONS = new Map<string, number>([
-  ["CLP", 2],
-  ["CVE", 0],
-  ["IDR", 0],
-  ["ISK", 2],
-]);
 
 /** Adyen's documented limits on the fields the adapter fills. */
 const REFERENCE_MAX_LENGTH = 80;

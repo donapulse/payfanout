@@ -8,11 +8,14 @@ import { PayFanoutError } from "./errors.js";
  */
 export type MinorUnitAmount = number;
 
-/** ISO 4217 currencies whose exponent is not the default 2. */
+/**
+ * ISO 4217 currencies whose exponent is not the default 2, as ISO 4217 list
+ * one gives their minor units.
+ */
 const CURRENCY_EXPONENT_OVERRIDES: Readonly<Record<string, number>> = {
   // 0-decimal
   BIF: 0, CLP: 0, DJF: 0, GNF: 0, ISK: 0, JPY: 0, KMF: 0, KRW: 0,
-  PYG: 0, RWF: 0, UGX: 0, VND: 0, VUV: 0, XAF: 0, XOF: 0, XPF: 0,
+  PYG: 0, RWF: 0, UGX: 0, UYI: 0, VND: 0, VUV: 0, XAF: 0, XOF: 0, XPF: 0,
   // 3-decimal
   BHD: 3, IQD: 3, JOD: 3, KWD: 3, LYD: 3, OMR: 3, TND: 3,
   // 4-decimal

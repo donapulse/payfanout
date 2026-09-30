@@ -5288,7 +5288,10 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `invalid_request`, which ends the cascade, and hosts route them elsewhere with a currency rule
   placed before any rule that can send them to Paysafe, since the router takes the first rule
   that matches (setup guide). A core capability listing the currencies an adapter refuses would
-  let the router skip it; that is a contract change, and a follow-up of its own.
+  let the router skip it; that is a contract change, and a follow-up of its own. (Superseded
+  2026-09-30 for the router by "Currency denylist capability (2026-09-30)": the adapter declares
+  these currencies in `unsupportedCurrencies`, and the router skips Paysafe for them;
+  `supportedCurrencies` stays undeclared.)
 - **Tests.** Paysafe's table and SIX's list one ship as test fixtures. The table is compared row
   for row with the constant in `src`; with list one it drives the expected refusals, and every
   code of either goes through `createPaymentSession`, the refused set computed from the rule and
@@ -5766,6 +5769,17 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   alone now fails registration, as a rail that can never be routed. `@payfanout/adapter-stripe-server`
   takes a patch; the router skips Stripe for UGX from the `@payfanout/server` release that reads
   the field.
+- **Paysafe declares the currencies its rule refuses**, today BIF, BYR, CLF, CLP, DJF, GNF,
+  IQD, ISK, KMF, UGX, UYI, UYW, VUV, XAF, XOF and XPF. `refusedCurrencies()` in
+  `src/currency-exponents.ts` puts `currencyRefusal` itself to every code of Paysafe's table
+  and of `listNonDefaultCurrencyExponents()`, the only codes the rule can refuse, so the
+  declaration follows the table and core's exponents as the refusal does, and no list is kept
+  by hand. `createPaymentSession` refuses these currencies on every session, zero-amount ones
+  included, so screening refuses nothing the adapter would take. Tests compare the declaration
+  with the sessions the adapter refuses over the table and ISO 4217 list one, and with the rule
+  over every three-letter code. A host `paymentMethods` override with a rail whose `currencies`
+  are all declared unsupported now fails registration. `@payfanout/adapter-paysafe-server`
+  takes a patch.
 - **Release.** `@payfanout/core` takes a minor: an optional field, a screen and validation
   rules that only read it, and `listNonDefaultCurrencyExponents()`. `@payfanout/server` takes a
   minor (changed in review, 2026-09-30; the first version shipped it as a dependency patch):

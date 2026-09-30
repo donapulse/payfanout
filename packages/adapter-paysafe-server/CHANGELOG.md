@@ -1,5 +1,18 @@
 # @payfanout/adapter-paysafe-server
 
+## 3.0.0
+
+### Major Changes
+
+- 292200d: Refuse the currencies Paysafe may price with another exponent than PayFanout instead of sending their amounts unchanged: CLP and BYR, which Paysafe's currency table prices differently (per that table, CLP 10,000 would be charged as CLP 100.00), and, as a precaution, BIF, CLF, DJF, GNF, IQD, ISK, KMF, UGX, UYI, UYW, VUV, XAF, XOF and XPF, which the table does not list and which are not priced in hundredths. Calls that would send an amount you pass in them reject with a non-retryable `invalid_request`, marked `outcomeUnknown` when a retried charge, subscription create or completion finds that Paysafe already holds something under its key, or when that lookup fails; calls that would report an amount in them, voids and captures or refunds of no amount included, reject with `unsupported_operation`, a subscription list page holding one fails whole, and webhook events in them carry no `amount` (see the setup guide for each case).
+  
+  Breaking: payments in these currencies that went through before, possibly at the wrong price, are now refused, with no option to allow them. Before upgrading, route these currencies to another provider and move `SubscriptionManager` subscriptions that renew on Paysafe in them, as their renewals would fail with `invalid_request` into dunning. Native Paysafe subscriptions created in them keep billing at Paysafe's exponent and can no longer be read, listed or cancelled through the adapter: cancel them in the Paysafe portal. `cancelNativeSubscription` now reads the subscription before cancelling it, one more request on every cancel.
+
+### Patch Changes
+
+- Updated dependencies [7c1fed9]
+  - @payfanout/core@4.4.1
+
 ## 2.1.0
 
 ### Minor Changes

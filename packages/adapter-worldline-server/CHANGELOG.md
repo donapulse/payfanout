@@ -1,5 +1,12 @@
 # @payfanout/adapter-worldline-server
 
+## 3.0.2
+
+### Patch Changes
+
+- Updated dependencies [7c1fed9]
+  - @payfanout/core@4.4.1
+
 ## 3.0.1
 
 ### Patch Changes

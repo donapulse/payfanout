@@ -1551,9 +1551,10 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   (payments/payment-methods/bacs-debit, "customers who hold a British bank account"),
   GoCardless Bacs → GB (support.gocardless.com Schemes-and-Requirements, "GBP from UK
   bank accounts"; superseded 2026-09-30: GoCardless sessions no longer declare Bacs, see
-  "GoCardless sessions declare Pay by Bank only"), Paysafe Interac → CA (interac-e-transfer page, "Supported region:
-  Canada"). SEPA stays undeclared on both Stripe and GoCardless: the providers state a
-  zone, not a country (Stripe "Europe", GoCardless "the Eurozone" on the support page,
+  "GoCardless sessions declare Pay by Bank only"), Paysafe Interac → CA
+  (interac-e-transfer page, "Supported region: Canada"). SEPA stays undeclared on both
+  Stripe and GoCardless: the providers state a zone, not a country (Stripe "Europe",
+  GoCardless "the Eurozone" on the support page,
   while collecting from non-Eurozone SEPA countries per the API docs — the two GoCardless
   statements do not even agree on the zone's edge), and a hardcoded membership list would
   screen out valid payments the day it drifts. No PSP-wide `supportedCountries` exists,
@@ -5358,7 +5359,8 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   been refused by GoCardless with a non-retryable `invalid_request`, ending the cascade before
   a PSP that serves SEPA was tried, where it used to create a Pay by Bank session. The
   adapter now refuses only a list naming no type it takes (`["sepa_debit"]`, or
-  `["card"]`), as the Stripe decision above reasons for mixed lists; a list that also names
+  `["card"]`), as "Stripe: explicit payment_method_types vs intent currency (2026-07-15)"
+  reasons for mixed lists; a list that also names
   `bank_redirect_generic` is served, as every session is Pay by Bank. A list such as
   `["card", "bank_redirect_generic"]`, refused before, is served too.
 - **The fallback does not change it** (corrected in review, 2026-09-30). The Fallbacks guide

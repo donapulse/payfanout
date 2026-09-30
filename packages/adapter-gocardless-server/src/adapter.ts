@@ -85,7 +85,8 @@ export interface GoCardlessServerAdapterConfig {
   goCardlessVersion?: string;
   /**
    * Lets a billing request fall back from instant bank payment to collecting
-   * a Direct Debit mandate when the instant rails are unavailable. Off by
+   * a Direct Debit mandate: GoCardless offers the payer that option when they
+   * cannot find their bank or their bank authorisation fails. Off by
    * default: fallback payments confirm on debit timing (days), not seconds.
    * Only `true` is sent; `false` leaves `fallback_enabled` unset, as GoCardless
    * asks when its payment intelligence feature is used ("Should not be set

@@ -190,15 +190,14 @@ describe("GoCardlessClientAdapter", () => {
     expect(() => adapter.unmount({} as never)).toThrowError(/not produced by GoCardlessClientAdapter/);
   });
 
-  it("honors a per-account capability override", () => {
+  it("honors a per-account capability override that narrows the list", () => {
+    // An account taking EUR alone narrows Pay by Bank to that currency.
     const adapter = new GoCardlessClientAdapter({
       environment: "sandbox",
-      paymentMethods: [
-        { type: "bank_redirect_generic", flow: "redirect", supported: true },
-        { type: "ach", flow: "redirect", supported: true },
-      ],
+      paymentMethods: [{ type: "bank_redirect_generic", flow: "redirect", supported: true, currencies: ["EUR"] }],
     });
-    expect(adapter.listPaymentMethodCapabilities()).toHaveLength(2);
-    expect(adapter.listPaymentMethodCapabilities()[1]).toMatchObject({ type: "ach", supported: true });
+    expect(adapter.listPaymentMethodCapabilities()).toEqual([
+      { type: "bank_redirect_generic", flow: "redirect", supported: true, currencies: ["EUR"] },
+    ]);
   });
 });

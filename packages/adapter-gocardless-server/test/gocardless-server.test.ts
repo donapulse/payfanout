@@ -536,6 +536,7 @@ describe("GoCardlessServerAdapter specifics", () => {
   it("serves a list naming bank_redirect_generic beside types it does not take, as the router's screen does", async () => {
     const { adapter } = makePair();
     for (const [types, currency, key] of [
+      [[], "GBP", "m0"],
       [["sepa_debit", "bank_redirect_generic"], "EUR", "m1"],
       [["bacs_debit", "bank_redirect_generic"], "GBP", "m2"],
       [["card", "bank_redirect_generic"], "GBP", "m3"],
@@ -546,6 +547,21 @@ describe("GoCardlessServerAdapter specifics", () => {
         status: "requires_action",
       });
     }
+  });
+
+  it("honors a paymentMethods override that narrows the list, in the screen and the adapter alike", async () => {
+    const { adapter } = makePair({
+      paymentMethods: [{ type: "bank_redirect_generic", flow: "redirect", supported: false }],
+    });
+    const input = {
+      amount: 100,
+      currency: "GBP",
+      returnUrl: RETURN_URL,
+      paymentMethodTypes: ["bank_redirect_generic" as const],
+      idempotencyKey: "n1",
+    };
+    expect(screenSessionInput(adapter.getCapabilities(), input)).toMatch(/supports none of the requested payment method types: /);
+    await expect(adapter.createPaymentSession(input)).rejects.toMatchObject({ code: "invalid_request" });
   });
 
   it("declares bank_redirect_generic the one method a session takes, so the router skips a Direct Debit session", () => {

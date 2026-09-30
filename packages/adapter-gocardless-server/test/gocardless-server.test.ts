@@ -515,18 +515,37 @@ describe("GoCardlessServerAdapter specifics", () => {
       adapter.createPaymentSession({ ...base, paymentMethodTypes: ["ach"], idempotencyKey: "k2" }),
     ).rejects.toMatchObject({ code: "invalid_request" });
     // A session is a one-off Open Banking payment: it never collects by Direct Debit.
-    for (const [type, key] of [
-      ["bacs_debit", "k3"],
-      ["sepa_debit", "k4"],
+    for (const [types, currency, key] of [
+      [["bacs_debit"], "GBP", "k3"],
+      [["sepa_debit"], "EUR", "k4"],
+      [["sepa_debit", "bacs_debit"], "EUR", "k5"],
     ] as const) {
       await expect(
-        adapter.createPaymentSession({ ...base, paymentMethodTypes: [type], idempotencyKey: key }),
-        type,
-      ).rejects.toMatchObject({ code: "invalid_request" });
+        adapter.createPaymentSession({ ...base, currency, paymentMethodTypes: [...types], idempotencyKey: key }),
+        types.join(","),
+      ).rejects.toMatchObject({
+        code: "invalid_request",
+        message: expect.stringMatching(/supports none of the requested payment method types: /),
+      });
     }
     await expect(
-      adapter.createPaymentSession({ ...base, paymentMethodTypes: ["bank_redirect_generic"], idempotencyKey: "k5" }),
+      adapter.createPaymentSession({ ...base, paymentMethodTypes: ["bank_redirect_generic"], idempotencyKey: "k6" }),
     ).resolves.toMatchObject({ status: "requires_action" });
+  });
+
+  it("serves a list naming bank_redirect_generic beside types it does not take, as the router's screen does", async () => {
+    const { adapter } = makePair();
+    for (const [types, currency, key] of [
+      [["sepa_debit", "bank_redirect_generic"], "EUR", "m1"],
+      [["bacs_debit", "bank_redirect_generic"], "GBP", "m2"],
+      [["card", "bank_redirect_generic"], "GBP", "m3"],
+    ] as const) {
+      const input = { amount: 100, currency, returnUrl: RETURN_URL, paymentMethodTypes: [...types], idempotencyKey: key };
+      expect(screenSessionInput(adapter.getCapabilities(), input), types.join(",")).toBeUndefined();
+      await expect(adapter.createPaymentSession(input), types.join(",")).resolves.toMatchObject({
+        status: "requires_action",
+      });
+    }
   });
 
   it("declares bank_redirect_generic the one method a session takes, so the router skips a Direct Debit session", () => {
@@ -538,7 +557,7 @@ describe("GoCardlessServerAdapter specifics", () => {
       const session = { amount: 1000, currency: "EUR", idempotencyKey: "k", returnUrl: RETURN_URL } as const;
       for (const type of ["sepa_debit", "bacs_debit"] as const) {
         expect(screenSessionInput(caps, { ...session, paymentMethodTypes: [type] }), type).toMatch(
-          /supports none of the requested payment method types/,
+          /supports none of the requested payment method types: /,
         );
       }
       expect(screenSessionInput(caps, { ...session, paymentMethodTypes: ["bank_redirect_generic"] })).toBeUndefined();

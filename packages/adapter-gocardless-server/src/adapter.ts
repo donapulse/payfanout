@@ -96,7 +96,12 @@ export interface GoCardlessServerAdapterConfig {
   fallbackEnabled?: boolean;
   /** Where the hosted flow sends payers who cannot proceed (e.g. unsupported bank). */
   exitUri?: string;
-  /** Scheme enablement varies per account — override the conservative defaults. */
+  /**
+   * The methods a session declares. Override only to narrow the defaults (to
+   * what your account enables): every session is a one-off Pay by Bank
+   * payment, so declaring `sepa_debit` or `bacs_debit` supported would not
+   * make one collect by Direct Debit.
+   */
   paymentMethods?: PaymentMethodCapability[];
   baseUrl?: string;
   /** Injected for tests. */
@@ -250,12 +255,12 @@ interface RefundOutcome {
  * "Pay by Bank"): `faster_payments` in GBP, SEPA credit transfers in EUR. So
  * bank_redirect_generic is the one method it takes. SEPA Direct Debit and Bacs
  * collect against a mandate, which no session can be asked for, so they are
- * declared unsupported here, even with fallbackEnabled: GoCardless falls back
- * to a mandate only when the payer's bank cannot pay instantly. Such a
- * payment still reports its scheme (see mapSchemeToMethodType). Everything is
- * flow "redirect": bank
- * authorisation is only permitted from GoCardless-hosted UIs, so an embedded
- * flow cannot honestly be claimed.
+ * declared unsupported here, even with fallbackEnabled: with it, a payer who
+ * cannot find their bank, or whose bank authorisation fails, may choose to
+ * continue by Direct Debit, and such a payment still reports its scheme (see
+ * mapSchemeToMethodType). Everything is flow "redirect": bank authorisation is
+ * only permitted from GoCardless-hosted UIs, so an embedded flow cannot
+ * honestly be claimed.
  */
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "bank_redirect_generic", flow: "redirect", supported: true },
@@ -472,10 +477,13 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
         { missing: "returnUrl" },
       );
     }
-    if (input.paymentMethodTypes?.some((type) => !this.isSupportedMethodType(type))) {
+    // Every session is Pay by Bank, so a list naming any supported type is
+    // served, as core's screening reads a list; one naming none rejects.
+    const requested = input.paymentMethodTypes;
+    if (requested && requested.length > 0 && !requested.some((type) => this.isSupportedMethodType(type))) {
       throw PayFanoutError.invalidRequest(
-        `GoCardless adapter does not support one of the requested payment method types: ${input.paymentMethodTypes.join(", ")}`,
-        { paymentMethodTypes: input.paymentMethodTypes },
+        `GoCardless adapter supports none of the requested payment method types: ${requested.join(", ")}`,
+        { paymentMethodTypes: requested },
       );
     }
 

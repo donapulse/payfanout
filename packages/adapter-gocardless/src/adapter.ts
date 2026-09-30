@@ -13,7 +13,11 @@ import {
 export interface GoCardlessClientAdapterConfig {
   /** Explicit, mirrors the server adapter — never inferred. */
   environment: "sandbox" | "live";
-  /** Scheme enablement varies per account — override the conservative defaults. */
+  /**
+   * The methods a session declares, mirroring the server adapter. Override
+   * only to narrow the defaults: a session is a one-off Pay by Bank payment,
+   * whatever this list says.
+   */
   paymentMethods?: PaymentMethodCapability[];
 }
 

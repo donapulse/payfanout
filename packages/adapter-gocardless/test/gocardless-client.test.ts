@@ -54,6 +54,16 @@ runClientAdapterConformanceTests("gocardless", makeAdapter, {
 });
 
 describe("GoCardlessClientAdapter", () => {
+  it("declares bank_redirect_generic the one method a session takes, as the server adapter does", () => {
+    const methods = makeAdapter().listPaymentMethodCapabilities();
+    expect(methods.filter((method) => method.supported).map((method) => method.type)).toEqual(["bank_redirect_generic"]);
+    expect(methods.filter((method) => !method.supported).map((method) => method.type)).toEqual([
+      "sepa_debit",
+      "bacs_debit",
+      "ach",
+    ]);
+  });
+
   it("validates its config eagerly", () => {
     expect(() => new GoCardlessClientAdapter({ environment: "prod" as never })).toThrowError(
       /sandbox.*live/,

@@ -130,9 +130,12 @@ the expected seam).
   on debit timing (days), so the session must be `requiresServerCompletion` (or the host must
   accept a payment created after the redirect), the mandate becomes a reusable handle the
   vault contract would have to expose honestly, and the payment's charge date and late
-  failures need their own event mapping. Unblock: demand for Direct Debit one-offs through
-  GoCardless, a decision on how completion and the mandate surface in the contract, and a
-  sandbox run of the mandate-then-payment sequence.
+  failures need their own event mapping. Another route, for Pro and Enterprise accounts
+  with custom payment pages, is the restricted
+  `POST /billing_requests/{id}/actions/fallback`, which moves a billing request with
+  `fallback_enabled` from Open Banking to Direct Debit. Unblock: demand for Direct Debit
+  one-offs through GoCardless, a decision on how completion and the mandate surface in the
+  contract, and a sandbox run of the mandate-then-payment sequence.
 - **Dispute/chargeback management:** today the library surfaces `payment.chargeback` webhooks;
   evidence submission stays in PSP dashboards. Unblock: real merchant demand.
 - **Niche until demanded** (unchanged): Level 2/3 card data, DCC, surcharging,

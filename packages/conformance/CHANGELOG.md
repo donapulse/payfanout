@@ -1,5 +1,12 @@
 # @payfanout/conformance
 
+## 3.0.5
+
+### Patch Changes
+
+- Updated dependencies [7c1fed9]
+  - @payfanout/core@4.4.1
+
 ## 3.0.4
 
 ### Patch Changes

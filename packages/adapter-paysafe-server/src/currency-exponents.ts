@@ -28,16 +28,11 @@ export const PAYSAFE_CURRENCY_EXPONENTS: ReadonlyMap<string, number> = new Map(
 );
 
 /**
- * ISO 4217 on codes the rule meets that core's getCurrencyExponent does not
- * list, and so reads with its default 2 (SIX, list one of 2026-09-17, list
- * three of 2026-01-01). List one gives UYI the exponent 0: the rule takes it
- * from here until core does. BYR was withdrawn in 2017-01, and list three
- * gives no minor unit; the entry only words its refusal.
+ * BYR, withdrawn from ISO 4217 in 2017-01 (list three of 2026-01-01), which
+ * core does not list and so reads with its default 2. Only its refusal's
+ * wording uses this.
  */
-const ISO_4217_ON_CORE_DEFAULTS: ReadonlyMap<string, number | "withdrawn"> = new Map<string, number | "withdrawn">([
-  ["BYR", "withdrawn"],
-  ["UYI", 0],
-]);
+const WITHDRAWN_FROM_ISO_4217: ReadonlySet<string> = new Set(["BYR"]);
 
 /** Why the adapter refuses a currency; every refusal's `raw` carries it. */
 export interface CurrencyRefusal {
@@ -46,17 +41,15 @@ export interface CurrencyRefusal {
   paysafeExponent?: number;
   /** Core's getCurrencyExponent: the minor units PayFanout amounts are in. */
   payfanoutExponent: number;
-  /** ISO 4217's exponent, present only where it is not PayFanout's. */
-  isoExponent?: number;
 }
 
 /**
  * The refusal for `currency`, or undefined when the adapter sends and reports
  * its amounts unchanged. A currency is refused when Paysafe's table gives it
- * another exponent than PayFanout, or when the table has no row for it and it
- * is not priced in hundredths, by PayFanout or by ISO 4217. A currency the
- * table lacks that is priced in hundredths is sent unchanged, since the table
- * is not exhaustive: the one residual risk, left to the go-live checklist.
+ * another exponent than PayFanout, or when the table has no row for it and
+ * PayFanout does not price it in hundredths. A currency the table lacks that
+ * is priced in hundredths is sent unchanged, since the table is not
+ * exhaustive: the one residual risk, left to the go-live checklist.
  */
 export function currencyRefusal(currency: unknown): CurrencyRefusal | undefined {
   const code = typeof currency === "string" ? currency.trim().toUpperCase() : "";
@@ -66,21 +59,36 @@ export function currencyRefusal(currency: unknown): CurrencyRefusal | undefined 
   if (paysafeExponent !== undefined) {
     return paysafeExponent === payfanoutExponent ? undefined : { currency: code, paysafeExponent, payfanoutExponent };
   }
-  const iso = ISO_4217_ON_CORE_DEFAULTS.get(code);
-  const isoExponent = typeof iso === "number" && iso !== payfanoutExponent ? iso : undefined;
-  if (payfanoutExponent === 2 && isoExponent === undefined) return undefined;
-  return { currency: code, payfanoutExponent, ...(isoExponent !== undefined ? { isoExponent } : {}) };
+  return payfanoutExponent === 2 ? undefined : { currency: code, payfanoutExponent };
 }
 
 /** Refuses a call that would send, or sign for sending, an amount in a refused currency. */
 export function assertSendableCurrency(currency: string): void {
   const refusal = currencyRefusal(currency);
   if (refusal === undefined) return;
-  const code = refusal.currency;
   throw refusalError(
     "invalid_request",
-    `The Paysafe adapter refuses ${code}: ${reason(refusal)}. Take ${code} payments with another provider`,
+    `${refuses(refusal)}. Take ${refusal.currency} payments with another provider`,
     { ...refusal },
+  );
+}
+
+/**
+ * Refuses to complete a session signed in a refused currency. Only a context
+ * an earlier release signed, or one made with encodeSessionContext, carries
+ * one, and that release may already have completed the session: the refusal
+ * leaves the outcome open, so no host charges the customer twice.
+ */
+export function assertCompletableCurrency(currency: string): void {
+  const refusal = currencyRefusal(currency);
+  if (refusal === undefined) return;
+  throw refusalError(
+    "invalid_request",
+    `${refuses(refusal)}. This session was signed in ${refusal.currency} before the adapter refused it, and an ` +
+      "earlier release may already have completed it: look for its payment in the Paysafe portal before charging " +
+      "the customer elsewhere",
+    { ...refusal },
+    true,
   );
 }
 
@@ -166,12 +174,14 @@ export function assertReportablePage(
   );
 }
 
+function refuses(refusal: CurrencyRefusal): string {
+  return `The Paysafe adapter refuses ${refusal.currency}: ${reason(refusal)}`;
+}
+
 function reason(refusal: CurrencyRefusal): string {
-  const { currency: code, paysafeExponent, payfanoutExponent, isoExponent } = refusal;
-  const withdrawn = ISO_4217_ON_CORE_DEFAULTS.get(code) === "withdrawn" ? ", a code ISO 4217 withdrew," : "";
-  const payfanout =
-    `PayFanout reads ${code}${withdrawn} with the exponent ${payfanoutExponent}` +
-    (isoExponent !== undefined ? `, although ISO 4217 gives it ${isoExponent}` : "");
+  const { currency: code, paysafeExponent, payfanoutExponent } = refusal;
+  const withdrawn = WITHDRAWN_FROM_ISO_4217.has(code) ? ", a code ISO 4217 withdrew," : "";
+  const payfanout = `PayFanout reads ${code}${withdrawn} with the exponent ${payfanoutExponent}`;
   return paysafeExponent !== undefined
     ? `Paysafe's currency table gives ${code} the exponent ${paysafeExponent}, while ${payfanout}, and the ` +
         "adapter does not convert between them"
@@ -183,6 +193,11 @@ function capitalized(word: string): string {
   return `${word.charAt(0).toUpperCase()}${word.slice(1)}`;
 }
 
-function refusalError(code: UnifiedErrorCode, message: string, raw: Record<string, unknown>): PayFanoutError {
-  return new PayFanoutError({ code, message, retryable: false, raw, pspName: "paysafe" });
+function refusalError(
+  code: UnifiedErrorCode,
+  message: string,
+  raw: Record<string, unknown>,
+  outcomeUnknown = false,
+): PayFanoutError {
+  return new PayFanoutError({ code, message, retryable: false, raw, pspName: "paysafe", outcomeUnknown });
 }

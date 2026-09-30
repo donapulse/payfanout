@@ -46,7 +46,12 @@ import {
   type VerifyCredentialsResult,
   type VerifyPaymentMethodInput,
 } from "@payfanout/core";
-import { assertReportablePage, assertSendableCurrency, assertUsableRecord } from "./currency-exponents.js";
+import {
+  assertCompletableCurrency,
+  assertReportablePage,
+  assertSendableCurrency,
+  assertUsableRecord,
+} from "./currency-exponents.js";
 import {
   decodeSessionContext,
   encodeSessionContext,
@@ -1192,9 +1197,11 @@ function defaultSleep(ms: number): Promise<void> {
  * see "Currencies the adapter refuses" in the setup guide).
  * createPaymentSession, updatePaymentSession, completePayment,
  * chargeSavedPaymentMethod and createNativeSubscription refuse one with
- * `invalid_request` before any request. capturePayment and refundPayment
- * read the payment first and refuse with `invalid_request` when they carry
- * an amount, which is in PayFanout's minor units, and with
+ * `invalid_request` before any request; completePayment's refusal, which
+ * only a session signed before the upgrade meets, is outcomeUnknown, as an
+ * earlier release may already have completed it. capturePayment and
+ * refundPayment read the payment first and refuse with `invalid_request`
+ * when they carry an amount, which is in PayFanout's minor units, and with
  * `unsupported_operation` when they carry none, as cancelPayment does: those
  * send Paysafe's own amounts, or none, but answer with amounts that cannot be
  * reported in PayFanout's minor units. cancelNativeSubscription reads the
@@ -1504,9 +1511,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    */
   async completePayment(input: CompletePaymentInput): Promise<PaymentInfo> {
     const context = await this.decodeContext(input.pspSessionId);
-    // A context signed by an earlier release, or with encodeSessionContext,
-    // can still carry a currency the adapter refuses.
-    assertSendableCurrency(context.currency);
+    assertCompletableCurrency(context.currency);
     // Bank-debit sessions have no handle yet at all: it is minted here, from
     // the bank details the client's envelope carries.
     const bankPaymentType = context.paymentType;

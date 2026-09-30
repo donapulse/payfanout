@@ -68,9 +68,10 @@ const ISO_ROWS = new Map(ISO_LIST_ONE);
 
 /**
  * The rule, from the two tables: a row must agree with PayFanout's exponent,
- * and a currency without one must be priced in hundredths by PayFanout and by
- * ISO 4217. A code ISO 4217 gives no minor unit (metals, SDR, test codes) is
- * taken at PayFanout's exponent.
+ * and a currency without one must be priced in hundredths. The adapter reads
+ * PayFanout's exponent alone; this also asks ISO 4217's, so a code core read
+ * against the list would fail here. A code ISO 4217 gives no minor unit
+ * (metals, SDR, test codes) is taken at PayFanout's exponent.
  */
 function refusedByRule(code: string): boolean {
   const payfanout = getCurrencyExponent(code);
@@ -265,6 +266,8 @@ describe("currencies whose Paysafe exponent may not be PayFanout's", () => {
     expect(clp.message).toContain("PayFanout reads CLP with the exponent 0");
     expect(clp.message).toMatch(/does not convert/);
     expect(clp.raw).toEqual({ currency: "CLP", paysafeExponent: 2, payfanoutExponent: 0 });
+    // Nothing was ever sent for a new session, so the refusal is definitive.
+    expect(clp.outcomeUnknown).toBeUndefined();
 
     const isk = await rejection(adapter.createPaymentSession({ amount: 10_000, currency: "ISK", idempotencyKey: "k" }));
     expect(isk.message).toContain("Paysafe's currency table has no row for ISK");
@@ -282,13 +285,13 @@ describe("currencies whose Paysafe exponent may not be PayFanout's", () => {
     expect(iqd.raw).toEqual({ currency: "IQD", payfanoutExponent: 3 });
   });
 
-  it("refuses UYI, which PayFanout reads with 2 although ISO 4217 gives it 0", async () => {
+  it("refuses UYI, which PayFanout reads with ISO 4217's 0 and the table lacks", async () => {
     const { adapter } = makePair();
-    expect(getCurrencyExponent("UYI")).toBe(2);
+    expect(getCurrencyExponent("UYI")).toBe(0);
     const uyi = await rejection(adapter.createPaymentSession({ amount: 10_000, currency: "UYI", idempotencyKey: "k" }));
     expect(uyi).toMatchObject({ code: "invalid_request", retryable: false });
-    expect(uyi.message).toContain("PayFanout reads UYI with the exponent 2, although ISO 4217 gives it 0");
-    expect(uyi.raw).toEqual({ currency: "UYI", payfanoutExponent: 2, isoExponent: 0 });
+    expect(uyi.message).toContain("PayFanout reads UYI with the exponent 0");
+    expect(uyi.raw).toEqual({ currency: "UYI", payfanoutExponent: 0 });
   });
 
   it("refuses them on a bank-debit session too, which carries no currency gate of its own", async () => {
@@ -311,9 +314,18 @@ describe("currencies whose Paysafe exponent may not be PayFanout's", () => {
 
   it("refuses to complete a session signed in one before any request, on the card and bank-debit paths", async () => {
     const { adapter, fake } = makePair();
+    // Only a session signed before the upgrade gets here, and the release that
+    // signed it may already have completed it: a host must not charge again.
+    const signedEarlier = {
+      code: "invalid_request",
+      retryable: false,
+      outcomeUnknown: true,
+      message: expect.stringMatching(/does not convert.*look for its payment in the Paysafe portal/),
+      raw: { currency: "CLP", paysafeExponent: 2, payfanoutExponent: 0 },
+    };
     await expect(
       adapter.completePayment({ pspSessionId: await context("CLP"), clientToken: "tok_clp", idempotencyKey: "c1" }),
-    ).rejects.toMatchObject({ code: "invalid_request", message: expect.stringMatching(/does not convert/) });
+    ).rejects.toMatchObject(signedEarlier);
     const achEnvelope = `paysafe-bank.${utf8ToBase64Url(
       JSON.stringify({
         v: 1,
@@ -329,7 +341,7 @@ describe("currencies whose Paysafe exponent may not be PayFanout's", () => {
         clientToken: achEnvelope,
         idempotencyKey: "c2",
       }),
-    ).rejects.toMatchObject({ code: "invalid_request" });
+    ).rejects.toMatchObject(signedEarlier);
     expect(fake.requests).toEqual([]);
   });
 

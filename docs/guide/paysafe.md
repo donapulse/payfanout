@@ -123,18 +123,17 @@ unchanged. Paysafe reads `amount` in the minor units of its own
 [currency table](https://developer.paysafe.com/en/support/reference-information/codes/#currency-codes),
 which lists "the currencies ... in which transaction requests are processed". The adapter
 refuses a currency when that table gives it another exponent than PayFanout, or when the
-table has no row for it and it is not priced in hundredths, by PayFanout or by ISO 4217, since
-Paysafe's exponent for it is then unknown:
+table has no row for it and PayFanout does not price it in hundredths, since Paysafe's
+exponent for it is then unknown:
 
 | Currency | Paysafe's exponent | PayFanout's exponent |
 | --- | --- | --- |
 | CLP | 2 | 0 |
 | BYR | 0 | 2: ISO 4217 withdrew BYR in 2017, and PayFanout reads a code it does not list with 2 |
 | ISK | none: the table has no row for ISK, which the card payments page lists as a processing currency | 0 |
-| BIF, DJF, GNF, KMF, UGX, VUV, XAF, XOF, XPF | none: the table has no row | 0 |
+| BIF, DJF, GNF, KMF, UGX, UYI, VUV, XAF, XOF, XPF | none: the table has no row | 0 |
 | IQD | none: the table has no row | 3 |
 | CLF, UYW | none: the table has no row | 4 |
-| UYI | none: the table has no row | 2, although ISO 4217 gives UYI 0 |
 
 Sent unchanged, CLP 10,000 (`amount: 10000`) would be charged as CLP 100.00. Nor does the
 adapter convert: no sandbox run has confirmed Paysafe's table, and a conversion built on a
@@ -151,7 +150,9 @@ In the refused currencies:
 
 - `createPaymentSession`, `updatePaymentSession`, `chargeSavedPaymentMethod` and
   `createNativeSubscription` reject with a non-retryable `invalid_request` before calling
-  Paysafe, and so does `completePayment` for a session an earlier release signed in one.
+  Paysafe, and so does `completePayment` for a session an earlier release signed in one,
+  marked `outcomeUnknown`: that release may already have completed the session, so look
+  for its payment in the Paysafe portal before charging the customer elsewhere.
 - `capturePayment`, `cancelPayment` and `refundPayment` on a payment Paysafe holds in one (made
   by an earlier release, or by another integration on the account) read the payment, then
   reject before any settlement, void or refund request. A capture or refund that states an

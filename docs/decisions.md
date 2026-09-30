@@ -5051,15 +5051,15 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   others were recorded here, which they were not. The table's introduction makes each of them
   as unknown as ISK: it lists the currencies "in which transaction requests are processed" and
   asks merchants to "verify the right exponent is applied". A currency is now refused when its
-  row gives another exponent than core's `getCurrencyExponent`, or when it has no row and is not
-  priced in hundredths, by core or by ISO 4217 list one. Against list one of 2026-09-17
-  (compared 2026-09-30), the currencies without a row that are not priced in hundredths are ISK,
-  BIF, DJF, GNF, KMF, UGX, VUV, XAF, XOF and XPF (0), IQD (3), CLF and UYW (4), and UYI (0).
-  Core reads UYI, which it does not list, with its default 2: of list one's numeric minor units,
-  it is the one core misreads. The adapter takes list one's 0 for UYI from a one-entry map in
-  `src/currency-exponents.ts`, whose comment says why, until core follows list one, a core fix
-  of its own; UYI is therefore refused. The refused set is BIF, BYR, CLF, CLP, DJF, GNF, IQD,
-  ISK, KMF, UGX, UYI, UYW, VUV, XAF, XOF and XPF. The rule reads core at call time, so it follows
+  row gives another exponent than core's `getCurrencyExponent`, or when it has no row and core
+  does not price it in hundredths. Against list one of 2026-09-17 (compared 2026-09-30), the
+  currencies without a row that are not priced in hundredths are ISK, BIF, DJF, GNF, KMF, UGX,
+  UYI, VUV, XAF, XOF and XPF (0), IQD (3), and CLF and UYW (4). Core read UYI, which it did not
+  list, with its default 2, the one code of list one whose numeric minor units it misread; the
+  first review round took list one's 0 for UYI from a one-entry map in the adapter, and once
+  core followed list one (see "Core currency exponents checked against ISO 4217" below) the map
+  went, and the rule asks core alone. The refused set is BIF, BYR, CLF, CLP, DJF, GNF, IQD, ISK,
+  KMF, UGX, UYI, UYW, VUV, XAF, XOF and XPF. The rule reads core at call time, so it follows
   core's exponents if they change, and the only list kept by hand is Paysafe's table, one
   constant in `src/currency-exponents.ts` cited to the Codes page, which replaces the
   three-entry exclusion map.
@@ -5087,9 +5087,8 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   request, sending the host to the Paysafe portal; a capture of the authorized amount states an
   amount too. `verifyPaymentMethod` sends no amount and reports 0, so it is left alone. The
   messages name Paysafe's exponent and PayFanout's, and `raw` carries `currency`,
-  `paysafeExponent` when the table has a row, `payfanoutExponent`, and `isoExponent` only where
-  ISO 4217 gives another exponent than PayFanout (UYI). They no longer credit core's default to
-  ISO 4217 (changed in review, 2026-09-30): BYR's reads "PayFanout reads BYR, a code ISO 4217
+  `paysafeExponent` when the table has a row, and `payfanoutExponent`. They no longer credit
+  core's default to ISO 4217 (changed in review, 2026-09-30): BYR's reads "PayFanout reads BYR, a code ISO 4217
   withdrew, with the exponent 2", and the `raw` field `isoExponent`, which carried core's value,
   became `payfanoutExponent`.
 - **Voids, and captures and refunds with no amount, refuse with `unsupported_operation`**
@@ -5143,7 +5142,16 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   move those subscriptions first. A browser session signed in one before the upgrade still
   passes its amount to Paysafe.js `tokenize` (the client adapter's `confirm`), so a 3-D Secure
   screen could show CLP 100.00 until the session TTL ends; `completePayment` refuses the
-  session, no money moves, and the client adapter is not changed.
+  session, and the client adapter is not changed. That refusal is `invalid_request` marked
+  `outcomeUnknown` (changed in review, 2026-09-30): only a session signed before the upgrade
+  reaches it, and the release that signed it may already have completed it, for instance a
+  completion whose answer was lost and that is retried after the upgrade. A plain
+  `invalid_request` reads as definitive and would let a host charge the customer through
+  another provider; the message sends the host to the Paysafe portal first. The other
+  refusals stay definitive: a saved-method charge or native subscription retried across the
+  upgrade may have gone through too, but nothing in those calls tells a retry from a first
+  attempt, and marking every such refusal would report first attempts, the common case, as
+  possibly charged.
 - **`supportedCurrencies` stays undeclared**, as for Adyen: the capability is an allowlist, and
   the table does not list every currency Paysafe processes ("and many more", and the Account
   Manager line), so a declared list would refuse currencies Paysafe takes. The router therefore
@@ -5158,9 +5166,10 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   asserted as the set above. JPY, KWD and USD round-trip unchanged. In review (2026-09-30), the
   new tests were run against the first version: 13 failed, and those that pin behaviour it
   already had passed. Each mutation of the rule (a row that disagrees sent, a currency without a
-  row priced off hundredths sent, one priced in hundredths refused, UYI's entry removed), of the
+  row priced off hundredths sent, one priced in hundredths refused), of the
   `unsupported_operation` split, of the stopped-subscription message, of the list failure's
-  `raw`, and of the read before the cancel made a test fail. The conformance suite passes
+  `raw`, of the read before the cancel, and of the completion refusal's `outcomeUnknown`
+  (dropped, or given to every refusal) made a test fail. The conformance suite passes
   unchanged.
 - **Sandbox checks, not run.** The first two need a merchant account provisioned in the
   currency; the reference sandbox account is CAD-only. The API reads back the integer it was

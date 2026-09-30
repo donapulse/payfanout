@@ -154,6 +154,14 @@ currency the PSP or the requested rail itself cannot settle — SEPA asked for i
 skipped without a PSP call —
 the router and `PaymentService` share one predicate, `screenSessionInput` from
 `@payfanout/core`, so a skipped candidate is exactly one the service would have rejected.
+An adapter states its currencies as the list it takes (`supportedCurrencies`), as the few
+it refuses when its PSP takes too many to list (`unsupportedCurrencies`), or both. A
+session in a currency outside the first or on the second skips that candidate,
+zero-amount sessions included, and `PaymentService` refuses it with a non-retryable
+`unsupported_operation`. Only session creation is screened: a session update, a
+saved-method charge or a native subscription in such a currency meets the adapter's own
+refusal. A currency an adapter refuses without declaring it still ends the cascade with
+its `invalid_request`, so route it with a rule of its own.
 Country-bound rails (Bacs pays from UK bank accounts, Interac from Canadian ones) screen
 the same way **when the session states `customerCountry`** (ISO 3166-1 alpha-2, the
 customer's country — not `country`, which resolves the merchant account). Omit it and
@@ -208,7 +216,11 @@ while another under the same key is still in progress. Retry all of them only un
 Amounts are **integer minor units, always**, and minor units are currency-dependent, JPY
 has 0 decimals (`¥500` → `500`), BHD has 3 (`BD 1.234` → `1234`). Use
 `toMinorUnits(major, currency)` / `formatMinorUnits(minor, currency)` from
-`@payfanout/core`. Refund state is **derived**, never a payment status:
+`@payfanout/core`. A record whose PSP states no currency, which the adapter cannot source
+from a related record either, reports `NO_CURRENCY` (`"XXX"`, ISO 4217's "no currency
+involved"): its amount reads with the default exponent 2, so reconcile it with the PSP
+before booking it, and never send `XXX` back as a payment's currency. Refund state is
+**derived**, never a payment status:
 `getRefundState(info)` → `"none" | "partial" | "full"`.
 
 ## Observability

@@ -170,9 +170,11 @@ export class PaymentRouter {
 
   /**
    * Creates the session on the first candidate able to serve it, cascading on
-   * transient failures. Capability mismatches (manual capture, zero-amount
-   * verification, unsupported method types) skip the candidate up front —
-   * no PSP round-trip is spent on a call that cannot succeed.
+   * transient failures. Capability mismatches (a currency outside the
+   * adapter's supportedCurrencies or on its unsupportedCurrencies, manual
+   * capture, zero-amount verification, unsupported method types) skip the
+   * candidate up front — no PSP round-trip is spent on a call that cannot
+   * succeed.
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<RoutedSessionResult> {
     const chain = this.selectChain(input);

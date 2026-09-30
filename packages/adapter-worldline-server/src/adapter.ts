@@ -1,10 +1,12 @@
 import {
   assertMinorUnitAmount,
   classifyHttpFallback,
+  firstCurrencyCode,
   getCurrencyExponent,
   getUserMessage,
   isPayFanoutError,
   isTransportRetryable,
+  NO_CURRENCY,
   normalizeCurrency,
   PayFanoutError,
   repeatsSecret,
@@ -848,6 +850,12 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
     // refunded) — both come from the normalized payment view.
     const info = await this.retrievePayment(req.pspPaymentId);
     const currencyCode = info.currency;
+    if (currencyCode === NO_CURRENCY) {
+      throw PayFanoutError.invalidRequest(
+        `Payment ${req.pspPaymentId} states no currency, so a refund amount cannot be sent for it — refund it in the Worldline back office`,
+        { pspPaymentId: req.pspPaymentId },
+      );
+    }
     const refundable = (info.amountCaptured ?? info.amount) - info.amountRefunded;
     const amount = req.amount ?? Math.max(0, refundable);
     const refund = await this.request<WorldlineRefundLike>(
@@ -1029,7 +1037,7 @@ export class WorldlineServerAdapter implements ServerPaymentAdapter {
       amountRefunded: opts.amountRefunded ?? 0,
       ...(opts.amountCaptured !== undefined ? { amountCaptured: opts.amountCaptured } : {}),
       ...(opts.amountCapturable !== undefined ? { amountCapturable: opts.amountCapturable } : {}),
-      currency: (money.currencyCode ?? opts.currencyFallback ?? "").toUpperCase() || "XXX",
+      currency: firstCurrencyCode(money.currencyCode, opts.currencyFallback) ?? NO_CURRENCY,
       paymentMethodType: "card",
       ...(metadata ? { metadata } : {}),
       ...(methodDetails ? { paymentMethodDetails: methodDetails } : {}),
@@ -1591,10 +1599,10 @@ function walkable(answered: UnifiedPaymentStatus, current: PaymentInfo): boolean
 function assertSessionsPayment(payment: WorldlinePaymentLike, context: WorldlineSessionContextV1): void {
   if (endedUnpaid(paymentStatus(payment))) return;
   const amount = payment.paymentOutput?.amountOfMoney?.amount ?? undefined;
-  const currency = payment.paymentOutput?.amountOfMoney?.currencyCode ?? undefined;
+  // Read as a payment read reads it: an empty or malformed code states none.
+  const currency = firstCurrencyCode(payment.paymentOutput?.amountOfMoney?.currencyCode);
   const differs =
-    (amount !== undefined && amount !== context.amount) ||
-    (currency !== undefined && String(currency).toUpperCase() !== context.currency);
+    (amount !== undefined && amount !== context.amount) || (currency !== undefined && currency !== context.currency);
   if (!differs) return;
   throw new PayFanoutError({
     code: "invalid_request",

@@ -1,7 +1,9 @@
 import {
   assertMinorUnitAmount,
+  firstCurrencyCode,
   lowercaseKeys,
   NATIVE_SUBSCRIPTION_INTERVALS,
+  NO_CURRENCY,
   normalizeCurrency,
   normalizeSecrets,
   PayFanoutError,
@@ -48,6 +50,7 @@ import {
   assertSendableCurrency,
   assertThreeDecimalRule,
   readStripeAmounts,
+  REFUSED_CURRENCIES,
   refusesUnconverted,
   toStripeAmount,
   type RecordUse,
@@ -135,7 +138,11 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
  * a list page holding one fails whole, its `raw` naming each such record and
  * carrying the page's `nextCursor`; and webhook and polled events in UGX carry
  * no `amount`. A zero-amount session is a SetupIntent, which carries no
- * amount or currency, and is left alone in every currency.
+ * amount or currency, and is left alone in every currency. UGX is declared in
+ * `unsupportedCurrencies`, so the router skips Stripe for a UGX session and
+ * PaymentService refuses one with `unsupported_operation`, zero-amount
+ * sessions included (from the `@payfanout/server` release that reads the
+ * field).
  *
  * Earlier releases sent UGX amounts, and MGA amounts that are not whole
  * ariary, unconverted, so a retry under the same key after the upgrade may
@@ -203,6 +210,9 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
   getCapabilities(): AdapterCapabilities {
     return {
       pspName: this.pspName,
+      // UGX: every amount in it is refused before it is sent (currency-units.ts);
+      // declared so the router skips Stripe instead of ending its cascade there.
+      unsupportedCurrencies: [...REFUSED_CURRENCIES],
       supportsPaymentRetrieval: true, // GET /v1/payment_intents/:id
       supportsRefunds: true,
       supportsPartialRefunds: true,
@@ -696,7 +706,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
         status: seti.status === "succeeded" ? "succeeded" : seti.last_setup_error ? "failed" : mapSetupIntentStatus(seti),
         amount: 0,
         amountRefunded: 0,
-        currency: "USD",
+        currency: NO_CURRENCY,
         paymentMethodType: "card",
         ...(seti.status === "succeeded" && paymentMethodId
           ? { savedPaymentMethodToken: paymentMethodId }
@@ -735,7 +745,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       status: seti.status === "succeeded" ? "succeeded" : seti.last_setup_error ? "failed" : mapSetupIntentStatus(seti),
       amount: 0,
       amountRefunded: 0,
-      currency: "USD", // verification is amountless; currency is not meaningful here
+      currency: NO_CURRENCY, // a SetupIntent moves no money and states no currency
       paymentMethodType: "card",
       createdAt: new Date(seti.created * 1000).toISOString(),
       raw: seti,
@@ -1057,7 +1067,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       pspName: this.pspName,
       status: mapSubscriptionStatus(sub.status),
       amount,
-      currency: (sub.currency ?? price?.currency ?? "").toUpperCase(),
+      currency: subscriptionCurrency(sub) ?? NO_CURRENCY,
       ...(interval ? { interval } : {}),
       ...(interval && recurring?.interval_count !== undefined ? { intervalCount: recurring.interval_count } : {}),
       ...(periodStart !== undefined ? { currentPeriodStart: new Date(periodStart * 1000).toISOString() } : {}),
@@ -1293,8 +1303,9 @@ function installment(sub: StripeSubscriptionLike): number {
   return total;
 }
 
+/** One reading serves both the unit conversion and the reported currency, so the two never disagree. */
 function subscriptionCurrency(sub: StripeSubscriptionLike): string | undefined {
-  return sub.currency ?? sub.items?.data[0]?.price?.currency;
+  return firstCurrencyCode(sub.currency, sub.items?.data[0]?.price?.currency);
 }
 
 function pageCursor(page: StripeListLike<{ id: string }>): string | undefined {

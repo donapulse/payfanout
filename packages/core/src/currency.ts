@@ -9,6 +9,30 @@ import { PayFanoutError } from "./errors.js";
 export type MinorUnitAmount = number;
 
 /**
+ * ISO 4217's code for "no currency involved". A session, payment or
+ * subscription record carries it when the PSP stated no currency for it and
+ * the adapter had no other source it trusts, instead of a plausible guess such
+ * as USD. It reads with the default exponent 2; reconcile such a record with
+ * the PSP before relying on its amounts.
+ */
+export const NO_CURRENCY = "XXX";
+
+/**
+ * The first of `codes` that is three letters once trimmed and uppercased, the
+ * shape of an ISO 4217 code (the code itself is not looked up), or undefined
+ * when none is: how an adapter reads the currency a PSP record states,
+ * reporting {@link NO_CURRENCY} when it states none.
+ */
+export function firstCurrencyCode(...codes: unknown[]): string | undefined {
+  for (const code of codes) {
+    if (typeof code !== "string") continue;
+    const upper = code.trim().toUpperCase();
+    if (/^[A-Z]{3}$/.test(upper)) return upper;
+  }
+  return undefined;
+}
+
+/**
  * ISO 4217 currencies whose exponent is not the default 2, as ISO 4217 list
  * one gives their minor units.
  */
@@ -31,6 +55,18 @@ const CURRENCY_EXPONENT_OVERRIDES: Readonly<Record<string, number>> = {
 export function getCurrencyExponent(currency: string): number {
   const code = normalizeCurrency(currency);
   return CURRENCY_EXPONENT_OVERRIDES[code] ?? 2;
+}
+
+/**
+ * Every currency getCurrencyExponent gives an exponent other than 2, with
+ * that exponent, in code order: the 0-, 3- and 4-decimal codes of ISO 4217
+ * list one. Any other valid code reads as 2 (an invalid one throws), so an
+ * adapter comparing its PSP's currency table with PayFanout's minor units can
+ * enumerate every code the comparison turns on from these and that table. A
+ * fresh array on each call.
+ */
+export function listNonDefaultCurrencyExponents(): Array<[currency: string, exponent: number]> {
+  return Object.entries(CURRENCY_EXPONENT_OVERRIDES).sort(([a], [b]) => (a < b ? -1 : 1));
 }
 
 export function normalizeCurrency(currency: string): string {

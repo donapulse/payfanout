@@ -382,7 +382,8 @@ describe("Paysafe native subscriptions: retrieve and status mapping", () => {
     const { adapter } = scripted([() => json(200, { id: "sub_bare", status: "ACTIVE" })]);
     const record = await adapter.retrieveNativeSubscription({ subscriptionId: "sub_bare" });
     expect(record.amount).toBe(0);
-    expect(record.currency).toBe("USD");
+    // ISO 4217's "no currency", never a guess such as USD.
+    expect(record.currency).toBe("XXX");
     expect(record.interval).toBeUndefined();
     expect(record.intervalCount).toBeUndefined();
     expect(record.currentPeriodStart).toBeUndefined();

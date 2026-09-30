@@ -13,7 +13,11 @@ import { StripeClientAdapter } from "@payfanout/adapter-stripe";
 import { PaysafeClientAdapter } from "@payfanout/adapter-paysafe";
 
 const adapters = [
-  new StripeClientAdapter({ publishableKey: "pk_…", environment: "sandbox" }),
+  new StripeClientAdapter({
+    publishableKey: "pk_…",
+    environment: "sandbox",
+    apiVersion: "2024-06-20", // the server adapter's apiVersion
+  }),
   new PaysafeClientAdapter({ apiKey: "base64-public-key", environment: "sandbox" }),
 ];
 

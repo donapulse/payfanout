@@ -1,4 +1,11 @@
-import { getCurrencyExponent, PayFanoutError, type UnifiedErrorCode } from "@payfanout/core";
+import {
+  firstCurrencyCode,
+  getCurrencyExponent,
+  listNonDefaultCurrencyExponents,
+  NO_CURRENCY,
+  PayFanoutError,
+  type UnifiedErrorCode,
+} from "@payfanout/core";
 
 /**
  * Paysafe's Currency Codes table, its 81 rows grouped by exponent, as
@@ -61,6 +68,23 @@ export function currencyRefusal(currency: unknown): CurrencyRefusal | undefined 
   }
   return payfanoutExponent === 2 ? undefined : { currency: code, payfanoutExponent };
 }
+
+/**
+ * Every currency `currencyRefusal` refuses, in code order, which the adapter
+ * declares as `unsupportedCurrencies` so that the router skips Paysafe for
+ * them. The rule can refuse only a code the table lists or one PayFanout does
+ * not price in hundredths, so those are the codes it is put to.
+ */
+export function refusedCurrencies(): string[] {
+  const candidates = new Set([
+    ...PAYSAFE_CURRENCY_EXPONENTS.keys(),
+    ...listNonDefaultCurrencyExponents().map(([code]) => code),
+  ]);
+  return [...candidates].filter((code) => currencyRefusal(code) !== undefined).sort();
+}
+
+/** `refusedCurrencies()` computed once, as `getCapabilities()` runs on almost every call. */
+export const REFUSED_CURRENCIES: readonly string[] = Object.freeze(refusedCurrencies());
 
 /** Refuses a call that would send, or sign for sending, an amount in a refused currency. */
 export function assertSendableCurrency(currency: string): void {
@@ -157,6 +181,14 @@ export function assertUsableRecord(currency: unknown, subject: string, record: u
         raw,
       );
   }
+}
+
+/**
+ * The currency a read reports: the record's own ISO 4217 code, uppercased,
+ * else NO_CURRENCY rather than a guess such as USD.
+ */
+export function reportedCurrency(code: string | undefined): string {
+  return firstCurrencyCode(code) ?? NO_CURRENCY;
 }
 
 /**

@@ -357,6 +357,28 @@ describe("completePayment sends Worldline's mandatory 3-D Secure data", () => {
     expect(createPaymentBody(bare.fake).order).not.toHaveProperty("customer");
   });
 
+  it("reports the session's currency for a challenge whose payment states none, or an empty or malformed one", async () => {
+    for (const currencyCode of [undefined, "", "EURO"]) {
+      const fake = new FakeWorldlineApi();
+      const { adapter } = makePair({
+        fetch: async (input, init) => {
+          const response = await fake.fetch(input, init);
+          if (init?.method !== "POST" || !new URL(String(input)).pathname.endsWith("/payments")) return response;
+          const body = (await response.json()) as {
+            payment?: { paymentOutput?: { amountOfMoney?: { currencyCode?: string } } };
+          };
+          const money = body.payment?.paymentOutput?.amountOfMoney;
+          if (money && currencyCode === undefined) delete money.currencyCode;
+          else if (money) money.currencyCode = currencyCode;
+          return new Response(JSON.stringify(body), { status: response.status, headers: response.headers });
+        },
+      });
+      const info = await complete(adapter, { currency: "JPY" }, envelope("htp_3ds", DEVICE));
+      expect(info.status, String(currencyCode)).toBe("requires_action");
+      expect(info.currency, String(currencyCode)).toBe("JPY");
+    }
+  });
+
   it("surfaces a challenge as requires_action when the clientToken is the envelope", async () => {
     const { adapter, fake } = makePair();
     const info = await complete(adapter, {}, envelope("htp_3ds", DEVICE));

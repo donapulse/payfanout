@@ -16,11 +16,13 @@ import { WorldlineClientAdapter } from "@payfanout/adapter-worldline";
 import { PayFanoutProvider, PaymentFields, usePay, usePayFanout, type PayResult } from "@payfanout/react";
 import { localizeError, PayFanoutError } from "@payfanout/core";
 import { I18nProvider, LOCALES, useI18n } from "./i18n.js";
+import { STRIPE_API_VERSION } from "./stripe-api-version.js";
 
 const adapters = [
   new StripeClientAdapter({
     publishableKey: import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY ?? "pk_test_replace_me",
     environment: "sandbox",
+    apiVersion: STRIPE_API_VERSION, // the server adapter's pin, which picks the Stripe.js build
   }),
   new PaysafeClientAdapter({
     apiKey: import.meta.env.VITE_PAYSAFE_PUBLIC_KEY ?? "replace_me_base64",

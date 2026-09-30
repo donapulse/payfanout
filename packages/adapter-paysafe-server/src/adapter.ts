@@ -51,6 +51,8 @@ import {
   assertSendableCurrency,
   assertUsableRecord,
   currencyRefusal,
+  REFUSED_CURRENCIES,
+  reportedCurrency,
   sendRefusal,
 } from "./currency-exponents.js";
 import {
@@ -1196,7 +1198,10 @@ function defaultSleep(ms: number): Promise<void> {
  * adapter sends PayFanout's unchanged and converts none, so it refuses a
  * currency the table gives another exponent than PayFanout (CLP, BYR), or
  * one the table lacks that is not priced in hundredths (ISK, UYI and others;
- * see "Currencies the adapter refuses" in the setup guide).
+ * see "Currencies the adapter refuses" in the setup guide), and declares
+ * them in `unsupportedCurrencies`, so the router skips Paysafe for a session
+ * in one and PaymentService refuses it with `unsupported_operation` (from the
+ * `@payfanout/server` release that reads the field).
  * createPaymentSession and updatePaymentSession refuse one with
  * `invalid_request` before any request. completePayment,
  * chargeSavedPaymentMethod and createNativeSubscription, which earlier
@@ -1256,6 +1261,9 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   getCapabilities(): AdapterCapabilities {
     return {
       pspName: this.pspName,
+      // Refused on every session, whatever the amount (currency-exponents.ts);
+      // declared so the router skips Paysafe instead of ending its cascade there.
+      unsupportedCurrencies: [...REFUSED_CURRENCIES],
       supportsPaymentRetrieval: true, // GET /paymenthub/v1/payments/{id}
       supportsRefunds: true,
       supportsPartialRefunds: true,
@@ -2687,7 +2695,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       pspName: this.pspName,
       status: mapSubscriptionStatus(sub.status),
       amount: nextPayment?.amount ?? plan?.amount ?? 0,
-      currency: (plan?.currencyCode ?? "").toUpperCase() || "USD",
+      currency: reportedCurrency(plan?.currencyCode),
       // An unrecognized frequency yields NO interval (absent = "no faithful
       // projection"), and intervalCount only rides along with one.
       ...(interval ? { interval } : {}),
@@ -2808,7 +2816,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       ...(typeof payment.availableToSettle === "number"
         ? { amountCapturable: fullyCaptured ? 0 : payment.availableToSettle }
         : {}),
-      currency: (payment.currencyCode ?? "").toUpperCase() || "USD",
+      currency: reportedCurrency(payment.currencyCode),
       paymentMethodType: toUnifiedMethodType(payment.paymentType),
       ...(methodDetails ? { paymentMethodDetails: methodDetails } : {}),
       ...(mandateReference ? { mandateReference } : {}),

@@ -57,10 +57,41 @@ and `PaymentService` will hold you to:
   `getCurrencyExponent` / `assertMinorUnitAmount` from core. PSP-specific quirks (e.g.
   Stripe's three-decimal multiples-of-10) stay inside your adapter and reject with
   `invalid_request`, never leak them to callers.
+- **Currencies you report** come from the PSP record, else from a source your adapter
+  trusts (the currency it sent, or one another record of the same payment states), else
+  core's `NO_CURRENCY` (`"XXX"`, ISO 4217's "no currency"): never a plausible guess such
+  as USD. Read them with core's `firstCurrencyCode(own, fallback, …)`, which takes the
+  first candidate that is three letters once trimmed and uppercased, so an empty or
+  malformed code falls through to the next source; scale the amount by that same reading.
+  Never send an amount in a guessed currency either: when no record states the
+  currency, refuse the call with `invalid_request` before sending, unless the amount is
+  one the PSP itself reported and its API makes the currency optional on that call (a
+  full refund of the PSP's own remaining amount), which then goes without one. An
+  amount the PSP reports with no currency anywhere reads with `NO_CURRENCY`'s default
+  exponent under a record that reports `NO_CURRENCY`, so a call that went through never
+  fails on its answer; a record with no currency field to flag it (a refund read)
+  refuses it instead.
 - **Hard currency constraints** go in `capabilities.supportedCurrencies` (uppercase
   ISO 4217; omit when unrestricted). The router pre-screens candidates with it — a
   declared constraint means a mismatched payment skips your PSP instead of aborting the
   failover cascade on your local rejection. Keep the local validation as defense.
+- **Currencies you refuse to send** go in `capabilities.unsupportedCurrencies` (uppercase
+  ISO 4217; omit when there are none), for a PSP that takes too many currencies to list
+  in `supportedCurrencies` while your adapter refuses a few, such as a currency the PSP
+  prices with another exponent than ISO 4217; you may declare both lists. The router
+  pre-screens session creation with it exactly as with `supportedCurrencies`, and
+  `PaymentService` refuses such a session with a non-retryable `unsupported_operation`
+  before calling you; every other call (updates, saved-method charges, native
+  subscriptions) still meets your own refusal, so keep it. Declare a currency when you
+  refuse every amount you would send in it. That is a trade-off: screening also refuses
+  zero-amount sessions in the currency, even ones your adapter still serves because they
+  send no amount, and your changeset must say so. A refusal of only some non-zero amounts
+  (Stripe's MGA amounts that are not whole ariary) stays a local check. Derive the list
+  from the constant or rule your local refusal reads so the two cannot drift. Registration
+  rejects an entry that can never match (not a string, or not three letters once trimmed
+  and uppercased), a currency in both lists, and a supported rail whose `currencies` all
+  sit on this one; the conformance suite also fails an entry that works but is not written
+  as its bare uppercase code, as it does for the other currency lists.
 - **Per-rail currency constraints** go in the same shape one level down, on the method:
   `paymentMethods: [{ type: "sepa_debit", flow: "embedded", supported: true, currencies: ["EUR"] }]`.
   Absent or empty means unrestricted, exactly as `supportedCurrencies` reads, and the
@@ -441,7 +472,7 @@ suite proves plumbing, then validate against the PSP sandbox manually before goi
 - [ ] Full + partial refund, over-refund rejection, cancel-before-capture, manual
       capture / multi-capture (if supported) exercised against the PSP sandbox
 - [ ] JPY and BHD amounts round-trip correctly end-to-end (or the constraint is
-      declared via `supportedCurrencies`)
+      declared via `supportedCurrencies` or `unsupportedCurrencies`)
 - [ ] Registered in the demo app (`examples/demo`) and payable behind the unchanged
       `<PayButton>`, if the demo needed edits beyond adding your adapter to the two
       registries, something leaked

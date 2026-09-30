@@ -132,9 +132,35 @@ export interface AdapterCapabilities {
    * Hard PSP currency constraints (ISO 4217, uppercase). ABSENT means
    * unrestricted. When present, the router pre-screens candidates by it —
    * without it, a PSP-local currency rejection (invalid_request) aborts the
-   * failover cascade before an eligible PSP is tried.
+   * failover cascade before an eligible PSP is tried. An adapter whose PSP
+   * takes too many currencies to list declares the few it refuses in
+   * `unsupportedCurrencies` instead, or declares both.
    */
   supportedCurrencies?: string[];
+  /**
+   * Currencies the adapter refuses to send any amount in (ISO 4217,
+   * uppercase). ABSENT or empty means none. A PSP that takes most currencies
+   * cannot be given a `supportedCurrencies` list without refusing some it
+   * takes, yet its adapter may still refuse a few, such as a currency the PSP
+   * prices with another exponent than ISO 4217. An adapter may declare either
+   * list or both; a session's currency must pass each one declared.
+   *
+   * Only session creation is screened: the router skips the adapter for a
+   * session in one of these currencies instead of aborting the failover
+   * cascade on its local invalid_request, and PaymentService refuses such a
+   * session with a non-retryable unsupported_operation. Session updates,
+   * saved-method charges and native subscriptions still meet the adapter's
+   * own refusal, so keep the local check: hosts can also call an adapter
+   * without PaymentService.
+   *
+   * Declare a currency when the adapter refuses every amount it would send in
+   * it. The declaration is a trade-off: screening also refuses zero-amount
+   * sessions in the currency, even ones the adapter itself still serves
+   * because they send no amount, and the adapter's changeset must say so. A
+   * refusal of only some non-zero amounts (a whole-unit rule) stays a local
+   * check. Listed codes are compared trimmed and uppercased.
+   */
+  unsupportedCurrencies?: string[];
   /**
    * The PSP exposes a read for a single payment (retrievePayment). False is the
    * push-only declaration — the payment reference is a write target only, and
@@ -214,7 +240,7 @@ export interface PaymentSession {
   /** Token the client SDK needs to mount/confirm. */
   clientSecret?: string;
   amount: MinorUnitAmount;
-  /** ISO 4217. */
+  /** Uppercase ISO 4217; {@link NO_CURRENCY} when the PSP states none. */
   currency: string;
   status: UnifiedPaymentStatus;
   metadata?: Record<string, string>;
@@ -252,6 +278,7 @@ export interface PaymentInfo {
   amountCaptured?: MinorUnitAmount;
   /** Authorized-but-uncaptured remainder, when the PSP reports it. */
   amountCapturable?: MinorUnitAmount;
+  /** Uppercase ISO 4217; {@link NO_CURRENCY} when the PSP states none. */
   currency: string;
   paymentMethodType: UnifiedPaymentMethodType;
   /**
@@ -400,7 +427,7 @@ export interface NativeSubscriptionRecord {
   status: NativeSubscriptionStatus;
   /** Amount of each installment. Integer minor units. */
   amount: MinorUnitAmount;
-  /** Uppercase ISO 4217. */
+  /** Uppercase ISO 4217; {@link NO_CURRENCY} when the PSP states none. */
   currency: string;
   /** Absent when the source cadence has no faithful day/week/month/year projection. */
   interval?: NativeSubscriptionInterval;

@@ -2038,7 +2038,9 @@ sandbox round-trip before production use, and the setup guide carries that warni
   leading, so pass-through would shift the decimal point. Same shape as the PayZen CNY/KHR
   exclusion. `supportedCurrencies` is left undeclared: the capability is an allowlist and no
   complete, verified Adyen currency list was available, so declaring one would be a guess —
-  the cost is that the router cannot pre-screen those four.
+  the cost is that the router cannot pre-screen those four. (Superseded 2026-09-30 for the
+  router by "Currency denylist capability (2026-09-30)": the four are declared in
+  `unsupportedCurrencies`, and `supportedCurrencies` stays undeclared.)
 - **Webhook verification requires a second factor, and that is deliberate.** Adyen's HMAC-SHA256
   covers eight colon-joined values (`pspReference:originalReference:merchantAccountCode:`
   `merchantReference:value:currency:eventCode:success`), base64, carried inside the payload
@@ -2525,7 +2527,10 @@ description of what v2 changes is what the migration then had to implement.
   `mapStripeError` sees the errors of the adapter's own calls, which carry the host's pinned
   `apiVersion`. The browser adapter follows the account's default API version through
   Stripe.js; since 2026-09-26 it maps these codes and `incorrect_zip` the same way (see
-  "Stripe: one card-error classification on both halves (2026-09-26)").
+  "Stripe: one card-error classification on both halves (2026-09-26)"). (Superseded
+  2026-09-30: the browser adapter now loads the Stripe.js build of the pinned `apiVersion`,
+  or gives a page's own v3 that version; see "Stripe.js version follows the pinned API
+  version (2026-09-30)".)
 - **On the server, the checks live in the `StripeCardError` branch only** (the browser
   classifies every Stripe.js error type). Neither page states which error
   `type` the new codes arrive with, so the conservative reading extends the branch that
@@ -4259,6 +4264,7 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `detailedErrorCode` (PSP_707's 207 is not in the acquirer map, so `card_declined`). "3DS
   disabled" is therefore `invalid_request` as AUTH_103 and `processing_error` as PSP_055.
   Mapping them belongs with one PSP_ map for both halves (#247), not with this change.
+  (Resolved 2026-09-30 by #247: see "PayZen PSP_ codes on both halves (2026-09-30)".)
 - **Doc-derived only.** No sandbox run has produced any of these codes.
 
 ## Stripe: one card-error classification on both halves (2026-09-26)
@@ -5288,7 +5294,10 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   `invalid_request`, which ends the cascade, and hosts route them elsewhere with a currency rule
   placed before any rule that can send them to Paysafe, since the router takes the first rule
   that matches (setup guide). A core capability listing the currencies an adapter refuses would
-  let the router skip it; that is a contract change, and a follow-up of its own.
+  let the router skip it; that is a contract change, and a follow-up of its own. (Superseded
+  2026-09-30 for the router by "Currency denylist capability (2026-09-30)": the adapter declares
+  these currencies in `unsupportedCurrencies`, and the router skips Paysafe for them;
+  `supportedCurrencies` stays undeclared.)
 - **Tests.** Paysafe's table and SIX's list one ship as test fixtures. The table is compared row
   for row with the constant in `src`; with list one it drives the expected refusals, and every
   code of either goes through `createPaymentSession`, the refused set computed from the rule and
@@ -5672,3 +5681,675 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   - **Three-decimal.** From an account whose presentment list has KWD (only the AE list
     does), send `amount: 1235` in KWD straight to the PaymentIntents API, as the adapter
     refuses it locally, and record whether Stripe refuses it too.
+
+## Currency denylist capability (2026-09-30)
+
+- **The gap.** `AdapterCapabilities.supportedCurrencies` is an allowlist, and adapters whose
+  PSP takes most currencies refuse a few: Paysafe the currencies its table prices with another
+  exponent or lacks ("Paysafe: currencies whose exponent may not be PayFanout's (2026-09-27)")
+  and Adyen CLP, CVE, IDR and ISK ("Adyen adapter (2026-08-02)"), both on every session, and
+  Stripe every UGX amount it would send ("Stripe: currencies whose API units differ from
+  PayFanout's (2026-09-30)"). None of them can declare an allowlist without refusing
+  currencies its PSP takes, so the router could not pre-screen these currencies: a candidate
+  asked for one refused with `invalid_request`, a business rejection that ends the cascade
+  before the next PSP is tried, and hosts had to route them with a rule of their own. The
+  Paysafe entry named the fix, a capability listing the currencies an adapter refuses, as "a
+  contract change, and a follow-up of its own"; this is that follow-up.
+- **`AdapterCapabilities.unsupportedCurrencies?: string[]`**: uppercase ISO 4217 codes the
+  adapter refuses to send any amount in, absent or empty meaning none; an adapter may declare
+  this list, `supportedCurrencies`, or both. `screenSessionInput` refuses a session in a listed
+  currency after the `supportedCurrencies` check, with a message of its own, `"<psp>" declares
+  currency <code> unsupported`, since the list is the adapter's declaration rather than a fact
+  about its PSP (changed in review, 2026-09-30: the first version reused the allowlist's
+  `"<psp>" does not support currency <input>`, which is unchanged). The input is trimmed and
+  uppercased as for the allowlist, and each listed code is trimmed and uppercased too
+  (`listedCurrencyCode`), so that registration can reject exactly the entries that can never
+  match; the allowlist's own comparison is unchanged. `PaymentRouter` skips the candidate
+  without a PSP call and tries the next one; `PaymentService` refuses the session with a
+  non-retryable `unsupported_operation` before calling the adapter.
+- **Every session in a listed currency, zero-amount ones included: a trade-off** (restated in
+  review, 2026-09-30). The list is read as the allowlist has always been read, whatever the
+  amount. An adapter declares a currency when it refuses every amount it would send in it;
+  declaring it also refuses zero-amount sessions in that currency, even ones the adapter
+  itself still serves because they send no amount, and that adapter's changeset must say so.
+  A refusal of only some non-zero amounts (Stripe's MGA amounts that are not whole ariary)
+  stays a local check. Reading the list only for sessions that carry an amount was rejected:
+  Paysafe refuses its currencies on zero-amount sessions too, and such a session would again
+  end the cascade. Stripe bears the cost: its zero-amount UGX sessions are SetupIntents, which
+  carry no currency and so serve any, and with UGX declared a host creates them in another
+  currency.
+- **What `PaymentService` answers changes.** The adapters refuse these sessions with
+  `invalid_request` and a `raw` naming the currency's units; once an adapter declares a
+  currency, `PaymentService` answers first, with `unsupported_operation`, the screening message
+  and no `raw`, as it already does for a currency outside `supportedCurrencies` (PayPal's RUB).
+  Only `createPaymentSession` is screened: session updates, `chargeSavedPaymentMethod`,
+  `createNativeSubscription` and `SubscriptionManager` renewals still meet the adapter's own
+  refusal, and an adapter called directly refuses as before and keeps its local check.
+- **Validation reports only what stops a declaration from working** (changed in review,
+  2026-09-30). `validateAdapterCapabilities` reports an `unsupportedCurrencies` entry that can
+  never match (not a string, or not three letters once trimmed and uppercased); a currency in
+  both lists (screening refuses it, so declaring it supported contradicts the adapter); and a
+  supported rail whose `currencies` are all declared unsupported, which can never be routed, as
+  the existing rule says of a rail outside `supportedCurrencies`. The last two read well-formed
+  entries only, and the both-lists rule reads the allowlist as screening does, each entry
+  uppercased and not trimmed, except that a value that is not a string is skipped here, where
+  screening would throw on it. `PaymentService`
+  rejects exactly these at registration. An entry that matches but is not written as its bare
+  uppercase code (`"ugx"`, `" UGX"`) works, so it registers and core does not report it. The
+  first version rejected such an entry at registration, so `new PaymentService()` threw over a
+  code screening matches anyway, and a non-string entry made the rail rule throw. An option
+  letting registration skip the form check, tried next, was dropped: a second parameter makes
+  `adapters.map(validateAdapterCapabilities)` fail to compile, a build break in a minor. A rail
+  both lists shut out gets the `supportedCurrencies` diagnosis alone, and a refused currency
+  the allowlist leaves out anyway is redundant, not contradictory, and passes.
+- **The conformance suite checks the bare uppercase form** (changed in review, 2026-09-30).
+  The suite asserts that `validateAdapterCapabilities` finds no issue, so the three rules above
+  reach every adapter's run through core. Next to its identical checks of `supportedCurrencies`
+  and each payment method's `currencies`, it now also checks that each `unsupportedCurrencies`
+  code is written as its bare uppercase code (`/^[A-Z]{3}$/`), which a working `"ugx"` is not.
+  The push-only fake in the suite's own tests declares, and refuses, XTS, the code ISO 4217
+  reserves for testing, so the check runs on a passing adapter there. `@payfanout/conformance`
+  takes a minor, and this supersedes #91's practice, which released its country-shape
+  assertions as a major because an adapter declaring malformed codes would newly fail the
+  suite: checks gated on a new optional field take a conformance minor, since an adapter that
+  passes the suite today declares no such field and keeps its verdict. The client adapters
+  have nothing to mirror: `ClientPaymentAdapter` exposes per-method capabilities only, never a
+  PSP-wide currency list.
+- **`listNonDefaultCurrencyExponents()`.** A declaration derived from an adapter's own refusal
+  rule, rather than typed out beside it, needs every code the rule could refuse. Paysafe's rule
+  reads core's exponents, and core kept the codes it does not read as 2 to itself, so the only
+  complete list was every three-letter code put to the rule: 17,576 calls, measured at 10 to
+  20 ms of CPU on first use under Node 24, too much for an adapter that runs on edge runtimes.
+  Core now lists those codes with their exponents, in code order, as a fresh array on each call;
+  any code outside the list reads as 2, so the codes an adapter's table and core's could
+  disagree on are that table's and this list's.
+- **Stripe declares UGX**, from `REFUSED_CURRENCIES` in `src/currency-units.ts`, the set the
+  send refusal reads, so the two cannot drift; a test puts every three-letter code to that
+  refusal and compares. MGA is not declared, as only MGA amounts that are not whole ariary are
+  refused. The one UGX session the adapter creates is a zero-amount one, a SetupIntent that
+  carries no currency, and screening now refuses it with the rest: through `PaymentService` or
+  the router, a verification or save-card session labelled UGX is refused, and the guide says to
+  create it in another currency, since the SetupIntent is the same in any. Leaving UGX
+  undeclared to keep that label was rejected: every UGX payment would still end the cascade on
+  a Stripe candidate. A host `paymentMethods` override with a rail whose `currencies` are UGX
+  alone now fails registration, as a rail that can never be routed.
+  `@payfanout/adapter-stripe-server` takes a patch; the router skips Stripe for UGX, and
+  `PaymentService` refuses a UGX session for it, from the `@payfanout/server` release that
+  reads the field.
+- **Paysafe declares the currencies its rule refuses**, today BIF, BYR, CLF, CLP, DJF, GNF,
+  IQD, ISK, KMF, UGX, UYI, UYW, VUV, XAF, XOF and XPF. `refusedCurrencies()` in
+  `src/currency-exponents.ts` puts `currencyRefusal` itself to every code of Paysafe's table
+  and of `listNonDefaultCurrencyExponents()`, the only codes the rule can refuse, so the
+  declaration follows the table and core's exponents as the refusal does, and no list is kept
+  by hand. `createPaymentSession` refuses these currencies on every session, zero-amount ones
+  included, so screening refuses nothing the adapter would take. Tests compare the declaration
+  with the sessions the adapter refuses over the table and ISO 4217 list one, and with the rule
+  over every three-letter code. A host `paymentMethods` override with a rail whose `currencies`
+  are all declared unsupported now fails registration. `@payfanout/adapter-paysafe-server`
+  takes a patch.
+- **Adyen declares CLP, CVE, IDR and ISK**, the keys of the map its refusal reads. Re-read
+  2026-09-30 at docs.adyen.com/development-resources/currency-codes: of the table's 138 rows,
+  those four alone are marked "differs from standard" (CLP 2, CVE 0, IDR 0, ISK 2), under the
+  note "For CLP, CVE, IDR, and ISK the ISO 4217 standard has a different number of decimals than
+  shown in our currency codes table. When submitting amounts in minor units, the decimals in the
+  table on this page are leading." `createPaymentSession` refuses them on every session, and the
+  adapter declares no zero-amount verification, so screening refuses nothing it would take. The
+  webhook mapper, which kept its own copy of the four codes, now reads the same map. A host
+  `paymentMethods` override with a rail whose `currencies` are all declared unsupported now fails
+  registration. `@payfanout/adapter-adyen-server` takes a patch.
+- **Nothing to declare elsewhere.** PayZen's CNY and KHR (and BHD) are already outside the
+  `supportedCurrencies` it declares, so the router skips PayZen for them. PayPal and GoCardless
+  refuse no currency their allowlists admit; PayPal's whole-unit rule for HUF and TWD refuses
+  some amounts only. Worldline refuses no currency for a session, only a partial capture in a
+  currency not priced in hundredths.
+- **Release.** `@payfanout/core` takes a minor: an optional field, a screen and validation
+  rules that only read it, and `listNonDefaultCurrencyExponents()`. `@payfanout/server` takes a
+  minor (changed in review, 2026-09-30; the first version shipped it as a dependency patch):
+  its router and `PaymentService` act on the field through the core it pins, so hosts need its
+  release for the router to read the field. `@payfanout/conformance` takes a minor, as above.
+
+## Stripe.js version follows the pinned API version (2026-09-30)
+
+- **Why.** `@payfanout/adapter-stripe` always loaded `https://js.stripe.com/v3` and created
+  the Stripe object without an API version, so its requests used the account's default
+  (docs.stripe.com/api-versions: Stripe takes a request's version from "The `Stripe-Version`
+  header on the request, if you set one", then "The API version pinned by your server-side
+  SDK", then "Your account’s default API version, if you don’t specify a version"; the
+  version also determines "The structure of objects Stripe.js returns"). The server adapter
+  sends the version the host pins, so the two halves could speak different versions, and the
+  browser's error codes (#213) followed the account default. Doc-verified 2026-09-30,
+  docs.stripe.com/sdks/stripejs-versioning: "Stripe.js v3 is no longer recommended for
+  integrations, but we’ll continue to support it."
+- **`apiVersion` is required on the client adapter: the server adapter's version, or, while
+  the server is on a release this adapter does not know yet, a version of the newest release
+  it knows** (reworded in review, 2026-09-30: the first version asked for "the same string").
+  The project pins a provider's API version explicitly wherever it has one. Rejected: a
+  default per adapter release, which would drift from the host's server pin whenever either
+  moved, unnoticed; and the server adapter handing its version to the browser through the
+  session, which has no channel for it (a `PaymentSession` reaches the client adapter only as
+  the `clientSecret` in `MountOptions`), so it would be a core contract change, major across
+  core, conformance and every adapter (parked in future-designs.md). Nothing can check that
+  the two halves agree, so the docs say what to pass.
+- **A version with a release name loads that release's build.** docs.stripe.com/
+  sdks/stripejs-versioning: "To use versioned Stripe.js, include the version name in the
+  script tag’s URL.", with `<script src="https://js.stripe.com/dahlia/stripe.js"></script>`;
+  the Payment Element variant of docs.stripe.com/payments/accept-a-payment loads the same
+  URL. So `2026-08-26.dahlia` loads `https://js.stripe.com/dahlia/stripe.js`.
+- **The releases with a build: acacia, basil, clover, dahlia.** docs.stripe.com/api-versions:
+  "Starting with the 2024-09-30.acacia release, Stripe follows a new API release process",
+  "API versions use a date-based identifier, such as `2024-09-30.acacia`. Twice-yearly major
+  releases also have a name, such as Acacia or Basil. Monthly versions after a major release
+  stay in that named line and don’t introduce breaking changes." and "The current version of
+  the API is **2026-08-26.dahlia**."; the versioning page: "We release Stripe.js major
+  versions alongside the API release trains twice per year." The changelog
+  (docs.stripe.com/changelog) lists the releases Acacia, Basil, Clover and Dahlia, and its
+  2025-02-24.acacia entry "Versioning in Stripe JS" introduced the builds. The served files
+  answer 200 at `https://js.stripe.com/{acacia,basil,clover,dahlia}/stripe.js` and 403 for a
+  name without a build (`/preview/stripe.js`, `/zinnia/stripe.js`), which the adapter would
+  have reported as a retryable `psp_unavailable` load failure at mount time. A release the
+  adapter does not list is refused at construction with `invalid_request` instead, and the
+  message names the remedy: while the server is on that release, a version of the newest
+  release the adapter knows (added in review, 2026-09-30). Not yet listed: `endive`.
+  `/endive/stripe.js` answers 200 and the served files know it, pinning it to
+  `2026-09-30.endive`, but docs.stripe.com has no page for it (`/changelog/endive` answers
+  404, checked again after Stripe re-served the builds on 2026-09-30), so it waits for a
+  release that reads its changelog. The
+  versioning page calls upgrading the two halves at different times safe ("Gradual updates
+  are safe, so you don’t need to release both at the same time."), which covers the lag of a
+  client kept on the newest release it knows while the server moves first; it is not a
+  reason to keep them apart for good.
+- **Preview versions and beta headers are refused, saying what to pass instead** (decided in
+  review, 2026-09-30). docs.stripe.com/sdks/versioning: "We have a public preview release
+  channel, which uses preview API versions that are distinct from general availability (GA)
+  versions. For example, `2025-04-30.preview` instead of `2025-04-30.basil`." No Stripe.js
+  build speaks one: the versioning page names none, and `/preview/stripe.js` answers 403. A
+  `.preview` version is refused, asking for a generally available version, such as one of
+  the newest release the adapter knows, and the message does not call "preview" a release.
+  Beta headers ride in the server SDK's version (Stripe's Node SDK README,
+  github.com/stripe/stripe-node: "Some preview features require a name and version to be set
+  in the `Stripe-Version` header like `feature_beta=v3`. If your preview feature has this
+  requirement, use the `apiVersion` property of `config` object to set it", as in
+  `'2022-08-01; feature_beta=v3'`), but not in Stripe.js's: the versioning page says
+  "Historically, some preview features involved adding beta headers to your `apiVersion` used
+  by Stripe.js requests (for example, `'2025-02-24.acacia; custom_checkout_beta=v1'`).
+  Because we no longer support this API version override, you can’t explicitly add beta
+  headers directly to API requests. Instead, any supported Stripe.js previews add necessary
+  headers automatically when the corresponding beta flag (for example
+  `custom_checkout_beta_5`) is set when you initialize Stripe.js." A version carrying `;` is
+  refused, asking for the version before it.
+- **A date alone loads v3 and passes the version to `Stripe()`.** Every version before
+  2024-09-30.acacia is a date alone (the changelog's last is 2024-06-20).
+  docs.stripe.com/js/initializing: "`apiVersion` Override your account's API version. **This
+  option is only available on Stripe.js v3.** For versions after `v3` such as `acacia`, the
+  API version is pinned to the Stripe.js version." The served versioned builds throw on it
+  ("Can not provide apiVersion to Stripe()", reported as "Unsupported on version [dahlia]:
+  …"), so only v3 gets it, and v3 keeps its URL,
+  `https://js.stripe.com/v3`, which pages that include it already carry. A date alone from
+  2024-09-30 on is refused (added in review, 2026-09-30): every version since carries a
+  release name, and the changelog lists none without one. So is the mirror case, a release
+  name with an earlier date (`2024-06-20.dahlia`), and a date that does not exist
+  (`2019-02-31`, `2023-02-29`), by the Gregorian calendar's month lengths and leap years
+  (added in the second review, 2026-09-30).
+- **What a release build speaks: AMBIGUOUS in the docs, read from the served files.** The
+  versioning page: "each versioned Stripe.js automatically uses the API version associated
+  with the Stripe.js version. That is, the Stripe.js `acacia` version uses a compatible API
+  version such as `2024-12-18.acacia` (which includes the date) to represent the release date
+  of the API version. You can’t override the API version." and "We recommend that businesses
+  keep the Stripe.js version and server-side API version on the same release train. For
+  example, if you use Stripe.js `acacia`, you can safely use `2025-02-24.acacia` or another
+  `acacia` minor version on your application server." Which dated version a build uses is not
+  stated. The served files pin acacia to `2025-01-27.acacia`, basil to `2025-03-31.basil`,
+  clover to `2025-09-30.clover` and dahlia to `2026-03-25.dahlia`: each release's first
+  version except acacia, and not the page's example `2024-12-18.acacia`. Stripe can move them
+  within a release. Every statement here about the served files was read on 2026-09-30,
+  first in the files last modified on 2026-09-29 and again after Stripe re-served every
+  build that day (Last-Modified 2026-09-30 14:43 GMT, basil 14:03); the builds are identical
+  but for the build name each carries, and nothing described here changed between the two
+  reads. Their minified code is not quoted, as its names change with every build. So the browser speaks the release, not the server's date: the monthly versions
+  of a release add no breaking change, but a field or code a later one added can reach the
+  server and not the browser. The guide gives the dahlia value as observed on this date.
+- **Rejected: v3 with the exact version for a release pin** (review, 2026-09-30), when the
+  adapter loads Stripe.js itself, which would make the browser speak the server's date
+  exactly. The release's build stays: Stripe recommends it ("Stripe.js v3 is no longer
+  recommended for integrations"), a release's Stripe.js changes ship only there ("to access
+  recent features that can’t be backported because of their breaking changes"), Stripe's own
+  loader loads the named builds from its v6 on, and v3 with a release's version is documented
+  only for acacia, as a migration step. v3 stays usable where a page runs it: "Stripe.js v3
+  isn’t deprecated", and Stripe will "continue to maintain Stripe.js v3 as an evergreen
+  version" (the versioning page, "Support for Stripe.js v3"), which is why a page's own v3 is
+  used and given the pinned version (below).
+- **`sdkUrl` removed, and refused rather than ignored.** docs.stripe.com/payments/
+  accept-a-payment (Payment Element, PaymentIntents): "Always load Stripe.js from
+  js.stripe.com to remain compliant. Don’t include the script in a bundle or host it
+  yourself."; docs.stripe.com/js: "it should always be loaded directly from
+  `https://js.stripe.com`, rather than included in a bundle or hosted yourself". The served
+  script throws "Stripe.js must be loaded from js.stripe.com." when its own `src` is on no
+  Stripe origin. With `apiVersion` naming the file, `sdkUrl` could only load another build
+  than the version names, the drift this change removes. A JavaScript config still carrying
+  it would otherwise load another file than it says, so the constructor refuses it, before
+  it looks at `apiVersion`, so that an upgrading config learns of it first (changed in
+  review, 2026-09-30). The `loadScript` test seam receives the derived URL.
+- **A Stripe.js the page already runs is used, never refused** (changed in review,
+  2026-09-30: the first version refused a global naming another build with
+  `invalid_request`). The served files set `window.Stripe` only when it is unset: beside a v2
+  global they add themselves as `window.Stripe.StripeV3`, and beside any other they only warn
+  ("[Stripe.js] It looks like Stripe.js was loaded more than one time. Please only load it
+  once per page."), so loading the pinned build over another would still run the other. They
+  set `version` on the global to `3` for v3 and to the release name otherwise. Stripe's
+  pages do not describe the property, but Stripe's
+  own loader reads it: `@stripe/stripe-js` (github.com/stripe/stripe-js, `src/shared.ts`,
+  read 2026-09-30 at 10.0.0-rc.4; the tags v6.0.0 to v9.0.0 hold the same lines) resolves
+  `window.Stripe` whenever it exists, maps the marker with `version === 3 ? 'v3' : version`,
+  and when it is not its own build only warns, for test keys (`if (isTestKey && version !==
+  expectedVersion)`: "Stripe.js@${version} was loaded on the page, but
+  @stripe/stripe-js@${_VERSION} expected Stripe.js@${expectedVersion}. This may result in
+  unexpected behavior."), then uses it. docs.stripe.com/js asks sites to "include this script
+  on every page, not just the checkout page", so a page's own copy is common, and refusing it
+  would turn a change to the page's tags into a checkout that fails in live mode. The adapter
+  follows Stripe's loader, in `loadSdk()`, `mount()` and `handleRedirectReturn()` alike, and
+  for a global another script defines while the adapter's own load is in flight:
+  - v3 is given `config.apiVersion`, a release's version included, which v3 takes to
+    "Override your account's API version" (docs.stripe.com/js/initializing; the served file
+    validates it as an optional string), so the browser speaks exactly the pin. The
+    versioning page shows this for acacia, as the step before moving to the acacia build
+    ("Upgrade the API version your Stripe.js integration uses to `2024-12-18.acacia`
+    gradually (if it makes sense for your needs) before upgrading Stripe.js to `acacia`");
+    with a basil or later version it is not sandbox-verified.
+  - Another release's build is used without an `apiVersion`, which it throws on, and speaks
+    its own pinned version; in a sandbox the adapter warns once on the console, naming both
+    builds and the fix, as Stripe's loader warns for test keys only.
+  - Beside a v2 global, the adapter loads its build and uses the `StripeV3` it attaches.
+  - A `version` naming no build (anything but `2`, `3` or a lowercase word) is used as if it
+    were the build the pin names, so a Stripe.js that dropped or reshaped the property keeps
+    working rather than failing every checkout.
+- **A `<script>` the page added for the build is waited for** (added in review, 2026-09-30).
+  Core's `injectScript` reuses the page's own tag for the URL at once, loaded or not, so a
+  mount racing that tag failed with a retryable `psp_unavailable`. Stripe's loader waits on
+  such a tag (`script.addEventListener('load', …)` and `'error'`, with no bound), and before
+  loading again after an error removes it and injects a new one. The adapter waits for the
+  page tag's `load` or `error` for up to 30 seconds, the bound the REST adapters give a
+  request by default, then confirms the global. Precisely (changed in the second review,
+  2026-09-30, after the first version could wait 30 seconds on a tag that would never fire
+  again, and fail while another script had defined a usable Stripe.js):
+  - The call resolves when the tag loads (the global is then confirmed), and as soon as
+    Stripe.js is there, which it checks every 100 ms, since another script, such as the
+    page's own v3 tag, may define it meanwhile.
+  - When the tag fails, it ran nothing and is removed; when 30 seconds pass, it is kept. In
+    both cases the call resolves if Stripe.js is there by then, and otherwise rejects with a
+    retryable `psp_unavailable`.
+  - The tags for the build's URL that an attempt watched settle while Stripe.js stayed
+    missing are recorded: one core injected, after it loaded, and a page's, after the wait
+    ended. The next call removes such a tag, only while Stripe.js is still missing, so that
+    core's `injectScript` injects a fresh one and reports its load or failure instead of the
+    adapter waiting on a tag that fires nothing more.
+  - Only the watched tag is recorded (changed after approval, 2026-09-30: the first version
+    recorded whichever tag for the URL came first once the attempt ended, so when the page's
+    first tag failed and was removed, a second one still loading was recorded and replaced).
+    The watched tag is the page's, or, with none on the page, the one core inserts before
+    `injectScript` returns.
+  - The record is one for the whole page, shared by every adapter (changed after approval,
+    2026-09-30: it was one per adapter, so a second adapter waited 30 seconds on a tag the
+    first had already seen settle). The tags belong to the page, and a `WeakSet` of them
+    keeps none alive, as core's own record of loading tags does.
+  - A page tag that timed out may still be loading when the next call replaces it. If both
+    copies run, they are the same build, and the second to run finds the global set and
+    only logs Stripe.js's warning about a second copy, "[Stripe.js] It looks like Stripe.js
+    was loaded more than one time. Please only load it once per page.".
+  - A page tag that failed before the adapter looked leaves no trace on the element, so the
+    first call waits the full 30 seconds; the next one replaces it. Resource Timing could
+    tell a finished fetch sooner: the Fetch standard marks resource timing for a network
+    error too ("This covers the case of response being a network error",
+    fetch.spec.whatwg.org, fetch response handover), but which engines report failed
+    script loads, and how long after its entry a fetched script runs, could not be verified
+    here, and a wrong reading would remove a tag still loading, so the adapter does not rely
+    on it (decided in implementation).
+  - Two adapters on one page: the second one, finding the first one's tag still loading,
+    waits with core's `injectScript` and, once that tag has loaded Stripe.js, does not wait
+    again.
+- **The adapter's calls exist in every build.** The dahlia changelog
+  (docs.stripe.com/changelog/dahlia/2026-03-25/remove-legacy-stripejs-methods) removes
+  `handleCardPayment`, `confirmPaymentIntent`, `handleFpxPayment`, `handleCardSetup`,
+  `confirmSetupIntent`, `createSource` and `retrieveSource` ("The following methods have been
+  removed and will throw an error if called"); the adapter calls `elements`,
+  `confirmPayment`, `confirmSetup`, `retrievePaymentIntent` and `retrieveSetupIntent`, all in
+  the current reference. The builds' other breaking changes reach the host's UI and
+  `fieldOptions`, which the guide and the changeset list for hosts moving from v3 (added in
+  review, 2026-09-30), each read on its changelog page:
+  - basil's Payment Element defaults to an accordion (changelog/basil/2025-03-31/
+    default-layout-of-payment-element: "To migrate, either set the layout value to `tabs` or
+    change your design to match the `accordion` layout."). The adapter hands `fieldOptions`
+    to `elements.create("payment", …)` untouched, and docs.stripe.com/js/elements_object/
+    create_payment_element says of `layout`: "If you only pass a layout type (`'accordion'`
+    or `‘tabs’`) without any additional parameters, the Payment Element renders using that
+    layout and the default values associated with it.", so `fieldOptions={{ layout: "tabs" }}`
+    on `<PaymentFields>` keeps tabs.
+  - clover: "A postal code is no longer collected for all card payments on Checkout and
+    Payment Element in the following regions: Canada, United Kingdom, Puerto Rico"
+    (changelog/clover/2025-09-30/postal_code_in_card_form_for_non_us_countries), and
+    "Elements validates the Intent state and returns an error to your integration instead of
+    rendering a non-functional payment form" (changelog/clover/2025-09-30/client-secret-reuse),
+    which reaches the host's `onError` through the Payment Element's `loaderror`. That check
+    follows the API version, not the build ("This validation only applies when using API
+    version `2025-09-30.clover` or later"), so a page's v3 given a clover or later version
+    makes it too; the guide and the changeset say so (added in the second review,
+    2026-09-30).
+  - dahlia: "Attempting to set `options.layout.radios` to a value not on its enum list now
+    throws an integration error." (changelog/dahlia/2026-03-25/disallow-booleans-for-radios),
+    so a boolean in `fieldOptions.layout.radios` makes `mount()` reject.
+  - From clover on, the sandbox testing assistant shows
+    (docs.stripe.com/sdks/stripejs-testing-assistant: "By default, Stripe automatically
+    enables the testing assistant for integrations using Elements with the Checkout Sessions
+    API or for those using Elements with the Payment Intents API on Clover version or
+    later.", and it "doesn’t appear in live mode").
+- **`hideTestingAssistant`** (added in review, 2026-09-30). docs.stripe.com/js/initializing
+  lists the `Stripe()` option `developerTools.assistant.enabled`: "Set to `false` to disable
+  the sandbox assistant UI."; the testing assistant page: "To hide the testing assistant, set
+  the `developerTools.assistant.enabled` option to `false` when you set up Elements." The
+  served files (corrected in the second review, as the first version said `enabled` defaults
+  to true) validate `developerTools` as `{ assistant: { enabled } }`, leaving `enabled` unset
+  by default, and decide when Elements is created: the host's `enabled` if it gave one;
+  otherwise shown for Elements with Checkout Sessions; otherwise the build's own default,
+  which their table of builds sets off for v3, acacia and basil and on from clover, dahlia
+  inheriting it. `hideTestingAssistant: true` passes `developerTools: { assistant: { enabled:
+  false } }` on every build; unset or `false` passes nothing and leaves Stripe's default,
+  since only `false` has a documented effect.
+- **CSP re-verified.** docs.stripe.com/security/guide lists for Stripe.js "`connect-src`,
+  `https://api.stripe.com`, `https://maps.googleapis.com`", "`frame-src`,
+  `https://*.js.stripe.com`, `https://js.stripe.com`, `https://hooks.stripe.com`" and
+  "`script-src`, `https://*.js.stripe.com`, `https://js.stripe.com`,
+  `https://maps.googleapis.com`", as on 2026-09-26, so the onboarding descriptor and the
+  guide's list stand. A build loads from `/<release>/stripe.js`, and the served files take
+  their lazy chunks and their frames from `https://js.stripe.com/v3/`: host sources cover
+  both, a path-narrowed source cannot, and the guide now says to list hosts. The same page says "If you’re using Trusted
+  Types, you must allow dynamic scripts to be loaded from `https://js.stripe.com` and
+  `https://*.js.stripe.com`", which the guide now repeats: the adapter's own `<script>` needs
+  it.
+- **Error codes: no gap.** Both halves read the same codes in the same order (compared
+  2026-09-30: the invalid-card-data, fraud and failed-authentication sets are identical, but
+  for Stripe.js's own `incomplete_*` field codes in the browser). The builds the adapter loads
+  speak versions older than 2026-08-26.dahlia, which added `authentication_failure`,
+  `expired_payment_method`, `incorrect_postal_code` and `payment_method_restricted`
+  (docs.stripe.com/changelog/dahlia/2026-08-26/adds-payment-method-error-codes: "This change
+  does not remove any error codes"), so on a build the adapter loads the browser meets the
+  older codes today, while v3 speaks whatever version it is given: a dated one where the
+  adapter loads v3, and on a page that runs its own v3 the pinned version, a release's
+  included, so a page's v3 given `2026-08-26.dahlia` meets the new codes (corrected in the
+  second review, 2026-09-30). Both forms are mapped. The browser tests now also pin
+  `payment_method_restricted` (a decline, or `fraud_suspected` with `lost_card`) and
+  `expired_card` as an error code, as the server's do. Not changed, as it does not depend on
+  the version: the halves read error *types* differently (the server maps rate limits,
+  connection and API errors and invalid requests by the SDK's error class; the browser
+  reports an unrecognized Stripe.js error as `unknown`). Aligning them needs the types
+  Stripe.js reports, which its reference does not list.
+- **Demo.** `examples/demo/src/stripe-api-version.ts` holds the one pin both halves import. It
+  stays `2024-06-20`: the demo keeps v3, whose requests now carry that version.
+- **Release.** `@payfanout/adapter-stripe` takes a major, 0.3.3 to 1.0.0, as
+  `@payfanout/adapter-adyen` (0.1.0 to 1.0.0) and `@payfanout/adapter-worldline` (0.1.2 to
+  1.0.0) did for their breaking changes (changed in review, 2026-09-30: the first version
+  took a minor): `apiVersion` is required, `sdkUrl` is refused, and the builds from basil on
+  change the Payment Element's behavior for hosts moving from v3.
+- **Tests.** `test/stripe-client-version.test.ts` pins the URL for each known release and
+  several of its versions, `Stripe()` without an `apiVersion` for them (the test double
+  throws on one, as the served builds do), v3 with the pinned version for dates alone, with
+  and without a locale, in `mount()` and `handleRedirectReturn()`, and each refusal (missing,
+  malformed, a date alone from 2024-09-30 on, unknown release, preview, beta headers,
+  `sdkUrl` before `apiVersion`) with its message; `hideTestingAssistant` on both kinds of
+  build, unset, `false` and malformed; and a Stripe.js already there: the pinned build used
+  without loading or warning, a page's v3 given the pinned version, a release's included,
+  another release's build used as it is with one warning in a sandbox and none in live mode,
+  a v2 global beside which the build loads and its `StripeV3` is used, a `version` naming no
+  build used as the pinned build, and a build another script defined while the adapter's
+  loaded. The second review added the dates that do not exist (February 29 outside leap
+  years, a 31st in a 30-day month, next to the leap days and last days that do) and release
+  names dated before 2024-09-30. `test/stripe-client-page.test.ts` runs in jsdom: a real
+  `window.Stripe` of the pinned build or of v3, a v2 global, and a page's own tag waited for
+  until it loads, failing and removed so the retry injects the file again, given up on after
+  30 seconds and kept, no timer left once it loads, and no wait on the adapter's own tag;
+  since the second review also another script's Stripe.js ending the wait early, or making
+  the tag's failure or the end of the wait resolve the call, a page tag that failed before
+  the adapter looked replaced by the next call after the first one timed out, the adapter's
+  own tag that loaded without Stripe.js replaced at once, twice, and a second adapter that
+  found the first one's tag loading not waiting once it has loaded Stripe.js; and after
+  approval, a second page tag for the URL, still loading when the first failed, waited on by
+  the next call rather than replaced, and a tag one adapter saw load without Stripe.js
+  replaced at once by another adapter.
+  `test/stripe-client-csp.test.ts` pins the nonce on both URLs. The first version's 33
+  mutations each made a test fail (every release loading v3, a release URL without
+  `/stripe.js`, v3 with a trailing slash, the dated version not passed to `Stripe()` or a
+  release's passed, an unknown release accepted, `endive` added or `basil` dropped, the
+  version pattern unanchored or loosened on month, day or case, the empty or missing version
+  reported wrongly, `sdkUrl` ignored, the seam given the v3 URL, the nonce dropped, the
+  locale or the redirect return's locale lost, empty `Stripe()` options instead of none, the
+  fraud and `expired_card` error-code steps removed, and ten on the refusal of another
+  build, which review replaced). The review's 31 did too: beta headers, a date alone from
+  2024-09-30 on and a preview version accepted, the date boundary moved, the oldest release
+  named as the newest, `sdkUrl` checked after `apiVersion`, `hideTestingAssistant` ignored,
+  inverted, sent when `false` or unchecked, a page's v3 not given a release's version, a
+  `version` naming no build always or never treated as v3, the warning dropped, given in
+  live mode, repeated, or given for v3 or for the pinned build, any number read as v3, v3
+  not recognised, the release pattern unanchored, a v2 global used as it is or detected on
+  another number, a page tag not waited for, the adapter's own tag waited for, a page tag's
+  error ignored, a failed page tag kept, the wait bound shortened, its timer left running
+  after a load, and a load read as a failure. The second review's 20 did too: the calendar
+  check removed, the century or 400-year leap rule dropped, February always or never given
+  29 days, April or every 30-day month given 31, the month read one off, a month's last day
+  refused, a release name before 2024-09-30 accepted or the boundary moved, the version not
+  cut to its date, the poll for another script's Stripe.js removed, slowed to a second or
+  left running, a failed or ended wait resolving nothing, settled tags not recorded or not
+  removed, a removed tag still waited on, and the second adapter waiting on a tag that
+  loaded Stripe.js. The five after approval did too: the record kept per adapter, whichever
+  tag came first recorded instead of the watched one, the tag core injected never recorded,
+  and a recorded tag not removed or nothing recorded.
+- **Sandbox checks, not run.** In a sandbox page on the dahlia build, the `Stripe-Version` of
+  Stripe.js's requests (the browser's network panel) shows which version the build speaks. A
+  confirmation with the expired-card test card under v3 with `2024-06-20` and under dahlia
+  shows the code each returns. Mounting a PaymentIntent that already succeeded under a clover
+  or later build records the `type` and `code` of the `loaderror` error clover added, which
+  the browser maps by those. A page running v3 with a basil or later version given as
+  `apiVersion` (the adapter's handling of a page's own v3) needs a confirmation in a sandbox,
+  with the `Stripe-Version` of its requests read the same way.
+
+## Trusted Types and the SDK loader (2026-09-30)
+
+- **A refused script URL is an `invalid_request`.** Under `require-trusted-types-for 'script'`
+  the `src` setter of a `<script>` runs "Get Trusted Type compliant string": a policy's error is
+  rethrown, and a default policy's null or undefined result throws a TypeError, as does a page
+  with no default policy (MDN's HTMLScriptElement.src: thrown "if the property is set with a
+  string when Trusted Types are enforced by a CSP and no default policy is defined"; the W3C
+  Trusted Types draft, read 2026-09-30). Core's `injectScript` assigned the URL inside its
+  promise executor, so every client adapter's `loadSdk()` rejected with that bare exception. It
+  now rejects with a non-retryable `invalid_request` attributed to the PSP, the exception on
+  `raw`, and inserts nothing: the page's own policy refused the URL, so a retry cannot help.
+- **PayFanout creates no policy.** The adapters load their SDKs by URL and the host's default
+  policy decides; the providers page asks for one that returns the URL only for the hosts each
+  set-up guide lists. The specification warns that "a lax, no-op default policy defeats all the
+  benefits of using Trusted Types" and advises a default policy "in a transitional period
+  only", which is why the guidance names the hosts rather than accepting any URL. An opt-in
+  named policy is parked in future-designs.md. The directive also governs HTML and script-text
+  sinks, so a PSP SDK that writes to one meets the same policy on its own terms; that is the
+  PSP's code, outside the loader, so the guide asks hosts to try each SDK under enforcement.
+
+## PayZen PSP_ codes on both halves (2026-09-30)
+
+- **The halves read PSP_ codes differently.** The server adapter maps a PSP_ code through
+  its PSP code map, a code outside it being a non-retryable `processing_error`. The browser
+  adapter sent a PSP_ code from `KR.onError` to the form's generic branch, a retryable
+  `processing_error`, and read one on an unpaid order's last transaction by its
+  `detailedErrorCode` through the acquirer map, else `card_declined`. On a payment answer a
+  PSP_ code's `detailedErrorCode` is PayZen's own (39 for PSP_539, 207 for PSP_707, 208 for
+  PSP_708 in the use cases below), not an acquirer's, so a 51 there would have read as
+  `insufficient_funds`; PSP_101, a refund refusal that carries the acquirer's code there, as
+  the page says and the server reads it, never reaches the browser. Both halves now hold one
+  PSP code map, kept identical by the server suite's map-parity test beside the acquirer and
+  AUTH_ maps, and the browser's transaction-error helper reads PSP_ answers from either source
+  through it: a refusal is never retryable, and an outage or a rate limit is, as core makes
+  `psp_unavailable` and `rate_limited`. A PSP_ code the map does not list reads as
+  `processing_error` on both halves; on an unpaid transaction it read as `card_declined`
+  before, which is why the map now holds every payment refusal the page documents but one
+  whose class the page leaves open (below). A smartForm
+  host that retries on a retryable failure stops retrying on PSP_ answers from `KR.onError`,
+  which were retryable before. `PSP_108` moved from the browser's CLIENT_ map into the shared
+  map, with the same `session_expired`. The parity test reads every entry of a map, comments
+  dropped and several entries on one line included (changed in review, 2026-09-30: it read one
+  entry per line, so two entries on one line of one map passed unnoticed).
+- **Doc-verified 2026-09-30** through PayZen's content API against the PSP_ error page
+  (payzen.io/en-EN/rest/V4.0/api/errors_psp.html) and the 3-D Secure use cases, none marked
+  deprecated: "Challenge authentication, without the 3DS Method" (pci/createtoken/3ds2/
+  challenge.html) answers a failed authentication with PSP_539 "3D Secure refusal for the
+  transaction" and detail 39; "Authentication Challenge failed or abandoned during the
+  challenge" (pci/v2/createpayment/external-authentication/3ds2/challenge_failed.html) and
+  "Challenge authentication timeout" (pci/v2/createpayment/3ds2/timeout.html) answer the same;
+  "Authentication rejected" (pci/v2/createpayment/3ds2/rejected.html) answers PSP_707
+  "Authentication refused by the issuer", detail 207 "Authentication refusal from emisor for
+  this transaction"; "Authentification impossible" (pci/v2/createpayment/
+  external-authentication/3ds2/challenge_unavailable.html, authentication status
+  UNAVAILABLE) answers PSP_708, detail 208 "3D Secure - Refusal because the emisor could not
+  authenticate". The error page reads PSP_539 "3D Secure refused for the transaction.", PSP_707
+  "3D Secure - Refusal of the authentication by the issuer.", PSP_708 "3D Secure - Refusal as
+  authentication by the issuer is impossible.", PSP_052 "The ACS signature is invalid.",
+  PSP_053 "3DS technical error.", PSP_054 "Incorrect 3DS parameter." and PSP_055 "3DS
+  disabled.".
+- **Classified by the rule the other adapters follow** ("A failed cardholder authentication
+  is `authentication_required`; a 3-D Secure that could not complete is `processing_error`",
+  above). PSP_539, a challenge the cardholder failed, abandoned or let time out, stays
+  `authentication_required`, as PSP_136 (a 3-D Secure session that expired) does. PSP_707 is
+  `card_declined`: the issuer refused the authentication, so authenticating again with the same
+  card cannot succeed and another card can. That is a third category beside the rule's two.
+  The page's one example is a frictionless authentication with status REJECTED,
+  `transStatusReason` "10" and reason `STOLEN_CARD`, which the ACQ_ codes would read as
+  `fraud_suspected` (41/43); the code covers every reason an issuer rejects for, so it stays
+  `card_declined`, whose message the customer sees either way. PSP_708 is `processing_error`:
+  the issuer could not run the authentication. PSP_052 to PSP_055 describe what AUTH_100 to
+  AUTH_103 do and read the same way: `processing_error` for the invalid ACS signature and the
+  technical error, `invalid_request` for the incorrect parameter and a disabled 3-D Secure.
+  None is retryable.
+- **The page's other refusals and technical errors, mapped** (added in review, 2026-09-30).
+  `card_declined`: PSP_003 "Payment refused.", PSP_091 "Payment method refused.", PSP_575 "The
+  operation has been rejected by PayPal.", PSP_624 "Inactive card.", PSP_625 "Payment refused
+  by the acquirer.", PSP_534 "Failed verification of the card requiring systematic
+  verification.", PSP_535 "Failed e-Carte Bleue verification.", PSP_572 "The authorization has
+  been declined by Cofinoga.", PSP_573 "Refusal of authorization for 1 euro (or request for
+  information from the CB network if supported by the acquirer).", PSP_600 "Failed commercial
+  card verification.", PSP_601 "Declined due the refusal of the first installment.", and the
+  merchant's liability-shift rules PSP_611 "Refusal of transactions without Liability shift"
+  and PSP_636 "Refusal of derivative transactions, without a Liability shift for the primary
+  transaction.". The page gives no remedy for these two; the adapter reads them as refusals,
+  not `authentication_required`, as nothing on the page says a new authentication of the same
+  card would obtain the liability shift. `fraud_suspected`, as PSP_536: PSP_641 "The
+  transaction has been declined by the risk analyzer." and PSP_647 "The risk management module has requested for
+  this transaction to be declined.". `authentication_required`: PSP_649 "The payment session has
+  expired (the buyer has been redirected to the ACS and has not finalized the 3D Secure
+  authentication).", PSP_716 "OTP expired.", PSP_717 "Invalid OTP." and PSP_722 "The
+  authentication has been canceled.". `invalid_request`: PSP_718 "Invalid authentication
+  settings.". `psp_unavailable`: every other code the page gives "Technical error." (PSP_996,
+  as PSP_999), "A technical error has occurred." (PSP_594) or "Due to a technical problem, we
+  are unable to process your request." (PSP_555, 569, 577, 585, 587, 608, 643, 648, 650, 652
+  and 658, as PSP_513; 648 and 650 add "Transaction has not been created."). The suite checks
+  each of those codes.
+- **Left to the default `processing_error`, whose class the page leaves open**
+  (2026-09-30). PSP_642 "The card type used is not valid for the requested payment mode." may
+  be a card another card replaces or a shop setting for that mode. PSP_609 "The timeout has
+  been exceeded during buyer redirection." names nothing that timed out. PSP_639 "Refund
+  refused." names no refuser, unlike PSP_101, whose issuer refusal reads as `card_declined`.
+  PSP_679 "The transaction status is unknown." says the outcome is not known, which a code
+  alone cannot carry: it wants `outcomeUnknown` (#282). The page's 3-D Secure technical
+  errors (PSP_605, 713, 719, 720 and 997) already read as the rule's `processing_error`
+  through the default.
+- **Every other mapped PSP_ code re-read against the page.** Each definition supports its
+  mapping except these, left as they were. PSP_203 ("An error occurred while adding to the
+  grey list"), PSP_204 ("An error occurred during the verification of the data in the grey
+  list") and PSP_205 ("Data already present in the grey list") are mapped to
+  `fraud_suspected`, but the page describes grey-list operations, not refusals, and nothing
+  says when a payment answers one. PSP_099 ("Too many attempts.") is mapped to a retryable
+  `rate_limited`, but CreatePayment's `transactionOptions.cardOptions.retry` reads "Number of
+  new attempts available in case the payment is rejected (1 by default)."
+  (payzen.io/en-EN/rest/V4.0/api/playground/Charge/CreatePayment), and the server sets none, so
+  the code may mean a form token's attempts are spent, which no retry recovers. AMBIGUOUS: a
+  sandbox payment with a card on the shop's grey list, and two refused attempts on one sandbox
+  form token, would show which codes those answers carry; until then they keep their mapping.
+- **Eight mutations** (the browser's PSP_ branch dropped, PSP_ codes kept out of it on
+  `KR.onError`, a rate limit made non-retryable, the acquirer map read first for PSP_ codes,
+  PSP_707 dropped, PSP_708 read as a decline, the browser's map diverging from the server's,
+  and two extra entries on one line of the browser's map) each made a test fail, and so did
+  six on the review's additions (a new refusal or technical-error entry dropped or
+  reclassified, on both halves or on one, and a computed entry in the browser's map).
+
+## No invented currencies (2026-09-30)
+
+- **The gap.** When a PSP record stated no currency, four server adapters reported one
+  anyway: PayPal `USD` (seven sites, three of them the currency of an amount it sends: a
+  capture, a partial refund and an amount-only session update), GoCardless `GBP` (three),
+  Paysafe `USD` (two), and Stripe `USD` on the amountless answer of `verifyPaymentMethod`.
+  PayPal's subscription projection, PayZen's payment and subscription reads and Stripe's
+  subscription read reported `""`, which core's `normalizeCurrency` rejects. A Paysafe JPY
+  1,500 payment read without its currency reported as USD 15.00.
+- **The provider schemas.** PayPal's Orders v2 and Payments v2 schemas
+  (`developer.paypal.com/api/orders/v2/schema.json` and `/api/payments/v2/schema.json`,
+  read 2026-09-30) make `amount` optional on purchase units, authorizations, captures and
+  refunds, and require `currency_code` on every money object. Paysafe's Payments API spec
+  (`paysafe-ph-payments-api.yaml`, read 2026-09-30) requires `currencyCode` on the payment
+  POST /payments returns (201) and GET /payments/{paymentId} returns (200). GoCardless's
+  OpenAPI spec (`openapi-schema-public.json`, read 2026-09-30) marks no response field
+  required, `id` included, so it settles nothing either way.
+- **The rule.** A record reports the PSP's own currency, else one the adapter trusts
+  (PayPal: any money object of the same purchase unit, whose records share the order's one
+  currency, and for a capture or refund read on its own, the capture's order; GoCardless:
+  a payment's billing request `payment_request`; PayZen: a transaction's
+  `orderDetails.orderCurrency`, which the V4 Transaction schema requires; Worldline: on a
+  3-D Secure challenge, the session's currency), else core's new `NO_CURRENCY` (`"XXX"`,
+  ISO 4217's code for "no currency involved"), which the Adyen and Worldline adapters
+  already reported and now take from core. A SetupIntent moves no money, so Stripe's
+  verification answer reports it too. The record reads this change touches go through
+  core's new `firstCurrencyCode`, the first candidate that is three letters once trimmed
+  and uppercased, so an empty or malformed code (`""`, `"EURO"`) falls through to the next
+  source instead of being reported; so does Worldline's check that a completion's payment
+  is the session's. Stripe scales a subscription's amount by that same reading, so a
+  subscription stating `""` over an ISK price reports ISK with its amount converted from
+  Stripe's units. Webhook mappers and Stripe's PaymentIntent reads, whose currency the
+  providers require, read the field as before.
+- **Why a related record can stand in.** PayPal's Orders v2 error messages refuse
+  `MULTI_CURRENCY_ORDER` ("Entire Order request must have the same currency_code") and
+  `AUTHORIZATION_CURRENCY_MISMATCH` (an authorization in another currency than the
+  order's) (`developer.paypal.com/api/orders/v2/error-messages`), and its Payments v2
+  schema says "Currency of capture must be the same as currency of authorization" and
+  "Refund must be in the same currency as the capture"
+  (`developer.paypal.com/api/payments/v2/schema.json`), both read 2026-09-30. GoCardless
+  describes a billing request's `payment_request_payment` link as the "ID of the payment
+  that was created from this payment request"; the adapter reads the billing request's
+  currency only for a payment it reached through that link.
+- **Nothing is sent in a guessed currency.** When no record of the payment states its
+  currency, PayPal refuses a capture amount, a partial refund and an amount-only session
+  update with `invalid_request` before sending. A refund in full sends no amount and still
+  goes through, and so does a capture of all of an authorization nothing was taken from,
+  which PayPal captures in full when no amount is sent; the remainder of a partly captured
+  one is refused, because without an amount PayPal would take the authorization's full
+  amount. A PayPal value whose money object and records state no currency reads with
+  `NO_CURRENCY`'s default exponent under a record that reports `NO_CURRENCY`: throwing
+  instead would fail the answer of a capture, void or refund that has gone through. A
+  refund read, whose record has no currency field to flag the amount, first reads the
+  refunded capture and then its order, and refuses a value none of them gives a currency
+  with `processing_error`; a refund call's answer reads its value like any other and falls
+  back to the amount asked when it has none. A session update that only restates the
+  order's own currency no longer sends a PATCH, which re-sent the amount it read (0 when
+  the order reported none). A full refund sends no amount, so a failed read of its
+  capture's order does not stop it; a partial refund or a refund read keeps that failure,
+  retryable. Worldline refuses a refund of a payment that states no currency instead of
+  sending `XXX`: the contract's `amountOfMoney` requires a `currencyCode`, and it does not
+  say what a refund sent without `amountOfMoney` takes. PayZen refuses such a partial
+  refund and sends a full one without the `currency` its V4 schema makes optional (only
+  `uuid` is required on RefundRequest and CancelOrRefundRequest, read 2026-09-30) instead
+  of sending `""`. Core does not screen `XXX` as an input currency: a session in it goes
+  to the adapter, whose PSP refuses it as it would any code it does not take.
+- **Not changed.** An amount a PSP omits still reads as 0, as before. Paysafe card refunds
+  that state no currency keep their earlier rule (see "Card refunds and settlements may
+  state no currency: AMBIGUOUS" above): a refund reports no currency field. Nineteen
+  mutations of the first version (each guard dropped, each fallback set back to its old
+  guess, the related-record sources removed, the restated-currency PATCH re-enabled, a
+  currency-less value thrown on instead of read, the refund read's refusal dropped) each
+  made a test fail, and so did twenty-two of the final one (`firstCurrencyCode`'s shape
+  check, trim or fall-through dropped, each adapter's read set back to its old form, each
+  capture and order lookup removed or made to throw on a 404, the untouched-authorization
+  exemption widened or removed), and thirteen more in review (the exemption's check that
+  the whole authorization is captured, each lookup's retryable failure and the full
+  refund's tolerance of one, the Worldline session fallback, session check and refund
+  refusal, PayZen's order currency and refund paths).

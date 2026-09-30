@@ -3,10 +3,13 @@ import fc from "fast-check";
 import {
   allocate,
   assertMinorUnitAmount,
+  firstCurrencyCode,
   formatMinorUnits,
   fromMinorUnits,
   getCurrencyExponent,
   isPayFanoutError,
+  NO_CURRENCY,
+  normalizeCurrency,
   toMinorUnits,
 } from "@payfanout/core";
 
@@ -24,6 +27,20 @@ describe("currency exponents", () => {
   it("knows three-decimal currencies", () => {
     expect(getCurrencyExponent("BHD")).toBe(3);
     expect(getCurrencyExponent("KWD")).toBe(3);
+  });
+
+  it("reads NO_CURRENCY, ISO 4217's XXX, as a well-formed code with the default exponent", () => {
+    expect(NO_CURRENCY).toBe("XXX");
+    expect(normalizeCurrency(NO_CURRENCY)).toBe("XXX");
+    expect(getCurrencyExponent(NO_CURRENCY)).toBe(2);
+    expect(formatMinorUnits(1050, NO_CURRENCY)).toBe("10.50");
+  });
+
+  it("takes the first candidate that is a currency code once trimmed and uppercased", () => {
+    expect(firstCurrencyCode(" eur ")).toBe("EUR");
+    expect(firstCurrencyCode(undefined, "", "EURO", 978, "gbp", "USD")).toBe("GBP");
+    expect(firstCurrencyCode("E1R", "  ", null, {})).toBeUndefined();
+    expect(firstCurrencyCode()).toBeUndefined();
   });
 
   it("rejects malformed codes", () => {

@@ -1,5 +1,17 @@
 import type { AdapterCapabilities } from "./model.js";
 import type { CreatePaymentSessionInput } from "./adapters.js";
+import { firstCurrencyCode } from "./currency.js";
+
+/**
+ * An `unsupportedCurrencies` entry as screening compares it, trimmed and
+ * uppercased, or undefined for one that can never match a session's currency:
+ * not a string, or not three letters in that form. validateAdapterCapabilities
+ * reads entries through this too, so registration rejects exactly the entries
+ * screening could never match.
+ */
+export function listedCurrencyCode(entry: unknown): string | undefined {
+  return firstCurrencyCode(entry);
+}
 
 /**
  * Static capability screening for a session input — the single source of
@@ -23,6 +35,17 @@ export function screenSessionInput(
     if (!caps.supportedCurrencies.some((c) => c.toUpperCase() === currency)) {
       return `"${psp}" does not support currency ${String(input.currency)}`;
     }
+  }
+  // Worded as the adapter's own declaration: the adapter refuses the currency,
+  // which says nothing about what its PSP takes. An entry that can never match
+  // must not match a session that states no currency either.
+  if (
+    caps.unsupportedCurrencies?.some((c) => {
+      const code = listedCurrencyCode(c);
+      return code !== undefined && code === currency;
+    })
+  ) {
+    return `"${psp}" declares currency ${currency} unsupported`;
   }
   if (input.captureMethod === "manual" && !caps.supportsManualCapture) {
     return `"${psp}" does not support manual capture`;

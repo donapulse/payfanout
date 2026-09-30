@@ -1,6 +1,5 @@
 import {
   assertMinorUnitAmount,
-  getCurrencyExponent,
   lowercaseKeys,
   NATIVE_SUBSCRIPTION_INTERVALS,
   normalizeCurrency,
@@ -44,10 +43,21 @@ import {
   type VerifyCredentialsResult,
   type VerifyPaymentMethodInput,
 } from "@payfanout/core";
+import {
+  assertReportablePage,
+  assertSendableCurrency,
+  assertThreeDecimalRule,
+  readStripeAmounts,
+  refusesUnconverted,
+  toStripeAmount,
+  type RecordUse,
+  type StripeRecord,
+} from "./currency-units.js";
 import { mapStripeError } from "./error-map.js";
 import type {
   StripeChargeLike,
   StripeClientLike,
+  StripeListLike,
   StripePaymentIntentLike,
   StripePaymentMethodLike,
   StripeRefundLike,
@@ -98,6 +108,53 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
   { type: "bacs_debit", flow: "embedded", supported: true, currencies: ["GBP"], countries: ["GB"] },
 ];
 
+/**
+ * The Stripe server adapter: PaymentIntents, Refunds, Customers and Billing
+ * over the Stripe Node SDK, confirm-on-client.
+ *
+ * Amounts cross it in PayFanout's minor units (core's getCurrencyExponent,
+ * which follows ISO 4217) and are converted where Stripe's API reads a
+ * currency in other units (see "Currencies with Stripe-specific units" in the
+ * setup guide). ISK is sent multiplied by 100 and reported divided by 100, as
+ * Stripe takes it as a two-decimal value whose decimals are always 00; an ISK
+ * amount Stripe reports that is not a multiple of 100 cannot be reported and
+ * fails the read. MGA, a zero-decimal currency at Stripe, is sent divided by
+ * 100 and reported multiplied by 100, and an MGA amount that is not whole
+ * ariary (a multiple of 100) is refused with `invalid_request` before any
+ * request. Where the caller names the currency (session creation, an update
+ * naming amount and currency, saved-method charges, native subscriptions),
+ * three-decimal amounts must be multiples of 10, a rule from an earlier
+ * version of Stripe's currencies page that the adapter keeps.
+ *
+ * UGX is refused, as Stripe's currencies page gives it both units: a call
+ * that would send a UGX amount rejects with `invalid_request` before the
+ * request that would carry it; reads of a UGX record reject with
+ * `unsupported_operation`, as do the answers of calls that went through
+ * without sending an amount (a capture, cancellation or refund with no amount,
+ * a metadata-only update, a subscription cancellation), marked outcomeUnknown;
+ * a list page holding one fails whole, its `raw` naming each such record and
+ * carrying the page's `nextCursor`; and webhook and polled events in UGX carry
+ * no `amount`. A zero-amount session is a SetupIntent, which carries no
+ * amount or currency, and is left alone in every currency.
+ *
+ * Earlier releases sent UGX amounts, and MGA amounts that are not whole
+ * ariary, unconverted, so a retry under the same key after the upgrade may
+ * meet money they already moved. Their refusal is therefore marked
+ * outcomeUnknown on `chargeSavedPaymentMethod` and `createNativeSubscription`,
+ * whose earlier attempt the adapter cannot read back; on `capturePayment`,
+ * unless the PaymentIntent it reads is still `requires_capture`; on
+ * `refundPayment`, unless the PaymentIntent's refund list, read on the way to
+ * the refusal, is complete and holds only failed or canceled refunds; and on
+ * `updatePaymentSession` when the update names UGX or sends an amount for a
+ * UGX PaymentIntent (a currency change away from a UGX PaymentIntent, whose
+ * amount cannot be kept, is refused final). These refusals, final or not, ask
+ * the host to check the Stripe Dashboard for that request under the
+ * idempotency key before sending another.
+ *
+ * `updatePaymentSession`, `capturePayment` and `refundPayment` read the
+ * PaymentIntent first whenever the currency of the amount they send is not
+ * in the call (see each method), one more request each time.
+ */
 export class StripeServerAdapter implements ServerPaymentAdapter {
   readonly pspName = STRIPE_PSP_NAME;
   private readonly config: StripeServerAdapterConfig;
@@ -173,24 +230,19 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {
     assertMinorUnitAmount(input.amount, "amount");
     const currency = normalizeCurrency(input.currency);
-    // Stripe expresses amounts in the same integer minor units as core, but
-    // requires three-decimal currency amounts to end in 0 (e.g. BHD 1000, not 1001).
-    if (getCurrencyExponent(currency) === 3 && input.amount % 10 !== 0) {
-      throw PayFanoutError.invalidRequest(
-        `Stripe requires three-decimal ${currency} amounts to be a multiple of 10 minor units, got ${input.amount}`,
-      );
-    }
-
     if (input.savePaymentMethod && !input.customer) {
       throw PayFanoutError.invalidRequest(
         "savePaymentMethod requires `customer` — create one with createCustomer first",
       );
     }
+    // A SetupIntent carries no amount or currency, so no unit applies to it.
     if (input.amount === 0) return this.createVerificationSession(input, currency);
 
+    const amount = toStripeAmount(input.amount, currency, { label: "amount" });
+    assertThreeDecimalRule(input.amount, currency);
     const metadata = withPayfanoutId(input.metadata, input.id);
     const params: Record<string, unknown> = {
-      amount: input.amount,
+      amount,
       currency: currency.toLowerCase(),
       capture_method: input.captureMethod ?? "automatic",
       ...(metadata ? { metadata } : {}),
@@ -205,7 +257,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
 
     return this.run(async (client) => {
       const pi = await client.paymentIntents.create(params, { idempotencyKey: input.idempotencyKey });
-      return this.toPaymentSession(pi, input.id, metadata);
+      return this.toPaymentSession(pi, input.id, metadata, { kind: "answer", action: "session creation" });
     });
   }
 
@@ -213,6 +265,27 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
    * Cart total changed? Stripe PaymentIntents update in place — same
    * pspSessionId, same clientSecret, no client remount needed (the Payment
    * Element re-fetches the amount on confirm).
+   *
+   * Stripe's units for the amount depend on the currency, so an update that
+   * carries `amount` without `currency`, or `currency` without `amount`,
+   * first reads the PaymentIntent (GET /v1/payment_intents/:id, one more
+   * request): the first to learn the currency the amount is sent in, the
+   * second to keep the session's amount, in PayFanout's minor units, across
+   * the change. A currency change always sends the kept amount converted for
+   * the new currency, so its parameters depend only on the state it asks for
+   * and a retry under the same key sends the same request: a session of
+   * amount 1000 moved from ISK to USD still has amount 1000 (USD 10.00),
+   * where Stripe alone would keep its 100000 (USD 1,000.00). An update that
+   * names both, or neither, reads nothing first. Refusals of the amount (UGX,
+   * MGA amounts that are not whole ariary, and, when the update names both
+   * amount and currency, three-decimal amounts that are not multiples of 10)
+   * come before the update is sent. A UGX refusal, whether the update names
+   * UGX or sends an amount for a UGX PaymentIntent, is marked outcomeUnknown,
+   * as an earlier release sent such updates unconverted under the same key.
+   *
+   * A currency change without an amount writes the amount it read, so an
+   * amount update landing between that read and its write is overwritten:
+   * send the updates of one session one at a time.
    */
   async updatePaymentSession(input: UpdatePaymentSessionInput): Promise<PaymentSession> {
     if (input.pspSessionId.startsWith("seti_")) {
@@ -222,24 +295,44 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     }
     if (input.amount !== undefined) assertMinorUnitAmount(input.amount, "amount");
     const currency = input.currency !== undefined ? normalizeCurrency(input.currency) : undefined;
-    // The 3-decimal multiple-of-10 rule can only be pre-checked when the call
-    // names the currency; otherwise Stripe re-validates it server-side.
-    if (input.amount !== undefined && currency && getCurrencyExponent(currency) === 3 && input.amount % 10 !== 0) {
-      throw PayFanoutError.invalidRequest(
-        `Stripe requires three-decimal ${currency} amounts to be a multiple of 10 minor units, got ${input.amount}`,
-      );
+    if (currency !== undefined) {
+      assertSendableCurrency(currency, { label: "amount", sentBefore: { what: "an update", open: true } });
     }
-    const params: Record<string, unknown> = {
-      ...(input.amount !== undefined ? { amount: input.amount } : {}),
-      ...(currency ? { currency: currency.toLowerCase() } : {}),
-      ...(input.metadata ? { metadata: input.metadata } : {}),
-      ...checkoutFieldParams(input),
-    };
+    let amount: number | undefined;
+    if (input.amount !== undefined && currency !== undefined) {
+      amount = toStripeAmount(input.amount, currency, { label: "amount" });
+      assertThreeDecimalRule(input.amount, currency);
+    }
+    const fields = checkoutFieldParams(input);
     return this.run(async (client) => {
+      if (input.amount !== undefined && currency === undefined) {
+        const current = await client.paymentIntents.retrieve(input.pspSessionId);
+        amount = toStripeAmount(input.amount, current.currency, {
+          label: "amount",
+          record: {
+            ...paymentIntentRecord(current),
+            action: "update",
+            remedy:
+              "Check the Stripe Dashboard for an update under this idempotency key, then cancel it and take the " +
+              "payment with another provider",
+            outcomeUnknown: true,
+          },
+        });
+      } else if (input.amount === undefined && currency !== undefined) {
+        const current = await client.paymentIntents.retrieve(input.pspSessionId);
+        const kept = readStripeAmounts(paymentIntentRecord(current), { amount: current.amount }, { kind: "keep" });
+        amount = toStripeAmount(kept.amount, currency, { label: "the amount the currency change keeps" });
+      }
+      const params: Record<string, unknown> = {
+        ...(amount !== undefined ? { amount } : {}),
+        ...(currency ? { currency: currency.toLowerCase() } : {}),
+        ...(input.metadata ? { metadata: input.metadata } : {}),
+        ...fields,
+      };
       const pi = await client.paymentIntents.update(input.pspSessionId, params, {
         idempotencyKey: input.idempotencyKey,
       });
-      return this.toPaymentSession(pi, pi.metadata?.payfanout_id, pi.metadata);
+      return this.toPaymentSession(pi, pi.metadata?.payfanout_id, pi.metadata, { kind: "answer", action: "update" });
     });
   }
 
@@ -253,6 +346,18 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     });
   }
 
+  /**
+   * A capture that states `amount` first reads the PaymentIntent (one more
+   * request) to send it in Stripe's units for the payment's currency, and
+   * refuses one Stripe cannot be sent (see the class notes) before the
+   * capture. An earlier release sent such captures unconverted, so the
+   * refusal of a UGX amount, or of an MGA amount that is not whole ariary, is
+   * marked outcomeUnknown unless the PaymentIntent read is still
+   * `requires_capture`, which shows nothing was captured; either way it asks
+   * the host to check the Stripe Dashboard under the key before sending
+   * another. Without `amount`, Stripe captures its own `amount_capturable`
+   * and nothing is read first.
+   */
   async capturePayment(
     pspPaymentId: string,
     amount: MinorUnitAmount | undefined,
@@ -260,35 +365,80 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
   ): Promise<PaymentInfo> {
     if (amount !== undefined) assertMinorUnitAmount(amount, "capture amount");
     return this.run(async (client) => {
-      const pi = await client.paymentIntents.capture(
-        pspPaymentId,
-        amount !== undefined ? { amount_to_capture: amount } : {},
-        { idempotencyKey },
-      );
-      return this.toPaymentInfo(pi);
+      let params: Record<string, unknown> = {};
+      if (amount !== undefined) {
+        const current = await client.paymentIntents.retrieve(pspPaymentId);
+        const moved = current.status !== "requires_capture";
+        params = {
+          amount_to_capture: toStripeAmount(amount, current.currency, {
+            label: "amount_to_capture",
+            record: {
+              ...paymentIntentRecord(current),
+              action: "capture",
+              remedy: "Check the Stripe Dashboard for a capture under this idempotency key before capturing it there",
+              outcomeUnknown: moved,
+            },
+            sentBefore: { what: "a capture", open: moved },
+          }),
+        };
+      }
+      const pi = await client.paymentIntents.capture(pspPaymentId, params, { idempotencyKey });
+      return this.toPaymentInfo(pi, { kind: "answer", action: "capture" });
     });
   }
 
   async cancelPayment(pspPaymentId: string, idempotencyKey: string): Promise<PaymentInfo> {
     return this.run(async (client) => {
       const pi = await client.paymentIntents.cancel(pspPaymentId, {}, { idempotencyKey });
-      return this.toPaymentInfo(pi);
+      return this.toPaymentInfo(pi, { kind: "answer", action: "cancellation" });
     });
   }
 
+  /**
+   * A refund that states `amount` first reads the PaymentIntent (one more
+   * request) to send it in Stripe's units for the payment's currency, and
+   * refuses one Stripe cannot be sent (see the class notes) before the
+   * refund. An earlier release sent such refunds unconverted, so on the way
+   * to refusing a UGX amount, or an MGA amount that is not whole ariary, the
+   * adapter lists the PaymentIntent's refunds (GET /v1/refunds, one request
+   * more): the refusal is final only when that list is complete and holds
+   * nothing but failed or canceled refunds, and is marked outcomeUnknown
+   * otherwise, including when the list cannot be read. Either way it asks the
+   * host to check the Stripe Dashboard under the key before sending another.
+   * A refund that is sent lists nothing. Without `amount`, Stripe refunds what
+   * remains and nothing is read first.
+   */
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
     if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
     return this.run(async (client) => {
+      let amount: number | undefined;
+      let paymentCurrency: string | undefined;
+      if (req.amount !== undefined) {
+        const current = await client.paymentIntents.retrieve(req.pspPaymentId);
+        paymentCurrency = current.currency;
+        const moved =
+          refusesUnconverted(req.amount, current.currency) && (await refundsMayHaveMoved(client, req.pspPaymentId));
+        amount = toStripeAmount(req.amount, current.currency, {
+          label: "amount",
+          record: {
+            ...paymentIntentRecord(current),
+            action: "refund",
+            remedy: "Check the Stripe Dashboard for a refund under this idempotency key before refunding it there",
+            outcomeUnknown: moved,
+          },
+          sentBefore: { what: "a refund", open: moved },
+        });
+      }
       const refund = await client.refunds.create(
         {
           payment_intent: req.pspPaymentId,
-          ...(req.amount !== undefined ? { amount: req.amount } : {}),
+          ...(amount !== undefined ? { amount } : {}),
           // RefundReason is exactly Stripe's own vocabulary — passed through as-is.
           ...(req.reason ? { reason: req.reason } : {}),
         },
         { idempotencyKey: req.idempotencyKey },
       );
-      return toRefundResult(refund);
+      return toRefundResult(refund, { kind: "answer", action: "refund" }, paymentCurrency);
     });
   }
 
@@ -319,6 +469,13 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     });
   }
 
+  /**
+   * A page holding a PaymentIntent whose amounts cannot be reported (UGX, or
+   * an ISK amount that is not a multiple of 100) fails whole with
+   * `unsupported_operation`: `raw.records` names each such PaymentIntent, and
+   * `raw.nextCursor` is the cursor the page would have carried, so later
+   * pages stay reachable (a `limit` of 1 steps past each one).
+   */
   async listPayments(input: ListPaymentsInput = {}): Promise<ListPaymentsResult> {
     const params: Record<string, unknown> = {
       limit: clampPageSize(input.limit),
@@ -328,12 +485,18 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     };
     return this.run(async (client) => {
       const page = await client.paymentIntents.list(params);
+      const nextCursor = pageCursor(page);
+      assertReportablePage(
+        page.data.map((pi) => ({ id: pi.id, currency: pi.currency, amounts: Object.values(paymentIntentAmounts(pi)) })),
+        "PaymentIntent",
+        nextCursor,
+      );
       const payments = page.data.map((pi) => this.toPaymentInfo(pi));
-      const last = page.data[page.data.length - 1];
-      return { payments, ...(page.has_more && last ? { nextCursor: last.id } : {}) };
+      return { payments, ...(nextCursor !== undefined ? { nextCursor } : {}) };
     });
   }
 
+  /** A page holding a refund whose amount cannot be reported fails whole, as listPayments describes. */
   async listRefunds(input: ListRefundsInput = {}): Promise<ListRefundsResult> {
     const params: Record<string, unknown> = {
       limit: clampPageSize(input.limit),
@@ -343,9 +506,14 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     };
     return this.run(async (client) => {
       const page = await client.refunds.list(params);
+      const nextCursor = pageCursor(page);
+      assertReportablePage(
+        page.data.map((refund) => ({ id: refund.id, currency: refund.currency, amounts: [refund.amount] })),
+        "refund",
+        nextCursor,
+      );
       const refunds = page.data.map((refund) => toRefundInfo(refund));
-      const last = page.data[page.data.length - 1];
-      return { refunds, ...(page.has_more && last ? { nextCursor: last.id } : {}) };
+      return { refunds, ...(nextCursor !== undefined ? { nextCursor } : {}) };
     });
   }
 
@@ -355,7 +523,8 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
    * Pages GET /v1/subscriptions. Stripe's default listing is what this
    * returns: every subscription that has NOT been canceled (canceled ones are
    * excluded unless queried directly by id) — the live set an adoption flow
-   * needs, newest first.
+   * needs, newest first. A page holding a subscription whose installment
+   * cannot be reported fails whole, as listPayments describes.
    */
   async listNativeSubscriptions(input: ListNativeSubscriptionsInput = {}): Promise<ListNativeSubscriptionsResult> {
     const params: Record<string, unknown> = {
@@ -364,9 +533,14 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     };
     return this.run(async (client) => {
       const page = await client.subscriptions.list(params);
+      const nextCursor = pageCursor(page);
+      assertReportablePage(
+        page.data.map((sub) => ({ id: sub.id, currency: subscriptionCurrency(sub), amounts: [installment(sub)] })),
+        "subscription",
+        nextCursor,
+      );
       const subscriptions = page.data.map((sub) => this.toNativeSubscription(sub));
-      const last = page.data[page.data.length - 1];
-      return { subscriptions, ...(page.has_more && last ? { nextCursor: last.id } : {}) };
+      return { subscriptions, ...(nextCursor !== undefined ? { nextCursor } : {}) };
     });
   }
 
@@ -412,11 +586,12 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       throw PayFanoutError.invalidRequest("createNativeSubscription requires a positive amount");
     }
     const currency = normalizeCurrency(input.currency);
-    if (getCurrencyExponent(currency) === 3 && input.amount % 10 !== 0) {
-      throw PayFanoutError.invalidRequest(
-        `Stripe requires three-decimal ${currency} amounts to be a multiple of 10 minor units, got ${input.amount}`,
-      );
-    }
+    // Checked with a planId too, though that path sends the Price's own amount.
+    const unitAmount = toStripeAmount(input.amount, currency, {
+      label: "amount",
+      sentBefore: { what: "a subscription", open: true },
+    });
+    assertThreeDecimalRule(input.amount, currency);
     const anchor = input.startAt !== undefined ? toEpochSeconds(input.startAt, "startAt") : undefined;
     const metadata = withMerchantRef(input.metadata, input.merchantRefNum);
 
@@ -437,7 +612,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
               interval: input.interval,
               ...(input.intervalCount !== undefined ? { interval_count: input.intervalCount } : {}),
             },
-            unit_amount: input.amount,
+            unit_amount: unitAmount,
           },
         };
       }
@@ -453,7 +628,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
         },
         { idempotencyKey: input.idempotencyKey },
       );
-      return this.toNativeSubscription(sub);
+      return this.toNativeSubscription(sub, { kind: "answer", action: "subscription creation" });
     });
   }
 
@@ -463,21 +638,26 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
    * none is sent; replay safety is verified instead: when the cancel call
    * rejects, the subscription is re-fetched and an already-canceled one
    * resolves as success — a replayed cancel can never fail on its own
-   * earlier success.
+   * earlier success. A UGX subscription is cancelled all the same, but its
+   * record cannot be reported: the call rejects with `unsupported_operation`
+   * marked outcomeUnknown.
    */
   async cancelNativeSubscription(input: CancelNativeSubscriptionInput): Promise<NativeSubscriptionRecord> {
     return this.run(async (client) => {
+      let sub: StripeSubscriptionLike;
       try {
-        return this.toNativeSubscription(await client.subscriptions.cancel(input.subscriptionId));
+        sub = await client.subscriptions.cancel(input.subscriptionId);
       } catch (err) {
+        let current: StripeSubscriptionLike | undefined;
         try {
-          const sub = await client.subscriptions.retrieve(input.subscriptionId);
-          if (mapSubscriptionStatus(sub.status) === "canceled") return this.toNativeSubscription(sub);
+          current = await client.subscriptions.retrieve(input.subscriptionId);
         } catch {
           // The re-fetch adds nothing here — surface the original cancel error below.
         }
-        throw mapStripeError(err);
+        if (current === undefined || mapSubscriptionStatus(current.status) !== "canceled") throw mapStripeError(err);
+        sub = current;
       }
+      return this.toNativeSubscription(sub, { kind: "answer", action: "cancellation" });
     });
   }
 
@@ -631,16 +811,16 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
   async chargeSavedPaymentMethod(input: ChargeSavedPaymentMethodInput): Promise<PaymentInfo> {
     assertMinorUnitAmount(input.amount, "amount");
     const currency = normalizeCurrency(input.currency);
-    if (getCurrencyExponent(currency) === 3 && input.amount % 10 !== 0) {
-      throw PayFanoutError.invalidRequest(
-        `Stripe requires three-decimal ${currency} amounts to be a multiple of 10 minor units, got ${input.amount}`,
-      );
-    }
+    const amount = toStripeAmount(input.amount, currency, {
+      label: "amount",
+      sentBefore: { what: "a charge", open: true },
+    });
+    assertThreeDecimalRule(input.amount, currency);
     const metadata = withPayfanoutId(input.metadata, input.id);
     return this.run(async (client) => {
       const pi = await client.paymentIntents.create(
         {
-          amount: input.amount,
+          amount,
           currency: currency.toLowerCase(),
           customer: input.pspCustomerId,
           payment_method: input.savedPaymentMethodToken,
@@ -656,7 +836,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
         },
         { idempotencyKey: input.idempotencyKey },
       );
-      return this.toPaymentInfo(pi);
+      return this.toPaymentInfo(pi, { kind: "answer", action: "charge" });
     });
   }
 
@@ -746,13 +926,15 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     pi: StripePaymentIntentLike,
     payfanoutId: string | undefined,
     metadata: Record<string, string> | undefined,
+    use: RecordUse,
   ): PaymentSession {
+    const { amount } = readStripeAmounts(paymentIntentRecord(pi), { amount: pi.amount }, use);
     return {
       id: payfanoutId ?? pi.metadata?.payfanout_id ?? pi.id,
       pspName: this.pspName,
       pspSessionId: pi.id,
       clientSecret: pi.client_secret ?? undefined,
-      amount: pi.amount,
+      amount,
       currency: pi.currency.toUpperCase(),
       status: mapPaymentIntentStatus(pi),
       ...(metadata && Object.keys(metadata).length > 0 ? { metadata } : {}),
@@ -796,8 +978,8 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     return { payment_method_types: [...mapped] };
   }
 
-  private toPaymentInfo(pi: StripePaymentIntentLike): PaymentInfo {
-    const charge = typeof pi.latest_charge === "object" && pi.latest_charge !== null ? pi.latest_charge : undefined;
+  private toPaymentInfo(pi: StripePaymentIntentLike, use: RecordUse = { kind: "read" }): PaymentInfo {
+    const charge = expandedCharge(pi);
     const chargeType = charge?.payment_method_details?.type;
     const methodDetails = toPaymentMethodDetails(charge);
     const mandateReference = extractMandate(charge);
@@ -805,18 +987,20 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     const chargedWith =
       typeof charge?.payment_method === "string" ? charge.payment_method : charge?.payment_method?.id;
     const savedPaymentMethodToken = pi.setup_future_usage && chargedWith ? chargedWith : undefined;
+    const { amount, amountRefunded, amountCaptured, amountCapturable } = readStripeAmounts(
+      paymentIntentRecord(pi),
+      paymentIntentAmounts(pi),
+      use,
+    );
     return {
       id: pi.metadata?.payfanout_id ?? pi.id,
       pspName: this.pspName,
       pspPaymentId: pi.id,
       status: mapPaymentIntentStatus(pi),
-      // After a (partial) capture Stripe keeps `amount` at the authorized value;
-      // the money actually collected is amount_received. Refund state must be
-      // derived against collected funds, so that wins once it exists.
-      amount: pi.amount_received && pi.amount_received > 0 ? pi.amount_received : pi.amount,
-      amountRefunded: charge?.amount_refunded ?? 0,
-      ...(pi.amount_received !== undefined ? { amountCaptured: pi.amount_received } : {}),
-      ...(pi.amount_capturable !== undefined ? { amountCapturable: pi.amount_capturable } : {}),
+      amount,
+      amountRefunded,
+      ...(amountCaptured !== undefined ? { amountCaptured } : {}),
+      ...(amountCapturable !== undefined ? { amountCapturable } : {}),
       currency: pi.currency.toUpperCase(),
       paymentMethodType:
         (chargeType ? STRIPE_CHARGE_TYPE_TO_UNIFIED[chargeType] : undefined) ??
@@ -837,22 +1021,26 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
    * total: Σ price.unit_amount × quantity over the items — tiered/custom
    * prices (unit_amount null) and metered prices (billed by reported usage)
    * have no fixed installment and contribute 0 rather than an invented one;
-   * `raw` keeps the truth. Cadence comes from the first item's price (Stripe
+   * `raw` keeps the truth. The total is converted from Stripe's units into
+   * PayFanout's minor units (ISK and MGA differ; a UGX subscription cannot be
+   * reported). Cadence comes from the first item's price (Stripe
    * holds every item on a subscription to one shared billing interval).
    * Period bounds read the subscription's own current_period_* (API versions
    * before 2025-03-31.basil, the pinned 2024-06-20 included) and fall back to
    * the first item's (basil moved them there).
    */
-  private toNativeSubscription(sub: StripeSubscriptionLike): NativeSubscriptionRecord {
+  private toNativeSubscription(
+    sub: StripeSubscriptionLike,
+    use: RecordUse = { kind: "read" },
+  ): NativeSubscriptionRecord {
     const items = sub.items?.data ?? [];
     const first = items[0];
     const price = first?.price ?? undefined;
-    let amount = 0;
-    for (const item of items) {
-      if (typeof item.price?.unit_amount !== "number") continue;
-      if (item.price.recurring?.usage_type === "metered") continue;
-      amount += item.price.unit_amount * (item.quantity ?? 1);
-    }
+    const { amount } = readStripeAmounts(
+      { subject: `Subscription ${sub.id}`, currency: subscriptionCurrency(sub), raw: sub },
+      { amount: installment(sub) },
+      use,
+    );
     const recurring = price?.recurring ?? undefined;
     const interval =
       recurring?.interval && (NATIVE_SUBSCRIPTION_INTERVALS as readonly string[]).includes(recurring.interval)
@@ -1042,22 +1230,93 @@ function toSavedPaymentMethod(
   };
 }
 
-function toRefundResult(refund: StripeRefundLike): RefundResult {
+/**
+ * `paymentCurrency` stands in for a refund that states no currency of its
+ * own, which Stripe's Refund object always does.
+ */
+function toRefundResult(refund: StripeRefundLike, use: RecordUse, paymentCurrency?: string): RefundResult {
   const status: RefundResult["status"] =
     refund.status === "succeeded" ? "succeeded"
     : refund.status === "failed" || refund.status === "canceled" ? "failed"
     : "pending";
-  return { refundId: refund.id, status, amount: refund.amount, raw: refund };
+  const { amount } = readStripeAmounts(
+    { subject: `Refund ${refund.id}`, currency: refund.currency ?? paymentCurrency, raw: refund },
+    { amount: refund.amount },
+    use,
+  );
+  return { refundId: refund.id, status, amount, raw: refund };
 }
 
 function toRefundInfo(refund: StripeRefundLike): RefundInfo {
   const pspPaymentId =
     typeof refund.payment_intent === "string" ? refund.payment_intent : refund.payment_intent?.id;
   return {
-    ...toRefundResult(refund),
+    ...toRefundResult(refund, { kind: "read" }),
     ...(pspPaymentId ? { pspPaymentId } : {}),
     ...(refund.created ? { createdAt: new Date(refund.created * 1000).toISOString() } : {}),
   };
+}
+
+function expandedCharge(pi: StripePaymentIntentLike): StripeChargeLike | undefined {
+  return typeof pi.latest_charge === "object" && pi.latest_charge !== null ? pi.latest_charge : undefined;
+}
+
+function paymentIntentRecord(pi: StripePaymentIntentLike): StripeRecord {
+  return { subject: `PaymentIntent ${pi.id}`, currency: pi.currency, raw: pi };
+}
+
+/** The Stripe amounts toPaymentInfo reports, by PaymentInfo field; list pages check the same ones. */
+function paymentIntentAmounts(pi: StripePaymentIntentLike) {
+  return {
+    // After a (partial) capture Stripe keeps `amount` at the authorized value;
+    // the money actually collected is amount_received. Refund state must be
+    // derived against collected funds, so that wins once it exists.
+    amount: pi.amount_received && pi.amount_received > 0 ? pi.amount_received : pi.amount,
+    amountRefunded: expandedCharge(pi)?.amount_refunded ?? 0,
+    amountCaptured: pi.amount_received,
+    amountCapturable: pi.amount_capturable,
+  };
+}
+
+/**
+ * The per-installment total in Stripe's units: Σ price.unit_amount ×
+ * quantity, skipping prices with no unit amount and metered ones (see
+ * toNativeSubscription).
+ */
+function installment(sub: StripeSubscriptionLike): number {
+  let total = 0;
+  for (const item of sub.items?.data ?? []) {
+    if (typeof item.price?.unit_amount !== "number") continue;
+    if (item.price.recurring?.usage_type === "metered") continue;
+    total += item.price.unit_amount * (item.quantity ?? 1);
+  }
+  return total;
+}
+
+function subscriptionCurrency(sub: StripeSubscriptionLike): string | undefined {
+  return sub.currency ?? sub.items?.data[0]?.price?.currency;
+}
+
+function pageCursor(page: StripeListLike<{ id: string }>): string | undefined {
+  const last = page.data[page.data.length - 1];
+  return page.has_more && last ? last.id : undefined;
+}
+
+/**
+ * Whether refunds may already have moved money on a PaymentIntent. Only a
+ * complete list of its refunds (`has_more` false) holding nothing but failed
+ * or canceled ones, or none, shows that none did: a pending or
+ * `requires_action` refund may still move money, and Stripe does not say
+ * whether a charge's `amount_refunded` counts it.
+ */
+async function refundsMayHaveMoved(client: StripeClientLike, paymentIntent: string): Promise<boolean> {
+  try {
+    const page = await client.refunds.list({ payment_intent: paymentIntent, limit: 100 });
+    return page.has_more !== false || page.data.some((r) => r.status !== "failed" && r.status !== "canceled");
+  } catch {
+    // A list that cannot be read shows nothing, so the refusal stays open.
+    return true;
+  }
 }
 
 /** Stripe list endpoints accept 1-100. */

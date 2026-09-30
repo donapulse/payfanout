@@ -22,6 +22,12 @@ const CURRENCY_EXPONENT_OVERRIDES: Readonly<Record<string, number>> = {
   CLF: 4, UYW: 4,
 };
 
+/**
+ * The ISO 4217 exponent (minor units) of a currency: 2 unless the currency's
+ * minor units differ, as ISO 4217 list one gives them. A code outside that
+ * table also reads as 2, the codes ISO lists with no minor units (XAU, XDR,
+ * XTS and the like) and codes it does not list among them.
+ */
 export function getCurrencyExponent(currency: string): number {
   const code = normalizeCurrency(currency);
   return CURRENCY_EXPONENT_OVERRIDES[code] ?? 2;

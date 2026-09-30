@@ -5008,9 +5008,10 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   code, with ISO 4217 list one (SIX, list-one.xml, published 2026-09-17: 178 codes, 165 with
   numeric minor units). UYI, the Uruguay peso in indexed units, was the only disagreement:
   the list gives it 0 minor units, and core read it as the default 2. A test now carries the
-  list's minor units for every active code and fails on any difference, so the table cannot
-  drift from ISO without it showing.
+  list's minor units for every active code and fails on any difference from that list; a
+  later ISO 4217 amendment needs the fixture refreshed from the new list.
 - **The 13 codes whose minor units the list gives as "N.A."** (XAG, XAU, XBA, XBB, XBC, XBD,
-  XDR, XPD, XPT, XSU, XTS, XUA, XXX: precious metals, bond units, special drawing rights, the
-  testing code and "no currency") still read as 2. None is a currency a payment is taken in,
+  XDR, XPD, XPT, XSU, XTS, XUA, XXX: precious metals, bond units, special drawing rights,
+  regional units of account, the testing code and "no currency") still read as 2, as any code
+  outside core's table does, and a test pins that. None is a currency a payment is taken in,
   and refusing them in core would be a separate, breaking decision.

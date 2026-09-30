@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getCurrencyExponent } from "@payfanout/core";
+import { formatMinorUnits, fromMinorUnits, getCurrencyExponent, toMinorUnits } from "@payfanout/core";
 
 /**
  * ISO 4217 list one (SIX, published 2026-09-17): every active code with its
@@ -53,7 +53,17 @@ describe("currency exponents against ISO 4217 list one", () => {
     expect(wrong).toEqual([]);
   });
 
-  it("reads UYI, the Uruguay peso in indexed units, with the exponent 0", () => {
+  it("reads UYI, the Uruguay peso in indexed units, with the exponent 0, in every money helper", () => {
     expect(getCurrencyExponent("UYI")).toBe(0);
+    expect(toMinorUnits("12", "UYI")).toBe(12);
+    expect(() => toMinorUnits("12.34", "UYI")).toThrowError(/more precision/);
+    expect(fromMinorUnits(12, "UYI")).toBe(12);
+    expect(formatMinorUnits(12, "UYI")).toBe("12");
+  });
+
+  it("reads the codes ISO gives no minor units as 2, as it reads any code outside its table", () => {
+    for (const code of ["XAG", "XAU", "XBA", "XBB", "XBC", "XBD", "XDR", "XPD", "XPT", "XSU", "XTS", "XUA", "XXX"]) {
+      expect(getCurrencyExponent(code), code).toBe(2);
+    }
   });
 });

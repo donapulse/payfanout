@@ -143,8 +143,9 @@ it whenever GoCardless can have taken it, so a replay across an upgrade keeps it
 every runtime: `fetch` trims whitespace from both ends of a header value, so `"order-42\n"`
 still goes out as `order-42`. A key GoCardless never took goes out as `payfanout-sha256-`
 followed by its SHA-256 digest instead of failing: one over GoCardless's 128 characters
-("Keys must be no longer than 128 characters") once trimmed, counted in code points, and one
-holding a NUL, CR or LF inside the trimmed value, which no runtime sends. The same key always
+("Keys must be no longer than 128 characters") once trimmed, however GoCardless can have
+read them (below), and one holding a NUL, CR or LF inside the trimmed value, which no
+runtime sends. The same key always
 yields the same header, so a retry replays. Every other key goes out as given, as before.
 Runtimes send non-ASCII keys differently: Cloudflare Workers sends every character as UTF-8,
 while Node's `fetch` sends U+0080 to U+00FF as one byte each (so a key of such characters

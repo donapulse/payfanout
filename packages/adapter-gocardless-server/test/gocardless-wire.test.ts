@@ -41,6 +41,9 @@ describe("idempotencyKeyHeader", () => {
       // Node sends these one byte each, which read as UTF-8 are 65 characters ("é" 65 times), and a C1 control.
       "Ã©".repeat(65),
       "\u0085-order",
+      // 129 code points that read as exactly 128 UTF-8 characters, and 260 that read as 65 emoji (130 UTF-16 units).
+      `Ã©${"k".repeat(127)}`,
+      "ð\u009F\u0098\u0080".repeat(65),
     ];
     for (const key of asGiven) {
       expect(await idempotencyKeyHeader(key), JSON.stringify(key)).toBe(key);
@@ -56,6 +59,8 @@ describe("idempotencyKeyHeader", () => {
       "€".repeat(129),
       // One byte each on Node, and no shorter as UTF-8: each lone 0xE9 decodes to one U+FFFD.
       "é".repeat(129),
+      // Reads as 129 UTF-8 characters: one over.
+      `Ã©${"k".repeat(128)}`,
       // Above U+00FF, so never one byte each: their low bytes would read as 65 "é" if truncated.
       "ǃƩ".repeat(65),
       "line\nbreak",

@@ -502,10 +502,14 @@ choices they forced:
     smallest count of what Workers sends, and one holding a NUL, CR or LF inside the trimmed
     value, which no runtime sends (the Fetch standard, Node and Cloudflare's workerd all
     refuse them). Node sends U+0080 to U+00FF as one byte each, which GoCardless may read
-    as UTF-8 ("requests are UTF-8 encoded"), so a key of characters up to U+00FF counts as
-    those bytes decoded as UTF-8 (`"Ã©"` repeated 65 times is 65 characters so
-    read), and is digested only when that count is over 128 (added in the third review,
-    2026-09-30). The trim is a linear scan: a regular expression anchored at the end
+    as UTF-8 (Making Requests: "All requests and responses are JSON-formatted and UTF-8
+    encoded."), so a key of characters up to U+00FF counts as those bytes decoded as UTF-8
+    (`"Ã©"` repeated 65 times is 65 characters so read), and is digested only when that
+    count is over 128 (added in the third review, 2026-09-30). The decoding counts each
+    invalid sequence as one U+FFFD, as `TextDecoder` and common lossy decoders do; a
+    decoder at GoCardless that dropped invalid bytes would count fewer, and could have
+    taken a key the adapter now digests. That is an assumption, as GoCardless documents no
+    decoding. The trim is a linear scan: a regular expression anchored at the end
     re-scanned a whitespace run from every position, quadratic on a caller's key (flagged
     by code scanning in the third review). The
     same key always yields the same header, so a retry replays; the Worldline adapter

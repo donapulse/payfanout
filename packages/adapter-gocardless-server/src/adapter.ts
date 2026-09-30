@@ -439,8 +439,9 @@ export class GoCardlessServerAdapter implements ServerPaymentAdapter {
    * metadata GoCardless cannot hold (a key name over 50 characters, a value
    * over 500, the `id` included), and an idempotencyKey sent as its digest
    * that holds a lone surrogate. An idempotencyKey GoCardless cannot have
-   * taken as given, over 128 code points or holding a NUL, CR or LF once
-   * trimmed, is sent as a SHA-256 digest of itself (see idempotencyKeyHeader).
+   * taken as given, over 128 characters however GoCardless can have read it,
+   * or holding a NUL, CR or LF, once trimmed, is sent as a SHA-256 digest of
+   * itself (see idempotencyKeyHeader).
    * Metadata keys past the third are withheld, never refused.
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<PaymentSession> {

@@ -208,6 +208,20 @@ mount other PSPs as well, read
 before giving a directive a nonce.
 :::
 
+**How a refused payment reads.** The browser classifies PayZen's answer through the
+server adapter's code maps, whether `KR.onError` reports it or it sits on an unpaid
+order's last transaction:
+
+- a 3-D Secure challenge the buyer failed, abandoned or let time out (`PSP_539`) is
+  `authentication_required`;
+- an issuer that refused the authentication (`PSP_707`) and the refusals PayZen documents,
+  such as `PSP_003` and `PSP_625`, are `card_declined`;
+- an authentication the issuer could not run (`PSP_708`) is `processing_error`, and so is
+  a `PSP_` code the maps do not list, on both halves.
+
+A refusal is never retryable; only an outage or a rate limit is. PayZen's answer rides on
+the error's `raw`.
+
 ## 6. Offer several payment methods (smartForm)
 
 PayZen's **smartForm** presents a payment-method list — cards plus, per your shop's
@@ -281,11 +295,6 @@ Worth knowing:
   the form's own pay button flips the provider status while the form stays usable and
   the await keeps running. Key banners or disabled states on the `pay()` outcome, not
   on `status`, in smartForm mode.
-- A gateway answer reads the same in the browser as on the server: a 3-D Secure
-  challenge the buyer failed, abandoned or let time out (`PSP_539`) is
-  `authentication_required`, an issuer that refused the authentication (`PSP_707`) is
-  `card_declined`, and an authentication the issuer could not run (`PSP_708`) is
-  `processing_error`. None of them is retryable; the code is on `raw`.
 - A smartForm whose session/shop resolves to **cards only** renders the plain card
   fields directly — `form: "smartform"` is safe before any wallet contract exists.
 - The **material theme is incompatible** with the smartForm (`CLIENT_505`): its script

@@ -2,4 +2,4 @@
 "@payfanout/adapter-payzen-server": patch
 ---
 
-Map `PSP_707` (the issuer refused the authentication) to `card_declined`, `PSP_708` (the issuer could not authenticate) to `processing_error`, and `PSP_052` to `PSP_055` as `AUTH_100` to `AUTH_103` read, instead of the default `processing_error`.
+Map more of the `PSP_` codes PayZen documents instead of reading them as the default `processing_error`: `PSP_707` (the issuer refused the authentication) and the payment refusals such as `PSP_003`, `PSP_091`, `PSP_624` and `PSP_625` to `card_declined`, the risk-module declines `PSP_641` and `PSP_647` to `fraud_suspected`, the OTP and unfinished 3-D Secure failures (`PSP_649`, `PSP_716`, `PSP_717`, `PSP_722`) to `authentication_required`, `PSP_054`, `PSP_055` and `PSP_718` to `invalid_request`, and every code the page gives a technical-error text to a retryable `psp_unavailable`.

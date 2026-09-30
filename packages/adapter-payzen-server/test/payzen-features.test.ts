@@ -227,6 +227,27 @@ describe("mapPayZenError (envelope taxonomy)", () => {
     ["PSP_053", null, "processing_error", false],
     ["PSP_054", null, "invalid_request", false],
     ["PSP_055", null, "invalid_request", false],
+    // Refusals the error page documents: another card, a new authentication or
+    // the merchant's settings, never a retry.
+    ["PSP_003", null, "card_declined", false], // payment refused
+    ["PSP_091", null, "card_declined", false],
+    ["PSP_575", null, "card_declined", false], // rejected by PayPal
+    ["PSP_611", null, "card_declined", false], // refused without a liability shift
+    ["PSP_624", null, "card_declined", false], // inactive card
+    ["PSP_625", null, "card_declined", false],
+    ["PSP_636", null, "card_declined", false],
+    ["PSP_641", null, "fraud_suspected", false], // declined by the risk analyzer
+    ["PSP_647", null, "fraud_suspected", false],
+    ["PSP_649", null, "authentication_required", false], // 3-D Secure left unfinished
+    ["PSP_716", null, "authentication_required", false], // OTP expired
+    ["PSP_717", null, "authentication_required", false],
+    ["PSP_722", null, "authentication_required", false],
+    ["PSP_718", null, "invalid_request", false], // invalid authentication settings
+    // The page's technical-error texts, retryable as an outage.
+    ["PSP_996", null, "psp_unavailable", true],
+    ["PSP_555", null, "psp_unavailable", true],
+    ["PSP_648", null, "psp_unavailable", true],
+    ["PSP_658", null, "psp_unavailable", true],
     ["PSP_536", null, "fraud_suspected", false],
     ["PSP_204", null, "fraud_suspected", false],
     ["PSP_099", null, "rate_limited", true], // HTTP-200 rate limit — envelope is the only signal
@@ -280,8 +301,9 @@ describe("mapPayZenError (envelope taxonomy)", () => {
       const source = await readFile(fileURLToPath(new URL(path, import.meta.url)), "utf8");
       const start = source.indexOf(`const ${map}:`);
       if (start === -1) return [];
-      const block = source.slice(start, source.indexOf("\n};", start));
-      return [...block.matchAll(/^\s*["']?(\w+)["']?\s*:\s*["']([a-z_]+)["'],?/gm)].map((m) => `${m[1]}=${m[2]}`).sort();
+      // Every entry, wherever it sits: comments dropped, several per line read too.
+      const block = source.slice(source.indexOf("{", start), source.indexOf("\n};", start)).replace(/\/\/.*$/gm, "");
+      return [...block.matchAll(/["']?(\w+)["']?\s*:\s*["']([a-z_]+)["']/g)].map((m) => `${m[1]}=${m[2]}`).sort();
     };
     for (const map of ["ACQUIRER_CODE_MAP", "AUTH_CODE_MAP", "PAYZEN_PSP_CODE_MAP"]) {
       const server = await entries("../src/adapter.ts", map);

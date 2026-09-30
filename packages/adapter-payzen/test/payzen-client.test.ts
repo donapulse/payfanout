@@ -781,7 +781,10 @@ describe("PayZenClientAdapter error mapping", () => {
       [{ errorCode: "PSP_708", detailedErrorCode: "208" }, "processing_error", false],
       [{ errorCode: "PSP_055" }, "invalid_request", false],
       [{ errorCode: "PSP_999" }, "psp_unavailable", true],
+      [{ errorCode: "PSP_996" }, "psp_unavailable", true],
       [{ errorCode: "PSP_106" }, "rate_limited", true],
+      [{ errorCode: "PSP_641" }, "fraud_suspected", false],
+      [{ errorCode: "PSP_722" }, "authentication_required", false],
       [{ errorCode: "PSP_539", detailedErrorCode: "51" }, "authentication_required", false], // never an acquirer code
       [{ errorCode: "PSP_777" }, "processing_error", false], // a code the map does not list
       [{ errorCode: "SOMETHING_ELSE" }, "processing_error", true], // shopper may safely retry
@@ -831,6 +834,12 @@ describe("PayZenClientAdapter error mapping", () => {
       ["PSP_055", undefined, "invalid_request"],
       ["PSP_042", "51", "insufficient_funds"],
       ["PSP_539", "51", "authentication_required"],
+      // Refusals the page documents read as refusals, never as a retryable
+      // processing error: a declined card, a risk decision, a failed OTP.
+      ["PSP_003", undefined, "card_declined"],
+      ["PSP_625", undefined, "card_declined"],
+      ["PSP_647", undefined, "fraud_suspected"],
+      ["PSP_717", undefined, "authentication_required"],
       ["PSP_777", "51", "processing_error"], // a code the map does not list
     ];
     for (const [errorCode, detailedErrorCode, code] of cases) {

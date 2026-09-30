@@ -350,12 +350,11 @@ describe("currencies whose Paysafe exponent may not be PayFanout's", () => {
     );
     expect(ach).toMatchObject({ code: "invalid_request", retryable: false });
     expect(ach.outcomeUnknown).toBeUndefined();
-    // Reads only: the payments under each key, and the bank debit's handles.
-    expect(sentSince(fake, 0)).toEqual([
-      "GET /paymenthub/v1/payments",
-      "GET /paymenthub/v1/payments",
-      "GET /paymenthub/v1/paymenthandles",
-    ]);
+    // Reads only, three of each key as the lookup can trail a write: the
+    // payments under it, and the bank debit's handles.
+    const cardRead = ["GET /paymenthub/v1/payments"];
+    const achRead = ["GET /paymenthub/v1/payments", "GET /paymenthub/v1/paymenthandles"];
+    expect(sentSince(fake, 0)).toEqual([...cardRead, ...cardRead, ...cardRead, ...achRead, ...achRead, ...achRead]);
   });
 
   it("leaves a completion's refusal open when its key holds a payment an earlier release may have made", async () => {
@@ -433,12 +432,10 @@ describe("currencies whose Paysafe exponent may not be PayFanout's", () => {
       expect(sub, currency).toMatchObject({ code: "invalid_request", message: expect.stringMatching(currency) });
       expect(sub.outcomeUnknown, currency).toBeUndefined();
     }
-    // Reads only: no plan, payment or subscription was created.
-    expect(sentSince(fake, 0)).toEqual([
-      "GET /paymenthub/v1/payments",
-      "GET /subscriptionsplans/v1/subscriptions",
-      "GET /subscriptionsplans/v1/subscriptions",
-    ]);
+    // Reads only, three of each key: no plan, payment or subscription was created.
+    const payments = Array<string>(3).fill("GET /paymenthub/v1/payments");
+    const subscriptions = Array<string>(3).fill("GET /subscriptionsplans/v1/subscriptions");
+    expect(sentSince(fake, 0)).toEqual([...payments, ...subscriptions, ...subscriptions]);
   });
 
   it("leaves a retried charge's refusal open when its key holds a payment that may have moved money", async () => {
@@ -491,6 +488,127 @@ describe("currencies whose Paysafe exponent may not be PayFanout's", () => {
       raw: { lookupFailed: true },
     });
     expect(fake.uniqueSettlementCreations).toBe(0);
+  });
+
+  it("leaves a bank debit's retry open when its key holds a live payment, whatever its handles say", async () => {
+    const { adapter } = makePair();
+    const session = await adapter.createPaymentSession({
+      amount: 10_000,
+      currency: "USD",
+      paymentMethodTypes: ["ach"],
+      idempotencyKey: "s-ach",
+    });
+    await adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken: ACH_ENVELOPE, idempotencyKey: "c1" });
+    const err = await rejection(
+      adapter.completePayment({
+        pspSessionId: await context("CLP", { paymentType: "ACH" }),
+        clientToken: ACH_ENVELOPE,
+        idempotencyKey: "c1",
+      }),
+    );
+    expect(err).toMatchObject({ code: "invalid_request", outcomeUnknown: true });
+    expect(err.raw).toMatchObject({ earlier: [expect.objectContaining({ merchantRefNum: "c1", paymentType: "ACH" })] });
+  });
+
+  it("keeps a bank debit's retry final when a declined payment accounts for its spent handle", async () => {
+    const { adapter, fake } = makePair();
+    const session = await adapter.createPaymentSession({
+      amount: 10_000,
+      currency: "USD",
+      paymentMethodTypes: ["ach"],
+      idempotencyKey: "s-ach",
+    });
+    fake.recordFailure(
+      { method: "POST", path: "/paymenthub/v1/payments" },
+      { status: 402, code: "3009", message: "Your request has been declined by the issuing bank." },
+    );
+    await expect(
+      adapter.completePayment({ pspSessionId: session.pspSessionId, clientToken: ACH_ENVELOPE, idempotencyKey: "c1" }),
+    ).rejects.toMatchObject({ code: "card_declined" });
+    const err = await rejection(
+      adapter.completePayment({
+        pspSessionId: await context("CLP", { paymentType: "ACH" }),
+        clientToken: ACH_ENVELOPE,
+        idempotencyKey: "c1",
+      }),
+    );
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false });
+    expect(err.outcomeUnknown).toBeUndefined();
+  });
+
+  it("keeps a retried charge final when its key holds only a voided authorization", async () => {
+    const { adapter, fake } = makePair();
+    const voided = await paysafeCall<{ id: string }>(fake, "POST", "/paymenthub/v1/payments", {
+      merchantRefNum: "renewal-v",
+      dupCheck: true,
+      amount: 10_000,
+      currencyCode: "CLP",
+      paymentHandleToken: SEEDED_MULTI_USE_TOKEN,
+      settleWithAuth: false,
+    });
+    await paysafeCall(fake, "POST", `/paymenthub/v1/payments/${voided.id}/voidauths`, {
+      merchantRefNum: "renewal-v-void",
+      amount: 10_000,
+    });
+    const err = await rejection(
+      adapter.chargeSavedPaymentMethod({
+        pspCustomerId: "cust_1",
+        savedPaymentMethodToken: SEEDED_MULTI_USE_TOKEN,
+        amount: 10_000,
+        currency: "CLP",
+        idempotencyKey: "renewal-v",
+      }),
+    );
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false });
+    expect(err.outcomeUnknown).toBeUndefined();
+  });
+
+  it("retries a lookup the transport refuses, and reads a key the index trails again before calling it empty", async () => {
+    const { adapter, fake } = makePair();
+    const charge = (idempotencyKey: string) =>
+      adapter.chargeSavedPaymentMethod({
+        pspCustomerId: "cust_1",
+        savedPaymentMethodToken: SEEDED_MULTI_USE_TOKEN,
+        amount: 10_000,
+        currency: "CLP",
+        idempotencyKey,
+      });
+    for (const merchantRefNum of ["renewal-503", "renewal-lag"]) {
+      await paysafeCall(fake, "POST", "/paymenthub/v1/payments", {
+        merchantRefNum,
+        dupCheck: true,
+        amount: 10_000,
+        currencyCode: "CLP",
+        paymentHandleToken: SEEDED_MULTI_USE_TOKEN,
+        settleWithAuth: true,
+      });
+    }
+    fake.refuse({ method: "GET", path: "/paymenthub/v1/payments" }, 503, 1);
+    const afterRetry = await rejection(charge("renewal-503"));
+    expect(afterRetry).toMatchObject({ outcomeUnknown: true, raw: { earlier: [expect.anything()] } });
+    expect((afterRetry.raw as { earlier: unknown[] }).earlier).toHaveLength(1);
+    fake.hideFromLookups("payments", "renewal-lag", 2);
+    const afterLag = await rejection(charge("renewal-lag"));
+    expect(afterLag).toMatchObject({ outcomeUnknown: true, raw: { earlier: [expect.anything()] } });
+  });
+
+  it("keeps a failed lookup's own error on raw", async () => {
+    const { adapter, fake } = makePair();
+    fake.networkFailure = true;
+    const err = await rejection(
+      adapter.chargeSavedPaymentMethod({
+        pspCustomerId: "cust_1",
+        savedPaymentMethodToken: SEEDED_MULTI_USE_TOKEN,
+        amount: 10_000,
+        currency: "CLP",
+        idempotencyKey: "renewal-x",
+      }),
+    );
+    fake.networkFailure = false;
+    expect(err).toMatchObject({
+      outcomeUnknown: true,
+      raw: { lookupFailed: true, lookupError: expect.objectContaining({ code: "psp_unavailable" }) },
+    });
   });
 
   it("leaves a retried native subscription's refusal open when its key holds a subscription", async () => {

@@ -188,8 +188,11 @@ Before upgrading from a release that sent these currencies to Paysafe:
 - `SubscriptionManager` renewals on Paysafe in these currencies now fail with
   `invalid_request`, a definitive failure, so they would run dunning to cancellation: move
   those subscriptions to another provider first. A renewal an earlier release sent whose
-  answer was lost is the exception: its retry finds the payment under its key and leaves
-  the outcome open.
+  answer was lost is the exception when Paysafe shows a payment under its key: the retry's
+  refusal leaves the outcome open, the engine keeps replaying the same key until it
+  freezes the renewal, and you settle it from the Paysafe portal with
+  `resolvePendingRenewal`. An earlier attempt still in flight, or older than the lookup's
+  30-day window, can go unseen, and its retry's refusal is final.
 - A subscription list page holding a subscription in one of them fails whole, the other
   subscriptions on it included: step past it with a `limit` of 1, as above.
 - The currencies the table does not list are refused as a precaution, since their exponent

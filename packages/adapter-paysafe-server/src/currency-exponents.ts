@@ -77,6 +77,8 @@ export interface EarlierAttempt {
   noun: string;
   /** Absent when the lookup failed. */
   records?: readonly unknown[];
+  /** Why the lookup failed, kept on `raw.lookupError`. */
+  failure?: unknown;
 }
 
 /**
@@ -92,7 +94,7 @@ export function sendRefusal(refusal: CurrencyRefusal, earlier?: EarlierAttempt):
       ...refusal,
     });
   }
-  const { noun, records } = earlier;
+  const { noun, records, failure } = earlier;
   const why =
     records !== undefined
       ? `Paysafe already holds a ${noun} under this key, which an earlier release may have made`
@@ -100,7 +102,7 @@ export function sendRefusal(refusal: CurrencyRefusal, earlier?: EarlierAttempt):
   return refusalError(
     "invalid_request",
     `${refuses(refusal)}. But ${why}: check the Paysafe portal before taking it with another provider`,
-    { ...refusal, ...(records !== undefined ? { earlier: records } : { lookupFailed: true }) },
+    { ...refusal, ...(records !== undefined ? { earlier: records } : { lookupFailed: true, lookupError: failure }) },
     true,
   );
 }

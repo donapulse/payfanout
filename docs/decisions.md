@@ -5151,26 +5151,41 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   passes its amount to Paysafe.js `tokenize` (the client adapter's `confirm`), so a 3-D Secure
   screen could show CLP 100.00 until the session TTL ends; `completePayment` refuses the
   session, and the client adapter is not changed.
-- **A retry across the upgrade is never read as money that did not move** (changed in the
-  second review, 2026-09-30). A completion, a saved-method charge or a native subscription
-  create that an earlier release sent, whose answer was lost, is retried under the same key
-  after the upgrade: a `SubscriptionManager` renewal replays for 24 hours, and the engine
-  (`packages/server/src/subscriptions.ts`) reads a plain `invalid_request` as "the PSP
-  answered, and no money moved", closing the attempt and dunning a paid period, or charging it
-  again once the host moves the customer. `docs/adapter-authoring.md` asks for `outcomeUnknown`
-  on "a refusal you cannot resolve" of a call that moves money. So these three calls look their
-  key up before refusing, a read that moves no money: the payments filed under the
+- **A retry whose earlier attempt the lookup shows is not read as money that did not move**
+  (changed in the second review, 2026-09-30). A completion, a saved-method charge or a
+  native subscription create that an earlier release sent, whose answer was lost, is
+  retried under the same key after the upgrade: a `SubscriptionManager` renewal replays for
+  24 hours, and the engine (`packages/server/src/subscriptions.ts`) reads a plain
+  `invalid_request` as "the PSP answered, and no money moved", closing the attempt and
+  dunning a paid period, or charging it again once the host moves the customer.
+  `docs/adapter-authoring.md` asks for `outcomeUnknown` on "a refusal you cannot resolve" of
+  a call that moves money. So these three calls look their key up before refusing, a read
+  that moves no money: the payments filed under the
   merchantRefNum (and, for a bank debit, whose handle is minted at completion, a spent handle
   that no payment which moved no money accounts for, as `hiddenSpend` reads it), or the
   scheduler's subscriptions under it. A record that may have moved money, any subscription,
   or a lookup that fails marks the refusal `outcomeUnknown`, with the records on `raw.earlier`
-  (or `raw.lookupFailed`) and a message that sends the host to the Paysafe portal; a key that
-  holds nothing, or only failed, voided, cancelled or expired records, keeps it final, as a
-  first attempt's. A first version marked every completion refusal `outcomeUnknown` and none
-  of the others, on the reasoning that nothing tells a retry from a first attempt; the
-  merchantRefNum lookup the replay machinery already uses does. Refunds and partial captures
-  retried under a reused key have the same gap, but their messages already send the host to
-  the portal to act there, and they are left as they are.
+  (or `raw.lookupFailed` and the failure on `raw.lookupError`) and a message that sends the
+  host to the Paysafe portal; a key that holds nothing, or only failed, voided, cancelled or
+  expired records, keeps it final, as a first attempt's. The lookup goes through the usual
+  transport retries, and, since it can trail the write it indexes, a key that holds nothing
+  is read up to three times, as `readBackPatiently` reads an original, before the refusal is
+  final (added in the third review). What it cannot see stays a residual risk: an earlier
+  attempt still in flight (a rolling deploy, a host's fast retry), or one older than the
+  lookup's 30-day window, meets a final refusal; the changeset's advice to route these
+  currencies away before upgrading covers both. In a `SubscriptionManager` run, a pinned
+  renewal whose key holds a live payment is classified uncertain on every replay and ends
+  frozen, never under a new key, for the host to settle with `resolvePendingRenewal`. A
+  first version marked every completion refusal `outcomeUnknown` and none of the others, on
+  the reasoning that nothing tells a retry from a first attempt; the merchantRefNum lookup
+  the replay machinery already uses does. Refunds and partial captures retried under a
+  reused key have the same gap, but their messages already send the host to the portal to
+  act there, and they are left as they are.
+- **A major release** (decided in the third review, 2026-09-30). CLP and BYR are a mispricing
+  fixed, but the precautionary refusal of the currencies without a row stops traffic Paysafe
+  may have priced correctly, with no option to allow it, so the change is breaking for a
+  merchant who took them; the major keeps it out of `^2` ranges until the host has read the
+  upgrade notes.
 - **`supportedCurrencies` stays undeclared**, as for Adyen: the capability is an allowlist, and
   the table does not list every currency Paysafe processes ("and many more", and the Account
   Manager line), so a declared list would refuse currencies Paysafe takes. The router therefore

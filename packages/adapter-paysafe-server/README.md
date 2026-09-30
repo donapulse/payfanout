@@ -156,7 +156,8 @@ retrieved, not a separate credential).
   Sessions in them reject with a non-retryable `invalid_request` before any request.
   Saved-method charges, native subscription creates and completions reject the same way
   once their key is looked up, marked `outcomeUnknown` when Paysafe already holds something
-  under it that an earlier release may have made. Captures, voids and refunds of a
+  under it that an earlier release may have made, or when the lookup fails. Captures,
+  voids and refunds of a
   payment Paysafe holds in one read the payment, then reject before any settlement, void or
   refund request: with `invalid_request` when they state an amount, with
   `unsupported_operation` otherwise. Reads of such a payment or subscription, or of a refund

@@ -1119,10 +1119,11 @@ function movedNoMoney(record: RefNumRecord): boolean {
 }
 
 /**
- * A spent handle under a bank-debit key that none of the key's failed
- * payments accounts for, so a payment the lookup may not show yet. Paysafe
- * marks a handle COMPLETED "regardless of the payments call response status",
- * and a failed payment that names no handle accounts for one spent handle.
+ * A spent handle under a bank-debit key that none of `failed`, the key's
+ * payments that moved no money, accounts for, so a payment the lookup may not
+ * show yet. Paysafe marks a handle COMPLETED "regardless of the payments call
+ * response status", and such a payment that names no handle accounts for one
+ * spent handle.
  */
 function hiddenSpend(
   handles: PaysafePaymentHandleLike[],
@@ -1208,10 +1209,9 @@ function defaultSleep(ms: number): Promise<void> {
  * cancelPayment does: those send Paysafe's own amounts, or none, but answer
  * with amounts that cannot be reported in PayFanout's minor units.
  * cancelNativeSubscription reads the subscription first and refuses the same
- * way. retrievePayment,
- * retrieveRefund (for a refund Paysafe reports in such a currency),
- * retrieveNativeSubscription and listNativeSubscriptions refuse with
- * `unsupported_operation`, and webhook events in one carry no `amount`.
+ * way. retrievePayment, retrieveRefund (for a refund Paysafe reports in such
+ * a currency), retrieveNativeSubscription and listNativeSubscriptions refuse
+ * with `unsupported_operation`, and webhook events in one carry no `amount`.
  */
 export class PaysafeServerAdapter implements ServerPaymentAdapter {
   readonly pspName = PAYSAFE_PSP_NAME;
@@ -2608,8 +2608,12 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
    * Refuses a call in a currency the adapter refuses once `read` has looked
    * its key up, a read that moves no money. Earlier releases sent such calls:
    * records under the key, or a lookup that fails, leave the refusal's
-   * outcome open (see sendRefusal), so a retry across the upgrade is never
-   * read as money that did not move. A call with no key is refused as is.
+   * outcome open (see sendRefusal), so a retry whose earlier attempt the
+   * lookup shows is not read as money that did not move. The lookup can trail
+   * the write it indexes, so a key that holds nothing is read up to three
+   * times before the refusal is final; an earlier attempt still in flight, or
+   * older than the lookup's 30-day window, can still go unseen. A call with
+   * no key is refused as is.
    */
   private async refuseAfterLookup(
     currency: string,
@@ -2623,8 +2627,12 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
     let records: readonly unknown[];
     try {
       records = await read(merchantRefNum);
-    } catch {
-      throw sendRefusal(refusal, { noun });
+      for (let attempt = 1; records.length === 0 && attempt < REPLAY_READ_ATTEMPTS; attempt += 1) {
+        await this.backoff(attempt);
+        records = await read(merchantRefNum);
+      }
+    } catch (err) {
+      throw sendRefusal(refusal, { noun, failure: err });
     }
     throw sendRefusal(refusal, records.length > 0 ? { noun, records } : undefined);
   }

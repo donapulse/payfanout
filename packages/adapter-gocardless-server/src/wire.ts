@@ -34,7 +34,8 @@ export function assertMetadataLimits(metadata: Record<string, string>): void {
         { key, characters: keyCharacters, limit: METADATA_MAX_KEY_CHARACTERS },
       );
     }
-    const valueCharacters = typeof value === "string" ? characters(value) : 0;
+    // A value that is not a string goes out as its JSON, so that is what is counted.
+    const valueCharacters = characters(typeof value === "string" ? value : (JSON.stringify(value) ?? ""));
     if (valueCharacters > METADATA_MAX_VALUE_CHARACTERS) {
       throw PayFanoutError.invalidRequest(
         `GoCardless metadata values are at most ${METADATA_MAX_VALUE_CHARACTERS} characters; the value of "${key}" has ${valueCharacters}`,
@@ -44,30 +45,61 @@ export function assertMetadataLimits(metadata: Record<string, string>): void {
   }
 }
 
-/** Whether fetch refuses the text as a header value: a NUL, CR or LF, or any character above U+00FF. */
-function unsendableInHeader(text: string): boolean {
-  for (let i = 0; i < text.length; i++) {
-    const code = text.charCodeAt(i);
-    if (code === 0 || code === 10 || code === 13 || code > 0xff) return true;
+/** HTTP whitespace, which fetch trims from both ends of a header value before it is sent. */
+const HEADER_EDGE_WHITESPACE = /^[\t\n\r ]+|[\t\n\r ]+$/g;
+
+/**
+ * Whether the Fetch standard lets a header carry the value: no character
+ * above U+00FF anywhere, and no NUL, CR or LF once fetch has trimmed it. Any
+ * fetch refuses a value that fails this, so no such key ever reached
+ * GoCardless. Other control characters pass the standard, and a runtime may
+ * send them, although Node's fetch refuses them.
+ */
+function fetchCanCarry(value: string, trimmed: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    if (value.charCodeAt(i) > 0xff) return false;
   }
-  return false;
+  for (let i = 0; i < trimmed.length; i++) {
+    const code = trimmed.charCodeAt(i);
+    if (code === 0 || code === 10 || code === 13) return false;
+  }
+  return true;
 }
 
 /**
- * The Idempotency-Key header for an idempotencyKey. A key GoCardless takes
- * and fetch can send goes as given. A key over 128 characters, which
- * GoCardless answers with `idempotency_key_too_long`, or one no header can
- * carry is sent as a digest of itself instead, as the PayPal and Worldline
- * adapters derive theirs: the same key always yields the same header, and
- * neither kind can have reached GoCardless before, so no earlier request is
- * keyed differently. The 128 counts JavaScript's `length`, which for a
- * header-safe key is also its count of code points and of bytes.
+ * The Idempotency-Key header for an idempotencyKey. A key fetch can carry,
+ * and whose trimmed value GoCardless takes (at most 128 characters), goes as
+ * given, exactly as earlier releases sent it, so a replay of an earlier
+ * request keeps its key. Any other key, one over 128 characters once trimmed
+ * (GoCardless answers `idempotency_key_too_long`) or one no fetch can carry,
+ * never reached GoCardless, and is sent as `payfanout-sha256-` and the
+ * SHA-256 digest of itself: the same key always yields the same header. The
+ * 128 counts JavaScript's `length`, which for a value fetch can carry is
+ * also its count of code points and of bytes.
  */
 export async function idempotencyKeyHeader(idempotencyKey: string): Promise<string> {
-  if (idempotencyKey.length <= IDEMPOTENCY_KEY_MAX_CHARACTERS && !unsendableInHeader(idempotencyKey)) {
+  const trimmed = idempotencyKey.replace(HEADER_EDGE_WHITESPACE, "");
+  if (trimmed.length <= IDEMPOTENCY_KEY_MAX_CHARACTERS && fetchCanCarry(idempotencyKey, trimmed)) {
     return idempotencyKey;
   }
   return `payfanout-sha256-${await sha256Hex(idempotencyKey)}`;
+}
+
+/** A lone surrogate: text that is not well-formed Unicode. */
+const LONE_SURROGATE = /\p{Cs}/u;
+
+/**
+ * Refuses an idempotencyKey holding a lone surrogate. No fetch can carry it,
+ * and its digest, like its refund stamp, would be the digest of every key
+ * that differs from it only by another lone surrogate, as UTF-8 encoding
+ * replaces each with U+FFFD: two different requests would share one key.
+ */
+export function assertWellFormedIdempotencyKey(idempotencyKey: string): void {
+  if (typeof idempotencyKey === "string" && LONE_SURROGATE.test(idempotencyKey)) {
+    throw PayFanoutError.invalidRequest(
+      "The idempotencyKey holds a lone surrogate, so it is not well-formed Unicode and no request can carry it",
+    );
+  }
 }
 
 /**

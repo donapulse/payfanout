@@ -147,8 +147,16 @@ export class FakeGoCardlessApi {
     this.lastRequestUrl = url;
     this.lastRequestBody = body;
     const headers = init?.headers as Record<string, string> | undefined;
+    // As Node's fetch sends headers: each value trimmed of edge whitespace, and
+    // one it cannot carry refused before anything is sent, which the Headers
+    // constructor does for NUL, CR, LF and characters above U+00FF, and Node
+    // for every other control character but tab.
+    const sent = new Headers(headers);
+    for (const [name, value] of sent) {
+      if (/[^\t\x20-\x7e\x80-\xff]/.test(value)) throw new TypeError(`invalid ${name} header`);
+    }
     this.requests.push({ method, path, ...(body ? { body } : {}), headers: { ...headers } });
-    const idempotencyKey = headers?.["idempotency-key"];
+    const idempotencyKey = sent.get("idempotency-key") || undefined;
     if (idempotencyKey) this.idempotencyKeysSeen.push({ path, key: idempotencyKey });
 
     if (this.failure && this.failure.times > 0) {

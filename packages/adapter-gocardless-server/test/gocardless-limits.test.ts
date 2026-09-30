@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { CreatePaymentSessionInput } from "@payfanout/core";
+import { sha256Hex, type CreatePaymentSessionInput } from "@payfanout/core";
 import { GoCardlessServerAdapter, type GoCardlessServerAdapterConfig } from "../src/index.js";
 import { FakeGoCardlessApi } from "./fake-gocardless-api.js";
 
@@ -116,6 +116,23 @@ describe("GoCardless metadata limits", () => {
     const { adapter, fake } = makePair();
     await adapter.createPaymentSession(sessionInput({ metadata: { seats: 3 as never } }));
     expect(sentSessionMetadata(fake).request).toEqual({ seats: 3 });
+  });
+
+  it("measures a value that is not a string by the JSON it goes out as", async () => {
+    const { adapter, fake } = makePair();
+    const sent = fake.requests.length;
+    await expect(
+      adapter.createPaymentSession(sessionInput({ metadata: { tags: ["x".repeat(500)] as never } })),
+    ).rejects.toMatchObject({ code: "invalid_request", raw: { key: "tags", characters: 504, limit: 500 } });
+    expect(fake.requests).toHaveLength(sent);
+  });
+
+  it("sends host keys that name an object's own properties, such as constructor, like any other key", async () => {
+    const { adapter, fake } = makePair();
+    // JSON.parse makes "__proto__" an own key, as a host's parsed input would.
+    const metadata = JSON.parse('{"constructor":"c","__proto__":"p","toString":"t"}') as Record<string, string>;
+    await adapter.createPaymentSession(sessionInput({ metadata }));
+    expect(sentSessionMetadata(fake).request).toEqual(JSON.parse('{"constructor":"c","__proto__":"p","toString":"t"}'));
   });
 
   it("still withholds keys past the third, checking only the keys it sends", async () => {
@@ -248,6 +265,47 @@ describe("GoCardless idempotency keys", () => {
       expect(exact.fake.idempotencyKeysSeen.map(({ key }) => key)).toContain(key128);
     });
   }
+
+  it("sends a key fetch trims exactly as an earlier release sent it, so a replay across the upgrade replays", async () => {
+    const { adapter, fake } = makePair();
+    // fetch sent "order-42\n" as "order-42": the create an earlier release made under it is the one to meet.
+    const first = await adapter.createPaymentSession(sessionInput({ idempotencyKey: "order-42" }));
+    const again = await adapter.createPaymentSession(sessionInput({ idempotencyKey: "order-42\n" }));
+    expect(again.pspSessionId).toBe(first.pspSessionId);
+    expect(new Set(fake.idempotencyKeysSeen.map(({ key }) => key))).toEqual(new Set(["order-42"]));
+    // 128 characters and a trailing space went out as the 128, which GoCardless takes.
+    const long = "k".repeat(128);
+    const third = await adapter.createPaymentSession(sessionInput({ idempotencyKey: long }));
+    const fourth = await adapter.createPaymentSession(sessionInput({ idempotencyKey: `${long} ` }));
+    expect(fourth.pspSessionId).toBe(third.pspSessionId);
+  });
+
+  for (const [name, setUp] of cases) {
+    it(`${name} refuses a key holding a lone surrogate before any request`, async () => {
+      const { adapter, fake } = makePair();
+      const call = await setUp(adapter, fake);
+      const sent = fake.requests.length;
+      await expect(call("order-\uD800")).rejects.toMatchObject({
+        code: "invalid_request",
+        retryable: false,
+        message: expect.stringMatching(/lone surrogate/),
+      });
+      expect(fake.requests).toHaveLength(sent);
+    });
+  }
+
+  it("stamps a refund with the digest of the key as given, whatever header carries it, and replays it", async () => {
+    const { adapter, fake } = makePair();
+    const paymentId = await confirmedPayment(adapter, fake);
+    const key = `refund-${"x".repeat(200)}`;
+    const refund = await adapter.refundPayment({ pspPaymentId: paymentId, amount: 100, idempotencyKey: key });
+    const created = lastCreate(fake, "/refunds", "refunds") as { metadata?: Record<string, string> };
+    expect(created.metadata?.["payfanout_key_sha256"]).toBe(await sha256Hex(key));
+    expect(fake.idempotencyKeysSeen.at(-1)?.key).toBe(`payfanout-sha256-${await sha256Hex(key)}`);
+    const replay = await adapter.refundPayment({ pspPaymentId: paymentId, amount: 100, idempotencyKey: key });
+    expect(replay.refundId).toBe(refund.refundId);
+    expect(fake.requestsTo("POST", "/refunds")).toHaveLength(1);
+  });
 
   it("replays a create under the same over-long key instead of creating it twice", async () => {
     const { adapter, fake } = makePair();

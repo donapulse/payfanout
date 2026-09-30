@@ -1,18 +1,44 @@
 import { describe, expect, it } from "vitest";
-import { idempotencyKeyHeader, readAmount, wireInteger } from "../src/wire.js";
+import { assertWellFormedIdempotencyKey, idempotencyKeyHeader, readAmount, wireInteger } from "../src/wire.js";
 
 describe("idempotencyKeyHeader", () => {
   const DIGEST = /^payfanout-sha256-[0-9a-f]{64}$/;
 
-  it("sends a key GoCardless takes and a header can carry as given", async () => {
-    // Tabs and other control bytes pass fetch, so a key holding one was always sent as given.
-    for (const key of ["k", "k".repeat(128), "order-42:capture", "clé-é-ÿ", "a b c", "tab\tkey", "bell\u0007", "del\u007f"]) {
-      expect(await idempotencyKeyHeader(key), key).toBe(key);
+  it("sends every key an earlier release could send exactly as it sent it", async () => {
+    const asGiven = [
+      "k",
+      "k".repeat(128),
+      "order-42:capture",
+      "clé-é-ÿ",
+      "a b c",
+      "tab\tkey",
+      // fetch trims edge whitespace, so these went out, and still go out, as "order-42" or 128 characters.
+      "order-42\n",
+      "\r\norder-42",
+      " order-42 ",
+      `${"k".repeat(128)} `,
+      `${"k".repeat(128)}\r\n`,
+      // The Fetch standard lets a header carry these, so a runtime may have sent them; Node's fetch refuses them.
+      "bell\u0007",
+      "del\u007f",
+    ];
+    for (const key of asGiven) {
+      expect(await idempotencyKeyHeader(key), JSON.stringify(key)).toBe(key);
     }
   });
 
-  it("sends a key over 128 characters, or one no header carries, as a digest of itself", async () => {
-    for (const key of ["k".repeat(129), "x".repeat(4000), "key-€-1", "key-—", "line\nbreak", "cr\rkey", "nul\u0000"]) {
+  it("sends a key over 128 characters once trimmed, or one no fetch can carry, as a digest of itself", async () => {
+    const digested = [
+      "k".repeat(129),
+      ` ${"k".repeat(129)}`,
+      "x".repeat(4000),
+      "key-€-1",
+      "key-—",
+      "line\nbreak",
+      "cr\rkey",
+      "nul\u0000",
+    ];
+    for (const key of digested) {
       const header = await idempotencyKeyHeader(key);
       expect(header, JSON.stringify(key)).toMatch(DIGEST);
       expect(header.length).toBeLessThanOrEqual(128);
@@ -20,6 +46,23 @@ describe("idempotencyKeyHeader", () => {
       expect(await idempotencyKeyHeader(key)).toBe(header);
     }
     expect(await idempotencyKeyHeader("k".repeat(129))).not.toBe(await idempotencyKeyHeader("k".repeat(130)));
+    // Keys that differ only in their edge whitespace are different keys once digested.
+    expect(await idempotencyKeyHeader(` ${"k".repeat(129)}`)).not.toBe(await idempotencyKeyHeader("k".repeat(129)));
+  });
+});
+
+describe("assertWellFormedIdempotencyKey", () => {
+  it("refuses a key holding a lone surrogate, which would share its digest and refund stamp with others", () => {
+    for (const key of ["order-\uD800", "order-\uDC00", "\uDE00\uD83D"]) {
+      expect(() => assertWellFormedIdempotencyKey(key), JSON.stringify(key)).toThrowError(/lone surrogate/);
+    }
+  });
+
+  it("accepts well-formed text, astral characters included, and leaves a missing key to the caller's contract", () => {
+    for (const key of ["order-42", "order-😀", "order-�", "", "clé"]) {
+      expect(() => assertWellFormedIdempotencyKey(key), key).not.toThrow();
+    }
+    expect(() => assertWellFormedIdempotencyKey(undefined as never)).not.toThrow();
   });
 });
 

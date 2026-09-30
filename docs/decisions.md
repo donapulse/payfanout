@@ -482,18 +482,34 @@ choices they forced:
     code points, which are never more than the UTF-16 units or UTF-8 bytes of the same
     text, so it refuses nothing GoCardless accepts under any of those readings; if
     GoCardless counts units or bytes, text with characters outside ASCII can pass locally
-    and be refused by GoCardless, as before.
+    and be refused by GoCardless, as before. The spec types the metadata object's values
+    no further, so a value that is not a string (which the TypeScript types do not allow)
+    is sent as it is and measured as the JSON it goes out as. The metadata object has no
+    prototype, so a host key such as `constructor` or `__proto__` is sent like any other;
+    they used to be withheld silently.
   - *Idempotency keys.* The Limits page: "Keys must be no longer than 128 characters";
     Responses and Errors: `idempotency_key_too_long`, "Idempotency key exceeded 128
-    characters." A longer key, and one a header cannot carry (fetch refuses NUL, CR, LF and
-    any character above U+00FF, so such a key used to fail before the request as a
-    retryable `psp_unavailable`), is sent as `payfanout-sha256-` and the SHA-256 digest of
-    the key, 81 characters, on every call that sends one. The PayPal and Worldline adapters
-    derive theirs the same way for their shorter limits: the same key always yields the
-    same header, so a retry replays, and a key behind the router works on every provider.
-    Neither kind could reach GoCardless before, so every key it has seen is still sent as
-    given. The unit is undocumented. The adapter counts JavaScript's `length`, which for a
-    key a header can carry is also its count of code points and of bytes.
+    characters." The rule keeps every key GoCardless ever received as it was: `fetch` trims
+    HTTP whitespace (tab, LF, CR, space) from both ends of a header value, so earlier
+    releases sent `"order-42\n"` as `order-42` and 128 characters plus a space as the 128,
+    and such a key is still passed to `fetch` as given (changed in review, 2026-09-30: a
+    first version judged the untrimmed key and would have keyed those replays differently).
+    A key GoCardless never received is sent as `payfanout-sha256-` and the SHA-256 digest of
+    the key, 81 characters: one over 128 characters once trimmed, which GoCardless refuses,
+    and one the Fetch standard lets no header carry (a character above U+00FF, or a NUL, CR
+    or LF inside the trimmed value), which every `fetch` refuses before sending, so it used
+    to fail as a retryable `psp_unavailable`. The same key always yields the same header,
+    so a retry replays; the Worldline adapter hashes every key, and PayPal passes a key of
+    at most 38 bytes as given and hashes a longer one. Other control characters (BEL, DEL
+    and the like) pass the Fetch standard, so a runtime may have sent them, and such a key
+    is still passed as given; Node's `fetch` refuses them before sending (observed
+    2026-09-30 on Node 24.21.0 against a local server), so on Node that call still fails
+    as the transport error it always did. A key holding a lone surrogate is refused with
+    `invalid_request` before any request: no `fetch` can carry it, and UTF-8 encoding would
+    give it the digest, and the refund stamp, of every key that differs from it only by
+    another lone surrogate. The refund stamp stays the SHA-256 of the key as given. The
+    unit of the 128 is undocumented; the adapter counts JavaScript's `length` of the trimmed
+    value, which for a value `fetch` can carry is also its count of code points and bytes.
   - *Accept.* Making Requests: "Include an `Accept` header on all requests:" followed by
     `Accept: application/json`. Every request sends it, the connection check included.
   - *Amounts.* The spec types a payment's `amount` ("Amount, in the lowest denomination for

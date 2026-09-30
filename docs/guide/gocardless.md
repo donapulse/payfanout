@@ -132,18 +132,21 @@ sent:
   charge date per year", so `intervalCount` is at most 52 for `interval: "week"`, 12 for
   `"month"` and 1 for `"year"`.
 
-GoCardless types the amounts it returns as integers or strings of digits, and the adapter
-reads both as integer minor units. Any other amount GoCardless returns, such as `"10.50"`,
-rejects the read with a non-retryable `unknown` instead of reaching `amount` or
+GoCardless types the amounts it returns as an integer or a string. The adapter reads an
+integer, or a string of ASCII digits, as integer minor units. Any other amount, such as
+`"10.50"`, rejects the read with a non-retryable `unknown` instead of reaching `amount` or
 `amountRefunded` as a string or a fraction. An amount GoCardless leaves out still reads as
 0.
 
-An idempotency key goes out as the `Idempotency-Key` header unchanged when GoCardless takes
-it and a header can carry it. One over GoCardless's 128 characters ("Keys must be no longer
-than 128 characters"), or one a header cannot carry (a NUL, a line break, or a character
-above U+00FF), is sent as `payfanout-sha256-` followed by its SHA-256 digest instead of
-failing, and the same key always yields the same header, so a retry replays. Neither kind
-could reach GoCardless before, so no earlier request is keyed differently.
+An idempotency key goes out as the `Idempotency-Key` header exactly as earlier releases sent
+it whenever that reached GoCardless: `fetch` trims whitespace from both ends of a header
+value, so `"order-42\n"` still goes out as `order-42`, and a replay across an upgrade keeps
+its key. A key GoCardless never received goes out as `payfanout-sha256-` followed by its
+SHA-256 digest instead of failing: one over GoCardless's 128 characters once trimmed ("Keys
+must be no longer than 128 characters"), and one no `fetch` can put in a header (a character
+above U+00FF, or a NUL, CR or LF inside it). The same key always yields the same header, so
+a retry replays. A key holding a lone surrogate is refused with `invalid_request`, since it
+is not well-formed text.
 
 ### Replays and idempotency keys
 

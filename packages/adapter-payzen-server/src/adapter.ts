@@ -1507,6 +1507,13 @@ function ownCodeFor(map: Record<string, UnifiedErrorCode>, key: string | null | 
   return typeof key === "string" && Object.hasOwn(map, key) ? map[key] : undefined;
 }
 
+/**
+ * PSP_ codes → the taxonomy. A failed cardholder authentication is
+ * authentication_required and a 3-D Secure that could not complete a
+ * processing_error, as in the other adapters; PSP_052 to PSP_055 describe what
+ * AUTH_100 to AUTH_103 do and read the same way. The browser adapter holds the
+ * same map.
+ */
 const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
   PSP_042: "insufficient_funds",
   PSP_202: "expired_card",
@@ -1524,8 +1531,14 @@ const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
   PSP_531: "invalid_card_data",
   PSP_532: "invalid_card_data",
   PSP_533: "invalid_card_data",
-  PSP_136: "authentication_required",
-  PSP_539: "authentication_required",
+  PSP_136: "authentication_required", // 3-D Secure session expired
+  PSP_539: "authentication_required", // challenge failed, abandoned or timed out
+  PSP_707: "card_declined", // the issuer refused the authentication
+  PSP_708: "processing_error", // the issuer could not authenticate
+  PSP_052: "processing_error", // invalid ACS signature (AUTH_100)
+  PSP_053: "processing_error", // 3DS technical error (AUTH_101)
+  PSP_054: "invalid_request", // incorrect 3DS parameter (AUTH_102)
+  PSP_055: "invalid_request", // 3DS disabled (AUTH_103)
   PSP_203: "fraud_suspected",
   PSP_204: "fraud_suspected",
   PSP_205: "fraud_suspected",
@@ -1595,7 +1608,7 @@ export function mapPayZenError(answer: PayZenErrorAnswerLike | undefined, raw: u
   } else if (errorCode.startsWith("INT_") || errorCode.startsWith("CLIENT_")) {
     code = "invalid_request";
   } else if (errorCode.startsWith("PSP_")) {
-    code = PAYZEN_PSP_CODE_MAP[errorCode] ?? "processing_error";
+    code = ownCodeFor(PAYZEN_PSP_CODE_MAP, errorCode) ?? "processing_error";
   } else {
     code = "processing_error";
   }

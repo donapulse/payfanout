@@ -281,6 +281,11 @@ Worth knowing:
   the form's own pay button flips the provider status while the form stays usable and
   the await keeps running. Key banners or disabled states on the `pay()` outcome, not
   on `status`, in smartForm mode.
+- A gateway answer reads the same in the browser as on the server: a 3-D Secure
+  challenge the buyer failed, abandoned or let time out (`PSP_539`) is
+  `authentication_required`, an issuer that refused the authentication (`PSP_707`) is
+  `card_declined`, and an authentication the issuer could not run (`PSP_708`) is
+  `processing_error`. None of them is retryable; the code is on `raw`.
 - A smartForm whose session/shop resolves to **cards only** renders the plain card
   fields directly — `form: "smartform"` is safe before any wallet contract exists.
 - The **material theme is incompatible** with the smartForm (`CLIENT_505`): its script

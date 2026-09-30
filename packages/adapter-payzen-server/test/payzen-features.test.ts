@@ -218,8 +218,15 @@ describe("mapPayZenError (envelope taxonomy)", () => {
     ["PSP_112", null, "expired_card", false],
     ["PSP_026", null, "invalid_card_data", false],
     ["PSP_530", null, "invalid_card_data", false],
-    ["PSP_539", null, "authentication_required", false],
+    ["PSP_539", "39", "authentication_required", false], // challenge failed, abandoned or timed out
     ["PSP_136", null, "authentication_required", false],
+    ["PSP_707", "207", "card_declined", false], // the issuer refused the authentication
+    ["PSP_708", "208", "processing_error", false], // the issuer could not authenticate
+    // PSP_052 to PSP_055 read as AUTH_100 to AUTH_103 do.
+    ["PSP_052", null, "processing_error", false],
+    ["PSP_053", null, "processing_error", false],
+    ["PSP_054", null, "invalid_request", false],
+    ["PSP_055", null, "invalid_request", false],
     ["PSP_536", null, "fraud_suspected", false],
     ["PSP_204", null, "fraud_suspected", false],
     ["PSP_099", null, "rate_limited", true], // HTTP-200 rate limit — envelope is the only signal
@@ -266,7 +273,7 @@ describe("mapPayZenError (envelope taxonomy)", () => {
     expect(mapPayZenError({ errorCode: "INT_905" }, {}).message).toMatch(/shopId, password/);
   });
 
-  it("holds the same acquirer and AUTH_ maps as the browser adapter", async () => {
+  it("holds the same acquirer, AUTH_ and PSP_ maps as the browser adapter", async () => {
     const { readFile } = await import("node:fs/promises");
     const { fileURLToPath } = await import("node:url");
     const entries = async (path: string, map: string): Promise<string[]> => {
@@ -276,7 +283,7 @@ describe("mapPayZenError (envelope taxonomy)", () => {
       const block = source.slice(start, source.indexOf("\n};", start));
       return [...block.matchAll(/^\s*["']?(\w+)["']?\s*:\s*["']([a-z_]+)["'],?/gm)].map((m) => `${m[1]}=${m[2]}`).sort();
     };
-    for (const map of ["ACQUIRER_CODE_MAP", "AUTH_CODE_MAP"]) {
+    for (const map of ["ACQUIRER_CODE_MAP", "AUTH_CODE_MAP", "PAYZEN_PSP_CODE_MAP"]) {
       const server = await entries("../src/adapter.ts", map);
       expect(server.length, map).toBeGreaterThan(0);
       expect(await entries("../../adapter-payzen/src/adapter.ts", map), map).toEqual(server);

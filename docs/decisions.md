@@ -469,6 +469,99 @@ choices they forced:
   `@payfanout/core`, which Worldline's connection check now shares. The adapter's own screen
   above missed such a stretch inside a longer reason (`echo_fragmenttoken` for the token
   `sandbox_fragmenttoken_1234`); one shared helper keeps the two from drifting apart.
+- **Doc-verified 2026-09-26: request limits checked locally.** Checked against the OpenAPI
+  spec, the Limits, Making Requests and Responses and Errors pages, the Fallbacks and
+  Protect+ guides (docs.gocardless.com), and the support centre's Transaction limits page
+  that the spec links from `payments.amount`.
+  - *Metadata.* Every metadata field says "Up to 3 keys are permitted, with key names up
+    to 50 characters and values up to 500 characters." A key name or value the adapter
+    sends over its limit (the `id` is the value of `payfanout_id`, and a refund's `reason`
+    is a value) is refused with `invalid_request` before any request, naming the key, and
+    never truncated. Keys past the third are still withheld, and a withheld key is not
+    checked. GoCardless does not say what it counts as a character. The adapter counts
+    code points, which are never more than the UTF-16 units or UTF-8 bytes of the same
+    text, so it refuses nothing GoCardless accepts under any of those readings; if
+    GoCardless counts units or bytes, text with characters outside ASCII can pass locally
+    and be refused by GoCardless, as before. The spec types the metadata object's values
+    no further, so a value that is not a string (which the TypeScript types do not allow)
+    is sent as it is and measured as the JSON it goes out as. The metadata object has no
+    prototype, so a host key such as `constructor` or `__proto__` is sent like any other;
+    they used to be withheld silently.
+  - *Idempotency keys.* The Limits page: "Keys must be no longer than 128 characters";
+    Responses and Errors: `idempotency_key_too_long`, "Idempotency key exceeded 128
+    characters." Neither page, nor the OpenAPI spec (which defines no Idempotency-Key
+    parameter), states a character set or the unit of the 128. The rule keeps every key
+    GoCardless can have taken as it was, on every runtime the adapter runs on, so a replay
+    across the upgrade keeps its key. `fetch` trims HTTP whitespace (tab, LF, CR, space)
+    from both ends of a header value, so earlier releases sent `"order-42\n"` as `order-42`
+    and 128 characters plus a space as the 128, and such a key is still passed as given
+    (changed in review, 2026-09-30: a first version judged the untrimmed key and would have
+    keyed those replays differently). A key is sent as `payfanout-sha256-` and the SHA-256
+    digest of the key, 81 characters, only when GoCardless never took it: one over 128 code
+    points once trimmed, which GoCardless refused however it counts, as code points are the
+    smallest count of what Workers sends, and one holding a NUL, CR or LF inside the trimmed
+    value, which no runtime sends (the Fetch standard, Node and Cloudflare's workerd all
+    refuse them). Node sends U+0080 to U+00FF as one byte each, which GoCardless may read
+    as UTF-8 (Making Requests: "All requests and responses are JSON-formatted and UTF-8
+    encoded."), so a key of characters up to U+00FF counts as those bytes decoded as UTF-8
+    (`"Ã©"` repeated 65 times is 65 characters so read), and is digested only when that
+    count is over 128 (added in the third review, 2026-09-30). The decoding counts each
+    invalid sequence as one U+FFFD, as `TextDecoder` and common lossy decoders do; a
+    decoder at GoCardless that dropped invalid bytes would count fewer, and could have
+    taken a key the adapter now digests. That is an assumption, as GoCardless documents no
+    decoding. The trim is a linear scan: a regular expression anchored at the end
+    re-scanned a whitespace run from every position, quadratic on a caller's key (flagged
+    by code scanning in the third review). The
+    same key always yields the same header, so a retry replays; the Worldline adapter
+    hashes every key, and PayPal passes a key of at most 38 bytes as given and hashes a
+    longer one. Every other key is passed as given, as before (changed in review,
+    2026-09-30). A second version also digested keys holding a character above U+00FF,
+    which the Fetch standard's Headers refuse. workerd sends them as UTF-8, however
+    (`api/headers.c++` `normalizeHeaderValue`, `util/header-validation.h`: only NUL, CR and
+    LF are refused), so a Workers host retrying a create across the upgrade would have sent
+    a new key and created the resource twice. Node's `fetch` refuses such a key, or one
+    holding an ASCII control character other than tab, or DEL, before sending (observed
+    2026-09-30 on Node 24.21.0 against a local server), so on Node that call still fails as
+    the retryable transport error it always did; the guide advises ASCII keys. A lone
+    surrogate is refused where UTF-8 encoding would make a key share its hash with every
+    key that differs from it only by another lone surrogate: in a key sent as its digest,
+    which GoCardless never took, and in any refund key, whose stamp is the SHA-256 of the
+    key as given. The refund refusal is marked `outcomeUnknown`, since earlier releases
+    stamped such keys and Workers sent them; a shorter key holding one elsewhere goes as
+    given, as Workers always sent it (changed in review, 2026-09-30).
+  - *Accept.* Making Requests: "Include an `Accept` header on all requests:" followed by
+    `Accept: application/json`. Every request sends it, the connection check included.
+  - *Amounts.* The spec types a payment's `amount` ("Amount, in the lowest denomination for
+    the currency") and `amount_refunded`, a refund's `amount`, a payment request's `amount`
+    and a subscription's `amount` and `interval` as `oneOf [string, integer]`. Reads now
+    decode them as the refund path already did: a safe non-negative integer, or a string of
+    ASCII digits naming one, and nothing else; none of these fields is documented as
+    negative. Any other amount rejects the read with a non-retryable `unknown` rather than
+    reach a minor-unit field as a string, a fraction or NaN. `unknown` leaves the outcome
+    open, so a caller retries a money-moving call only under the same key, and
+    `PaymentRouter` neither retries nor fails over on it; `processing_error` would fail
+    over, and `psp_unavailable` would be retried against an answer that does not change.
+    An amount GoCardless leaves out still reads as 0, as before: the spec marks no field
+    required. An `interval` that does not read as an integer of at least 1 omits the
+    subscription's cadence, as an unrecognised `interval_unit` does.
+  - *`fallback_enabled`.* The spec: "(Optional) If true, this billing request can fallback
+    from instant payment to direct debit. Should not be set if GoCardless payment
+    intelligence feature is used." The Fallbacks guide: "Fallbacks should not be used if
+    you are using Protect+ with Verified Mandates.", and the Protect+ guide calls Protect+
+    "our anti-fraud payment intelligence product". A `false` still sets the field, so it is
+    sent only when `fallbackEnabled` is `true`.
+  - *Zero session amounts.* Core's `assertMinorUnitAmount` refuses negative and fractional
+    amounts and accepts 0, which `PaymentService` screens out for an adapter without
+    zero-amount verification; `createPaymentSession` now refuses it too when called
+    directly. The spec gives `payment_request.amount` no minimum. `payments.amount` says
+    "Minimum and maximum amounts vary by payment scheme" and links the Transaction limits
+    page, whose table lists a minimum of 1 for Faster Payments and SEPA (Open Banking),
+    with no unit stated, beside maximums an account can ask GoCardless to raise. The
+    adapter enforces none of these values; below them, GoCardless's own refusal applies.
+  - *Subscription intervals.* `subscriptions.interval`: "Must be greater than or equal to
+    `1`. Must result in at least one charge date per year." `intervalCount` is capped at 52
+    weekly (364 days; 53 weeks can leave a calendar year without a charge), 12 monthly and
+    1 yearly.
 
 ## PayPal adapter (2026-07-07)
 

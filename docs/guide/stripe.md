@@ -131,6 +131,10 @@ neither sends nor reports UGX amounts:
   `createNativeSubscription` in UGX reject with a non-retryable `invalid_request` before any
   request. `updatePaymentSession`, `capturePayment` and `refundPayment` that send an amount
   for a UGX payment reject the same way once they have read the payment (below).
+- The refusal of a `chargeSavedPaymentMethod` or `createNativeSubscription` in UGX, or in an
+  MGA amount that is not whole ariary, is marked `outcomeUnknown`: an earlier release sent
+  such requests unconverted, and one under the same idempotency key may already have
+  charged. Check the Stripe Dashboard before charging the customer elsewhere.
 - `retrievePayment`, `retrieveRefund` and `retrieveNativeSubscription` of a UGX record
   reject with `unsupported_operation`: read it in the Stripe Dashboard.
 - A capture, cancellation or refund without an amount, an update that changes neither

@@ -54,7 +54,18 @@ export interface SendTarget {
    * `action` names the call ("capture") and `remedy` ends the message.
    */
   record?: { subject: string; raw: unknown; action: string; remedy: string };
+  /**
+   * A charge or subscription create, which earlier releases sent in this
+   * currency unconverted: one under the same key may already have charged,
+   * and the adapter cannot read it back, so a refusal that release would not
+   * have made leaves the outcome open.
+   */
+  sentBefore?: boolean;
 }
+
+const SENT_BEFORE =
+  ". An earlier release sent such requests unconverted, so check the Stripe Dashboard for a charge under this " +
+  "idempotency key before sending another";
 
 /**
  * Refuses a call that would send an amount in `currency`, before any request:
@@ -97,8 +108,10 @@ export function toStripeAmount(amount: MinorUnitAmount, currency: string, target
       throw refusal(
         "invalid_request",
         `Stripe takes ${code} amounts with ${stripeExponent} decimals where PayFanout has ${payfanoutExponent}, so ` +
-          `${target.label} must be a multiple of ${divisor} minor units, got ${amount}`,
+          `${target.label} must be a multiple of ${divisor} minor units, got ${amount}` +
+          (target.sentBefore === true ? SENT_BEFORE : ""),
         raw,
+        target.sentBefore === true,
       );
     }
     stripeAmount = amount / divisor;
@@ -129,8 +142,10 @@ function sendableUnits(currency: string, target: SendTarget): Required<CurrencyU
   }
   throw refusal(
     "invalid_request",
-    `The Stripe adapter refuses ${units.currency}: ${why}. Take ${units.currency} payments with another provider`,
+    `The Stripe adapter refuses ${units.currency}: ${why}. Take ${units.currency} payments with another provider` +
+      (target.sentBefore === true ? SENT_BEFORE : ""),
     { ...units },
+    target.sentBefore === true,
   );
 }
 

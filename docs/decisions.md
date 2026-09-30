@@ -5072,7 +5072,17 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   reject with `unsupported_operation`; list pages holding one fail whole, `raw` naming each
   record and carrying the page's `nextCursor`; events keep `currency` and omit `amount`. A
   zero-amount session is a SetupIntent, which carries neither an amount nor a currency, and
-  is left alone (decided in implementation).
+  is left alone (decided in implementation). The refusal of a `chargeSavedPaymentMethod` or
+  `createNativeSubscription` in UGX, or in an MGA amount that is not whole ariary, is marked
+  `outcomeUnknown` (decided before review, 2026-09-30): an earlier release sent such
+  requests unconverted, a `SubscriptionManager` renewal retried across the upgrade reuses
+  its key, and the adapter cannot read the earlier attempt back (Stripe looks PaymentIntents
+  up by id, not by idempotency key), so `docs/adapter-authoring.md`'s rule for a refusal it
+  cannot resolve on a call that moves money applies; a plain `invalid_request` would read as
+  "no money moved" and let a host charge again elsewhere. The other send refusals move no
+  money or send the host to the Dashboard, and stay final. ISK and MGA sends whose amount
+  converts are sent, and a retry whose converted amount differs from the earlier release's
+  meets Stripe's own idempotency check, which the adapter already maps to `outcomeUnknown`.
 - **Three-decimal currencies: AMBIGUOUS, guard kept.** The page no longer has the section on
   three-decimal currencies the multiple-of-10 guard was built on (already missing on
   2026-07-17, see "PSP-native subscriptions across the contract (2026-07-17)"). BHD, JOD,

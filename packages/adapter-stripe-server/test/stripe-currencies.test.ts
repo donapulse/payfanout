@@ -288,28 +288,41 @@ describe("MGA: Stripe charges whole ariary", () => {
     const authorized = await stripeIntent(fake, 1500, "mga", "authorized");
     const vault = vaulted(fake);
     const log = recordCalls(fake);
-    const calls: Array<[() => Promise<unknown>, string[]]> = [
-      [() => adapter.createPaymentSession({ amount: 1050, currency: "MGA", idempotencyKey: "a" }), []],
+    // A charge or subscription create an earlier release sent unconverted may already have charged.
+    const calls: Array<[() => Promise<unknown>, string[], boolean]> = [
+      [() => adapter.createPaymentSession({ amount: 1050, currency: "MGA", idempotencyKey: "a" }), [], false],
       [
         () => adapter.updatePaymentSession({ pspSessionId: open.id, amount: 1050, currency: "MGA", idempotencyKey: "b" }),
         [],
+        false,
       ],
-      [() => adapter.updatePaymentSession({ pspSessionId: open.id, amount: 1050, idempotencyKey: "c" }), ["paymentIntents.retrieve"]],
-      [() => adapter.capturePayment(authorized.id, 1050, "d"), ["paymentIntents.retrieve"]],
-      [() => adapter.refundPayment({ pspPaymentId: paid.id, amount: 1050, idempotencyKey: "e" }), ["paymentIntents.retrieve"]],
-      [() => adapter.chargeSavedPaymentMethod({ ...vault, amount: 1050, currency: "MGA", idempotencyKey: "f" }), []],
+      [
+        () => adapter.updatePaymentSession({ pspSessionId: open.id, amount: 1050, idempotencyKey: "c" }),
+        ["paymentIntents.retrieve"],
+        false,
+      ],
+      [() => adapter.capturePayment(authorized.id, 1050, "d"), ["paymentIntents.retrieve"], false],
+      [
+        () => adapter.refundPayment({ pspPaymentId: paid.id, amount: 1050, idempotencyKey: "e" }),
+        ["paymentIntents.retrieve"],
+        false,
+      ],
+      [() => adapter.chargeSavedPaymentMethod({ ...vault, amount: 1050, currency: "MGA", idempotencyKey: "f" }), [], true],
       [
         () =>
           adapter.createNativeSubscription({ ...vault, amount: 1050, currency: "MGA", interval: "month", idempotencyKey: "g" }),
         [],
+        true,
       ],
     ];
-    for (const [call, expected] of calls) {
+    for (const [call, expected, sentBefore] of calls) {
       log.length = 0;
       const err = await rejectionOf(call());
       expect(err).toMatchObject({ code: "invalid_request", retryable: false, pspName: "stripe" });
       expect(err.message).toMatch(/MGA amounts with 0 decimals where PayFanout has 2, so .* must be a multiple of 100 minor units, got 1050/);
       expect(err.raw).toMatchObject({ currency: "MGA", payfanoutExponent: 2, stripeExponent: 0, amount: 1050 });
+      expect(err.outcomeUnknown).toBe(sentBefore ? true : undefined);
+      expect(err.message.includes("check the Stripe Dashboard for a charge under this idempotency key")).toBe(sentBefore);
       expect(names(log)).toEqual(expected);
     }
   });
@@ -406,28 +419,41 @@ describe("UGX: refused, as Stripe documents it with two units", () => {
     const open = await stripeIntent(fake, 5000, "usd");
     const vault = vaulted(fake);
     const log = recordCalls(fake);
-    const calls: Array<() => Promise<unknown>> = [
-      () => adapter.createPaymentSession({ amount: 5000, currency: "UGX", idempotencyKey: "a" }),
-      () => adapter.updatePaymentSession({ pspSessionId: open.id, amount: 5000, currency: "ugx", idempotencyKey: "b" }),
-      () => adapter.updatePaymentSession({ pspSessionId: open.id, currency: "UGX", idempotencyKey: "c" }),
-      () => adapter.chargeSavedPaymentMethod({ ...vault, amount: 5000, currency: "UGX", idempotencyKey: "d" }),
-      () => adapter.createNativeSubscription({ ...vault, amount: 5000, currency: "UGX", interval: "month", idempotencyKey: "e" }),
-      () =>
-        adapter.createNativeSubscription({
-          ...vault,
-          amount: 5000,
-          currency: "UGX",
-          interval: "month",
-          planId: fake.seedPrice({ currency: "ugx" }).id,
-          idempotencyKey: "f",
-        }),
+    // A charge or subscription create an earlier release sent unconverted may already have charged.
+    const calls: Array<[() => Promise<unknown>, boolean]> = [
+      [() => adapter.createPaymentSession({ amount: 5000, currency: "UGX", idempotencyKey: "a" }), false],
+      [
+        () => adapter.updatePaymentSession({ pspSessionId: open.id, amount: 5000, currency: "ugx", idempotencyKey: "b" }),
+        false,
+      ],
+      [() => adapter.updatePaymentSession({ pspSessionId: open.id, currency: "UGX", idempotencyKey: "c" }), false],
+      [() => adapter.chargeSavedPaymentMethod({ ...vault, amount: 5000, currency: "UGX", idempotencyKey: "d" }), true],
+      [
+        () =>
+          adapter.createNativeSubscription({ ...vault, amount: 5000, currency: "UGX", interval: "month", idempotencyKey: "e" }),
+        true,
+      ],
+      [
+        () =>
+          adapter.createNativeSubscription({
+            ...vault,
+            amount: 5000,
+            currency: "UGX",
+            interval: "month",
+            planId: fake.seedPrice({ currency: "ugx" }).id,
+            idempotencyKey: "f",
+          }),
+        true,
+      ],
     ];
-    for (const call of calls) {
+    for (const [call, sentBefore] of calls) {
       const err = await rejectionOf(call());
       expect(err).toMatchObject({ code: "invalid_request", retryable: false, pspName: "stripe" });
       expect(err.message).toMatch(
-        /^The Stripe adapter refuses UGX: Stripe's currencies page lists UGX as a zero-decimal currency and also asks for UGX amounts as two-decimal values ending in 00, so the unit it reads them in is unknown\. Take UGX payments with another provider$/,
+        /^The Stripe adapter refuses UGX: Stripe's currencies page lists UGX as a zero-decimal currency and also asks for UGX amounts as two-decimal values ending in 00, so the unit it reads them in is unknown\. Take UGX payments with another provider/,
       );
+      expect(err.message.endsWith("before sending another")).toBe(sentBefore);
+      expect(err.outcomeUnknown).toBe(sentBefore ? true : undefined);
       expect(err.raw).toEqual({ currency: "UGX", payfanoutExponent: 0 });
     }
     expect(names(log)).toEqual([]);

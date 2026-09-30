@@ -530,7 +530,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     }
     const currency = normalizeCurrency(input.currency);
     // Checked with a planId too, though that path sends the Price's own amount.
-    const unitAmount = toStripeAmount(input.amount, currency, { label: "amount" });
+    const unitAmount = toStripeAmount(input.amount, currency, { label: "amount", sentBefore: true });
     const anchor = input.startAt !== undefined ? toEpochSeconds(input.startAt, "startAt") : undefined;
     const metadata = withMerchantRef(input.metadata, input.merchantRefNum);
 
@@ -750,7 +750,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
   async chargeSavedPaymentMethod(input: ChargeSavedPaymentMethodInput): Promise<PaymentInfo> {
     assertMinorUnitAmount(input.amount, "amount");
     const currency = normalizeCurrency(input.currency);
-    const amount = toStripeAmount(input.amount, currency, { label: "amount" });
+    const amount = toStripeAmount(input.amount, currency, { label: "amount", sentBefore: true });
     const metadata = withPayfanoutId(input.metadata, input.id);
     return this.run(async (client) => {
       const pi = await client.paymentIntents.create(

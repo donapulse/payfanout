@@ -1,6 +1,6 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { getRefundState, isPayFanoutError } from "@payfanout/core";
+import { getRefundState, isPayFanoutError, screenSessionInput } from "@payfanout/core";
 import { runServerAdapterConformanceTests } from "@payfanout/conformance";
 import { GoCardlessServerAdapter, gocardlessOnboarding, type GoCardlessServerAdapterConfig } from "../src/index.js";
 import { FakeGoCardlessApi } from "./fake-gocardless-api.js";
@@ -514,8 +514,69 @@ describe("GoCardlessServerAdapter specifics", () => {
     await expect(
       adapter.createPaymentSession({ ...base, paymentMethodTypes: ["ach"], idempotencyKey: "k2" }),
     ).rejects.toMatchObject({ code: "invalid_request" });
+    // A session is a one-off Open Banking payment: it never collects by Direct Debit.
+    for (const [types, currency, key] of [
+      [["bacs_debit"], "GBP", "k3"],
+      [["sepa_debit"], "EUR", "k4"],
+      [["sepa_debit", "bacs_debit"], "EUR", "k5"],
+    ] as const) {
+      await expect(
+        adapter.createPaymentSession({ ...base, currency, paymentMethodTypes: [...types], idempotencyKey: key }),
+        types.join(","),
+      ).rejects.toMatchObject({
+        code: "invalid_request",
+        message: expect.stringMatching(/supports none of the requested payment method types: /),
+      });
+    }
     await expect(
-      adapter.createPaymentSession({ ...base, paymentMethodTypes: ["bacs_debit"], idempotencyKey: "k3" }),
+      adapter.createPaymentSession({ ...base, paymentMethodTypes: ["bank_redirect_generic"], idempotencyKey: "k6" }),
     ).resolves.toMatchObject({ status: "requires_action" });
+  });
+
+  it("serves a list naming bank_redirect_generic beside types it does not take, as the router's screen does", async () => {
+    const { adapter } = makePair();
+    for (const [types, currency, key] of [
+      [[], "GBP", "m0"],
+      [["sepa_debit", "bank_redirect_generic"], "EUR", "m1"],
+      [["bacs_debit", "bank_redirect_generic"], "GBP", "m2"],
+      [["card", "bank_redirect_generic"], "GBP", "m3"],
+    ] as const) {
+      const input = { amount: 100, currency, returnUrl: RETURN_URL, paymentMethodTypes: [...types], idempotencyKey: key };
+      expect(screenSessionInput(adapter.getCapabilities(), input), types.join(",")).toBeUndefined();
+      await expect(adapter.createPaymentSession(input), types.join(",")).resolves.toMatchObject({
+        status: "requires_action",
+      });
+    }
+  });
+
+  it("honors a paymentMethods override that narrows the list, in the screen and the adapter alike", async () => {
+    const { adapter } = makePair({
+      paymentMethods: [{ type: "bank_redirect_generic", flow: "redirect", supported: false }],
+    });
+    const input = {
+      amount: 100,
+      currency: "GBP",
+      returnUrl: RETURN_URL,
+      paymentMethodTypes: ["bank_redirect_generic" as const],
+      idempotencyKey: "n1",
+    };
+    expect(screenSessionInput(adapter.getCapabilities(), input)).toMatch(/supports none of the requested payment method types: /);
+    await expect(adapter.createPaymentSession(input)).rejects.toMatchObject({ code: "invalid_request" });
+  });
+
+  it("declares bank_redirect_generic the one method a session takes, so the router skips a Direct Debit session", () => {
+    for (const fallbackEnabled of [false, true]) {
+      const { adapter } = makePair({ fallbackEnabled });
+      const caps = adapter.getCapabilities();
+      const supported = caps.paymentMethods.filter((method) => method.supported).map((method) => method.type);
+      expect(supported).toEqual(["bank_redirect_generic"]);
+      const session = { amount: 1000, currency: "EUR", idempotencyKey: "k", returnUrl: RETURN_URL } as const;
+      for (const type of ["sepa_debit", "bacs_debit"] as const) {
+        expect(screenSessionInput(caps, { ...session, paymentMethodTypes: [type] }), type).toMatch(
+          /supports none of the requested payment method types: /,
+        );
+      }
+      expect(screenSessionInput(caps, { ...session, paymentMethodTypes: ["bank_redirect_generic"] })).toBeUndefined();
+    }
   });
 });

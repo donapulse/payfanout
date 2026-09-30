@@ -121,6 +121,21 @@ the expected seam).
   sign-off, not a side effect. The seam is reserved: a `mountWalletButtons?` optional
   client method mirroring `mount`. Unblock: demand + a second PSP with an express
   surface to keep the abstraction honest.
+- **GoCardless one-off Direct Debit sessions (Bacs, SEPA Core):** a session today is a
+  billing request's payment request, a one-off Open Banking payment, so the adapter declares
+  `sepa_debit` and `bacs_debit` unsupported (decisions.md, "GoCardless sessions declare Pay
+  by Bank only"). A Direct Debit session would be a billing request with a mandate request
+  (`bacs` or `sepa_core`), fulfilled in the hosted flow, followed by a server-side
+  `POST /payments` against the new mandate for the session's amount. That payment confirms
+  on debit timing (days), so the session must be `requiresServerCompletion` (or the host must
+  accept a payment created after the redirect), the mandate becomes a reusable handle the
+  vault contract would have to expose honestly, and the payment's charge date and late
+  failures need their own event mapping. Another route, for Pro and Enterprise accounts
+  with custom payment pages, is the restricted
+  `POST /billing_requests/{id}/actions/fallback`, which moves a billing request with
+  `fallback_enabled` from Open Banking to Direct Debit. Unblock: demand for Direct Debit
+  one-offs through GoCardless, a decision on how completion and the mandate surface in the
+  contract, and a sandbox run of the mandate-then-payment sequence.
 - **Dispute/chargeback management:** today the library surfaces `payment.chargeback` webhooks;
   evidence submission stays in PSP dashboards. Unblock: real merchant demand.
 - **Niche until demanded** (unchanged): Level 2/3 card data, DCC, surcharging,

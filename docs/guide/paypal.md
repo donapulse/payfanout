@@ -86,6 +86,25 @@ session `id` travels as the order's `custom_id`, so it takes at most 255 charact
 amounts must be greater than zero; both are refused as `invalid_request` before any call.
 OAuth tokens are minted and cached inside the adapter — nothing to configure.
 
+### Idempotency keys
+
+`createPaymentSession`, `completePayment`, `capturePayment`, `cancelPayment`,
+`refundPayment`, and `cancelNativeSubscription` send your `idempotencyKey` as the
+`PayPal-Request-Id` header: as given when its UTF-8 encoding is at most 38 bytes, and
+otherwise as the first 36 hex characters of its SHA-256 digest, so the same key always
+yields the same header and a retry replays. `updatePaymentSession` sends none: it re-reads
+the order before building its patch, so a replay writes the same values again.
+Two runtime details apply to the key as given:
+
+- `fetch` trims whitespace from both ends of a header value, so keys that differ only in
+  edge whitespace (`"order-42"` and `"order-42 "`) reach PayPal as one key.
+- Node's `fetch` refuses a header value holding a character above U+00FF, or an ASCII
+  control character other than tab, before sending, so on Node a short key holding one
+  (`"order-€-42"`) fails every call as a retryable `psp_unavailable` that no retry fixes.
+  Cloudflare Workers sends such a key as UTF-8.
+
+Use keys of printable ASCII.
+
 ## 5. Wire the client adapter
 
 ```tsx

@@ -1550,9 +1550,11 @@ current status (remaining sandbox checks run via the dispatch-only integration w
   bank account"; support matrix customer country "US"), Stripe Bacs → GB
   (payments/payment-methods/bacs-debit, "customers who hold a British bank account"),
   GoCardless Bacs → GB (support.gocardless.com Schemes-and-Requirements, "GBP from UK
-  bank accounts"), Paysafe Interac → CA (interac-e-transfer page, "Supported region:
-  Canada"). SEPA stays undeclared on both Stripe and GoCardless: the providers state a
-  zone, not a country (Stripe "Europe", GoCardless "the Eurozone" on the support page,
+  bank accounts"; superseded 2026-09-30: GoCardless sessions no longer declare Bacs, see
+  "GoCardless sessions declare Pay by Bank only"), Paysafe Interac → CA
+  (interac-e-transfer page, "Supported region: Canada"). SEPA stays undeclared on both
+  Stripe and GoCardless: the providers state a zone, not a country (Stripe "Europe",
+  GoCardless "the Eurozone" on the support page,
   while collecting from non-Eurozone SEPA countries per the API docs — the two GoCardless
   statements do not even agree on the zone's edge), and a hardcoded membership list would
   screen out valid payments the day it drifts. No PSP-wide `supportedCountries` exists,
@@ -5333,3 +5335,340 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   regional units of account, the testing code and "no currency") still read as 2, as any code
   outside core's table does, and a test pins that. None is a currency a payment is taken in,
   and refusing them in core would be a separate, breaking decision.
+
+## PayZen neon theme script (2026-09-30)
+
+- **The theme has a script, and the adapter did not load it.** PayZen's themes page
+  (payzen.io/en-EN/rest/V4.0/javascript/redirection/themes.html, read 2026-09-30 through the
+  content API) says "Each theme requires a dedicated CSS and JS file to be loaded" and lists,
+  for the default neon theme, `neon-reset.min.css` ("Applies the neon theme by forcing the
+  styles (!important)"), `neon.css` and `neon.js` ("Active part of the neon theme"). The
+  adapter loaded the library and `neon-reset.min.css` only (`injectKrAssets`), so the
+  payment form, embedded or smartForm, rendered without the theme's active part.
+- **What the script is, from the served files** (read 2026-09-30).
+  `https://static.payzen.eu/static/js/krypton-client/V4.0/ext/neon.js` (Last-Modified
+  2026-09-09) assigns `window.KR_CONFIGURATION`, with the button template and animation, the
+  field icons, the smartForm layout settings and `theme: { name: "neon", version: "V4.21.2" }`,
+  and loads nothing else (its only URLs are SVG namespaces). The library,
+  `.../V4.0/stable/kr-payment-form.min.js` (V4.21.2), reads `window.KR_CONFIGURATION` in the
+  configuration setup it runs when a form token is set up (`setupInitialConfig`, which also
+  reads the form token), not when the script loads. When that configuration exists, its
+  theme handler (`checkConflicts`) checks that the theme's name is neon, classic or
+  material, that its version equals the library's, that a stylesheet on the page whose name
+  ends with the theme's (`neon-reset.min.css` and the like) comes from the library's domain,
+  and that a script whose name ends with `neon.js` (or the theme's) is on the page, from that
+  domain; it reports a failure as a console warning and to PayZen's error tracking. It never
+  compares the stylesheet with the script (corrected in review, 2026-09-30: the first
+  version said it reports files that disagree).
+- **Load order: after the library, before the first form.** The themes page's prose says
+  the JS theme file "must be loaded before the main JavaScript library", while its own code
+  samples, like the display guide the setup guide already cites, load it after the library.
+  The served library settles it: the configuration is read at form setup, so a script that
+  has loaded by then applies, whichever came first. The adapter keeps the order the samples
+  and the existing stylesheet use: `neon.js` is injected once the library has loaded, through
+  core's `injectScript` (one tag per page, a failed tag removed, `cspNonce` applied), with
+  `async = false` like the library.
+- **Waited for, unlike the stylesheet.** `loadSdk()` resolves only once the theme script has
+  loaded, since `mount()` sets the form up right after; a theme script that fails to load
+  resolves it all the same and only leaves the theme's active part out. The stylesheet stays
+  unawaited, as before (its Google Fonts imports would hold up the first mount).
+- **Configuration.** `themeScriptUrl` overrides the script, and an empty string loads none,
+  as `cssUrl` does for the stylesheet. The default, `neon.js`, applies only while `scriptUrl`
+  and `cssUrl` are the default files, passed or left out, as the three come as a set
+  (changed in review, 2026-09-30; the values are compared, so a host that copies the
+  default "JavaScript URL" from its Back Office still gets the theme). A host that set `cssUrl` (its own styling, PayZen's theme-less
+  `no-theme.min.css`, or `""`) would otherwise have had neon's configuration laid over it,
+  with its field icons, button template, `form.wrapper` and smartForm settings, on a minor
+  release; and a host that set `scriptUrl` to another domain would have had a V4.21.2 theme
+  from `static.payzen.eu` checked against its library on every form, failing the domain
+  check. Such a host sets `themeScriptUrl` to the theme's script next to its library.
+  Another theme needs both theme files set (classic: `classic-reset.min.css` and
+  `classic.js`); the material theme's script turns the smartForm off (`CLIENT_505`). The
+  `loadScript` test seam now receives the theme script URL as a third argument; a
+  two-parameter seam still type-checks and loads no theme. The script comes from
+  `https://static.payzen.eu`, which `script-src` already allows, so the setup guide's CSP
+  tip gains no host. `@payfanout/adapter-payzen` takes a minor release for the new option.
+- **Tests.** The loader tests fire the theme script's load and pin its order (after the
+  library), its `async = false`, its nonce, the wait in `loadSdk()`, a failure that resolves,
+  the empty-string opt-out, the overrides, no default beside a host's own library or
+  stylesheet, and the seam's three arguments. Each mutation tried (not awaited, failure
+  propagated, nonce or `async = false` dropped, no empty-string guard, no theme script, a
+  wrong default, the override ignored, the default kept beside a host's files) made a test
+  fail.
+- **Not verified in a sandbox.** How the rendered form differs with and without the theme
+  script needs a form token, which only the PayZen API issues; the check is to mount the
+  embedded form in the sandbox and compare the pay button and field icons.
+
+## GoCardless sessions declare Pay by Bank only (2026-09-30)
+
+- **What a session is.** `createPaymentSession` creates a billing request with a
+  `payment_request` and nothing else. GoCardless's OpenAPI spec (docs.gocardless.com/
+  openapi-schema-public.json, read 2026-09-30) describes `BillingRequestPaymentRequest` as
+  "Request for a one-off strongly authorised payment", and its `scheme` as "A scheme used for
+  Open Banking payments. Currently `faster_payments` is supported in the UK (GBP) and
+  `sepa_credit_transfer` and `sepa_instant_credit_transfer` are supported in supported
+  Eurozone countries (EUR)." Bacs and SEPA Core are mandate schemes (`BillingRequestScheme`,
+  "Optional for mandate only requests"), and no session sets up a mandate.
+- **The capability list said otherwise.** Both GoCardless adapters declared `sepa_debit` and
+  `bacs_debit` supported for sessions, on the reasoning that "the classic debit schemes list
+  what the fulfilled payment can report". A session asked for either was created all the
+  same, as a Pay by Bank payment, and the router could send a session asking for SEPA Direct
+  Debit to GoCardless. Both are now declared `supported: false`; `bank_redirect_generic` is
+  the one method a session takes.
+- **A list is read as the router reads it** (changed in review, 2026-09-30). Core's
+  `screenSessionInput` passes a session when any requested type is supported, while the
+  adapter refused one naming any unsupported type. With `sepa_debit` and `bacs_debit`
+  unsupported, `["sepa_debit", "bank_redirect_generic"]` would have passed the screen, then
+  been refused by GoCardless with a non-retryable `invalid_request`, ending the cascade before
+  a PSP that serves SEPA was tried, where it used to create a Pay by Bank session. The
+  adapter now refuses only a list naming no type it takes (`["sepa_debit"]`, or
+  `["card"]`), as "Stripe: explicit payment_method_types vs intent currency (2026-07-15)"
+  reasons for mixed lists; a list that also names
+  `bank_redirect_generic` is served, as every session is Pay by Bank. A list such as
+  `["card", "bank_redirect_generic"]`, refused before, is served too.
+- **The fallback does not change it** (corrected in review, 2026-09-30). The Fallbacks guide
+  (docs.gocardless.com/docs/optimise/retain-customers-with-fallbacks): with
+  `fallback_enabled`, "The option to pay via Direct Debit will only be shown if either the
+  customer is unable to find" their bank "or" fails an "attempt to authorise through their
+  bank", and the payer then chooses "Continue payment using Direct Debit". The spec's
+  `POST /billing_requests/{billing_request_id}/actions/fallback` "Triggers a fallback from
+  the open-banking flow to direct debit", restricted to GoCardless Pro and Enterprise
+  accounts with the custom payment pages upgrade, and `fallback_occurred` is "True if the
+  billing request was completed with direct debit". `retrievePayment` keeps reporting such a
+  payment as `bacs_debit` or `sepa_debit` (`mapSchemeToMethodType`). Direct Debit is the
+  payer's choice after a failure, or the fallback action's, which the adapter never calls;
+  no session can be asked for it, so the method stays unsupported. A first version said the
+  fallback happens when "the payer's bank cannot pay instantly" and is "never the host's",
+  which the guide and the action contradict.
+- **Overrides only narrow.** `paymentMethods` still overrides the list on both adapters, but
+  declaring `sepa_debit` or `bacs_debit` supported would not make a session collect by
+  Direct Debit; the JSDoc and the guide say to override only to narrow the list.
+- **Release.** A host that named only `sepa_debit` or `bacs_debit` in a GoCardless session
+  got a Pay by Bank payment and now gets `invalid_request`, and a routing rule for those
+  methods alone no longer reaches GoCardless, so `@payfanout/adapter-gocardless-server` takes
+  a major and `@payfanout/adapter-gocardless`, whose capability list mirrors it, a minor
+  (0.x). A real Direct Debit session, a mandate request followed by a payment against the
+  mandate, is a design of its own (future-designs.md).
+
+## Stripe: currencies whose API units differ from PayFanout's (2026-09-30)
+
+- **Stripe reads `amount` in its own units for three currencies.** Doc-verified 2026-09-30
+  against docs.stripe.com/currencies, fetched in English (`Accept-Language: en-US`; without
+  it the page answers in French). The `.md` variant carries the prose; the zero-decimal list
+  is rendered only in the HTML page. "Currencies are two-decimal currencies unless otherwise
+  specified. All API requests expect `amount` values in the currency's minor unit". The
+  zero-decimal list reads BIF, CLP, DJF, GNF, JPY, KMF, KRW, MGA, PYG, RWF, UGX, VND, VUV,
+  XAF, XOF and XPF, for which "the charge and the amount are the same, without requiring
+  multiplication". The "Special cases" table gives "Icelandic Króna (ISK) | ISK transitioned
+  to a zero-decimal currency, but backward compatibility requires you to represent it as a
+  two-decimal value, where the decimal amount is always `00`. For example, to charge 5 ISK,
+  provide an `amount` value of `500`. You can't charge fractions of ISK." Its HUF and TWD
+  rows concern payouts only ("even though you can charge two-decimal amounts"), so their
+  charges stay two-decimal, as core has them. The API reference gives PaymentIntent `amount`
+  (create, update and object), Refund `amount` (create and object), Charge `amount_refunded`
+  and Price `unit_amount` in "the smallest currency unit", linking that page, and
+  `items[].price_data.unit_amount` in the currency's sub-unit; the PaymentIntent, Charge,
+  Refund, Subscription and Price objects each carry `currency`.
+- **Capture amounts: unit inferred, AMBIGUOUS** (corrected in review, 2026-09-30; the first
+  version of this entry quoted "the smallest currency unit" for them too). The capture
+  endpoint's `amount_to_capture` ("The amount to capture from the PaymentIntent, which must
+  be less than or equal to the original amount. Defaults to the full `amount_capturable` if
+  it's not provided.") and the PaymentIntent's `amount_capturable` ("Amount that can be
+  captured from this PaymentIntent.") and `amount_received` ("Amount that this PaymentIntent
+  collects.") carry no unit wording. The adapter converts them with `amount`, which they are
+  compared with and default from; no page states it, and the ISK and MGA sandbox checks
+  below would show it.
+- **Stripe's idempotency compares parameters.** Doc-verified 2026-09-30 against
+  docs.stripe.com/api/idempotent_requests: "Stripe's idempotency works by saving the
+  resulting status code and body of the first request made for any given idempotency key,
+  regardless of whether it succeeds or fails. Subsequent requests with the same key return
+  the same result, including `500` errors." and "You can remove keys from the system
+  automatically after they're at least 24 hours old. We generate a new request if a key is
+  reused after the original is pruned. The idempotency layer compares incoming parameters to
+  those of the original request and errors if they're not the same to prevent accidental
+  misuse." A retry must therefore send the very parameters of the first attempt, whatever
+  state that attempt left behind (below), and the test double now compares them on every
+  keyed write and replays a saved error as Stripe does (see Tests).
+- **Compared with core, currency by currency.** The HTML page embeds its per-country
+  presentment lists as JSON: 45 countries, 139 distinct currencies. Each was given Stripe's
+  decimals by the page's own rules (the zero-decimal list, ISK's special case, two
+  otherwise) and compared with core's `getCurrencyExponent`. ISK (two decimals at Stripe,
+  always 0; core and ISO 4217 give 0) and MGA (none at Stripe; core and ISO 4217 give 2)
+  disagree. UGX is on the zero-decimal list, where core agrees with it, and in the special
+  cases, where it does not (below). The rule of two decimals "unless otherwise specified"
+  would also put BHD, JOD, KWD, OMR and TND at two (below). Every zero-decimal code is in
+  the presentment lists.
+- **What the adapter did until now.** It sent PayFanout's amounts unchanged, so ISK 1,000
+  (`amount: 1000`) was charged as ISK 10, and MGA 10.00 (`amount: 1000`) as MGA 1,000.
+- **ISK and MGA convert both ways**, in `src/currency-units.ts`, which holds Stripe's
+  decimals for the two and reads PayFanout's from core at call time. ISK is sent multiplied
+  by 100, an amount whose product leaves the safe integer range refused with
+  `invalid_request`, and read divided by 100. A Stripe ISK amount that is not a multiple of
+  100 cannot be reported: reads fail with `unsupported_operation`, the record on
+  `raw.record`, and events omit `amount`. MGA is sent divided by 100, an amount that is not a
+  multiple of 100 (Stripe charges whole ariary) refused with `invalid_request` before the
+  request that would carry it, and read multiplied by 100. The conversion covers every
+  amount sent (PaymentIntent `amount` on session creation, update and saved-method charges,
+  `amount_to_capture`, refund `amount`, `price_data.unit_amount`) and every amount reported
+  (`PaymentSession.amount`; `PaymentInfo.amount`, `amountRefunded`, `amountCaptured` and
+  `amountCapturable`; the subscription installment, Σ `unit_amount` × `quantity` converted
+  as a total; refund amounts; webhook and polled event amounts).
+- **UGX: AMBIGUOUS, refused.** The special cases give UGX the ISK text ("UGX transitioned to
+  a zero-decimal currency, but backwards compatibility requires you to represent it as a
+  two-decimal value, where the decimal amount is always `00`. For example, to charge 5 UGX,
+  provide an `amount` value of `500`. You can't charge fractions of UGX. For invoices where
+  the `amount` is fractional after prorations, coupons, or taxes, Stripe automatically rounds
+  that amount to the nearest number evenly divisible by 100."), while the zero-decimal list
+  names UGX too. Either reading charges a hundredth or a hundred times the price if it is
+  the wrong one, so the adapter sends and reports no UGX amount. Sends reject with
+  `invalid_request` before the request that would carry the amount; reads of a UGX record
+  reject with `unsupported_operation`; list pages holding one fail whole, `raw` naming each
+  record and carrying the page's `nextCursor`; events keep `currency` and omit `amount`. A
+  zero-amount session is a SetupIntent, which carries neither an amount nor a currency, and
+  is left alone (decided in implementation).
+- **Refusals an earlier release would not have made leave the outcome open.** Earlier
+  releases sent UGX amounts, and MGA amounts that are not whole ariary, unconverted, so a
+  call retried under the same key after the upgrade may meet money its first attempt already
+  moved, and `docs/adapter-authoring.md`'s rule for a refusal the adapter cannot resolve
+  applies: a plain `invalid_request` would read as "no money moved" and let a host move it
+  again elsewhere.
+  - `chargeSavedPaymentMethod` and `createNativeSubscription` (decided before review,
+    2026-09-30): a `SubscriptionManager` renewal retried across the upgrade reuses its key,
+    and the adapter cannot read the earlier attempt back (Stripe looks PaymentIntents up by
+    id, not by idempotency key), so their refusal is always `outcomeUnknown`, asking the
+    host to check the Stripe Dashboard for a charge, or a subscription, under the key before
+    sending another.
+  - `capturePayment` with an amount (changed in review, 2026-09-30; the first version made
+    these refusals final and told the host to capture in the Dashboard, which could repeat
+    money a retried call had already moved). It reads the PaymentIntent anyway, so the
+    refusal is final only when that read shows a PaymentIntent still `requires_capture`, as
+    nothing is captured on one. Every other status leaves it `outcomeUnknown`, a cancelled
+    one included, which was never captured: the rule is conservative.
+  - `refundPayment` with an amount (changed in review, 2026-09-30, twice). The second review
+    replaced the first version's lift, a latest charge whose `amount_refunded` is 0: the
+    charge's field reads "Amount in the smallest currency unit refunded (can be less than
+    the amount attribute on the charge if a partial refund was issued)", which does not say
+    whether pending refunds count, and refunds can wait in two such states. The refunds guide
+    (docs.stripe.com/refunds, read 2026-09-30) says "If your available balance doesn't cover
+    the amount of the refund, Stripe holds the refund as pending for card transactions
+    (refunds for other payment method types fail) until your Stripe balance becomes
+    sufficient", and "For some payment methods without native refund support (for example,
+    Konbini, PromptPay, Boleto, and bank transfers), Stripe needs to collect bank account
+    details from your customer before it can process the refund. In these cases, the refund
+    enters the `requires_action` status". So on the way to the refusal only, never for a
+    refund that is sent, the adapter lists the PaymentIntent's refunds, and the refusal is
+    final only when that list is complete (`has_more` false) and holds nothing but `failed`
+    or `canceled` refunds, or none. Any other status, a null one included, another page, or
+    a list that cannot be read leaves it `outcomeUnknown`. Doc-verified 2026-09-30 against
+    docs.stripe.com/api/refunds/list: `GET /v1/refunds` "Returns a list of all refunds you
+    created", its `payment_intent` parameter "Only return refunds for the PaymentIntent
+    specified by this ID", and `limit` "can range between 1 and 100"; and
+    docs.stripe.com/api/refunds/object: `status` (string, nullable) "Status of the refund.
+    This can be `pending`, `requires_action`, `succeeded`, `failed`, or `canceled`." The
+    `expand` of the latest charge the first version added for its lift is gone.
+  - Both messages ask the host to check the Stripe Dashboard for a capture or refund under
+    the key before acting there, never to act first, and a final refusal asks it too (added
+    in the second review, 2026-09-30, for the MGA refusal the UGX one already had it for).
+  - `updatePaymentSession` when the update names UGX or sends an amount for a UGX
+    PaymentIntent (changed in review, 2026-09-30, twice): an update sending an amount for a
+    UGX PaymentIntent, and, since the second review, one naming UGX, with or without an
+    amount. A currency change away from a UGX PaymentIntent, whose amount cannot be kept,
+    stays a final `invalid_request` asking for the amount with the currency. The first two
+    are always `outcomeUnknown`, as an earlier release sent such updates unconverted under
+    the same key and no read through the adapter can show whether one went through
+    (`retrievePayment` refuses a UGX PaymentIntent); the message asks for a check under the
+    key. An MGA update's refusal stays final: it moves no money, and `retrievePayment`
+    reports the amount the PaymentIntent holds.
+  - The other send refusals stay final: session creation, which makes a new PaymentIntent
+    and moves no money; an MGA update, as above; the ISK overflow, which only amounts past
+    Stripe's 12-digit maximum reach, so no earlier attempt of it went through; and the
+    three-decimal rule, which earlier releases applied too.
+  ISK and MGA sends whose amount converts are sent, and a retry whose converted amount
+  differs from the earlier release's meets Stripe's own idempotency check, which the adapter
+  already maps to `outcomeUnknown`.
+- **Three-decimal currencies: AMBIGUOUS, guard kept.** The page no longer has the section on
+  three-decimal currencies the multiple-of-10 guard was built on (already missing on
+  2026-07-17, see "PSP-native subscriptions across the contract (2026-07-17)"). BHD, JOD,
+  KWD, OMR and TND appear only in the AE presentment list, and the page's meta description
+  still advertises "zero-decimal and three-decimal currency support". Read literally, the
+  page's "two-decimal currencies unless otherwise specified" would make them two-decimal at
+  Stripe, which nothing else on the page supports. They keep core's three decimals and the
+  guard, unchanged in rule and in reach: it applies to session creation, an update naming
+  both amount and currency, saved-method charges and native subscriptions, from one
+  function in `src/currency-units.ts` that replaces the four copies in the adapter. Captures,
+  refunds, amount-only updates and the amount a currency change keeps are left to Stripe, as
+  before (changed in review, 2026-09-30: the first version extended the guard to them once
+  they read the currency).
+- **Calls that name no currency read the PaymentIntent first.** A capture or refund that
+  states an amount, and an update carrying `amount` without `currency`, read the
+  PaymentIntent to learn the currency the amount is sent in: one more request, only when an
+  amount is given (a refund refused for the reasons above lists its refunds too). An
+  update carrying `currency` without `amount` reads it as well (decided in implementation):
+  Stripe keeps its own integer across a currency change, so a session of `amount: 1000`
+  moved from ISK (Stripe's `100000`) to USD would otherwise ask for USD 1,000.00. The
+  adapter reads the current amount in the old currency's units and always sends it
+  converted for the new currency, so "fields omitted are left unchanged" holds in
+  PayFanout's minor units and the parameters depend only on the state asked for (changed in
+  review, 2026-09-30: the first version sent the amount only when Stripe's figure changed,
+  so a same-key retry after a lost answer read the PaymentIntent already converted, sent
+  `currency` alone, and met Stripe's parameter check). A kept amount the new currency cannot
+  take is refused before the update, and so is a currency change of a UGX session, whose
+  amount cannot be read, with `invalid_request` asking for the amount with the currency.
+  A capture's or refund's parameters depend on the caller's amount and the payment's
+  currency, which no longer changes once the payment is authorized, so their retries send
+  the same request too. A currency change without an amount reads and then writes, so an
+  amount update landing between the two is overwritten: the setup guide asks hosts to send
+  the updates of one session one at a time (added in the second review, 2026-09-30).
+- **Calls that send no amount are not read first** (decided in implementation, keeping the
+  extra request to calls that send an amount). A capture, cancellation or refund without an
+  amount, an update of other fields and a subscription cancellation go through at Stripe
+  even for a UGX record; the answer is refused with `unsupported_operation` marked
+  `outcomeUnknown`, since the call took effect, and a retry under the same key gets the same
+  record and the same refusal. Reading first on every such call would refuse them before any
+  request instead, at the cost of one more request on every capture, cancellation and
+  refund in every currency.
+- **Records made by earlier releases.** They were sent ISK and MGA amounts unchanged, and
+  reads now report what Stripe holds (an ISK 1,000 payment from then reads as ISK 10). The
+  changeset and the setup guide send hosts to the Stripe Dashboard to reconcile those
+  payments and the Billing subscriptions created in them, which keep billing the price they
+  were created with.
+- **The browser adapter is unchanged.** It mounts the Payment Element from the session's
+  `clientSecret` and confirms with `elements`, `redirect` and `return_url` alone: no amount
+  or currency passes through it.
+- **Tests.** `test/stripe-currencies.test.ts` pins the exact wire amount on every send path
+  and the reported amount on every read path for ISK, MGA, USD, JPY and KWD; each MGA, UGX,
+  ISK and three-decimal refusal with the exact sequence of requests made (a log of every call
+  reaching the test double) and whether it leaves the outcome open; the list-page failures
+  with their `raw`; event amounts; same-key retries of a currency change, a capture and a
+  refund whose first answer was lost; and the refund-list rule for each refund status, an
+  empty list, another page, a list that does not say whether another page follows, and a
+  list that cannot be read. The test double keeps Stripe's idempotency on every keyed
+  write, creates and cancellations included: it saves the first result under a key, an
+  error as well as an answer ("regardless of whether it succeeds or fails"), replays it to
+  a same-key request with the same parameters, and refuses the key when they differ. It
+  saves nothing for parameters that fail validation, which it checks before the write, as
+  the same page says (re-fetched 2026-09-30): "We save results only after the execution of
+  an endpoint begins. If incoming parameters fail validation, or the request conflicts with
+  another request that’s executing concurrently, we don’t save the idempotent result
+  because no API endpoint initiates the execution." Declines and other execution errors are
+  saved (added in the final review, 2026-09-30). Each mutation tried (ISK multiplied by 10,
+  MGA or one send path left unconverted, UGX treated as zero-decimal, the whole-ariary,
+  overflow and multiple-of-100 checks dropped, a page check made a no-op, `outcomeUnknown`
+  dropped from answers or from the refusals above, the nothing-moved exceptions widened,
+  the refund list's statuses or its `has_more` ignored, a named UGX update made final, the
+  kept amount sent only when it changes, the three-decimal rule extended to captures, and in
+  the test double a validation failure saved or a cancellation left unkeyed) made a test
+  fail. The conformance suite passes unchanged.
+- **Sandbox checks, not run.** No Stripe sandbox run backs these facts; each check needs an
+  account whose presentment currencies include the currency.
+  - **UGX.** Charge `amount: 500` in UGX and read the payment in the Stripe Dashboard: UGX 5
+    means the special case holds and UGX can convert as ISK does; UGX 500 means the
+    zero-decimal list holds and UGX can pass unchanged. Either lifts the refusal.
+  - **ISK and MGA.** Charge ISK 1,000 and MGA 10.00 through the adapter (`amount: 1000` in
+    both) and confirm the Dashboard shows ISK 1,000 and MGA 10. Then authorize ISK 1,000
+    with manual capture, capture ISK 600 through the adapter (`amount_to_capture: 60000`),
+    and confirm the Dashboard shows ISK 600 captured and the PaymentIntent's
+    `amount_received` reads `60000`, which settles the unit of the capture fields.
+  - **Three-decimal.** From an account whose presentment list has KWD (only the AE list
+    does), send `amount: 1235` in KWD straight to the PaymentIntents API, as the adapter
+    refuses it locally, and record whether Stripe refuses it too.

@@ -52,12 +52,52 @@ export interface StripeJsLike {
   retrieveSetupIntent(clientSecret: string): Promise<StripeJsConfirmResult>;
 }
 
-export type StripeJsFactory = (publishableKey: string, options?: Record<string, unknown>) => StripeJsLike;
+/** `window.Stripe`: the `Stripe(publishableKey, options?)` initializer. */
+export interface StripeJsFactory {
+  (publishableKey: string, options?: Record<string, unknown>): StripeJsLike;
+  /**
+   * The build the global belongs to, as the served Stripe.js files set it and
+   * Stripe's own `@stripe/stripe-js` loader reads it: `3` for v3, the release
+   * name (`"dahlia"`) for a versioned build, `2` for the legacy v2.
+   */
+  version?: number | string;
+  /**
+   * Beside a Stripe.js v2 global, v3 and the versioned builds attach
+   * themselves here instead of replacing `window.Stripe`.
+   */
+  StripeV3?: StripeJsFactory;
+}
 
 export interface StripeClientAdapterConfig {
   publishableKey: string;
   /** Explicit, mirrors the server adapter — never inferred from key prefixes. */
   environment: "sandbox" | "live";
+  /**
+   * The Stripe API version the server adapter pins, such as
+   * `"2026-08-26.dahlia"` or `"2024-06-20"`, or, while the server is on a
+   * release this adapter does not know yet, a version of the newest release it
+   * knows. Required: it picks the Stripe.js build, which decides the API
+   * version the browser half speaks.
+   *
+   * - A version with a release name loads that release's build,
+   *   `https://js.stripe.com/<release>/stripe.js`, for the releases this
+   *   adapter knows: acacia, basil, clover and dahlia. Stripe pins each build
+   *   to an API version of its release and lets nothing override it, so the
+   *   browser speaks the release, not necessarily the date: a field or code a
+   *   later monthly version of the release added may reach the server and not
+   *   the browser.
+   * - A date alone, the form of every version before 2024-09-30.acacia, loads
+   *   `https://js.stripe.com/v3` and passes the version to `Stripe()` as
+   *   `apiVersion`, an option only v3 takes, so the browser speaks exactly it.
+   *
+   * A Stripe.js the page already runs is used instead of loading this build
+   * (see `loadSdk()`). The constructor refuses with `invalid_request` a missing
+   * or malformed version, a date that does not exist, a date alone from
+   * 2024-09-30 on and a release name with an earlier date, a release this
+   * adapter knows no build for, a preview version and a version carrying beta
+   * headers (`"…; name=v1"`), as no Stripe.js build speaks the last two.
+   */
+  apiVersion: string;
   /** Used for redirect-based methods; card/3DS flows stay inline (redirect: "if_required"). */
   returnUrl?: string;
   locale?: string;
@@ -76,16 +116,164 @@ export interface StripeClientAdapterConfig {
    */
   cspNonce?: string;
   /**
-   * Test seams: script injection + global lookup. `loadScript` is called again by
-   * the next loadSdk() after an attempt that rejects or leaves the SDK global
-   * missing, so it must be safe to call more than once.
+   * Hides the testing assistant Stripe.js shows at the bottom right of a
+   * sandbox page with Elements, on by default for the Payment Intents API from
+   * the clover build on, by passing `developerTools: { assistant: { enabled:
+   * false } }` to `Stripe()`. Live mode never shows it. Unset or `false` leaves
+   * Stripe's default.
+   */
+  hideTestingAssistant?: boolean;
+  /**
+   * Test seams: script injection + global lookup. `loadScript` receives the
+   * URL of the build `apiVersion` names, and is called again by the next
+   * loadSdk() after an attempt that rejects or leaves the SDK global missing,
+   * so it must be safe to call more than once. What `getStripeGlobal` returns
+   * is used as `window.Stripe` is.
    */
   loadScript?: (url: string) => Promise<void>;
   getStripeGlobal?: () => StripeJsFactory | undefined;
-  sdkUrl?: string;
 }
 
-const STRIPE_JS_URL = "https://js.stripe.com/v3";
+const STRIPE_JS_V3_URL = "https://js.stripe.com/v3";
+
+/**
+ * The releases docs.stripe.com documents a versioned Stripe.js build for, the
+ * newest last; the builds began with acacia. A release Stripe adds later loads
+ * once it is added here, after reading its changelog.
+ */
+const STRIPE_JS_RELEASES: readonly string[] = ["acacia", "basil", "clover", "dahlia"];
+
+/** Every Stripe API version from this date on carries a release name. */
+const FIRST_RELEASE_DATE = "2024-09-30";
+
+/** A date, then the release name every version from 2024-09-30.acacia on carries. */
+const STRIPE_API_VERSION = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])(?:\.([a-z]+))?$/;
+
+/**
+ * How long loadSdk() waits for a `<script>` the page added for the build to
+ * load, the bound the REST adapters give a request by default.
+ */
+const PAGE_SCRIPT_WAIT_MS = 30_000;
+
+/** How often that wait looks for a Stripe.js another script defined meanwhile. */
+const PAGE_SCRIPT_POLL_MS = 100;
+
+/**
+ * Tags for a build's URL that an attempt watched settle while Stripe.js
+ * stayed missing: one core injected, after it loaded, and a page's, after the
+ * wait for it ended. Neither fires again, so the next attempt of any adapter
+ * replaces them. Shared by every adapter, as the tags belong to the page.
+ */
+const settledTags = new WeakSet<Element>();
+
+/** The Stripe.js build an API version needs. */
+interface StripeJsBuild {
+  url: string;
+  /** `"v3"`, or the release name. */
+  name: string;
+}
+
+function stripeJsBuild(apiVersion: unknown): StripeJsBuild {
+  if (apiVersion === undefined || apiVersion === null || apiVersion === "") {
+    throw PayFanoutError.invalidRequest(
+      "StripeClientAdapter config.apiVersion is required: pass the apiVersion your StripeServerAdapter pins",
+    );
+  }
+  if (typeof apiVersion === "string" && apiVersion.includes(";")) {
+    throw PayFanoutError.invalidRequest(
+      'StripeClientAdapter config.apiVersion carries beta headers after ";", which Stripe.js no longer takes in an API version: pass the version before the ";"',
+    );
+  }
+  const match = typeof apiVersion === "string" ? STRIPE_API_VERSION.exec(apiVersion) : null;
+  if (!match) {
+    throw PayFanoutError.invalidRequest(
+      'StripeClientAdapter config.apiVersion must be a Stripe API version: a date, with or without a release name, such as "2026-08-26.dahlia" or "2024-06-20"',
+    );
+  }
+  const [version, release] = match;
+  const date = version.slice(0, 10);
+  if (!isCalendarDate(date)) {
+    throw PayFanoutError.invalidRequest(`StripeClientAdapter config.apiVersion "${version}" names a date that does not exist`);
+  }
+  if (release === undefined) {
+    if (date >= FIRST_RELEASE_DATE) {
+      throw PayFanoutError.invalidRequest(
+        `StripeClientAdapter config.apiVersion "${version}" has no release name, which every Stripe API version from ${FIRST_RELEASE_DATE} on carries, as in "${FIRST_RELEASE_DATE}.acacia"`,
+      );
+    }
+    return { url: STRIPE_JS_V3_URL, name: "v3" };
+  }
+  const newest = STRIPE_JS_RELEASES[STRIPE_JS_RELEASES.length - 1];
+  if (release === "preview") {
+    throw PayFanoutError.invalidRequest(
+      `StripeClientAdapter config.apiVersion "${version}" is a preview API version, which no Stripe.js build speaks: pass a generally available version, such as one of ${newest}, the newest release this adapter knows`,
+    );
+  }
+  if (!STRIPE_JS_RELEASES.includes(release)) {
+    throw PayFanoutError.invalidRequest(
+      `StripeClientAdapter config.apiVersion names the release "${release}", for which this adapter knows no Stripe.js build (it knows ${STRIPE_JS_RELEASES.join(", ")}): while the server is on "${release}", pass a version of ${newest}, the newest release this adapter knows`,
+    );
+  }
+  if (date < FIRST_RELEASE_DATE) {
+    throw PayFanoutError.invalidRequest(
+      `StripeClientAdapter config.apiVersion "${version}" has a release name, which no Stripe API version before ${FIRST_RELEASE_DATE} carries: before it, a version is a date alone, as in "2024-06-20"`,
+    );
+  }
+  return { url: `https://js.stripe.com/${release}/stripe.js`, name: release };
+}
+
+/** Whether a well-formed `YYYY-MM-DD` names a day of the Gregorian calendar. */
+function isCalendarDate(date: string): boolean {
+  const [year, month, day] = date.split("-").map(Number) as [number, number, number];
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  return day <= [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]!;
+}
+
+/**
+ * The build a global's `version` names, as the served files set it and
+ * Stripe's own loader reads it: `3` is v3, a lowercase word a release.
+ */
+function buildName(version: unknown): string | undefined {
+  if (version === 3) return "v3";
+  return typeof version === "string" && /^[a-z]+$/.test(version) ? version : undefined;
+}
+
+/**
+ * Waits for a `<script>` the page added for the build, which core's
+ * injectScript reuses at once whether or not it has loaded. Resolves on its
+ * `load`, and as soon as `ready()` holds, which it checks every
+ * PAGE_SCRIPT_POLL_MS since another script may define a usable Stripe.js
+ * meanwhile. On the tag's `error`, and after PAGE_SCRIPT_WAIT_MS, it resolves
+ * if `ready()` holds and otherwise rejects with a retryable `psp_unavailable`.
+ * A tag that failed ran nothing, so it is removed for the next call to fetch
+ * the file again, as Stripe's own loader does.
+ */
+function waitForPageScript(tag: HTMLScriptElement, url: string, ready: () => boolean): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const settle = (failure?: string) => {
+      clearTimeout(timer);
+      clearInterval(poll);
+      tag.removeEventListener("load", onLoad);
+      tag.removeEventListener("error", onError);
+      if (failure === undefined || ready()) resolve();
+      else reject(new PayFanoutError({ code: "psp_unavailable", message: failure, retryable: true, raw: undefined, pspName: "stripe" }));
+    };
+    const onLoad = () => settle();
+    const onError = () => {
+      tag.remove();
+      settle(`Failed to load ${url}`);
+    };
+    const timer = setTimeout(
+      () => settle(`The page's Stripe.js at ${url} did not load within ${PAGE_SCRIPT_WAIT_MS / 1000} seconds`),
+      PAGE_SCRIPT_WAIT_MS,
+    );
+    const poll = setInterval(() => {
+      if (ready()) settle();
+    }, PAGE_SCRIPT_POLL_MS);
+    tag.addEventListener("load", onLoad);
+    tag.addEventListener("error", onError);
+  });
+}
 
 /** Mirrors the server adapter's defaults, currency and country gates included. */
 const DEFAULT_METHODS: PaymentMethodCapability[] = [
@@ -108,10 +296,18 @@ interface StripeHandle {
   locale: string | undefined;
 }
 
+/**
+ * Stripe's Payment Element in the browser, confirm-on-client: `confirm()`
+ * finalizes the PaymentIntent the server adapter created. Stripe.js loads
+ * lazily from `https://js.stripe.com`, in the build of `config.apiVersion`, so
+ * the browser follows the host's pin, not the account's default version.
+ */
 export class StripeClientAdapter implements ClientPaymentAdapter {
   readonly pspName = "stripe";
   private readonly config: StripeClientAdapterConfig;
+  private readonly build: StripeJsBuild;
   private sdkPromise?: Promise<void>;
+  private warnedOtherBuild = false;
 
   constructor(config: StripeClientAdapterConfig) {
     if (!config.publishableKey) {
@@ -120,25 +316,60 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
     if (config.environment !== "sandbox" && config.environment !== "live") {
       throw PayFanoutError.invalidRequest('StripeClientAdapter config.environment must be "sandbox" or "live"');
     }
+    // The removed sdkUrl, refused rather than ignored: a JavaScript config still
+    // naming a URL would otherwise load another file than it says.
+    if ((config as { sdkUrl?: unknown }).sdkUrl !== undefined) {
+      throw PayFanoutError.invalidRequest(
+        "StripeClientAdapter config.sdkUrl is no longer supported: Stripe.js loads from https://js.stripe.com in the build config.apiVersion names",
+      );
+    }
+    this.build = stripeJsBuild(config.apiVersion);
     if (config.cspNonce !== undefined && !isValidCspNonce(config.cspNonce)) {
       throw PayFanoutError.invalidRequest(
         "StripeClientAdapter config.cspNonce must be the value of the policy's 'nonce-…' source: base64 or base64url characters",
       );
     }
+    if (config.hideTestingAssistant !== undefined && typeof config.hideTestingAssistant !== "boolean") {
+      throw PayFanoutError.invalidRequest("StripeClientAdapter config.hideTestingAssistant must be a boolean");
+    }
     this.config = config;
   }
 
+  /**
+   * Loads Stripe.js once, in the build `config.apiVersion` names, with
+   * `cspNonce` on the tag; `mount()` and `handleRedirectReturn()` call it
+   * first. A page runs one Stripe.js build, as a second copy leaves
+   * `window.Stripe` to the first, so the adapter uses the Stripe.js it finds,
+   * as Stripe's own loader does, whether the page had it before the call or
+   * another script defined it while the adapter's own was loading. Its
+   * `version` decides how: v3 is given `config.apiVersion`, a release's
+   * version included, and then speaks exactly it; another versioned build
+   * speaks the API version Stripe pins it to, and in a sandbox the adapter
+   * warns once on the console; a global whose `version` names no build is
+   * used as if it were the build `config.apiVersion` names. Beside a Stripe.js
+   * v2 global, the build loads and attaches itself as `window.Stripe.StripeV3`,
+   * which the adapter uses.
+   *
+   * A `<script>` the page added for the build's URL is waited for, for up to
+   * 30 seconds, since it may still be loading: the call resolves when it loads,
+   * or as soon as another script defines a usable Stripe.js, and otherwise
+   * rejects with a retryable `psp_unavailable` when the tag fails, which removes
+   * it, or when the wait ends. A page tag that failed before the call leaves no
+   * sign of it, so that first call waits the full 30 seconds. A load that fails
+   * or leaves Stripe.js missing is not kept: the next call loads again, and
+   * replaces with a fresh one a tag that an earlier call, of any adapter on the
+   * page, watched settle without Stripe.js: one the adapter injected, after it
+   * loaded, or a page's, after its wait.
+   */
   async loadSdk(): Promise<void> {
     assertBrowser("StripeClientAdapter", "loadSdk");
-    if (this.stripeGlobal()) return;
-    const url = this.config.sdkUrl ?? STRIPE_JS_URL;
-    this.sdkPromise ??= this.config.loadScript
-      ? this.config.loadScript(url)
-      : injectScript(url, this.pspName, { nonce: this.config.cspNonce });
+    if (this.stripeFactory()) return;
+    const url = this.build.url;
+    this.sdkPromise ??= this.config.loadScript ? this.config.loadScript(url) : this.injectStripeJs(url);
     const loading = this.sdkPromise;
     try {
       await loading;
-      if (!this.stripeGlobal()) {
+      if (!this.stripeFactory()) {
         throw new PayFanoutError({
           code: "psp_unavailable",
           message: "Stripe.js loaded but window.Stripe is missing",
@@ -159,9 +390,8 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
   async mount(container: HTMLElement, options: MountOptions): Promise<MountedFieldsHandle> {
     assertBrowser("StripeClientAdapter", "mount");
     await this.loadSdk();
-    const factory = this.stripeGlobal()!;
     const locale = options.locale ?? this.config.locale;
-    const stripe = factory(this.config.publishableKey, locale ? { locale } : undefined);
+    const stripe = this.createStripe(locale);
     const appearance = toStripeAppearance(options.appearance);
     const elements = stripe.elements({
       clientSecret: options.clientSecret,
@@ -235,10 +465,7 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
 
     assertBrowser("StripeClientAdapter", "handleRedirectReturn");
     await this.loadSdk();
-    const stripe = this.stripeGlobal()!(
-      this.config.publishableKey,
-      this.config.locale ? { locale: this.config.locale } : undefined,
-    );
+    const stripe = this.createStripe(this.config.locale);
     const result = piSecret
       ? await stripe.retrievePaymentIntent(piSecret)
       : await stripe.retrieveSetupIntent(setiSecret!);
@@ -254,6 +481,63 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
 
   listPaymentMethodCapabilities(): PaymentMethodCapability[] {
     return this.config.paymentMethods ?? DEFAULT_METHODS;
+  }
+
+  /** Call after loadSdk(), which confirmed the global. */
+  private createStripe(locale: string | undefined): StripeJsLike {
+    const factory = this.stripeFactory()!;
+    const running = buildName(factory.version);
+    if (running !== undefined && running !== "v3" && running !== this.build.name) this.warnOtherBuild(running);
+    // v3 takes any version, a release's included; a versioned build throws on one.
+    const runsV3 = running === undefined ? this.build.name === "v3" : running === "v3";
+    const options = {
+      ...(locale ? { locale } : {}),
+      ...(runsV3 ? { apiVersion: this.config.apiVersion } : {}),
+      ...(this.config.hideTestingAssistant === true ? { developerTools: { assistant: { enabled: false } } } : {}),
+    };
+    return factory(this.config.publishableKey, Object.keys(options).length > 0 ? options : undefined);
+  }
+
+  /** In a sandbox only, as Stripe's own loader warns only for test keys. */
+  private warnOtherBuild(running: string): void {
+    if (this.config.environment !== "sandbox" || this.warnedOtherBuild) return;
+    this.warnedOtherBuild = true;
+    console.warn(
+      `[payfanout] This page runs Stripe.js ${running}, not ${this.build.name} (${this.build.url}), the build ` +
+        `config.apiVersion "${this.config.apiVersion}" names. The Stripe adapter uses the page's copy, so the ` +
+        `browser speaks the API version Stripe pins ${running} to. Load ${this.build.url} on the page instead, ` +
+        "or no Stripe.js at all and let the adapter load it.",
+    );
+  }
+
+  /**
+   * core's injectScript, then the wait for a `<script>` the page added for the
+   * same URL. A tag already seen settled is removed first, so that injectScript
+   * injects a fresh one and reports its load or failure. Only the tag this call
+   * watched is recorded as settled, never another one for the same URL.
+   */
+  private async injectStripeJs(url: string): Promise<void> {
+    const selector = `script[src="${url}"]`;
+    const found = document.querySelector<HTMLScriptElement>(selector);
+    if (found !== null && settledTags.has(found)) found.remove();
+    const pageTag = found?.isConnected ? found : null;
+    const injecting = injectScript(url, this.pspName, { nonce: this.config.cspNonce });
+    // With no tag for the URL on the page, core inserts its own before returning.
+    const watched = pageTag ?? document.querySelector(selector);
+    try {
+      await injecting;
+      if (pageTag !== null && !this.stripeFactory()) {
+        await waitForPageScript(pageTag, url, () => this.stripeFactory() !== undefined);
+      }
+    } finally {
+      if (watched?.isConnected && !this.stripeFactory()) settledTags.add(watched);
+    }
+  }
+
+  /** The Stripe.js in use: `window.Stripe`, or beside a v2 global the build attached as `StripeV3`. */
+  private stripeFactory(): StripeJsFactory | undefined {
+    const global = this.stripeGlobal();
+    return global?.version === 2 ? global.StripeV3 : global;
   }
 
   private stripeGlobal(): StripeJsFactory | undefined {

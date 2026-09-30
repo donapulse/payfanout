@@ -121,6 +121,15 @@ the expected seam).
   sign-off, not a side effect. The seam is reserved: a `mountWalletButtons?` optional
   client method mirroring `mount`. Unblock: demand + a second PSP with an express
   surface to keep the abstraction honest.
+- **Client configuration handed over by the server adapter:** the Stripe client adapter
+  takes `apiVersion` in its own config because nothing carries the server adapter's pin
+  to the browser: a `PaymentSession` reaches the client adapter only as the `clientSecret`
+  in `MountOptions` (decisions.md, "Stripe.js version follows the pinned API version"). A
+  provider-data field on the session, handed to `mount()`, would let a server adapter tell
+  its client half what the browser SDK needs, an API version or anything else fixed when
+  the SDK loads, instead of the host setting it in two places. It changes the contract of
+  core, conformance and every adapter, a major release with its own sign-off. Unblock: a
+  second provider whose client half needs server-side configuration, and that sign-off.
 - **GoCardless one-off Direct Debit sessions (Bacs, SEPA Core):** a session today is a
   billing request's payment request, a one-off Open Banking payment, so the adapter declares
   `sepa_debit` and `bacs_debit` unsupported (decisions.md, "GoCardless sessions declare Pay

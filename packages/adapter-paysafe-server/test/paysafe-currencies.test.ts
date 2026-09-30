@@ -275,13 +275,27 @@ describe("the currencies the adapter declares unsupported", () => {
     expect(makePair().adapter.getCapabilities().unsupportedCurrencies).toEqual(refused);
   });
 
+  it("fails registration for a paymentMethods override whose rail takes declared currencies alone", () => {
+    const { adapter } = makePair({
+      paymentMethods: [
+        { type: "card", flow: "embedded", supported: true },
+        { type: "sepa_debit", flow: "embedded", supported: true, currencies: ["CLP", "ISK"] },
+      ],
+    });
+    const issues = validateAdapterCapabilities(adapter, { registration: true });
+    expect(issues).toContainEqual(
+      expect.stringMatching(/offers sepa_debit in CLP\/ISK but declares each of those currencies in unsupportedCurrencies/),
+    );
+    expect(validateAdapterCapabilities(makePair().adapter, { registration: true })).toEqual([]);
+  });
+
   it("is refused on every session, zero-amount ones included, by the adapter and by screening alike", async () => {
     const { adapter } = makePair();
     const caps = adapter.getCapabilities();
     for (const currency of REFUSED) {
       const zero = { amount: 0, currency, idempotencyKey: `k-${currency}` };
       await expect(adapter.createPaymentSession(zero), currency).rejects.toMatchObject({ code: "invalid_request" });
-      expect(screenSessionInput(caps, zero)).toBe(`"paysafe" does not support currency ${currency}`);
+      expect(screenSessionInput(caps, zero)).toBe(`"paysafe" declares currency ${currency} unsupported`);
     }
     for (const currency of ["JPY", "KWD", "USD", "GHS"]) {
       expect(screenSessionInput(caps, { amount: 1000, currency, idempotencyKey: "k" }), currency).toBeUndefined();

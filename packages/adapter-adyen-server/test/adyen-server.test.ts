@@ -825,6 +825,20 @@ describe("AdyenServerAdapter specifics", () => {
     }
   });
 
+  it("fails registration for a paymentMethods override whose rail takes declared currencies alone", () => {
+    const { adapter } = makePair({
+      paymentMethods: [
+        { type: "card", flow: "embedded", supported: true },
+        { type: "ideal", flow: "redirect", supported: true, currencies: ["ISK"] },
+      ],
+    });
+    const issues = validateAdapterCapabilities(adapter, { registration: true });
+    expect(issues).toContainEqual(
+      expect.stringMatching(/offers ideal in ISK but declares each of those currencies in unsupportedCurrencies/),
+    );
+    expect(validateAdapterCapabilities(makePair().adapter, { registration: true })).toEqual([]);
+  });
+
   it("declares exactly the currencies createPaymentSession refuses, so screening refuses them first", async () => {
     const { adapter } = makePair();
     const caps = adapter.getCapabilities();
@@ -844,7 +858,7 @@ describe("AdyenServerAdapter specifics", () => {
     expect(refused.sort()).toEqual(caps.unsupportedCurrencies);
     for (const currency of caps.unsupportedCurrencies ?? []) {
       expect(screenSessionInput(caps, { amount: 1000, currency: currency.toLowerCase(), idempotencyKey: "k" })).toBe(
-        `"adyen" does not support currency ${currency.toLowerCase()}`,
+        `"adyen" declares currency ${currency} unsupported`,
       );
     }
     expect(screenSessionInput(caps, { amount: 1000, currency: "JPY", idempotencyKey: "k" })).toBeUndefined();

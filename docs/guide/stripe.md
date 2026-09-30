@@ -178,7 +178,10 @@ Every other refusal of an amount is final.
 `PaymentRouter` skips a Stripe candidate for a UGX session and tries the next one in the
 chain, and `PaymentService` refuses a UGX session for Stripe before calling the adapter,
 zero-amount sessions included. Its refusal is a non-retryable `unsupported_operation`
-(`"stripe" does not support currency UGX`), where the adapter's own is `invalid_request`.
+(`"stripe" declares currency UGX unsupported`), where the adapter's own is `invalid_request`.
+A `paymentMethods` override with a rail whose `currencies` are UGX alone now fails
+registration, since that rail can never be routed. The router reads the declaration from the
+`@payfanout/server` release that added `unsupportedCurrencies`.
 Give UGX a chain that names a provider serving it; when no candidate does, the router fails
 with `invalid_request`, each candidate's refusal on `raw`
 ([routing and failover](/guide/server#routing-failover)).

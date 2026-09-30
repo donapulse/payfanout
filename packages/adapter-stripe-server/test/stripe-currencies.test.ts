@@ -750,14 +750,28 @@ describe("the currencies the adapter declares unsupported", () => {
     expect(screenSessionInput(adapter.getCapabilities(), input)).toBeUndefined();
   });
 
+  it("fails registration for a paymentMethods override whose rail takes UGX alone", () => {
+    const { adapter } = makePair({
+      paymentMethods: [
+        { type: "card", flow: "embedded", supported: true },
+        { type: "ideal", flow: "redirect", supported: true, currencies: ["UGX"] },
+      ],
+    });
+    const issues = validateAdapterCapabilities(adapter, { registration: true });
+    expect(issues).toContainEqual(
+      expect.stringMatching(/offers ideal in UGX but declares each of those currencies in unsupportedCurrencies/),
+    );
+    expect(validateAdapterCapabilities(makePair().adapter, { registration: true })).toEqual([]);
+  });
+
   it("has screening refuse every UGX session, the zero-amount one the adapter still creates included", async () => {
     const { adapter } = makePair();
     const caps = adapter.getCapabilities();
     expect(screenSessionInput(caps, { amount: 5000, currency: " ugx ", idempotencyKey: "k" })).toBe(
-      '"stripe" does not support currency  ugx ',
+      '"stripe" declares currency UGX unsupported',
     );
     const zero = { amount: 0, currency: "UGX", idempotencyKey: "k" };
-    expect(screenSessionInput(caps, zero)).toBe('"stripe" does not support currency UGX');
+    expect(screenSessionInput(caps, zero)).toBe('"stripe" declares currency UGX unsupported');
     await expect(adapter.createPaymentSession(zero)).resolves.toMatchObject({ amount: 0, currency: "UGX" });
   });
 });

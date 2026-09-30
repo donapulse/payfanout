@@ -208,8 +208,9 @@ it declares the currencies it refuses in `unsupportedCurrencies`, derived from t
 `PaymentRouter` therefore skips a Paysafe candidate for a session in one of them and tries the
 next one in the chain, and `PaymentService` refuses such a session for Paysafe before calling
 the adapter, zero-amount sessions included, with a non-retryable `unsupported_operation`
-(`"paysafe" does not support currency CLP`) where the adapter's own refusal is
-`invalid_request`. Give the ones you take a chain that names a provider serving them; when no
+(`"paysafe" declares currency CLP unsupported`) where the adapter's own refusal is
+`invalid_request`. A `paymentMethods` override with a rail whose `currencies` are all declared
+unsupported now fails registration. Give the ones you take a chain that names a provider serving them; when no
 candidate does, the router fails with `invalid_request`, each candidate's refusal on `raw`
 ([routing and failover](/guide/server#routing-failover)).
 

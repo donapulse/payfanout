@@ -24,11 +24,12 @@ import { PayZenServerAdapter } from "@payfanout/adapter-payzen-server";
 import { GoCardlessServerAdapter, parseGoCardlessWebhookEvents } from "@payfanout/adapter-gocardless-server";
 import { PayPalServerAdapter } from "@payfanout/adapter-paypal-server";
 import { WorldlineServerAdapter } from "@payfanout/adapter-worldline-server";
+import { STRIPE_API_VERSION } from "./src/stripe-api-version.js";
 
 const stripe = new StripeServerAdapter({
   // Unset CI secrets render as EMPTY strings, not undefined — || treats them as absent.
   secretKey: process.env.STRIPE_SECRET_KEY || "sk_test_replace_me",
-  apiVersion: "2024-06-20", // pinned — never rely on the account default
+  apiVersion: STRIPE_API_VERSION, // pinned — never rely on the account default; the client pins the same
   webhookSigningSecret: process.env.STRIPE_WEBHOOK_SECRET || "whsec_replace_me",
   environment: "sandbox",
 });

@@ -23,8 +23,9 @@ dashboard's **Test mode** toggle **on** while you build, test-mode keys are pref
 | **Webhook signing secret** | Developers → Webhooks → *(your endpoint)* → *Signing secret* | `whsec_…` | server adapter (`webhookSigningSecret`) |
 
 The **API version** (`apiVersion`, e.g. `2024-06-20`) is **not a credential**, you pin it
-in code (see below). It is shown at Developers → API version, but never rely on the account
-default: it can change under you.
+in code and pass the same string to both adapters (see below): the server adapter sends it,
+and the client adapter loads the Stripe.js build that speaks it. Workbench shows the
+account's default version, but never rely on it: it can change under you.
 
 ::: danger Secret key is server-only
 `sk_…` and `whsec_…` never leave your backend. Only the publishable key (`pk_…`) is safe in
@@ -218,6 +219,7 @@ import { StripeClientAdapter } from "@payfanout/adapter-stripe";
 const stripe = new StripeClientAdapter({
   publishableKey: import.meta.env.VITE_STRIPE_PUBLISHABLE_KEY, // pk_test_… / pk_live_…
   environment: "sandbox",                                       // "sandbox" | "live"
+  apiVersion: "2024-06-20",                                     // REQUIRED, the server adapter's apiVersion
   // returnUrl: "https://shop.example/checkout/return",         // only for redirect methods (iDEAL, bank)
 });
 
@@ -230,19 +232,66 @@ const stripe = new StripeClientAdapter({
 </PayFanoutProvider>
 ```
 
-- Only `publishableKey` and `environment` are required. `returnUrl` matters **only** for
-  genuinely redirect methods; card payments and 3DS stay inline (Stripe's
-  `redirect: "if_required"`) and never navigate away.
+| Field | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `publishableKey` | ✅ | - | `pk_test_…` / `pk_live_…`. Constructor throws if empty. |
+| `environment` | ✅ | - | Exactly `"sandbox"` or `"live"`. Never inferred from the `pk_test`/`pk_live` prefix. |
+| `apiVersion` | ✅ | - | The server adapter's `apiVersion`, as the same string. **No default**: it picks the Stripe.js build (below), and the constructor throws without it. |
+| `returnUrl` | - | - | Where Stripe sends the customer back after a redirect method (iDEAL, bank redirects). |
+| `locale` | - | Stripe.js's `"auto"` | Language of Stripe.js's fields and error messages. A mount's own `locale` wins. |
+| `paymentMethods` | - | The server adapter's defaults | Capability list to show instead, per account or currency. |
+| `cspNonce` | - | - | For a nonce-based Content-Security-Policy, see the tip below. |
+
+- `returnUrl` matters **only** for genuinely redirect methods; card payments and 3DS stay
+  inline (Stripe's `redirect: "if_required"`) and never navigate away.
 - **Confirm-on-client:** `<PayButton>` calls `confirm()` in the browser and resolves the
   outcome. Stripe **never** uses `onServerCompletion`, that callback is for tokenize-first
   PSPs like [Paysafe](/guide/paysafe).
 - **SSR-safe:** constructing the adapter at module scope is fine; only *mounting* runs in
   the browser. Components work as Next.js App Router client components.
 
+### Which Stripe.js the adapter loads
+
+Besides v3, Stripe publishes a Stripe.js build for each API release since acacia. The client
+adapter loads the build your `apiVersion` names, from `https://js.stripe.com`, so the
+browser follows your pin rather than the account's default version:
+
+| `apiVersion` | Stripe.js loaded | API version the browser speaks |
+| --- | --- | --- |
+| A version with a release name, such as `2026-08-26.dahlia` (releases acacia, basil, clover and dahlia) | That release's build: `https://js.stripe.com/dahlia/stripe.js` | The version Stripe pins the build to, in the same release |
+| A date alone, such as `2024-06-20` (every version before `2024-09-30.acacia`) | `https://js.stripe.com/v3` | Exactly yours: the adapter passes it to `Stripe()` as `apiVersion` |
+
+- **A release build speaks its release, not your date.** Stripe pins each versioned build to
+  an API version of its release, and nothing overrides it: the dahlia build carried
+  `2026-03-25.dahlia` when this was written, whichever dahlia version your server pins.
+  Monthly versions of a release bring no breaking changes, which is why Stripe calls a server
+  on the same release safe. A field or error code that only a later monthly version added
+  can still reach the server and not the browser; where one added a general code beside an
+  older one (`2026-08-26.dahlia`'s `authentication_failure` beside
+  `payment_intent_authentication_failure`), both halves map the two codes the same way.
+- **v3 serves dates alone.** It is the one build that takes an `apiVersion` option, and
+  Stripe no longer recommends it, though it still supports it. The versioned builds need your
+  server on a release version, an API upgrade like any other: read
+  [Stripe's changelog](https://docs.stripe.com/changelog) for the gap first.
+- **Refused at construction** with `invalid_request`: a missing or malformed `apiVersion`,
+  and a release this version of the adapter knows no build for, such as one Stripe publishes
+  after it. Stripe calls upgrading the server and Stripe.js at different times safe, so the
+  client can stay on the newest release it knows while the server moves ahead.
+- **One Stripe.js per page.** A second copy of Stripe.js leaves the first in place. When
+  `window.Stripe` already exists, the adapter uses it only if it is the build `apiVersion`
+  names, and otherwise rejects `loadSdk()` and `mount()` with a non-retryable
+  `invalid_request`. If your pages load Stripe.js themselves, as Stripe suggests for its
+  fraud signals, load that same build, and give every `StripeClientAdapter` on a page the
+  same release, or dates alone.
+- In a sandbox, the builds from clover on show Stripe's
+  [testing assistant](https://docs.stripe.com/sdks/stripejs-testing-assistant) at the bottom
+  right of the page; it never appears in live mode.
+
 ::: tip Content-Security-Policy
-Stripe.js loads from `https://js.stripe.com/v3` and renders card fields, 3DS, and
-redirect challenges in iframes. Stripe's security guide lists these sources for
-Stripe.js, and for Link, which the Payment Element offers when your account enables it:
+Stripe.js loads from `https://js.stripe.com`, in the build of your `apiVersion`, and renders
+card fields, 3DS, and redirect challenges in iframes. Stripe's security guide lists these
+sources for Stripe.js, and for Link, which the Payment Element offers when your account
+enables it:
 
 ```
 script-src  https://js.stripe.com https://*.js.stripe.com
@@ -253,11 +302,16 @@ img-src     https://*.link.com
 ```
 
 `https://*.js.stripe.com` lets Stripe.js start its frames on other origins to load faster.
-The guide also lists `https://maps.googleapis.com`, needed only with the Address Element
-and your own Google Maps key; this adapter mounts the Payment Element alone. Stripe.js
-must load from `https://js.stripe.com`: Stripe asks never to bundle or self-host it, and
-the script refuses to run from another origin. The `sdkUrl` config field only points the
-adapter at another `https://js.stripe.com` URL, such as a versioned build.
+List the hosts, as above, rather than paths: a versioned build loads from
+`/<release>/stripe.js` but takes its frames and lazy chunks from `https://js.stripe.com/v3/`,
+so a source narrowed to one of those paths blocks the other. The guide also lists
+`https://maps.googleapis.com`, needed only with the Address Element and your own Google Maps
+key; this adapter mounts the Payment Element alone. Stripe.js must load from
+`https://js.stripe.com`: Stripe asks never to bundle or self-host it, to stay PCI compliant,
+and the script refuses to run from another origin, so the adapter takes no script URL of
+its own. Under Trusted Types (`require-trusted-types-for 'script'`), Stripe asks you to
+allow scripts from `https://js.stripe.com` and `https://*.js.stripe.com`, and its security
+guide gives an example default policy; the `<script>` the adapter injects needs that too.
 
 **Nonce-based policies.** Pass the nonce your server put in the page's policy as
 `cspNonce` (the adapter never reads one from the page), and the adapter sets it as the
@@ -344,6 +398,9 @@ Nothing in your PayFanout code changes except credentials and one string:
 - [ ] Confirm your card fields are still the Stripe-hosted Payment Element (SAQ-A), there
       is no raw card input anywhere.
 - [ ] Keep the `apiVersion` pinned; upgrade it deliberately, not implicitly.
+- [ ] Pass the server adapter's `apiVersion` to the client adapter too, and move the client
+      with the server when you upgrade. If your pages load Stripe.js themselves, load the
+      build the adapter loads (§5, "Which Stripe.js the adapter loads").
 
 Then continue with [Server usage](/guide/server), [React usage](/guide/react), and
 [Webhooks](/guide/webhooks).

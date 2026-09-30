@@ -5672,3 +5672,164 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   - **Three-decimal.** From an account whose presentment list has KWD (only the AE list
     does), send `amount: 1235` in KWD straight to the PaymentIntents API, as the adapter
     refuses it locally, and record whether Stripe refuses it too.
+
+## Stripe.js version follows the pinned API version (2026-09-30)
+
+- **Why.** `@payfanout/adapter-stripe` always loaded `https://js.stripe.com/v3` and created
+  the Stripe object without an API version, so its requests used the account's default
+  (docs.stripe.com/api-versions: Stripe takes a request's version from "The `Stripe-Version`
+  header on the request, if you set one", then "The API version pinned by your server-side
+  SDK", then "Your account’s default API version, if you don’t specify a version"; the
+  version also determines "The structure of objects Stripe.js returns"). The server adapter
+  sends the version the host pins, so the two halves could speak different versions, and the
+  browser's error codes (#213) followed the account default. Doc-verified 2026-09-30,
+  docs.stripe.com/sdks/stripejs-versioning: "Stripe.js v3 is no longer recommended for
+  integrations, but we’ll continue to support it."
+- **`apiVersion` is required on the client adapter: the same string the server adapter
+  pins.** The project pins a provider's API version explicitly wherever it has one. Rejected:
+  a default per adapter release, which would drift from the host's server pin whenever either
+  moved, unnoticed; and the server adapter handing its version to the browser through the
+  session, which has no channel for it (a `PaymentSession` reaches the client adapter only as
+  the `clientSecret` in `MountOptions`), so it would be a core contract change, major across
+  core, conformance and every adapter (parked in future-designs.md). Nothing can check that
+  the two strings agree, so the docs ask for the same one.
+- **A version with a release name loads that release's build.** docs.stripe.com/
+  sdks/stripejs-versioning: "To use versioned Stripe.js, include the version name in the
+  script tag’s URL.", with `<script src="https://js.stripe.com/dahlia/stripe.js"></script>`;
+  the Payment Element variant of docs.stripe.com/payments/accept-a-payment loads the same
+  URL. So `2026-08-26.dahlia` loads `https://js.stripe.com/dahlia/stripe.js`.
+- **The releases with a build: acacia, basil, clover, dahlia.** docs.stripe.com/api-versions:
+  "Starting with the 2024-09-30.acacia release, Stripe follows a new API release process",
+  "API versions use a date-based identifier, such as `2024-09-30.acacia`. Twice-yearly major
+  releases also have a name, such as Acacia or Basil. Monthly versions after a major release
+  stay in that named line and don’t introduce breaking changes." and "The current version of
+  the API is **2026-08-26.dahlia**."; the versioning page: "We release Stripe.js major
+  versions alongside the API release trains twice per year." The changelog
+  (docs.stripe.com/changelog) lists the releases Acacia, Basil, Clover and Dahlia, and its
+  2025-02-24.acacia entry "Versioning in Stripe JS" introduced the builds. The served files
+  answer 200 at `https://js.stripe.com/{acacia,basil,clover,dahlia}/stripe.js` and 403 for a
+  name without a build (`/preview/stripe.js`, `/zinnia/stripe.js`), which the adapter would
+  have reported as a retryable `psp_unavailable` load failure at mount time. A release the
+  adapter does not list, a `.preview` version included, is refused at construction with
+  `invalid_request` instead. Not yet listed: `endive`. `/endive/stripe.js` answers 200 and
+  the served files know it (`pinnedApiVersion:"2026-09-30.endive"`), but docs.stripe.com has
+  no page for it (`/changelog/endive` answers 404), so it waits for a release that reads its
+  changelog. The versioning page calls upgrading the two halves at different times safe
+  ("Gradual updates are safe, so you don’t need to release both at the same time."), so a
+  host whose server moves first keeps the client on the newest release it knows.
+- **A date alone loads v3 and passes the version to `Stripe()`.** Every version before
+  2024-09-30.acacia is a date alone (the changelog's last is 2024-06-20).
+  docs.stripe.com/js/initializing: "`apiVersion` Override your account's API version. **This
+  option is only available on Stripe.js v3.** For versions after `v3` such as `acacia`, the
+  API version is pinned to the Stripe.js version." The served versioned builds throw on it
+  (`if(n.apiVersion)throw Ty("Can not provide apiVersion to Stripe()")`, a `VersionError`
+  reading "Unsupported on version [dahlia]: …"), so only v3 gets it, and v3 keeps its URL,
+  `https://js.stripe.com/v3`, which pages that include it already carry.
+- **What a release build speaks: AMBIGUOUS in the docs, read from the served files.** The
+  versioning page: "each versioned Stripe.js automatically uses the API version associated
+  with the Stripe.js version. That is, the Stripe.js `acacia` version uses a compatible API
+  version such as `2024-12-18.acacia` (which includes the date) to represent the release date
+  of the API version. You can’t override the API version." and "We recommend that businesses
+  keep the Stripe.js version and server-side API version on the same release train. For
+  example, if you use Stripe.js `acacia`, you can safely use `2025-02-24.acacia` or another
+  `acacia` minor version on your application server." Which dated version a build uses is not
+  stated. The served files (Last-Modified 2026-09-29; the five are byte-identical but for a
+  padded build name) pin acacia to `2025-01-27.acacia`, basil to `2025-03-31.basil`, clover
+  to `2025-09-30.clover` and dahlia to `2026-03-25.dahlia`: each release's first version
+  except acacia, and not the page's example `2024-12-18.acacia`. Stripe can move them within
+  a release. So the browser speaks the release, not the server's date: the monthly versions
+  of a release add no breaking change, but a field or code a later one added can reach the
+  server and not the browser. The guide gives the dahlia value as observed on this date.
+- **`sdkUrl` removed, and refused rather than ignored.** docs.stripe.com/payments/
+  accept-a-payment (Payment Element, PaymentIntents): "Always load Stripe.js from
+  js.stripe.com to remain compliant. Don’t include the script in a bundle or host it
+  yourself."; docs.stripe.com/js: "it should always be loaded directly from
+  `https://js.stripe.com`, rather than included in a bundle or hosted yourself". The served
+  script throws "Stripe.js must be loaded from js.stripe.com." when its own `src` is on no
+  Stripe origin. With `apiVersion` naming the file, `sdkUrl` could only load another build
+  than the version names, the drift this change removes. A JavaScript config still carrying
+  it would otherwise load another file than it says, so the constructor refuses it. The
+  `loadScript` test seam receives the derived URL.
+- **One build per page, checked by the global's `version`.** The served files set
+  `window.Stripe` only when it is unset: beside a v2 global they add themselves as
+  `window.Stripe.StripeV3`, and beside any other they only warn ("[Stripe.js] It looks like
+  Stripe.js was loaded more than one time. Please only load it once per page."). A second
+  copy leaves the first global in place, so loading the pinned build over another would
+  still run the other. They set `version` on the global to `3` for v3 and to the release name
+  otherwise (`xy.version="v3"===Iy?3:Iy`); Stripe does not document it.
+  `loadSdk()` used any global it found. It now uses one only when its `version` names the
+  needed build, and rejects a global whose `version` names another (an integer, or lowercase
+  letters, as the served files set it) with a non-retryable `invalid_request`: before loading
+  when the page had it, or after its own load when another script defined the global first.
+  A global without such a `version` is used as it is, so a Stripe.js that dropped or reshaped
+  the property keeps working rather than failing every checkout (decided in implementation).
+- **The adapter's calls exist in every build.** The dahlia changelog
+  (docs.stripe.com/changelog/dahlia/2026-03-25/remove-legacy-stripejs-methods) removes
+  `handleCardPayment`, `confirmPaymentIntent`, `handleFpxPayment`, `handleCardSetup`,
+  `confirmSetupIntent`, `createSource` and `retrieveSource` ("The following methods have been
+  removed and will throw an error if called"); the adapter calls `elements`,
+  `confirmPayment`, `confirmSetup`, `retrievePaymentIntent` and `retrieveSetupIntent`, all in
+  the current reference. The builds' other breaking changes reach the host's UI, not the
+  adapter: basil's Payment Element defaults to an accordion ("To migrate, either set the
+  layout value to `tabs` or change your design", which `fieldOptions.layout` does), clover
+  "Removes postal code for card payments in certain regions" and validates the intent's state
+  when Elements is created, and from clover on the sandbox testing assistant shows
+  (docs.stripe.com/sdks/stripejs-testing-assistant: "By default, Stripe automatically enables
+  the testing assistant for integrations using Elements with the Checkout Sessions API or for
+  those using Elements with the Payment Intents API on Clover version or later.", and it
+  "doesn’t appear in live mode"). The adapter passes no `developerTools` to `Stripe()`.
+- **CSP re-verified.** docs.stripe.com/security/guide lists for Stripe.js "`connect-src`,
+  `https://api.stripe.com`, `https://maps.googleapis.com`", "`frame-src`,
+  `https://*.js.stripe.com`, `https://js.stripe.com`, `https://hooks.stripe.com`" and
+  "`script-src`, `https://*.js.stripe.com`, `https://js.stripe.com`,
+  `https://maps.googleapis.com`", as on 2026-09-26, so the onboarding descriptor and the
+  guide's list stand. A build loads from `/<release>/stripe.js`, and the served files take
+  their lazy chunks (`e.p="https://js.stripe.com/v3/"`) and frames (base
+  `"https://js.stripe.com/v3/"`) from `/v3/`: host sources cover both, a path-narrowed source
+  cannot, and the guide now says to list hosts. The same page says "If you’re using Trusted
+  Types, you must allow dynamic scripts to be loaded from `https://js.stripe.com` and
+  `https://*.js.stripe.com`", which the guide now repeats: the adapter's own `<script>` needs
+  it.
+- **Error codes: no gap.** Both halves read the same codes in the same order (compared
+  2026-09-30: the invalid-card-data, fraud and failed-authentication sets are identical, but
+  for Stripe.js's own `incomplete_*` field codes in the browser). The builds the adapter loads
+  speak versions older than 2026-08-26.dahlia, which added `authentication_failure`,
+  `expired_payment_method`, `incorrect_postal_code` and `payment_method_restricted`
+  (docs.stripe.com/changelog/dahlia/2026-08-26/adds-payment-method-error-codes: "This change
+  does not remove any error codes"), and a v3 page speaks the pinned dated version, so the
+  browser meets the older codes today; both forms are mapped. The browser tests now also pin
+  `payment_method_restricted` (a decline, or `fraud_suspected` with `lost_card`) and
+  `expired_card` as an error code, as the server's do. Not changed, as it does not depend on
+  the version: the halves read error *types* differently (the server maps rate limits,
+  connection and API errors and invalid requests by the SDK's error class; the browser
+  reports an unrecognized Stripe.js error as `unknown`). Aligning them needs the types
+  Stripe.js reports, which its reference does not list.
+- **Demo.** `examples/demo/src/stripe-api-version.ts` holds the one pin both halves import. It
+  stays `2024-06-20`: the demo keeps v3, whose requests now carry that version.
+- **Release.** `@payfanout/adapter-stripe` takes a minor (0.x) for a breaking change:
+  `apiVersion` is required, `sdkUrl` is refused, and a page's other Stripe.js build is refused
+  instead of used.
+- **Tests.** `test/stripe-client-version.test.ts` pins the URL for each known release and
+  several of its versions, `Stripe()` without an `apiVersion` for them (the test double
+  throws on one, as the served builds do), v3 with the pinned version for dates alone, with
+  and without a locale, in `mount()` and `handleRedirectReturn()`, and each refusal (missing,
+  malformed, unknown release, `sdkUrl`) with its message; the global checks (the pinned build
+  used without loading, another build refused before loading and after its own load, a
+  `version` naming no build used as it is). `test/stripe-client-csp.test.ts` pins the nonce on
+  both URLs and runs the check against a real `window.Stripe` in jsdom. Each of 33 mutations
+  made a test fail: every release loading v3, a release URL without `/stripe.js`, v3 with a
+  trailing slash, the dated version not passed to `Stripe()` or a release's passed, an
+  unknown release accepted, `endive` added or `basil` dropped, the version pattern unanchored
+  at either end or loosened on month, day or case, the empty or missing version reported
+  wrongly, `sdkUrl` ignored, the build check removed, made strict about a `version` naming no
+  build, or blind to numbers, to release names or to other strings, the check skipped before
+  or after loading, v3 described without its `v`, the refusal made retryable or its `raw`
+  dropped, the seam given the v3 URL, the nonce dropped, the locale or the redirect return's
+  locale lost, empty `Stripe()` options instead of none, and the fraud and `expired_card`
+  error-code steps removed.
+- **Sandbox checks, not run.** In a sandbox page on the dahlia build, the `Stripe-Version` of
+  Stripe.js's requests (the browser's network panel) shows which version the build speaks. A
+  confirmation with the expired-card test card under v3 with `2024-06-20` and under dahlia
+  shows the code each returns. Mounting a PaymentIntent that already succeeded under a clover
+  or later build records the `type` and `code` of the `loaderror` error clover added, which
+  the browser maps by those.

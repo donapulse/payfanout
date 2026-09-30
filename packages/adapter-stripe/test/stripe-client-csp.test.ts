@@ -4,13 +4,15 @@ import { isPayFanoutError } from "@payfanout/core";
 import { StripeClientAdapter, type StripeJsFactory, type StripeJsLike } from "../src/index.js";
 
 // jsdom fetches no subresource here, so the script loads only when a test says so.
-const STRIPE_JS_URL = "https://js.stripe.com/v3";
+const API_VERSION = "2026-08-26.dahlia";
+const STRIPE_JS_URL = "https://js.stripe.com/dahlia/stripe.js";
 /** A per-response Content-Security-Policy nonce, as a host server would mint it. */
 const NONCE = "cmFuZG9tLW5vbmNlLXZhbHVl";
 
 afterEach(() => {
   vi.restoreAllMocks();
   document.head.innerHTML = "";
+  delete (window as { Stripe?: unknown }).Stripe;
 });
 
 /** The attributes of every element inserted into the head, as they stood at insertion. */
@@ -26,28 +28,35 @@ function recordInsertions(): Array<Record<string, string>> {
 }
 
 describe("StripeClientAdapter cspNonce", () => {
-  it("puts the nonce on the Stripe.js script before inserting it", async () => {
-    const insertions = recordInsertions();
-    let stripe: StripeJsFactory | undefined = undefined;
-    const adapter = new StripeClientAdapter({
-      publishableKey: "pk_test_unit",
-      environment: "sandbox",
-      cspNonce: NONCE,
-      getStripeGlobal: () => stripe,
+  for (const [apiVersion, url] of [
+    [API_VERSION, STRIPE_JS_URL],
+    ["2024-06-20", "https://js.stripe.com/v3"],
+  ] as const) {
+    it(`puts the nonce on the Stripe.js script of ${apiVersion} before inserting it`, async () => {
+      const insertions = recordInsertions();
+      let stripe: StripeJsFactory | undefined = undefined;
+      const adapter = new StripeClientAdapter({
+        publishableKey: "pk_test_unit",
+        environment: "sandbox",
+        apiVersion,
+        cspNonce: NONCE,
+        getStripeGlobal: () => stripe,
+      });
+      const loading = adapter.loadSdk();
+      expect(insertions).toHaveLength(1);
+      expect(insertions[0]).toMatchObject({ nonce: NONCE, src: url });
+      stripe = () => ({}) as StripeJsLike;
+      document.querySelector(`script[src="${url}"]`)!.dispatchEvent(new Event("load"));
+      await expect(loading).resolves.toBeUndefined();
     });
-    const loading = adapter.loadSdk();
-    expect(insertions).toHaveLength(1);
-    expect(insertions[0]).toMatchObject({ nonce: NONCE, src: STRIPE_JS_URL });
-    stripe = () => ({}) as StripeJsLike;
-    document.querySelector(`script[src="${STRIPE_JS_URL}"]`)!.dispatchEvent(new Event("load"));
-    await expect(loading).resolves.toBeUndefined();
-  });
+  }
 
   it("injects the script without a nonce when none is configured", () => {
     const insertions = recordInsertions();
     const adapter = new StripeClientAdapter({
       publishableKey: "pk_test_unit",
       environment: "sandbox",
+      apiVersion: API_VERSION,
       getStripeGlobal: () => undefined,
     });
     void adapter.loadSdk();
@@ -61,6 +70,7 @@ describe("StripeClientAdapter cspNonce", () => {
     const adapter = new StripeClientAdapter({
       publishableKey: "pk_test_unit",
       environment: "sandbox",
+      apiVersion: API_VERSION,
       cspNonce: NONCE,
       getStripeGlobal: () => stripe,
       loadScript: async (...args: unknown[]) => {
@@ -77,7 +87,7 @@ describe("StripeClientAdapter cspNonce", () => {
     for (const cspNonce of ["", "a b", "'nonce-abc'", "abc==="]) {
       let err: unknown;
       try {
-        new StripeClientAdapter({ publishableKey: "pk_test_unit", environment: "sandbox", cspNonce });
+        new StripeClientAdapter({ publishableKey: "pk_test_unit", environment: "sandbox", apiVersion: API_VERSION, cspNonce });
       } catch (caught) {
         err = caught;
       }
@@ -89,5 +99,39 @@ describe("StripeClientAdapter cspNonce", () => {
           "StripeClientAdapter config.cspNonce must be the value of the policy's 'nonce-…' source: base64 or base64url characters",
       });
     }
+  });
+});
+
+describe("StripeClientAdapter and a window.Stripe already on the page", () => {
+  /** A global as the served Stripe.js files leave it: the initializer, carrying its build's version. */
+  function pageStripe(version: number | string): StripeJsFactory {
+    const factory: StripeJsFactory = () => ({}) as StripeJsLike;
+    factory.version = version;
+    return factory;
+  }
+
+  it("uses the page's Stripe.js when it is the pinned build, injecting nothing", async () => {
+    const insertions = recordInsertions();
+    (window as { Stripe?: unknown }).Stripe = pageStripe("dahlia");
+    const adapter = new StripeClientAdapter({ publishableKey: "pk_test_unit", environment: "sandbox", apiVersion: API_VERSION });
+    await expect(adapter.loadSdk()).resolves.toBeUndefined();
+    expect(insertions).toHaveLength(0);
+  });
+
+  it("refuses the page's v3 for a pinned release, without loading another copy", async () => {
+    const insertions = recordInsertions();
+    (window as { Stripe?: unknown }).Stripe = pageStripe(3);
+    const adapter = new StripeClientAdapter({ publishableKey: "pk_test_unit", environment: "sandbox", apiVersion: API_VERSION });
+    await expect(adapter.loadSdk()).rejects.toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      pspName: "stripe",
+      message:
+        'This page already runs Stripe.js v3, but config.apiVersion "2026-08-26.dahlia" needs Stripe.js dahlia ' +
+        "(https://js.stripe.com/dahlia/stripe.js): a page runs one Stripe.js build, so load that one or leave the loading to the adapter",
+      raw: { loadedVersion: 3, neededVersion: "dahlia" },
+    });
+    expect(insertions).toHaveLength(0);
+    expect(document.querySelector("script")).toBeNull();
   });
 });

@@ -8,6 +8,8 @@ import {
   type StripeJsLike,
 } from "../src/index.js";
 
+const API_VERSION = "2026-08-26.dahlia";
+
 function makeFakeStripeJs(confirmResult: StripeJsConfirmResult): StripeJsLike & {
   elementsCalls: Record<string, unknown>[];
   confirmPaymentCalls: Record<string, unknown>[];
@@ -61,6 +63,7 @@ function makeAdapter(
   const adapter = new StripeClientAdapter({
     publishableKey: "pk_test_123",
     environment: "sandbox",
+    apiVersion: API_VERSION,
     getStripeGlobal: () => () => fake,
     loadScript: async () => {},
   });

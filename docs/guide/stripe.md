@@ -156,15 +156,20 @@ refusal of such an amount is therefore marked `outcomeUnknown` on:
 
 - `chargeSavedPaymentMethod` and `createNativeSubscription`, whose earlier attempt the
   adapter cannot read back;
-- `capturePayment` and `refundPayment` with an amount, unless the PaymentIntent they read
-  shows nothing moved: a capture's refusal stays final while the PaymentIntent is still
-  `requires_capture`, and a refund's while its latest charge has nothing refunded;
-- `updatePaymentSession` with an amount for a UGX PaymentIntent.
+- `capturePayment` with an amount, unless the PaymentIntent it reads is still
+  `requires_capture`, which shows nothing was captured;
+- `refundPayment` with an amount, unless the PaymentIntent's refunds, which the adapter
+  lists on the way to the refusal (`GET /v1/refunds`, one more request), show nothing
+  moved: the list must be complete and hold only `failed` or `canceled` refunds, or none.
+  A `pending` or `requires_action` refund keeps it open, and so does a list that cannot be
+  read. A refund that is sent lists nothing;
+- `updatePaymentSession` whenever UGX is refused, whether the update names UGX or sends an
+  amount for a UGX PaymentIntent.
 
-The message then asks you to check the Stripe Dashboard for a charge, capture, refund or
-update under that idempotency key before sending another, and, like any `outcomeUnknown`
-error, the call may be retried only under the same key. Every other refusal of an amount is
-final.
+Each of these refusals, final or open, asks you to check the Stripe Dashboard for a charge,
+subscription, capture, refund or update under that idempotency key before sending another,
+and, like any `outcomeUnknown` error, an open one may be retried only under the same key.
+Every other refusal of an amount is final.
 
 The adapter declares no `supportedCurrencies`, so the router cannot skip Stripe for UGX on
 its own, and a Stripe candidate that refuses it ends the cascade. Route UGX to another
@@ -175,11 +180,13 @@ the first matching rule wins: `{ when: { currency: ["UGX"] }, use: ["<psp>"] }`
 **Some calls read the payment first.** Stripe's units depend on the currency, so
 `capturePayment` and `refundPayment` that state an amount, and `updatePaymentSession` that
 carries `amount` without `currency` or `currency` without `amount`, first read the
-PaymentIntent (`GET /v1/payment_intents/:id`, with its latest charge for a refund): one more
-request on each such call. A currency change without an amount keeps the session's amount in
-PayFanout's minor units, and always sends it converted for the new currency, so a retry
-under the same key sends the same request: a session of `amount: 1000` moved from ISK to USD
-asks for USD 10.00, not the USD 1,000.00 Stripe's own `100000` would mean.
+PaymentIntent (`GET /v1/payment_intents/:id`): one more request on each such call. A
+currency change without an amount keeps the session's amount in PayFanout's minor units, and
+always sends it converted for the new currency, so a retry under the same key sends the same
+request: a session of `amount: 1000` moved from ISK to USD asks for USD 10.00, not the
+USD 1,000.00 Stripe's own `100000` would mean. Such a currency change reads the amount and
+then writes it, so an amount update that lands between the two is overwritten: send the
+updates of one session one at a time.
 
 ::: warning Upgrading from a release that sent these amounts unchanged
 Earlier releases sent ISK and MGA amounts to Stripe as they were: ISK 1,000

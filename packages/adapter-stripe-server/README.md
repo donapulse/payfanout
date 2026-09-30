@@ -78,17 +78,20 @@ Pair it on the browser with [`@payfanout/adapter-stripe`](../adapter-stripe). Th
   Stripe's currencies page documents with both units, is refused: calls that would send a
   UGX amount reject with `invalid_request` before the request carrying it, reads of a UGX
   record reject with `unsupported_operation`, list pages holding one fail whole, and UGX
-  events carry no `amount`. `capturePayment` and `refundPayment` with an amount, and
+  events carry no `amount`. On a UGX record, `cancelPayment`, a capture or refund with no
+  amount, a metadata-only update and `cancelNativeSubscription` take effect at Stripe and
+  then reject with `unsupported_operation` marked `outcomeUnknown`, as their answer cannot
+  be reported. `capturePayment` and `refundPayment` with an amount, and
   `updatePaymentSession` with only one of `amount` and `currency`, read the PaymentIntent
   first. Earlier releases sent UGX amounts, and MGA amounts that are not whole ariary,
   unconverted, so their refusal is marked `outcomeUnknown` on `chargeSavedPaymentMethod`
-  and `createNativeSubscription`, on `capturePayment` and `refundPayment` unless the
-  PaymentIntent read shows nothing moved (still `requires_capture`, or a latest charge with
-  nothing refunded), and on `updatePaymentSession` for a UGX PaymentIntent: check the
-  Stripe Dashboard for the request under its idempotency key before sending another. The
-  three-decimal multiple-of-10 rule applies to session creation, an update naming amount
-  and currency, saved-method charges and subscriptions. See [currencies with
-  Stripe-specific
+  and `createNativeSubscription`; on `capturePayment` unless the PaymentIntent is still
+  `requires_capture`; on `refundPayment` unless the PaymentIntent's refunds, listed on the
+  way to the refusal, are all failed or canceled (or none); and on `updatePaymentSession`
+  whenever UGX is refused. Each of these refusals asks you to check the Stripe Dashboard for
+  the request under its idempotency key before sending another. The three-decimal
+  multiple-of-10 rule applies to session creation, an update naming amount and currency,
+  saved-method charges and subscriptions. See [currencies with Stripe-specific
   units](https://donapulse.github.io/payfanout/guide/stripe#currencies-with-stripe-specific-units).
 
 ## Documentation

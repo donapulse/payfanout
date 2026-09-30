@@ -5053,8 +5053,8 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   reused after the original is pruned. The idempotency layer compares incoming parameters to
   those of the original request and errors if they're not the same to prevent accidental
   misuse." A retry must therefore send the very parameters of the first attempt, whatever
-  state that attempt left behind (below), and the test double now compares them on a
-  same-key update, capture and refund.
+  state that attempt left behind (below), and the test double now compares them on every
+  keyed write and replays a saved error as Stripe does (see Tests).
 - **Compared with core, currency by currency.** The HTML page embeds its per-country
   presentment lists as JSON: 45 countries, 139 distinct currencies. Each was given Stripe's
   decimals by the page's own rules (the zero-decimal list, ISK's special case, two
@@ -5102,27 +5102,50 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
     2026-09-30): a `SubscriptionManager` renewal retried across the upgrade reuses its key,
     and the adapter cannot read the earlier attempt back (Stripe looks PaymentIntents up by
     id, not by idempotency key), so their refusal is always `outcomeUnknown`, asking the
-    host to check the Stripe Dashboard for a charge under the key before sending another.
-  - `capturePayment` and `refundPayment` with an amount (changed in review, 2026-09-30; the
-    first version made these refusals final and told the host to capture or refund in the
-    Dashboard, which could repeat money a retried call had already moved). They read the
-    PaymentIntent anyway, so the refusal is final only when that read shows nothing moved:
-    for a capture, a PaymentIntent still `requires_capture`; for a refund, a latest charge
-    (expanded on that read) whose `amount_refunded` is 0. Anything else, a PaymentIntent
-    captured or cancelled, a charge with a refund, or no charge at all, leaves the refusal
-    `outcomeUnknown`. Either way the message asks the host to check the Stripe Dashboard for
-    a capture or refund under the key before capturing or refunding there, never to act
-    first.
-  - `updatePaymentSession` with an amount for a UGX PaymentIntent (changed in review,
-    2026-09-30): always `outcomeUnknown`, as no read through the adapter can show whether an
-    earlier update went through (`retrievePayment` refuses a UGX PaymentIntent); the message
-    asks for a check under the key, then a cancellation. An MGA update's refusal stays
-    final: it moves no money, and `retrievePayment` reports the amount the PaymentIntent
-    holds.
-  - The other send refusals stay final: session creation and updates naming the currency,
-    which move no money; the ISK overflow, which only amounts past Stripe's 12-digit maximum
-    reach, so no earlier attempt of it went through; and the three-decimal rule, which
-    earlier releases applied too.
+    host to check the Stripe Dashboard for a charge, or a subscription, under the key before
+    sending another.
+  - `capturePayment` with an amount (changed in review, 2026-09-30; the first version made
+    these refusals final and told the host to capture in the Dashboard, which could repeat
+    money a retried call had already moved). It reads the PaymentIntent anyway, so the
+    refusal is final only when that read shows a PaymentIntent still `requires_capture`, as
+    nothing is captured on one. Every other status leaves it `outcomeUnknown`, a cancelled
+    one included, which was never captured: the rule is conservative.
+  - `refundPayment` with an amount (changed in review, 2026-09-30, twice). The second review
+    replaced the first version's lift, a latest charge whose `amount_refunded` is 0: the
+    charge's field reads "Amount in the smallest currency unit refunded (can be less than
+    the amount attribute on the charge if a partial refund was issued)", which does not say
+    whether pending refunds count, and refunds can wait in two such states. The refunds guide
+    (docs.stripe.com/refunds, read 2026-09-30) says "If your available balance doesn't cover
+    the amount of the refund, Stripe holds the refund as pending for card transactions
+    (refunds for other payment method types fail) until your Stripe balance becomes
+    sufficient", and "For some payment methods without native refund support (for example,
+    Konbini, PromptPay, Boleto, and bank transfers), Stripe needs to collect bank account
+    details from your customer before it can process the refund. In these cases, the refund
+    enters the `requires_action` status". So on the way to the refusal only, never for a
+    refund that is sent, the adapter lists the PaymentIntent's refunds, and the refusal is
+    final only when that list is complete (`has_more` false) and holds nothing but `failed`
+    or `canceled` refunds, or none. Any other status, a null one included, another page, or
+    a list that cannot be read leaves it `outcomeUnknown`. Doc-verified 2026-09-30 against
+    docs.stripe.com/api/refunds/list: `GET /v1/refunds` "Returns a list of all refunds you
+    created", its `payment_intent` parameter "Only return refunds for the PaymentIntent
+    specified by this ID", and `limit` "can range between 1 and 100"; and
+    docs.stripe.com/api/refunds/object: `status` (string, nullable) "Status of the refund.
+    This can be `pending`, `requires_action`, `succeeded`, `failed`, or `canceled`." The
+    `expand` of the latest charge the first version added for its lift is gone.
+  - Both messages ask the host to check the Stripe Dashboard for a capture or refund under
+    the key before acting there, never to act first, and a final refusal asks it too (added
+    in the second review, 2026-09-30, for the MGA refusal the UGX one already had it for).
+  - `updatePaymentSession` whenever UGX is refused (changed in review, 2026-09-30, twice):
+    an update sending an amount for a UGX PaymentIntent, and, since the second review, one
+    naming UGX, with or without an amount. Always `outcomeUnknown`, as an earlier release
+    sent such updates unconverted under the same key and no read through the adapter can
+    show whether one went through (`retrievePayment` refuses a UGX PaymentIntent); the
+    message asks for a check under the key. An MGA update's refusal stays final: it moves
+    no money, and `retrievePayment` reports the amount the PaymentIntent holds.
+  - The other send refusals stay final: session creation, which makes a new PaymentIntent
+    and moves no money; an MGA update, as above; the ISK overflow, which only amounts past
+    Stripe's 12-digit maximum reach, so no earlier attempt of it went through; and the
+    three-decimal rule, which earlier releases applied too.
   ISK and MGA sends whose amount converts are sent, and a retry whose converted amount
   differs from the earlier release's meets Stripe's own idempotency check, which the adapter
   already maps to `outcomeUnknown`.
@@ -5142,7 +5165,7 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
 - **Calls that name no currency read the PaymentIntent first.** A capture or refund that
   states an amount, and an update carrying `amount` without `currency`, read the
   PaymentIntent to learn the currency the amount is sent in: one more request, only when an
-  amount is given (the refund's read expands the latest charge, for the rule above). An
+  amount is given (a refund refused for the reasons above lists its refunds too). An
   update carrying `currency` without `amount` reads it as well (decided in implementation):
   Stripe keeps its own integer across a currency change, so a session of `amount: 1000`
   moved from ISK (Stripe's `100000`) to USD would otherwise ask for USD 1,000.00. The
@@ -5156,7 +5179,9 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   amount cannot be read, with `invalid_request` asking for the amount with the currency.
   A capture's or refund's parameters depend on the caller's amount and the payment's
   currency, which no longer changes once the payment is authorized, so their retries send
-  the same request too.
+  the same request too. A currency change without an amount reads and then writes, so an
+  amount update landing between the two is overwritten: the setup guide asks hosts to send
+  the updates of one session one at a time (added in the second review, 2026-09-30).
 - **Calls that send no amount are not read first** (decided in implementation, keeping the
   extra request to calls that send an amount). A capture, cancellation or refund without an
   amount, an update of other fields and a subscription cancellation go through at Stripe
@@ -5177,15 +5202,19 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   and the reported amount on every read path for ISK, MGA, USD, JPY and KWD; each MGA, UGX,
   ISK and three-decimal refusal with the exact sequence of requests made (a log of every call
   reaching the test double) and whether it leaves the outcome open; the list-page failures
-  with their `raw`; event amounts; and same-key retries of a currency change, a capture and
-  a refund whose first answer was lost. The test double saves a keyed update's, capture's
-  and refund's answer and refuses the key when the parameters differ, as Stripe does. Each
-  mutation tried (ISK multiplied by 10, MGA or one send path left unconverted, UGX treated
-  as zero-decimal, the whole-ariary, overflow and multiple-of-100 checks dropped, a page
-  check made a no-op, `outcomeUnknown` dropped from answers or from the refusals above, the
-  nothing-moved exceptions widened, the kept amount sent only when it changes, the
-  three-decimal rule extended to captures) made a test fail. The conformance suite passes
-  unchanged.
+  with their `raw`; event amounts; same-key retries of a currency change, a capture and a
+  refund whose first answer was lost; and the refund-list rule for each refund status, an
+  empty list, another page and a list that cannot be read. The test double keeps Stripe's
+  idempotency on every keyed write, creates included: it saves the first result under a
+  key, an error as well as an answer ("regardless of whether it succeeds or fails"),
+  replays it to a same-key request with the same parameters, and refuses the key when they
+  differ. Each mutation tried (ISK multiplied by 10, MGA or one send path left unconverted,
+  UGX treated as zero-decimal, the whole-ariary, overflow and multiple-of-100 checks
+  dropped, a page check made a no-op, `outcomeUnknown` dropped from answers or from the
+  refusals above, the nothing-moved exceptions widened, the refund list's statuses or its
+  `has_more` ignored, a named UGX update made final, the kept amount sent only when it
+  changes, the three-decimal rule extended to captures) made a test fail. The conformance
+  suite passes unchanged.
 - **Sandbox checks, not run.** No Stripe sandbox run backs these facts; each check needs an
   account whose presentment currencies include the currency.
   - **UGX.** Charge `amount: 500` in UGX and read the payment in the Stripe Dashboard: UGX 5

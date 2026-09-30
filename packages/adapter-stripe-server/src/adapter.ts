@@ -48,6 +48,7 @@ import {
   assertSendableCurrency,
   assertThreeDecimalRule,
   readStripeAmounts,
+  refusesUnconverted,
   toStripeAmount,
   type RecordUse,
   type StripeRecord,
@@ -140,13 +141,13 @@ const DEFAULT_METHODS: PaymentMethodCapability[] = [
  * ariary, unconverted, so a retry under the same key after the upgrade may
  * meet money they already moved. Their refusal is therefore marked
  * outcomeUnknown on `chargeSavedPaymentMethod` and `createNativeSubscription`,
- * whose earlier attempt the adapter cannot read back; on `capturePayment` and
- * `refundPayment`, unless the PaymentIntent they read shows nothing moved
- * (still `requires_capture` for a capture, a latest charge with nothing
- * refunded for a refund); and, for a UGX PaymentIntent, on
- * `updatePaymentSession`. The message then asks the host to check the Stripe
- * Dashboard for that request under the idempotency key before sending
- * another.
+ * whose earlier attempt the adapter cannot read back; on `capturePayment`,
+ * unless the PaymentIntent it reads is still `requires_capture`; on
+ * `refundPayment`, unless the PaymentIntent's refund list, read on the way to
+ * the refusal, is complete and holds only failed or canceled refunds; and on
+ * `updatePaymentSession` whenever UGX is refused, named or read. These
+ * refusals, final or not, ask the host to check the Stripe Dashboard for that
+ * request under the idempotency key before sending another.
  *
  * `updatePaymentSession`, `capturePayment` and `refundPayment` read the
  * PaymentIntent first whenever the currency of the amount they send is not
@@ -276,9 +277,13 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
    * names both, or neither, reads nothing first. Refusals of the amount (UGX,
    * MGA amounts that are not whole ariary, and, when the update names both
    * amount and currency, three-decimal amounts that are not multiples of 10)
-   * come before the update is sent; the refusal of an amount for a UGX
-   * PaymentIntent is marked outcomeUnknown, as an earlier release sent such
-   * updates unconverted.
+   * come before the update is sent. A UGX refusal, whether the update names
+   * UGX or sends an amount for a UGX PaymentIntent, is marked outcomeUnknown,
+   * as an earlier release sent such updates unconverted under the same key.
+   *
+   * A currency change without an amount writes the amount it read, so an
+   * amount update landing between that read and its write is overwritten:
+   * send the updates of one session one at a time.
    */
   async updatePaymentSession(input: UpdatePaymentSessionInput): Promise<PaymentSession> {
     if (input.pspSessionId.startsWith("seti_")) {
@@ -288,7 +293,9 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     }
     if (input.amount !== undefined) assertMinorUnitAmount(input.amount, "amount");
     const currency = input.currency !== undefined ? normalizeCurrency(input.currency) : undefined;
-    if (currency !== undefined) assertSendableCurrency(currency, { label: "amount" });
+    if (currency !== undefined) {
+      assertSendableCurrency(currency, { label: "amount", sentBefore: { what: "an update", open: true } });
+    }
     let amount: number | undefined;
     if (input.amount !== undefined && currency !== undefined) {
       amount = toStripeAmount(input.amount, currency, { label: "amount" });
@@ -344,8 +351,10 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
    * capture. An earlier release sent such captures unconverted, so the
    * refusal of a UGX amount, or of an MGA amount that is not whole ariary, is
    * marked outcomeUnknown unless the PaymentIntent read is still
-   * `requires_capture`, which shows nothing was captured. Without `amount`,
-   * Stripe captures its own `amount_capturable` and nothing is read first.
+   * `requires_capture`, which shows nothing was captured; either way it asks
+   * the host to check the Stripe Dashboard under the key before sending
+   * another. Without `amount`, Stripe captures its own `amount_capturable`
+   * and nothing is read first.
    */
   async capturePayment(
     pspPaymentId: string,
@@ -367,7 +376,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
               remedy: "Check the Stripe Dashboard for a capture under this idempotency key before capturing it there",
               outcomeUnknown: moved,
             },
-            ...(moved ? { sentBefore: "a capture" } : {}),
+            sentBefore: { what: "a capture", open: moved },
           }),
         };
       }
@@ -384,14 +393,18 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
   }
 
   /**
-   * A refund that states `amount` first reads the PaymentIntent, its latest
-   * charge expanded (one more request), to send it in Stripe's units for the
-   * payment's currency, and refuses one Stripe cannot be sent (see the class
-   * notes) before the refund. An earlier release sent such refunds
-   * unconverted, so the refusal of a UGX amount, or of an MGA amount that is
-   * not whole ariary, is marked outcomeUnknown unless that charge shows
-   * `amount_refunded` 0, nothing refunded. Without `amount`, Stripe refunds
-   * what remains and nothing is read first.
+   * A refund that states `amount` first reads the PaymentIntent (one more
+   * request) to send it in Stripe's units for the payment's currency, and
+   * refuses one Stripe cannot be sent (see the class notes) before the
+   * refund. An earlier release sent such refunds unconverted, so on the way
+   * to refusing a UGX amount, or an MGA amount that is not whole ariary, the
+   * adapter lists the PaymentIntent's refunds (GET /v1/refunds, one request
+   * more): the refusal is final only when that list is complete and holds
+   * nothing but failed or canceled refunds, and is marked outcomeUnknown
+   * otherwise, including when the list cannot be read. Either way it asks the
+   * host to check the Stripe Dashboard under the key before sending another.
+   * A refund that is sent lists nothing. Without `amount`, Stripe refunds what
+   * remains and nothing is read first.
    */
   async refundPayment(req: RefundRequest): Promise<RefundResult> {
     if (req.amount !== undefined) assertMinorUnitAmount(req.amount, "refund amount");
@@ -399,9 +412,10 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
       let amount: number | undefined;
       let paymentCurrency: string | undefined;
       if (req.amount !== undefined) {
-        const current = await client.paymentIntents.retrieve(req.pspPaymentId, { expand: ["latest_charge"] });
+        const current = await client.paymentIntents.retrieve(req.pspPaymentId);
         paymentCurrency = current.currency;
-        const moved = expandedCharge(current)?.amount_refunded !== 0;
+        const moved =
+          refusesUnconverted(req.amount, current.currency) && (await refundsMayHaveMoved(client, req.pspPaymentId));
         amount = toStripeAmount(req.amount, current.currency, {
           label: "amount",
           record: {
@@ -410,7 +424,7 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
             remedy: "Check the Stripe Dashboard for a refund under this idempotency key before refunding it there",
             outcomeUnknown: moved,
           },
-          ...(moved ? { sentBefore: "a refund" } : {}),
+          sentBefore: { what: "a refund", open: moved },
         });
       }
       const refund = await client.refunds.create(
@@ -571,7 +585,10 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
     }
     const currency = normalizeCurrency(input.currency);
     // Checked with a planId too, though that path sends the Price's own amount.
-    const unitAmount = toStripeAmount(input.amount, currency, { label: "amount", sentBefore: "a charge" });
+    const unitAmount = toStripeAmount(input.amount, currency, {
+      label: "amount",
+      sentBefore: { what: "a subscription", open: true },
+    });
     assertThreeDecimalRule(input.amount, currency);
     const anchor = input.startAt !== undefined ? toEpochSeconds(input.startAt, "startAt") : undefined;
     const metadata = withMerchantRef(input.metadata, input.merchantRefNum);
@@ -792,7 +809,10 @@ export class StripeServerAdapter implements ServerPaymentAdapter {
   async chargeSavedPaymentMethod(input: ChargeSavedPaymentMethodInput): Promise<PaymentInfo> {
     assertMinorUnitAmount(input.amount, "amount");
     const currency = normalizeCurrency(input.currency);
-    const amount = toStripeAmount(input.amount, currency, { label: "amount", sentBefore: "a charge" });
+    const amount = toStripeAmount(input.amount, currency, {
+      label: "amount",
+      sentBefore: { what: "a charge", open: true },
+    });
     assertThreeDecimalRule(input.amount, currency);
     const metadata = withPayfanoutId(input.metadata, input.id);
     return this.run(async (client) => {
@@ -1278,6 +1298,23 @@ function subscriptionCurrency(sub: StripeSubscriptionLike): string | undefined {
 function pageCursor(page: StripeListLike<{ id: string }>): string | undefined {
   const last = page.data[page.data.length - 1];
   return page.has_more && last ? last.id : undefined;
+}
+
+/**
+ * Whether refunds may already have moved money on a PaymentIntent. Only a
+ * complete list of its refunds (`has_more` false) holding nothing but failed
+ * or canceled ones, or none, shows that none did: a pending or
+ * `requires_action` refund may still move money, and Stripe does not say
+ * whether a charge's `amount_refunded` counts it.
+ */
+async function refundsMayHaveMoved(client: StripeClientLike, paymentIntent: string): Promise<boolean> {
+  try {
+    const page = await client.refunds.list({ payment_intent: paymentIntent, limit: 100 });
+    return page.has_more !== false || page.data.some((r) => r.status !== "failed" && r.status !== "canceled");
+  } catch {
+    // A list that cannot be read shows nothing, so the refusal stays open.
+    return true;
+  }
 }
 
 /** Stripe list endpoints accept 1-100. */

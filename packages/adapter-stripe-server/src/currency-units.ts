@@ -52,14 +52,15 @@ export interface SendTarget {
   /** The record the call read to learn the currency, having been given none. */
   record?: RecordTarget;
   /**
-   * Set on a call an earlier release sent unconverted, when the adapter cannot
-   * tell that nothing moved under the same key: it names what that release may
-   * already have done ("a charge", "a capture"). The refusals that release
-   * would not have made, UGX and an amount that is not whole in Stripe's
-   * units, then leave the outcome open, and ask the host to look for it under
-   * the key in the Stripe Dashboard before sending another.
+   * Set on a call an earlier release sent unconverted: `what` names what that
+   * release may already have done under the same key ("a charge", "a
+   * capture"). The refusals that release would not have made, UGX and an
+   * amount that is not whole in Stripe's units, then ask the host to look for
+   * it under the key in the Stripe Dashboard before sending another, and leave
+   * the outcome open when `open` is set, as the call cannot tell that nothing
+   * moved.
    */
-  sentBefore?: string;
+  sentBefore?: { what: string; open: boolean };
 }
 
 /** A record read first; the refusal of an amount for a UGX one names it. */
@@ -90,6 +91,24 @@ export function assertSendableCurrency(currency: string, target: SendTarget): vo
 }
 
 /**
+ * Whether `toStripeAmount` refuses `amount` in `currency` for a reason an
+ * earlier release would not have refused it for, UGX or an amount that is not
+ * whole in Stripe's units: the refusals whose outcome a call may then need to
+ * decide.
+ */
+export function refusesUnconverted(amount: MinorUnitAmount, currency: string): boolean {
+  const units = currencyUnits(currency);
+  if (units === undefined) return false;
+  if (units.stripeExponent === undefined) return true;
+  return !wholeInStripeUnits(amount, units.stripeExponent - units.payfanoutExponent);
+}
+
+/** Whether `amount` is whole in Stripe's units, `shift` decimals away from PayFanout's. */
+function wholeInStripeUnits(amount: MinorUnitAmount, shift: number): boolean {
+  return shift >= 0 || amount % 10 ** -shift === 0;
+}
+
+/**
  * The `amount` to send Stripe for a PayFanout amount in `currency`. Throws a
  * non-retryable invalid_request, for the call to reject before the request
  * that would carry it, when Stripe cannot be sent the amount: any UGX amount;
@@ -117,13 +136,13 @@ export function toStripeAmount(amount: MinorUnitAmount, currency: string, target
   }
   if (shift < 0) {
     const divisor = 10 ** -shift;
-    if (amount % divisor !== 0) {
+    if (!wholeInStripeUnits(amount, shift)) {
       throw refusal(
         "invalid_request",
         `Stripe takes ${code} amounts with ${stripeExponent} decimals where PayFanout has ${payfanoutExponent}, so ` +
           `${target.label} must be a multiple of ${divisor} minor units, got ${amount}${sentBefore(target)}`,
         raw,
-        target.sentBefore !== undefined,
+        target.sentBefore?.open === true,
       );
     }
     return amount / divisor;
@@ -169,15 +188,16 @@ function sendableUnits(currency: string, target: SendTarget): Required<CurrencyU
     `The Stripe adapter refuses ${units.currency}: ${why}. Take ${units.currency} payments with another provider` +
       sentBefore(target),
     { ...units },
-    target.sentBefore !== undefined,
+    target.sentBefore?.open === true,
   );
 }
 
+/** The hint ending a refusal an earlier release would not have made, when the call is one it sent. */
 function sentBefore(target: SendTarget): string {
-  return target.sentBefore === undefined
-    ? ""
-    : `${SENT_BEFORE}, so check the Stripe Dashboard for ${target.sentBefore} under this idempotency key before ` +
-        "sending another";
+  if (target.sentBefore === undefined) return "";
+  const { what, open } = target.sentBefore;
+  const where = `the Stripe Dashboard for ${what} under this idempotency key before sending another`;
+  return open ? `${SENT_BEFORE}, so check ${where}` : `. Check ${where}`;
 }
 
 type Reading = { amount: number; reason?: undefined } | { amount?: undefined; reason: string };

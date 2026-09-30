@@ -4,6 +4,7 @@ import {
   StripeServerAdapter,
   stripeEventBodyToUnified,
   type StripePaymentIntentLike,
+  type StripeRefundLike,
   type StripeServerAdapterConfig,
 } from "../src/index.js";
 import { FakeStripe, stripeError } from "./fake-stripe.js";
@@ -191,8 +192,9 @@ describe.each(CASES)("$currency amounts on every path", ({ currency, amount, par
 
     const log = recordCalls(fake);
     const refunded = await adapter.refundPayment({ pspPaymentId: first.pspSessionId, amount: partial, idempotencyKey: "r1" });
+    // A refund that is sent lists nothing: the refund list is read only on the way to a refusal.
     expect(names(log)).toEqual(["paymentIntents.retrieve", "refunds.create"]);
-    expect(log[0]!.args).toEqual([first.pspSessionId, { expand: ["latest_charge"] }]);
+    expect(log[0]!.args).toEqual([first.pspSessionId]);
     expect(log[1]!.args).toEqual([{ payment_intent: first.pspSessionId, amount: stripePartial }, { idempotencyKey: "r1" }]);
     expect(refunded).toMatchObject({ status: "succeeded", amount: partial });
 
@@ -294,13 +296,14 @@ describe("MGA: Stripe charges whole ariary", () => {
     await fake.paymentIntents.capture(captured.id, {});
     const refunded = await stripeIntent(fake, 1500, "mga", "succeeded");
     await fake.refunds.create({ payment_intent: refunded.id, amount: 500 });
-    // No longer requires_capture: only that status shows nothing was captured.
+    // Cancelled, so never captured: the rule is conservative and leaves every status but requires_capture open.
     const voided = await stripeIntent(fake, 1500, "mga", "authorized");
     await fake.paymentIntents.cancel(voided.id);
     const vault = vaulted(fake);
     const log = recordCalls(fake);
-    // What an earlier release, which sent these unconverted, may already have done under the key.
-    const calls: Array<[() => Promise<unknown>, string[], string | undefined]> = [
+    // What an earlier release, which sent these unconverted, may already have done under the key, and whether
+    // the refusal leaves that open.
+    const calls: Array<[() => Promise<unknown>, string[], { what: string; open: boolean } | undefined]> = [
       [() => adapter.createPaymentSession({ amount: 1050, currency: "MGA", idempotencyKey: "a" }), [], undefined],
       [
         () => adapter.updatePaymentSession({ pspSessionId: open.id, amount: 1050, currency: "MGA", idempotencyKey: "b" }),
@@ -313,51 +316,52 @@ describe("MGA: Stripe charges whole ariary", () => {
         undefined,
       ],
       // Still requires_capture: nothing was captured, so the refusal is final.
-      [() => adapter.capturePayment(authorized.id, 1050, "d"), ["paymentIntents.retrieve"], undefined],
-      [() => adapter.capturePayment(captured.id, 1050, "d2"), ["paymentIntents.retrieve"], "a capture"],
-      [() => adapter.capturePayment(voided.id, 1050, "d3"), ["paymentIntents.retrieve"], "a capture"],
-      // A charge with nothing refunded: the refusal is final.
+      [() => adapter.capturePayment(authorized.id, 1050, "d"), ["paymentIntents.retrieve"], { what: "a capture", open: false }],
+      [() => adapter.capturePayment(captured.id, 1050, "d2"), ["paymentIntents.retrieve"], { what: "a capture", open: true }],
+      [() => adapter.capturePayment(voided.id, 1050, "d3"), ["paymentIntents.retrieve"], { what: "a capture", open: true }],
+      // No refund on the payment, so the refusal is final; a charge without one included.
       [
         () => adapter.refundPayment({ pspPaymentId: paid.id, amount: 1050, idempotencyKey: "e" }),
-        ["paymentIntents.retrieve"],
-        undefined,
+        ["paymentIntents.retrieve", "refunds.list"],
+        { what: "a refund", open: false },
       ],
       [
         () => adapter.refundPayment({ pspPaymentId: refunded.id, amount: 1050, idempotencyKey: "e2" }),
-        ["paymentIntents.retrieve"],
-        "a refund",
+        ["paymentIntents.retrieve", "refunds.list"],
+        { what: "a refund", open: true },
       ],
       [
         () => adapter.refundPayment({ pspPaymentId: open.id, amount: 1050, idempotencyKey: "e3" }),
-        ["paymentIntents.retrieve"],
-        "a refund",
+        ["paymentIntents.retrieve", "refunds.list"],
+        { what: "a refund", open: false },
       ],
       [
         () => adapter.chargeSavedPaymentMethod({ ...vault, amount: 1050, currency: "MGA", idempotencyKey: "f" }),
         [],
-        "a charge",
+        { what: "a charge", open: true },
       ],
       [
         () =>
           adapter.createNativeSubscription({ ...vault, amount: 1050, currency: "MGA", interval: "month", idempotencyKey: "g" }),
         [],
-        "a charge",
+        { what: "a subscription", open: true },
       ],
     ];
-    for (const [call, expected, sentBefore] of calls) {
+    for (const [call, expected, hint] of calls) {
       log.length = 0;
       const err = await rejectionOf(call());
       expect(err).toMatchObject({ code: "invalid_request", retryable: false, pspName: "stripe" });
       expect(err.message).toMatch(/^Stripe takes MGA amounts with 0 decimals where PayFanout has 2, so .* must be a multiple of 100 minor units, got 1050/);
       expect(err.raw).toMatchObject({ currency: "MGA", payfanoutExponent: 2, stripeExponent: 0, amount: 1050 });
-      expect(err.outcomeUnknown).toBe(sentBefore === undefined ? undefined : true);
-      expect(err.message).toMatch(
-        sentBefore === undefined
-          ? /, got 1050$/
-          : new RegExp(
-              `, got 1050\\. An earlier release sent such requests unconverted, so check the Stripe Dashboard for ${sentBefore} under this idempotency key before sending another$`,
-            ),
-      );
+      expect(err.outcomeUnknown).toBe(hint?.open === true ? true : undefined);
+      const check = `the Stripe Dashboard for ${hint?.what ?? ""} under this idempotency key before sending another`;
+      const tail =
+        hint === undefined
+          ? ", got 1050"
+          : hint.open
+            ? `, got 1050. An earlier release sent such requests unconverted, so check ${check}`
+            : `, got 1050. Check ${check}`;
+      expect(err.message.slice(-tail.length)).toBe(tail);
       expect(names(log)).toEqual(expected);
     }
   });
@@ -454,19 +458,20 @@ describe("UGX: refused, as Stripe documents it with two units", () => {
     const open = await stripeIntent(fake, 5000, "usd");
     const vault = vaulted(fake);
     const log = recordCalls(fake);
-    // A charge or subscription create an earlier release sent unconverted may already have charged.
-    const calls: Array<[() => Promise<unknown>, boolean]> = [
-      [() => adapter.createPaymentSession({ amount: 5000, currency: "UGX", idempotencyKey: "a" }), false],
+    // An update, charge or subscription create an earlier release sent unconverted may already have taken
+    // effect under the key; a session creation moves nothing and makes a new PaymentIntent.
+    const calls: Array<[() => Promise<unknown>, string | undefined]> = [
+      [() => adapter.createPaymentSession({ amount: 5000, currency: "UGX", idempotencyKey: "a" }), undefined],
       [
         () => adapter.updatePaymentSession({ pspSessionId: open.id, amount: 5000, currency: "ugx", idempotencyKey: "b" }),
-        false,
+        "an update",
       ],
-      [() => adapter.updatePaymentSession({ pspSessionId: open.id, currency: "UGX", idempotencyKey: "c" }), false],
-      [() => adapter.chargeSavedPaymentMethod({ ...vault, amount: 5000, currency: "UGX", idempotencyKey: "d" }), true],
+      [() => adapter.updatePaymentSession({ pspSessionId: open.id, currency: "UGX", idempotencyKey: "c" }), "an update"],
+      [() => adapter.chargeSavedPaymentMethod({ ...vault, amount: 5000, currency: "UGX", idempotencyKey: "d" }), "a charge"],
       [
         () =>
           adapter.createNativeSubscription({ ...vault, amount: 5000, currency: "UGX", interval: "month", idempotencyKey: "e" }),
-        true,
+        "a subscription",
       ],
       [
         () =>
@@ -478,17 +483,23 @@ describe("UGX: refused, as Stripe documents it with two units", () => {
             planId: fake.seedPrice({ currency: "ugx" }).id,
             idempotencyKey: "f",
           }),
-        true,
+        "a subscription",
       ],
     ];
+    const refused =
+      "The Stripe adapter refuses UGX: Stripe's currencies page lists UGX as a zero-decimal currency and also asks for " +
+      "UGX amounts as two-decimal values ending in 00, so the unit it reads them in is unknown. Take UGX payments with " +
+      "another provider";
     for (const [call, sentBefore] of calls) {
       const err = await rejectionOf(call());
       expect(err).toMatchObject({ code: "invalid_request", retryable: false, pspName: "stripe" });
-      expect(err.message).toMatch(
-        /^The Stripe adapter refuses UGX: Stripe's currencies page lists UGX as a zero-decimal currency and also asks for UGX amounts as two-decimal values ending in 00, so the unit it reads them in is unknown\. Take UGX payments with another provider/,
+      expect(err.message).toBe(
+        sentBefore === undefined
+          ? refused
+          : `${refused}. An earlier release sent such requests unconverted, so check the Stripe Dashboard for ` +
+              `${sentBefore} under this idempotency key before sending another`,
       );
-      expect(err.message.endsWith("before sending another")).toBe(sentBefore);
-      expect(err.outcomeUnknown).toBe(sentBefore ? true : undefined);
+      expect(err.outcomeUnknown).toBe(sentBefore === undefined ? undefined : true);
       expect(err.raw).toEqual({ currency: "UGX", payfanoutExponent: 0 });
     }
     expect(names(log)).toEqual([]);
@@ -509,15 +520,23 @@ describe("UGX: refused, as Stripe documents it with two units", () => {
     const UPDATE = "update: .*\\. Check the Stripe Dashboard for an update under this idempotency key, then cancel it and take the payment with another provider";
     const CAPTURE = "capture: .*\\. Check the Stripe Dashboard for a capture under this idempotency key before capturing it there";
     const REFUND = "refund: .*\\. Check the Stripe Dashboard for a refund under this idempotency key before refunding it there";
-    const calls: Array<[() => Promise<unknown>, StripePaymentIntentLike, string, boolean]> = [
-      [() => adapter.updatePaymentSession({ pspSessionId: open.id, amount: 6000, idempotencyKey: "a" }), open, UPDATE, true],
-      [() => adapter.capturePayment(authorized.id, 1000, "b"), authorized, CAPTURE, false],
-      [() => adapter.capturePayment(captured.id, 1000, "b2"), captured, CAPTURE, true],
-      [() => adapter.capturePayment(voided.id, 1000, "b3"), voided, CAPTURE, true],
-      [() => adapter.refundPayment({ pspPaymentId: paid.id, amount: 1000, idempotencyKey: "c" }), paid, REFUND, false],
-      [() => adapter.refundPayment({ pspPaymentId: refunded.id, amount: 1000, idempotencyKey: "c2" }), refunded, REFUND, true],
+    const READ = ["paymentIntents.retrieve"];
+    const LISTED = ["paymentIntents.retrieve", "refunds.list"];
+    const calls: Array<[() => Promise<unknown>, StripePaymentIntentLike, string, boolean, string[]]> = [
+      [() => adapter.updatePaymentSession({ pspSessionId: open.id, amount: 6000, idempotencyKey: "a" }), open, UPDATE, true, READ],
+      [() => adapter.capturePayment(authorized.id, 1000, "b"), authorized, CAPTURE, false, READ],
+      [() => adapter.capturePayment(captured.id, 1000, "b2"), captured, CAPTURE, true, READ],
+      [() => adapter.capturePayment(voided.id, 1000, "b3"), voided, CAPTURE, true, READ],
+      [() => adapter.refundPayment({ pspPaymentId: paid.id, amount: 1000, idempotencyKey: "c" }), paid, REFUND, false, LISTED],
+      [
+        () => adapter.refundPayment({ pspPaymentId: refunded.id, amount: 1000, idempotencyKey: "c2" }),
+        refunded,
+        REFUND,
+        true,
+        LISTED,
+      ],
     ];
-    for (const [call, pi, message, outcomeOpen] of calls) {
+    for (const [call, pi, message, outcomeOpen, requests] of calls) {
       log.length = 0;
       const err = await rejectionOf(call());
       expect(err).toMatchObject({ code: "invalid_request", retryable: false, pspName: "stripe" });
@@ -526,7 +545,7 @@ describe("UGX: refused, as Stripe documents it with two units", () => {
       expect(err.message.includes("unknown. An earlier release sent such requests unconverted. Check")).toBe(outcomeOpen);
       expect(err.message).not.toMatch(/(Capture|Refund) it in the Stripe Dashboard/);
       expect(err.raw).toEqual({ currency: "UGX", payfanoutExponent: 0, record: pi });
-      expect(names(log)).toEqual(["paymentIntents.retrieve"]);
+      expect(names(log)).toEqual(requests);
     }
   });
 
@@ -887,6 +906,108 @@ describe("same-key retries of a capture or refund that went through", () => {
   });
 });
 
+describe("a refused refund's outcome, read from the PaymentIntent's refund list", () => {
+  // An MGA amount that is not whole ariary, and any UGX amount, are refused after the PaymentIntent is read.
+  const cases: Array<[string, Array<StripeRefundLike["status"]>, boolean]> = [
+    ["no refund", [], false],
+    ["a failed refund", ["failed"], false],
+    ["a canceled refund", ["canceled"], false],
+    ["only failed and canceled refunds", ["failed", "canceled", "failed"], false],
+    ["a pending refund", ["pending"], true],
+    ["a refund requiring action", ["requires_action"], true],
+    ["a succeeded refund", ["succeeded"], true],
+    ["a refund without a status", [null], true],
+    ["a pending refund among failed ones", ["failed", "pending", "canceled"], true],
+  ];
+  for (const [label, statuses, open] of cases) {
+    it(`is ${open ? "left open" : "final"} with ${label}`, async () => {
+      const { adapter, fake } = makePair();
+      const intents: StripePaymentIntentLike[] = [];
+      for (const currency of ["mga", "ugx"]) {
+        const pi = await stripeIntent(fake, 1500, currency, "succeeded");
+        for (const status of statuses) fake.seedRefund({ status, amount: 100, currency, payment_intent: pi.id });
+        intents.push(pi);
+      }
+      const log = recordCalls(fake);
+      for (const pi of intents) {
+        log.length = 0;
+        const err = await rejectionOf(adapter.refundPayment({ pspPaymentId: pi.id, amount: 1050, idempotencyKey: `r-${pi.id}` }));
+        expect(err).toMatchObject({ code: "invalid_request", retryable: false });
+        expect(err.outcomeUnknown).toBe(open ? true : undefined);
+        expect(err.message).toMatch(/Check the Stripe Dashboard for a refund under this idempotency key before /i);
+        expect(names(log)).toEqual(["paymentIntents.retrieve", "refunds.list"]);
+        expect(log[1]!.args).toEqual([{ payment_intent: pi.id, limit: 100 }]);
+        expect(fake.uniqueRefundCreations).toBe(0);
+      }
+    });
+  }
+
+  it("is left open when the list has another page, whatever the first one holds", async () => {
+    const { adapter, fake } = makePair();
+    const pi = await stripeIntent(fake, 1500, "mga", "succeeded");
+    for (let i = 0; i < 101; i += 1) fake.seedRefund({ status: "failed", amount: 1, currency: "mga", payment_intent: pi.id });
+    const err = await rejectionOf(adapter.refundPayment({ pspPaymentId: pi.id, amount: 1050, idempotencyKey: "r" }));
+    expect(err.outcomeUnknown).toBe(true);
+  });
+
+  it("is left open when the list cannot be read", async () => {
+    const { adapter, fake } = makePair();
+    const pi = await stripeIntent(fake, 1500, "mga", "succeeded");
+    fake.refunds.list = async () => {
+      throw stripeError({ type: "StripeAPIError", statusCode: 500, message: "boom" });
+    };
+    const log = recordCalls(fake);
+    const err = await rejectionOf(adapter.refundPayment({ pspPaymentId: pi.id, amount: 1050, idempotencyKey: "r" }));
+    expect(names(log)).toEqual(["paymentIntents.retrieve", "refunds.list"]);
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false, outcomeUnknown: true });
+    expect(err.message).toMatch(/An earlier release sent such requests unconverted, so check the Stripe Dashboard for a refund/);
+  });
+
+  it("lists nothing for a refund that is sent, or refused for another reason", async () => {
+    const { adapter, fake } = makePair();
+    const mga = await stripeIntent(fake, 1500, "mga", "succeeded");
+    const isk = await stripeIntent(fake, 100_000, "isk", "succeeded");
+    const log = recordCalls(fake);
+    await adapter.refundPayment({ pspPaymentId: mga.id, amount: 1000, idempotencyKey: "a" });
+    expect(names(log)).toEqual(["paymentIntents.retrieve", "refunds.create"]);
+    log.length = 0;
+    const overflow = await rejectionOf(
+      adapter.refundPayment({ pspPaymentId: isk.id, amount: 90_071_992_547_410, idempotencyKey: "b" }),
+    );
+    expect(overflow.message).toMatch(/leaves the safe integer range/);
+    expect(overflow.outcomeUnknown).toBeUndefined();
+    expect(names(log)).toEqual(["paymentIntents.retrieve"]);
+  });
+});
+
+describe("the test double keeps Stripe's idempotency on every keyed write", () => {
+  it("refuses a reused key when a create's parameters differ", async () => {
+    const { adapter } = makePair();
+    await adapter.createPaymentSession({ amount: 1000, currency: "USD", idempotencyKey: "k" });
+    const err = await rejectionOf(adapter.createPaymentSession({ amount: 2000, currency: "USD", idempotencyKey: "k" }));
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false, outcomeUnknown: true });
+  });
+
+  it("answers a same-key retry of a request that failed with the saved error, creating nothing more", async () => {
+    const { adapter, fake } = makePair();
+    const customer = fake.seedCustomer();
+    const pm = fake.seedPaymentMethod(customer.id, { behavior: "declined" });
+    const input = {
+      pspCustomerId: customer.id,
+      savedPaymentMethodToken: pm.id,
+      amount: 1000,
+      currency: "USD",
+      idempotencyKey: "c",
+    };
+    const first = await rejectionOf(adapter.chargeSavedPaymentMethod(input));
+    expect(first).toMatchObject({ code: "insufficient_funds" });
+    const created = fake.uniquePaymentIntentCreations;
+    const again = await rejectionOf(adapter.chargeSavedPaymentMethod(input));
+    expect(again).toMatchObject({ code: "insufficient_funds", message: first.message });
+    expect(fake.uniquePaymentIntentCreations).toBe(created);
+  });
+});
+
 describe("three-decimal amounts: the multiple-of-10 rule stays where it ran before", () => {
   it("refuses a KWD amount that is not a multiple of 10 on creation, a named update, charges and subscriptions", async () => {
     const { adapter, fake } = makePair();
@@ -967,10 +1088,16 @@ describe("amounts in no known currency pass unchanged", () => {
   it("sends an amount unchanged for a PaymentIntent whose currency is no currency code", async () => {
     const { adapter, fake } = makePair();
     const odd = await stripeIntent(fake, 1000, "", "authorized");
+    const paid = await stripeIntent(fake, 1000, "", "succeeded");
     const log = recordCalls(fake);
     const captured = await adapter.capturePayment(odd.id, 400, "k");
     expect(log[1]!.args[1]).toEqual({ amount_to_capture: 400 });
     expect(captured.amount).toBe(400);
+    log.length = 0;
+    const refunded = await adapter.refundPayment({ pspPaymentId: paid.id, amount: 300, idempotencyKey: "r" });
+    expect(names(log)).toEqual(["paymentIntents.retrieve", "refunds.create"]);
+    expect(log[1]!.args[0]).toEqual({ payment_intent: paid.id, amount: 300 });
+    expect(refunded.amount).toBe(300);
   });
 
   it("reports a listed PaymentIntent without the optional amounts Stripe left off", async () => {

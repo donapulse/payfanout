@@ -50,7 +50,7 @@ Provider support is uneven, so there is no single "supports subscriptions" flag 
 | --- | --- | --- | --- | --- | --- |
 | Stripe | yes | yes | yes | yes | Billing Subscriptions API; list returns Stripe's default (not-canceled) set |
 | Paysafe | yes | yes | yes | yes | Payment Scheduler; bills a multi-use payment handle; day/month/year cadences only |
-| GoCardless | yes | yes | yes | yes | bills a bank-debit mandate; week/month/year cadences only; see the cancel caveat below |
+| GoCardless | yes | yes | yes | yes | bills a bank-debit mandate; week/month/year cadences only, charging at least once a year; see the cancel caveat below |
 | PayPal | yes | yes | no | yes | creation needs buyer approval in the PayPal UI — a server-only create would fake support; a list page costs one call per returned item to resolve amounts |
 | PayZen | no | yes | yes | yes | no list API: retain `subscriptionId` **and** `paymentMethodToken`, they are a composite key |
 | Worldline | no | no | no | no | no native engine — recurring is card-on-file; use the vault + `SubscriptionManager` |

@@ -155,6 +155,12 @@ export class FakePaysafeApi {
   authFailure = false;
   networkFailure = false;
   /**
+   * Refunds of card payments filed and answered as Paysafe's one card refund
+   * example shows them (POST /settlements/{settlementId}/refunds, "Card"):
+   * with no currencyCode, which the refunds schema does not require.
+   */
+  cardRefundsWithoutCurrency = false;
+  /**
    * Settlements and refunds: run the state check (remaining authorization,
    * remaining settlement) before the merchantRefNum check, the other
    * undocumented order. Default: 5031 first.
@@ -907,13 +913,14 @@ export class FakePaysafeApi {
           return stateRejection("3402", "The requested Refund amount exceeds the remaining Settlement amount.");
         }
         if (reused) return duplicateRefNum();
+        const withoutCurrency = this.cardRefundsWithoutCurrency && payment.paymentType === "CARD";
         if (this.activeFailure) {
           const failed = {
             id: `ref_${++this.seq}`,
             merchantRefNum: refNum,
             ...failedRecord(this.activeFailure, this.stamp("10:00:00")),
             amount,
-            currencyCode: payment.currencyCode,
+            ...(withoutCurrency ? {} : { currencyCode: payment.currencyCode }),
           };
           this.file(this.refundsByRef, refNum, failed);
           return json(this.activeFailure.status, { error: failed.error });
@@ -925,7 +932,7 @@ export class FakePaysafeApi {
           merchantRefNum: refNum,
           status: "COMPLETED",
           amount,
-          currencyCode: payment.currencyCode,
+          ...(withoutCurrency ? {} : { currencyCode: payment.currencyCode }),
           txnTime: this.stamp("10:10:00"),
         };
         this.file(this.refundsByRef, refNum, refund);

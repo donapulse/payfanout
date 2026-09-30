@@ -115,6 +115,100 @@ everything completion needs, signed. Interac e-Transfer is the exception: Paysaf
 tokenize it, so the handle is minted server-side at session creation (§8).
 :::
 
+### Currencies the adapter refuses
+
+PayFanout amounts are in the minor units `getCurrencyExponent` from `@payfanout/core` gives
+each currency, which follow ISO 4217 (JPY 0, BHD 3), and the adapter sends them to Paysafe
+unchanged. Paysafe reads `amount` in the minor units of its own
+[currency table](https://developer.paysafe.com/en/support/reference-information/codes/#currency-codes),
+which lists "the currencies ... in which transaction requests are processed". The adapter
+refuses a currency when that table gives it another exponent than PayFanout, or when the
+table has no row for it and PayFanout does not price it in hundredths, since Paysafe's
+exponent for it is then unknown:
+
+| Currency | Paysafe's exponent | PayFanout's exponent |
+| --- | --- | --- |
+| CLP | 2 | 0 |
+| BYR | 0 | 2: ISO 4217 withdrew BYR in 2017, and PayFanout reads a code it does not list with 2 |
+| ISK | none: the table has no row for ISK, which the card payments page lists as a processing currency | 0 |
+| BIF, DJF, GNF, KMF, UGX, UYI, VUV, XAF, XOF, XPF | none: the table has no row | 0 |
+| IQD | none: the table has no row | 3 |
+| CLF, UYW | none: the table has no row | 4 |
+
+Sent unchanged, CLP 10,000 (`amount: 10000`) would be charged as CLP 100.00. Nor does the
+adapter convert: no sandbox run has confirmed Paysafe's table, and a conversion built on a
+wrong entry would charge a hundred times too much. The rule reads `getCurrencyExponent`, so
+it follows PayFanout's exponents if they change.
+
+A currency the table does not list and that is priced in hundredths is sent unchanged: the
+table is not exhaustive (the card payments page lists processing currencies "and many
+more"), and Paysafe asks merchants "to verify the right exponent is applied to the
+currencies" before going live. Confirm such a currency's exponent with your Paysafe account
+manager before you take it (§13).
+
+In the refused currencies:
+
+- `createPaymentSession` and `updatePaymentSession` reject with a non-retryable
+  `invalid_request` before calling Paysafe.
+- `chargeSavedPaymentMethod`, `createNativeSubscription`, and `completePayment` for a session
+  an earlier release signed in one, first look their key up (a read, which moves no money),
+  since an earlier release sent such calls, then reject with a non-retryable
+  `invalid_request`. The refusal is marked `outcomeUnknown` when Paysafe holds a payment
+  under the key that may have moved money (or a spent bank-debit handle whose payment it
+  does not show yet), or a subscription, or when the lookup fails: check the Paysafe portal
+  before charging the customer elsewhere. Otherwise it is final.
+- `capturePayment`, `cancelPayment` and `refundPayment` on a payment Paysafe holds in one (made
+  by an earlier release, or by another integration on the account) read the payment, then
+  reject before any settlement, void or refund request. A capture or refund that states an
+  amount rejects with `invalid_request`, as that amount is in PayFanout's minor units. A
+  void, and a capture or refund with no amount, reject with `unsupported_operation`: they
+  send Paysafe's own amounts, or none, but answer with amounts that cannot be reported in
+  PayFanout's minor units. Capture, void or refund such a payment in the Paysafe portal.
+- `retrievePayment` and `retrieveNativeSubscription` reject with `unsupported_operation`,
+  since the amounts cannot be reported in PayFanout's minor units: read them in the Paysafe
+  portal. So does `retrieveRefund` for a refund Paysafe reports in one. Paysafe does not
+  promise a `currencyCode` on a refund or a settlement (its card examples carry none), and a
+  refund names no payment, so a refund that states no currency is reported as it comes, with
+  Paysafe's amount.
+- `cancelNativeSubscription` rejects a subscription in one with `unsupported_operation`
+  before cancelling it, even one already stopped, whose cancel would otherwise succeed.
+- `listNativeSubscriptions` fails a page holding one with `unsupported_operation`.
+  `raw.records` names each such subscription, and `raw.nextCursor` carries the cursor the
+  page would have had, so later pages stay reachable; a `limit` of 1 steps past each one.
+  The scheduler lists cancelled subscriptions too.
+- Webhook events Paysafe reports in one carry no `amount`; `currency` and every other field
+  stay. An event that states no currency keeps its `amount` as delivered.
+
+To learn a subscription's currency, `cancelNativeSubscription` now reads the subscription
+before cancelling it, whatever the currency: one more request on every cancel, and a read
+that fails fails the cancel before anything is sent.
+
+Before upgrading from a release that sent these currencies to Paysafe:
+
+- `SubscriptionManager` renewals on Paysafe in these currencies now fail with
+  `invalid_request`, a definitive failure, so they would run dunning to cancellation: move
+  those subscriptions to another provider first. A renewal an earlier release sent whose
+  answer was lost is the exception when Paysafe shows a payment under its key: the retry's
+  refusal leaves the outcome open, the engine keeps replaying the same key until it
+  freezes the renewal, and you settle it from the Paysafe portal with
+  `resolvePendingRenewal`. An earlier attempt still in flight, or older than the lookup's
+  30-day window, can go unseen, and its retry's refusal is final.
+- A subscription list page holding a subscription in one of them fails whole, the other
+  subscriptions on it included: step past it with a `limit` of 1, as above.
+- The currencies the table does not list are refused as a precaution, since their exponent
+  at Paysafe is undocumented: traffic in them that Paysafe priced correctly until now stops
+  too, and the adapter has no option to allow them.
+- Native subscriptions created in them keep billing at Paysafe's exponent (a CLP 10,000 plan
+  bills CLP 100.00 every cycle), and the adapter can no longer read, list or cancel them:
+  cancel them in the Paysafe portal and re-create them elsewhere.
+
+The adapter declares no `supportedCurrencies`, because Paysafe's table does not list every
+currency it processes, so the router cannot skip Paysafe for these currencies on its own, and
+a Paysafe candidate that refuses one ends the cascade. Route the ones you take to another
+provider with a rule of their own, placed before any rule that can send them to Paysafe,
+since the first matching rule wins: `{ when: { currency: ["CLP", "ISK"] }, use: ["<psp>"] }`
+([routing and failover](/guide/server#routing-failover)).
+
 ## 5. Wire the client adapter
 
 ```tsx
@@ -671,6 +765,12 @@ your Paysafe portal** rather than assuming.
 - [ ] Set `environment: "live"` on **both** adapters (host flips to `api.paysafe.com`).
 - [ ] Confirm your **live** merchant account ids per currency/country and that
       `merchantAccountResolver` returns them.
+- [ ] Route the currencies the adapter refuses to another provider, with a routing rule
+      placed before any rule that can send them to Paysafe (§4, "Currencies the adapter
+      refuses").
+- [ ] For each currency you take that Paysafe's currency table does not list, confirm with
+      your Paysafe account manager that Paysafe applies the exponent 2 to it: the adapter
+      sends its amounts unchanged, in hundredths.
 - [ ] Register the **live** notification endpoint in the portal and use its **live** HMAC
       key.
 - [ ] Keep `PAYSAFE_SESSION_KEY` stable and secret in production, rotate it deliberately

@@ -10,6 +10,7 @@ import {
   type UnifiedWebhookEvent,
   type UnifiedWebhookEventType,
 } from "@payfanout/core";
+import { currencyRefusal } from "./currency-exponents.js";
 
 /**
  * Paysafe webhook signature: base64(HMAC_SHA256(hmacKey, rawJsonBody)) carried
@@ -114,6 +115,12 @@ type JsonObject = Record<string, unknown>;
  * - handle, settlement and every other resource leave it unset (correlate those
  *   by the payload `merchantRefNum` on `raw`).
  *
+ * `amount` is left out when the payload's currency is one the adapter refuses
+ * (see PaysafeServerAdapter), whose Paysafe minor units may not be
+ * PayFanout's; `currency` and every other field are reported as for any
+ * currency. A payload that states no currency, as Paysafe does not promise one
+ * on card refunds, keeps its `amount` as delivered.
+ *
  * `id` survives Paysafe's redeliveries. Paysafe sends no event id and repeats a
  * notification with the next `attemptNumber` ("1", "2", "3"), so a hash of the
  * raw bytes would give every attempt its own id. The id is `paysafe_` + the
@@ -178,7 +185,10 @@ export async function parsePaysafeWebhookEvent(rawBody: string): Promise<Unified
     pspName: "paysafe",
     type: mapEventType(name),
     ...(pspPaymentId !== undefined ? { pspPaymentId } : {}),
-    ...(typeof amount === "number" && Number.isSafeInteger(amount) ? { amount } : {}),
+    // An amount in a currency the adapter refuses is not in PayFanout's minor units.
+    ...(typeof amount === "number" && Number.isSafeInteger(amount) && currencyRefusal(currency) === undefined
+      ? { amount }
+      : {}),
     ...(typeof currency === "string" && currency !== "" ? { currency: currency.toUpperCase() } : {}),
     ...(resource === "refund" && resourceId !== undefined ? { refundId: resourceId } : {}),
     occurredAt: normalizeTime(asText(body.txnTime) ?? eventDate ?? asText(payload?.txnTime)),

@@ -441,16 +441,21 @@ describe("Paysafe native subscriptions: cancel (verified-idempotent)", () => {
 
   it("sends exactly { status: CANCELLED } — never the reversible SUSPENDED", async () => {
     const { adapter, requests } = scripted([
+      () => json(200, { id: "sub_1", status: "ACTIVE", plan: { amount: 100, currencyCode: "USD" } }),
       () => json(200, { id: "sub_1", status: "CANCELLED", plan: { amount: 100, currencyCode: "USD" } }),
     ]);
     await adapter.cancelNativeSubscription({ subscriptionId: "sub_1", idempotencyKey: "k" });
-    expect(requests[0]!.method).toBe("PATCH");
-    expect(requests[0]!.url).toContain("/subscriptionsplans/v1/subscriptions/sub_1");
-    expect(requests[0]!.body).toEqual({ status: "CANCELLED" });
+    // The subscription's currency is read first (see paysafe-currencies.test.ts).
+    expect(requests[0]!.method).toBe("GET");
+    expect(requests[0]!.url).toContain("fields=plan,customerProfile,paymentsInformation");
+    expect(requests[1]!.method).toBe("PATCH");
+    expect(requests[1]!.url).toContain("/subscriptionsplans/v1/subscriptions/sub_1");
+    expect(requests[1]!.body).toEqual({ status: "CANCELLED" });
   });
 
   it("rethrows the PATCH rejection when the re-fetch shows a non-terminal subscription", async () => {
     const { adapter } = scripted([
+      () => json(200, { id: "sub_1", status: "ACTIVE", plan: { amount: 100, currencyCode: "USD" } }),
       () => json(400, { error: { code: "5068", message: "Field error(s)" } }),
       () => json(200, { id: "sub_1", status: "ACTIVE", plan: { amount: 100, currencyCode: "USD" } }),
     ]);
@@ -468,6 +473,7 @@ describe("Paysafe native subscriptions: cancel (verified-idempotent)", () => {
 
   it("rethrows the PATCH rejection when the verification re-fetch itself fails", async () => {
     const { adapter } = scripted([
+      () => json(200, { id: "sub_1", status: "ACTIVE", plan: { amount: 100, currencyCode: "USD" } }),
       () => json(503, { error: { code: "1000", message: "down" } }),
       () => json(404, { error: { code: "5269", message: "No such subscription" } }),
     ]);
@@ -481,6 +487,27 @@ describe("Paysafe native subscriptions: cancel (verified-idempotent)", () => {
     await expect(
       adapter.cancelNativeSubscription({ subscriptionId: "", idempotencyKey: "k" }),
     ).rejects.toMatchObject({ code: "invalid_request" });
+  });
+
+  it("fails the cancel before any PATCH when the read before it fails, as that read's own error", async () => {
+    const answers: Array<[() => Response, string]> = [
+      [() => json(503, { error: { code: "1000", message: "down" } }), "psp_unavailable"],
+      [() => json(404, { error: { code: "5269", message: "No such subscription" } }), "invalid_request"],
+    ];
+    for (const [answer, code] of answers) {
+      const read = scripted([answer]);
+      const readError = await read.adapter.retrieveNativeSubscription({ subscriptionId: "sub_1" }).catch((e: unknown) => e);
+      const { adapter, requests } = scripted([answer]);
+      const cancelError = await adapter
+        .cancelNativeSubscription({ subscriptionId: "sub_1", idempotencyKey: "k" })
+        .catch((e: unknown) => e);
+      expect(isPayFanoutError(cancelError) && isPayFanoutError(readError)).toBe(true);
+      if (isPayFanoutError(cancelError) && isPayFanoutError(readError)) {
+        expect(readError.code).toBe(code);
+        expect(cancelError).toMatchObject({ code: readError.code, retryable: readError.retryable, raw: readError.raw });
+      }
+      expect(requests.map((r) => r.method)).toEqual(["GET"]);
+    }
   });
 });
 

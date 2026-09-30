@@ -774,6 +774,20 @@ describe("PayZenClientAdapter error mapping", () => {
       [{ errorCode: "AUTH_103" }, "invalid_request", false],
       [{ errorCode: "AUTH_150" }, "processing_error", false], // a code the page does not list
       [{ errorCode: "AUTH_102", detailedErrorCode: "51" }, "invalid_request", false], // never an acquirer code
+      // PSP_ codes read through the server's map: a refusal is never retryable,
+      // an outage or a rate limit always is.
+      [{ errorCode: "PSP_539", detailedErrorCode: "39" }, "authentication_required", false],
+      [{ errorCode: "PSP_707", detailedErrorCode: "207" }, "card_declined", false],
+      [{ errorCode: "PSP_708", detailedErrorCode: "208" }, "processing_error", false],
+      [{ errorCode: "PSP_055" }, "invalid_request", false],
+      [{ errorCode: "PSP_999" }, "psp_unavailable", true],
+      [{ errorCode: "PSP_996" }, "psp_unavailable", true],
+      [{ errorCode: "PSP_594" }, "psp_unavailable", true],
+      [{ errorCode: "PSP_106" }, "rate_limited", true],
+      [{ errorCode: "PSP_641" }, "fraud_suspected", false],
+      [{ errorCode: "PSP_722" }, "authentication_required", false],
+      [{ errorCode: "PSP_539", detailedErrorCode: "51" }, "authentication_required", false], // never an acquirer code
+      [{ errorCode: "PSP_777" }, "processing_error", false], // a code the map does not list
       [{ errorCode: "SOMETHING_ELSE" }, "processing_error", true], // shopper may safely retry
       [{}, "processing_error", true],
     ];
@@ -803,6 +817,48 @@ describe("PayZenClientAdapter error mapping", () => {
         clientAnswer: { orderStatus: "UNPAID", transactions: [{ uuid: "u1", errorCode }] },
       });
       expect((await pending).error, errorCode).toMatchObject({ code, retryable: false });
+    }
+  });
+
+  it("refines UNPAID declines from PSP_-family transaction errors as the server reads them", async () => {
+    // PayZen's 3-D Secure use cases: a failed, abandoned or timed-out challenge
+    // (PSP_539/39), an issuer's refusal (PSP_707/207), an authentication the
+    // issuer could not run (PSP_708/208). The detail is PayZen's own, so 39,
+    // 51 or 207 never reads as an acquirer code.
+    const cases: Array<[string, string | undefined, string]> = [
+      ["PSP_539", "39", "authentication_required"],
+      ["PSP_707", "207", "card_declined"],
+      ["PSP_708", "208", "processing_error"],
+      ["PSP_052", undefined, "processing_error"],
+      ["PSP_053", undefined, "processing_error"],
+      ["PSP_054", undefined, "invalid_request"],
+      ["PSP_055", undefined, "invalid_request"],
+      ["PSP_042", "51", "insufficient_funds"],
+      ["PSP_539", "51", "authentication_required"],
+      // Refusals the page documents read as refusals, never as a retryable
+      // processing error: a declined card, a risk decision, a failed OTP.
+      ["PSP_003", undefined, "card_declined"],
+      ["PSP_625", undefined, "card_declined"],
+      ["PSP_572", undefined, "card_declined"],
+      ["PSP_601", undefined, "card_declined"],
+      ["PSP_647", undefined, "fraud_suspected"],
+      ["PSP_717", undefined, "authentication_required"],
+      ["PSP_777", "51", "processing_error"], // a code the map does not list
+    ];
+    for (const [errorCode, detailedErrorCode, code] of cases) {
+      stubBrowser();
+      const fake = makeFakeKr();
+      const { adapter } = makeAdapter(fake);
+      const handle = await adapter.mount(fakeContainer(), { clientSecret: FORM_TOKEN });
+      const pending = adapter.confirm(handle);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      fake.submitCb?.({
+        clientAnswer: { orderStatus: "UNPAID", transactions: [{ uuid: "u1", errorCode, detailedErrorCode }] },
+      });
+      expect((await pending).error, `${errorCode}/${String(detailedErrorCode)}`).toMatchObject({
+        code,
+        retryable: false,
+      });
     }
   });
 

@@ -1507,7 +1507,28 @@ function ownCodeFor(map: Record<string, UnifiedErrorCode>, key: string | null | 
   return typeof key === "string" && Object.hasOwn(map, key) ? map[key] : undefined;
 }
 
+/**
+ * PSP_ codes → the taxonomy. A failed cardholder authentication is
+ * authentication_required and a 3-D Secure that could not complete a
+ * processing_error, as in the other adapters; PSP_052 to PSP_055 describe what
+ * AUTH_100 to AUTH_103 do and read the same way. The browser adapter holds the
+ * same map.
+ */
 const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
+  // Refusals another card may overcome.
+  PSP_003: "card_declined", // payment refused
+  PSP_091: "card_declined", // payment method refused
+  PSP_575: "card_declined", // rejected by PayPal
+  PSP_611: "card_declined", // refused without a liability shift
+  PSP_624: "card_declined", // inactive card
+  PSP_625: "card_declined", // refused by the acquirer
+  PSP_636: "card_declined", // derivative refused: no liability shift on the primary
+  PSP_534: "card_declined", // failed a verification the card requires every time
+  PSP_535: "card_declined", // failed e-Carte Bleue verification
+  PSP_572: "card_declined", // authorization declined by Cofinoga
+  PSP_573: "card_declined", // 1-euro authorization refused
+  PSP_600: "card_declined", // failed commercial card verification
+  PSP_601: "card_declined", // declined: the first installment was refused
   PSP_042: "insufficient_funds",
   PSP_202: "expired_card",
   PSP_508: "expired_card",
@@ -1524,16 +1545,34 @@ const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
   PSP_531: "invalid_card_data",
   PSP_532: "invalid_card_data",
   PSP_533: "invalid_card_data",
-  PSP_136: "authentication_required",
-  PSP_539: "authentication_required",
+  PSP_136: "authentication_required", // 3-D Secure session expired
+  PSP_539: "authentication_required", // challenge failed, abandoned or timed out
+  PSP_649: "authentication_required", // 3-D Secure left unfinished at the ACS
+  PSP_716: "authentication_required", // OTP expired
+  PSP_717: "authentication_required", // invalid OTP
+  PSP_722: "authentication_required", // authentication canceled
+  PSP_707: "card_declined", // the issuer refused the authentication
+  PSP_708: "processing_error", // the issuer could not authenticate
+  PSP_052: "processing_error", // invalid ACS signature (AUTH_100)
+  PSP_053: "processing_error", // 3DS technical error (AUTH_101)
+  PSP_054: "invalid_request", // incorrect 3DS parameter (AUTH_102)
+  PSP_055: "invalid_request", // 3DS disabled (AUTH_103)
+  PSP_718: "invalid_request", // invalid authentication settings
   PSP_203: "fraud_suspected",
   PSP_204: "fraud_suspected",
   PSP_205: "fraud_suspected",
   PSP_536: "fraud_suspected",
+  PSP_641: "fraud_suspected", // declined by the risk analyzer
+  PSP_647: "fraud_suspected", // declined at the risk module's request
   // HTTP-200 rate limiting — the envelope is the only signal.
   PSP_099: "rate_limited",
   PSP_106: "rate_limited",
+  // "Technical error.", "A technical error has occurred." and "Due to a
+  // technical problem, we are unable to process your request.", every code
+  // the page gives one of these texts.
+  PSP_996: "psp_unavailable",
   PSP_999: "psp_unavailable",
+  PSP_594: "psp_unavailable",
   PSP_513: "psp_unavailable",
   PSP_514: "psp_unavailable",
   PSP_515: "psp_unavailable",
@@ -1542,6 +1581,17 @@ const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
   PSP_538: "psp_unavailable",
   PSP_540: "psp_unavailable",
   PSP_541: "psp_unavailable",
+  PSP_555: "psp_unavailable",
+  PSP_569: "psp_unavailable",
+  PSP_577: "psp_unavailable",
+  PSP_585: "psp_unavailable",
+  PSP_587: "psp_unavailable",
+  PSP_608: "psp_unavailable",
+  PSP_643: "psp_unavailable",
+  PSP_648: "psp_unavailable",
+  PSP_650: "psp_unavailable",
+  PSP_652: "psp_unavailable",
+  PSP_658: "psp_unavailable",
   PSP_010: "invalid_request", // transaction not found
   PSP_015: "invalid_request", // too many results (Order/Get > 30 transactions)
   // Token / subscription lookups and state rejections.
@@ -1595,7 +1645,7 @@ export function mapPayZenError(answer: PayZenErrorAnswerLike | undefined, raw: u
   } else if (errorCode.startsWith("INT_") || errorCode.startsWith("CLIENT_")) {
     code = "invalid_request";
   } else if (errorCode.startsWith("PSP_")) {
-    code = PAYZEN_PSP_CODE_MAP[errorCode] ?? "processing_error";
+    code = ownCodeFor(PAYZEN_PSP_CODE_MAP, errorCode) ?? "processing_error";
   } else {
     code = "processing_error";
   }

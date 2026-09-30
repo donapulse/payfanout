@@ -5768,9 +5768,10 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   create it in another currency, since the SetupIntent is the same in any. Leaving UGX
   undeclared to keep that label was rejected: every UGX payment would still end the cascade on
   a Stripe candidate. A host `paymentMethods` override with a rail whose `currencies` are UGX
-  alone now fails registration, as a rail that can never be routed. `@payfanout/adapter-stripe-server`
-  takes a patch; the router skips Stripe for UGX from the `@payfanout/server` release that reads
-  the field.
+  alone now fails registration, as a rail that can never be routed.
+  `@payfanout/adapter-stripe-server` takes a patch; the router skips Stripe for UGX, and
+  `PaymentService` refuses a UGX session for it, from the `@payfanout/server` release that
+  reads the field.
 - **Paysafe declares the currencies its rule refuses**, today BIF, BYR, CLF, CLP, DJF, GNF,
   IQD, ISK, KMF, UGX, UYI, UYW, VUV, XAF, XOF and XPF. `refusedCurrencies()` in
   `src/currency-exponents.ts` puts `currencyRefusal` itself to every code of Paysafe's table
@@ -5783,7 +5784,7 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   are all declared unsupported now fails registration. `@payfanout/adapter-paysafe-server`
   takes a patch.
 - **Adyen declares CLP, CVE, IDR and ISK**, the keys of the map its refusal reads. Re-read
-  2026-09-30 at docs.adyen.com/development-resources/currency-codes: of the table's 169 rows,
+  2026-09-30 at docs.adyen.com/development-resources/currency-codes: of the table's 138 rows,
   those four alone are marked "differs from standard" (CLP 2, CVE 0, IDR 0, ISK 2), under the
   note "For CLP, CVE, IDR, and ISK the ISO 4217 standard has a different number of decimals than
   shown in our currency codes table. When submitting amounts in minor units, the decimals in the

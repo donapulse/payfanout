@@ -79,6 +79,15 @@ function bareCardToken(paymentMethod: Record<string, string> = {}): string {
   return JSON.stringify({ ...CARD, ...paymentMethod });
 }
 
+/** A currency refusal: an invalid_request naming the currency on raw. */
+function isCurrencyRefusal(outcome: unknown, currency: string): boolean {
+  return (
+    isPayFanoutError(outcome) &&
+    outcome.code === "invalid_request" &&
+    (outcome.raw as { currency?: unknown } | undefined)?.currency === currency
+  );
+}
+
 function makePair(config: Partial<AdyenServerAdapterConfig> = {}): {
   adapter: AdyenServerAdapter;
   fake: FakeAdyenApi;
@@ -653,22 +662,30 @@ describe("AdyenServerAdapter specifics", () => {
     expect(refused.code).toBe("card_declined");
   });
 
-  it("omits a webhook amount priced on a deviating exponent", async () => {
+  it("omits a webhook amount priced on a deviating exponent, for every currency it declares", async () => {
     const { adapter } = makePair();
-    const item = signed({
-      amount: { currency: "ISK", value: 1000 },
-      eventCode: "AUTHORISATION",
-      eventDate: "2026-08-02T10:00:00+02:00",
-      merchantAccountCode: "TestMerchant",
-      merchantReference: "outside-payfanout",
-      pspReference: "8836100000000099",
-      success: "true",
-    });
-    const event = await adapter.parseWebhookEvent(envelope(item));
+    const item = (currency: string) =>
+      signed({
+        amount: { currency, value: 1000 },
+        eventCode: "AUTHORISATION",
+        eventDate: "2026-08-02T10:00:00+02:00",
+        merchantAccountCode: "TestMerchant",
+        merchantReference: "outside-payfanout",
+        pspReference: "8836100000000099",
+        success: "true",
+      });
     // ISK is 0-decimal in ISO 4217 and 2-decimal at Adyen; reporting the raw
-    // value would be off by a factor of 100.
-    expect(event.amount).toBeUndefined();
-    expect(event.currency).toBe("ISK");
+    // value would be off by a factor of 100. The webhook reads the same map as
+    // the declaration, so each declared currency omits its amount.
+    const declared = adapter.getCapabilities().unsupportedCurrencies ?? [];
+    expect(declared).toEqual(["CLP", "CVE", "IDR", "ISK"]);
+    for (const currency of declared) {
+      const event = await adapter.parseWebhookEvent(envelope(item(currency)));
+      expect(event.amount, currency).toBeUndefined();
+      expect(event.currency).toBe(currency);
+    }
+    const usd = await adapter.parseWebhookEvent(envelope(item("USD")));
+    expect(usd.amount).toBe(1000);
   });
 
   it("maps refusal reason codes onto the taxonomy and never marks them retryable", async () => {
@@ -853,7 +870,8 @@ describe("AdyenServerAdapter specifics", () => {
       const outcome = await adapter
         .createPaymentSession({ amount: 1000, currency, idempotencyKey: `k-${currency}` })
         .catch((err: unknown) => err);
-      if (isPayFanoutError(outcome)) refused.push(currency);
+      // Counted only as the currency refusal itself, never another error.
+      if (isCurrencyRefusal(outcome, currency)) refused.push(currency);
     }
     expect(refused.sort()).toEqual(caps.unsupportedCurrencies);
     for (const currency of caps.unsupportedCurrencies ?? []) {

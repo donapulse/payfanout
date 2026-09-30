@@ -51,7 +51,7 @@ import {
   assertSendableCurrency,
   assertUsableRecord,
   currencyRefusal,
-  refusedCurrencies,
+  REFUSED_CURRENCIES,
   sendRefusal,
 } from "./currency-exponents.js";
 import {
@@ -1261,7 +1261,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       pspName: this.pspName,
       // Refused on every session, whatever the amount (currency-exponents.ts);
       // declared so the router skips Paysafe instead of ending its cascade there.
-      unsupportedCurrencies: refusedCurrencies(),
+      unsupportedCurrencies: [...REFUSED_CURRENCIES],
       supportsPaymentRetrieval: true, // GET /paymenthub/v1/payments/{id}
       supportsRefunds: true,
       supportsPartialRefunds: true,

@@ -343,8 +343,11 @@ Nothing in your PayFanout code changes except credentials and one string:
 - [ ] Switch the Dashboard to **live mode** and swap in the **live** keys (`sk_live_…`,
       `pk_live_…`) via your production secrets.
 - [ ] Set `environment: "live"` on **both** the server and client adapters.
-- [ ] If you take UGX, route it to another provider with a routing rule placed before any
-      rule that can send it to Stripe (§4, "Currencies with Stripe-specific units").
+- [ ] If you take UGX, give it a routing chain that names another provider: the router
+      skips Stripe for it from the `@payfanout/server` release that reads
+      `unsupportedCurrencies` (§4, "Currencies with Stripe-specific units"). With an older
+      server, place a rule that sends UGX elsewhere before any rule that can send it to
+      Stripe.
 - [ ] Add a **live** webhook endpoint in the Dashboard and use its **new** `whsec_…` signing
       secret (test and live endpoints have different secrets).
 - [ ] Set a `statementDescriptor` on your sessions so the charge is recognizable on the

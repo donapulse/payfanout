@@ -81,6 +81,9 @@ export function refusedCurrencies(): string[] {
   return [...candidates].filter((code) => currencyRefusal(code) !== undefined).sort();
 }
 
+/** `refusedCurrencies()` computed once, as `getCapabilities()` runs on almost every call. */
+export const REFUSED_CURRENCIES: readonly string[] = Object.freeze(refusedCurrencies());
+
 /** Refuses a call that would send, or sign for sending, an amount in a refused currency. */
 export function assertSendableCurrency(currency: string): void {
   const refusal = currencyRefusal(currency);

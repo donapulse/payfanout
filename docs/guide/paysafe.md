@@ -205,13 +205,16 @@ Before upgrading from a release that sent these currencies to Paysafe:
 **The router skips Paysafe for these currencies.** The adapter declares no
 `supportedCurrencies`, because Paysafe's table does not list every currency it processes, but
 it declares the currencies it refuses in `unsupportedCurrencies`, derived from the same rule.
-`PaymentRouter` therefore skips a Paysafe candidate for a session in one of them and tries the
-next one in the chain, and `PaymentService` refuses such a session for Paysafe before calling
-the adapter, zero-amount sessions included, with a non-retryable `unsupported_operation`
-(`"paysafe" declares currency CLP unsupported`) where the adapter's own refusal is
-`invalid_request`. A `paymentMethods` override with a rail whose `currencies` are all declared
-unsupported now fails registration. Give the ones you take a chain that names a provider serving them; when no
-candidate does, the router fails with `invalid_request`, each candidate's refusal on `raw`
+From the `@payfanout/server` release that reads the field, `PaymentRouter` skips a Paysafe
+candidate for a session in one of them and tries the next one in the chain, and
+`PaymentService` refuses such a session for Paysafe before calling the adapter, zero-amount
+sessions included, with a non-retryable `unsupported_operation` (`"paysafe" declares currency
+CLP unsupported`) where the adapter's own refusal is `invalid_request`. An older server screens
+with its own copy of core and does neither, so there route these currencies with a rule placed
+before any rule that can send them to Paysafe. A `paymentMethods` override with a rail whose
+`currencies` are all declared unsupported now fails registration. Give the currencies you take
+a chain that names a provider serving them; when no candidate does, the router fails with
+`invalid_request`, each candidate's refusal on `raw`
 ([routing and failover](/guide/server#routing-failover)).
 
 ## 5. Wire the client adapter
@@ -771,7 +774,8 @@ your Paysafe portal** rather than assuming.
 - [ ] Confirm your **live** merchant account ids per currency/country and that
       `merchantAccountResolver` returns them.
 - [ ] Give the currencies the adapter refuses a routing chain that names another provider:
-      the router skips Paysafe for them (§4, "Currencies the adapter refuses").
+      the router skips Paysafe for them from the `@payfanout/server` release that reads
+      `unsupportedCurrencies` (§4, "Currencies the adapter refuses").
 - [ ] For each currency you take that Paysafe's currency table does not list, confirm with
       your Paysafe account manager that Paysafe applies the exponent 2 to it: the adapter
       sends its amounts unchanged, in hundredths.

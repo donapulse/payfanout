@@ -22,6 +22,15 @@ import { FakeStripe, stripeError } from "./fake-stripe.js";
 
 const NOW_MS = Date.parse("2026-09-30T12:00:00Z");
 
+/** A currency refusal: an invalid_request naming the currency on raw. */
+function isCurrencyRefusal(outcome: unknown, currency: string): boolean {
+  return (
+    isPayFanoutError(outcome) &&
+    outcome.code === "invalid_request" &&
+    (outcome.raw as { currency?: unknown } | undefined)?.currency === currency
+  );
+}
+
 function makePair(config: Partial<StripeServerAdapterConfig> = {}): { adapter: StripeServerAdapter; fake: FakeStripe } {
   const fake = new FakeStripe();
   const adapter = new StripeServerAdapter({
@@ -742,7 +751,8 @@ describe("the currencies the adapter declares unsupported", () => {
       const outcome = await adapter
         .createPaymentSession({ amount: 100_000, currency, idempotencyKey: `k-${currency}` })
         .catch((err: unknown) => err);
-      if (isPayFanoutError(outcome)) refused.push(currency);
+      // Counted only as the currency refusal itself, never another error.
+      if (isCurrencyRefusal(outcome, currency)) refused.push(currency);
     }
     expect(refused).toEqual(declared);
     const input = { amount: 150, currency: "MGA", idempotencyKey: "k" };

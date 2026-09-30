@@ -130,6 +130,13 @@ the expected seam).
   the SDK loads, instead of the host setting it in two places. It changes the contract of
   core, conformance and every adapter, a major release with its own sign-off. Unblock: a
   second provider whose client half needs server-side configuration, and that sign-off.
+- **A named Trusted Types policy for the SDK loader:** under `require-trusted-types-for
+  'script'` core's `injectScript` assigns a plain URL, so the page's default policy must
+  accept each SDK URL (decisions.md, "Trusted Types and the SDK loader"). An opt-in named
+  `payfanout` policy, created only when the host allows that name in its `trusted-types`
+  directive and restricted to the adapters' own SDK URLs, would let a strict page drop its
+  default policy for them. It adds a policy the host must list and review, so it waits for a
+  host that enforces Trusted Types without a default policy. Unblock: that host.
 - **GoCardless one-off Direct Debit sessions (Bacs, SEPA Core):** a session today is a
   billing request's payment request, a one-off Open Banking payment, so the adapter declares
   `sepa_debit` and `bacs_debit` unsupported (decisions.md, "GoCardless sessions declare Pay

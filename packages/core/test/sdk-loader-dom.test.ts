@@ -90,6 +90,30 @@ describe("the SDK loaders against a DOM", () => {
     expect(document.querySelector("script")).toBeNull();
   });
 
+  it("refuse a script URL an enforced Trusted Types policy rejects, with the browser's TypeError on raw, and insert nothing", async () => {
+    const insertions = recordInsertions();
+    const create = document.createElement.bind(document);
+    vi.spyOn(document, "createElement").mockImplementation((tagName: string) => {
+      const element = create(tagName);
+      if (tagName === "script") {
+        // What a browser does to a plain string under require-trusted-types-for
+        // 'script' when no default policy accepts it.
+        Object.defineProperty(element, "src", {
+          set() {
+            throw new TypeError("This document requires 'TrustedScriptURL' assignment.");
+          },
+        });
+      }
+      return element;
+    });
+    const error = await rejection(injectScript(SDK_URL, "acme", { nonce: NONCE }));
+    expect(error).toMatchObject({ code: "invalid_request", retryable: false, pspName: "acme" });
+    expect(error.message).toMatch(/Trusted Types/);
+    expect(error.raw).toBeInstanceOf(TypeError);
+    expect(insertions).toEqual([]);
+    expect(document.querySelector("script")).toBeNull();
+  });
+
   it("make a second call wait for the script the first inserted, and reject both when it fails", async () => {
     const first = injectScript(SDK_URL, "acme", { nonce: NONCE });
     const second = injectScript(SDK_URL, "acme", { nonce: NONCE });

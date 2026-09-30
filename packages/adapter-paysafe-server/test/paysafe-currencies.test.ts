@@ -564,7 +564,12 @@ describe("currencies whose Paysafe exponent may not be PayFanout's", () => {
   });
 
   it("retries a lookup the transport refuses, and reads a key the index trails again before calling it empty", async () => {
-    const { adapter, fake } = makePair();
+    const sleeps: number[] = [];
+    const { adapter, fake } = makePair({
+      sleep: async (ms: number) => {
+        sleeps.push(ms);
+      },
+    });
     const charge = (idempotencyKey: string) =>
       adapter.chargeSavedPaymentMethod({
         pspCustomerId: "cust_1",
@@ -587,9 +592,51 @@ describe("currencies whose Paysafe exponent may not be PayFanout's", () => {
     const afterRetry = await rejection(charge("renewal-503"));
     expect(afterRetry).toMatchObject({ outcomeUnknown: true, raw: { earlier: [expect.anything()] } });
     expect((afterRetry.raw as { earlier: unknown[] }).earlier).toHaveLength(1);
+    // The index trails the write twice: the key is read again after 250 ms, then 500 ms.
+    sleeps.length = 0;
     fake.hideFromLookups("payments", "renewal-lag", 2);
     const afterLag = await rejection(charge("renewal-lag"));
     expect(afterLag).toMatchObject({ outcomeUnknown: true, raw: { earlier: [expect.anything()] } });
+    expect(sleeps).toEqual([250, 500]);
+  });
+
+  it("retries a bank debit's handle lookup the transport refuses, and keeps an empty key final", async () => {
+    const { adapter, fake } = makePair();
+    fake.refuse({ method: "GET", path: "/paymenthub/v1/paymenthandles" }, 503, 1);
+    const err = await rejection(
+      adapter.completePayment({
+        pspSessionId: await context("CLP", { paymentType: "ACH" }),
+        clientToken: ACH_ENVELOPE,
+        idempotencyKey: "c-503",
+      }),
+    );
+    expect(err).toMatchObject({ code: "invalid_request", retryable: false });
+    expect(err.outcomeUnknown).toBeUndefined();
+  });
+
+  it("leaves the refusal open when a read of an empty key fails afterwards", async () => {
+    const fake = new FakePaysafeApi();
+    let paymentReads = 0;
+    const flaky: typeof fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      if ((init?.method ?? "GET") === "GET" && new URL(url).pathname === "/paymenthub/v1/payments") {
+        paymentReads += 1;
+        if (paymentReads > 1) throw new TypeError("simulated network failure");
+      }
+      return fake.fetch(input, init);
+    };
+    const { adapter } = makePair({ fetch: flaky });
+    const err = await rejection(
+      adapter.chargeSavedPaymentMethod({
+        pspCustomerId: "cust_1",
+        savedPaymentMethodToken: SEEDED_MULTI_USE_TOKEN,
+        amount: 10_000,
+        currency: "CLP",
+        idempotencyKey: "renewal-y",
+      }),
+    );
+    expect(err).toMatchObject({ code: "invalid_request", outcomeUnknown: true, raw: { lookupFailed: true } });
+    expect(paymentReads).toBeGreaterThan(1);
   });
 
   it("keeps a failed lookup's own error on raw", async () => {

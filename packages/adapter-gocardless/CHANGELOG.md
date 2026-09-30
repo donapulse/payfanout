@@ -1,5 +1,11 @@
 # @payfanout/adapter-gocardless
 
+## 0.3.0
+
+### Minor Changes
+
+- 7bb7ad7: List `sepa_debit` and `bacs_debit` as unsupported payment methods, as the server adapter now declares them: a GoCardless session is a one-off Open Banking payment (Pay by Bank), so `bank_redirect_generic` is the one method it offers.
+
 ## 0.2.13
 
 ### Patch Changes

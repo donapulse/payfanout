@@ -220,7 +220,11 @@ has 0 decimals (`¥500` → `500`), BHD has 3 (`BD 1.234` → `1234`). Use
 `@payfanout/core`. A record whose PSP states no currency, which the adapter cannot source
 from a related record either, reports `NO_CURRENCY` (`"XXX"`, ISO 4217's "no currency
 involved"): its amount reads with the default exponent 2, so reconcile it with the PSP
-before booking it, and never send `XXX` back as a payment's currency. Refund state is
+before booking it, and never send `XXX` back as a payment's currency: `PaymentService`
+refuses it as the currency of a session, session update, saved-method charge or native
+subscription, `PaymentRouter` before screening any candidate and `SubscriptionManager` in a
+plan, all with a non-retryable `invalid_request`, while an adapter called directly passes
+it to the PSP. Refund state is
 **derived**, never a payment status:
 `getRefundState(info)` → `"none" | "partial" | "full"`.
 

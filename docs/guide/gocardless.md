@@ -17,7 +17,7 @@ Next.js edge) and [`@payfanout/adapter-gocardless`](/guide/react) (browser-safe 
 Dashboard menu names, scheme availability per country, and simulator catalogs change over
 time and vary per account. The **field names and behavior below are exact** (read from the
 adapter source), but re-verify credential locations and scheme enablement against your own
-[GoCardless developer docs](https://developer.gocardless.com) before going live.
+[GoCardless developer docs](https://docs.gocardless.com) before going live.
 :::
 
 ## 1. Get your GoCardless credentials

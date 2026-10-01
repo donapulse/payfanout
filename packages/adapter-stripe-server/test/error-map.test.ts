@@ -29,6 +29,9 @@ describe("mapStripeError", () => {
     // The SDK reports a response body cut off mid-transfer this way: no status code at all.
     { name: "API error without a status", err: { type: "StripeAPIError" }, code: "psp_unavailable", retryable: true },
     { name: "bad API key", err: { type: "StripeAuthenticationError" }, code: "invalid_request", retryable: false },
+    // 403: a restricted key without the permission — configuration, never an unknown outcome.
+    { name: "key lacks a permission", err: { type: "StripePermissionError", statusCode: 403 }, code: "invalid_request", retryable: false },
+    { name: "bare 403", err: { statusCode: 403 }, code: "invalid_request", retryable: false },
     {
       name: "insufficient funds decline",
       err: { type: "StripeCardError", code: "card_declined", decline_code: "insufficient_funds", message: "…" },

@@ -1690,7 +1690,6 @@ export function mapPayZenError(answer: PayZenErrorAnswerLike | undefined, raw: u
         ? "PayZen rejected the API credentials — check shopId, password, and that they match the configured environment."
         : getUserMessage(code),
     retryable,
-    // "The transaction status is unknown.": the call may have taken effect.
     ...(errorCode === UNKNOWN_OUTCOME_CODE ? { outcomeUnknown: true } : {}),
     raw,
     pspName: PAYZEN_PSP_NAME,

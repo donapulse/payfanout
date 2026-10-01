@@ -844,6 +844,9 @@ function isTechnicalError(errorCode: string | null | undefined): boolean {
   return errorCode === "ACQ_999" || errorCode === "AUTH_999";
 }
 
+/** "The transaction status is unknown.": a processing_error marked outcomeUnknown, as on the server. */
+const UNKNOWN_OUTCOME_CODE = "PSP_679";
+
 /**
  * The error for PayZen's answer on a transaction: an unpaid order's last
  * transaction, or an ACQ_, AUTH_ or PSP_ error from KR.onError, read as the
@@ -871,6 +874,7 @@ function transactionError(
     code,
     message: getUserMessage(code),
     retryable: code === "psp_unavailable" || code === "rate_limited",
+    ...(errorCode === UNKNOWN_OUTCOME_CODE ? { outcomeUnknown: true } : {}),
     raw,
     pspName: "payzen",
   });

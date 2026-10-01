@@ -6253,7 +6253,9 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   been exceeded during buyer redirection." names nothing that timed out. PSP_639 "Refund
   refused." names no refuser, unlike PSP_101, whose issuer refusal reads as `card_declined`.
   PSP_679 "The transaction status is unknown." says the outcome is not known, which a code
-  alone cannot carry: it wants `outcomeUnknown` (#282). The page's 3-D Secure technical
+  alone cannot carry: since #282 (2026-10-01) both halves mark it `outcomeUnknown` on a
+  non-retryable `processing_error`, as PayZen takes no idempotency key a retry could reuse;
+  the page does not say which calls answer it. The page's 3-D Secure technical
   errors (PSP_605, 713, 719, 720 and 997) already read as the rule's `processing_error`
   through the default.
 - **Every other mapped PSP_ code re-read against the page.** Each definition supports its

@@ -1,5 +1,11 @@
 # @payfanout/adapter-paysafe-server
 
+## 3.0.2
+
+### Patch Changes
+
+- 680ea25: Send an `unscheduled` `chargeSavedPaymentMethod` with `storedCredential.type` `TOPUP`, Paysafe's unscheduled merchant-initiated type, instead of `ADHOC`, which Paysafe defines as consumer-initiated.
+
 ## 3.0.1
 
 ### Patch Changes

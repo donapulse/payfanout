@@ -2294,7 +2294,9 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
   /**
    * Merchant-initiated charge of a MULTI_USE token. storedCredential carries
    * the networks' credential-on-file semantics (INITIAL while the customer is
-   * present, SUBSEQUENT for recurring; ADHOC covers unscheduled top-ups).
+   * present, SUBSEQUENT for recurring). An unscheduled charge is TOPUP,
+   * Paysafe's "unscheduled merchant-initiated request"; ADHOC is its
+   * consumer-initiated type, which a merchant-initiated charge is not.
    */
   async chargeSavedPaymentMethod(input: ChargeSavedPaymentMethodInput): Promise<PaymentInfo> {
     assertMinorUnitAmount(input.amount, "amount");
@@ -2315,7 +2317,7 @@ export class PaysafeServerAdapter implements ServerPaymentAdapter {
       ...(merchantAccountId ? { accountId: merchantAccountId } : {}),
       storedCredential:
         occurrence === "unscheduled"
-          ? { type: "ADHOC", occurrence: "SUBSEQUENT" }
+          ? { type: "TOPUP", occurrence: "SUBSEQUENT" }
           : { type: "RECURRING", occurrence: occurrence === "initial" ? "INITIAL" : "SUBSEQUENT" },
       // INITIAL (customer-present) charges of browser-originated tokens need
       // AVS data on the payment itself (3004 without a zip).

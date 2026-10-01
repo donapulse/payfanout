@@ -301,3 +301,40 @@ describe("PaymentService session screening (shared predicate with PaymentRouter)
     expect(adapter.calls.filter((c) => c.method === "createPaymentSession")).toHaveLength(0);
   });
 });
+
+describe("NO_CURRENCY as an input", () => {
+  it("refuses XXX on every call that takes a currency, before any adapter call", async () => {
+    const adapter = new FakeAdapter({ capabilities: { supportsSavedPaymentMethods: true } });
+    const service = new PaymentService({ adapters: [adapter] });
+    const refusal = /was given currency XXX, which adapters report for a record that states no currency/;
+    await expectInvalidRequest(service.createPaymentSession("fake", { ...baseInput, currency: " xxx " }), refusal);
+    await expectInvalidRequest(
+      service.updatePaymentSession("fake", { pspSessionId: "s_1", currency: "XXX", idempotencyKey: "u" }),
+      refusal,
+    );
+    await expectInvalidRequest(
+      service.chargeSavedPaymentMethod("fake", {
+        pspCustomerId: "c_1",
+        savedPaymentMethodToken: "pm_1",
+        amount: 1000,
+        currency: "XXX",
+        idempotencyKey: "c",
+      }),
+      refusal,
+    );
+    await expectInvalidRequest(
+      service.createNativeSubscription("fake", {
+        savedPaymentMethodToken: "pm_1",
+        amount: 1500,
+        currency: "XXX",
+        interval: "month",
+        idempotencyKey: "n",
+      }),
+      refusal,
+    );
+    expect(adapter.calls).toEqual([]);
+    // Any other currency still reaches the adapter.
+    await service.createPaymentSession("fake", baseInput);
+    expect(adapter.calls.map((call) => call.method)).toEqual(["createPaymentSession"]);
+  });
+});

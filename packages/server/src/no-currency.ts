@@ -8,7 +8,7 @@ export function refuseNoCurrency(currency: string | undefined, what: string, psp
   if (firstCurrencyCode(currency) !== NO_CURRENCY) return;
   throw new PayFanoutError({
     code: "invalid_request",
-    message: `${what} was given currency ${NO_CURRENCY}, which adapters report for a record that states no currency — pass the payment's own currency`,
+    message: `${what} was given currency ${NO_CURRENCY}, which adapters report for a record that states no currency — pass the currency to charge in`,
     retryable: false,
     ...(pspName !== undefined ? { pspName } : {}),
   });

@@ -313,7 +313,7 @@ describe("PaymentRouter failover cascade", () => {
   });
 
   it("refuses XXX, core's NO_CURRENCY, before screening or calling any candidate", async () => {
-    // psp-b declares its currencies, which would otherwise end in the generic "no PSP" refusal.
+    // Refused before screening: psp-b's declared currencies are never consulted.
     const a = new FakeAdapter({ pspName: "psp-a" });
     const b = new FakeAdapter({ pspName: "psp-b", capabilities: { supportedCurrencies: ["EUR"] } });
     const attempts: unknown[] = [];

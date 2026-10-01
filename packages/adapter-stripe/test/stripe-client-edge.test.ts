@@ -345,7 +345,15 @@ describe("StripeClientAdapter edge cases", () => {
     const setupDone = { type: "invalid_request_error", code: "setup_intent_unexpected_state", setup_intent: { status: "succeeded" } };
     expect(await confirmWith("seti_1_secret", setupDone)).toEqual({ status: "succeeded" });
     // Without the status of the intent the code names, the outcome stays open.
-    const withoutStatus = [unexpected, { ...unexpected, payment_intent: {} }, { ...unexpected, setup_intent: { status: "succeeded" } }];
+    const withoutStatus = [
+      unexpected,
+      { ...unexpected, payment_intent: {} },
+      { ...unexpected, setup_intent: { status: "succeeded" } },
+      // States a confirmation accepts, and one Stripe may add later, are not settled.
+      { ...unexpected, payment_intent: { status: "requires_payment_method" } },
+      { ...unexpected, payment_intent: { status: "requires_action" } },
+      { ...unexpected, payment_intent: { status: "some_future_state" } },
+    ];
     for (const error of withoutStatus) {
       expect(await confirmWith("pi_1_secret", error), JSON.stringify(error)).toMatchObject({
         status: "failed",

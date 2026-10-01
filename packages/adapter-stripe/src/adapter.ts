@@ -673,6 +673,13 @@ function classifyStripeJsError(error: StripeJsErrorLike | undefined): UnifiedErr
 }
 
 /** The status of the intent an unexpected-state error carries, when it carries one. */
+const SETTLED_INTENT_STATUSES: ReadonlySet<string> = new Set(["succeeded", "processing", "requires_capture", "canceled"]);
+
+/**
+ * The settled state an unexpected-state error's intent is in, for the states a
+ * confirmation cannot leave an intent in by mistake. Any other state, one a
+ * confirmation accepts or one Stripe adds later, keeps the outcome open.
+ */
 function unexpectedStateStatus(error: StripeJsErrorLike): string | undefined {
   const intent =
     error.code === "payment_intent_unexpected_state"
@@ -680,8 +687,10 @@ function unexpectedStateStatus(error: StripeJsErrorLike): string | undefined {
       : error.code === "setup_intent_unexpected_state"
         ? error.setup_intent
         : undefined;
-  return typeof intent?.status === "string" ? intent.status : undefined;
+  const status = intent?.status;
+  return typeof status === "string" && SETTLED_INTENT_STATUSES.has(status) ? status : undefined;
 }
+
 
 /**
  * A refusal that does not show whether the payment went through. As on the server,

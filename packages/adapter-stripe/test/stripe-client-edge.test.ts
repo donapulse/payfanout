@@ -176,7 +176,7 @@ describe("StripeClientAdapter edge cases", () => {
     expect(fResult.error?.code).toBe("authentication_required");
     expect(fResult.error?.retryable).toBe(false);
 
-    const exotic = makeAdapter({ type: "api_error", message: "Something odd." });
+    const exotic = makeAdapter({ type: "future_error", message: "Something odd." });
     const eHandle = await exotic.mount({} as HTMLElement, { clientSecret: "pi_1_secret" });
     const eResult = await exotic.confirm(eHandle);
     expect(eResult.error?.code).toBe("unknown");
@@ -254,9 +254,25 @@ describe("StripeClientAdapter edge cases", () => {
       [{ type: "validation_error", code: "incomplete_number" }, "invalid_card_data", false],
       [{ type: "validation_error", code: "incomplete_cvc" }, "invalid_card_data", false],
       [{ type: "validation_error", code: "incomplete_expiry" }, "invalid_card_data", false],
+      // Any other field the customer has to correct, never a decline.
+      [{ type: "validation_error" }, "invalid_card_data", false],
+      // The types the server maps by the SDK's error class, the same way.
+      [{ type: "rate_limit_error" }, "rate_limited", true],
+      [{ type: "api_connection_error" }, "psp_unavailable", true],
+      [{ type: "api_error" }, "psp_unavailable", true],
+      [{ type: "authentication_error" }, "invalid_request", false],
+      [{ type: "idempotency_error" }, "invalid_request", false],
+      [{ type: "invalid_request_error" }, "invalid_request", false],
+      // Both 429s by their codes, whatever the type, as the server reads every 429.
+      [{ type: "invalid_request_error", code: "rate_limit" }, "rate_limited", true],
+      [{ type: "invalid_request_error", code: "lock_timeout" }, "rate_limited", true],
+      // Stripe.js may report a failed 3-D Secure as an invalid request: the codes come first.
+      [{ type: "invalid_request_error", code: "payment_intent_authentication_failure" }, "authentication_required", false],
+      [{ type: "invalid_request_error", code: "setup_intent_authentication_failure" }, "authentication_required", false],
       // Only the lists' own entries count.
       [{ type: "card_error", code: "card_declined", decline_code: "constructor" }, "card_declined", false],
-      [{ type: "api_error", code: "constructor" }, "unknown", false],
+      [{ type: "constructor", code: "constructor" }, "unknown", false],
+      [{ type: "toString" }, "unknown", false],
     ];
     for (const [error, code, retryable] of cases) {
       expect(await confirmWith(error), JSON.stringify(error)).toMatchObject({ code, retryable });
@@ -264,9 +280,61 @@ describe("StripeClientAdapter edge cases", () => {
     vi.stubGlobal("navigator", { language: "es-ES" });
     const fraud = await confirmWith({ type: "card_error", code: "card_declined", decline_code: "stolen_card", message: "Card reported stolen." });
     expect(fraud?.message).toBe(getUserMessage("fraud_suspected", "es"));
-    // Every other message is Stripe.js's own, which it localizes.
+    // A card or validation error's message is Stripe.js's own, which it localizes.
     const funds = await confirmWith({ type: "card_error", code: "card_declined", decline_code: "insufficient_funds", message: "Fonds insuffisants." });
     expect(funds?.message).toBe("Fonds insuffisants.");
+    const field = await confirmWith({ type: "validation_error", message: "Champ incomplet." });
+    expect(field?.message).toBe("Champ incomplet.");
+    // Stripe does not write the other types' messages for the customer, who reads core's.
+    const catalogued = [
+      ["rate_limit_error", "rate_limited"],
+      ["api_connection_error", "psp_unavailable"],
+      ["api_error", "psp_unavailable"],
+      ["authentication_error", "invalid_request"],
+      ["idempotency_error", "invalid_request"],
+      ["invalid_request_error", "invalid_request"],
+    ] as const;
+    for (const [type, code] of catalogued) {
+      expect((await confirmWith({ type, message: "Developer detail." }))?.message, type).toBe(getUserMessage(code, "es"));
+    }
+    // A reused key's first request ran and may have gone through, as on the server.
+    expect((await confirmWith({ type: "idempotency_error" }))?.outcomeUnknown).toBe(true);
+    expect((await confirmWith({ type: "invalid_request_error" }))?.outcomeUnknown).toBeUndefined();
+    expect((await confirmWith({ type: "authentication_error" }))?.outcomeUnknown).toBeUndefined();
+  });
+
+  it("maps a Payment Element loaderror the way it maps a confirmation's error", async () => {
+    stubBrowser();
+    let loadError: ((payload?: { error?: object }) => void) | undefined;
+    const element = {
+      mount: () => {},
+      unmount: () => {},
+      destroy: () => {},
+      on: (event: string, handler: (payload?: { error?: object }) => void) => {
+        if (event === "loaderror") loadError = handler;
+      },
+    };
+    const adapter = new StripeClientAdapter({
+      publishableKey: "pk",
+      environment: "sandbox",
+      apiVersion: API_VERSION,
+      getStripeGlobal: () => () => ({
+        elements: () => ({ create: () => element }),
+        confirmPayment: async () => ({}),
+        confirmSetup: async () => ({}),
+        retrievePaymentIntent: async () => ({}),
+        retrieveSetupIntent: async () => ({}),
+      }),
+      loadScript: async () => {},
+    });
+    const onError = vi.fn();
+    await adapter.mount({} as HTMLElement, { clientSecret: "pi_1_secret", locale: "fr", onError });
+    loadError!({ error: { type: "api_connection_error", message: "Network failure." } });
+    loadError!({ error: { type: "invalid_request_error", message: "Developer detail." } });
+    expect(onError.mock.calls.map(([error]) => [error.code, error.retryable, error.message])).toEqual([
+      ["psp_unavailable", true, getUserMessage("psp_unavailable", "fr")],
+      ["invalid_request", false, getUserMessage("invalid_request", "fr")],
+    ]);
   });
 
   it("writes the generic fraud message in the browser's locale under \"auto\", without one, or with an empty one", async () => {

@@ -6353,3 +6353,12 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   the whole authorization is captured, each lookup's retryable failure and the full
   refund's tolerance of one, the Worldline session fallback, session check and refund
   refusal, PayZen's order currency and refund paths).
+
+## Stripe.js error types (2026-10-01)
+
+- The browser maps Stripe.js error types as the server maps the SDK's classes, after its
+  code-level mapping. `api_connection_error`, `rate_limit_error` and `authentication_error`
+  come from the `StripeErrorType` declarations in `github.com/stripe/stripe-js`, which the
+  Stripe.js reference links; docs.stripe.com names only the others. Stripe asks to show card
+  and validation messages only, so the mapped types carry core's message. `validation_error`,
+  input the customer corrects, is `invalid_card_data`, no longer `card_declined`.

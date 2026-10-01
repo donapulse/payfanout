@@ -650,11 +650,40 @@ function classifyStripeJsError(error: StripeJsErrorLike | undefined): UnifiedErr
   if (decline !== undefined && FRAUD_DECLINE_CODES.has(decline)) return "fraud_suspected";
   if (code !== undefined && AUTHENTICATION_FAILURE_CODES.has(code)) return "authentication_required";
   if (either((value) => value === "processing_error")) return "processing_error";
-  if (code === "card_declined" || error?.type === "card_error" || error?.type === "validation_error") {
-    return "card_declined";
-  }
-  return "unknown";
+  if (code === "card_declined" || error?.type === "card_error") return "card_declined";
+  // Stripe.js's own check of what the customer typed into the fields, before anything is
+  // sent: the customer corrects it, and Stripe asks to show them its message. Not
+  // invalid_request, which reports a request the integration built wrong.
+  if (error?.type === "validation_error") return "invalid_card_data";
+  // Stripe's codes for a rate limit and a lock timeout, which the server reads as 429s.
+  if (code === "rate_limit" || code === "lock_timeout") return "rate_limited";
+  return classifyStripeJsErrorType(error?.type);
 }
+
+/** The server adapter's mapping of the Stripe SDK's error classes, for the types Stripe.js reports. */
+function classifyStripeJsErrorType(type: string | undefined): UnifiedErrorCode {
+  switch (type) {
+    case "rate_limit_error":
+      return "rate_limited";
+    case "api_connection_error":
+    case "api_error":
+      return "psp_unavailable";
+    case "authentication_error":
+    case "idempotency_error":
+    case "invalid_request_error":
+      return "invalid_request";
+    default:
+      return "unknown";
+  }
+}
+
+/** Codes whose Stripe.js message is not written for the customer, or must not reach them. */
+const CATALOG_MESSAGE_CODES: ReadonlySet<UnifiedErrorCode> = new Set([
+  "fraud_suspected",
+  "rate_limited",
+  "psp_unavailable",
+  "invalid_request",
+]);
 
 /**
  * The locale a message for the customer is in: Stripe.js's own, which is the
@@ -670,17 +699,19 @@ function mapStripeJsError(error: StripeJsErrorLike | undefined, locale: string |
   const code = classifyStripeJsError(error);
   return new PayFanoutError({
     code,
-    // Stripe asks never to tell the customer more than a generic decline for
-    // these; core's catalog message follows the customer's locale where core or
-    // the host has one, and English otherwise.
-    message:
-      code === "fraud_suspected"
-        ? getUserMessage("fraud_suspected", customerLocale(locale))
-        : (error?.message ?? "Payment failed."),
+    // Stripe asks never to tell the customer more than a generic decline for fraud, and
+    // to show them the message of card and validation errors only; core's catalog
+    // message follows the customer's locale where core or the host has one, and
+    // English otherwise.
+    message: CATALOG_MESSAGE_CODES.has(code)
+      ? getUserMessage(code, customerLocale(locale))
+      : (error?.message ?? "Payment failed."),
     // authentication_required is resolved on-session (a 3DS challenge), never by replay.
-    retryable: code === "processing_error",
+    retryable: code === "processing_error" || code === "rate_limited" || code === "psp_unavailable",
     raw: error,
     pspName: "stripe",
+    // As on the server: the reused key's first request ran, and may have gone through.
+    ...(code === "invalid_request" && error?.type === "idempotency_error" ? { outcomeUnknown: true } : {}),
   });
 }
 

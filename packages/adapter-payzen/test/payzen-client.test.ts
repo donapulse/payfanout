@@ -797,6 +797,29 @@ describe("PayZenClientAdapter error mapping", () => {
     }
   });
 
+  it("marks PSP_679, a transaction whose status is unknown, outcomeUnknown on both paths", async () => {
+    stubBrowser();
+    const fake = makeFakeKr();
+    const { adapter } = makeAdapter(fake);
+    const seen: unknown[] = [];
+    await adapter.mount(fakeContainer(), { clientSecret: FORM_TOKEN, onError: (e) => seen.push(e) });
+    fake.errorCb?.({ errorCode: "PSP_679" });
+    expect(seen.at(-1)).toMatchObject({ code: "processing_error", retryable: false, outcomeUnknown: true });
+    fake.errorCb?.({ errorCode: "PSP_003" });
+    expect((seen.at(-1) as { outcomeUnknown?: boolean }).outcomeUnknown).toBeUndefined();
+
+    stubBrowser();
+    const unpaid = makeFakeKr();
+    const { adapter: confirming } = makeAdapter(unpaid);
+    const handle = await confirming.mount(fakeContainer(), { clientSecret: FORM_TOKEN });
+    const pending = confirming.confirm(handle);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    unpaid.submitCb?.({
+      clientAnswer: { orderStatus: "UNPAID", transactions: [{ uuid: "u1", errorCode: "PSP_679" }] },
+    });
+    expect((await pending).error).toMatchObject({ code: "processing_error", retryable: false, outcomeUnknown: true });
+  });
+
   it("refines UNPAID declines from AUTH_-family transaction errors", async () => {
     const cases: Array<[string, string]> = [
       ["AUTH_100", "processing_error"],

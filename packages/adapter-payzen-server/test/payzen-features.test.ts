@@ -330,6 +330,15 @@ describe("mapPayZenError (envelope taxonomy)", () => {
     expect(mapPayZenError({ errorCode: "INT_905" }, {}).message).toMatch(/shopId, password/);
   });
 
+  it("marks PSP_679, a transaction whose status is unknown, outcomeUnknown and never retryable", () => {
+    expect(mapPayZenError({ errorCode: "PSP_679" }, {})).toMatchObject({
+      code: "processing_error",
+      retryable: false,
+      outcomeUnknown: true,
+    });
+    expect(mapPayZenError({ errorCode: "PSP_003" }, {}).outcomeUnknown).toBeUndefined();
+  });
+
   it("holds the same acquirer, AUTH_ and PSP_ maps as the browser adapter", async () => {
     const { readFile } = await import("node:fs/promises");
     const { fileURLToPath } = await import("node:url");

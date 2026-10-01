@@ -5,7 +5,6 @@ import {
   isUnifiedPaymentStatus,
   NATIVE_SUBSCRIPTION_INTERVALS,
   NATIVE_SUBSCRIPTION_STATUSES,
-  PAYMENT_METHOD_FLOWS,
   PAYMENT_METHOD_TYPES,
   REFUND_STATUSES,
   WEBHOOK_EVENT_TYPES,
@@ -23,6 +22,7 @@ import {
   validateAdapterCapabilities,
   validateOnboardingDescriptor,
 } from "@payfanout/core";
+import { validateDeclarationShapes } from "./declaration-shapes.js";
 
 /**
  * The contract every ServerPaymentAdapter — present or future — must pass.
@@ -181,37 +181,7 @@ export function runServerAdapterConformanceTests(
       // The full flag/surface rule table lives in core — the same one
       // @payfanout/server enforces at registration, so the two cannot drift.
       expect(validateAdapterCapabilities(adapter)).toEqual([]);
-      expect(adapter.pspName.length).toBeGreaterThan(0);
-      expect(caps.paymentMethods.length).toBeGreaterThan(0);
-      for (const method of caps.paymentMethods) {
-        expect(PAYMENT_METHOD_TYPES).toContain(method.type);
-        expect(PAYMENT_METHOD_FLOWS).toContain(method.flow);
-        expect(typeof method.supported).toBe("boolean");
-        // Per-method currencies is the same pre-screen input at rail scope: a
-        // malformed code never matches, silently disabling the rail instead of
-        // gating it. A single-currency rail (SEPA/EUR) that omits it routes
-        // dishonestly — but only the adapter knows, so shape is what's checkable.
-        for (const currency of method.currencies ?? []) {
-          expect(currency).toMatch(/^[A-Z]{3}$/);
-        }
-        // Countries mirror currencies (ISO 3166-1 alpha-2, customer side): a
-        // malformed code never matches a session's customerCountry, so the
-        // rail silently screens out for every session that states one.
-        for (const country of method.countries ?? []) {
-          expect(country).toMatch(/^[A-Z]{2}$/);
-        }
-      }
-      // supportedCurrencies is a router pre-screen input — malformed codes
-      // would silently disable a PSP for every payment.
-      for (const currency of caps.supportedCurrencies ?? []) {
-        expect(currency).toMatch(/^[A-Z]{3}$/);
-      }
-      // unsupportedCurrencies is the same input, inverted. Core already fails
-      // an entry that can never match; a working one is held here to the bare
-      // uppercase form of the lists above.
-      for (const currency of caps.unsupportedCurrencies ?? []) {
-        expect(currency).toMatch(/^[A-Z]{3}$/);
-      }
+      expect(validateDeclarationShapes(adapter.pspName, caps)).toEqual([]);
     });
 
     if (fixtures.onboarding) {

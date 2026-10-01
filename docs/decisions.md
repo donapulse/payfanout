@@ -6361,6 +6361,15 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
 - The browser maps Stripe.js error types as the server maps the SDK's classes, after its
   code-level mapping. `api_connection_error`, `rate_limit_error` and `authentication_error`
   come from the `StripeErrorType` declarations in `github.com/stripe/stripe-js`, which the
-  Stripe.js reference links; docs.stripe.com names only the others. Stripe asks to show card
-  and validation messages only, so the mapped types carry core's message. `validation_error`,
-  input the customer corrects, is `invalid_card_data`, no longer `card_declined`.
+  Stripe.js reference links; docs.stripe.com names only the others.
+- Stripe asks to show the message of card and validation errors only, so every other type,
+  `unknown` included, carries core's message. A failed 3-D Secure keeps Stripe's text under
+  any type, a deliberate exception: core's `authentication_required` message asks for the
+  authentication that just failed.
+- `payment_intent_unexpected_state` and `setup_intent_unexpected_state` stay outcome-open
+  (`invalid_request`, `outcomeUnknown`). The browser sends no idempotency key, so a double
+  submit or a retry can meet them after the payment went through, and `confirm()` reports
+  the status of the intent the error carries when it has one.
+- `validation_error`, input the customer corrects, is `invalid_card_data`, no longer
+  `card_declined`. It also covers IBAN and BECS fields, where core's card wording reads
+  wrong under `localizeError`.

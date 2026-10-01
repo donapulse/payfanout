@@ -36,6 +36,9 @@ export interface StripeJsErrorLike {
   code?: string;
   decline_code?: string;
   message?: string;
+  /** The intent the failed request involved, as Stripe's error object carries it. */
+  payment_intent?: { status?: string };
+  setup_intent?: { status?: string };
 }
 
 export interface StripeJsConfirmResult {
@@ -432,6 +435,10 @@ export class StripeClientAdapter implements ClientPaymentAdapter {
     const isSetup = h.clientSecret.startsWith("seti_");
     const result = isSetup ? await h.stripe.confirmSetup(params) : await h.stripe.confirmPayment(params);
     if (result.error) {
+      // An intent past the states a confirmation accepts, after a double submit or a retry
+      // whose first attempt went through, answers with the state it is in: report that.
+      const intentStatus = unexpectedStateStatus(result.error);
+      if (intentStatus !== undefined) return { status: toUnifiedStatus(intentStatus) };
       return { status: "failed", error: mapStripeJsError(result.error, h.locale) };
     }
     const status = (result.paymentIntent ?? result.setupIntent)?.status;
@@ -629,6 +636,9 @@ const AUTHENTICATION_FAILURE_CODES = new Set([
   "setup_intent_authentication_failure",
 ]);
 
+/** An intent no longer in a state the request accepts, such as one already paid. */
+const UNEXPECTED_STATE_CODES = new Set(["payment_intent_unexpected_state", "setup_intent_unexpected_state"]);
+
 /**
  * In the server adapter's order, so a decline maps the same way whichever half
  * reports it. The issuer's decline code counts like the error code wherever
@@ -657,7 +667,30 @@ function classifyStripeJsError(error: StripeJsErrorLike | undefined): UnifiedErr
   if (error?.type === "validation_error") return "invalid_card_data";
   // Stripe's codes for a rate limit and a lock timeout, which the server reads as 429s.
   if (code === "rate_limit" || code === "lock_timeout") return "rate_limited";
+  // Outcome open, never a final invalid request: see leavesOutcomeOpen.
+  if (code !== undefined && UNEXPECTED_STATE_CODES.has(code)) return "invalid_request";
   return classifyStripeJsErrorType(error?.type);
+}
+
+/** The status of the intent an unexpected-state error carries, when it carries one. */
+function unexpectedStateStatus(error: StripeJsErrorLike): string | undefined {
+  const intent =
+    error.code === "payment_intent_unexpected_state"
+      ? error.payment_intent
+      : error.code === "setup_intent_unexpected_state"
+        ? error.setup_intent
+        : undefined;
+  return typeof intent?.status === "string" ? intent.status : undefined;
+}
+
+/**
+ * A refusal that does not show whether the payment went through. As on the server,
+ * a reused key's first request ran. The browser sends no key of its own, so a double
+ * submit, or a retry after a connection error, can find the intent already paid.
+ */
+function leavesOutcomeOpen(error: StripeJsErrorLike | undefined, code: UnifiedErrorCode): boolean {
+  if (code !== "invalid_request") return false;
+  return error?.type === "idempotency_error" || (error?.code !== undefined && UNEXPECTED_STATE_CODES.has(error.code));
 }
 
 /** The server adapter's mapping of the Stripe SDK's error classes, for the types Stripe.js reports. */
@@ -677,13 +710,20 @@ function classifyStripeJsErrorType(type: string | undefined): UnifiedErrorCode {
   }
 }
 
-/** Codes whose Stripe.js message is not written for the customer, or must not reach them. */
-const CATALOG_MESSAGE_CODES: ReadonlySet<UnifiedErrorCode> = new Set([
-  "fraud_suspected",
-  "rate_limited",
-  "psp_unavailable",
-  "invalid_request",
-]);
+/**
+ * Stripe.js's own message, where it is for the customer: Stripe asks to show the
+ * message of a card or validation error, and never more than a generic decline for
+ * fraud. A failed 3-D Secure keeps Stripe's text under any type, as a deliberate
+ * exception: Stripe.js may send one as an invalid request, and core's
+ * authentication_required message asks for the authentication that just failed.
+ */
+function customerFacingMessage(error: StripeJsErrorLike | undefined, code: UnifiedErrorCode): string | undefined {
+  if (error === undefined || code === "fraud_suspected") return undefined;
+  const failedAuthentication = error.code !== undefined && AUTHENTICATION_FAILURE_CODES.has(error.code);
+  return error.type === "card_error" || error.type === "validation_error" || failedAuthentication
+    ? error.message
+    : undefined;
+}
 
 /**
  * The locale a message for the customer is in: Stripe.js's own, which is the
@@ -699,19 +739,14 @@ function mapStripeJsError(error: StripeJsErrorLike | undefined, locale: string |
   const code = classifyStripeJsError(error);
   return new PayFanoutError({
     code,
-    // Stripe asks never to tell the customer more than a generic decline for fraud, and
-    // to show them the message of card and validation errors only; core's catalog
-    // message follows the customer's locale where core or the host has one, and
-    // English otherwise.
-    message: CATALOG_MESSAGE_CODES.has(code)
-      ? getUserMessage(code, customerLocale(locale))
-      : (error?.message ?? "Payment failed."),
+    // Core's catalog message follows the customer's locale where core or the host has
+    // one, and English otherwise.
+    message: customerFacingMessage(error, code) ?? getUserMessage(code, customerLocale(locale)),
     // authentication_required is resolved on-session (a 3DS challenge), never by replay.
     retryable: code === "processing_error" || code === "rate_limited" || code === "psp_unavailable",
     raw: error,
     pspName: "stripe",
-    // As on the server: the reused key's first request ran, and may have gone through.
-    ...(code === "invalid_request" && error?.type === "idempotency_error" ? { outcomeUnknown: true } : {}),
+    ...(leavesOutcomeOpen(error, code) ? { outcomeUnknown: true } : {}),
   });
 }
 

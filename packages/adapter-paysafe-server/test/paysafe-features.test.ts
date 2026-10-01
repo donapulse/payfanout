@@ -995,7 +995,7 @@ describe("Paysafe Customer Vault", () => {
     });
   });
 
-  it("maps 'unscheduled' onto ADHOC stored-credential semantics", async () => {
+  it("maps 'unscheduled' onto TOPUP, Paysafe's unscheduled merchant-initiated type", async () => {
     const { adapter, fake } = makePair();
     const customer = await adapter.createCustomer({ idempotencyKey: "k-cust" });
     const saved = await adapter.savePaymentMethod({
@@ -1012,7 +1012,7 @@ describe("Paysafe Customer Vault", () => {
       idempotencyKey: "k-c",
     });
     expect(fake.lastRequestBody).toMatchObject({
-      storedCredential: { type: "ADHOC", occurrence: "SUBSEQUENT" },
+      storedCredential: { type: "TOPUP", occurrence: "SUBSEQUENT" },
     });
   });
 

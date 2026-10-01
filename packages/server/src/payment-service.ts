@@ -35,6 +35,7 @@ import {
   validateAdapterCapabilities,
   type VerifyPaymentMethodInput,
 } from "@payfanout/core";
+import { refuseNoCurrency } from "./no-currency.js";
 
 /**
  * One record per adapter call, emitted to PaymentServiceOptions.telemetry.
@@ -127,6 +128,7 @@ export class PaymentService {
   async createPaymentSession(pspName: string, input: CreatePaymentSessionInput): Promise<PaymentSession> {
     const adapter = this.adapterFor(pspName);
     assertMinorUnitAmount(input.amount, "amount");
+    refuseNoCurrency(input.currency, "createPaymentSession", pspName);
     requireIdempotencyKey(input.idempotencyKey, "createPaymentSession");
     // Capability rules live in core's screenSessionInput — the router consumes
     // the same predicate for candidate skipping, so the two can never drift.
@@ -192,6 +194,7 @@ export class PaymentService {
     if (input.amount === 0) {
       throw guardError(pspName, "chargeSavedPaymentMethod requires a positive amount", "invalid_request");
     }
+    refuseNoCurrency(input.currency, "chargeSavedPaymentMethod", pspName);
     requireIdempotencyKey(input.idempotencyKey, "chargeSavedPaymentMethod");
     return this.run(pspName, "chargeSavedPaymentMethod", () => adapter.chargeSavedPaymentMethod!(input));
   }
@@ -214,6 +217,7 @@ export class PaymentService {
       throw guardError(pspName, `"${pspName}" does not support updating payment sessions`);
     }
     if (input.amount !== undefined) assertMinorUnitAmount(input.amount, "amount");
+    refuseNoCurrency(input.currency, "updatePaymentSession", pspName);
     requireIdempotencyKey(input.idempotencyKey, "updatePaymentSession");
     return this.run(pspName, "updatePaymentSession", () => adapter.updatePaymentSession!(input));
   }
@@ -369,6 +373,7 @@ export class PaymentService {
     if (input.amount === 0) {
       throw guardError(pspName, "createNativeSubscription requires a positive amount", "invalid_request");
     }
+    refuseNoCurrency(input.currency, "createNativeSubscription", pspName);
     // The cadence must be unambiguous: exactly one authoritative expression.
     if (!input.interval && !input.schedule) {
       throw guardError(

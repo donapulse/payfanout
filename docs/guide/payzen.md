@@ -217,7 +217,11 @@ order's last transaction:
 - an issuer that refused the authentication (`PSP_707`) and the refusals PayZen documents,
   such as `PSP_003` and `PSP_625`, are `card_declined`;
 - an authentication the issuer could not run (`PSP_708`) is `processing_error`, and so is
-  a `PSP_` code the maps do not list, on both halves.
+  a `PSP_` code the maps do not list, on both halves;
+- a transaction whose status PayZen reports as unknown (`PSP_679`) is a `processing_error`
+  marked `outcomeUnknown` on both halves: it may have gone through, so read the payment
+  back (`retrievePayment`, or the IPN) before trying again, as PayZen takes no idempotency
+  key.
 
 A refusal is never retryable; only an outage or a rate limit is. PayZen's answer rides on
 the error's `raw`.

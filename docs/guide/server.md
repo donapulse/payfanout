@@ -211,7 +211,8 @@ the PSP; `outcomeUnknown: true` adds that doubt to a code that would otherwise r
 definitive, such as a Paysafe `processing_error` whose original cannot be read back,
 Stripe's refusal of a reused idempotency key, or the `processing_error` of a request refused
 while another under the same key is still in progress. Retry all of them only under the same
-`idempotencyKey`, never under a new one.
+`idempotencyKey`, never under a new one. A PSP that takes no idempotency key (PayZen) cannot
+dedupe even that, so read the payment back before any retry.
 
 Amounts are **integer minor units, always**, and minor units are currency-dependent, JPY
 has 0 decimals (`¥500` → `500`), BHD has 3 (`BD 1.234` → `1234`). Use
@@ -219,7 +220,11 @@ has 0 decimals (`¥500` → `500`), BHD has 3 (`BD 1.234` → `1234`). Use
 `@payfanout/core`. A record whose PSP states no currency, which the adapter cannot source
 from a related record either, reports `NO_CURRENCY` (`"XXX"`, ISO 4217's "no currency
 involved"): its amount reads with the default exponent 2, so reconcile it with the PSP
-before booking it, and never send `XXX` back as a payment's currency. Refund state is
+before booking it, and never send `XXX` back as a payment's currency: `PaymentService`
+refuses it as the currency of a session, session update, saved-method charge or native
+subscription, `PaymentRouter` before screening any candidate and `SubscriptionManager` in a
+plan, all with a non-retryable `invalid_request`, while an adapter called directly passes
+it to the PSP. Refund state is
 **derived**, never a payment status:
 `getRefundState(info)` → `"none" | "partial" | "full"`.
 

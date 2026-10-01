@@ -312,6 +312,24 @@ describe("PaymentRouter failover cascade", () => {
     expect((await router.createPaymentSession(input({ currency: "USD" }))).pspName).toBe("refusing");
   });
 
+  it("refuses XXX, core's NO_CURRENCY, before screening or calling any candidate", async () => {
+    // Refused before screening: psp-b's declared currencies are never consulted.
+    const a = new FakeAdapter({ pspName: "psp-a" });
+    const b = new FakeAdapter({ pspName: "psp-b", capabilities: { supportedCurrencies: ["EUR"] } });
+    const attempts: unknown[] = [];
+    const router = new PaymentRouter({
+      service: new PaymentService({ adapters: [b, a] }),
+      onAttempt: (attempt) => attempts.push(attempt),
+    });
+    await expect(router.createPaymentSession(input({ currency: " xxx " }))).rejects.toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+      message: expect.stringMatching(/^createPaymentSession was given currency XXX/) as string,
+    });
+    expect([...a.calls, ...b.calls]).toHaveLength(0);
+    expect(attempts).toEqual([]);
+  });
+
   it("fails with the diagnostic error when every candidate refuses the currency", async () => {
     const a = new FakeAdapter({ pspName: "psp-a", capabilities: { unsupportedCurrencies: ["CLP"] } });
     const b = new FakeAdapter({ pspName: "psp-b", capabilities: { supportedCurrencies: ["USD"] } });

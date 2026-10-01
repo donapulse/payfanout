@@ -62,7 +62,15 @@ function classify(e: StripeErrorLike): {
     // request may have gone through, so only the same key may follow.
     return { code: "invalid_request", retryable: false, message: "The payment request was invalid.", outcomeUnknown: true };
   }
-  if (e.type === "StripeAuthenticationError") {
+  // 401: no valid API key; 403: "The API key doesn't have permissions to
+  // perform the request" (a restricted key). Configuration either way, which
+  // the request never reached far enough to act on.
+  if (
+    e.type === "StripeAuthenticationError" ||
+    e.type === "StripePermissionError" ||
+    e.statusCode === 401 ||
+    e.statusCode === 403
+  ) {
     return { code: "invalid_request", retryable: false, message: "Payment configuration error." };
   }
   if (e.type === "StripeCardError") {

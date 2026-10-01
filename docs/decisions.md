@@ -107,9 +107,11 @@ tokens. Shipped surface:
   server-created `/paymenthandles` tokens and browser `/singleusepaymenthandles`
   tokens (Paysafe.js); listing ONLY via `GET /customers/{id}?fields=paymenthandles`
   (the collection GET 405s); delete by handle id; charges carry
-  `storedCredential { type: RECURRING, occurrence: INITIAL|SUBSEQUENT }` (ADHOC used
-  for "unscheduled", not sandbox-verified); a deleted token dies at /payments with
-  5068. **createCustomer is idempotent per host user id:** duplicate
+  `storedCredential { type: RECURRING, occurrence: INITIAL|SUBSEQUENT }` (TOPUP for
+  "unscheduled" since 2026-10-01: the Payments API spec defines TOPUP as "Unscheduled
+  merchant-initiated request" and ADHOC, used before, as "Ad hoc consumer-initiated
+  request"; not sandbox-verified); a deleted token dies at /payments with 5068.
+  **createCustomer is idempotent per host user id:** duplicate
   `merchantCustomerId` → 409 error 7505; the adapter recovers the existing profile via
   `GET /customers?merchantCustomerId=` — a restarted host that lost its cache gets the
   same profile back (found by E2E, sandbox-verified). **Re-saving an already-vaulted
@@ -6252,7 +6254,9 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   been exceeded during buyer redirection." names nothing that timed out. PSP_639 "Refund
   refused." names no refuser, unlike PSP_101, whose issuer refusal reads as `card_declined`.
   PSP_679 "The transaction status is unknown." says the outcome is not known, which a code
-  alone cannot carry: it wants `outcomeUnknown` (#282). The page's 3-D Secure technical
+  alone cannot carry: since #282 (2026-10-01) both halves mark it `outcomeUnknown` on a
+  non-retryable `processing_error`, as PayZen takes no idempotency key a retry could reuse;
+  the page does not say which calls answer it. The page's 3-D Secure technical
   errors (PSP_605, 713, 719, 720 and 997) already read as the rule's `processing_error`
   through the default.
 - **Every other mapped PSP_ code re-read against the page.** Each definition supports its
@@ -6338,8 +6342,12 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   say what a refund sent without `amountOfMoney` takes. PayZen refuses such a partial
   refund and sends a full one without the `currency` its V4 schema makes optional (only
   `uuid` is required on RefundRequest and CancelOrRefundRequest, read 2026-09-30) instead
-  of sending `""`. Core does not screen `XXX` as an input currency: a session in it goes
-  to the adapter, whose PSP refuses it as it would any code it does not take.
+  of sending `""`. Since #283 (2026-10-01), `PaymentService` refuses `XXX` as an input
+  currency (session, session update, saved-method charge, native subscription),
+  `PaymentRouter` before screening a candidate (so no circuit records it) and
+  `SubscriptionManager` in a plan (a trial would otherwise fail only at its first renewal),
+  all with `invalid_request`; an adapter called directly still passes it to the PSP, which
+  refuses it as it would any code it does not take.
 - **Not changed.** An amount a PSP omits still reads as 0, as before. Paysafe card refunds
   that state no currency keep their earlier rule (see "Card refunds and settlements may
   state no currency: AMBIGUOUS" above): a refund reports no currency field. Nineteen
@@ -6353,3 +6361,21 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   the whole authorization is captured, each lookup's retryable failure and the full
   refund's tolerance of one, the Worldline session fallback, session check and refund
   refusal, PayZen's order currency and refund paths).
+
+## Stripe.js error types (2026-10-01)
+
+- The browser maps Stripe.js error types as the server maps the SDK's classes, after its
+  code-level mapping. `api_connection_error`, `rate_limit_error` and `authentication_error`
+  come from the `StripeErrorType` declarations in `github.com/stripe/stripe-js`, which the
+  Stripe.js reference links; docs.stripe.com names only the others.
+- Stripe asks to show the message of card and validation errors only, so every other type,
+  `unknown` included, carries core's message. A failed 3-D Secure keeps Stripe's text under
+  any type, a deliberate exception: core's `authentication_required` message asks for the
+  authentication that just failed.
+- `payment_intent_unexpected_state` and `setup_intent_unexpected_state` stay outcome-open
+  (`invalid_request`, `outcomeUnknown`). The browser sends no idempotency key, so a double
+  submit or a retry can meet them after the payment went through, and `confirm()` reports
+  the status of the intent the error carries when it has one.
+- `validation_error`, input the customer corrects, is `invalid_card_data`, no longer
+  `card_declined`. It also covers IBAN and BECS fields, where core's card wording reads
+  wrong under `localizeError`.

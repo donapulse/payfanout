@@ -6,6 +6,7 @@ import {
   type PaymentSession,
   type UnifiedPaymentMethodType,
 } from "@payfanout/core";
+import { refuseNoCurrency } from "./no-currency.js";
 import type { PaymentService } from "./payment-service.js";
 
 /**
@@ -177,6 +178,8 @@ export class PaymentRouter {
    * succeed.
    */
   async createPaymentSession(input: CreatePaymentSessionInput): Promise<RoutedSessionResult> {
+    // Refused before any candidate is screened or called, so no circuit records it.
+    refuseNoCurrency(input.currency, "createPaymentSession");
     const chain = this.selectChain(input);
     const attempts: RoutedAttempt[] = [];
 

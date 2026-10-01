@@ -110,7 +110,8 @@ tokens. Shipped surface:
   `storedCredential { type: RECURRING, occurrence: INITIAL|SUBSEQUENT }` (TOPUP for
   "unscheduled" since 2026-10-01: the Payments API spec defines TOPUP as "Unscheduled
   merchant-initiated request" and ADHOC, used before, as "Ad hoc consumer-initiated
-  request"; not sandbox-verified); a deleted token dies at /payments with 5068. **createCustomer is idempotent per host user id:** duplicate
+  request"; not sandbox-verified); a deleted token dies at /payments with 5068.
+  **createCustomer is idempotent per host user id:** duplicate
   `merchantCustomerId` → 409 error 7505; the adapter recovers the existing profile via
   `GET /customers?merchantCustomerId=` — a restarted host that lost its cache gets the
   same profile back (found by E2E, sandbox-verified). **Re-saving an already-vaulted

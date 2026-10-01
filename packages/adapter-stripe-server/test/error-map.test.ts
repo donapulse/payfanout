@@ -32,6 +32,7 @@ describe("mapStripeError", () => {
     // 403: a restricted key without the permission — configuration, never an unknown outcome.
     { name: "key lacks a permission", err: { type: "StripePermissionError", statusCode: 403 }, code: "invalid_request", retryable: false },
     { name: "bare 403", err: { statusCode: 403 }, code: "invalid_request", retryable: false },
+    { name: "bare 401", err: { statusCode: 401 }, code: "invalid_request", retryable: false },
     {
       name: "insufficient funds decline",
       err: { type: "StripeCardError", code: "card_declined", decline_code: "insufficient_funds", message: "…" },

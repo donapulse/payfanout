@@ -40,8 +40,9 @@ export interface UnifiedError {
    * answer the adapter could not read back, or a refusal of a reused
    * idempotencyKey. psp_unavailable, rate_limited and unknown already leave
    * the outcome open without it. Retry any of these only under the SAME
-   * idempotencyKey — a new key can repeat the operation. Absent means the
-   * code alone tells.
+   * idempotencyKey — a new key can repeat the operation; a PSP that takes no
+   * idempotency key (PayZen) cannot dedupe even that, so read the payment
+   * back first. Absent means the code alone tells.
    */
   outcomeUnknown?: boolean;
 }

@@ -6,6 +6,7 @@ import {
   type PaymentInfo,
   type UnifiedErrorCode,
 } from "@payfanout/core";
+import { refuseNoCurrency } from "./no-currency.js";
 import type { PaymentService } from "./payment-service.js";
 
 /**
@@ -1586,6 +1587,8 @@ function normalizePlan(plan: SubscriptionPlan): Required<SubscriptionPlan> {
   if (!["day", "week", "month", "year"].includes(plan.interval)) {
     throw PayFanoutError.invalidRequest(`plan.interval must be day|week|month|year, got "${String(plan.interval)}"`);
   }
+  // A trial defers the first charge, so the plan is refused here, not at its first renewal.
+  refuseNoCurrency(plan.currency, "plan.currency");
   return { amount: plan.amount, currency: normalizeCurrency(plan.currency), interval: plan.interval, intervalCount };
 }
 

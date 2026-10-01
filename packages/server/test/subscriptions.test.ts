@@ -1221,3 +1221,20 @@ describe("subscription.updated and event timestamps", () => {
     expect(events[0]!.occurredAt).toBe("2026-03-01T00:00:00.000Z");
   });
 });
+
+describe("NO_CURRENCY in a plan", () => {
+  it("refuses an XXX plan when a trial is created and when a plan is updated", async () => {
+    const { manager, charges } = harness();
+    const xxx = { ...PLAN, currency: "XXX" };
+    await expect(create(manager, { plan: xxx, startAt: new Date(T0 + 14 * DAY) })).rejects.toMatchObject({
+      code: "invalid_request",
+      message: expect.stringMatching(/^plan\.currency was given currency XXX/) as string,
+    });
+    await create(manager);
+    await expect(manager.updateSubscription("sub_1", { plan: xxx })).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+    expect((await manager.retrieveSubscription("sub_1")).plan.currency).toBe("USD");
+    expect(charges).toHaveLength(1);
+  });
+});

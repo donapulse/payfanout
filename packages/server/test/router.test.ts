@@ -312,6 +312,17 @@ describe("PaymentRouter failover cascade", () => {
     expect((await router.createPaymentSession(input({ currency: "USD" }))).pspName).toBe("refusing");
   });
 
+  it("refuses XXX, core's NO_CURRENCY, without calling any candidate", async () => {
+    const a = new FakeAdapter({ pspName: "psp-a" });
+    const b = new FakeAdapter({ pspName: "psp-b" });
+    const router = new PaymentRouter({ service: new PaymentService({ adapters: [a, b] }) });
+    await expect(router.createPaymentSession(input({ currency: "XXX" }))).rejects.toMatchObject({
+      code: "invalid_request",
+      retryable: false,
+    });
+    expect([...a.calls, ...b.calls]).toHaveLength(0);
+  });
+
   it("fails with the diagnostic error when every candidate refuses the currency", async () => {
     const a = new FakeAdapter({ pspName: "psp-a", capabilities: { unsupportedCurrencies: ["CLP"] } });
     const b = new FakeAdapter({ pspName: "psp-b", capabilities: { supportedCurrencies: ["USD"] } });

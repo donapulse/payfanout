@@ -1,7 +1,5 @@
 import {
   assertMinorUnitAmount,
-  firstCurrencyCode,
-  NO_CURRENCY,
   PayFanoutError,
   type AdapterCapabilities,
   type CancelNativeSubscriptionInput,
@@ -37,6 +35,7 @@ import {
   validateAdapterCapabilities,
   type VerifyPaymentMethodInput,
 } from "@payfanout/core";
+import { refuseNoCurrency } from "./no-currency.js";
 
 /**
  * One record per adapter call, emitted to PaymentServiceOptions.telemetry.
@@ -129,7 +128,7 @@ export class PaymentService {
   async createPaymentSession(pspName: string, input: CreatePaymentSessionInput): Promise<PaymentSession> {
     const adapter = this.adapterFor(pspName);
     assertMinorUnitAmount(input.amount, "amount");
-    refuseNoCurrency(pspName, input.currency, "createPaymentSession");
+    refuseNoCurrency(input.currency, "createPaymentSession", pspName);
     requireIdempotencyKey(input.idempotencyKey, "createPaymentSession");
     // Capability rules live in core's screenSessionInput — the router consumes
     // the same predicate for candidate skipping, so the two can never drift.
@@ -195,7 +194,7 @@ export class PaymentService {
     if (input.amount === 0) {
       throw guardError(pspName, "chargeSavedPaymentMethod requires a positive amount", "invalid_request");
     }
-    refuseNoCurrency(pspName, input.currency, "chargeSavedPaymentMethod");
+    refuseNoCurrency(input.currency, "chargeSavedPaymentMethod", pspName);
     requireIdempotencyKey(input.idempotencyKey, "chargeSavedPaymentMethod");
     return this.run(pspName, "chargeSavedPaymentMethod", () => adapter.chargeSavedPaymentMethod!(input));
   }
@@ -218,7 +217,7 @@ export class PaymentService {
       throw guardError(pspName, `"${pspName}" does not support updating payment sessions`);
     }
     if (input.amount !== undefined) assertMinorUnitAmount(input.amount, "amount");
-    refuseNoCurrency(pspName, input.currency, "updatePaymentSession");
+    refuseNoCurrency(input.currency, "updatePaymentSession", pspName);
     requireIdempotencyKey(input.idempotencyKey, "updatePaymentSession");
     return this.run(pspName, "updatePaymentSession", () => adapter.updatePaymentSession!(input));
   }
@@ -374,7 +373,7 @@ export class PaymentService {
     if (input.amount === 0) {
       throw guardError(pspName, "createNativeSubscription requires a positive amount", "invalid_request");
     }
-    refuseNoCurrency(pspName, input.currency, "createNativeSubscription");
+    refuseNoCurrency(input.currency, "createNativeSubscription", pspName);
     // The cadence must be unambiguous: exactly one authoritative expression.
     if (!input.interval && !input.schedule) {
       throw guardError(
@@ -500,19 +499,6 @@ function requireIdempotencyKey(key: string, operation: string): void {
 }
 
 /** Capability guards reject with unsupported_operation; input-shape problems pass invalid_request. */
-/**
- * Refuses core's NO_CURRENCY (`XXX`) as an input currency: adapters report it
- * for a record that states no currency, so it names no currency to charge in.
- */
-function refuseNoCurrency(pspName: string, currency: string | undefined, operation: string): void {
-  if (firstCurrencyCode(currency) !== NO_CURRENCY) return;
-  throw guardError(
-    pspName,
-    `${operation} was given currency ${NO_CURRENCY}, which adapters report for a record that states no currency — pass the payment's own currency`,
-    "invalid_request",
-  );
-}
-
 function guardError(
   pspName: string,
   message: string,

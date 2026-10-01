@@ -6339,9 +6339,11 @@ and honor period page (`/payment-methods/auth-honor`), the Extend an authorizati
   refund and sends a full one without the `currency` its V4 schema makes optional (only
   `uuid` is required on RefundRequest and CancelOrRefundRequest, read 2026-09-30) instead
   of sending `""`. Since #283 (2026-10-01), `PaymentService` refuses `XXX` as an input
-  currency (session, session update, saved-method charge, native subscription) with
-  `invalid_request` before the adapter; an adapter called directly still passes it to the
-  PSP, which refuses it as it would any code it does not take.
+  currency (session, session update, saved-method charge, native subscription),
+  `PaymentRouter` before screening a candidate (so no circuit records it) and
+  `SubscriptionManager` in a plan (a trial would otherwise fail only at its first renewal),
+  all with `invalid_request`; an adapter called directly still passes it to the PSP, which
+  refuses it as it would any code it does not take.
 - **Not changed.** An amount a PSP omits still reads as 0, as before. Paysafe card refunds
   that state no currency keep their earlier rule (see "Card refunds and settlements may
   state no currency: AMBIGUOUS" above): a refund reports no currency field. Nineteen

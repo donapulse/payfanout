@@ -1645,6 +1645,14 @@ const PAYZEN_PSP_CODE_MAP: Record<string, UnifiedErrorCode> = {
 };
 
 /**
+ * "The transaction status is unknown." (PayZen's PSP_ error page): a
+ * processing_error marked outcomeUnknown, as the operation may have taken
+ * effect and PayZen has no idempotency key a retry could reuse. The browser
+ * adapter reads it the same way.
+ */
+const UNKNOWN_OUTCOME_CODE = "PSP_679";
+
+/**
  * Envelope-level error → taxonomy. PayZen prefixes announce the origin:
  * INT_ (merchant integration), PSP_ (gateway), ACQ_ (acquirer decline),
  * AUTH_ (3DS), CLIENT_ (browser). New codes appear over time — unmapped
@@ -1682,6 +1690,7 @@ export function mapPayZenError(answer: PayZenErrorAnswerLike | undefined, raw: u
         ? "PayZen rejected the API credentials — check shopId, password, and that they match the configured environment."
         : getUserMessage(code),
     retryable,
+    ...(errorCode === UNKNOWN_OUTCOME_CODE ? { outcomeUnknown: true } : {}),
     raw,
     pspName: PAYZEN_PSP_NAME,
   });

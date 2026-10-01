@@ -211,7 +211,8 @@ the PSP; `outcomeUnknown: true` adds that doubt to a code that would otherwise r
 definitive, such as a Paysafe `processing_error` whose original cannot be read back,
 Stripe's refusal of a reused idempotency key, or the `processing_error` of a request refused
 while another under the same key is still in progress. Retry all of them only under the same
-`idempotencyKey`, never under a new one.
+`idempotencyKey`, never under a new one. A PSP that takes no idempotency key (PayZen) cannot
+dedupe even that, so read the payment back before any retry.
 
 Amounts are **integer minor units, always**, and minor units are currency-dependent, JPY
 has 0 decimals (`¥500` → `500`), BHD has 3 (`BD 1.234` → `1234`). Use

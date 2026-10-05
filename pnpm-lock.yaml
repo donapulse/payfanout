@@ -248,8 +248,8 @@ importers:
         specifier: workspace:*
         version: link:../core
       stripe:
-        specifier: ^22.6.2
-        version: 22.6.2(@types/node@26.6.2)
+        specifier: ^23.0.0
+        version: 23.0.0(@types/node@26.6.2)
     devDependencies:
       '@payfanout/conformance':
         specifier: workspace:*
@@ -321,8 +321,8 @@ importers:
         specifier: workspace:*
         version: link:../server
       stripe:
-        specifier: ^22.6.2
-        version: 22.6.2(@types/node@26.6.2)
+        specifier: ^23.0.0
+        version: 23.0.0(@types/node@26.6.2)
 
   packages/react:
     dependencies:
@@ -2389,11 +2389,11 @@ packages:
   stringify-entities@4.0.4:
     resolution: {integrity: sha512-IwfBptatlO+QCJUo19AqvrPNqlVMpW9YEL2LIVY+Rpv2qsjCGxaDLNRgeGsQWJhfItebuJhsGSLjaBbNSQ+ieg==}
 
-  stripe@22.6.2:
-    resolution: {integrity: sha512-PwRE2scocvXqDKPiskMa5vRJEAEkq46W69XyUYmAwrNSLr675lQnfqLwnsndAWizwgihOWw/irLmoFRo3ez7ew==}
-    engines: {node: '>=18'}
+  stripe@23.0.0:
+    resolution: {integrity: sha512-MDE2A5ZVVluYURORaZEVghSmnLJc3w6aHAlZSxDQMsOjOb3V0O6ro/CiaeFlJS4N7uIVmsg98ocRsPmUK6YfyA==}
+    engines: {node: '>=20'}
     peerDependencies:
-      '@types/node': '>=18'
+      '@types/node': '>=20'
     peerDependenciesMeta:
       '@types/node':
         optional: true
@@ -4838,7 +4838,7 @@ snapshots:
       character-entities-html4: 2.1.0
       character-entities-legacy: 3.0.0
 
-  stripe@22.6.2(@types/node@26.6.2):
+  stripe@23.0.0(@types/node@26.6.2):
     optionalDependencies:
       '@types/node': 26.6.2
 
